@@ -73,6 +73,10 @@ cmd_setup() {
   python3 "$_main_repo/utils/domain_substitution.py" apply \
     -r "$_main_repo/domain_regex.list" -f "$_main_repo/domain_substitution.list" "$_src_dir"
 
+  # Tarka: product name in UI strings, and the app icon (binary, so not a patch).
+  python3 "$_root_dir/utils/name_substitution.py" --sub -t "$_src_dir" --backup-path "$_root_dir/build/namesubs.tar"
+  cp "$_root_dir/resources/branding/app.icns" "$_src_dir/chrome/app/theme/chromium/mac/app.icns"
+
   _write_gn_args
   mkdir -p "$_src_dir/third_party/llvm-build/Release+Asserts" "$_src_dir/third_party/rust-toolchain/bin"
   "$_root_dir/retrieve_and_unpack_resource.py" -p "$_arch"

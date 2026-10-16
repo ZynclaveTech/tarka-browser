@@ -47,6 +47,9 @@ python3 "$_main_repo/utils/prune_binaries.py" "$_src_dir" "$_main_repo/pruning.l
 python3 "$_main_repo/utils/patches.py" apply "$_src_dir" "$_main_repo/patches" "$_root_dir/patches"
 
 python3 "$_main_repo/utils/domain_substitution.py" apply -r "$_main_repo/domain_regex.list" -f "$_main_repo/domain_substitution.list" "$_src_dir"
+# Tarka: product name in UI strings, and the app icon (binary, so not a patch).
+python3 "$_root_dir/utils/name_substitution.py" --sub -t "$_src_dir" --backup-path "$_root_dir/build/namesubs.tar"
+cp "$_root_dir/resources/branding/app.icns" "$_src_dir/chrome/app/theme/chromium/mac/app.icns"
 # Set build flags
 cat "$_main_repo/flags.gn" "$_root_dir/flags.macos.gn" > "$_src_dir/out/Default/args.gn"
 
