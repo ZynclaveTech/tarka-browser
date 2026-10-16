@@ -12,10 +12,14 @@ _main_repo="$_root_dir/ungoogled-chromium"
 
 # Clone to get the Chromium Source
 clone=true
-while getopts 'd' OPTION; do
+_mode=release
+while getopts 'dm:' OPTION; do
   case "$OPTION" in
     d)
       clone=false
+      ;;
+    m)
+      _mode="$OPTARG"
       ;;
   esac
 done
@@ -53,6 +57,11 @@ else
   echo 'target_cpu = "x64"' >> "$_src_dir/out/Default/args.gn"
 fi
 
+# Development mode: component build, no LTO/PGO, no symbols. See flags.dev.gn.
+if [[ $_mode == "dev" ]]; then
+  cat "$_root_dir/flags.dev.gn" >> "$_src_dir/out/Default/args.gn"
+fi
+
 mkdir -p "$_src_dir/third_party/llvm-build/Release+Asserts"
 mkdir -p "$_src_dir/third_party/rust-toolchain/bin"
 
@@ -77,4 +86,6 @@ ln -s "$_esbuild_module" third_party/devtools-frontend/src/node_modules/esbuild
 
 ninja -C out/Default chrome chromedriver
 
-CHROMIUM_SRC_DIR="$_src_dir" "$_root_dir/sign_and_package_app.sh"
+if [[ $_mode == "release" ]]; then
+  CHROMIUM_SRC_DIR="$_src_dir" "$_root_dir/sign_and_package_app.sh"
+fi
