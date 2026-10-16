@@ -60,9 +60,15 @@ else
   echo 'target_cpu = "x64"' >> "$_src_dir/out/Default/args.gn"
 fi
 
-# Development mode: component build, no LTO/PGO, no symbols. See flags.dev.gn.
+# Development mode: static build, no LTO/PGO, no symbols. See flags.dev.gn.
 if [[ $_mode == "dev" ]]; then
   cat "$_root_dir/flags.dev.gn" >> "$_src_dir/out/Default/args.gn"
+fi
+
+# The PGO profile is only fetched by the clone path (clone.py -p); a tarball
+# build (-d) has none, and flags.macos.gn's chrome_pgo_phase=2 would stop gn.
+if ! $clone; then
+  echo 'chrome_pgo_phase=0' >> "$_src_dir/out/Default/args.gn"
 fi
 
 mkdir -p "$_src_dir/third_party/llvm-build/Release+Asserts"
