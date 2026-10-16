@@ -4,8 +4,11 @@ set -euo pipefail
 
 _root_dir="$(dirname "$(greadlink -f "$0")")"
 _src_dir="${CHROMIUM_SRC_DIR:-$_root_dir/build/src}"
-_app="$_src_dir/out/Default/Chromium.app"
-_framework="$_app/Contents/Frameworks/Chromium Framework.framework"
+# Product name as set in chrome/app/theme/chromium/BRANDING by patches/tarka/core/branding.patch.
+_product_name="${TARKA_PRODUCT_NAME:-Tarka}"
+_bundle_id="${TARKA_BUNDLE_ID:-com.gettarka.Tarka}"
+_app="$_src_dir/out/Default/$_product_name.app"
+_framework="$_app/Contents/Frameworks/$_product_name Framework.framework"
 _helpers="$_framework/Helpers"
 _libraries="$_framework/Libraries"
 _pkg_dmg="$_src_dir/chrome/installer/mac/pkg-dmg"
@@ -16,7 +19,7 @@ if [[ -z "$_target_dmg" ]]; then
   _chromium_version="$(cat "$_root_dir/ungoogled-chromium/chromium_version.txt")"
   _ungoogled_revision="$(cat "$_root_dir/ungoogled-chromium/revision.txt")"
   _package_revision="$(cat "$_root_dir/revision.txt")"
-  _target_dmg="$_root_dir/build/ungoogled-chromium_${_chromium_version}-${_ungoogled_revision}.${_package_revision}_macos.dmg"
+  _target_dmg="$_root_dir/build/${_product_name}_${_chromium_version}-${_ungoogled_revision}.${_package_revision}_macos.dmg"
 fi
 
 sign() {
@@ -41,15 +44,15 @@ xattr -cs "$_app"
 
 # Sign the binary
 sign --identifier chrome_crashpad_handler --options=restrict,library,runtime,kill "$_helpers/chrome_crashpad_handler"
-sign --identifier io.ungoogled-software.ungoogled-chromium.helper --options restrict,library,runtime,kill "$_helpers/Chromium Helper.app"
-sign --identifier io.ungoogled-software.ungoogled-chromium.helper.renderer --options restrict,kill,runtime --entitlements "$_root_dir/entitlements/helper-renderer-entitlements.plist" "$_helpers/Chromium Helper (Renderer).app"
-sign --identifier io.ungoogled-software.ungoogled-chromium.helper --options restrict,kill,runtime --entitlements "$_root_dir/entitlements/helper-gpu-entitlements.plist" "$_helpers/Chromium Helper (GPU).app"
-sign --identifier io.ungoogled-software.ungoogled-chromium.framework.AlertNotificationService --options restrict,library,runtime,kill "$_helpers/Chromium Helper (Alerts).app"
-if [[ -d "$_helpers/Chromium Helper (Aperitif).app" ]]; then
-  sign --identifier io.ungoogled-software.ungoogled-chromium.helper --options restrict,library,runtime,kill "$_helpers/Chromium Helper (Aperitif).app"
-  sign --identifier io.ungoogled-software.ungoogled-chromium.helper.renderer --options restrict,kill,runtime --entitlements "$_root_dir/entitlements/helper-renderer-entitlements.plist" "$_helpers/Chromium Helper (Aperitif Renderer).app"
-  sign --identifier io.ungoogled-software.ungoogled-chromium.helper --options restrict,kill,runtime --entitlements "$_root_dir/entitlements/helper-gpu-entitlements.plist" "$_helpers/Chromium Helper (Aperitif GPU).app"
-  sign --identifier io.ungoogled-software.ungoogled-chromium.framework.AlertNotificationService --options restrict,library,runtime,kill "$_helpers/Chromium Helper (Aperitif Alerts).app"
+sign --identifier $_bundle_id.helper --options restrict,library,runtime,kill "$_helpers/$_product_name Helper.app"
+sign --identifier $_bundle_id.helper.renderer --options restrict,kill,runtime --entitlements "$_root_dir/entitlements/helper-renderer-entitlements.plist" "$_helpers/$_product_name Helper (Renderer).app"
+sign --identifier $_bundle_id.helper --options restrict,kill,runtime --entitlements "$_root_dir/entitlements/helper-gpu-entitlements.plist" "$_helpers/$_product_name Helper (GPU).app"
+sign --identifier $_bundle_id.framework.AlertNotificationService --options restrict,library,runtime,kill "$_helpers/$_product_name Helper (Alerts).app"
+if [[ -d "$_helpers/$_product_name Helper (Aperitif).app" ]]; then
+  sign --identifier $_bundle_id.helper --options restrict,library,runtime,kill "$_helpers/$_product_name Helper (Aperitif).app"
+  sign --identifier $_bundle_id.helper.renderer --options restrict,kill,runtime --entitlements "$_root_dir/entitlements/helper-renderer-entitlements.plist" "$_helpers/$_product_name Helper (Aperitif Renderer).app"
+  sign --identifier $_bundle_id.helper --options restrict,kill,runtime --entitlements "$_root_dir/entitlements/helper-gpu-entitlements.plist" "$_helpers/$_product_name Helper (Aperitif GPU).app"
+  sign --identifier $_bundle_id.framework.AlertNotificationService --options restrict,library,runtime,kill "$_helpers/$_product_name Helper (Aperitif Alerts).app"
 fi
 sign --identifier app_mode_loader --options restrict,library,runtime,kill "$_helpers/app_mode_loader"
 sign --identifier web_app_shortcut_copier --options restrict,library,runtime,kill "$_helpers/web_app_shortcut_copier"
@@ -62,11 +65,11 @@ for _dylib in "$_libraries"/*.dylib; do
   sign --identifier "$_dylib_name" "$_dylib"
 done
 
-sign --identifier io.ungoogled-software.ungoogled-chromium.framework "$_framework"
+sign --identifier "$_bundle_id.framework" "$_framework"
 if (( _ad_hoc )); then
-  sign --identifier io.ungoogled-software.ungoogled-chromium --options restrict,library,runtime,kill --entitlements "$_root_dir/entitlements/app-entitlements.plist" "$_app"
+  sign --identifier "$_bundle_id" --options restrict,library,runtime,kill --entitlements "$_root_dir/entitlements/app-entitlements.plist" "$_app"
 else
-  sign --identifier io.ungoogled-software.ungoogled-chromium --options restrict,library,runtime,kill --entitlements "$_root_dir/entitlements/app-entitlements.plist" --requirements '=designated => identifier "io.ungoogled-software.ungoogled-chromium" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */' "$_app"
+  sign --identifier "$_bundle_id" --options restrict,library,runtime,kill --entitlements "$_root_dir/entitlements/app-entitlements.plist" --requirements "=designated => identifier \"$_bundle_id\" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */" "$_app"
 fi
 
 # Verify the binary signature
@@ -167,5 +170,5 @@ fi
 "$_pkg_dmg" \
   --sourcefile --source "$_app" \
   --target "$_target_dmg" \
-  --volname Chromium --symlink /Applications:/Applications \
+  --volname "$_product_name" --symlink /Applications:/Applications \
   --format UDBZ --verbosity 2
