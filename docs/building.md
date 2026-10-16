@@ -22,9 +22,13 @@ system Python 3.14 is too new for depot_tools.
 ./dev.sh run     # launches the app with --user-data-dir=build/profile
 ```
 
-The development build (`flags.dev.gn`) is a component build with no LTO, no
-PGO and no symbols: it links in seconds and fits an 18 GB machine. It is
-not what ships. `TARKA_JOBS` sets ninja's parallelism (default 8; 11 cores
+The development build (`flags.dev.gn`) is a static build with no LTO, no
+PGO, no symbols and no precompiled headers: it fits an 18 GB machine and
+relinks in a few minutes. It is not what ships. Two configurations were
+tried and rejected: precompiled headers (the Chromium clang rejects
+`-fmodule-name` on a `-x c++-header` compile) and a component build (shared
+libraries that pull in the nightly Rust std without Rust code of their own
+fail to link the allocator symbols). `TARKA_JOBS` sets ninja's parallelism (default 8; 11 cores
 and 18 GB swap at 13).
 
 Builds longer than a couple of minutes should run in the background with
@@ -52,4 +56,19 @@ If a download failed, remove `build/download_cache` and run `setup` again.
 
 ## Disk and time
 
-Filled in after the first build.
+First development build, 2026-10-16/17, Apple M3 Pro (11 cores), 18 GB,
+8 ninja jobs, Chromium 155.0.8059.39:
+
+| Step | Time | Size |
+|---|---|---|
+| `dev.sh setup` (tarball 1.9 GB + toolchain 0.9 GB, prune, patch, substitute, gn bootstrap, gn gen) | 42 min | `build/download_cache` 2.7 GB |
+| `dev.sh build` chrome, static dev flags, from scratch | about 5 h 15 min of compile (22:02 → 03:16) plus three restarts for the fixes below | `build/src` 26 GB, of which `out/Default` 11 GB |
+| App bundle | — | `Chromium.app` 713 MB unstripped |
+| Disk after | — | 79 GB free, from 121 GB before setup |
+
+Three configuration fixes were needed before the first link succeeded,
+each now in the repo: precompiled headers off (`flags.dev.gn`), static
+instead of component build (`flags.dev.gn`), and
+`patches/tarka/core/fix-link-without-managed-profile-creation.patch`
+(see the patch header). Incremental rebuilds after a one-file change
+take a few minutes, dominated by the framework link.
