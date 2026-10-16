@@ -24,5 +24,7 @@ Silicon Mac with the toolchain installed:
 ## Licence
 
 Tarka's own patches and scripts: BSD 3-Clause (`LICENSE`). Upstream
-ungoogled-chromium: `LICENSE.ungoogled_chromium`. Borrowed files keep their
-own licence, stated in their header.
+ungoogled-chromium: `LICENSE.ungoogled_chromium`. `utils/name_substitution.py`
+and `utils/name_substitution_utils.py` are borrowed from Helium under GPL-3.0
+(`LICENSE.GPL-3.0`); they run at build time only, and their output is
+Chromium's own string data, so the browser binary is not covered by them.

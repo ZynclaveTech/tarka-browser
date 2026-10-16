@@ -31,6 +31,9 @@ _arch=${1:-arm64}
 # Add local clang and build tools to PATH
 # export PATH="$PATH:$_src_dir/third_party/llvm-build/Release+Asserts/bin"
 
+# A development tree (dev.sh setup) must be reset first; see the check.
+"$_root_dir/devutils/check_clean_tree.sh"
+
 rm -rf "$_src_dir/out" || true
 mkdir -p "$_download_cache"
 

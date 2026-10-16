@@ -37,14 +37,19 @@ their output in `build/logs/`; `./dev.sh build` tees there itself.
 ## Release build
 
 ```sh
+./dev.sh reset
 MACOS_AD_HOC_SIGNING=1 ./build.sh -d -m release arm64
 ```
 
-`-d` downloads the source tarball instead of cloning Chromium. `build.sh`
-deletes `build/src/out` first and builds from scratch with
-`is_official_build=true` and ThinLTO. The `.dmg` lands in `build/`. Without
-`MACOS_AD_HOC_SIGNING=1` it expects the Developer ID variables documented in
-`sign_and_package_app.sh`.
+`build.sh` is upstream's one-shot script: it re-extracts the tarball into
+`build/src`, applies the patches with `patches.py` (not quilt), and builds
+with `is_official_build=true` and ThinLTO. It assumes a fresh tree, so run
+`./dev.sh reset` first; `devutils/check_clean_tree.sh` makes it refuse to
+start otherwise. `-d` downloads the source tarball instead of cloning
+Chromium, and tarball builds have no PGO profile, so `build.sh` turns PGO
+off for them. The `.dmg` lands in `build/`. Without `MACOS_AD_HOC_SIGNING=1`
+it expects the Developer ID variables documented in `sign_and_package_app.sh`.
+Afterwards `./dev.sh reset && ./dev.sh setup` restores the development tree.
 
 ## Resetting
 

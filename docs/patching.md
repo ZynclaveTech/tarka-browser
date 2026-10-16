@@ -41,6 +41,15 @@ and keep their original licence header.
 
 ## Updating to a new Chromium
 
-Bump the `ungoogled-chromium` submodule to the matching tag, `./dev.sh
-reset && ./dev.sh setup`, fix any patch that fails to apply with `quilt
-push -f` + edit + `quilt refresh`, rebuild, smoke test.
+Bump the `ungoogled-chromium` submodule to the matching tag, then
+`./dev.sh reset && ./dev.sh setup`. If a patch fails to apply, setup stops
+there; fix it in `build/src` with `quilt push -f`, edit, `quilt refresh`,
+then `./dev.sh setup --continue`, which finishes the remaining steps
+(substitutions, icon, toolchain, gn gen) without re-fetching. Rebuild,
+smoke test.
+
+Name substitution runs after the patches, so before `quilt refresh` or
+`quilt pop` on any patch that touches a `.grd`, `.grdp` or `.xtb` file,
+run `python3 utils/name_substitution.py --unsub -t build/src --backup-path
+build/namesubs.tar`, and `--sub` again afterwards. Keep Tarka patches off
+string files where you can.

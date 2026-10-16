@@ -1,6 +1,7 @@
 # Copyright 2025 The Helium Authors
+# Modifications Copyright 2026 The Tarka Authors
 # You can use, redistribute, and/or modify this source code under
-# the terms of the GPL-3.0 license that can be found in the LICENSE file.
+# the terms of the GPL-3.0 license that can be found in the LICENSE.GPL-3.0 file.
 # Adapted for Tarka: product name is Tarka and the chrome:// scheme is left alone.
 """Util library for name_substitution.py"""
 

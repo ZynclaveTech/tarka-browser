@@ -4,6 +4,8 @@
 # rebuilds from scratch on every run; this script keeps build/src around.
 #
 #   ./dev.sh setup   fetch, prune, patch, substitute, gn gen (once)
+#   ./dev.sh setup --continue   resume after fixing a patch that failed to
+#                    apply: skips fetch, prune and quilt push
 #   ./dev.sh build   ninja chrome, incremental, logged under build/logs/
 #   ./dev.sh run     launch the built app with its own profile directory
 #   ./dev.sh reset   delete build/src, keep build/download_cache
@@ -12,7 +14,8 @@
 
 set -euo pipefail
 
-_root_dir="$(dirname "$(greadlink -f "${BASH_SOURCE[0]}")")"
+# TARKA_ROOT overrides the repo root; the tests point it at a fake tree.
+_root_dir="${TARKA_ROOT:-$(dirname "$(greadlink -f "${BASH_SOURCE[0]}")")}"
 _src_dir="$_root_dir/build/src"
 _out_dir="$_src_dir/out/Default"
 _main_repo="$_root_dir/ungoogled-chromium"
@@ -56,19 +59,35 @@ _fix_esbuild() {
 }
 
 cmd_setup() {
+  local resume=false
+  [[ "${1:-}" == "--continue" ]] && resume=true
   if [[ -d "$_out_dir" ]]; then
     echo "$_out_dir already exists; run ./dev.sh reset for a clean setup" >&2
     return 0
   fi
+  if ! $resume && [[ -e "$_root_dir/patches/series.merged" ]]; then
+    cat >&2 <<MSG
+patches/series.merged exists: a previous setup stopped part-way (usually a
+patch that failed to apply). Either
+  - fix it: cd build/src; quilt push -f; edit; quilt refresh; cd ../..;
+    then ./dev.sh setup --continue
+  - or start over: ./dev.sh reset && ./dev.sh setup
+MSG
+    return 2
+  fi
   mkdir -p "$_download_cache" "$_logs_dir"
 
-  "$_root_dir/retrieve_and_unpack_resource.py" -d -g "$_arch"
-  python3 "$_main_repo/utils/prune_binaries.py" "$_src_dir" "$_main_repo/pruning.list"
+  if ! $resume; then
+    "$_root_dir/retrieve_and_unpack_resource.py" -d -g "$_arch"
+    python3 "$_main_repo/utils/prune_binaries.py" "$_src_dir" "$_main_repo/pruning.list"
 
-  # Apply ungoogled-chromium's patches, then ours, through quilt so that
-  # build/src/.pc exists and new patches can be made with quilt new/refresh.
-  "$_root_dir/devutils/update_patches.sh" merge
-  (cd "$_src_dir" && _quilt push -a)
+    # Apply ungoogled-chromium's patches, then ours, through quilt so that
+    # build/src/.pc exists and new patches can be made with quilt new/refresh.
+    "$_root_dir/devutils/update_patches.sh" merge
+    (cd "$_src_dir" && _quilt push -a)
+  else
+    (cd "$_src_dir" && _quilt push -a)   # applies whatever is still unapplied
+  fi
 
   python3 "$_main_repo/utils/domain_substitution.py" apply \
     -r "$_main_repo/domain_regex.list" -f "$_main_repo/domain_substitution.list" "$_src_dir"
