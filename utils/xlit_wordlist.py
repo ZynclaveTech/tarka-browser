@@ -9,20 +9,28 @@ the ones that are real words. This tool builds and packs the lists it needs.
 It uses only the standard library, so it runs in the plain build environment.
 
     xlit_wordlist.py count --tag hi --top 50000 < corpus.txt > hi.tsv
+    xlit_wordlist.py english <en.tsv> <english-exclude.txt> > english-common.txt
     xlit_wordlist.py pack <words-dir> <english.txt[.xz]> <out.bin>
 
 count
 -----
 Reads UTF-8 text on stdin (as a stream; nothing is kept but the counts) and
-prints the TOP most frequent words as "word<TAB>count", commonest first, ties
-broken by the word. A word is a run of the script's letters and combining
-marks that is bounded by whitespace or punctuation on both sides. A token
-that mixes in Latin letters, digits, danda, or any other character is not a
-word. Text is NFC-normalised first (the model emits NFC), so the precomposed
-nukta letters U+0958..U+095F count as the base letter plus nukta.
+prints the TOP most frequent words (seen at least --min-count times) as
+"word<TAB>count", commonest first, ties broken by the word. A word is a run
+of the script's letters and combining marks that is bounded by whitespace or
+punctuation on both sides. A token that mixes in Latin letters, digits,
+danda, or any other character is not a word. Text is NFC-normalised first
+(the model emits NFC), so the precomposed nukta letters U+0958..U+095F count as the
+base letter plus nukta.
 
 The tag "en" is English: the text is lower-cased and only a-z words count
 (apostrophes are not delimiters, so "don't" is not a word).
+
+english
+-------
+Takes the 20,000 commonest English words from a "count --tag en" file and
+drops the ones in english-exclude.txt (romanised Indian words that an Indian
+reader types as Indian-language text). One word per line comes out.
 
 pack: TXLW v1 (all integers little-endian)
 ------------------------------------------
@@ -151,8 +159,9 @@ def _pattern(tag):
     return _PATTERNS[tag]
 
 
-def count_words(tag, stream, out, top):
-    """Counts the words of `tag` in the text `stream`; writes the top `top`."""
+def count_words(tag, stream, out, top, min_count=1):
+    """Counts the words of `tag` in the text `stream`; writes the top `top`
+    that occur at least `min_count` times."""
     pattern = _pattern(tag)
     english = tag == ENGLISH_TAG
     counts = Counter()
@@ -168,8 +177,35 @@ def count_words(tag, stream, out, top):
         if len(counts) > PRUNE_AT:
             counts = Counter({w: n for w, n in counts.items() if n > 1})
     ranked = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+    ranked = [item for item in ranked if item[1] >= min_count]
     for word, n in ranked[:top]:
         out.write('%s\t%d\n' % (word, n))
+
+
+def build_english(tsv, exclude, out, top=20000):
+    """Writes the English list: the `top` commonest words of the "word<TAB>
+    count" stream `tsv`, one per line, minus the words in `exclude`.
+
+    `exclude` has one word per line, optionally followed by a TAB and the
+    reason. Blank lines and lines starting with "#" are skipped."""
+    excluded = set()
+    for number, line in enumerate(exclude, 1):
+        line = line.rstrip('\n')
+        if not line or line.startswith('#'):
+            continue
+        word = line.split('\t', 1)[0]
+        if not re.fullmatch('[a-z]+', word):
+            raise ValueError('exclude line %d: %r is not a-z only' %
+                             (number, word))
+        excluded.add(word)
+    kept = 0
+    for line in tsv:
+        if kept >= top:
+            break
+        kept += 1
+        word = line.split('\t', 1)[0]
+        if word not in excluded:
+            out.write(word + '\n')
 
 
 def _open_text(path):
@@ -249,6 +285,12 @@ def main(argv=None):
     c.add_argument('--tag', required=True,
                    choices=sorted(SCRIPT_BLOCKS) + [ENGLISH_TAG])
     c.add_argument('--top', type=int, default=50000)
+    c.add_argument('--min-count', type=int, default=1,
+                   help='drop words seen fewer times (for tiny corpora)')
+    e = sub.add_parser('english', help='cut the English list')
+    e.add_argument('counts', help='word<TAB>count file, commonest first')
+    e.add_argument('exclude', help='english-exclude.txt')
+    e.add_argument('--top', type=int, default=20000)
     p = sub.add_parser('pack', help='pack lists into a TXLW v1 file')
     p.add_argument('words_dir')
     p.add_argument('english')
@@ -259,8 +301,12 @@ def main(argv=None):
                                  errors='replace', newline='')
         stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8',
                                   newline='\n')
-        count_words(args.tag, stdin, stdout, args.top)
+        count_words(args.tag, stdin, stdout, args.top, args.min_count)
         stdout.flush()
+    elif args.command == 'english':
+        with open(args.counts, encoding='utf-8') as tsv, \
+                open(args.exclude, encoding='utf-8') as exclude:
+            build_english(tsv, exclude, sys.stdout, args.top)
     else:
         pack(args.words_dir, args.english, args.out)
     return 0

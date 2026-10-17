@@ -123,5 +123,46 @@ class KnownOutputsTest(unittest.TestCase):
             xlit_reference.transliterate(self.model, 'xx', 'abc')
 
 
+RESOURCES = os.path.join(REPO, 'resources', 'xlit')
+
+
+class GoldenFilesTest(unittest.TestCase):
+    def read(self, name):
+        with open(os.path.join(RESOURCES, name), encoding='utf-8') as f:
+            return [line.rstrip('\n') for line in f if line.strip()]
+
+    def test_golden_covers_every_input_and_language(self):
+        inputs = self.read('golden-inputs.txt')
+        self.assertEqual(len(inputs), 60)
+        for needed in ('namaste', 'vanakkam', 'dilli', 'bharat', 'lakshan',
+                       'taj', 'mahal'):
+            self.assertIn(needed, inputs)
+        lines = [line.split('\t') for line in self.read('golden.tsv')]
+        tags = {fields[0] for fields in lines}
+        self.assertEqual(len(tags), 21)
+        self.assertNotIn('en', tags)
+        self.assertEqual(len(lines), 60 * 21)
+        self.assertEqual({fields[1] for fields in lines}, set(inputs))
+        for fields in lines:
+            self.assertGreaterEqual(len(fields), 3, fields)
+            for cand in fields[2:]:
+                text, _, score = cand.rpartition('|')
+                self.assertTrue(text)
+                self.assertTrue(0.0 < float(score) <= 1.0, cand)
+
+    @unittest.skipIf(np is None, 'numpy not installed')
+    def test_golden_lines_match_the_reference(self):
+        path = os.environ.get(MODEL_ENV, DEFAULT_MODEL)
+        if not os.path.exists(path):
+            self.skipTest('xlit-model.bin not present: ' + path)
+        model = xlit_reference.load_model(path)
+        lines = self.read('golden.tsv')
+        for line in lines[::97]:  # a spread over tags and inputs
+            tag, word, *cands = line.split('\t')
+            got = xlit_reference.format_candidates(
+                xlit_reference.transliterate(model, tag, word))
+            self.assertEqual(got, '\t'.join(cands), (tag, word))
+
+
 if __name__ == '__main__':
     unittest.main()

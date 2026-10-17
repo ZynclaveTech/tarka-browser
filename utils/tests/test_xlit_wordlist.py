@@ -22,9 +22,9 @@ DEFAULT_WORDS = os.path.join(
     REPO, 'build/src/third_party/indicxlit/xlit-words.bin')
 
 
-def count(tag, text, top=50000):
+def count(tag, text, top=50000, min_count=1):
     out = io.StringIO()
-    xlit_wordlist.count_words(tag, io.StringIO(text), out, top)
+    xlit_wordlist.count_words(tag, io.StringIO(text), out, top, min_count)
     return [line.split('\t') for line in out.getvalue().splitlines()]
 
 
@@ -93,6 +93,11 @@ class CountTest(unittest.TestCase):
         self.assertEqual(count('hi', text), expected)
         self.assertEqual(count('hi', text, top=3), expected[:3])
 
+    def test_min_count_drops_rare_words(self):
+        text = 'क ख ख ग ग ग'
+        self.assertEqual(count('hi', text, min_count=2),
+                         [['ग', '3'], ['ख', '2']])
+
     def test_cli_reads_stdin(self):
         script = os.path.join(os.path.dirname(__file__), '..',
                               'xlit_wordlist.py')
@@ -101,6 +106,28 @@ class CountTest(unittest.TestCase):
             input='नमस्ते नमस्ते भारत'.encode('utf-8'),
             capture_output=True, check=True).stdout.decode('utf-8')
         self.assertEqual(out, 'नमस्ते\t2\nभारत\t1\n')
+
+
+class EnglishListTest(unittest.TestCase):
+    def build(self, tsv, exclude, top=20000):
+        out = io.StringIO()
+        xlit_wordlist.build_english(io.StringIO(tsv), io.StringIO(exclude),
+                                    out, top)
+        return out.getvalue().splitlines()
+
+    def test_takes_top_n_then_removes_excluded(self):
+        tsv = 'the\t9\nnamaste\t8\nof\t7\nbhai\t6\nand\t5\n'
+        exclude = '# romanised Hindi\nnamaste\tgreeting\n\nbhai\n'
+        # the cut is made before the exclusions, so top=4 leaves 2 words
+        self.assertEqual(self.build(tsv, exclude, top=4), ['the', 'of'])
+        self.assertEqual(self.build(tsv, exclude), ['the', 'of', 'and'])
+
+    def test_exclude_entries_not_in_the_list_are_harmless(self):
+        self.assertEqual(self.build('the\t1\n', 'zzz\treason\n'), ['the'])
+
+    def test_rejects_non_ascii_exclude(self):
+        with self.assertRaises(ValueError):
+            self.build('the\t1\n', 'नमस्ते\treason\n')
 
 
 class PackTest(unittest.TestCase):
