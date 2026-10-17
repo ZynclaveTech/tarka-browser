@@ -1,0 +1,59 @@
+--- a/chrome/browser/ui/views/tabs/common/horizontal_tab_style_views.cc
++++ b/chrome/browser/ui/views/tabs/common/horizontal_tab_style_views.cc
+@@ -69,6 +69,47 @@
+     return GetPinnedPath(path_type, scale, flags).value_or(SkPath());
+   }
+ 
++  // Tark: every painted tab shape is a 30 DIP stadium, a "pill" (spec 6.1).
++  // It is inset by the bottom-corner extension on both sides, which with the
++  // tab overlap leaves a 6 DIP gap between neighbouring pills
++  // (2 x 12 - 18). The hit test keeps Chromium's shape below, which is
++  // easier to click.
++  if (path_type != TabStyle::PathType::kHitTest) {
++    constexpr float kPillHeight = 30.0f;
++    const gfx::RectF pill_bounds = ScaleAndAlignBounds(
++        delegate_->GetView()->bounds(), scale, GetStrokeThickness());
++    const float visible_height =
++        (delegate_->GetView()->height() -
++         GetLayoutConstant(LayoutConstant::kTabstripToolbarOverlap)) *
++        scale;
++    const float inset = tab_style()->GetBottomCornerRadius() * scale;
++    float pill_left = pill_bounds.x() + inset;
++    float pill_right = pill_bounds.right() - inset;
++    float pill_top = pill_bounds.y() + (visible_height - kPillHeight * scale) / 2;
++    float pill_bottom = pill_top + kPillHeight * scale;
++    if (path_type == TabStyle::PathType::kActiveTab ||
++        path_type == TabStyle::PathType::kBorder) {
++      const float half_stroke = 0.5f * GetStrokeThickness() * scale;
++      pill_left += half_stroke;
++      pill_right -= half_stroke;
++      pill_top += half_stroke;
++      pill_bottom -= half_stroke;
++    }
++    const float pill_radius = (pill_bottom - pill_top) / 2;
++    SkPathBuilder pill;
++    pill.addRRect(SkRRect::MakeRectXY(
++        SkRect::MakeLTRB(pill_left, pill_top, std::max(pill_left, pill_right),
++                         pill_bottom),
++        pill_radius, pill_radius));
++    gfx::PointF pill_origin(delegate_->GetView()->origin());
++    pill_origin.Scale(scale);
++    pill.offset(-pill_origin.x(), -pill_origin.y());
++    if (flags.render_units == TabStyle::RenderUnits::kDips && scale != 1.0f) {
++      pill.transform(SkMatrix::Scale(1.0f / scale, 1.0f / scale));
++    }
++    return pill.detach();
++  }
++
+   const int stroke_thickness = GetStrokeThickness();
+ 
+   // We'll do the entire path calculation in aligned pixels.
+@@ -466,6 +507,8 @@
+ 
+ TabStyle::SeparatorBounds HorizontalTabStyleViews::GetSeparatorBounds(
+     float scale) const {
++  // Tark: pills stand apart; no separators between tabs (spec 6.1).
++  return TabStyle::SeparatorBounds();
+   const gfx::Rect original_bounds = delegate_->GetView()->bounds();
+   // Factor out the amount of the tab strip that is overlapped by the toolbar.
+   const gfx::Rect visible_bounds = gfx::Rect(
