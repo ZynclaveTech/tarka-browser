@@ -89,8 +89,11 @@ MSG
     (cd "$_src_dir" && _quilt push -a)   # applies whatever is still unapplied
   fi
 
+  # Tark leaves the Chrome Web Store's files unsubstituted (utils/domain_substitution_skip.txt).
+  python3 "$_root_dir/utils/filter_substitution_list.py" "$_main_repo/domain_substitution.list" \
+    "$_root_dir/utils/domain_substitution_skip.txt" "$_root_dir/build/domain_substitution.list"
   python3 "$_main_repo/utils/domain_substitution.py" apply \
-    -r "$_main_repo/domain_regex.list" -f "$_main_repo/domain_substitution.list" "$_src_dir"
+    -r "$_main_repo/domain_regex.list" -f "$_root_dir/build/domain_substitution.list" "$_src_dir"
 
   # Tarka: product name in UI strings, and the app icon (binary, so not a patch).
   python3 "$_root_dir/utils/name_substitution.py" --sub -t "$_src_dir" --backup-path "$_root_dir/build/namesubs.tar"

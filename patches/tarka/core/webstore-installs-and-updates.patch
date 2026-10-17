@@ -1,0 +1,113 @@
+Tark: restore Chrome Web Store installs and extension update checks.
+ungoogled-chromium's disable-webstore-urls.patch and inox 0005 remove the
+store download (DownloadCrx), the install (StartCrxInstaller), the default
+store update URL and the update-check loop; this puts the four back. Spec
+§5.3: store traffic only on install and update; cws_info_service and
+content verification stay off. The store's hosts are kept unsubstituted by
+utils/domain_substitution_skip.txt. Store extensions are routed to
+ExtensionDownloader (clients2.google.com) instead of UpdateService
+(update.googleapis.com), which stays substituted so the component updater
+cannot reach Google.
+
+--- a/extensions/browser/updater/extension_downloader.cc
++++ b/extensions/browser/updater/extension_downloader.cc
+@@ -158,7 +158,7 @@
+                                       const GURL& update_url) {
+   if (update_url.is_empty()) {
+     // Fill in default update URL.
+-    return std::nullopt;
++    return extension_urls::GetWebstoreUpdateUrl();
+   }
+ 
+   // Skip extensions with non-empty invalid update URLs.
+@@ -176,6 +176,11 @@
+     return std::nullopt;
+   }
+ 
++  // Make sure we use SSL for store-hosted extensions.
++  if (extension_urls::IsWebstoreUpdateUrl(update_url) &&
++      !update_url.SchemeIsCryptographic()) {
++    return extension_urls::GetWebstoreUpdateUrl();
++  }
+ 
+   return update_url;
+ }
+@@ -347,6 +352,10 @@
+     AddToFetches(fetches_preparing, std::move(task));
+   pending_tasks_.clear();
+ 
++  for (auto& fetch_list : fetches_preparing) {
++    for (auto& fetch : fetch_list.second)
++      StartUpdateCheck(std::move(fetch));
++  }
+ }
+ 
+ void ExtensionDownloader::SetIdentityManager(
+--- a/extensions/browser/webstore_installer.cc
++++ b/extensions/browser/webstore_installer.cc
+@@ -481,6 +481,21 @@
+ 
+ void WebstoreInstaller::DownloadCrx(const ExtensionId& extension_id,
+                                     InstallSource source) {
++  download_url_ = GetWebstoreInstallURL(extension_id, source);
++  MaybeAppendAuthUserParameter(approval_->authuser, download_url_);
++
++  base::FilePath user_data_dir =
++      ExtensionsBrowserClient::Get()->GetUserDataDir();
++  base::FilePath download_path = user_data_dir.Append(kWebstoreDownloadFolder);
++
++  base::FilePath download_directory(g_download_directory_for_tests
++                                        ? *g_download_directory_for_tests
++                                        : download_path);
++
++  GetExtensionFileTaskRunner()->PostTaskAndReplyWithResult(
++      FROM_HERE,
++      base::BindOnce(&GetDownloadFilePath, download_directory, extension_id),
++      base::BindOnce(&WebstoreInstaller::StartDownload, this, extension_id));
+ }
+ 
+ // http://crbug.com/40957413
+@@ -635,6 +650,24 @@
+ void WebstoreInstaller::StartCrxInstaller(const DownloadItem& download) {
+   DCHECK_CURRENTLY_ON(BrowserThread::UI);
+   DCHECK(!crx_installer_.get());
++
++  const InstallApproval* approval = GetAssociatedApproval(download);
++  DCHECK(approval);
++
++  crx_installer_ =
++      ExtensionsBrowserClient::Get()->CreateCrxInstallerFromDownloadItem(
++          browser_context_, download);
++
++  crx_installer_->set_expected_id(approval->extension_id);
++  crx_installer_->set_is_gallery_install(true);
++  crx_installer_->set_allow_silent_install(true);
++  crx_installer_->AddInstallerCallback(base::BindOnce(
++      &WebstoreInstaller::OnInstallerDone, weak_ptr_factory_.GetWeakPtr()));
++  if (approval->withhold_permissions) {
++    crx_installer_->set_withhold_permissions();
++  }
++
++  crx_installer_->InstallCrx(download.GetFullPath());
+ }
+ 
+ void WebstoreInstaller::ReportFailure(const std::string& error,
+--- a/chrome/browser/extensions/updater/extension_updater.cc
++++ b/chrome/browser/extensions/updater/extension_updater.cc
+@@ -800,11 +800,11 @@
+     return false;
+   }
+ 
+-  // UpdateService can only update extensions from the store. If `update_url`
+-  // is empty, we default to checking from the store.
+-  GURL update_url = GetEffectiveUpdateURL(*extension);
+-  return update_url.is_empty() ||
+-         extension_urls::IsWebstoreUpdateUrl(update_url);
++  // Tark: store extensions are updated through ExtensionDownloader, which
++  // asks clients2.google.com (spec §5.3, the same host installs use).
++  // UpdateService would ask update.googleapis.com, which stays substituted
++  // so the component updater cannot reach Google.
++  return false;
+ }
+ 
+ void ExtensionUpdater::InstallCRXFile(FetchedCRXFile crx_file) {
