@@ -103,6 +103,11 @@ MSG
   mkdir -p "$_src_dir/third_party/llvm-build/Release+Asserts" "$_src_dir/third_party/rust-toolchain/bin"
   "$_root_dir/retrieve_and_unpack_resource.py" -p "$_arch"
 
+  # Tark: uBlock Origin's sources, and the key that fixes its extension id.
+  python3 "$_main_repo/utils/downloads.py" retrieve -i "$_root_dir/downloads-tark.ini" -c "$_download_cache"
+  python3 "$_main_repo/utils/downloads.py" unpack -i "$_root_dir/downloads-tark.ini" -c "$_download_cache" "$_src_dir"
+  python3 "$_root_dir/utils/ublock_key.py" "$_src_dir/third_party/ublock/manifest.json" "$_root_dir/resources/ublock/key.txt"
+
   _fix_esbuild
   cd "$_src_dir"
   ./tools/gn/bootstrap/bootstrap.py -o out/Default/gn --skip-generate-buildfiles

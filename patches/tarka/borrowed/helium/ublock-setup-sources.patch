@@ -1,0 +1,195 @@
+--- a/chrome/browser/extensions/BUILD.gn
++++ b/chrome/browser/extensions/BUILD.gn
+@@ -638,6 +638,7 @@
+     "//net:extras",
+     "//services/metrics/public/cpp:ukm_builders",
+     "//storage/browser",
++    "//third_party/ublock",
+     "//third_party/zlib/google:zip",
+     "//ui/base/accelerators/global_accelerator_listener",
+     "//ui/base/unowned_user_data",
+--- a/chrome/browser/extensions/chrome_component_extension_resource_manager.cc
++++ b/chrome/browser/extensions/chrome_component_extension_resource_manager.cc
+@@ -33,6 +33,7 @@
+ #include "extensions/common/extension_id.h"
+ #include "pdf/buildflags.h"
+ #include "ui/base/resource/resource_bundle.h"
++#include "third_party/ublock/resources/grit/ublock_resources_map.h"
+ 
+ #if BUILDFLAG(IS_CHROMEOS)
+ #include "ash/keyboard/ui/resources/keyboard_resource_util.h"
+@@ -128,6 +129,7 @@
+           extensions_features::kApiContextualTasksPrivate)) {
+     AddComponentResourceEntries(kContextualTasksExtensionResources);
+   }
++  AddComponentResourceEntries(kUblockResources);
+ 
+ #if !BUILDFLAG(IS_ANDROID)
+   if (base::FeatureList::IsEnabled(features::kIndigo)) {
+--- a/chrome/chrome_paks.gni
++++ b/chrome/chrome_paks.gni
+@@ -150,6 +150,7 @@
+       "$root_gen_dir/third_party/blink/public/resources/blink_resources.pak",
+       "$root_gen_dir/third_party/blink/public/resources/inspector_overlay_resources.pak",
+       "$root_gen_dir/third_party/blink/public/strings/permission_element_generated_strings.pak",
++      "$root_gen_dir/third_party/ublock/resources/ublock_resources.pak",
+       "$root_gen_dir/ui/resources/ui_lottie_resources.pak",
+       "$root_gen_dir/ui/webui/resources/webui_resources.pak",
+     ]
+@@ -181,6 +182,7 @@
+       "//third_party/blink/public:devtools_inspector_resources",
+       "//third_party/blink/public:resources",
+       "//third_party/blink/public/strings:permission_element_generated_strings",
++      "//third_party/ublock",
+       "//ui/resources:ui_lottie_resources_grd",
+       "//ui/webui/resources",
+     ]
+--- /dev/null
++++ b/third_party/ublock/BUILD.gn
+@@ -0,0 +1,57 @@
++# Copyright 2025 The Helium Authors
++# Modifications Copyright 2026 The Tark Authors
++# You can use, redistribute, and/or modify this source code under
++# the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++import("//ui/webui/resources/tools/generate_grd.gni")
++import("//tools/grit/grit_rule.gni")
++
++file_list = "$target_gen_dir/files.json"
++compressed_assets = "$target_gen_dir/compressed_assets.grdp"
++generated_grd = "$target_gen_dir/ublock_resources.grd"
++
++action("generate_file_list") {
++    script = "generate_file_list.py"
++    args = [
++        rebase_path("."),
++        rebase_path(file_list),
++        rebase_path(compressed_assets),
++        rebase_path(root_gen_dir),
++    ]
++    inputs = [
++        "manifest.json",
++        "generate_file_list.py",
++        "//ui/webui/resources/tools/generate_grd.py",
++    ]
++    outputs = [ file_list, compressed_assets ]
++}
++
++generate_grd("ublock_grd") {
++    out_grd = generated_grd
++
++    grd_prefix = "ublock"
++    resource_path_prefix = "ublock"
++
++    manifest_files = [ file_list ]
++    grdp_files = [ compressed_assets ]
++    deps = [":generate_file_list"]
++}
++
++grit("ublock") {
++    source = generated_grd
++
++    # Required because the .grd is generated.
++    enable_input_discovery_for_gn_analyze = false
++    use_brotli = true
++
++    output_dir = "$target_gen_dir/resources"
++
++    outputs = [
++        "grit/ublock_resources.h",
++        "grit/ublock_resources_map.cc",
++        "grit/ublock_resources_map.h",
++        "ublock_resources.pak"
++    ]
++
++    deps = [":ublock_grd"]
++}
+--- /dev/null
++++ b/third_party/ublock/README.chromium
+@@ -0,0 +1,18 @@
++Name: uBlock Origin
++Short Name: ublock
++URL: https://github.com/gorhill/uBlock
++Version: 1.66.4
++License: GPL-3.0
++License File: LICENSE.txt
++Shipped: yes
++Security Critical: yes
++
++Description:
++uBlock Origin - An efficient blocker for Chromium and Firefox. Fast and lean.
++
++Local Modifications:
++Patched out remote URLs from assets.json, patched in public key into manifest
++
++Tark: upstream gorhill/uBlock release (downloads-tark.ini), unmodified except
++for a "key" added to manifest.json at build time (utils/ublock_key.py) so
++the built-in copy has a fixed id.
+--- /dev/null
++++ b/third_party/ublock/generate_file_list.py
+@@ -0,0 +1,54 @@
++# Copyright 2025 The Helium Authors
++# Modifications Copyright 2026 The Tark Authors
++# You can use, redistribute, and/or modify this source code under
++# the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++import json
++import os
++import sys
++import xml.etree.ElementTree as ET
++from fnmatch import fnmatchcase
++from sys import argv
++from pathlib import Path
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[2] /
++                       'ui/webui/resources/tools'))
++import generate_grd
++
++# Build metadata and WebAssembly sources are not extension runtime assets.
++EXCLUDED_FILES = (
++    'BUILD.gn',
++    'README.chromium',
++    'generate_file_list.py',
++    '*.wat',
++)
++
++ublock_src = Path(argv[1])
++out_file = argv[2]
++
++grdp_file = Path(argv[3])
++root_gen_dir = Path(argv[4])
++files = []
++compressed_assets = ET.Element('grit-part')
++
++for root, _, filenames in os.walk(ublock_src):
++  for filename in filenames:
++    path = Path(root) / filename
++    relative = path.relative_to(ublock_src).as_posix()
++    if any(fnmatchcase(relative, pattern) for pattern in EXCLUDED_FILES):
++      continue
++    if relative.startswith('assets/') and path.suffix in ('.txt', '.dat'):
++      file_path = '${root_gen_dir}/' + Path(
++          os.path.relpath(path, root_gen_dir)).as_posix()
++      entry = ET.fromstring(generate_grd._generate_include_row(
++          'ublock', relative, file_path, {}, 'ublock'))
++      entry.set('compress', 'gzip')
++      compressed_assets.append(entry)
++    else:
++      files.append(relative)
++
++with open(out_file, 'w') as f:
++  json.dump({'base_dir': ublock_src.as_posix(), 'files': files}, f)
++ET.indent(compressed_assets)
++ET.ElementTree(compressed_assets).write(grdp_file, encoding='utf-8',
++                                       xml_declaration=True)
+--- a/tools/gritsettings/resource_ids.spec
++++ b/tools/gritsettings/resource_ids.spec
+@@ -240,7 +240,7 @@
+     "META": {"sizes": {"includes": [500]}},
+     "includes": [2850],
+   },
+-  "<(SHARED_INTERMEDIATE_DIR)/chrome/browser/resources/ash/settings/resources.grd": {
++  "<(SHARED_INTERMEDIATE_DIR)/third_party/ublock/ublock_resources.grd": {
+     "META": {"sizes": {"includes": [1000],}},
+     "includes": [2860],
+   },
