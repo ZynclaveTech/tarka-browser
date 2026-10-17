@@ -27,6 +27,30 @@ REPLACEMENT_REGEXES = list(map(lambda line: (re.compile(line[0]), line[1]),
                                REPLACEMENT_REGEXES_STR))
 
 
+def _private(match):
+    """Tark calls Incognito "private" (spec 6.1). Capital P at the start of a
+    sentence and in title case ("Open Link in Private Window"), lower case in
+    running text ("New private window")."""
+    word = match.group(0)
+    if word[0] == 'i':
+        return 'private'
+    before = match.string[:match.start()]
+    after = match.string[match.end():]
+    starts_sentence = (not before.strip() or re.search(r'[.!?]\s+$', before)
+                       or re.search(r'\{\s*$', before))  # an ICU plural branch
+    title_case = re.match(r'\s+[A-Z]', after)
+    return 'Private' if starts_sentence or title_case else 'private'
+
+
+# English UI text only: translations keep their own word, which in several
+# languages is "incognito" inside a native phrase ("Navigazione in incognito").
+# URLs and identifiers (chrome://settings/incognito, IncognitoMode) are left
+# alone.
+ENGLISH_ONLY_REGEXES = [
+    (re.compile(r'(?<![\w/.:-])[Ii]ncognito(?![\w/.-])'), _private),
+]
+
+
 def add_grit_to_path(tree):
     """Inserts the grit/ folder into the module loading path."""
     grit_path = tree / 'tools' / 'grit'
@@ -68,10 +92,13 @@ def compute_fp(message):
     return grit.extern.tclib.GenerateMessageId(text, meaning)
 
 
-def replace_text(text):
-    """Replaces instances of Chrom(e | ium) with Tark in strings"""
+def replace_text(text, translation=False):
+    """Replaces instances of Chrom(e | ium) with Tark in strings, and in
+    English text (not translations) Incognito with private."""
     had_match = False
-    for regex, replacement in REPLACEMENT_REGEXES:
+    regexes = REPLACEMENT_REGEXES if translation else (
+        REPLACEMENT_REGEXES + ENGLISH_ONLY_REGEXES)
+    for regex, replacement in regexes:
         if regex.search(text):
             had_match = True
             text = regex.sub(replacement, text)
@@ -88,7 +115,7 @@ def should_skip_tail(elem):
         and elem.tail == 'Chromium'
 
 
-def replace_grit_message(msg):
+def replace_grit_message(msg, translation=False):
     """
     Replaces instances of Chrom(e | ium) with Tark
     in a <message> or <translation> element (and its children).
@@ -96,17 +123,17 @@ def replace_grit_message(msg):
     had_any_match = False
 
     if msg.text:
-        text, match = replace_text(msg.text)
+        text, match = replace_text(msg.text, translation)
         msg.text = text
         had_any_match |= match
 
     if msg.tail and not should_skip_tail(msg):
-        tail, match = replace_text(msg.tail)
+        tail, match = replace_text(msg.tail, translation)
         msg.tail = tail
         had_any_match |= match
 
     for child in msg:
-        had_any_match |= replace_grit_message(child)
+        had_any_match |= replace_grit_message(child, translation)
 
     return had_any_match
 
@@ -116,13 +143,16 @@ def replace_xtb_translation(msg, fp_map):
     Replaces instances of Chrom(e | ium) with Tark in a
     .xtb <translation>.
     """
-    if not replace_grit_message(msg):
-        return False
+    had_match = replace_grit_message(msg, translation=True)
 
+    # Tark: a translation follows its English message to the new id even when
+    # the translation itself had nothing to replace ("Neues Inkognitofenster"
+    # for "New private window"); otherwise the locale falls back to English.
     msg_id = msg.get('id')
     if msg_id in fp_map:
         msg.set('id', fp_map[msg_id])
-    return True
+        return True
+    return had_match
 
 
 def get_parser():
