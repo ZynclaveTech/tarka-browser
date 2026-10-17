@@ -1,0 +1,47 @@
+Tark: no Google spell-check service or dictionary downloads (spec 5.2).
+Removes "Ask Google for suggestions" from the context menu, makes the spelling
+service unavailable, and drops the dictionary download URL (macOS uses its own
+dictionaries; ungoogled-chromium already stopped the download itself).
+
+--- a/chrome/browser/renderer_context_menu/spelling_menu_observer.cc
++++ b/chrome/browser/renderer_context_menu/spelling_menu_observer.cc
+@@ -192,7 +192,7 @@
+   proxy_->AddMenuItem(
+       IDC_SPELLCHECK_ADD_TO_DICTIONARY,
+       l10n_util::GetStringUTF16(IDS_CONTENT_CONTEXT_ADD_TO_DICTIONARY));
+-  proxy_->AddSpellCheckServiceItem(integrate_spelling_service_.GetValue());
++  // Tark: no "Ask Google for suggestions" (spec 5.2).
+ }
+ 
+ #if BUILDFLAG(IS_WIN) && BUILDFLAG(USE_BROWSER_SPELLCHECKER)
+--- a/chrome/browser/spellchecker/spellcheck_hunspell_dictionary.cc
++++ b/chrome/browser/spellchecker/spellcheck_hunspell_dictionary.cc
+@@ -274,14 +274,9 @@
+     return GetDownloadUrlForTesting();
+   }
+ 
+-  std::string bdict_file = dictionary_file_.path.BaseName().MaybeAsASCII();
+-  DCHECK(!bdict_file.empty());
+-
+-  static const char kDownloadServerUrl[] =
+-      "https://redirector.gvt1.com/edgedl/chrome/dict/";
+-
+-  return GURL(std::string(kDownloadServerUrl) +
+-              base::ToLowerASCII(bdict_file));
++  // Tark: no dictionary downloads from Google (spec 5.2); macOS checks
++  // spelling with the system dictionaries.
++  return GURL();
+ }
+ 
+ void SpellcheckHunspellDictionary::DownloadDictionary(GURL url) {
+--- a/components/spellcheck/browser/spelling_service_client.cc
++++ b/components/spellcheck/browser/spelling_service_client.cc
+@@ -183,6 +183,8 @@
+ 
+ bool SpellingServiceClient::IsAvailable(content::BrowserContext* context,
+                                         ServiceType type) {
++  // Tark: Google's spelling service is never used (spec 5.2).
++  return false;
+   const PrefService* pref = user_prefs::UserPrefs::Get(context);
+   DCHECK(pref);
+   // If prefs don't allow spell checking, if enhanced spell check is disabled,
