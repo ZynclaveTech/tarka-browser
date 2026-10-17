@@ -3,7 +3,7 @@
 Tarka is a Chromium browser for macOS with no tracking and nothing extra:
 no telemetry, no account, no sync, no Google services unless you turn one
 on. It is built on [ungoogled-chromium](https://github.com/ungoogled-software/ungoogled-chromium),
-searches [Tarka](https://gettarka.com) by default, and looks like it.
+searches [Shodhya](https://shodhya.com) by default, and looks like it.
 Everything Tarka changes is a patch under `patches/` or a build-time
 substitution; the Chromium tree is never committed.
 
