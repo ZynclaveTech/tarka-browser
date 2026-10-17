@@ -157,3 +157,25 @@ skips Quilt's `.pc` backups, so after `--sub` on an existing dev tree, do not
 refresh older patches that touch `chrome/app/generated_resources.grd` or
 `chrome/app/settings_strings.grdp`; they would absorb the substitution. A clean
 `./dev.sh reset && ./dev.sh setup` has no such caveat.
+
+**Settings strings** (M3 Tasks 12–15). Tark's settings patches add their
+strings as new `IDS_SETTINGS_TARK_*` messages inside Tark's own block of
+`settings_strings.grdp` and point templates at the new keys; they never
+rename Chromium's messages in place. Patches apply before name
+substitution, so a hunk whose context is an upstream message would not
+match a clean tree if the dev tree's copy had been substituted, and a
+renamed upstream message would orphan its translations in every locale.
+The strings reach the page through `tark::AddTarkSettingsStrings()`
+(`chrome/browser/ui/webui/settings/tark_settings_strings.cc`).
+
+**Settings layout.** The home grid, the eight-item menu, Advanced's stacked
+sections and the section header are Tark elements under
+`chrome/browser/resources/settings/tark/` plus edits to `route.ts`,
+`settings_main` and `settings_menu`. One shared rule outside Settings:
+`cr_view_manager.css` lets views flow (instead of stacking at the top)
+under the custom property `--tark-view-flow: 1`, which only Advanced sets.
+
+**Checking pages without stealing focus.** Capture WebUI pages through
+DevTools (`Page.captureScreenshot` on a `--remote-debugging-port` build)
+rather than bringing the window forward; a frontmost capture can catch
+keystrokes meant for another app.
