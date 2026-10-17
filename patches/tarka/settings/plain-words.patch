@@ -1,0 +1,218 @@
+--- a/chrome/app/settings_strings.grdp
++++ b/chrome/app/settings_strings.grdp
+@@ -590,6 +590,27 @@
+     <message name="IDS_SETTINGS_TARK_STATUS_ADVANCED" desc="State shown under Advanced: what the section holds.">
+       Profile, system, reset
+     </message>
++    <message name="IDS_SETTINGS_TARK_BLOCK_ADS" desc="Label of the first Privacy settings toggle, which turns the built-in ad and tracker blocker on or off.">
++      Block ads and trackers
++    </message>
++    <message name="IDS_SETTINGS_TARK_BLOCK_ADS_DESC" desc="Description under the Block ads and trackers toggle: which blocker does it.">
++      uBlock Origin, built in
++    </message>
++    <message name="IDS_SETTINGS_TARK_CLEAR_DATA" desc="Label of the Privacy settings row that opens the dialog to delete history, cookies and cache.">
++      Clear history and site data
++    </message>
++    <message name="IDS_SETTINGS_TARK_CLEAR_DATA_DESC" desc="Description under Clear history and site data. Keeps the term 'browsing data' so settings search finds the row by its old name.">
++      Deletes browsing data: history, cookies, cache and more
++    </message>
++    <message name="IDS_SETTINGS_TARK_SEARCH_SUGGESTIONS" desc="Label of the toggle that sends what you type in the address bar to your search engine to get suggestions.">
++      Search suggestions
++    </message>
++    <message name="IDS_SETTINGS_TARK_SITE_PERMISSIONS" desc="Label of the Privacy settings row, and title of its page, where the user decides what each site may use (location, camera, pop-ups).">
++      Site permissions
++    </message>
++    <message name="IDS_SETTINGS_TARK_SITE_PERMISSIONS_DESC" desc="Description under Site permissions. Keeps the term 'site settings' so settings search finds the row by its old name.">
++      Site settings for location, camera, pop-ups and more
++    </message>
+     <message name="IDS_SETTINGS_TARK_HEADER_SEARCH" desc="Sentence under the Search section label: which engine searches from the address bar.">
+       <ph name="ENGINE">$1<ex>Shodhya</ex></ph> is your search engine
+     </message>
+@@ -627,15 +648,15 @@
+       The Chrome Web Store, when you install an extension from it and to check those extensions for updates (<ph name="HOSTS">$1<ex>store.example.com</ex></ph>)
+     </message>
+     <message name="IDS_SETTINGS_TARK_CONNECTS_UBLOCK" desc="Item in the list of services Tark connects to: the built-in ad blocker's filter lists. $1 is a list of host names.">
+-      uBlock Origin's filter-list sites, to keep its lists of ads and trackers current; switch uBlock Origin off on the Extensions page to stop this (<ph name="HOSTS">$1<ex>lists.example.com</ex></ph>)
++      uBlock Origin's filter-list sites, to keep its lists of ads and trackers current; turn off Block ads and trackers above to stop this (<ph name="HOSTS">$1<ex>lists.example.com</ex></ph>)
+     </message>
+-    <message name="IDS_SETTINGS_TARK_CONNECTS_WIDEVINE" desc="Item in the list of services Tark connects to: Google's DRM module server, used only if the user turns on protected content. $1 is a list of host names.">
+-      Google's Widevine servers, only if you turn on protected content above (<ph name="HOSTS">$1<ex>update.example.com</ex></ph>)
++    <message name="IDS_SETTINGS_TARK_CONNECTS_WIDEVINE" desc="Item in the list of services Tark connects to: Google's DRM module server, used only if the user turns on protected video. $1 is a list of host names.">
++      Google's Widevine servers, only if you turn on protected video above (<ph name="HOSTS">$1<ex>update.example.com</ex></ph>)
+     </message>
+     <message name="IDS_SETTINGS_TARK_WIDEVINE" desc="Label of the Privacy settings toggle that lets sites play DRM-protected video by downloading Google's Widevine module.">
+-      Protected content (Widevine)
++      Protected video (Netflix, Prime and others)
+     </message>
+-    <message name="IDS_SETTINGS_TARK_WIDEVINE_DESC" desc="Description under the protected content (Widevine) toggle.">
++    <message name="IDS_SETTINGS_TARK_WIDEVINE_DESC" desc="Description under the protected video (Widevine) toggle.">
+       Lets sites like Netflix play protected video. Turning it on downloads Google's Widevine module from <ph name="HOST">$1<ex>update.example.com</ex></ph> and keeps it updated.
+     </message>
+     <message name="IDS_SETTINGS_RELATED_SERVICES_TITLE" desc="Title of the section allowing the user to access related services from the 'Your saved info' page.">
+--- a/chrome/browser/resources/settings/privacy_page/privacy_page.html
++++ b/chrome/browser/resources/settings/privacy_page/privacy_page.html
+@@ -11,10 +11,17 @@
+           on-close="onPrivacyGuideDialogClosed_">
+       </settings-privacy-guide-dialog>
+     </template>
+-    <cr-link-row id="clearBrowsingData"
++    <!-- Tark: the built-in blocker, first on the page (spec 6.1). -->
++    <settings-toggle-button id="tarkUblockToggle"
++        pref="[[tarkUblockPref_]]" no-set-pref
++        label="$i18n{tarkBlockAds}"
++        sub-label="$i18n{tarkBlockAdsDesc}"
++        on-settings-boolean-control-change="onTarkUblockChange_">
++    </settings-toggle-button>
++    <cr-link-row id="clearBrowsingData" class="hr"
+         start-icon="cr:delete"
+-        label="$i18n{clearBrowsingData}"
+-        sub-label="$i18n{clearBrowsingDataDescription}"
++        label="$i18n{tarkClearData}"
++        sub-label="$i18n{tarkClearDataDesc}"
+         on-click="onClearBrowsingDataClick_"></cr-link-row>
+     <cr-link-row id="thirdPartyCookiesLinkRow"
+         start-icon="privacy:cookie"
+@@ -30,8 +37,8 @@
+         on-click="onSecurityPageClick_"
+         role-description="$i18n{subpageArrowRoleDescription}"></cr-link-row>
+     <cr-link-row id="siteSettingsLinkRow" start-icon="privacy:page-info"
+-        class="hr" label="$i18n{siteSettings}"
+-        sub-label="$i18n{siteSettingsSublabel}"
++        class="hr" label="$i18n{tarkSitePermissions}"
++        sub-label="$i18n{tarkSitePermissionsDesc}"
+         on-click="onSiteSettingsLinkRowClick_"
+         role-description="$i18n{subpageArrowRoleDescription}"></cr-link-row>
+     <!-- Tark: protected content is opt-in (spec 5.1). -->
+--- a/chrome/browser/resources/settings/privacy_page/privacy_page.ts
++++ b/chrome/browser/resources/settings/privacy_page/privacy_page.ts
+@@ -29,6 +29,7 @@
+ import {focusWithoutInk} from 'chrome://resources/js/focus_without_ink.js';
+ import {afterNextRender, PolymerElement} from 'chrome://resources/polymer/v3_0/polymer/polymer_bundled.min.js';
+ 
++import type {SettingsToggleButtonElement} from '../controls/settings_toggle_button.js';
+ import {loadTimeData} from '../i18n_setup.js';
+ import type {MetricsBrowserProxy} from '../metrics_browser_proxy.js';
+ import {MetricsBrowserProxyImpl, PrivacyGuideInteractions} from '../metrics_browser_proxy.js';
+@@ -37,6 +38,7 @@
+ import type {Route} from '../router.js';
+ import {SettingsViewMixin} from '../settings_page/settings_view_mixin.js';
+ import {CookieControlsMode} from '../site_settings/constants.js';
++import {UBLOCK_ORIGIN_ID} from '../tark/tark_status.js';
+ 
+ import {HatsBrowserProxyImpl, TrustSafetyInteraction} from './hats_browser_proxy.js';
+ import {PrivacyGuideAvailabilityMixin} from './privacy_guide/privacy_guide_availability_mixin.js';
+@@ -67,6 +69,19 @@
+     return {
+       showClearBrowsingDataDialog_: Boolean,
+       tarkConnectsExpanded_: {type: Boolean, value: false},
++
++      // Tark: uBlock Origin's enabled state, shown as a pref so the row is a
++      // settings-toggle-button like its neighbours.
++      tarkUblockPref_: {
++        type: Object,
++        value() {
++          return {
++            key: 'tark.ublock_enabled',
++            type: chrome.settingsPrivate.PrefType.BOOLEAN,
++            value: true,
++          };
++        },
++      },
+       showPrivacyGuideDialog_: Boolean,
+ 
+       // The label of the confirmation toast that is displayed after deletion
+@@ -103,6 +118,7 @@
+ 
+   declare private showClearBrowsingDataDialog_: boolean;
+   declare private tarkConnectsExpanded_: boolean;
++  declare private tarkUblockPref_: chrome.settingsPrivate.PrefObject<boolean>;
+   declare private showPrivacyGuideDialog_: boolean;
+   declare private dbdDeletionConfirmationToastLabel_: string;
+   declare private shouldShowDbdDeletionConfirmationToast_: boolean;
+@@ -112,6 +128,48 @@
+ 
+   private metricsBrowserProxy_: MetricsBrowserProxy =
+       MetricsBrowserProxyImpl.getInstance();
++  private tarkUblockChanged_ = (info: chrome.management.ExtensionInfo) => {
++    if (info.id === UBLOCK_ORIGIN_ID) {
++      this.setTarkUblockEnabled_(info.enabled);
++    }
++  };
++
++  override connectedCallback() {
++    super.connectedCallback();
++    chrome.management.onEnabled.addListener(this.tarkUblockChanged_);
++    chrome.management.onDisabled.addListener(this.tarkUblockChanged_);
++    this.refreshTarkUblock_();
++  }
++
++  override disconnectedCallback() {
++    super.disconnectedCallback();
++    chrome.management.onEnabled.removeListener(this.tarkUblockChanged_);
++    chrome.management.onDisabled.removeListener(this.tarkUblockChanged_);
++  }
++
++  private async refreshTarkUblock_() {
++    try {
++      const info = await chrome.management.get(UBLOCK_ORIGIN_ID);
++      this.setTarkUblockEnabled_(info.enabled);
++    } catch (e) {
++      // Not installed: nothing is blocking.
++      this.setTarkUblockEnabled_(false);
++    }
++  }
++
++  private setTarkUblockEnabled_(enabled: boolean) {
++    this.tarkUblockPref_ = {...this.tarkUblockPref_, value: enabled};
++  }
++
++  private async onTarkUblockChange_(e: CustomEvent<boolean>) {
++    const enabled = (e.target as SettingsToggleButtonElement).checked;
++    try {
++      await chrome.management.setEnabled(UBLOCK_ORIGIN_ID, enabled);
++    } finally {
++      // Show what is true now, whether or not the change went through.
++      this.refreshTarkUblock_();
++    }
++  }
+ 
+   override currentRouteChanged(newRoute: Route, oldRoute?: Route) {
+     super.currentRouteChanged(newRoute, oldRoute);
+--- a/chrome/browser/resources/settings/search_page/search_page.html.ts
++++ b/chrome/browser/resources/settings/search_page/search_page.html.ts
+@@ -75,7 +75,7 @@
+     <!-- Tark: the suggestions switch lives with the engine it sends to. -->
+     <settings-toggle-button id="searchSuggestToggle" class="hr"
+         pref-key="search.suggest_enabled"
+-        label="$i18n{searchSuggestPref}"
++        label="$i18n{tarkSearchSuggestions}"
+         sub-label="$i18n{searchSuggestPrefDesc}">
+     </settings-toggle-button>
+ 
+--- a/chrome/browser/resources/settings/site_settings/site_settings_page.html
++++ b/chrome/browser/resources/settings/site_settings/site_settings_page.html
+@@ -7,7 +7,7 @@
+       padding: 0 var(--cr-section-padding);
+     }
+   </style>
+-  <settings-subpage page-title="$i18n{siteSettings}"
++  <settings-subpage page-title="$i18n{tarkSitePermissions}"
+       learn-more-url="$i18n{exceptionsLearnMoreURL}"
+       route-path$="[[routePath]]">
+     <template is="dom-if" if="[[showUnusedSitePermissions_]]">
+--- a/chrome/browser/ui/webui/settings/tark_settings_strings.cc
++++ b/chrome/browser/ui/webui/settings/tark_settings_strings.cc
+@@ -32,6 +32,13 @@
+       {"tarkStatusExtensions", IDS_SETTINGS_TARK_STATUS_EXTENSIONS},
+       {"tarkStatusPasswords", IDS_SETTINGS_TARK_STATUS_PASSWORDS},
+       {"tarkStatusAdvanced", IDS_SETTINGS_TARK_STATUS_ADVANCED},
++      {"tarkBlockAds", IDS_SETTINGS_TARK_BLOCK_ADS},
++      {"tarkBlockAdsDesc", IDS_SETTINGS_TARK_BLOCK_ADS_DESC},
++      {"tarkClearData", IDS_SETTINGS_TARK_CLEAR_DATA},
++      {"tarkClearDataDesc", IDS_SETTINGS_TARK_CLEAR_DATA_DESC},
++      {"tarkSearchSuggestions", IDS_SETTINGS_TARK_SEARCH_SUGGESTIONS},
++      {"tarkSitePermissions", IDS_SETTINGS_TARK_SITE_PERMISSIONS},
++      {"tarkSitePermissionsDesc", IDS_SETTINGS_TARK_SITE_PERMISSIONS_DESC},
+       {"tarkHeaderSearch", IDS_SETTINGS_TARK_HEADER_SEARCH},
+       {"tarkHeaderPrivacy", IDS_SETTINGS_TARK_HEADER_PRIVACY},
+       {"tarkHeaderLookSystem", IDS_SETTINGS_TARK_HEADER_LOOK_SYSTEM},
