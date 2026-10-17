@@ -67,3 +67,59 @@ def test_a_translation_follows_its_changed_message():
     assert util.replace_xtb_translation(msg, {"111": "222"}) is True
     assert msg.get("id") == "222"
     assert msg.text == "Neues Inkognitofenster"
+
+
+# M3b Task 4: words outside .grd files, in string literals and HTML text only.
+LITERAL_CASES = [
+    ('inline constexpr char kName[] = "Chrome History page";',
+     'inline constexpr char kName[] = "Tark History page";'),
+    ('inline constexpr char kChromeRefreshName[] = "Refresh";',
+     'inline constexpr char kChromeRefreshName[] = "Refresh";'),
+    ('"Chrome Web Store"', '"Chrome Web Store"'),
+    ('"chrome://flags"', '"chrome://flags"'),
+    ('"Restore Pages? Chromium didn\'t shut down correctly"',
+     '"Restore Pages? Tark didn\'t shut down correctly"'),
+    ('"Shows \\"Chrome\\" here" Chrome "and Chromium"',
+     '"Shows \\"Tark\\" here" Chrome "and Tark"'),
+]
+
+
+def test_replace_string_literals():
+    for source, expected in LITERAL_CASES:
+        assert util.replace_string_literals(source) == expected, source
+
+
+HTML_CASES = [
+    ('<h1>List of Chrome URLs</h1>', '<h1>List of Tark URLs</h1>'),
+    ('<a href="chrome://settings" title="Chrome">Chrome settings</a>',
+     '<a href="chrome://settings" title="Chrome">Tark settings</a>'),
+    ('<div class="ChromeThing">${this.chromeUrl}</div>',
+     '<div class="ChromeThing">${this.chromeUrl}</div>'),
+]
+
+
+def test_replace_html_text():
+    for source, expected in HTML_CASES:
+        assert util.replace_html_text(source) == expected, source
+
+
+def test_literal_files_are_named():
+    import name_substitution
+    assert 'chrome/browser/flag_descriptions.h' in name_substitution.LITERAL_FILES
+    assert 'components/webui/chrome_urls/resources/app.html.ts' in name_substitution.LITERAL_FILES
+    assert 'chrome/browser/existing_switch_flag_entries.h' in name_substitution.LITERAL_FILES
+
+
+# Found previewing M3b Task 4: a Google product name and a hyphenated prose word.
+M3B_TEXT_CASES = [
+    ("Learn about connecting to Chrome DevTools MCP", "Learn about connecting to Chrome DevTools MCP"),
+    ("Inspect with Chrome Developer Tools", "Inspect with Tark Developer Tools"),
+    ("private and non-incognito tabs", "private and non-private tabs"),
+    ("--enable-incognito-themes", "--enable-incognito-themes"),
+]
+
+
+def test_m3b_text_cases():
+    for source, expected in M3B_TEXT_CASES:
+        got, _ = util.replace_text(source)
+        assert got == expected, f"{source!r}: {got!r} != {expected!r}"

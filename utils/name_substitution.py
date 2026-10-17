@@ -19,6 +19,20 @@ import name_substitution_utils as util
 
 IGNORE_DIRS = ['.pc', 'chromeos', 'remoting', 'ash', 'testdata']
 
+# Tark (M3b, spec 6.3): UI text that lives outside .grd files. C++ headers get
+# the rename inside string literals; HTML and Lit templates in text between
+# tags. Paths are relative to the source tree.
+LITERAL_FILES = [
+    'chrome/browser/flag_descriptions.h',
+    'chrome/browser/ungoogled_flag_entries.h',
+    'chrome/browser/existing_switch_flag_entries.h',
+    'components/webui/chrome_urls/resources/app.html.ts',
+    'components/webui/chrome_urls/resources/chrome_urls.html',
+    'chrome/browser/resources/inspect/inspect.html',
+    'chrome/browser/resources/accessibility/accessibility.html',
+    'components/net_log/resources/net_export.html',
+]
+
 
 def replacement_sanity():
     """Sanity check to ensure replacement regexes are working as intended"""
@@ -54,6 +68,9 @@ def parse_args():
     group.add_argument('--dry-run', action='store_true')
     parser.add_argument('-t', metavar='source_tree', type=Path, required=True)
     parser.add_argument('--workers', type=int, default=os.cpu_count())
+    parser.add_argument('--only-literals', action='store_true',
+                        help='Tark: only LITERAL_FILES, for a dev tree that '
+                        'already had its .grd files substituted')
 
     args = parser.parse_args()
 
@@ -148,6 +165,39 @@ def substitute_xtb_file(args):
     return ((arcname, original_text) if save_original else None, )
 
 
+def substitute_literal_file(path, tree, save_original, dry_run):
+    """The rename in one LITERAL_FILES entry. Returns ((arcname, original), {})
+    like substitute_grit_file when the file changed, else None."""
+    arcname = str(path.relative_to(tree))
+    with open(path, 'r', encoding='utf-8') as file:
+        original_text = file.read()
+    if path.suffix == '.h':
+        replaced = util.replace_string_literals(original_text)
+    else:
+        replaced = util.replace_html_text(original_text)
+    if replaced == original_text:
+        return None
+    print(f"Replaced strings in {arcname}")
+    if not dry_run:
+        with open(path, 'w', encoding='utf-8') as file:
+            file.write(replaced)
+    return ((arcname, original_text) if save_original else None, {})
+
+
+def substitute_literal_files(tree, save_original, dry_run):
+    """Runs substitute_literal_file over LITERAL_FILES; a missing file fails,
+    since it means a Chromium update moved UI text Tark renames."""
+    results = []
+    for relative in LITERAL_FILES:
+        path = tree / relative
+        if not path.is_file():
+            raise FileNotFoundError(f"literal file moved upstream: {relative}")
+        result = substitute_literal_file(path, tree, save_original, dry_run)
+        if result is not None:
+            results.append(result)
+    return results
+
+
 def do_unsubstitution(tree, tarpath):
     """Reverts name substitutions from the backup tarball"""
     with tarfile.open(str(tarpath), 'r:gz') as tar:
@@ -191,6 +241,8 @@ def do_substitution(tree, tarpath, workers, dry_run):
         results = executor.map(substitute_xtb_file, file_args)
         modified_files += [r for r in results if r is not None]
 
+    modified_files += substitute_literal_files(tree, save_original, dry_run)
+
     maybe_make_tarball(tarpath, map(lambda f: f[0], modified_files))
     print(f"Modified {len(modified_files)} files")
 
@@ -206,7 +258,13 @@ def main():
     if args.sub:
         if args.backup_path is not None and args.backup_path.exists():
             raise FileExistsError("unsub tarball already exists, aborting")
-        do_substitution(args.t, args.backup_path, args.workers, args.dry_run)
+        if args.only_literals:
+            modified = substitute_literal_files(args.t, args.backup_path is not None,
+                                                args.dry_run)
+            maybe_make_tarball(args.backup_path, [m[0] for m in modified])
+            print(f"Modified {len(modified)} files")
+        else:
+            do_substitution(args.t, args.backup_path, args.workers, args.dry_run)
     elif args.unsub and args.backup_path and not args.dry_run:
         do_unsubstitution(args.t, args.backup_path)
 

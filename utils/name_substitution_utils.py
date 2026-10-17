@@ -14,6 +14,7 @@ REPLACEMENT_REGEXES_STR = [
     (r'(\w+) Root Program', r'\1_unreplace Root Program'),
     (r'(\w+) Web( S|s)tore', r'\1_unreplace Web Store'),
     (r'(\w+) Remote Desktop', r'\1_unreplace Remote Desktop'),
+    (r'(\w+) DevTools MCP', r'\1_unreplace DevTools MCP'),
 
     # main replacement
     (r'(?:Google )?Chrom(e|ium)(?!\w)', r'Tark'),
@@ -48,6 +49,7 @@ def _private(match):
 # alone.
 ENGLISH_ONLY_REGEXES = [
     (re.compile(r'(?<![\w/.:-])[Ii]ncognito(?![\w/.-])'), _private),
+    (re.compile(r'\bnon-incognito\b'), 'non-private'),
 ]
 
 
@@ -104,6 +106,33 @@ def replace_text(text, translation=False):
             text = regex.sub(replacement, text)
 
     return text, had_match
+
+
+_STRING_LITERAL = re.compile(r'"((?:\\.|[^"\\\n])*)"')
+_HTML_TEXT = re.compile(r'>([^<>]*)<')
+_TEMPLATE_EXPRESSION = re.compile(r'(\$\{[^}]*\})')
+
+
+def replace_string_literals(text):
+    """Tark (M3b): the product rename inside double-quoted C++/TS string
+    literals only, for UI text kept outside .grd files (chrome://flags
+    descriptions). Identifiers such as kChromeRefreshName are untouched."""
+    return _STRING_LITERAL.sub(
+        lambda m: '"' + replace_text(m.group(1))[0] + '"', text)
+
+
+def _replace_text_node(match):
+    parts = _TEMPLATE_EXPRESSION.split(match.group(1))
+    # Odd indexes are ${...} expressions: code, left alone.
+    return '>' + ''.join(part if i % 2 else replace_text(part)[0]
+                         for i, part in enumerate(parts)) + '<'
+
+
+def replace_html_text(text):
+    """Tark (M3b): the product rename in HTML text between tags only; tag
+    names, attributes (href="chrome://...") and ${...} expressions in Lit
+    templates are untouched."""
+    return _HTML_TEXT.sub(_replace_text_node, text)
 
 
 def should_skip_tail(elem):
