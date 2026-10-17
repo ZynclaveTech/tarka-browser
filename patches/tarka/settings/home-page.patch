@@ -1,0 +1,749 @@
+--- a/chrome/app/settings_strings.grdp
++++ b/chrome/app/settings_strings.grdp
+@@ -530,6 +530,66 @@
+     <message name="IDS_SETTINGS_YOUR_SAVED_INFO_AUTOFILL_SETTINGS_DESCRIPTION" desc="Description of the Autofill settings section on 'Your saved info' page.">
+       Settings that affect how autofill works across different types of info
+     </message>
++    <message name="IDS_SETTINGS_TARK_SEARCH" desc="Name of the Search section of Tark's settings: the search engine and suggestions.">
++      Search
++    </message>
++    <message name="IDS_SETTINGS_TARK_PRIVACY" desc="Name of the Privacy section of Tark's settings.">
++      Privacy
++    </message>
++    <message name="IDS_SETTINGS_TARK_LOOK" desc="Name of the section of Tark's settings about how Tark looks (theme, toolbar, fonts).">
++      Look
++    </message>
++    <message name="IDS_SETTINGS_TARK_EXTENSIONS" desc="Name of the Extensions entry in Tark's settings.">
++      Extensions
++    </message>
++    <message name="IDS_SETTINGS_TARK_PASSWORDS" desc="Name of the Passwords section of Tark's settings (passwords, addresses, cards).">
++      Passwords
++    </message>
++    <message name="IDS_SETTINGS_TARK_DOWNLOADS" desc="Name of the Downloads section of Tark's settings.">
++      Downloads
++    </message>
++    <message name="IDS_SETTINGS_TARK_LANGUAGES" desc="Name of the Languages section of Tark's settings.">
++      Languages
++    </message>
++    <message name="IDS_SETTINGS_TARK_ADVANCED" desc="Name of the section of Tark's settings that gathers the less used ones (profile, startup, system, reset).">
++      Advanced
++    </message>
++    <message name="IDS_SETTINGS_TARK_HOME_LEAD" desc="First, bold part of the one line on the settings home page that says how Tark is set up.">
++      Private by default.
++    </message>
++    <message name="IDS_SETTINGS_TARK_HOME_REST" desc="End of the one line on the settings home page, after whether ads are blocked.">
++      no Google · no sync
++    </message>
++    <message name="IDS_SETTINGS_TARK_STATUS_ADS_BLOCKED" desc="State shown under Privacy on the settings home page when the built-in ad blocker is on.">
++      Ads blocked
++    </message>
++    <message name="IDS_SETTINGS_TARK_STATUS_ADS_NOT_BLOCKED" desc="State shown under Privacy on the settings home page when the built-in ad blocker is switched off.">
++      Ads not blocked
++    </message>
++    <message name="IDS_SETTINGS_TARK_STATUS_LOOK_SYSTEM" desc="State shown under Look when Tark's light or dark appearance follows the Mac's.">
++      Follows your Mac
++    </message>
++    <message name="IDS_SETTINGS_TARK_STATUS_LOOK_LIGHT" desc="State shown under Look when Tark is set to the light appearance.">
++      Always light
++    </message>
++    <message name="IDS_SETTINGS_TARK_STATUS_LOOK_DARK" desc="State shown under Look when Tark is set to the dark appearance.">
++      Always dark
++    </message>
++    <message name="IDS_SETTINGS_TARK_STATUS_NO_EXTENSIONS" desc="State shown under Extensions when none are installed.">
++      No extensions
++    </message>
++    <message name="IDS_SETTINGS_TARK_STATUS_ONE_EXTENSION" desc="State shown under Extensions when one extension is installed.">
++      1 installed
++    </message>
++    <message name="IDS_SETTINGS_TARK_STATUS_EXTENSIONS" desc="State shown under Extensions with the number installed.">
++      <ph name="COUNT">$1<ex>3</ex></ph> installed
++    </message>
++    <message name="IDS_SETTINGS_TARK_STATUS_PASSWORDS" desc="State shown under Passwords: they are stored only on this computer, with no sync.">
++      Saved on this Mac
++    </message>
++    <message name="IDS_SETTINGS_TARK_STATUS_ADVANCED" desc="State shown under Advanced: what the section holds.">
++      Profile, system, reset
++    </message>
+     <message name="IDS_SETTINGS_TARK_CONNECTS_TITLE" desc="Title of the Privacy settings row that lists every service Tark itself connects to.">
+       What Tark connects to
+     </message>
+--- a/chrome/browser/resources/settings/BUILD.gn
++++ b/chrome/browser/resources/settings/BUILD.gn
+@@ -407,6 +407,9 @@
+     "settings_page/searchable_view_container_mixin_lit.ts",
+     "settings_page/settings_section.html.ts",
+     "settings_page/settings_section.ts",
++    "tark/home_page.html.ts",
++    "tark/home_page.ts",
++    "tark/tark_status.ts",
+     "settings_page/settings_subpage.html.ts",
+     "settings_page/settings_subpage.ts",
+     "settings_page/settings_view_mixin_lit.ts",
+@@ -588,6 +591,7 @@
+     "search_page/search_page_index.css",
+     "search_page/site_shortcuts_page.css",
+     "settings_page/settings_section.css",
++    "tark/home_page.css",
+     "settings_page/settings_subpage.css",
+     "site_settings/clear_storage_dialog_shared.css",
+     "site_settings/site_settings_shared.css",
+--- a/chrome/browser/resources/settings/route.ts
++++ b/chrome/browser/resources/settings/route.ts
+@@ -306,6 +306,10 @@
+         loadTimeData.getString('performancePageTitle'));
+   }
+ 
++  // Tark: chrome://settings/ is its own view, the home page (spec 6.1).
++  // Set last so no child route inherits it.
++  r.BASIC.section = 'home';
++
+   return r as unknown as SettingsRoutes;
+ }
+ 
+--- a/chrome/browser/resources/settings/settings_main/settings_main.html
++++ b/chrome/browser/resources/settings/settings_main/settings_main.html
+@@ -50,6 +50,13 @@
+ 
+ <cr-view-manager id="switcher"
+     show-all$="[[shouldShowAll_(inSearchMode_, lastRoute_)]]">
++  <div slot="view" id="home">
++    <template is="dom-if" if="[[renderHome_(lastRoute_, inSearchMode_)]]"
++        restamp>
++      <settings-tark-home-page></settings-tark-home-page>
++    </template>
++  </div>
++
+   <template is="dom-if" if="[[showPage_(pageVisibility_.people)]]">
+     <div slot="view" id="people">
+       <template is="dom-if" if="[[renderPlugin_(
+--- a/chrome/browser/resources/settings/settings_main/settings_main.ts
++++ b/chrome/browser/resources/settings/settings_main/settings_main.ts
+@@ -35,7 +35,9 @@
+ import {loadTimeData} from '../i18n_setup.js';
+ import {pageVisibility} from '../page_visibility.js';
+ import type {PageVisibility} from '../page_visibility.js';
+-import {getTopLevelRoute, routes} from '../route.js';
++import '../tark/home_page.js';
++
++import {routes} from '../route.js';
+ import {RouteObserverMixin} from '../router.js';
+ import type {Route, SettingsRoutes} from '../router.js';
+ import {combineSearchResults} from '../search_settings.js';
+@@ -126,7 +128,6 @@
+   declare toolbarSpinnerActive: boolean;
+ 
+   private pendingViewSwitching_: PromiseResolver<void> = new PromiseResolver();
+-  private topLevelEquivalentRoute_: Route = getTopLevelRoute();
+   private currentQuery_: string = '';
+ 
+   override connectedCallback() {
+@@ -157,8 +158,8 @@
+       ensureLazyLoaded();
+     }
+ 
+-    const effectiveRoute =
+-        route === routes.BASIC ? this.topLevelEquivalentRoute_ : route;
++    // Tark: chrome://settings/ shows the home page, not the first section.
++    const effectiveRoute = route;
+ 
+     if (this.lastRoute_ === effectiveRoute) {
+       // Nothing to do.
+@@ -263,6 +264,10 @@
+         (!!this.lastRoute_ && route.contains(this.lastRoute_));
+   }
+ 
++  private renderHome_(): boolean {
++    return !this.inSearchMode_ && this.lastRoute_ === routes.BASIC;
++  }
++
+   private showPage_(visibility?: boolean): boolean {
+     return visibility !== false;
+   }
+--- a/chrome/browser/resources/settings/settings_ui/settings_ui.html
++++ b/chrome/browser/resources/settings/settings_ui/settings_ui.html
+@@ -51,6 +51,10 @@
+         top: 0;
+       }
+ 
++      :host([tark-home]) #left settings-menu {
++        visibility: hidden;
++      }
++
+       #left settings-menu {
+         max-height: 100%;
+         overflow: auto;
+--- a/chrome/browser/resources/settings/settings_ui/settings_ui.ts
++++ b/chrome/browser/resources/settings/settings_ui/settings_ui.ts
+@@ -193,6 +193,9 @@
+ 
+     const urlSearchQuery =
+         Router.getInstance().getQueryParameters().get('search') || '';
++    // Tark: the home page stands alone, without the side menu.
++    this.toggleAttribute(
++        'tark-home', route === routes.BASIC && urlSearchQuery === '');
+     if (urlSearchQuery === this.lastSearchQuery_) {
+       return;
+     }
+--- /dev/null
++++ b/chrome/browser/resources/settings/tark/home_page.css
+@@ -0,0 +1,98 @@
++/* Copyright 2026 The Tark Authors
++ * Use of this source code is governed by a BSD-style license that can be
++ * found in the LICENSE file. */
++
++/* #css_wrapper_metadata_start
++ * #type=style-lit
++ * #import=//resources/cr_elements/cr_shared_vars.css.js
++ * #css_wrapper_metadata_end */
++
++:host {
++  /* Amber as the tab-group yellow uses it: #ffb703 is too light on paper
++   * for an icon (1.7:1), #b78100 keeps 3:1. */
++  --tark-amber: #b78100;
++  display: block;
++  padding: 8px 0 24px;
++}
++
++@media (prefers-color-scheme: dark) {
++  :host {
++    --tark-amber: #ffc53d;
++  }
++}
++
++#summary {
++  align-items: center;
++  border: 1px solid var(--color-sys-primary, var(--cr-link-color));
++  border-radius: 14px;
++  color: var(--cr-secondary-text-color);
++  display: flex;
++  font-size: 13px;
++  gap: 10px;
++  margin-bottom: 16px;
++  padding: 10px 12px;
++}
++
++#summary b {
++  color: var(--cr-primary-text-color);
++  font-weight: 600;
++}
++
++#summaryIcon {
++  --iron-icon-fill-color: var(--color-sys-primary, var(--cr-link-color));
++  flex: none;
++}
++
++#tiles {
++  display: grid;
++  gap: 12px;
++  grid-template-columns: repeat(auto-fill, minmax(170px, 1fr));
++}
++
++.tile {
++  background: var(--color-sys-base-container-elevated,
++      var(--cr-card-background-color));
++  border: 1px solid var(--cr-separator-color);
++  border-radius: 14px;
++  color: var(--cr-primary-text-color);
++  display: flex;
++  flex-direction: column;
++  gap: 4px;
++  outline: none;
++  padding: 14px;
++  text-decoration: none;
++}
++
++.tile:hover,
++.tile:focus-visible {
++  border-color: var(--color-sys-primary, var(--cr-link-color));
++}
++
++.tile:focus-visible {
++  box-shadow: 0 0 0 1px var(--color-sys-primary, var(--cr-link-color));
++}
++
++.tile cr-icon {
++  --iron-icon-fill-color: var(--color-sys-primary, var(--cr-link-color));
++  margin-bottom: 4px;
++}
++
++/* Indigo, coral, amber in turn, as in the mockup. */
++.tile:nth-child(3n+2) cr-icon {
++  --iron-icon-fill-color: var(--tark-coral);
++}
++
++.tile:nth-child(3n) cr-icon {
++  --iron-icon-fill-color: var(--tark-amber);
++}
++
++.name {
++  font-size: 14px;
++  font-weight: 600;
++}
++
++.state {
++  color: var(--cr-secondary-text-color);
++  font-size: 12px;
++  min-height: 1.3em;
++}
+--- /dev/null
++++ b/chrome/browser/resources/settings/tark/home_page.html.ts
+@@ -0,0 +1,28 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++import {html} from 'chrome://resources/lit/v3_0/lit.rollup.js';
++
++import type {TarkHomePageElement} from './home_page.js';
++
++export function getHtml(this: TarkHomePageElement) {
++  // clang-format off
++  return html`<!--_html_template_start_-->
++<div id="summary">
++  <cr-icon icon="settings:security" id="summaryIcon"></cr-icon>
++  <span><b>$i18n{tarkHomeLead}</b> ${this.adsText_()} · $i18n{tarkHomeRest}</span>
++</div>
++<div id="tiles">
++  ${this.tiles_().map(tile => html`
++    <a class="tile" href="${tile.href}"
++        target="${tile.external ? '_blank' : '_self'}"
++        @click="${this.onTileClick_}">
++      <cr-icon icon="${tile.icon}"></cr-icon>
++      <span class="name">${tile.name}</span>
++      <span class="state">${tile.state}</span>
++    </a>`)}
++</div>
++<!--_html_template_end_-->`;
++  // clang-format on
++}
+--- /dev/null
++++ b/chrome/browser/resources/settings/tark/home_page.ts
+@@ -0,0 +1,151 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++/**
++ * @fileoverview 'settings-tark-home-page' is Tark's settings home
++ * (chrome://settings/, spec 6.1): one line saying how Tark is set up and
++ * eight tiles, each showing its section's state and opening it.
++ */
++
++import 'chrome://resources/cr_elements/cr_icon/cr_icon.js';
++import '../icons.html.js';
++
++import {I18nMixinLit} from 'chrome://resources/cr_elements/i18n_mixin_lit.js';
++import {CrLitElement} from 'chrome://resources/lit/v3_0/lit.rollup.js';
++
++import {Router} from '../router.js';
++import type {SettingsPlugin} from '../settings_main/settings_plugin.js';
++import {getTarkStatus, onTarkStatusChanged} from './tark_status.js';
++import type {TarkStatus} from './tark_status.js';
++
++import {getCss} from './home_page.css.js';
++import {getHtml} from './home_page.html.js';
++
++export interface TarkTile {
++  name: string;
++  icon: string;
++  href: string;
++  state: string;
++  external: boolean;
++}
++
++const TarkHomePageElementBase = I18nMixinLit(CrLitElement);
++
++export class TarkHomePageElement extends TarkHomePageElementBase implements
++    SettingsPlugin {
++  static get is() {
++    return 'settings-tark-home-page';
++  }
++
++  static override get styles() {
++    return getCss();
++  }
++
++  override render() {
++    return getHtml.bind(this)();
++  }
++
++  static override get properties() {
++    return {
++      status_: {type: Object},
++    };
++  }
++
++  protected accessor status_: TarkStatus|null = null;
++  private stopListening_: (() => void)|null = null;
++  private refreshes_: number = 0;
++
++  override connectedCallback() {
++    super.connectedCallback();
++    this.refresh_();
++    this.stopListening_ = onTarkStatusChanged(() => this.refresh_());
++  }
++
++  override disconnectedCallback() {
++    super.disconnectedCallback();
++    this.stopListening_?.();
++    this.stopListening_ = null;
++  }
++
++  private async refresh_() {
++    // Only the latest of overlapping refreshes lands.
++    const refresh = ++this.refreshes_;
++    const status = await getTarkStatus();
++    if (refresh === this.refreshes_) {
++      this.status_ = status;
++    }
++  }
++
++  protected adsText_(): string {
++    return this.i18n(
++        this.status_?.adsBlocked ? 'tarkStatusAdsBlocked' :
++                                   'tarkStatusAdsNotBlocked');
++  }
++
++  protected tiles_(): TarkTile[] {
++    const s = this.status_;
++    const look = s?.look === 'light' ? 'tarkStatusLookLight' :
++        s?.look === 'dark'           ? 'tarkStatusLookDark' :
++                                       'tarkStatusLookSystem';
++    const extensions = !s || s.extensions === 0 ?
++        this.i18n('tarkStatusNoExtensions') :
++        s.extensions === 1 ?
++        this.i18n('tarkStatusOneExtension') :
++        this.i18n('tarkStatusExtensions', String(s.extensions));
++    return [
++      {name: this.i18n('tarkSearch'), icon: 'settings:search',
++       href: '/search', state: s?.search || '', external: false},
++      {name: this.i18n('tarkPrivacy'), icon: 'settings:security',
++       href: '/privacy', state: s ? this.adsText_() : '', external: false},
++      {name: this.i18n('tarkLook'), icon: 'settings:palette',
++       href: '/appearance', state: this.i18n(look), external: false},
++      {name: this.i18n('tarkExtensions'), icon: 'settings:chrome-extension',
++       href: 'chrome://extensions', state: extensions, external: true},
++      {name: this.i18n('tarkPasswords'), icon: 'settings:password-manager',
++       href: '/autofill', state: this.i18n('tarkStatusPasswords'),
++       external: false},
++      {name: this.i18n('tarkDownloads'), icon: 'settings:download',
++       href: '/downloads', state: s?.downloads || '', external: false},
++      {name: this.i18n('tarkLanguages'), icon: 'settings:translate',
++       href: '/languages', state: s?.languages || '', external: false},
++      {name: this.i18n('tarkAdvanced'), icon: 'settings:build',
++       href: '/advancedSettings', state: this.i18n('tarkStatusAdvanced'),
++       external: false},
++    ];
++  }
++
++  // Opens a section in place, as the side menu does, instead of reloading.
++  // Extensions and modified clicks (new tab, new window) keep the link.
++  protected onTileClick_(e: MouseEvent) {
++    const href = (e.currentTarget as HTMLAnchorElement).getAttribute('href')!;
++    if (e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) {
++      return;
++    }
++    const route = Router.getInstance().getRouteForPath(href);
++    if (!route) {
++      return;
++    }
++    e.preventDefault();
++    Router.getInstance().navigateTo(
++        route, /* dynamicParams */ undefined, /* removeSearch */ true);
++  }
++
++  // SettingsPlugin: the home page itself is never a search result; the
++  // sections it opens are searched as usual.
++  searchContents(query: string) {
++    return Promise.resolve({
++      canceled: false,
++      matchCount: 0,
++      wasClearSearch: query === '',
++    });
++  }
++}
++
++declare global {
++  interface HTMLElementTagNameMap {
++    'settings-tark-home-page': TarkHomePageElement;
++  }
++}
++
++customElements.define(TarkHomePageElement.is, TarkHomePageElement);
+--- /dev/null
++++ b/chrome/browser/resources/settings/tark/tark_status.ts
+@@ -0,0 +1,151 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++/**
++ * @fileoverview How Tark is set up, for the settings home page and the
++ * section headers (spec 6.1). Read from the settings front end only: the
++ * search-engine list, chrome.management for uBlock Origin and extensions,
++ * the colour-scheme mode, and prefs through chrome.settingsPrivate.
++ */
++
++import {browserProxyFactory, ColorSchemeMode} from 'chrome://resources/cr_components/customize_color_scheme_mode/customize_color_scheme_mode.mojom-webui.js';
++import {addWebUiListener} from 'chrome://resources/js/cr.js';
++
++import {SearchEnginesBrowserProxyImpl} from '../search_page/search_engines_browser_proxy.js';
++
++/** The built-in uBlock Origin (components/tark_ublock/extension_ids.h). */
++export const UBLOCK_ORIGIN_ID = 'onfgfofhhcjllijjogonbaokaiokfgna';
++
++export type TarkLook = 'system'|'light'|'dark';
++
++export interface TarkStatus {
++  search: string;
++  adsBlocked: boolean;
++  look: TarkLook;
++  extensions: number;
++  downloads: string;
++  languages: string;
++}
++
++let look: TarkLook = 'system';
++let lookKnown: Promise<void>|null = null;
++const listeners: Array<() => void> = [];
++let listening = false;
++
++function notify() {
++  listeners.forEach(cb => cb());
++}
++
++function listen() {
++  if (listening) {
++    return;
++  }
++  listening = true;
++  addWebUiListener('search-engines-changed', notify);
++  chrome.settingsPrivate.onPrefsChanged.addListener(notify);
++  chrome.management.onInstalled.addListener(notify);
++  chrome.management.onUninstalled.addListener(notify);
++  chrome.management.onEnabled.addListener(notify);
++  chrome.management.onDisabled.addListener(notify);
++  document.addEventListener('visibilitychange', () => {
++    if (document.visibilityState === 'visible') {
++      notify();
++    }
++  });
++}
++
++function knowLook(): Promise<void> {
++  if (!lookKnown) {
++    lookKnown = new Promise(resolve => {
++      // Never hold the page back: without an answer, "Follows your Mac".
++      setTimeout(resolve, 1000);
++      const proxy = browserProxyFactory.getInstance();
++      proxy.callbackRouter.setColorSchemeMode.addListener(
++          (mode: ColorSchemeMode) => {
++            look = mode === ColorSchemeMode.kLight ? 'light' :
++                mode === ColorSchemeMode.kDark     ? 'dark' :
++                                                     'system';
++            resolve();
++            notify();
++          });
++      proxy.handler.initializeColorSchemeMode();
++    });
++  }
++  return lookKnown;
++}
++
++/** The last part of a folder path, "Downloads" for /Users/me/Downloads. */
++export function folderName(path: string): string {
++  const parts = path.split(/[\\/]/).filter(p => p);
++  return parts.length ? parts[parts.length - 1] : path;
++}
++
++/**
++ * Preferred languages, each in its own language, base languages once:
++ * "en-US,en,hi" becomes "English, हिन्दी".
++ */
++export function languageNames(acceptLanguages: string): string {
++  const seen = new Set<string>();
++  const names: string[] = [];
++  for (const code of acceptLanguages.split(',')) {
++    const base = code.trim().split('-')[0];
++    if (!base || seen.has(base)) {
++      continue;
++    }
++    seen.add(base);
++    let name = base;
++    try {
++      name = new Intl.DisplayNames([base], {type: 'language'}).of(base) || base;
++    } catch (e) {
++      // An unknown code shows as itself.
++    }
++    names.push(name.charAt(0).toLocaleUpperCase(base) + name.slice(1));
++  }
++  return names.join(', ');
++}
++
++async function prefValue(name: string): Promise<unknown> {
++  try {
++    return (await chrome.settingsPrivate.getPref(name)).value;
++  } catch (e) {
++    return undefined;
++  }
++}
++
++export async function getTarkStatus(): Promise<TarkStatus> {
++  listen();
++  const [engines, ublock, all, downloads, languages] = await Promise.all([
++    SearchEnginesBrowserProxyImpl.getInstance().getSearchEnginesList(),
++    chrome.management.get(UBLOCK_ORIGIN_ID).catch(() => null),
++    chrome.management.getAll().catch(() => []),
++    prefValue('download.default_directory'),
++    prefValue('intl.accept_languages'),
++    knowLook(),
++  ]);
++  const engine = engines.defaults.find(e => e.default) ||
++      engines.actives.find(e => e.default);
++  return {
++    search: engine ? engine.name : '',
++    adsBlocked: !!ublock && ublock.enabled,
++    look,
++    extensions: all.filter(e => e.type === 'extension').length,
++    downloads: folderName(typeof downloads === 'string' ? downloads : ''),
++    languages: languageNames(typeof languages === 'string' ? languages : ''),
++  };
++}
++
++/**
++ * Calls `cb` when anything the status shows may have changed. Returns the
++ * function that stops it.
++ */
++export function onTarkStatusChanged(cb: () => void): () => void {
++  listen();
++  listeners.push(cb);
++  return () => {
++    const i = listeners.indexOf(cb);
++    if (i !== -1) {
++      listeners.splice(i, 1);
++    }
++  };
++}
+--- a/chrome/browser/ui/webui/settings/BUILD.gn
++++ b/chrome/browser/ui/webui/settings/BUILD.gn
+@@ -180,6 +180,8 @@
+     "site_settings_helper.cc",
+     "tark_contacted_hosts.cc",
+     "tark_contacted_hosts.h",
++    "tark_settings_strings.cc",
++    "tark_settings_strings.h",
+   ]
+ 
+   deps = [
+--- a/chrome/browser/ui/webui/settings/settings_localized_strings_provider.cc
++++ b/chrome/browser/ui/webui/settings/settings_localized_strings_provider.cc
+@@ -70,6 +70,7 @@
+ #include "chrome/grit/generated_resources.h"
+ #include "components/autofill/content/browser/content_autofill_client.h"
+ #include "chrome/browser/ui/webui/settings/tark_contacted_hosts.h"
++#include "chrome/browser/ui/webui/settings/tark_settings_strings.h"
+ #include "components/component_updater/component_updater_url_constants.h"
+ #include "components/autofill/core/browser/data_manager/payments/payments_data_manager.h"
+ #include "components/autofill/core/browser/data_manager/personal_data_manager.h"
+@@ -4602,6 +4603,7 @@
+                          content::WebContents* web_contents) {
+   AddA11yStrings(html_source);
+   AddAboutStrings(html_source, profile);
++  tark::AddTarkSettingsStrings(html_source);
+   AddAiStrings(html_source);
+   AddAutofillStrings(html_source, profile, web_contents);
+   AddAppearanceStrings(html_source, profile);
+--- /dev/null
++++ b/chrome/browser/ui/webui/settings/tark_settings_strings.cc
+@@ -0,0 +1,39 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/ui/webui/settings/tark_settings_strings.h"
++
++#include "chrome/grit/generated_resources.h"
++#include "content/public/browser/web_ui_data_source.h"
++#include "ui/base/webui/web_ui_util.h"
++
++namespace tark {
++
++void AddTarkSettingsStrings(content::WebUIDataSource* html_source) {
++  static constexpr webui::LocalizedString kStrings[] = {
++      {"tarkSearch", IDS_SETTINGS_TARK_SEARCH},
++      {"tarkPrivacy", IDS_SETTINGS_TARK_PRIVACY},
++      {"tarkLook", IDS_SETTINGS_TARK_LOOK},
++      {"tarkExtensions", IDS_SETTINGS_TARK_EXTENSIONS},
++      {"tarkPasswords", IDS_SETTINGS_TARK_PASSWORDS},
++      {"tarkDownloads", IDS_SETTINGS_TARK_DOWNLOADS},
++      {"tarkLanguages", IDS_SETTINGS_TARK_LANGUAGES},
++      {"tarkAdvanced", IDS_SETTINGS_TARK_ADVANCED},
++      {"tarkHomeLead", IDS_SETTINGS_TARK_HOME_LEAD},
++      {"tarkHomeRest", IDS_SETTINGS_TARK_HOME_REST},
++      {"tarkStatusAdsBlocked", IDS_SETTINGS_TARK_STATUS_ADS_BLOCKED},
++      {"tarkStatusAdsNotBlocked", IDS_SETTINGS_TARK_STATUS_ADS_NOT_BLOCKED},
++      {"tarkStatusLookSystem", IDS_SETTINGS_TARK_STATUS_LOOK_SYSTEM},
++      {"tarkStatusLookLight", IDS_SETTINGS_TARK_STATUS_LOOK_LIGHT},
++      {"tarkStatusLookDark", IDS_SETTINGS_TARK_STATUS_LOOK_DARK},
++      {"tarkStatusNoExtensions", IDS_SETTINGS_TARK_STATUS_NO_EXTENSIONS},
++      {"tarkStatusOneExtension", IDS_SETTINGS_TARK_STATUS_ONE_EXTENSION},
++      {"tarkStatusExtensions", IDS_SETTINGS_TARK_STATUS_EXTENSIONS},
++      {"tarkStatusPasswords", IDS_SETTINGS_TARK_STATUS_PASSWORDS},
++      {"tarkStatusAdvanced", IDS_SETTINGS_TARK_STATUS_ADVANCED},
++  };
++  html_source->AddLocalizedStrings(kStrings);
++}
++
++}  // namespace tark
+--- /dev/null
++++ b/chrome/browser/ui/webui/settings/tark_settings_strings.h
+@@ -0,0 +1,19 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_WEBUI_SETTINGS_TARK_SETTINGS_STRINGS_H_
++#define CHROME_BROWSER_UI_WEBUI_SETTINGS_TARK_SETTINGS_STRINGS_H_
++
++namespace content {
++class WebUIDataSource;
++}
++
++namespace tark {
++
++// Strings for Tark's settings home page and section names (spec 6.1).
++void AddTarkSettingsStrings(content::WebUIDataSource* html_source);
++
++}  // namespace tark
++
++#endif  // CHROME_BROWSER_UI_WEBUI_SETTINGS_TARK_SETTINGS_STRINGS_H_
+--- a/tools/typescript/definitions/management.d.ts
++++ b/tools/typescript/definitions/management.d.ts
+@@ -20,7 +20,7 @@
+       // TODO(crbug.com/40173780): Define commented out fields as needed.
+       //disabledReason?: ExtensionDisabledReason;
+       isApp: boolean;
+-      //type: ExtensionType;
++      type: string;
+       appLaunchUrl?: string;
+       homepageUrl?: string;
+       updateUrl?: string;
+@@ -39,8 +39,18 @@
+     }
+ 
+     export function get(id: string): Promise<ExtensionInfo>;
++    export function getAll(): Promise<ExtensionInfo[]>;
+     export function uninstall(id: string, options?: UninstallOptions):
+         Promise<void>;
+     export function setEnabled(id: string, enabled: boolean): Promise<void>;
++
++    interface ManagementEvent<T> {
++      addListener(callback: (arg: T) => void): void;
++      removeListener(callback: (arg: T) => void): void;
++    }
++    export const onInstalled: ManagementEvent<ExtensionInfo>;
++    export const onUninstalled: ManagementEvent<string>;
++    export const onEnabled: ManagementEvent<ExtensionInfo>;
++    export const onDisabled: ManagementEvent<ExtensionInfo>;
+   }
+ }
