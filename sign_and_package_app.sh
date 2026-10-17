@@ -5,7 +5,7 @@ set -euo pipefail
 _root_dir="$(dirname "$(greadlink -f "$0")")"
 _src_dir="${CHROMIUM_SRC_DIR:-$_root_dir/build/src}"
 # Product name as set in chrome/app/theme/chromium/BRANDING by patches/tarka/core/branding.patch.
-_product_name="${TARKA_PRODUCT_NAME:-Tarka}"
+_product_name="${TARKA_PRODUCT_NAME:-Tark}"
 _bundle_id="${TARKA_BUNDLE_ID:-com.gettarka.Tarka}"
 _app="$_src_dir/out/Default/$_product_name.app"
 _framework="$_app/Contents/Frameworks/$_product_name Framework.framework"

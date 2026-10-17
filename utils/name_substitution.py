@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 
 # Copyright 2025 The Helium Authors
-# Modifications Copyright 2026 The Tarka Authors
+# Modifications Copyright 2026 The Tark Authors
 # You can use, redistribute, and/or modify this source code under
 # the terms of the GPL-3.0 license that can be found in the LICENSE.GPL-3.0 file.
-# Adapted for Tarka: product name is Tarka and the chrome:// scheme is left alone.
-"""Script to replace instances of Chrome/Chromium with Tarka"""
+# Adapted for Tark: product name is Tark and the chrome:// scheme is left alone.
+"""Script to replace instances of Chrome/Chromium with Tark"""
 
 from concurrent.futures import ProcessPoolExecutor
 from tarfile import TarInfo
@@ -23,16 +23,17 @@ IGNORE_DIRS = ['.pc', 'chromeos', 'remoting', 'ash', 'testdata']
 def replacement_sanity():
     """Sanity check to ensure replacement regexes are working as intended"""
     before_after = [
-        ('Chromium', 'Tarka'),
-        ('Google Chrome', 'Tarka'),
-        ('Chrome', 'Tarka'),
+        ('Chromium', 'Tark'),
+        ('Google Chrome', 'Tark'),
+        ('Chrome', 'Tark'),
         ('Chrome Web Store', 'Chrome Web Store'),
         ('Chromium Web Store', 'Chromium Web Store'),
         ('Chrome Root Program', 'Chrome Root Program'),
         ('Chrome Remote Desktop', 'Chrome Remote Desktop'),
         ('chrome://about', 'chrome://about'),
-        ('The Chromium Authors', 'The Tarka Authors'),
-        ('Chrome Google Chrome Chrome Chromium', 'Tarka Tarka Tarka Tarka'),
+        ('The Chromium Authors', 'The Tark Authors'),
+        ("Chromium's", "Tark's"),
+        ('Chrome Google Chrome Chrome Chromium', 'Tark Tark Tark Tark'),
     ]
 
     for source, expected in before_after:

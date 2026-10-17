@@ -1,4 +1,4 @@
-# Building Tarka
+# Building Tark
 
 ## Requirements
 
