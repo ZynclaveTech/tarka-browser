@@ -1,0 +1,186 @@
+--- a/chrome/browser/ui/color/BUILD.gn
++++ b/chrome/browser/ui/color/BUILD.gn
+@@ -45,6 +45,8 @@
+     "tab_group_color_ids.h",
+     "tab_strip_color_mixer.cc",
+     "tab_strip_color_mixer.h",
++    "tarka_color_mixer.cc",
++    "tarka_color_mixer.h",
+   ]
+ 
+   configs += [ "//build/config/compiler:wexit_time_destructors" ]
+--- a/chrome/browser/ui/color/chrome_color_mixers.cc
++++ b/chrome/browser/ui/color/chrome_color_mixers.cc
+@@ -23,6 +23,7 @@
+ #include "chrome/browser/ui/color/omnibox_color_mixer.h"
+ #include "chrome/browser/ui/color/product_specifications_color_mixer.h"
+ #include "chrome/browser/ui/color/tab_strip_color_mixer.h"
++#include "chrome/browser/ui/color/tarka_color_mixer.h"
+ #include "ui/color/color_provider_utils.h"
+ 
+ namespace {
+@@ -88,6 +89,10 @@
+   // Must be the last one in order to override other mixer colors.
+   AddNativeChromeColorMixer(provider, key);
+ 
++  // Tark: the palette wins over Chromium's mixers; a user's theme still wins
++  // over Tark's.
++  AddTarkaColorMixer(provider, key);
++
+   if (key.custom_theme) {
+     key.custom_theme->AddColorMixers(provider, key);
+   }
+--- /dev/null
++++ b/chrome/browser/ui/color/tarka_color_mixer.cc
+@@ -0,0 +1,127 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/ui/color/tarka_color_mixer.h"
++
++#include "chrome/browser/ui/color/chrome_color_id.h"
++#include "third_party/skia/include/core/SkColor.h"
++#include "ui/color/color_id.h"
++#include "ui/color/color_mixer.h"
++#include "ui/color/color_provider.h"
++#include "ui/color/color_recipe.h"
++#include "ui/color/color_transform.h"
++#include "ui/gfx/color_utils.h"
++
++namespace {
++
++struct Tokens {
++  SkColor paper, raised, ink, soft, faint, rule, indigo, coral, amber,
++      on_indigo;
++};
++
++// Verbatim from spec §6 (utils/tokens.py holds the same values for tests).
++constexpr Tokens kDark = {
++    SkColorSetRGB(0x12, 0x12, 0x1c), SkColorSetRGB(0x1b, 0x1b, 0x29),
++    SkColorSetRGB(0xf3, 0xef, 0xe6), SkColorSetRGB(0xbd, 0xb6, 0xa8),
++    SkColorSetRGB(0x94, 0x8d, 0x80), SkColorSetRGB(0x2c, 0x2c, 0x3d),
++    SkColorSetRGB(0x8f, 0x88, 0xff), SkColorSetRGB(0xff, 0x6b, 0x85),
++    SkColorSetRGB(0xff, 0xc5, 0x3d), SkColorSetRGB(0x12, 0x12, 0x1c)};
++constexpr Tokens kLight = {
++    SkColorSetRGB(0xf6, 0xf1, 0xe7), SkColorSetRGB(0xff, 0xfd, 0xf8),
++    SkColorSetRGB(0x14, 0x14, 0x2b), SkColorSetRGB(0x4d, 0x47, 0x3d),
++    SkColorSetRGB(0x6f, 0x67, 0x57), SkColorSetRGB(0xd9, 0xd0, 0xbf),
++    SkColorSetRGB(0x43, 0x38, 0xca), SkColorSetRGB(0xe6, 0x3e, 0x5c),
++    SkColorSetRGB(0xff, 0xb7, 0x03), SkColorSetRGB(0xff, 0xff, 0xff)};
++
++// Indigo at 14% over a surface: Tark's selection and hover wash.
++constexpr SkAlpha kWashAlpha = 0x24;
++
++}  // namespace
++
++void AddTarkaColorMixer(ui::ColorProvider* provider,
++                        const ui::ColorProviderKey& key) {
++  if (key.contrast_mode == ui::ColorProviderKey::ContrastMode::kHigh ||
++      key.forced_colors != ui::ColorProviderKey::ForcedColors::kNone) {
++    return;
++  }
++  const Tokens& t = key.color_mode == ui::ColorProviderKey::ColorMode::kDark
++                        ? kDark
++                        : kLight;
++  const SkColor wash = color_utils::AlphaBlend(t.indigo, t.raised, kWashAlpha);
++  ui::ColorMixer& mixer = provider->AddMixer();
++
++  // System tokens: WebUI pages read these as --color-sys-*.
++  mixer[ui::kColorSysBase] = {ui::ColorTransform(t.paper)};
++  mixer[ui::kColorSysHeader] = {ui::ColorTransform(t.paper)};
++  mixer[ui::kColorSysBaseContainer] = {ui::ColorTransform(t.raised)};
++  mixer[ui::kColorSysBaseContainerElevated] = {ui::ColorTransform(t.raised)};
++  mixer[ui::kColorSysSurface] = {ui::ColorTransform(t.paper)};
++  mixer[ui::kColorSysSurface1] = {ui::ColorTransform(t.raised)};
++  mixer[ui::kColorSysSurface2] = {ui::ColorTransform(t.raised)};
++  mixer[ui::kColorSysSurface3] = {ui::ColorTransform(t.raised)};
++  mixer[ui::kColorSysSurface4] = {ui::ColorTransform(t.raised)};
++  mixer[ui::kColorSysSurface5] = {ui::ColorTransform(t.raised)};
++  mixer[ui::kColorSysOnSurface] = {ui::ColorTransform(t.ink)};
++  mixer[ui::kColorSysOnSurfaceSubtle] = {ui::ColorTransform(t.soft)};
++  mixer[ui::kColorSysOnSurfaceSecondary] = {ui::ColorTransform(t.soft)};
++  mixer[ui::kColorSysDivider] = {ui::ColorTransform(t.rule)};
++  mixer[ui::kColorSysNeutralOutline] = {ui::ColorTransform(t.rule)};
++  mixer[ui::kColorSysTonalOutline] = {ui::ColorTransform(t.rule)};
++  mixer[ui::kColorSysPrimary] = {ui::ColorTransform(t.indigo)};
++  mixer[ui::kColorSysOnPrimary] = {ui::ColorTransform(t.on_indigo)};
++  mixer[ui::kColorSysTonalContainer] = {ui::ColorTransform(wash)};
++  mixer[ui::kColorSysOnTonalContainer] = {ui::ColorTransform(t.ink)};
++  mixer[ui::kColorFocusableBorderFocused] = {ui::ColorTransform(t.indigo)};
++
++  // Window frame, tab strip and toolbar: one flat paper surface, no seams.
++  mixer[ui::kColorFrameActive] = {ui::ColorTransform(t.paper)};
++  mixer[ui::kColorFrameInactive] = {ui::ColorTransform(t.paper)};
++  mixer[kColorToolbar] = {ui::ColorTransform(t.paper)};
++  mixer[kColorToolbarContentAreaSeparator] = {ui::ColorTransform(t.paper)};
++  mixer[kColorToolbarTopSeparatorFrameActive] = {ui::ColorTransform(t.paper)};
++  mixer[kColorToolbarTopSeparatorFrameInactive] = {ui::ColorTransform(t.paper)};
++  mixer[kColorToolbarButtonIcon] = {ui::ColorTransform(t.soft)};
++  mixer[kColorToolbarButtonIconInactive] = {ui::ColorTransform(t.rule)};
++  mixer[kColorBookmarkBarBackground] = {ui::ColorTransform(t.paper)};
++  mixer[kColorInfoBarBackground] = {ui::ColorTransform(t.raised)};
++
++  // Tabs: the active tab is a raised pill, inactive tabs are bare text.
++  // "Bare" is paper, not transparent: Chromium blends tab and address bar
++  // text for contrast against these colours and needs them opaque.
++  mixer[kColorTabBackgroundActiveFrameActive] = {ui::ColorTransform(t.raised)};
++  mixer[kColorTabBackgroundActiveFrameInactive] = {ui::ColorTransform(t.raised)};
++  mixer[kColorTabBackgroundInactiveFrameActive] = {ui::ColorTransform(t.paper)};
++  mixer[kColorTabBackgroundInactiveFrameInactive] = {ui::ColorTransform(t.paper)};
++  mixer[kColorTabForegroundActiveFrameActive] = {ui::ColorTransform(t.ink)};
++  mixer[kColorTabForegroundActiveFrameInactive] = {ui::ColorTransform(t.ink)};
++  mixer[kColorTabForegroundInactiveFrameActive] = {ui::ColorTransform(t.faint)};
++  mixer[kColorTabForegroundInactiveFrameInactive] = {ui::ColorTransform(t.faint)};
++  mixer[kColorTabStrokeFrameActive] = {ui::ColorTransform(t.rule)};
++  mixer[kColorTabStrokeFrameInactive] = {ui::ColorTransform(t.rule)};
++
++  // Address bar: bare at rest, a raised pill on hover.
++  mixer[kColorLocationBarBackground] = {ui::ColorTransform(t.paper)};
++  mixer[kColorLocationBarBackgroundHovered] = {ui::ColorTransform(t.raised)};
++  mixer[kColorLocationBarBorder] = {ui::ColorTransform(t.paper)};
++  mixer[kColorLocationBarBorderOpaque] = {ui::ColorTransform(t.paper)};
++  mixer[kColorOmniboxText] = {ui::ColorTransform(t.ink)};
++  mixer[kColorOmniboxTextDimmed] = {ui::ColorTransform(t.soft)};
++
++  // Suggestions: the site's suggestion box.
++  mixer[kColorOmniboxResultsBackground] = {ui::ColorTransform(t.raised)};
++  mixer[kColorOmniboxResultsBackgroundHovered] = {ui::ColorTransform(wash)};
++  mixer[kColorOmniboxResultsBackgroundSelected] = {ui::ColorTransform(wash)};
++  mixer[kColorOmniboxResultsTextSelected] = {ui::ColorTransform(t.ink)};
++  mixer[kColorOmniboxResultsTextDimmed] = {ui::ColorTransform(t.soft)};
++  mixer[kColorOmniboxResultsTextDimmedSelected] = {ui::ColorTransform(t.soft)};
++  mixer[kColorOmniboxResultsUrl] = {ui::ColorTransform(t.indigo)};
++  mixer[kColorOmniboxResultsUrlSelected] = {ui::ColorTransform(t.indigo)};
++
++  // Menus.
++  mixer[ui::kColorMenuBackground] = {ui::ColorTransform(t.raised)};
++  mixer[ui::kColorMenuItemBackgroundSelected] = {ui::ColorTransform(wash)};
++  mixer[ui::kColorMenuItemForeground] = {ui::ColorTransform(t.ink)};
++  mixer[ui::kColorMenuItemForegroundSecondary] = {ui::ColorTransform(t.faint)};
++  mixer[ui::kColorMenuSeparator] = {ui::ColorTransform(t.rule)};
++}
+--- /dev/null
++++ b/chrome/browser/ui/color/tarka_color_mixer.h
+@@ -0,0 +1,21 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_COLOR_TARKA_COLOR_MIXER_H_
++#define CHROME_BROWSER_UI_COLOR_TARKA_COLOR_MIXER_H_
++
++#include "ui/color/color_provider_key.h"
++
++namespace ui {
++class ColorProvider;
++}
++
++// Tark's palette (spec §6, from shodhya.com's paper.css), in the dark or the
++// light column as the device appearance says. Added after Chromium's own
++// mixers so it wins, and before a user's custom theme so a theme still can.
++// Skipped in increased-contrast and forced-colours modes.
++void AddTarkaColorMixer(ui::ColorProvider* provider,
++                        const ui::ColorProviderKey& key);
++
++#endif  // CHROME_BROWSER_UI_COLOR_TARKA_COLOR_MIXER_H_
