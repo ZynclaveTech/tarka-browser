@@ -1,0 +1,232 @@
+--- a/chrome/browser/ui/bookmarks/bookmark_utils.cc
++++ b/chrome/browser/ui/bookmarks/bookmark_utils.cc
+@@ -12,6 +12,7 @@
+ #include "base/memory/raw_ptr.h"
+ #include "base/notreached.h"
+ #include "base/strings/utf_string_conversions.h"
++#include "base/strings/string_util.h"
+ #include "build/build_config.h"
+ #include "chrome/browser/bookmarks/bookmark_merged_surface_service.h"
+ #include "chrome/browser/bookmarks/bookmark_merged_surface_service_factory.h"
+@@ -49,6 +50,7 @@
+ 
+ #if defined(TOOLKIT_VIEWS)
+ #include "chrome/grit/theme_resources.h"
++#include "content/public/common/url_constants.h"
+ #include "ui/base/resource/resource_bundle.h"
+ #include "ui/base/themed_vector_icon.h"
+ #include "ui/color/color_id.h"
+@@ -270,8 +272,16 @@
+     format_types &= ~url_formatter::kFormatUrlOmitHTTP;
+   }
+ 
+-  return url_formatter::FormatUrl(url, format_types, base::UnescapeRule::SPACES,
+-                                  nullptr, nullptr, nullptr);
++  std::u16string text = url_formatter::FormatUrl(
++      url, format_types, base::UnescapeRule::SPACES, nullptr, nullptr, nullptr);
++  // Tark: internal pages read tark://x (spec 6.3); saving re-parses the text
++  // with FixupURL(), which maps tark:// back to chrome://.
++  static constexpr std::u16string_view kChromePrefix = u"chrome://";
++  if (url.SchemeIs(content::kChromeUIScheme) &&
++      base::StartsWith(text, kChromePrefix)) {
++    text.replace(0, kChromePrefix.size(), u"tark://");
++  }
++  return text;
+ }
+ 
+ bool IsAppsShortcutEnabled(Profile* profile) {
+--- a/chrome/browser/ui/toolbar/chrome_location_bar_model_delegate.cc
++++ b/chrome/browser/ui/toolbar/chrome_location_bar_model_delegate.cc
+@@ -6,6 +6,7 @@
+ 
+ #include "base/check.h"
+ #include "base/feature_list.h"
++#include "base/strings/string_util.h"
+ #include "build/build_config.h"
+ #include "chrome/browser/autocomplete/autocomplete_classifier_factory.h"
+ #include "chrome/browser/autocomplete/chrome_autocomplete_scheme_classifier.h"
+@@ -64,9 +65,18 @@
+ ChromeLocationBarModelDelegate::FormattedStringWithEquivalentMeaning(
+     const GURL& url,
+     const std::u16string& formatted_url) const {
+-  return AutocompleteInput::FormattedStringWithEquivalentMeaning(
++  std::u16string text = AutocompleteInput::FormattedStringWithEquivalentMeaning(
+       url, formatted_url, ChromeAutocompleteSchemeClassifier(GetProfile()),
+       nullptr);
++  // Tark: internal pages read tark://x (spec 6.3). Only the text changes;
++  // GetURL() stays chrome://, so the chip, icon and page info are unchanged,
++  // and the URL fixer maps tark:// back when the text is edited and entered.
++  static constexpr std::u16string_view kChromePrefix = u"chrome://";
++  if (url.SchemeIs(content::kChromeUIScheme) &&
++      base::StartsWith(text, kChromePrefix)) {
++    text.replace(0, kChromePrefix.size(), u"tark://");
++  }
++  return text;
+ }
+ 
+ bool ChromeLocationBarModelDelegate::GetURL(GURL* url) const {
+--- a/chrome/browser/ui/views/tabs/hovercard/hover_card_anchor_target.cc
++++ b/chrome/browser/ui/views/tabs/hovercard/hover_card_anchor_target.cc
+@@ -3,6 +3,7 @@
+ // found in the LICENSE file.
+ 
+ #include "chrome/browser/ui/views/tabs/hovercard/hover_card_anchor_target.h"
++#include "base/strings/string_util.h"
+ 
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/performance_controls/tab_resource_usage_tab_helper.h"
+@@ -17,6 +18,7 @@
+ #include "components/strings/grit/components_strings.h"
+ #include "components/tabs/public/tab_group.h"
+ #include "components/url_formatter/url_formatter.h"
++#include "content/public/common/url_constants.h"
+ #include "ui/base/interaction/element_tracker.h"
+ #include "ui/base/l10n/l10n_util.h"
+ #include "ui/views/view.h"
+@@ -118,6 +120,12 @@
+               url_formatter::kFormatUrlOmitTrivialSubdomains |
+               url_formatter::kFormatUrlTrimAfterHost,
+           base::UnescapeRule::NORMAL, nullptr, nullptr, nullptr);
++      // Tark: internal pages read tark://x (spec 6.3).
++      static constexpr std::u16string_view kChromePrefix = u"chrome://";
++      if (domain_url.SchemeIs(content::kChromeUIScheme) &&
++          base::StartsWith(domain, kChromePrefix)) {
++        domain.replace(0, kChromePrefix.size(), u"tark://");
++      }
+     }
+   }
+ 
+--- a/components/omnibox/browser/builtin_provider.cc
++++ b/components/omnibox/browser/builtin_provider.cc
+@@ -52,11 +52,20 @@
+   const std::u16string embedderAbout = base::StrCat(
+       {base::UTF8ToUTF16(client_->GetEmbedderRepresentationOfAboutScheme()),
+        url::kStandardSchemeSeparator16});
++  // Tark: input that starts with tark or tarka gets suggestions in that
++  // scheme (tark://settings); AddBuiltinMatch() opens the chrome:// page.
++  std::u16string displayAbout = embedderAbout;
++  if (base::StartsWith(text, u"tarka", base::CompareCase::INSENSITIVE_ASCII)) {
++    displayAbout = u"tarka://";
++  } else if (base::StartsWith(text, u"tark",
++                              base::CompareCase::INSENSITIVE_ASCII)) {
++    displayAbout = u"tark://";
++  }
+ 
+   const int kUrl = ACMatchClassification::URL;
+   const int kMatch = kUrl | ACMatchClassification::MATCH;
+ 
+-  bool starting_about = base::StartsWith(embedderAbout, text,
++  bool starting_about = base::StartsWith(displayAbout, text,
+                                          base::CompareCase::INSENSITIVE_ASCII);
+   if (starting_about ||
+       base::StartsWith(kAbout, text, base::CompareCase::INSENSITIVE_ASCII)) {
+@@ -71,8 +80,11 @@
+     ACMatchClassifications styles =
+         ClassifyTermMatches(style_matches, std::string::npos, kMatch, kUrl);
+     // Include some common builtin URLs as the user types the scheme.
+-    for (const std::u16string& url :
+-         client_->GetBuiltinsToProvideAsUserTypes()) {
++    for (std::u16string url : client_->GetBuiltinsToProvideAsUserTypes()) {
++      if (displayAbout != embedderAbout &&
++          base::StartsWith(url, embedderAbout)) {
++        url.replace(0, embedderAbout.length(), displayAbout);
++      }
+       AddBuiltinMatch(url, std::u16string(), styles);
+     }
+   } else {
+@@ -105,13 +117,13 @@
+       std::u16string host_and_path =
+           base::UTF8ToUTF16(url.GetHost() + url.GetPath());
+       base::TrimString(host_and_path, u"/", &host_and_path);
+-      size_t match_length = embedderAbout.length() + host_and_path.length();
++      size_t match_length = displayAbout.length() + host_and_path.length();
+       for (Builtins::const_iterator i(builtins_.begin());
+            (i != builtins_.end()) && (matches_.size() < provider_max_matches_);
+            ++i) {
+         if (base::StartsWith(*i, host_and_path,
+                              base::CompareCase::INSENSITIVE_ASCII)) {
+-          std::u16string match_string = embedderAbout + *i;
++          std::u16string match_string = displayAbout + *i;
+           TermMatches style_matches = {{0, 0, match_length}};
+           ACMatchClassifications styles = ClassifyTermMatches(
+               style_matches, match_string.length(), kMatch, kUrl);
+@@ -164,7 +176,9 @@
+   match.suggest_type = omnibox::TYPE_NAVIGATION;
+   match.fill_into_edit = match_string;
+   match.inline_autocompletion = inline_completion;
+-  match.destination_url = GURL(match_string);
++  // Tark: the fixer opens tark://x as chrome://x and leaves other
++  // builtins (chrome://, about:blank) as they are.
++  match.destination_url = url_formatter::FixupURL(base::UTF16ToUTF8(match_string));
+   match.contents = match_string;
+   match.contents_class = styles;
+   matches_.push_back(match);
+--- a/components/omnibox/browser/omnibox_text_util.cc
++++ b/components/omnibox/browser/omnibox_text_util.cc
+@@ -180,6 +180,17 @@
+     }
+ 
+     *text = base::UTF8ToUTF16(url_from_text->spec());
++    // Tark: an internal page copies as tark://x, as the address bar shows it
++    // (spec 6.3); tark:// is a standard scheme, so the URL keeps its parts.
++    if (url_from_text->SchemeIs("chrome")) {
++      GURL::Replacements replacements;
++      replacements.SetSchemeStr("tark");
++      GURL tark_url = url_from_text->ReplaceComponents(replacements);
++      if (tark_url.is_valid()) {
++        *url_from_text = tark_url;
++        *text = base::UTF8ToUTF16(tark_url.spec());
++      }
++    }
+     return;
+   }
+ 
+--- a/components/webui/chrome_urls/resources/app.html.ts
++++ b/components/webui/chrome_urls/resources/app.html.ts
+@@ -13,10 +13,10 @@
+ <ul>
+   ${this.webuiUrlInfos_.map(info => html`
+     ${this.isChromeUrlsUrl_(info) ?
+-      html`<li><a href="#">chrome://chrome-urls</a></li>` :
++      html`<li><a href="#">${this.displayUrl_(info.url)}</a></li>` :
+       html`${info.enabled ?
+-        html`<li><a href="${info.url}">${info.url}</a></li>` :
+-        html`<li>${info.url}</li>`
++        html`<li><a href="${info.url}">${this.displayUrl_(info.url)}</a></li>` :
++        html`<li>${this.displayUrl_(info.url)}</li>`
+       }`
+     }`)}
+ </ul>
+@@ -33,8 +33,8 @@
+   <ul>
+     ${this.internalUrlInfos_.map(info => html`
+       ${this.isInternalUiEnabled_(info) ?
+-        html`<li><a href="${info.url}">${info.url}</a></li>` :
+-        html`<li>${info.url}</li>`
++        html`<li><a href="${info.url}">${this.displayUrl_(info.url)}</a></li>` :
++        html`<li>${this.displayUrl_(info.url)}</li>`
+       }`)}
+   </ul>` : ''}
+ ${this.commandUrls_.length ? html`
+@@ -45,6 +45,6 @@
+     address bar if you need them.
+   </p>
+   <ul>
+-    ${this.commandUrls_.map(url => html`<li>${url}</li>`)}
++    ${this.commandUrls_.map(url => html`<li>${this.displayUrl_(url)}</li>`)}
+   </ul>` : ''}`;
+ }
+--- a/components/webui/chrome_urls/resources/app.ts
++++ b/components/webui/chrome_urls/resources/app.ts
+@@ -175,6 +175,11 @@
+     return info.enabled && this.internalUisEnabled_;
+   }
+ 
++  // Tark: addresses read tark://x (spec 6.3); links keep chrome://.
++  protected displayUrl_(url: string): string {
++    return url.replace(/^chrome:\/\//, 'tark://');
++  }
++
+   protected isChromeUrlsUrl_(info: WebuiUrlInfo): boolean {
+     return info.url === 'chrome://chrome-urls';
+   }
