@@ -1,4 +1,4 @@
-# How Tarka changes Chromium
+# How Shodhya changes Chromium
 
 Nothing in the Chromium tree is committed. `./dev.sh setup` (and `build.sh`)
 rebuild `build/src` from the tarball in this order:
@@ -7,9 +7,9 @@ rebuild `build/src` from the tarball in this order:
 2. `devutils/update_patches.sh merge` prepends ungoogled-chromium's patch
    series to ours and writes `patches/series.merged`.
 3. `quilt push -a` applies that merged series: ungoogled-chromium's patches,
-   then the macOS ones, then Tarka's (`patches/tarka/…`, `patches/borrowed/…`).
+   then the macOS ones, then Shodhya's (`patches/tarka/…`, `patches/borrowed/…`).
 4. `domain_substitution.py` rewrites Google hostnames in the tree.
-5. `utils/name_substitution.py --sub` renames Chromium/Chrome to Tarka in
+5. `utils/name_substitution.py --sub` renames Chromium/Chrome to Shodhya in
    `.grd`, `.grdp` and `.xtb` string files, keeping a backup tarball at
    `build/namesubs.tar` so it can be undone (`--unsub`). It leaves
    `chrome://` URLs and the names of Google's own services alone.
@@ -51,5 +51,5 @@ smoke test.
 Name substitution runs after the patches, so before `quilt refresh` or
 `quilt pop` on any patch that touches a `.grd`, `.grdp` or `.xtb` file,
 run `python3 utils/name_substitution.py --unsub -t build/src --backup-path
-build/namesubs.tar`, and `--sub` again afterwards. Keep Tarka patches off
+build/namesubs.tar`, and `--sub` again afterwards. Keep Shodhya patches off
 string files where you can.
