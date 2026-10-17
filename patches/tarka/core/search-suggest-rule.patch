@@ -71,7 +71,7 @@ Policy- or extension-controlled values are left alone.
      "//components/version_info",
 --- /dev/null
 +++ b/chrome/browser/search_engines/tark_suggest_rule.cc
-@@ -0,0 +1,93 @@
+@@ -0,0 +1,106 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -96,9 +96,10 @@ Policy- or extension-controlled values are left alone.
 +                 base::BindRepeating(&SuggestRule::OnSuggestPrefChanged,
 +                                     base::Unretained(this)));
 +  observation_.Observe(template_url_service_);
-+  if (template_url_service_->loaded()) {
-+    Apply();
-+  } else {
++  // Runs before the address bar can send anything: before the engine list
++  // loads it can only turn suggestions off, using the engine saved in prefs.
++  Apply();
++  if (!template_url_service_->loaded()) {
 +    on_loaded_ = template_url_service_->RegisterOnLoadedCallback(
 +        base::BindOnce(&SuggestRule::Apply, base::Unretained(this)));
 +    template_url_service_->Load();
@@ -131,9 +132,13 @@ Policy- or extension-controlled values are left alone.
 +}
 +
 +void SuggestRule::Apply() {
-+  if (!template_url_service_ || !template_url_service_->loaded()) {
++  if (!template_url_service_) {
 +    return;
 +  }
++  // Until the engine list loads, the default engine comes from prefs and may
++  // not be final (an extension's engine, say), so only the private direction
++  // is allowed: turning suggestions off.
++  const bool loaded = template_url_service_->loaded();
 +  const PrefService::Preference* suggest =
 +      prefs_->FindPreference(prefs::kSearchSuggestEnabled);
 +  // A policy or an extension that sets suggestions decides, not the rule.
@@ -149,7 +154,7 @@ Policy- or extension-controlled values are left alone.
 +  if (!shodhya && suggest->IsDefaultValue()) {
 +    prefs_->SetBoolean(prefs::kSearchSuggestEnabled, false);
 +    prefs_->SetBoolean(kSuggestOffByRule, true);
-+  } else if (shodhya && prefs_->GetBoolean(kSuggestOffByRule)) {
++  } else if (loaded && shodhya && prefs_->GetBoolean(kSuggestOffByRule)) {
 +    prefs_->ClearPref(prefs::kSearchSuggestEnabled);
 +    prefs_->ClearPref(kSuggestOffByRule);
 +  }
@@ -162,6 +167,14 @@ Policy- or extension-controlled values are left alone.
 +  // The user (or sync, or a policy) chose; the rule's write is no longer
 +  // its own to undo.
 +  prefs_->ClearPref(kSuggestOffByRule);
++  // A change back to the default value is nobody's choice (a reset, a cleared
++  // pref): judge it again, so it cannot turn suggestions on for an engine
++  // other than Shodhya.
++  const PrefService::Preference* suggest =
++      prefs_->FindPreference(prefs::kSearchSuggestEnabled);
++  if (suggest && suggest->IsDefaultValue()) {
++    Apply();
++  }
 +}
 +
 +}  // namespace tark
