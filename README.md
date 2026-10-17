@@ -12,6 +12,9 @@ and the current plan in [docs/superpowers/plans/](docs/superpowers/plans/).
 
 ![Tark's settings home in dark mode: one line on how Tark is set up and eight tiles showing each section's state](docs/screenshots/m3/task12-home-dark.png)
 
+Internal pages answer to `tark://` (`tark://settings`, `tark://extensions`),
+and the three-dot mark is the only logo the browser shows.
+
 ## Build
 
 See [docs/building.md](docs/building.md). The short version, on an Apple
