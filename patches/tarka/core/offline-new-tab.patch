@@ -1,0 +1,172 @@
+Tark: an offline new tab (spec 6.1). When the network is down, chrome://newtab
+resolves to chrome://new-tab-page-third-party/, now Tark's page: the mark, a
+search pill and "You're offline. Searches will run when you're back." The
+address bar has focus on every new tab, so typing goes there.
+
+--- a/chrome/browser/chrome_content_browser_client.cc
++++ b/chrome/browser/chrome_content_browser_client.cc
+@@ -404,6 +404,7 @@
+ #include "mojo/public/cpp/bindings/remote.h"
+ #include "net/base/data_url.h"
+ #include "net/base/features.h"
++#include "net/base/network_change_notifier.h"
+ #include "net/base/url_util.h"
+ #include "net/cookies/cookie_setting_override.h"
+ #include "net/cookies/site_for_cookies.h"
+@@ -909,6 +910,13 @@
+ 
+   Profile* profile = Profile::FromBrowserContext(browser_context);
+ 
++  // Tark: offline, a new tab shows Tark's own page (the mark, a search pill,
++  // one line) instead of a network error for shodhya.com (spec 6.1).
++  if (!profile->IsOffTheRecord() && net::NetworkChangeNotifier::IsOffline()) {
++    *url = GURL(chrome::kChromeUINewTabPageThirdPartyURL);
++    return true;
++  }
++
+   // Don't change the URL when incognito mode.
+   if (profile->IsOffTheRecord()) {
+    if (!base::CommandLine::ForCurrentProcess()->HasSwitch("custom-ntp"))
+--- a/chrome/browser/resources/new_tab_page_third_party/new_tab_page_third_party.html
++++ b/chrome/browser/resources/new_tab_page_third_party/new_tab_page_third_party.html
+@@ -1,57 +1,77 @@
+ <!doctype html>
+-<html dir="$i18n{textdirection}" lang="$i18n{language}"
+-    $i18n{hascustombackground} $i18n{isdark} $i18n{webuiRoundedIconsAttribute}>
++<html dir="$i18n{textdirection}" lang="$i18n{language}">
+   <head>
+     <meta charset="utf-8">
++    <meta name="color-scheme" content="light dark">
+     <title>$i18n{title}</title>
++    <!-- Tark: the offline new tab (spec 6.1). The address bar is focused on
++         every new tab, so typing goes there; the pill shows where. -->
+     <style>
+       html {
+-        --ntp-focus-shadow-color: rgba(var(--google-blue-600-rgb), .4);
+-        --ntp-theme-text-color: var(--google-grey-800);
+-        background-attachment: fixed;
+-        background-color: $i18n{colorBackground};
+-        background-position: $i18n{backgroundPosition};
+-        background-repeat: $i18n{backgroundTiling};
++        --paper: #f6f1e7;
++        --raised: #fffdf8;
++        --ink: #14142b;
++        --soft: #4d473d;
++        --rule: #d9d0bf;
++        --indigo: #4338ca;
++        --coral: #e63e5c;
++        --amber: #ffb703;
++        background: var(--paper);
++        color: var(--ink);
+         height: 100%;
+-        overflow: auto;
+       }
+ 
+       @media (prefers-color-scheme: dark) {
+         html {
+-          --ntp-focus-shadow-color: rgba(var(--google-blue-300-rgb), .5);
+-          --ntp-theme-text-color: white;
++          --paper: #12121c;
++          --raised: #1b1b29;
++          --ink: #f3efe6;
++          --soft: #bdb6a8;
++          --rule: #2c2c3d;
++          --indigo: #8f88ff;
++          --coral: #ff6b85;
++          --amber: #ffc53d;
+         }
+       }
+ 
+-      html[has-custom-background] {
+-        background-image: image-set(
+-            url(chrome://theme/IDR_THEME_NTP_BACKGROUND?$i18n{themeId}) 1x,
+-            url(chrome://theme/IDR_THEME_NTP_BACKGROUND@2x?$i18n{themeId}) 2x);
+-      }
+-
+       body {
+         align-items: center;
+         display: flex;
++        flex-direction: column;
++        gap: 28px;
+         height: 100vh;
+         justify-content: center;
+         margin: 0;
+       }
+ 
+-      cr-most-visited {
+-        --most-visited-focus-shadow: 0 0 0 2px var(--ntp-focus-shadow-color);
+-        --most-visited-text-color: var(--ntp-theme-text-color);
+-        --most-visited-text-shadow: none;
++      .pill {
++        background: var(--raised);
++        border: 1px solid var(--rule);
++        border-radius: 999px;
++        box-sizing: border-box;
++        color: var(--soft);
++        font-size: 16px;
++        max-width: 90vw;
++        padding: 14px 22px;
++        width: 560px;
+       }
+ 
+-      html[has-custom-background] cr-most-visited {
+-        --most-visited-text-shadow: 0 0 16px rgba(0, 0, 0, .3);
++      p {
++        color: var(--soft);
++        font-size: 14px;
++        margin: 0;
+       }
+     </style>
+   </head>
+   <body>
+-    <script type="module" src="strings.m.js"></script>
+-    <cr-most-visited></cr-most-visited>
+-    <script type="module" src="new_tab_page_third_party.js"></script>
++    <svg width="64" height="52" viewBox="0 0 44 36" role="img"
++        aria-label="Tark">
++      <circle cx="22" cy="9" r="7" fill="var(--amber)"/>
++      <circle cx="9" cy="27" r="7" fill="var(--coral)"/>
++      <circle cx="35" cy="27" r="7" fill="var(--indigo)"/>
++    </svg>
++    <div class="pill" aria-hidden="true">Search Shodhya</div>
++    <p>You're offline. Searches will run when you're back.</p>
+     <link rel="stylesheet" href="chrome://resources/css/text_defaults_md.css">
+   </body>
+ </html>
+--- a/chrome/browser/resources/new_tab_page_third_party/new_tab_page_third_party.ts
++++ b/chrome/browser/resources/new_tab_page_third_party/new_tab_page_third_party.ts
+@@ -2,31 +2,6 @@
+ // Use of this source code is governed by a BSD-style license that can be
+ // found in the LICENSE file.
+ 
+-import 'chrome://resources/cr_components/most_visited/most_visited.js';
+-
+-import {assert} from 'chrome://resources/js/assert.js';
+-import {skColorToRgba} from 'chrome://resources/js/color_utils.js';
+-
+-import {BrowserProxy} from './browser_proxy.js';
+-
+-
+-const {callbackRouter, handler} = BrowserProxy.getInstance();
+-
+-callbackRouter.setTheme.addListener(theme => {
+-  const html = document.documentElement;
+-  html.toggleAttribute('has-custom-background', theme.hasCustomBackground);
+-  const style = html.style;
+-  style.backgroundColor = theme.colorBackground;
+-  const backgroundImage = `image-set(
+-      url(chrome://theme/IDR_THEME_NTP_BACKGROUND?${theme.id}) 1x,
+-      url(chrome://theme/IDR_THEME_NTP_BACKGROUND@2x?${theme.id}) 2x)`;
+-  style.backgroundImage = theme.hasCustomBackground ? backgroundImage : 'unset';
+-  style.backgroundRepeat = theme.backgroundTiling;
+-  style.backgroundPosition = theme.backgroundPosition;
+-  style.setProperty('--ntp-theme-text-color', skColorToRgba(theme.textColor));
+-
+-  const mostVisitedElement = document.querySelector('cr-most-visited');
+-  assert(mostVisitedElement);
+-  mostVisitedElement.theme = theme.mostVisited;
+-});
+-handler.updateTheme();
++// Tark: the page is Tark's offline new tab (spec 6.1) and needs no script;
++// Chromium's most-visited tiles and theme background are not shown.
++export {};
