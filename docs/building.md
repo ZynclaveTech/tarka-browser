@@ -139,3 +139,21 @@ private window has the same install API and shows "Remove from Tark" for an
 installed extension. Run end to end (final review): in a private window the
 store shows "You can't add or remove items when in Incognito or Guest mode"
 and disables "Add to Tark", so it says why instead of failing silently.
+
+## M3 notes
+
+**WebUI pages and Paper.** Settings, Extensions, History, Downloads and
+Bookmarks always load the theme colours (`chrome://theme/colors.css`), which
+carry Tark's palette from the colour mixer; Chromium loads them only behind
+its unreleased 2026 redesign flags. Inter is served from
+`chrome://resources/fonts/` (copied from `resources/fonts/` by `dev.sh` and
+`build.sh`; licence `resources/fonts/Inter-OFL.txt`). Recoloured, not Paper:
+the side menus of Extensions and History keep Chromium's pill highlight for
+the current item (their own navigation styles, outside the shared Settings
+menu).
+
+**Re-running name substitution in a dev tree** (M3 Task 7). `utils/name_substitution.py`
+skips Quilt's `.pc` backups, so after `--sub` on an existing dev tree, do not
+refresh older patches that touch `chrome/app/generated_resources.grd` or
+`chrome/app/settings_strings.grdp`; they would absorb the substitution. A clean
+`./dev.sh reset && ./dev.sh setup` has no such caveat.

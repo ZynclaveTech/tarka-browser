@@ -98,6 +98,9 @@ MSG
   # Tarka: product name in UI strings, and the app icon (binary, so not a patch).
   python3 "$_root_dir/utils/name_substitution.py" --sub -t "$_src_dir" --backup-path "$_root_dir/build/namesubs.tar"
   cp "$_root_dir/resources/branding/app.icns" "$_src_dir/chrome/app/theme/chromium/mac/app.icns"
+  # Inter for WebUI pages (M3 Task 8), served as chrome://resources/fonts/.
+  mkdir -p "$_src_dir/ui/webui/resources/fonts"
+  cp "$_root_dir"/resources/fonts/inter-latin*.woff2 "$_src_dir/ui/webui/resources/fonts/"
 
   _write_gn_args
   mkdir -p "$_src_dir/third_party/llvm-build/Release+Asserts" "$_src_dir/third_party/rust-toolchain/bin"
