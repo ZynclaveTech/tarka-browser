@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Adds a public key to the bundled uBlock Origin's manifest so the built-in
-copy has a fixed extension id (M4 Task 3), and computes that id.
+copy has a fixed extension id (M4 Task 3), and computes that id. Also drops
+the manifest's managed-storage schema, which a component cannot load.
 
 usage: ublock_key.py MANIFEST_JSON KEY_FILE     add the key, print the id
 """
@@ -23,6 +24,11 @@ def set_key(manifest_path, public_key_b64):
     if current is not None and current != public_key_b64:
         raise ValueError(f"{manifest_path} already has a different key")
     data["key"] = public_key_b64
+    # The component's files are served from the resource pak, so Chromium
+    # cannot read a managed-storage schema from disk and would register an
+    # empty policy schema, which crashes chrome://policy. Tark sets no
+    # managed policy for uBlock Origin, so the declaration goes.
+    data.pop("storage", None)
     open(manifest_path, "w", encoding="utf-8").write(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
 
 

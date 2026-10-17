@@ -32,3 +32,17 @@ def test_set_key_is_idempotent_and_refuses_a_different_key(tmp_path):
     set_key(m, HELIUM_KEY)
     with pytest.raises(ValueError):
         set_key(m, HELIUM_KEY[:-8] + "AAAAAAAA")
+
+
+def test_set_key_drops_the_managed_storage_schema(tmp_path):
+    # Final review C2: the component's files live in the resource pak, so the
+    # managed-storage schema cannot be read from disk; Chromium then registers
+    # an empty policy schema for uBlock and chrome://policy CHECK-crashes.
+    m = tmp_path / "manifest.json"
+    m.write_text(json.dumps({"name": "uBlock Origin",
+                             "storage": {"managed_schema": "managed_storage.json"},
+                             "permissions": ["storage"]}))
+    set_key(m, HELIUM_KEY)
+    out = json.loads(m.read_text())
+    assert "storage" not in out
+    assert out["permissions"] == ["storage"]
