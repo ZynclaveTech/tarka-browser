@@ -17,4 +17,4 @@ def test_borrowed_headers_intact():
         assert "Copyright 2025 The Helium Authors" in head, f.name
         assert "GPL-3.0" in head, f.name
         assert "LICENSE.GPL-3.0" in head, f.name
-        assert "Modifications Copyright 2026 The Shodhya Authors" in head, f.name
+        assert "Modifications Copyright 2026 The Tarka Authors" in head, f.name
