@@ -123,7 +123,12 @@ cmd_run() {
     echo "no app bundle in $_out_dir; run ./dev.sh build first" >&2
     return 1
   fi
-  open -n "$app" --args --user-data-dir="$_root_dir/build/profile" "$@"
+  # --use-mock-keychain: Chromium unlocks its "Safe Storage" keychain key
+  # before the cookie store opens, and every rebuild changes the ad-hoc
+  # signature, so macOS would ask for keychain access on every launch and
+  # block all network loads until answered. Release builds with a Developer
+  # ID ask once and keep the real keychain.
+  open -n "$app" --args --user-data-dir="$_root_dir/build/profile" --use-mock-keychain "$@"
 }
 
 cmd_reset() {
