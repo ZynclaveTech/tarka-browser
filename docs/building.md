@@ -1,4 +1,4 @@
-# Building Shodhya
+# Building Tarka
 
 ## Requirements
 
