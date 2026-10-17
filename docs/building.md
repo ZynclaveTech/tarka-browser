@@ -116,7 +116,16 @@ python3 utils/net_hosts.py /tmp/tark-idle.json --allowed utils/allowed_hosts.txt
 It counts DNS lookups, request starts and QUIC sessions only, so hosts
 named inside response headers (Cloudflare's `report-to`, CSP `report-uri`)
 are not counted; Chromium's Reporting and NEL are compiled out
-(`enable_reporting=false`). It exits 1 if any host is not on the list.
+(`enable_reporting=false`). It exits 1 if any host is not on the list. Its
+blind spot: a connection to a bare IP address with no URL request (a
+preconnect) makes no DNS lookup and is not counted.
+
+**uBlock Origin "off" across a browser update** (Review Focus 4, checked by
+reading, not by test). A new uBlock version re-registers the component
+extension; `ExtensionRegistrar::AddComponentExtension` asks
+`GetDisableReasonsOnInstalled`, which keeps the user's `DISABLE_USER_ACTION`
+because Helium's hunk makes `MustRemainEnabled` false for uBlock. Re-check
+this on every Chromium or uBlock bump.
 
 Result on 2026-10-17 (dev build with all of M4 Tasks 1 to 8, new
 profile, first-run on, two idle minutes): `shodhya.com` (16),
