@@ -1,0 +1,79 @@
+Tark: no Translate unless the user brings a server (spec 5.2). The app-menu
+item shows only with ungoogled-chromium's --translate-script-url, like its
+context-menu item; the Languages page loses its Google Translate card; Live
+Translate, which sends captions to Google, is off.
+
+--- a/chrome/browser/resources/settings/languages_page/languages_page_index.html.ts
++++ b/chrome/browser/resources/settings/languages_page/languages_page_index.html.ts
+@@ -18,9 +18,6 @@
+       route-path="${this.routes_.SPELL_CHECK.path}">
+   </settings-spell-check-page>
+ 
+-  <settings-translate-page slot="view" id="translate">
+-  </settings-translate-page>
+-
+ <if expr="not is_macosx">
+   <settings-edit-dictionary-page slot="view" id="editDictionary"
+       data-parent-view-id="spellCheck"
+--- a/chrome/browser/resources/settings/languages_page/languages_page_index.ts
++++ b/chrome/browser/resources/settings/languages_page/languages_page_index.ts
+@@ -5,7 +5,6 @@
+ import 'chrome://resources/cr_elements/cr_view_manager/cr_view_manager.js';
+ import './languages_page.js';
+ import './spell_check_page.js';
+-import './translate_page.js';
+ // <if expr="not is_macosx">
+ import './edit_dictionary_page.js';
+ 
+@@ -56,7 +55,7 @@
+ 
+   private showDefaultViews_() {
+     this.$.viewManager.switchViews(
+-        ['languages', 'spellCheck', 'translate'], 'no-animation',
++        ['languages', 'spellCheck'], 'no-animation',
+         'no-animation');
+   }
+ 
+--- a/chrome/browser/ui/toolbar/app_menu_model.cc
++++ b/chrome/browser/ui/toolbar/app_menu_model.cc
+@@ -10,6 +10,7 @@
+ #include <optional>
+ 
+ #include "base/command_line.h"
++#include "components/translate/core/common/translate_switches.h"
+ #include "base/debug/debugging_buildflags.h"
+ #include "base/debug/profiler.h"
+ #include "base/functional/bind.h"
+@@ -2123,8 +2124,14 @@
+             lens::features::kLensOverlay));
+   }
+ 
+-  AddItemWithStringIdAndVectorIcon(this, IDC_SHOW_TRANSLATE, IDS_SHOW_TRANSLATE,
+-                                   vector_icons::kGTranslateIcon);
++  // Tark: Translate is offered only when the user points it at a server of
++  // their choosing (ungoogled-chromium's --translate-script-url).
++  if (base::CommandLine::ForCurrentProcess()->HasSwitch(
++          translate::switches::kTranslateScriptURL)) {
++    AddItemWithStringIdAndVectorIcon(this, IDC_SHOW_TRANSLATE,
++                                     IDS_SHOW_TRANSLATE,
++                                     vector_icons::kGTranslateIcon);
++  }
+ 
+   CreateFindAndEditSubMenu();
+ 
+--- a/media/base/media_switches.cc
++++ b/media/base/media_switches.cc
+@@ -1854,11 +1854,8 @@
+ }
+ 
+ bool IsLiveTranslateEnabled() {
+-#if BUILDFLAG(IS_CHROMEOS)
+-  return base::FeatureList::IsEnabled(kFeatureManagementLiveTranslateCrOS);
+-#else
+-  return true;
+-#endif
++  // Tark: Live Translate sends captions to Google's translation service.
++  return false;
+ }
+ 
+ bool IsRestrictOwnAudioSupported() {
