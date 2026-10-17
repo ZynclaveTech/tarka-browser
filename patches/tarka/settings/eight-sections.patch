@@ -1,0 +1,509 @@
+--- a/chrome/browser/resources/settings/a11y_page/a11y_page_index.ts
++++ b/chrome/browser/resources/settings/a11y_page/a11y_page_index.ts
+@@ -70,6 +70,7 @@
+               'captions', 'no-animation', 'no-animation');
+           break;
+         // </if>
++        case routes.ADVANCED_GROUP:  // Tark: shown under Advanced.
+         case routes.BASIC:
+           // Switch back to the default views in case they are part of search
+           // results.
+--- a/chrome/browser/resources/settings/people_page/people_page_index.ts
++++ b/chrome/browser/resources/settings/people_page/people_page_index.ts
+@@ -65,6 +65,7 @@
+           this.$.viewManager.switchView(
+               'parent', 'no-animation', 'no-animation');
+           break;
++        case routes.ADVANCED_GROUP:  // Tark: shown under Advanced.
+         case routes.BASIC:
+           // Switch back to the default views in case they are part of search
+           // results.
+--- a/chrome/browser/resources/settings/performance_page/performance_page_index.ts
++++ b/chrome/browser/resources/settings/performance_page/performance_page_index.ts
+@@ -81,6 +81,7 @@
+         case routes.PERFORMANCE:
+           this.showDefaultViews_();
+           break;
++        case routes.ADVANCED_GROUP:  // Tark: shown under Advanced.
+         case routes.BASIC:
+           // Switch back to the default views in case they are part of search
+           // results.
+--- a/chrome/browser/resources/settings/route.ts
++++ b/chrome/browser/resources/settings/route.ts
+@@ -306,6 +306,12 @@
+         loadTimeData.getString('performancePageTitle'));
+   }
+ 
++  // Tark: Advanced shows, one after another, the sections the other seven
++  // do not name (spec 6.1). Their own paths keep working.
++  r.ADVANCED_GROUP = r.BASIC.createSection(
++      '/advancedSettings', 'advancedGroup',
++      loadTimeData.getString('tarkAdvanced'));
++
+   // Tark: chrome://settings/ is its own view, the home page (spec 6.1).
+   // Set last so no child route inherits it.
+   r.BASIC.section = 'home';
+@@ -340,6 +346,28 @@
+ 
+ export let routes: SettingsRoutes = Router.getInstance().getRoutes();
+ 
++/**
++ * Tark: the sections Advanced groups, in the order it shows them. A page
++ * hidden by pageVisibility has no route and is left out.
++ */
++export function advancedGroupRoutes(): Route[] {
++  return [
++    routes.PEOPLE,
++    routes.ON_STARTUP,
++    routes.DEFAULT_BROWSER,
++    routes.PERFORMANCE,
++    routes.ACCESSIBILITY,
++    routes.SYSTEM,
++    routes.RESET,
++  ].filter(route => !!route);
++}
++
++/** Tark: whether `route` is Advanced or lies inside one of its sections. */
++export function isInAdvancedGroup(route: Route): boolean {
++  return route === routes.ADVANCED_GROUP ||
++      advancedGroupRoutes().some(section => section.contains(route));
++}
++
+ // Returns the "effective" route when at chrome://settings/.
+ export function getTopLevelRoute(): Route {
+   if (!loadTimeData.getBoolean('isGuest')) {
+--- a/chrome/browser/resources/settings/router.ts
++++ b/chrome/browser/resources/settings/router.ts
+@@ -18,6 +18,7 @@
+   ACCESSIBILITY: Route;
+   ADDRESSES: Route;
+   ADVANCED: Route;
++  ADVANCED_GROUP: Route;
+   AI: Route;
+   AI_MODE_SEARCH: Route;
+   AI_SUGGESTIONS: Route;
+--- a/chrome/browser/resources/settings/settings_main/settings_main.html
++++ b/chrome/browser/resources/settings/settings_main/settings_main.html
+@@ -32,6 +32,12 @@
+   cr-view-manager [hidden-by-search] {
+     display: none;
+   }
++
++  /* Tark: Advanced stacks its sections in the page flow. */
++  cr-view-manager[tark-group] > [slot=view].active {
++    --tark-view-flow: 1;
++    position: static;
++  }
+ </style>
+ <div id="noSearchResults" hidden$="[[!showNoResultsFound_]]">
+   <div>$i18n{searchNoResults}</div>
+--- a/chrome/browser/resources/settings/settings_main/settings_main.ts
++++ b/chrome/browser/resources/settings/settings_main/settings_main.ts
+@@ -37,7 +37,7 @@
+ import type {PageVisibility} from '../page_visibility.js';
+ import '../tark/home_page.js';
+ 
+-import {routes} from '../route.js';
++import {advancedGroupRoutes, isInAdvancedGroup, routes} from '../route.js';
+ import {RouteObserverMixin} from '../router.js';
+ import type {Route, SettingsRoutes} from '../router.js';
+ import {combineSearchResults} from '../search_settings.js';
+@@ -152,7 +152,8 @@
+   override async currentRouteChanged(route: Route) {
+     this.pendingViewSwitching_ = new PromiseResolver();
+ 
+-    if (routes.ADVANCED && routes.ADVANCED.contains(route)) {
++    if ((routes.ADVANCED && routes.ADVANCED.contains(route)) ||
++        route === routes.ADVANCED_GROUP) {
+       // Load the lazy module immediately, don't wait for requestIdleCallback()
+       // to fire. No-op if it has already fired.
+       ensureLazyLoaded();
+@@ -169,9 +170,14 @@
+ 
+     this.lastRoute_ = effectiveRoute;
+ 
+-    const newSection = effectiveRoute.section;
+-    let sectionElement = this.$.switcher.querySelector(`#${newSection}`);
+-    if (!sectionElement) {
++    // Tark: Advanced shows its sections together, in the page flow.
++    const grouped = effectiveRoute === routes.ADVANCED_GROUP;
++    const viewIds = grouped ? advancedGroupRoutes().map(r => r.section) :
++                              [effectiveRoute.section];
++    const findViews = () =>
++        viewIds.filter(id => !!this.$.switcher.querySelector(`#${id}`));
++    let views = findViews();
++    if (views.length < viewIds.length) {
+       // Wait for any pageVisibility <dom-if>s to render and try again.
+       await this.beforeNextRenderPromise_();
+ 
+@@ -181,12 +187,12 @@
+         this.pendingViewSwitching_.resolve();
+         return;
+       }
+-      sectionElement = this.$.switcher.querySelector(`#${newSection}`);
++      views = findViews();
+     }
+ 
+-    assert(sectionElement);
+-    await this.$.switcher.switchView(
+-        sectionElement.id, 'no-animation', 'no-animation');
++    assert(views.length > 0);
++    this.$.switcher.toggleAttribute('tark-group', grouped);
++    await this.$.switcher.switchViews(views, 'no-animation', 'no-animation');
+     this.pendingViewSwitching_.resolve();
+   }
+ 
+@@ -261,7 +267,10 @@
+ 
+   private renderPlugin_(route: Route): boolean {
+     return this.inSearchMode_ ||
+-        (!!this.lastRoute_ && route.contains(this.lastRoute_));
++        (!!this.lastRoute_ &&
++         (route.contains(this.lastRoute_) ||
++          (this.lastRoute_ === routes.ADVANCED_GROUP &&
++           isInAdvancedGroup(route))));
+   }
+ 
+   private renderHome_(): boolean {
+--- a/chrome/browser/resources/settings/settings_menu/settings_menu.html
++++ b/chrome/browser/resources/settings/settings_menu/settings_menu.html
+@@ -90,123 +90,66 @@
+       <cr-menu-selector id="menu" selectable="a:not(#extensionsLink)"
+           attr-for-selected="href" on-iron-activate="onSelectorActivate_"
+           on-click="onLinkClick_" selected-attribute="selected">
+-        <a role="menuitem"
+-            id="people" href="/people" hidden="[[!pageVisibility_.people]]"
++        <!-- Tark: eight sections (spec 6.1); Advanced groups the rest. -->
++        <a role="menuitem" id="tarkSearch" href="/search"
+             class="cr-nav-menu-item">
+-<if expr="not _google_chrome">
+-          <cr-icon icon="settings:person"></cr-icon>
+-</if>
+-<if expr="_google_chrome">
+-          <cr-icon icon="settings-internal:google-g"></cr-icon>
+-</if>
+-          $i18n{peoplePageTitle}
+-          <cr-ripple></cr-ripple>
+-        </a>
+-        <a role="menuitem" id="autofill" href="/autofill"
+-            on-click="onAutofillClick_"
+-            class="cr-nav-menu-item"
+-            hidden="[[!pageVisibility_.yourSavedInfo]]">
+-          <cr-icon icon="settings:password-manager"></cr-icon>
+-          $i18n{autofillPageTitle}
++          <cr-icon icon="settings:search"></cr-icon>
++          $i18n{tarkSearch}
+           <cr-ripple></cr-ripple>
+         </a>
+-        <a role="menuitem" id="privacy" href="/privacy"
++        <a role="menuitem" id="tarkPrivacy" href="/privacy"
+             hidden="[[!pageVisibility_.privacy]]"
+             class="cr-nav-menu-item">
+           <cr-icon icon="settings:security"></cr-icon>
+-          $i18n{privacyPageTitle}
++          $i18n{tarkPrivacy}
+           <cr-ripple></cr-ripple>
+         </a>
+-        <a role="menuitem" id="performance" href="/performance"
+-            class="cr-nav-menu-item"
+-            hidden="[[!pageVisibility_.performance]]">
+-          <cr-icon icon="settings:speed"></cr-icon>
+-          $i18n{performancePageTitle}
+-          <cr-ripple></cr-ripple>
+-        </a>
+-        <a role="menuitem" id="ai" href="/ai"
+-            hidden="[[!showAiPageMenuItem_(showAiPage_, pageVisibility_.ai)]]"
+-            class="cr-nav-menu-item">
+-          <cr-icon icon="settings20:button-magic"></cr-icon>
+-          $i18n{aiPageTitle}
+-          <cr-ripple></cr-ripple>
+-        </a>
+-        <a role="menuitem" id="appearance" href="/appearance"
++        <a role="menuitem" id="tarkLook" href="/appearance"
+             hidden="[[!pageVisibility_.appearance]]"
+             class="cr-nav-menu-item">
+           <cr-icon icon="settings:palette"></cr-icon>
+-          $i18n{appearancePageTitle}
++          $i18n{tarkLook}
+           <cr-ripple></cr-ripple>
+         </a>
+-        <a role="menuitem" id="search" href="/search" class="cr-nav-menu-item">
+-          <cr-icon icon="settings:search"></cr-icon>
+-          $i18n{searchPageTitle}
+-          <cr-ripple></cr-ripple>
+-        </a>
+-<if expr="not is_chromeos">
+-        <a role="menuitem" id="defaultBrowser" class="cr-nav-menu-item"
+-          href="/defaultBrowser"
+-          hidden="[[!pageVisibility_.defaultBrowser]]">
+-          <cr-icon icon="settings:web-asset"></cr-icon>
+-          $i18n{defaultBrowser}
+-          <cr-ripple></cr-ripple>
+-        </a>
+-</if>
+-        <a role="menuitem" id="onStartup" href="/onStartup"
+-            class="cr-nav-menu-item"
+-            hidden="[[!pageVisibility_.onStartup]]">
+-          <cr-icon icon="settings:power-settings-new"></cr-icon>
+-          $i18n{onStartup}
++        <a role="menuitem" id="extensionsLink" class="cr-nav-menu-item"
++            href="chrome://extensions" target="_blank"
++            hidden="[[!pageVisibility_.extensions]]"
++            on-click="onExtensionsLinkClick_"
++            title="$i18n{extensionsLinkTooltip}">
++          <cr-icon icon="settings:chrome-extension"></cr-icon>
++          <span>$i18n{tarkExtensions}</span>
++          <div class="cr-icon icon-external"></div>
+           <cr-ripple></cr-ripple>
+         </a>
+-        <div class="menu-separator"></div>
+-        <a role="menuitem" id="languages" href="/languages"
+-            class="cr-nav-menu-item"
+-            hidden="[[!pageVisibility_.languages]]">
+-          <cr-icon icon="settings:translate"></cr-icon>
+-          $i18n{languagesPageTitle}
++        <a role="menuitem" id="tarkPasswords" href="/autofill"
++            on-click="onAutofillClick_"
++            hidden="[[!pageVisibility_.yourSavedInfo]]"
++            class="cr-nav-menu-item">
++          <cr-icon icon="settings:password-manager"></cr-icon>
++          $i18n{tarkPasswords}
+           <cr-ripple></cr-ripple>
+         </a>
+-        <a role="menuitem" id="downloads" href="/downloads"
+-            class="cr-nav-menu-item"
+-            hidden="[[!pageVisibility_.downloads]]">
++        <a role="menuitem" id="tarkDownloads" href="/downloads"
++            hidden="[[!pageVisibility_.downloads]]"
++            class="cr-nav-menu-item">
+           <cr-icon icon="settings:download"></cr-icon>
+-          $i18n{downloadsPageTitle}
++          $i18n{tarkDownloads}
+           <cr-ripple></cr-ripple>
+         </a>
+-        <a role="menuitem" id="accessibility" href="/accessibility"
+-            class="cr-nav-menu-item"
+-            hidden="[[!pageVisibility_.a11y]]">
+-          <cr-icon icon="settings:accessibility"></cr-icon>
+-          $i18n{a11yPageTitle}
++        <a role="menuitem" id="tarkLanguages" href="/languages"
++            hidden="[[!pageVisibility_.languages]]"
++            class="cr-nav-menu-item">
++          <cr-icon icon="settings:translate"></cr-icon>
++          $i18n{tarkLanguages}
+           <cr-ripple></cr-ripple>
+         </a>
+-<if expr="not is_chromeos">
+-        <a role="menuitem" id="system" href="/system" class="cr-nav-menu-item"
+-            hidden="[[!pageVisibility_.system]]">
++        <a role="menuitem" id="tarkAdvanced" href="/advancedSettings"
++            class="cr-nav-menu-item">
+           <cr-icon icon="settings:build"></cr-icon>
+-          $i18n{systemPageTitle}
+-          <cr-ripple></cr-ripple>
+-        </a>
+-</if>
+-        <a role="menuitem" id="reset" href="/reset"
+-            hidden="[[!pageVisibility_.reset]]" class="cr-nav-menu-item">
+-          <cr-icon icon="settings:restart-alt"></cr-icon>
+-          $i18n{resetPageTitle}
+-          <cr-ripple></cr-ripple>
+-        </a>
+-        <div hidden="[[hideBottomMenuSeparator_(pageVisibility_)]]"
+-            class="menu-separator"></div>
+-        <a role="menuitem" id="extensionsLink" class="cr-nav-menu-item"
+-            href="chrome://extensions" target="_blank"
+-            hidden="[[!pageVisibility_.extensions]]"
+-            on-click="onExtensionsLinkClick_"
+-            title="$i18n{extensionsLinkTooltip}">
+-          <cr-icon icon="settings:chrome-extension"></cr-icon>
+-          <span>$i18n{extensionsPageTitle}</span>
+-          <div class="cr-icon icon-external"></div>
++          $i18n{tarkAdvanced}
+           <cr-ripple></cr-ripple>
+         </a>
++        <div class="menu-separator"></div>
+         <a role="menuitem" id="about-menu" href="/help"
+             class="cr-nav-menu-item">
+           <cr-icon icon="cr:chrome-product"></cr-icon>
+--- a/chrome/browser/resources/settings/settings_menu/settings_menu.ts
++++ b/chrome/browser/resources/settings/settings_menu/settings_menu.ts
+@@ -25,22 +25,20 @@
+ import {assert} from 'chrome://resources/js/assert.js';
+ import {PolymerElement} from 'chrome://resources/polymer/v3_0/polymer/polymer_bundled.min.js';
+ 
+-import {loadTimeData} from '../i18n_setup.js';
+ import type {MetricsBrowserProxy} from '../metrics_browser_proxy.js';
+ import {AutofillSettingsReferrer, MetricsBrowserProxyImpl} from '../metrics_browser_proxy.js';
+ import {pageVisibility} from '../page_visibility.js';
+ import type {PageVisibility} from '../page_visibility.js';
+ import type {Route} from '../router.js';
++import {isInAdvancedGroup, routes} from '../route.js';
+ import {RouteObserverMixin, Router} from '../router.js';
+ 
+ import {getTemplate} from './settings_menu.html.js';
+ 
+ export interface SettingsMenuElement {
+   $: {
+-    autofill: HTMLLinkElement,
+     menu: CrMenuSelectorElement,
+-    people: HTMLLinkElement,
+-    yourSavedInfo: HTMLLinkElement,
++    tarkPasswords: HTMLLinkElement,
+   };
+ }
+ 
+@@ -82,25 +80,16 @@
+         type: Object,
+         value: () => pageVisibility,
+       },
+-
+-      showAiPage_: {
+-        type: Boolean,
+-        value: () => loadTimeData.getBoolean('showAiPage'),
+-      },
+     };
+   }
+ 
+   declare private pageVisibility_?: PageVisibility;
+-  declare private showAiPage_: boolean;
+   private metricsBrowserProxy_: MetricsBrowserProxy =
+       MetricsBrowserProxyImpl.getInstance();
+ 
+-  private showAiPageMenuItem_(): boolean {
+-    return this.showAiPage_ &&
+-        (!this.pageVisibility_ || this.pageVisibility_.ai !== false);
+-  }
+-
+-  override currentRouteChanged(newRoute: Route) {
++  override currentRouteChanged(route: Route) {
++    // Tark: every section Advanced groups selects the Advanced item.
++    const newRoute = isInAdvancedGroup(route) ? routes.ADVANCED_GROUP : route;
+     // Focus the initially selected path.
+     const anchors = this.shadowRoot!.querySelectorAll('a');
+     for (let i = 0; i < anchors.length; ++i) {
+@@ -168,23 +157,6 @@
+         'Autofill.YourSavedInfoSettingsPage.VisitReferrer',
+         AutofillSettingsReferrer.SETTINGS_MENU);
+   }
+-
+-  private hideBottomMenuSeparator_(): boolean {
+-    if (!this.pageVisibility_) {
+-      return false;
+-    }
+-
+-    const visibilities = [
+-      this.pageVisibility_.languages,
+-      this.pageVisibility_.downloads,
+-      this.pageVisibility_.a11y,
+-      // <if expr="not is_chromeos">
+-      this.pageVisibility_.system,
+-      // </if>
+-      this.pageVisibility_.reset,
+-    ];
+-    return visibilities.every(visibility => visibility === false);
+-  }
+ }
+ 
+ declare global {
+--- a/ui/webui/resources/cr_elements/cr_view_manager/cr_view_manager.css
++++ b/ui/webui/resources/cr_elements/cr_view_manager/cr_view_manager.css
+@@ -25,3 +25,11 @@
+ :host ::slotted(.closing) {
+   display: block;
+ }
++
++/* Tark: Settings' Advanced shows several sections one after another; the
++ * views inside them flow too, instead of stacking at the top. */
++@container style(--tark-view-flow: 1) {
++  :host ::slotted(.active) {
++    position: initial;
++  }
++}
+--- a/chrome/browser/resources/settings/settings_ui/settings_ui.html
++++ b/chrome/browser/resources/settings/settings_ui/settings_ui.html
+@@ -25,6 +25,49 @@
+         --cr-toolbar-left-spacer-width: var(--settings-menu-width);
+       }
+ 
++      #tarkMark {
++        border-radius: 6px;
++        display: flex;
++        margin-inline-end: 16px;
++        outline: none;
++      }
++
++      #tarkMark:focus-visible {
++        box-shadow: 0 0 0 2px var(--color-sys-primary, var(--cr-link-color));
++      }
++
++      cr-toolbar[narrow] #tarkMark {
++        display: none;
++      }
++
++      #tarkMark svg {
++        height: 24px;
++        width: 24px;
++      }
++
++      /* The mark's colours (spec 6: amber, coral, indigo). */
++      #tarkMark .amber {
++        fill: #ffb703;
++      }
++
++      #tarkMark .coral {
++        fill: var(--tark-coral);
++      }
++
++      #tarkMark .indigo {
++        fill: #4338ca;
++      }
++
++      @media (prefers-color-scheme: dark) {
++        #tarkMark .amber {
++          fill: #ffc53d;
++        }
++
++        #tarkMark .indigo {
++          fill: #8f88ff;
++        }
++      }
++
+       @media (prefers-color-scheme: light) {
+         cr-toolbar {
+           --iron-icon-fill-color: white;
+@@ -92,6 +135,15 @@
+         narrow="{{narrow_}}"
+         narrow-threshold="980"
+         show-menu="[[narrow_]]">
++      <!-- Tark: the three-dot mark returns to the home grid (spec 6.1). -->
++      <a id="tarkMark" slot="product-logo" href="/" on-click="onMarkClick_"
++          aria-label="$i18n{settings}" title="$i18n{settings}">
++        <svg viewBox="0 0 44 36" aria-hidden="true">
++          <circle cx="22" cy="9" r="7" class="amber"></circle>
++          <circle cx="9" cy="27" r="7" class="coral"></circle>
++          <circle cx="35" cy="27" r="7" class="indigo"></circle>
++        </svg>
++      </a>
+     </cr-toolbar>
+     <cr-drawer id="drawer" on-close="onMenuClose_" heading="$i18n{settings}"
+         align="$i18n{textdirection}">
+--- a/chrome/browser/resources/settings/settings_ui/settings_ui.ts
++++ b/chrome/browser/resources/settings/settings_ui/settings_ui.ts
+@@ -262,6 +262,16 @@
+     this.$.drawer.close();
+   }
+ 
++  // Tark: the mark opens the home grid in place, clearing any search.
++  private onMarkClick_(e: MouseEvent) {
++    if (e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) {
++      return;
++    }
++    e.preventDefault();
++    Router.getInstance().navigateTo(
++        routes.BASIC, /* dynamicParams */ undefined, /* removeSearch */ true);
++  }
++
+   private onMenuButtonClick_() {
+     this.$.drawer.toggle();
+   }
