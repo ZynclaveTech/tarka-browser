@@ -51,6 +51,28 @@ off for them. The `.dmg` lands in `build/`. Without `MACOS_AD_HOC_SIGNING=1`
 it expects the Developer ID variables documented in `sign_and_package_app.sh`.
 Afterwards `./dev.sh reset && ./dev.sh setup` restores the development tree.
 
+### First release build (2026-10-17)
+
+`./build.sh -d -m release arm64` on the 18 GB M3 Pro: official flags, ThinLTO,
+no PGO (tarball build). Compile and link 5 h 10 min at 8 jobs, with other
+work running alongside; **the ThinLTO link of the framework succeeded within
+18 GB**, so release builds do not need a bigger machine. Results:
+
+| Artefact | Size |
+|---|---|
+| `build/Tarka_155.0.8059.39-1.1_macos.dmg` | 147 MB |
+| `Tarka.app` | 390 MB (framework binary 260 MB) |
+
+Ad-hoc signing needed one change: macOS 26 refuses to load the framework
+into a process signed with library validation or the hardened runtime when
+the signature has no Team ID, which an ad-hoc one never has. Ad-hoc signing
+therefore leaves both out (`sign()` in `sign_and_package_app.sh`); Developer
+ID signing for notarized releases keeps them. Verified: the release app
+renders a page and runs JavaScript headlessly. Open for M5: strict
+verification (`codesign --verify --deep --strict`) flags a `FinderInfo`
+attribute on `Helpers/app_mode_loader` inside the dmg, which notarization
+will reject; clear it before signing.
+
 ## Resetting
 
 ```sh

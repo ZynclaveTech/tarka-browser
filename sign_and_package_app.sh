@@ -24,7 +24,18 @@ fi
 
 sign() {
   if (( _ad_hoc )); then
-    codesign --sign - --force "$@"
+    # Library validation compares Team IDs, and an ad-hoc signature has
+    # none, so on macOS 26 the app cannot load its own framework with it on;
+    # the hardened runtime turns library validation on by itself. Both mean
+    # nothing without a Developer ID, and an ad-hoc build cannot be notarized
+    # anyway, so ad-hoc signing leaves them out. Release signing keeps them.
+    local args=() a
+    for a in "$@"; do
+      a="${a//library,/}"; a="${a//,library/}"
+      a="${a//runtime,/}"; a="${a//,runtime/}"
+      args+=("$a")
+    done
+    codesign --sign - --force "${args[@]}"
   else
     codesign --sign "$MACOS_CERTIFICATE_NAME" --force --timestamp "$@"
   fi
