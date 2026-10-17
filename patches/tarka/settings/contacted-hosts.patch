@@ -1,0 +1,194 @@
+Tark: Settings > Privacy says what Tark connects to (spec 5.3).
+
+An expandable "What Tark connects to" row lists every service the browser
+itself contacts, with its hosts, in plain words. The hosts live in a new
+file, tark_contacted_hosts.cc, because domain substitution rewrites Google
+hosts in Chromium's string files; utils/allowed_hosts.txt mirrors them for
+the network check, and a unit test keeps the two in step. The Security row's
+description no longer promises Safe Browsing, which Tark does not build.
+
+--- a/chrome/app/settings_strings.grdp
++++ b/chrome/app/settings_strings.grdp
+@@ -530,6 +530,24 @@
+     <message name="IDS_SETTINGS_YOUR_SAVED_INFO_AUTOFILL_SETTINGS_DESCRIPTION" desc="Description of the Autofill settings section on 'Your saved info' page.">
+       Settings that affect how autofill works across different types of info
+     </message>
++    <message name="IDS_SETTINGS_TARK_CONNECTS_TITLE" desc="Title of the Privacy settings row that lists every service Tark itself connects to.">
++      What Tark connects to
++    </message>
++    <message name="IDS_SETTINGS_TARK_CONNECTS_INTRO" desc="Introduction to the list of services Tark connects to. Websites the user visits are separate.">
++      Tark itself connects only to these services, and only for these reasons. Websites you visit load what they choose.
++    </message>
++    <message name="IDS_SETTINGS_TARK_CONNECTS_SHODHYA" desc="Item in the list of services Tark connects to: its default search engine. $1 is a list of host names.">
++      Shodhya, for search, search suggestions and the new tab page (<ph name="HOSTS">$1<ex>shodhya.com</ex></ph>)
++    </message>
++    <message name="IDS_SETTINGS_TARK_CONNECTS_STORE" desc="Item in the list of services Tark connects to: the extension store. $1 is a list of host names.">
++      The Chrome Web Store, when you install an extension from it and to check those extensions for updates (<ph name="HOSTS">$1<ex>store.example.com</ex></ph>)
++    </message>
++    <message name="IDS_SETTINGS_TARK_CONNECTS_UBLOCK" desc="Item in the list of services Tark connects to: the built-in ad blocker's filter lists. $1 is a list of host names.">
++      uBlock Origin's filter-list sites, to keep its lists of ads and trackers current; switch uBlock Origin off on the Extensions page to stop this (<ph name="HOSTS">$1<ex>lists.example.com</ex></ph>)
++    </message>
++    <message name="IDS_SETTINGS_TARK_CONNECTS_WIDEVINE" desc="Item in the list of services Tark connects to: Google's DRM module server, used only if the user turns on protected content. $1 is a list of host names.">
++      Google's Widevine servers, only if you turn on protected content above (<ph name="HOSTS">$1<ex>update.example.com</ex></ph>)
++    </message>
+     <message name="IDS_SETTINGS_TARK_WIDEVINE" desc="Label of the Privacy settings toggle that lets sites play DRM-protected video by downloading Google's Widevine module.">
+       Protected content (Widevine)
+     </message>
+@@ -1787,7 +1805,7 @@
+       Security
+     </message>
+     <message name="IDS_SETTINGS_SECURITY_DESCRIPTION" desc="Description of the controls available on the security settings page">
+-      Safe Browsing (protection from dangerous sites) and other security settings
++      Secure connections, secure DNS and other security settings
+     </message>
+     <message name="IDS_SETTINGS_ADVANCED_PROTECTION_PROGRAM" desc="Name of the link which takes users       to the Google Advanced Protection Program external webpage">
+       Google Advanced Protection Program
+--- a/chrome/browser/resources/settings/privacy_page/privacy_page.html
++++ b/chrome/browser/resources/settings/privacy_page/privacy_page.html
+@@ -40,6 +40,18 @@
+         label="$i18n{tarkWidevine}"
+         sub-label="$i18n{tarkWidevineDesc}">
+     </settings-toggle-button>
++    <!-- Tark: every service the browser itself contacts (spec 5.3). -->
++    <cr-expand-button id="tarkConnectsButton" class="cr-row"
++        expanded="{{tarkConnectsExpanded_}}">
++      <div>$i18n{tarkConnectsTitle}</div>
++    </cr-expand-button>
++    <cr-collapse id="tarkConnectsList" opened="[[tarkConnectsExpanded_]]">
++      <div class="cr-row continuation secondary">$i18n{tarkConnectsIntro}</div>
++      <div class="cr-row continuation">$i18n{tarkConnectsShodhya}</div>
++      <div class="cr-row continuation">$i18n{tarkConnectsStore}</div>
++      <div class="cr-row continuation">$i18n{tarkConnectsUblock}</div>
++      <div class="cr-row continuation">$i18n{tarkConnectsWidevine}</div>
++    </cr-collapse>
+     <cr-toast id="deleteBrowsingDataToast" duration="5000">
+       <div>[[dbdDeletionConfirmationToastLabel_]]</div>
+     </cr-toast>
+--- a/chrome/browser/resources/settings/privacy_page/privacy_page.ts
++++ b/chrome/browser/resources/settings/privacy_page/privacy_page.ts
+@@ -9,6 +9,8 @@
+  */
+ import '/shared/settings/prefs/prefs.js';
+ import 'chrome://resources/cr_elements/icons.html.js';
++import 'chrome://resources/cr_elements/cr_collapse/cr_collapse.js';
++import 'chrome://resources/cr_elements/cr_expand_button/cr_expand_button.js';
+ import 'chrome://resources/cr_elements/cr_link_row/cr_link_row.js';
+ import 'chrome://resources/cr_elements/cr_shared_style.css.js';
+ import 'chrome://resources/cr_elements/cr_toast/cr_toast.js';
+@@ -64,6 +66,7 @@
+   static get properties() {
+     return {
+       showClearBrowsingDataDialog_: Boolean,
++      tarkConnectsExpanded_: {type: Boolean, value: false},
+       showPrivacyGuideDialog_: Boolean,
+ 
+       // The label of the confirmation toast that is displayed after deletion
+@@ -99,6 +102,7 @@
+   }
+ 
+   declare private showClearBrowsingDataDialog_: boolean;
++  declare private tarkConnectsExpanded_: boolean;
+   declare private showPrivacyGuideDialog_: boolean;
+   declare private dbdDeletionConfirmationToastLabel_: string;
+   declare private shouldShowDbdDeletionConfirmationToast_: boolean;
+--- a/chrome/browser/ui/webui/settings/BUILD.gn
++++ b/chrome/browser/ui/webui/settings/BUILD.gn
+@@ -178,6 +178,8 @@
+     "shared_settings_localized_strings_provider.cc",
+     "site_settings_handler.cc",
+     "site_settings_helper.cc",
++    "tark_contacted_hosts.cc",
++    "tark_contacted_hosts.h",
+   ]
+ 
+   deps = [
+--- a/chrome/browser/ui/webui/settings/settings_localized_strings_provider.cc
++++ b/chrome/browser/ui/webui/settings/settings_localized_strings_provider.cc
+@@ -69,6 +69,7 @@
+ #include "chrome/grit/branded_strings.h"
+ #include "chrome/grit/generated_resources.h"
+ #include "components/autofill/content/browser/content_autofill_client.h"
++#include "chrome/browser/ui/webui/settings/tark_contacted_hosts.h"
+ #include "components/component_updater/component_updater_url_constants.h"
+ #include "components/autofill/core/browser/data_manager/payments/payments_data_manager.h"
+ #include "components/autofill/core/browser/data_manager/personal_data_manager.h"
+@@ -2828,6 +2829,7 @@
+       {"securityJavascriptGuardrailsManageSiteExceptionsDesc",
+        IDS_SETTINGS_SECURITY_JAVASCRIPT_GUARDRAILS_MANAGE_SITE_EXCEPTIONS_DESCRIPTION}};
+   html_source->AddLocalizedStrings(kLocalizedStrings);
++  tark::AddContactedHostsStrings(html_source);
+   // Tark: the host comes from the component updater's URL, which domain
+   // substitution leaves alone, so Settings names the real server.
+   html_source->AddString(
+--- /dev/null
++++ b/chrome/browser/ui/webui/settings/tark_contacted_hosts.cc
+@@ -0,0 +1,43 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/ui/webui/settings/tark_contacted_hosts.h"
++
++#include "chrome/grit/generated_resources.h"
++#include "content/public/browser/web_ui_data_source.h"
++#include "ui/base/l10n/l10n_util.h"
++
++namespace tark {
++
++void AddContactedHostsStrings(content::WebUIDataSource* html_source) {
++  struct Row {
++    const char* name;
++    int message_id;
++    const char16_t* hosts;
++  };
++  static constexpr Row kRows[] = {
++      {"tarkConnectsShodhya", IDS_SETTINGS_TARK_CONNECTS_SHODHYA,
++       u"shodhya.com, api.shodhya.com"},
++      {"tarkConnectsStore", IDS_SETTINGS_TARK_CONNECTS_STORE,
++       u"chromewebstore.google.com, clients2.google.com, "
++       u"clients2.googleusercontent.com"},
++      {"tarkConnectsUblock", IDS_SETTINGS_TARK_CONNECTS_UBLOCK,
++       u"ublockorigin.github.io, ublockorigin.pages.dev, cdn.jsdelivr.net, "
++       u"raw.githubusercontent.com, malware-filter.gitlab.io, "
++       u"malware-filter.pages.dev, curbengh.github.io, publicsuffix.org, "
++       u"pgl.yoyo.org"},
++      {"tarkConnectsWidevine", IDS_SETTINGS_TARK_CONNECTS_WIDEVINE,
++       u"update.googleapis.com, edgedl.me.gvt1.com"},
++  };
++  for (const Row& row : kRows) {
++    html_source->AddString(
++        row.name, l10n_util::GetStringFUTF16(row.message_id, row.hosts));
++  }
++  html_source->AddLocalizedString("tarkConnectsTitle",
++                                  IDS_SETTINGS_TARK_CONNECTS_TITLE);
++  html_source->AddLocalizedString("tarkConnectsIntro",
++                                  IDS_SETTINGS_TARK_CONNECTS_INTRO);
++}
++
++}  // namespace tark
+--- /dev/null
++++ b/chrome/browser/ui/webui/settings/tark_contacted_hosts.h
+@@ -0,0 +1,23 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_WEBUI_SETTINGS_TARK_CONTACTED_HOSTS_H_
++#define CHROME_BROWSER_UI_WEBUI_SETTINGS_TARK_CONTACTED_HOSTS_H_
++
++namespace content {
++class WebUIDataSource;
++}
++
++namespace tark {
++
++// Adds the strings for Settings > Privacy > "What Tark connects to" (spec
++// 5.3). The hosts live in this file because domain substitution rewrites
++// every Google host in Chromium's string files and in the files it lists;
++// this file is Tark's own, so they reach the page as written. Keep them in
++// step with utils/allowed_hosts.txt, which the network check uses.
++void AddContactedHostsStrings(content::WebUIDataSource* html_source);
++
++}  // namespace tark
++
++#endif  // CHROME_BROWSER_UI_WEBUI_SETTINGS_TARK_CONTACTED_HOSTS_H_

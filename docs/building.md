@@ -99,3 +99,33 @@ instead of component build (`flags.dev.gn`), and
 `patches/tarka/core/fix-link-without-managed-profile-creation.patch`
 (see the patch header). Incremental rebuilds after a one-file change
 take a few minutes, dominated by the framework link.
+
+## M4 notes
+
+**Checking what Tark contacts.** Start a new profile with a net log and
+leave it alone for two minutes, quit, then check every contacted host
+against the §5.3 list:
+
+```sh
+open -n build/src/out/Default/Tark.app --args --user-data-dir=/tmp/tark-fresh \
+  --use-mock-keychain --log-net-log=/tmp/tark-idle.json
+# two minutes, no input; then quit Tark
+python3 utils/net_hosts.py /tmp/tark-idle.json --allowed utils/allowed_hosts.txt
+```
+
+It counts DNS lookups, request starts and QUIC sessions only, so hosts
+named inside response headers (Cloudflare's `report-to`, CSP `report-uri`)
+are not counted; Chromium's Reporting and NEL are compiled out
+(`enable_reporting=false`). It exits 1 if any host is not on the list.
+
+Result on 2026-10-17 (dev build with all of M4 Tasks 1 to 8, new
+profile, first-run on, two idle minutes): `shodhya.com` (16),
+`ublockorigin.github.io` (7), `ublockorigin.pages.dev` (7),
+`cdn.jsdelivr.net` (6), `malware-filter.gitlab.io` (3), `pgl.yoyo.org` (3),
+`publicsuffix.org` (3). Not allowed: none. Shodhya is the new tab page;
+the rest are uBlock Origin's first filter-list fetch.
+
+**The Web Store in a private window** (Review Focus 5). The store page in a
+private window has the same install API and shows "Remove from Tark" for an
+installed extension. The install goes through that same API, but an install
+started from a private window has not been run end to end.
