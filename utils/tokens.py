@@ -25,3 +25,18 @@ def contrast(a, b):
     """WCAG 2 contrast ratio between two #rrggbb colours."""
     la, lb = sorted((_luminance(a), _luminance(b)), reverse=True)
     return (la + 0.05) / (lb + 0.05)
+
+# Tab group colours, keyed by Chromium's group colour (spec 6.1): indigo,
+# coral, amber, mint, sky, lilac, peach, stone, and apricot for Chromium's
+# ninth. Light mode darkens each to at least 3:1 on light paper; amber's
+# spec value (#ffb703) is 1.55:1 there, so groups use #b78100.
+GROUP_DARK = {
+    "blue": "#8f88ff", "red": "#ff6b85", "yellow": "#ffc53d",
+    "green": "#6fd3c1", "cyan": "#7fb7ff", "purple": "#d99cff",
+    "pink": "#ff9f6b", "grey": "#bdb6a8", "orange": "#ffb074",
+}
+GROUP_LIGHT = {
+    "blue": "#4338ca", "red": "#e63e5c", "yellow": "#b78100",
+    "green": "#2f9986", "cyan": "#2d89ff", "purple": "#c05aff",
+    "pink": "#f55600", "grey": "#958a74", "orange": "#c25a00",
+}

@@ -33,3 +33,31 @@ def test_ink_on_paper_and_on_raised_passes_aa():
     for t in (DARK, LIGHT):
         assert contrast(t["ink"], t["paper"]) >= 4.5
         assert contrast(t["ink"], t["raised"]) >= 4.5
+
+
+# M3 Task 9: tab group colours (spec 6.1). A group's colour marks its chip
+# and the ring around its tabs, so it must stand out from the strip.
+CHROMIUM_GROUP_COLOURS = {"grey", "blue", "red", "yellow", "green", "pink",
+                          "purple", "cyan", "orange"}
+
+
+def test_every_chromium_group_colour_has_a_tark_colour():
+    from tokens import GROUP_DARK, GROUP_LIGHT
+    assert set(GROUP_DARK) == CHROMIUM_GROUP_COLOURS
+    assert set(GROUP_LIGHT) == CHROMIUM_GROUP_COLOURS
+
+
+def test_group_colours_follow_the_spec_mapping():
+    from tokens import GROUP_DARK
+    assert GROUP_DARK["blue"] == DARK["indigo"]
+    assert GROUP_DARK["red"] == DARK["coral"]
+    assert GROUP_DARK["yellow"] == DARK["amber"]
+    assert GROUP_DARK["grey"] == DARK["soft"]
+
+
+def test_group_colours_stand_out_from_the_strip_in_both_modes():
+    from tokens import GROUP_DARK, GROUP_LIGHT
+    for name, groups, t in (("dark", GROUP_DARK, DARK), ("light", GROUP_LIGHT, LIGHT)):
+        for colour, value in groups.items():
+            ratio = contrast(value, t["paper"])
+            assert ratio >= 3.0, f"{name} {colour} {value}: {ratio:.2f}"
