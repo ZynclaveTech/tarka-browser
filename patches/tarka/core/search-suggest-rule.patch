@@ -1,0 +1,336 @@
+Tark: search suggestions follow the default engine (spec §7).
+
+Suggestions are on by default (ungoogled-chromium's inox 0006 turns them
+off). A profile service, tark::SuggestRule, turns them off when the default
+engine stops being Shodhya, and back on when Shodhya returns, but only
+while the user has not set them: the pref tark.suggest_off_by_rule marks the
+rule's own write, and any other change to search.suggest_enabled clears it.
+Policy- or extension-controlled values are left alone.
+
+--- a/chrome/browser/profiles/chrome_browser_main_extra_parts_profiles.cc
++++ b/chrome/browser/profiles/chrome_browser_main_extra_parts_profiles.cc
+@@ -214,6 +214,7 @@
+ #include "chrome/browser/search/background/ntp_custom_background_service_factory.h"
+ #include "chrome/browser/search_engine_choice/search_engine_choice_service_factory.h"
+ #include "chrome/browser/search_engines/ai_mode_button_service_factory.h"
++#include "chrome/browser/search_engines/tark_suggest_rule_factory.h"
+ #include "chrome/browser/search_engines/template_url_fetcher_factory.h"
+ #include "chrome/browser/search_engines/template_url_prepopulate_data_resolver_factory.h"
+ #include "chrome/browser/search_engines/template_url_service_factory.h"
+@@ -753,6 +754,7 @@
+   actor_login::ActorLoginPermissionServiceFactory::GetInstance();
+   AiDataKeyedServiceFactory::GetInstance();
+   AiModeButtonServiceFactory::GetInstance();
++  tark::SuggestRuleFactory::GetInstance();
+   AimEligibilityServiceFactory::GetInstance();
+ #if BUILDFLAG(IS_ANDROID)
+   AndroidProfileBrowserCollectionServiceFactory::GetInstance();
+--- a/chrome/browser/profiles/profile.cc
++++ b/chrome/browser/profiles/profile.cc
+@@ -332,7 +332,7 @@
+ void Profile::RegisterProfilePrefs(user_prefs::PrefRegistrySyncable* registry) {
+   registry->RegisterBooleanPref(
+       prefs::kSearchSuggestEnabled,
+-      false,
++      true,
+       user_prefs::PrefRegistrySyncable::SYNCABLE_PREF);
+ #if BUILDFLAG(IS_ANDROID)
+   registry->RegisterStringPref(
+--- a/chrome/browser/search_engines/BUILD.gn
++++ b/chrome/browser/search_engines/BUILD.gn
+@@ -11,6 +11,8 @@
+   public = [
+     "ai_mode_button_service_factory.h",
+     "chrome_template_url_service_client.h",
++    "tark_suggest_rule.h",
++    "tark_suggest_rule_factory.h",
+     "template_url_fetcher_factory.h",
+     "template_url_prepopulate_data_resolver_factory.h",
+     "template_url_service_factory.h",
+@@ -20,6 +22,8 @@
+   sources = [
+     "ai_mode_button_service_factory.cc",
+     "chrome_template_url_service_client.cc",
++    "tark_suggest_rule.cc",
++    "tark_suggest_rule_factory.cc",
+     "template_url_fetcher_factory.cc",
+     "template_url_prepopulate_data_resolver_factory.cc",
+     "template_url_service_factory.cc",
+@@ -42,9 +46,12 @@
+     "//chrome/browser/search_engine_choice",
+     "//chrome/browser/webdata_services",
+     "//chrome/common:channel_info",
++    "//chrome/common:constants",
+     "//chrome/common:non_code_constants",
+     "//components/google/core/common",
++    "//components/keyed_service/core",
+     "//components/pref_registry",
++    "//components/prefs",
+     "//components/regional_capabilities",
+     "//components/strings",
+     "//components/version_info",
+--- /dev/null
++++ b/chrome/browser/search_engines/tark_suggest_rule.cc
+@@ -0,0 +1,93 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/search_engines/tark_suggest_rule.h"
++
++#include "base/auto_reset.h"
++#include "base/functional/bind.h"
++#include "chrome/common/pref_names.h"
++#include "components/pref_registry/pref_registry_syncable.h"
++#include "components/prefs/pref_service.h"
++#include "components/search_engines/template_url.h"
++#include "third_party/search_engines_data/resources/definitions/prepopulated_engines.h"
++
++namespace tark {
++
++SuggestRule::SuggestRule(PrefService* prefs,
++                         TemplateURLService* template_url_service)
++    : prefs_(prefs), template_url_service_(template_url_service) {
++  registrar_.Init(prefs_);
++  registrar_.Add(prefs::kSearchSuggestEnabled,
++                 base::BindRepeating(&SuggestRule::OnSuggestPrefChanged,
++                                     base::Unretained(this)));
++  observation_.Observe(template_url_service_);
++  if (template_url_service_->loaded()) {
++    Apply();
++  } else {
++    on_loaded_ = template_url_service_->RegisterOnLoadedCallback(
++        base::BindOnce(&SuggestRule::Apply, base::Unretained(this)));
++    template_url_service_->Load();
++  }
++}
++
++SuggestRule::~SuggestRule() = default;
++
++// static
++void SuggestRule::RegisterProfilePrefs(
++    user_prefs::PrefRegistrySyncable* registry) {
++  registry->RegisterBooleanPref(kSuggestOffByRule, false);
++}
++
++void SuggestRule::Shutdown() {
++  on_loaded_ = {};
++  observation_.Reset();
++  registrar_.RemoveAll();
++  template_url_service_ = nullptr;
++}
++
++void SuggestRule::OnTemplateURLServiceChanged() {
++  Apply();
++}
++
++void SuggestRule::OnTemplateURLServiceShuttingDown() {
++  on_loaded_ = {};
++  observation_.Reset();
++  template_url_service_ = nullptr;
++}
++
++void SuggestRule::Apply() {
++  if (!template_url_service_ || !template_url_service_->loaded()) {
++    return;
++  }
++  const PrefService::Preference* suggest =
++      prefs_->FindPreference(prefs::kSearchSuggestEnabled);
++  // A policy or an extension that sets suggestions decides, not the rule.
++  if (!suggest || !suggest->IsUserModifiable()) {
++    return;
++  }
++  const TemplateURL* engine = template_url_service_->GetDefaultSearchProvider();
++  const bool shodhya =
++      engine &&
++      engine->prepopulate_id() == TemplateURLPrepopulateData::shodhya.id;
++
++  base::AutoReset<bool> applying(&applying_, true);
++  if (!shodhya && suggest->IsDefaultValue()) {
++    prefs_->SetBoolean(prefs::kSearchSuggestEnabled, false);
++    prefs_->SetBoolean(kSuggestOffByRule, true);
++  } else if (shodhya && prefs_->GetBoolean(kSuggestOffByRule)) {
++    prefs_->ClearPref(prefs::kSearchSuggestEnabled);
++    prefs_->ClearPref(kSuggestOffByRule);
++  }
++}
++
++void SuggestRule::OnSuggestPrefChanged() {
++  if (applying_) {
++    return;
++  }
++  // The user (or sync, or a policy) chose; the rule's write is no longer
++  // its own to undo.
++  prefs_->ClearPref(kSuggestOffByRule);
++}
++
++}  // namespace tark
+--- /dev/null
++++ b/chrome/browser/search_engines/tark_suggest_rule.h
+@@ -0,0 +1,65 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_SEARCH_ENGINES_TARK_SUGGEST_RULE_H_
++#define CHROME_BROWSER_SEARCH_ENGINES_TARK_SUGGEST_RULE_H_
++
++#include "base/callback_list.h"
++#include "base/memory/raw_ptr.h"
++#include "base/scoped_observation.h"
++#include "components/keyed_service/core/keyed_service.h"
++#include "components/prefs/pref_change_registrar.h"
++#include "components/search_engines/template_url_service.h"
++#include "components/search_engines/template_url_service_observer.h"
++
++class PrefService;
++
++namespace user_prefs {
++class PrefRegistrySyncable;
++}
++
++namespace tark {
++
++// True while search suggestions are off because the rule turned them off,
++// not because the user did.
++inline constexpr char kSuggestOffByRule[] = "tark.suggest_off_by_rule";
++
++// Search suggestions are on while Shodhya is the default engine and off for
++// any other engine, so keystrokes never reach an engine the user merely
++// switched to. The rule acts only while the user has not set suggestions
++// themselves, and only ever undoes its own write.
++class SuggestRule : public KeyedService, public TemplateURLServiceObserver {
++ public:
++  SuggestRule(PrefService* prefs, TemplateURLService* template_url_service);
++  SuggestRule(const SuggestRule&) = delete;
++  SuggestRule& operator=(const SuggestRule&) = delete;
++  ~SuggestRule() override;
++
++  static void RegisterProfilePrefs(user_prefs::PrefRegistrySyncable* registry);
++
++  // KeyedService:
++  void Shutdown() override;
++
++  // TemplateURLServiceObserver:
++  void OnTemplateURLServiceChanged() override;
++  void OnTemplateURLServiceShuttingDown() override;
++
++ private:
++  void Apply();
++  void OnSuggestPrefChanged();
++
++  raw_ptr<PrefService> prefs_;
++  raw_ptr<TemplateURLService> template_url_service_;
++  PrefChangeRegistrar registrar_;
++  base::ScopedObservation<TemplateURLService, TemplateURLServiceObserver>
++      observation_{this};
++  base::CallbackListSubscription on_loaded_;
++  // Set around the rule's own pref writes, so OnSuggestPrefChanged can tell
++  // them from the user's.
++  bool applying_ = false;
++};
++
++}  // namespace tark
++
++#endif  // CHROME_BROWSER_SEARCH_ENGINES_TARK_SUGGEST_RULE_H_
+--- /dev/null
++++ b/chrome/browser/search_engines/tark_suggest_rule_factory.cc
+@@ -0,0 +1,61 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/search_engines/tark_suggest_rule_factory.h"
++
++#include <memory>
++
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/profiles/profile_selections.h"
++#include "chrome/browser/search_engines/tark_suggest_rule.h"
++#include "chrome/browser/search_engines/template_url_service_factory.h"
++
++namespace tark {
++
++// static
++SuggestRuleFactory* SuggestRuleFactory::GetInstance() {
++  static base::NoDestructor<SuggestRuleFactory> instance;
++  return instance.get();
++}
++
++SuggestRuleFactory::SuggestRuleFactory()
++    : ProfileKeyedServiceFactory(
++          "TarkSuggestRule",
++          ProfileSelections::Builder()
++              .WithRegular(ProfileSelection::kOriginalOnly)
++              .WithGuest(ProfileSelection::kOriginalOnly)
++              .WithAshInternals(ProfileSelection::kNone)
++              .Build()) {
++  DependsOn(TemplateURLServiceFactory::GetInstance());
++}
++
++SuggestRuleFactory::~SuggestRuleFactory() = default;
++
++std::unique_ptr<KeyedService>
++SuggestRuleFactory::BuildServiceInstanceForBrowserContext(
++    content::BrowserContext* context) const {
++  Profile* profile = Profile::FromBrowserContext(context);
++  TemplateURLService* template_url_service =
++      TemplateURLServiceFactory::GetForProfile(profile);
++  if (!template_url_service) {
++    return nullptr;
++  }
++  return std::make_unique<SuggestRule>(profile->GetPrefs(),
++                                       template_url_service);
++}
++
++void SuggestRuleFactory::RegisterProfilePrefs(
++    user_prefs::PrefRegistrySyncable* registry) {
++  SuggestRule::RegisterProfilePrefs(registry);
++}
++
++bool SuggestRuleFactory::ServiceIsCreatedWithBrowserContext() const {
++  return true;
++}
++
++bool SuggestRuleFactory::ServiceIsNULLWhileTesting() const {
++  return true;
++}
++
++}  // namespace tark
+--- /dev/null
++++ b/chrome/browser/search_engines/tark_suggest_rule_factory.h
+@@ -0,0 +1,34 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_SEARCH_ENGINES_TARK_SUGGEST_RULE_FACTORY_H_
++#define CHROME_BROWSER_SEARCH_ENGINES_TARK_SUGGEST_RULE_FACTORY_H_
++
++#include "base/no_destructor.h"
++#include "chrome/browser/profiles/profile_keyed_service_factory.h"
++
++namespace tark {
++
++// Creates the suggestions rule with every regular and guest profile.
++class SuggestRuleFactory : public ProfileKeyedServiceFactory {
++ public:
++  static SuggestRuleFactory* GetInstance();
++
++ private:
++  friend base::NoDestructor<SuggestRuleFactory>;
++  SuggestRuleFactory();
++  ~SuggestRuleFactory() override;
++
++  // BrowserContextKeyedServiceFactory:
++  std::unique_ptr<KeyedService> BuildServiceInstanceForBrowserContext(
++      content::BrowserContext* context) const override;
++  void RegisterProfilePrefs(
++      user_prefs::PrefRegistrySyncable* registry) override;
++  bool ServiceIsCreatedWithBrowserContext() const override;
++  bool ServiceIsNULLWhileTesting() const override;
++};
++
++}  // namespace tark
++
++#endif  // CHROME_BROWSER_SEARCH_ENGINES_TARK_SUGGEST_RULE_FACTORY_H_
