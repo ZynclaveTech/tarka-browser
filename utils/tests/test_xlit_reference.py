@@ -123,6 +123,94 @@ class KnownOutputsTest(unittest.TestCase):
             xlit_reference.transliterate(self.model, 'xx', 'abc')
 
 
+PAD, EOS, UNK = 1, 2, 3
+
+
+class ScriptedDecoder:
+    """A decoder whose next-token distribution depends on the history."""
+
+    def __init__(self, vocab, table):
+        self.vocab, self.table = vocab, table
+        self.hists = [()]
+
+    def reorder(self, source):
+        self.hists = [self.hists[i] for i in source]
+
+    def step(self, last, step):
+        rows = []
+        for i, token in enumerate(last):
+            if step > 0:
+                self.hists[i] = self.hists[i] + (token,)
+            probs = np.full(self.vocab, 1e-9)
+            for t, p in self.table(self.hists[i], step).items():
+                probs[t] = p
+            rows.append(np.log(probs / probs.sum()))
+        return np.array(rows)
+
+
+@unittest.skipIf(np is None, 'numpy not installed')
+class BeamSearchTest(unittest.TestCase):
+    def run_search(self, table, beam=2, nbest=2, max_len=10):
+        decoder = ScriptedDecoder(8, table)
+        return xlit_reference.beam_search(decoder, 8, PAD, EOS, UNK, beam,
+                                          nbest, max_len)
+
+    def test_eos_ranked_below_beam_is_skipped(self):
+        # fairseq finishes </s> only among the first `beam` of the 2*beam
+        # candidates. At step 1 the </s> of hypothesis [4] is 4th (0.08), so
+        # it is dropped: [4] must never be returned as a word.
+        def table(hist, step):
+            if step == 0:
+                return {4: .4, 5: .3, 6: .2, 7: .1}
+            if step == 1 and hist[-1] == 4:
+                return {6: .5, 7: .3, EOS: .2}
+            if step == 1 and hist[-1] == 5:
+                return {6: .6, EOS: .2, 7: .2}
+            return {EOS: 1.0}
+        found = self.run_search(table)
+        self.assertEqual([t for t, _ in found], [[4, 6], [5, 6]])
+        # normalised by the length including </s>: log(p) / 3
+        self.assertAlmostEqual(found[0][1], np.log(.2) / 3, places=5)
+        self.assertAlmostEqual(found[1][1], np.log(.18) / 3, places=5)
+
+    def test_eos_within_beam_finishes_and_beam_continues(self):
+        def table(hist, step):
+            if step == 0:
+                return {4: .6, 5: .4}
+            if step == 1:
+                return {EOS: .5, 6: .5}
+            return {EOS: 1.0}
+        found = self.run_search(table, beam=2, nbest=2)
+        # [4] ends within the beam; the beam goes on with [4, 6], whose
+        # longer length gives it the better normalised score
+        self.assertEqual([t for t, _ in found], [[4, 6], [4]])
+
+    def test_forced_eos_at_max_len_returns_truncated_hypotheses(self):
+        def table(hist, step):
+            return {4: .5, 5: .5, EOS: 1e-9}
+        found = self.run_search(table, max_len=3)
+        self.assertEqual(len(found), 2)
+        self.assertTrue(all(len(toks) == 3 for toks, _ in found), found)
+
+    def test_unk_is_not_blocked(self):
+        def table(hist, step):
+            return {UNK: .9, 4: .1} if step == 0 else {EOS: 1.0}
+        found = self.run_search(table)
+        self.assertEqual(found[0][0], [UNK])
+
+    def test_pad_is_never_selected(self):
+        def table(hist, step):
+            return {PAD: .9, 4: .1} if step == 0 else {EOS: 1.0}
+        found = self.run_search(table)
+        self.assertTrue(all(PAD not in toks for toks, _ in found))
+
+    def test_eos_is_not_allowed_first(self):
+        def table(hist, step):
+            return {EOS: .9, 4: .1} if step == 0 else {EOS: 1.0}
+        found = self.run_search(table)
+        self.assertTrue(all(toks for toks, _ in found))
+
+
 RESOURCES = os.path.join(REPO, 'resources', 'xlit')
 
 

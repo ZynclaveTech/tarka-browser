@@ -29,8 +29,30 @@ Details that matter for a port (all verified against the library):
     first token is at index 2, the padding index plus one), then
     layernorm_embedding; layers are pre-norm; q is scaled by 1/8 after its
     bias; GELU is the exact erf form; layer-norm eps is 1e-5;
-  * <pad> and <unk> are never produced, </s> is not allowed as the first
-    token, hypotheses are normalised by their length including </s>.
+
+The beam search reproduces fairseq v0.12.2 SequenceGenerator (the version the
+ai4bharat-transliteration 1.1.3 package pins) as that package calls it
+(interactive generation defaults, beam 4, translate(..., nbest=topk=4)):
+  * beam_size 4; max_len_a 0, max_len_b 200, so max_len = 200 whatever the
+    source length (min with the model's 1024 positions - 1); min_len 1;
+    lenpen 1.0; unkpen 0.0; temperature 1.0; scores normalised
+    (not --unnormalized); no sampling, no prefix, no constraints.
+  * step s = 0..max_len (one extra step for </s>). Log-probabilities are
+    float32 log-softmax. <pad> is set to -inf; <unk> only has unkpen (0)
+    subtracted, so it is NOT blocked; </s> is -inf while s < min_len; at
+    s = max_len everything but </s> is -inf (a forced </s>, so an unfinished
+    word is still returned, truncated).
+  * the 2*beam best (hypothesis, token) pairs by cumulative score are taken
+    (step 0 looks at one hypothesis only), ties broken by the lower flat
+    index. An </s> among the first `beam` of them finishes that hypothesis
+    (until `beam` hypotheses are finished); an </s> ranked beam..2*beam-1
+    is dropped. The next beam is the first `beam` non-</s> candidates.
+  * a finished hypothesis scores (cumulative log-prob including </s>) /
+    (s + 1) ** lenpen, s + 1 being its length including </s>. The loop stops
+    as soon as `beam` hypotheses are finished. Hypotheses are returned by
+    descending score.
+  * the library then prints score / ln 2 and rescoring uses 2 ** that, i.e.
+    exp(score): that is the number printed here.
 """
 
 import json
@@ -44,7 +66,10 @@ MAGIC = b'TXLM\x01\x00\x00\x00'
 LN_EPS = 1e-5
 BEAM = 4
 NBEST = 4
-MAX_LEN = 40
+MAX_LEN = 200
+MIN_LEN = 1
+LEN_PENALTY = 1.0
+UNK_PENALTY = 0.0
 MAX_POSITIONS = 256
 
 
@@ -174,6 +199,107 @@ def _log_softmax(logits):
     return logits - np.log(np.exp(logits).sum(-1, keepdims=True))
 
 
+class _Decoder:
+    """Incremental decoder with a KV cache; one row per live hypothesis."""
+
+    def __init__(self, model, enc):
+        m = self.m = model
+        self.scale = (m.dim // m.heads) ** -0.5
+        self.enc_k = [_heads(m, _linear(
+            m, enc, 'decoder.layers.%d.encoder_attn.k_proj' % i))
+            for i in range(m.layers)]
+        self.enc_v = [_heads(m, _linear(
+            m, enc, 'decoder.layers.%d.encoder_attn.v_proj' % i))
+            for i in range(m.layers)]
+        hd = m.dim // m.heads
+        self.keys = [np.zeros((1, m.heads, 0, hd), np.float32)
+                     for _ in range(m.layers)]
+        self.vals = [np.zeros((1, m.heads, 0, hd), np.float32)
+                     for _ in range(m.layers)]
+
+    def reorder(self, source):
+        self.keys = [k[source] for k in self.keys]
+        self.vals = [v[source] for v in self.vals]
+
+    def step(self, last, step):
+        """Log-probabilities (rows, vocab) for the token after `last`."""
+        m = self.m
+        b = len(last)
+        x = 16.0 * m.weights['decoder.embed_tokens.weight'][
+            np.array(last)[:, None]] + m.positions[2 + step][None, None]
+        x = _layer_norm(m, x, 'decoder.layernorm_embedding')
+        for i in range(m.layers):
+            p = 'decoder.layers.%d' % i
+            h = _layer_norm(m, x, p + '.self_attn_layer_norm')
+            q = _heads(m, _linear(m, h, p + '.self_attn.q_proj') * self.scale)
+            self.keys[i] = np.concatenate(
+                [self.keys[i],
+                 _heads(m, _linear(m, h, p + '.self_attn.k_proj'))], axis=2)
+            self.vals[i] = np.concatenate(
+                [self.vals[i],
+                 _heads(m, _linear(m, h, p + '.self_attn.v_proj'))], axis=2)
+            x = x + _linear(m, _attend(q, self.keys[i], self.vals[i]),
+                            p + '.self_attn.out_proj')
+            h = _layer_norm(m, x, p + '.encoder_attn_layer_norm')
+            q = _heads(m, _linear(m, h, p + '.encoder_attn.q_proj')
+                       * self.scale)
+            ek = np.broadcast_to(self.enc_k[i], (b,) + self.enc_k[i].shape[1:])
+            ev = np.broadcast_to(self.enc_v[i], (b,) + self.enc_v[i].shape[1:])
+            x = x + _linear(m, _attend(q, ek, ev), p + '.encoder_attn.out_proj')
+            h = _layer_norm(m, x, p + '.final_layer_norm')
+            x = x + _linear(m, gelu(_linear(m, h, p + '.fc1')), p + '.fc2')
+        x = _layer_norm(m, x[:, -1], 'decoder.layer_norm')
+        return _log_softmax(x @ m.weights['decoder.output_projection.weight'].T)
+
+
+def beam_search(decoder, vocab, pad, eos, unk, beam=BEAM, nbest=NBEST,
+                max_len=MAX_LEN):
+    """fairseq v0.12.2 SequenceGenerator._generate for one sentence.
+
+    `decoder.step(last_tokens, step)` returns (rows, vocab) log-probs and
+    `decoder.reorder(source_rows)` follows the surviving hypotheses. Returns
+    [(token ids without the leading/trailing </s>, normalised log score)],
+    best first.
+    """
+    hyps = [[eos]]  # token histories; the decoder starts from </s>
+    hyp_scores = np.zeros(1, dtype=np.float32)
+    finished = []
+    for step in range(max_len + 1):  # one extra step for </s>
+        lp = np.array(decoder.step([h[-1] for h in hyps], step),
+                      dtype=np.float32)
+        lp[:, pad] = -np.inf  # never select pad
+        lp[:, unk] -= UNK_PENALTY
+        if step >= max_len:  # forced end: only </s> remains possible
+            keep = lp[:, eos].copy()
+            lp[:] = -np.inf
+            lp[:, eos] = keep
+        elif step < MIN_LEN:
+            lp[:, eos] = -np.inf
+        # BeamSearch.step: the best 2*beam of all (hypothesis, token) pairs
+        # by cumulative score (step 0 has one hypothesis).
+        total = (hyp_scores[:, None] + lp).ravel()
+        k = min(2 * beam, total.size - 1)
+        top = np.argpartition(-total, k - 1)[:k]
+        top = top[np.lexsort((top, -total[top]))]  # score, then index
+        cands = [(total[i], int(i) // vocab, int(i) % vocab) for i in top]
+        # Only an </s> inside the first `beam` candidates ends a hypothesis;
+        # one ranked lower is skipped entirely (neither finished nor kept).
+        for score, bi, t in cands[:beam]:
+            if t == eos and score != -np.inf and len(finished) < nbest:
+                finished.append((hyps[bi][1:], score / np.float32(
+                    (step + 1) ** LEN_PENALTY)))
+        # The beam continues with the first `beam` candidates that are not
+        # </s>, taken from all 2*beam.
+        active = [c for c in cands if c[2] != eos][:beam]
+        if len(finished) >= nbest or step >= max_len or not active:
+            break
+        hyps = [hyps[bi] + [t] for _, bi, t in active]
+        hyp_scores = np.array([c[0] for c in active], dtype=np.float32)
+        decoder.reorder([bi for _, bi, _ in active])
+    finished.sort(key=lambda h: -float(h[1]))  # stable
+    return [(toks, float(score)) for toks, score in finished]
+
+
 def transliterate(model, tag, word, beam=BEAM, nbest=NBEST,
                   max_len=MAX_LEN):
     """Returns [(candidate, score)] best first, score in (0, 1]."""
@@ -185,69 +311,11 @@ def transliterate(model, tag, word, beam=BEAM, nbest=NBEST,
     ids += [m.src_index.get(c, m.unk) if len(c) == 1 else m.unk
             for c in word.lower()]
     ids.append(m.eos)
-    scale = (m.dim // m.heads) ** -0.5
-    enc = _encode(m, np.array(ids))
-    enc_k = [_heads(m, _linear(m, enc, 'decoder.layers.%d.encoder_attn.k_proj'
-                               % i)) for i in range(m.layers)]
-    enc_v = [_heads(m, _linear(m, enc, 'decoder.layers.%d.encoder_attn.v_proj'
-                               % i)) for i in range(m.layers)]
-    heads, hd = m.heads, m.dim // m.heads
-    keys = [np.zeros((1, heads, 0, hd), np.float32) for _ in range(m.layers)]
-    vals = [np.zeros((1, heads, 0, hd), np.float32) for _ in range(m.layers)]
-    hyps = [([m.eos], 0.0)]
-    finished = []
-    for step in range(max_len):
-        b = len(hyps)
-        last = np.array([[h[0][-1]] for h in hyps])
-        x = 16.0 * m.weights['decoder.embed_tokens.weight'][last] \
-            + m.positions[2 + step][None, None]
-        x = _layer_norm(m, x, 'decoder.layernorm_embedding')
-        for i in range(m.layers):
-            p = 'decoder.layers.%d' % i
-            h = _layer_norm(m, x, p + '.self_attn_layer_norm')
-            q = _heads(m, _linear(m, h, p + '.self_attn.q_proj') * scale)
-            keys[i] = np.concatenate(
-                [keys[i], _heads(m, _linear(m, h, p + '.self_attn.k_proj'))],
-                axis=2)
-            vals[i] = np.concatenate(
-                [vals[i], _heads(m, _linear(m, h, p + '.self_attn.v_proj'))],
-                axis=2)
-            x = x + _linear(m, _attend(q, keys[i], vals[i]),
-                            p + '.self_attn.out_proj')
-            h = _layer_norm(m, x, p + '.encoder_attn_layer_norm')
-            q = _heads(m, _linear(m, h, p + '.encoder_attn.q_proj') * scale)
-            ek = np.broadcast_to(enc_k[i], (b,) + enc_k[i].shape[1:])
-            ev = np.broadcast_to(enc_v[i], (b,) + enc_v[i].shape[1:])
-            x = x + _linear(m, _attend(q, ek, ev), p + '.encoder_attn.out_proj')
-            h = _layer_norm(m, x, p + '.final_layer_norm')
-            x = x + _linear(m, gelu(_linear(m, h, p + '.fc1')), p + '.fc2')
-        x = _layer_norm(m, x[:, -1], 'decoder.layer_norm')
-        lp = _log_softmax(x @ m.weights['decoder.output_projection.weight'].T)
-        lp[:, m.pad] = -np.inf
-        lp[:, m.unk] = -np.inf
-        if step == 0:
-            lp[:, m.eos] = -np.inf  # min_len = 1
-        cand = []
-        for bi, (_, score) in enumerate(hyps):
-            for t in np.argpartition(-lp[bi], 2 * beam)[:2 * beam]:
-                cand.append((score + float(lp[bi, t]), bi, int(t)))
-        cand.sort(key=lambda c: -c[0])
-        new, source = [], []
-        for score, bi, t in cand[:2 * beam]:
-            if t == m.eos:
-                if len(finished) < nbest:
-                    finished.append((hyps[bi][0][1:], score / (step + 1)))
-            elif len(new) < beam:
-                new.append((hyps[bi][0] + [t], score))
-                source.append(bi)
-        hyps = new
-        if len(finished) >= nbest or not hyps:
-            break
-        keys = [k[source] for k in keys]
-        vals = [v[source] for v in vals]
-    finished.sort(key=lambda h: -h[1])
+    decoder = _Decoder(m, _encode(m, np.array(ids)))
+    found = beam_search(decoder, len(m.tgt_vocab), m.pad, m.eos, m.unk,
+                        beam, nbest, max_len)
     return [(''.join(m.tgt_vocab[t] for t in toks), math.exp(score))
-            for toks, score in finished]
+            for toks, score in found]
 
 
 def format_candidates(cands):

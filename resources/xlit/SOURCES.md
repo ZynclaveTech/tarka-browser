@@ -2,7 +2,7 @@
 
 The lists in `words/` and `english-common.txt.xz` feed the dictionary rescoring
 of Tark's on-device transliteration (D1). They are counts of words in a
-public-domain corpus. AI4Bharat's own `word_prob_dicts` are **not** used: they
+corpus released under CC0 (see the licence note below). AI4Bharat's own `word_prob_dicts` are **not** used: they
 derive from CC BY-NC-SA data.
 
 ## Corpus: IndicCorp v2 (AI4Bharat), licence CC0
@@ -90,7 +90,7 @@ still transliterates `si`; without a list it returns its own candidate order.
 
 IndicCorp v2 `data/en.txt` (the English part), first 1 GiB, counted with
 `count --tag en --top 20000` (lower-cased, a-z only, apostrophe words
-dropped). The 584 words in `english-exclude.txt` are removed (19,416 remain).
+dropped). The 577 words in `english-exclude.txt` are removed (19,423 remain).
 `english-exclude.txt` gives a one-line reason for each; the rule is at its top.
 Rebuild:
 
@@ -98,9 +98,9 @@ Rebuild:
 
 The exclusions were found by transliterating every one of the 20,000 words to
 Hindi with the reference implementation and keeping, after review, the ones
-that are Indian-language words or names whose Devanagari form is among the
-5,000 commonest Hindi words (1,640 words matched; most are English
-loanwords such as `school` and were kept as English).
+that an Indian reader would type as Hindi far more often than as English and
+whose Devanagari form is among the 5,000 commonest Hindi words (1,640 words
+matched; most are English loanwords such as `school` and were kept as English).
 
 ## Other files
 
