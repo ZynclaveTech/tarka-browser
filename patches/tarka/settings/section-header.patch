@@ -1,0 +1,301 @@
+--- a/chrome/app/settings_strings.grdp
++++ b/chrome/app/settings_strings.grdp
+@@ -590,6 +590,30 @@
+     <message name="IDS_SETTINGS_TARK_STATUS_ADVANCED" desc="State shown under Advanced: what the section holds.">
+       Profile, system, reset
+     </message>
++    <message name="IDS_SETTINGS_TARK_HEADER_SEARCH" desc="Sentence under the Search section label: which engine searches from the address bar.">
++      <ph name="ENGINE">$1<ex>Shodhya</ex></ph> is your search engine
++    </message>
++    <message name="IDS_SETTINGS_TARK_HEADER_PRIVACY" desc="Sentence under the Privacy section label.">
++      Nothing goes to Google
++    </message>
++    <message name="IDS_SETTINGS_TARK_HEADER_LOOK_SYSTEM" desc="Sentence under the Look section label when the browser follows the Mac's light or dark appearance.">
++      Light or dark, as your Mac is
++    </message>
++    <message name="IDS_SETTINGS_TARK_HEADER_LOOK_LIGHT" desc="Sentence under the Look section label when the browser is always light.">
++      Always light
++    </message>
++    <message name="IDS_SETTINGS_TARK_HEADER_LOOK_DARK" desc="Sentence under the Look section label when the browser is always dark.">
++      Always dark
++    </message>
++    <message name="IDS_SETTINGS_TARK_HEADER_PASSWORDS" desc="Sentence under the Passwords section label.">
++      Saved on this Mac only, no sync
++    </message>
++    <message name="IDS_SETTINGS_TARK_HEADER_DOWNLOADS" desc="Sentence under the Downloads section label: the folder downloads are saved to.">
++      Files go to <ph name="FOLDER">$1<ex>Downloads</ex></ph>
++    </message>
++    <message name="IDS_SETTINGS_TARK_HEADER_ADVANCED" desc="Sentence under the Advanced section label, which groups the less used settings.">
++      For when you need them
++    </message>
+     <message name="IDS_SETTINGS_TARK_CONNECTS_TITLE" desc="Title of the Privacy settings row that lists every service Tark itself connects to.">
+       What Tark connects to
+     </message>
+--- a/chrome/browser/resources/settings/BUILD.gn
++++ b/chrome/browser/resources/settings/BUILD.gn
+@@ -409,6 +409,8 @@
+     "settings_page/settings_section.ts",
+     "tark/home_page.html.ts",
+     "tark/home_page.ts",
++    "tark/section_header.html.ts",
++    "tark/section_header.ts",
+     "tark/tark_status.ts",
+     "settings_page/settings_subpage.html.ts",
+     "settings_page/settings_subpage.ts",
+@@ -592,6 +594,7 @@
+     "search_page/site_shortcuts_page.css",
+     "settings_page/settings_section.css",
+     "tark/home_page.css",
++    "tark/section_header.css",
+     "settings_page/settings_subpage.css",
+     "site_settings/clear_storage_dialog_shared.css",
+     "site_settings/site_settings_shared.css",
+--- a/chrome/browser/resources/settings/settings_main/settings_main.html
++++ b/chrome/browser/resources/settings/settings_main/settings_main.html
+@@ -54,6 +54,11 @@
+   </settings-reset-profile-banner>
+ </template>
+ 
++<settings-tark-section-header class="cr-centered-card-container"
++    section="[[tarkHeaderSection_(lastRoute_, inSearchMode_)]]"
++    hidden$="[[!tarkHeaderSection_(lastRoute_, inSearchMode_)]]">
++</settings-tark-section-header>
++
+ <cr-view-manager id="switcher"
+     show-all$="[[shouldShowAll_(inSearchMode_, lastRoute_)]]">
+   <div slot="view" id="home">
+--- a/chrome/browser/resources/settings/settings_main/settings_main.ts
++++ b/chrome/browser/resources/settings/settings_main/settings_main.ts
+@@ -36,6 +36,7 @@
+ import {pageVisibility} from '../page_visibility.js';
+ import type {PageVisibility} from '../page_visibility.js';
+ import '../tark/home_page.js';
++import '../tark/section_header.js';
+ 
+ import {advancedGroupRoutes, isInAdvancedGroup, routes} from '../route.js';
+ import {RouteObserverMixin} from '../router.js';
+@@ -273,6 +274,31 @@
+            isInAdvancedGroup(route))));
+   }
+ 
++  /**
++   * Tark: the section whose header shows above the views, or '' on home,
++   * in search, on About and on subpages.
++   */
++  private tarkHeaderSection_(): string {
++    const route = this.lastRoute_;
++    if (this.inSearchMode_ || !route || route === routes.BASIC ||
++        route.isSubpage()) {
++      return '';
++    }
++    if (isInAdvancedGroup(route)) {
++      return 'advanced';
++    }
++    const sections: Array<[Route|undefined, string]> = [
++      [routes.SEARCH, 'search'],
++      [routes.PRIVACY, 'privacy'],
++      [routes.APPEARANCE, 'look'],
++      [routes.AUTOFILL, 'passwords'],
++      [routes.DOWNLOADS, 'downloads'],
++      [routes.LANGUAGES, 'languages'],
++    ];
++    const match = sections.find(([section]) => section?.contains(route));
++    return match ? match[1] : '';
++  }
++
+   private renderHome_(): boolean {
+     return !this.inSearchMode_ && this.lastRoute_ === routes.BASIC;
+   }
+--- /dev/null
++++ b/chrome/browser/resources/settings/tark/section_header.css
+@@ -0,0 +1,33 @@
++/* Copyright 2026 The Tark Authors
++ * Use of this source code is governed by a BSD-style license that can be
++ * found in the LICENSE file. */
++
++/* #css_wrapper_metadata_start
++ * #type=style-lit
++ * #import=//resources/cr_elements/cr_shared_vars.css.js
++ * #css_wrapper_metadata_end */
++
++:host {
++  display: block;
++  padding: 16px 0 4px;
++}
++
++:host([hidden]) {
++  display: none;
++}
++
++#label {
++  color: var(--color-sys-primary, var(--cr-link-color));
++  font-size: 11px;
++  font-weight: 600;
++  letter-spacing: .08em;
++  text-transform: uppercase;
++}
++
++#sentence {
++  color: var(--cr-primary-text-color);
++  font-size: 20px;
++  font-weight: 600;
++  margin-top: 4px;
++  min-height: 1.3em;
++}
+--- /dev/null
++++ b/chrome/browser/resources/settings/tark/section_header.html.ts
+@@ -0,0 +1,16 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++import {html} from 'chrome://resources/lit/v3_0/lit.rollup.js';
++
++import type {TarkSectionHeaderElement} from './section_header.js';
++
++export function getHtml(this: TarkSectionHeaderElement) {
++  // clang-format off
++  return html`<!--_html_template_start_-->
++<div id="label">${this.label_()}</div>
++<div id="sentence">${this.sentence_()}</div>
++<!--_html_template_end_-->`;
++  // clang-format on
++}
+--- /dev/null
++++ b/chrome/browser/resources/settings/tark/section_header.ts
+@@ -0,0 +1,118 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++/**
++ * @fileoverview 'settings-tark-section-header' opens each of Tark's settings
++ * sections (spec 6.1): the section's name as a small label and one plain
++ * sentence saying what it is set to.
++ */
++
++import {I18nMixinLit} from 'chrome://resources/cr_elements/i18n_mixin_lit.js';
++import {CrLitElement} from 'chrome://resources/lit/v3_0/lit.rollup.js';
++
++import {getCss} from './section_header.css.js';
++import {getHtml} from './section_header.html.js';
++import {getTarkStatus, onTarkStatusChanged} from './tark_status.js';
++import type {TarkStatus} from './tark_status.js';
++
++/** The sections with a header; '' for none. */
++export type TarkSection = ''|'search'|'privacy'|'look'|'passwords'|
++    'downloads'|'languages'|'advanced';
++
++const LABELS: Record<Exclude<TarkSection, ''>, string> = {
++  search: 'tarkSearch',
++  privacy: 'tarkPrivacy',
++  look: 'tarkLook',
++  passwords: 'tarkPasswords',
++  downloads: 'tarkDownloads',
++  languages: 'tarkLanguages',
++  advanced: 'tarkAdvanced',
++};
++
++const TarkSectionHeaderElementBase = I18nMixinLit(CrLitElement);
++
++export class TarkSectionHeaderElement extends TarkSectionHeaderElementBase {
++  static get is() {
++    return 'settings-tark-section-header';
++  }
++
++  static override get styles() {
++    return getCss();
++  }
++
++  override render() {
++    return getHtml.bind(this)();
++  }
++
++  static override get properties() {
++    return {
++      section: {type: String},
++      status_: {type: Object},
++    };
++  }
++
++  accessor section: TarkSection = '';
++  protected accessor status_: TarkStatus|null = null;
++  private stopListening_: (() => void)|null = null;
++  private refreshes_: number = 0;
++
++  override connectedCallback() {
++    super.connectedCallback();
++    this.refresh_();
++    this.stopListening_ = onTarkStatusChanged(() => this.refresh_());
++  }
++
++  override disconnectedCallback() {
++    super.disconnectedCallback();
++    this.stopListening_?.();
++    this.stopListening_ = null;
++  }
++
++  private async refresh_() {
++    // Only the latest of overlapping refreshes lands.
++    const refresh = ++this.refreshes_;
++    const status = await getTarkStatus();
++    if (refresh === this.refreshes_) {
++      this.status_ = status;
++    }
++  }
++
++  protected label_(): string {
++    return this.section ? this.i18n(LABELS[this.section]) : '';
++  }
++
++  protected sentence_(): string {
++    const s = this.status_;
++    switch (this.section) {
++      case 'search':
++        return s && s.search ? this.i18n('tarkHeaderSearch', s.search) : '';
++      case 'privacy':
++        return this.i18n('tarkHeaderPrivacy');
++      case 'look':
++        return this.i18n(
++            s?.look === 'light' ? 'tarkHeaderLookLight' :
++                s?.look === 'dark' ? 'tarkHeaderLookDark' :
++                                     'tarkHeaderLookSystem');
++      case 'passwords':
++        return this.i18n('tarkHeaderPasswords');
++      case 'downloads':
++        return s && s.downloads ?
++            this.i18n('tarkHeaderDownloads', s.downloads) : '';
++      case 'languages':
++        return s ? s.languages : '';
++      case 'advanced':
++        return this.i18n('tarkHeaderAdvanced');
++      default:
++        return '';
++    }
++  }
++}
++
++declare global {
++  interface HTMLElementTagNameMap {
++    'settings-tark-section-header': TarkSectionHeaderElement;
++  }
++}
++
++customElements.define(TarkSectionHeaderElement.is, TarkSectionHeaderElement);
+--- a/chrome/browser/ui/webui/settings/tark_settings_strings.cc
++++ b/chrome/browser/ui/webui/settings/tark_settings_strings.cc
+@@ -32,6 +32,14 @@
+       {"tarkStatusExtensions", IDS_SETTINGS_TARK_STATUS_EXTENSIONS},
+       {"tarkStatusPasswords", IDS_SETTINGS_TARK_STATUS_PASSWORDS},
+       {"tarkStatusAdvanced", IDS_SETTINGS_TARK_STATUS_ADVANCED},
++      {"tarkHeaderSearch", IDS_SETTINGS_TARK_HEADER_SEARCH},
++      {"tarkHeaderPrivacy", IDS_SETTINGS_TARK_HEADER_PRIVACY},
++      {"tarkHeaderLookSystem", IDS_SETTINGS_TARK_HEADER_LOOK_SYSTEM},
++      {"tarkHeaderLookLight", IDS_SETTINGS_TARK_HEADER_LOOK_LIGHT},
++      {"tarkHeaderLookDark", IDS_SETTINGS_TARK_HEADER_LOOK_DARK},
++      {"tarkHeaderPasswords", IDS_SETTINGS_TARK_HEADER_PASSWORDS},
++      {"tarkHeaderDownloads", IDS_SETTINGS_TARK_HEADER_DOWNLOADS},
++      {"tarkHeaderAdvanced", IDS_SETTINGS_TARK_HEADER_ADVANCED},
+   };
+   html_source->AddLocalizedStrings(kStrings);
+ }
