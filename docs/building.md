@@ -136,5 +136,6 @@ the rest are uBlock Origin's first filter-list fetch.
 
 **The Web Store in a private window** (Review Focus 5). The store page in a
 private window has the same install API and shows "Remove from Tark" for an
-installed extension. The install goes through that same API, but an install
-started from a private window has not been run end to end.
+installed extension. Run end to end (final review): in a private window the
+store shows "You can't add or remove items when in Incognito or Guest mode"
+and disables "Add to Tark", so it says why instead of failing silently.
