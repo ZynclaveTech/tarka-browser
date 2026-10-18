@@ -1,0 +1,124 @@
+--- a/chrome/browser/ui/ui_features.cc
++++ b/chrome/browser/ui/ui_features.cc
+@@ -81,7 +81,8 @@
+ BASE_FEATURE(kMenuSimplification, base::FEATURE_DISABLED_BY_DEFAULT);
+ BASE_FEATURE(kTabGroupColorRefresh, base::FEATURE_DISABLED_BY_DEFAULT);
+ BASE_FEATURE(kWebuiRefresh2026, base::FEATURE_DISABLED_BY_DEFAULT);
+-BASE_FEATURE(kAppMenuGlowUp, base::FEATURE_DISABLED_BY_DEFAULT);
++// Tark: the tile-style app menu is the Tark sheet (spec 6.4).
++BASE_FEATURE(kAppMenuGlowUp, base::FEATURE_ENABLED_BY_DEFAULT);
+ // Enables the redesigned Settings 2026 refresh features and search UX.
+ BASE_FEATURE(kSettingsRefresh2026, base::FEATURE_DISABLED_BY_DEFAULT);
+ // Enables search in the app Chrome menu.
+--- a/chrome/browser/ui/views/app_menu/action_app_menu_manager.cc
++++ b/chrome/browser/ui/views/app_menu/action_app_menu_manager.cc
+@@ -297,13 +297,61 @@
+     return;
+   }
+ 
+-  AddSearchBarAction(root);
++  // Tark: the Tark sheet (spec 6.4) — four tiles, one section of rows,
++  // the footer. Nothing Google, no account or sync rows.
+   AddBlockHeaderActions(root);
+-  AddYourChromeActions(root);
+-  AddToolsAndActionsActions(root);
++  AddTarkSheetActions(root);
+   AddFooterActions(root);
+ }
+ 
++void ActionAppMenuManager::AddTarkSheetActions(actions::ActionItem* root) {
++  AppMenuBuilder(
++      root, BrowserActions::From(browser_window_interface_)->root_action_item(),
++      kColorAppMenuToolsAndActionsBackground)
++      .AddSection(DisplayType::kSection, [this](AppMenuBuilder& section) {
++        Profile* profile = browser_window_interface_->GetProfile();
++        if (!profile->IsGuestSession()) {
++          section.AddDynamicSubmenu(
++              kActionBookmarksSubmenu,
++              base::BindRepeating(&BookmarksDynamicMenu::BuildBookmarksActions,
++                                  bookmarks_menu_->GetWeakPtr()),
++              [profile](AppMenuBuilder& sub_builder) {
++                const int bookmark_bar_string_id =
++                    profile->GetPrefs()->GetBoolean(
++                        bookmarks::prefs::kShowBookmarkBar)
++                        ? IDS_HIDE_BOOKMARK_BAR
++                        : IDS_SHOW_BOOKMARK_BAR;
++                sub_builder.AddAction(kActionBookmarkThisTab)
++                    .AddAction(kActionBookmarkAllTabs)
++                    .AddDivider()
++                    .AddAction(kActionShowBookmarkBar, /*type=*/std::nullopt,
++                               /*text_override=*/
++                               l10n_util::GetStringUTF16(
++                                   bookmark_bar_string_id))
++                    .AddAction(kActionShowBookmarkManager,
++                               /*type=*/std::nullopt,
++                               /*text_override=*/
++                               l10n_util::GetStringUTF16(
++                                   IDS_BOOKMARK_MANAGER))
++                    .AddDivider();
++              });
++        }
++#if BUILDFLAG(ENABLE_EXTENSIONS)
++        section.AddAction(
++            kActionExtensionsSubmenuManageExtensions, /*type=*/std::nullopt,
++            /*text_override=*/l10n_util::GetStringUTF16(IDS_EXTENSIONS_SUBMENU));
++#endif
++        section.AddSubmenu(
++            kActionZoomSubmenu,
++            [](AppMenuBuilder& sub) {
++              sub.AddAction(kActionZoomMinus)
++                  .AddAction(kActionZoomPlus)
++                  .AddAction(kActionFullscreen);
++            },
++            DisplayType::kCustom);
++      });
++}
++
+ void ActionAppMenuManager::AddSearchBarAction(actions::ActionItem* root) {
+   if (base::FeatureList::IsEnabled(features::kChroMenuSearch)) {
+     AppMenuBuilder(
+@@ -334,9 +382,10 @@
+                 ui::ImageModel::FromVectorIcon(
+                     features::IsRoundedIconsEnabled() ? kTabIcon
+                                                       : kNewTabRefreshOldIcon,
+-                    ui::kColorIcon, ui::SimpleMenuModel::kDefaultIconSize))
+-            .AddAction(kActionNewWindow, DisplayType::kBlock);
++                    ui::kColorIcon, ui::SimpleMenuModel::kDefaultIconSize));
+ 
++        // Tark: New tab, Private, History, Downloads (spec 6.4). A new
++        // window stays on ⌘N and the macOS File menu.
+         if (!profile->IsGuestSession()) {
+           if (enterprise_isolated_mode::IsolatedModeReplacesIncognito(
+                   profile)) {
+@@ -349,6 +398,8 @@
+                 /*text_override=*/l10n_util::GetStringUTF16(IDS_INCOGNITO));
+           }
+         }
++        section.AddAction(kActionShowHistory, DisplayType::kBlock)
++            .AddAction(kActionShowDownloads, DisplayType::kBlock);
+       });
+ }
+ 
+--- a/chrome/browser/ui/views/app_menu/action_app_menu_manager.h
++++ b/chrome/browser/ui/views/app_menu/action_app_menu_manager.h
+@@ -45,6 +45,8 @@
+  private:
+   void AddSearchBarAction(actions::ActionItem* root);
+   void AddBlockHeaderActions(actions::ActionItem* root);
++  // Tark: the Tark sheet's rows (spec 6.4).
++  void AddTarkSheetActions(actions::ActionItem* root);
+   void AddYourChromeActions(actions::ActionItem* root);
+   void AddToolsAndActionsActions(actions::ActionItem* root);
+   void AddFooterActions(actions::ActionItem* root);
+--- a/chrome/browser/ui/views/app_menu/app_menu_footer_view.cc
++++ b/chrome/browser/ui/views/app_menu/app_menu_footer_view.cc
+@@ -69,7 +69,8 @@
+     button->SetCallback(
+         base::BindRepeating(execute_command_callback, action_id.value()));
+ 
+-    if (action_id.value() == kActionExit) {
++    // Tark: About sits at the right of the footer (spec 6.4).
++    if (action_id.value() == kActionExit || action_id.value() == kActionAbout) {
+       right_container->AddChildView(std::move(button));
+     } else {
+       left_container->AddChildView(std::move(button));
