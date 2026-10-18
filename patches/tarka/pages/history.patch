@@ -1,0 +1,233 @@
+--- a/chrome/browser/resources/history/app.html.ts
++++ b/chrome/browser/resources/history/app.html.ts
+@@ -22,6 +22,7 @@
+     ?has-more-results="${!this.queryResult_.info?.finished}"
+     ?pending-delete="${this.pendingDelete_}"
+     .queryInfo="${this.queryResult_.info}"
++    .todayCount="${this.todayCount_()}"
+     ?querying="${this.queryState_.querying}"
+     .searchTerm="${this.queryState_.searchTerm}"
+     ?spinner-active="${this.shouldShowSpinner_()}"
+--- a/chrome/browser/resources/history/app.ts
++++ b/chrome/browser/resources/history/app.ts
+@@ -216,6 +216,14 @@
+     value: [],
+   };
+   protected accessor sessionList_: ForeignSession[]|null = null;
++
++  // Tark (M3d): pages visited today, from the loaded results.
++  protected todayCount_(): number {
++    const today = new Date();
++    today.setHours(0, 0, 0, 0);
++    return this.queryResult_.value.filter(
++        entry => entry.time >= today.getTime()).length;
++  }
+   protected accessor queryState_: QueryState = {
+     incremental: false,
+     querying: false,
+--- a/chrome/browser/resources/history/history_item.css
++++ b/chrome/browser/resources/history/history_item.css
+@@ -366,3 +366,22 @@
+   display: block;
+   position: fixed;
+ }
++
++/* Tark (M3d): the row's Remove link, quiet. */
++#quickRemoveCell {
++  align-items: center;
++  align-self: center;
++  display: flex;
++  margin-inline-start: 12px;
++}
++
++.tark-link {
++  background: none;
++  border: none;
++  color: var(--tark-soft);
++  cursor: pointer;
++  font: inherit;
++  font-size: 12px;
++  padding: 0;
++  white-space: nowrap;
++}
+--- a/chrome/browser/resources/history/history_item.html.ts
++++ b/chrome/browser/resources/history/history_item.html.ts
+@@ -22,7 +22,7 @@
+   </div>
+   <div role="row" @mousedown="${this.onRowMousedown_}"
+       @click="${this.onRowClick_}">
+-    <div id="item-container" focus-row-container>
++    <div id="item-container" focus-row-container data-tark-row>
+       <div role="gridcell" id="checkbox-cell">
+         <cr-checkbox id="checkbox" .checked="${this.selected}" focus-row-control
+             focus-type="cr-checkbox" @mousedown="${this.onCheckboxMousedown_}"
+@@ -114,10 +114,19 @@
+           </cr-collapse>
+         ` : ''}
+       </div>
++      <!-- Tark (M3d): Remove as a quiet link beside the menu. -->
++      <div role="gridcell" id="quickRemoveCell"
++          ?hidden="${!this.canRemove_()}">
++        <button id="quickRemove" class="tark-link" data-tark-action
++            focus-row-control focus-type="quick-remove"
++            aria-label="$i18n{removeFromHistory}"
++            @click="${this.onQuickRemoveClick_}">$i18n{removeFromHistory}</button>
++      </div>
+       <div role="gridcell" id="options">
+         <cr-icon-button id="menuButton" iron-icon="cr:more-vert"
+-            focus-row-control focus-type="cr-menu-button"
++            focus-row-control focus-type="cr-menu-button" data-tark-action
+             title="$i18n{actionMenuDescription}"
++            aria-label="$i18n{actionMenuDescription}"
+             @click="${this.onMenuButtonClick_}"
+             @keydown="${this.onMenuButtonKeydown_}" aria-haspopup="menu"
+             aria-describedby="${this.getAriaDescribedByForActions_()}">
+--- a/chrome/browser/resources/history/history_item.ts
++++ b/chrome/browser/resources/history/history_item.ts
+@@ -352,6 +352,21 @@
+     e.stopPropagation();
+   }
+ 
++  // Tark (M3d): the row's Remove link takes the menu's "Remove from history"
++  // path in history-list (undo toast, announcement, selection reset).
++  protected canRemove_(): boolean {
++    return loadTimeData.getBoolean('allowDeletingHistory');
++  }
++
++  protected onQuickRemoveClick_(e: Event) {
++    this.fire('tark-remove-item', {
++      target: e.target,
++      index: this.index,
++      item: this.item,
++    });
++    e.stopPropagation();
++  }
++
+   protected onMenuButtonKeydown_(e: KeyboardEvent) {
+     if (this.item?.starred && e.shiftKey && e.key === 'Tab') {
+       // If this item has a bookmark star, pressing shift + Tab from the more
+--- a/chrome/browser/resources/history/history_list.ts
++++ b/chrome/browser/resources/history/history_list.ts
+@@ -197,6 +197,8 @@
+     this.addEventListener('history-checkbox-select', this.onItemSelected_);
+     this.addEventListener('open-menu', this.onOpenMenu_);
+     this.addEventListener(
++        'tark-remove-item', e => this.onTarkRemoveItem_(e as OpenMenuEvent));
++    this.addEventListener(
+         'remove-bookmark-stars', e => this.onRemoveBookmarkStars_(e));
+   }
+ 
+@@ -476,6 +478,16 @@
+     this.fire('query-history', true);
+   }
+ 
++  // Tark (M3d): a row's Remove link, through the menu's removal path.
++  private onTarkRemoveItem_(e: OpenMenuEvent) {
++    if (this.pendingDelete) {
++      return;
++    }
++    this.actionMenuModel_ = e.detail;
++    this.$.sharedMenu.get();
++    this.onRemoveFromHistoryClick_();
++  }
++
+   private onOpenMenu_(e: OpenMenuEvent) {
+     const target = e.detail.target;
+     this.actionMenuModel_ = e.detail;
+--- a/chrome/browser/resources/history/history_toolbar.html.ts
++++ b/chrome/browser/resources/history/history_toolbar.html.ts
+@@ -10,6 +10,7 @@
+   // clang-format off
+   return html`<!--_html_template_start_-->
+ <cr-toolbar id="mainToolbar" disable-right-content-grow
++    .pageSentence="${this.sentence_}"
+     ?has-overlay="${this.itemsSelected_}" page-name="$i18n{title}"
+     clear-label="$i18n{clearSearch}"
+     search-icon-override="${this.computeSearchIconOverride_()}"
+--- a/chrome/browser/resources/history/history_toolbar.ts
++++ b/chrome/browser/resources/history/history_toolbar.ts
+@@ -13,6 +13,7 @@
+ import type {CrToolbarElement} from 'chrome://resources/cr_elements/cr_toolbar/cr_toolbar.js';
+ import type {CrToolbarSearchFieldElement} from 'chrome://resources/cr_elements/cr_toolbar/cr_toolbar_search_field.js';
+ import {loadTimeData} from 'chrome://resources/js/load_time_data.js';
++import {PluralStringProxyImpl} from 'chrome://resources/js/plural_string_proxy.js';
+ import {CrLitElement} from 'chrome://resources/lit/v3_0/lit.rollup.js';
+ import type {PropertyValues} from 'chrome://resources/lit/v3_0/lit.rollup.js';
+ 
+@@ -77,6 +78,9 @@
+       // button
+       // in narrow mode).
+       showMenuPromo: {type: Boolean},
++
++      todayCount: {type: Number},
++      sentence_: {type: String},
+     };
+   }
+ 
+@@ -91,6 +95,8 @@
+   accessor spinnerActive: boolean = false;
+   accessor showMenuPromo: boolean = false;
+   protected accessor itemsSelected_: boolean = false;
++  accessor todayCount: number = 0;
++  protected accessor sentence_: string = '';
+ 
+   override willUpdate(changedProperties: PropertyValues<this>) {
+     super.willUpdate(changedProperties);
+@@ -106,6 +112,15 @@
+     if (changedProperties.has('searchTerm')) {
+       this.searchTermChanged_();
+     }
++    if (changedProperties.has('todayCount')) {
++      this.updateSentence_();
++    }
++  }
++
++  // Tark (M3d): "Kept on this Mac only. 5 pages today."
++  private async updateSentence_() {
++    this.sentence_ = await PluralStringProxyImpl.getInstance().getPluralString(
++        'tarkHistorySentence', this.todayCount);
+   }
+ 
+   get searchField(): CrToolbarSearchFieldElement {
+--- a/chrome/browser/ui/webui/history/history_ui.cc
++++ b/chrome/browser/ui/webui/history/history_ui.cc
+@@ -47,6 +47,7 @@
+ #include "chrome/browser/ui/webui/history_clusters/history_clusters_handler.h"
+ #include "chrome/browser/ui/webui/managed_ui_handler.h"
+ #include "chrome/browser/ui/webui/metrics_handler.h"
++#include "chrome/browser/ui/webui/plural_string_handler.h"
+ #include "chrome/browser/ui/webui/page_not_available_for_guest/page_not_available_for_guest_ui.h"
+ #include "chrome/browser/ui/webui/theme_source.h"
+ #include "chrome/browser/ui/webui/user_education/user_education_handler.h"
+@@ -288,6 +289,11 @@
+ 
+   web_ui->AddMessageHandler(std::make_unique<webui::NavigationHandler>());
+   web_ui->AddMessageHandler(std::make_unique<MetricsHandler>());
++  // Tark (M3d): the header sentence.
++  auto plural_strings = std::make_unique<PluralStringHandler>();
++  plural_strings->AddLocalizedString("tarkHistorySentence",
++                                     IDS_TARK_PAGES_HISTORY_SENTENCE);
++  web_ui->AddMessageHandler(std::move(plural_strings));
+ 
+   web_ui->AddMessageHandler(
+       std::make_unique<HistoryLoginHandler>(base::BindRepeating(
+--- a/chrome/browser/resources/history/shared_style.css
++++ b/chrome/browser/resources/history/shared_style.css
+@@ -22,12 +22,16 @@
+   width: calc(100% - 2 * var(--card-padding-side));
+ }
+ 
++/* Tark (M3d): day headings are small uppercase soft text. */
+ .card-title {
+   align-items: center;
++  color: var(--tark-soft);
+   display: flex;
+-  font-size: 16px;
++  font-size: 11px;
+   font-weight: 500;
++  letter-spacing: 0.08em;
+   line-height: 24px;
++  text-transform: uppercase;
+   overflow: hidden;
+   padding: 23px 24px 13px;
+   text-overflow: ellipsis;
