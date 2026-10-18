@@ -67,6 +67,8 @@ def problems(page, facts):
         found.append('sentence %r does not match %s' % (sentence, SENTENCES[page]))
     if sentence and facts.get('sentence_lines', 1) != 1:
         found.append('sentence takes %s lines' % facts.get('sentence_lines'))
+    if facts.get('header_overflow'):
+        found.append('the header is wider than the window (search pushed out)')
     if facts.get('row_shadows'):
         found.append('%d elements with a box-shadow' % facts['row_shadows'])
     if page == 'version' and facts.get('rows', 0) < 3:
@@ -138,6 +140,8 @@ FACTS_JS = r"""(() => {
     sentence_lines: lines,
     row_shadows: shadows,
     sidebar_selected_border: border,
+    header_overflow: toolbar ? toolbar.scrollWidth > toolbar.clientWidth + 1 :
+                               false,
     actions: actions,
     rows: rows.length,
     danger_row: danger ? {text: danger.textContent.trim().slice(0, 200),

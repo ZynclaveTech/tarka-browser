@@ -114,3 +114,10 @@ def test_version_rows():
                    sidebar_selected_border=None)
     assert page_audit.problems('version', facts(rows=6, **version)) == []
     assert page_audit.problems('version', facts(rows=0, **version))
+
+
+def test_header_overflow_is_a_problem():
+    # Review (M3d): in a narrow window a long sentence pushed the search icon
+    # out of the toolbar; the toolbar must never be wider than its box.
+    assert page_audit.problems('history', facts(header_overflow=True))
+    assert not page_audit.problems('history', facts(header_overflow=False))
