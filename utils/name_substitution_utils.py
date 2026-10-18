@@ -11,7 +11,7 @@ import xml.etree.ElementTree as xml
 
 REPLACEMENT_REGEXES_STR = [
     # Tark: the copyright line (About, chrome://version) names the company.
-    (r'The Chromium Authors', r'Zynclave Tech Private Limited'),
+    (r'(?:The )?Chromium Authors', r'Zynclave Tech Private Limited'),
 
     # stuff we don't want to replace
     (r'(\w+) Root Program', r'\1_unreplace Root Program'),

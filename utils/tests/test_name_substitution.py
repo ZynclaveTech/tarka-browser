@@ -37,6 +37,9 @@ def test_copyright_names_the_company():
     hindi = "\u0915\u0949\u092a\u0940\u0930\u093e\u0907\u091f YEAR The Chromium Authors."
     assert util.replace_text(hindi, translation=True)[0] == (
         "\u0915\u0949\u092a\u0940\u0930\u093e\u0907\u091f YEAR Zynclave Tech Private Limited.")
+    # Persian and Armenian translate the company name without "The".
+    assert util.replace_text("Chromium Authors", translation=True)[0] == (
+        "Zynclave Tech Private Limited")
 
 
 # M3 Task 7: "Incognito" becomes "private" in English UI text only.
