@@ -243,3 +243,28 @@ through Accessibility. Never bring the window forward to screenshot it.
 - **Copyright.** Name substitution writes "Zynclave Tech Private Limited"
   for "(The) Chromium Authors" in UI strings and translations;
   `branding.patch` sets the company and the Finder copyright line.
+
+## D1: IndicXlit
+
+`./dev.sh setup` and `build.sh` fetch Tark's on-device transliteration
+model, convert it and install it (`utils/install_xlit.sh`, the function
+`_install_xlit`, run after uBlock Origin's sources are unpacked).
+
+- **Fetched** (`downloads-xlit.ini`, into `build/download_cache`, about
+  138 MB, once; later runs find the files and only re-check their sha256):
+  AI4Bharat IndicXlit's checkpoint `indicxlit.pt` and the dictionaries
+  `dict.en.txt` and `dict.hi.txt`, pinned to one Hugging Face commit. They
+  are retrieved only, never unpacked: the checkpoint is a zip that
+  `downloads.py unpack` would try to extract.
+- **Written** to `build/src/third_party/indicxlit/`: `xlit-model.bin`
+  (23 MB; `utils/xlit_convert.py` turns the checkpoint into a flat fp16
+  file, with no torch needed), `xlit-words.bin` (37 MB; `utils/xlit_wordlist.py pack`
+  of `resources/xlit/`), and `README.chromium` plus `LICENSE` from
+  `resources/indicxlit/`, so about:credits lists IndicXlit.
+- **Also copied** to `build/src/components/tark_xlit/test/data/`: both
+  `.bin` files, `golden.tsv` and `golden-inputs.txt`, for the unit tests.
+- The conversion is deterministic: `xlit-model.bin` has sha256
+  `3cfe73d2…cbd2fc`, and `xlit-words.bin` is 36,688,088 bytes. To redo the
+  step on an existing tree without a reset, source the function and call it
+  (see the variables at the top of `utils/install_xlit.sh`).
+- Test: `python3 -m pytest utils/tests/test_install_xlit.py`.

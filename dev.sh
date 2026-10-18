@@ -23,6 +23,9 @@ _download_cache="$_root_dir/build/download_cache"
 _logs_dir="$_root_dir/build/logs"
 _arch=arm64
 
+# shellcheck source=utils/install_xlit.sh
+source "$_root_dir/utils/install_xlit.sh"
+
 # depot_tools needs Python 3.13 or earlier; the system has 3.14.
 export PATH="/opt/homebrew/opt/python@3.13/libexec/bin:$PATH"
 
@@ -112,6 +115,9 @@ MSG
   python3 "$_main_repo/utils/downloads.py" retrieve -i "$_root_dir/downloads-tark.ini" -c "$_download_cache"
   python3 "$_main_repo/utils/downloads.py" unpack -i "$_root_dir/downloads-tark.ini" -c "$_download_cache" "$_src_dir"
   python3 "$_root_dir/utils/ublock_key.py" "$_src_dir/third_party/ublock/manifest.json" "$_root_dir/resources/ublock/key.txt"
+
+  # Tark: IndicXlit weights and word lists for the address bar (D1).
+  _install_xlit
 
   _fix_esbuild
   cd "$_src_dir"

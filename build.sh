@@ -9,6 +9,7 @@ _root_dir="$(dirname "$(greadlink -f "$0")")"
 _download_cache="$_root_dir/build/download_cache"
 _src_dir="$_root_dir/build/src"
 _main_repo="$_root_dir/ungoogled-chromium"
+source "$_root_dir/utils/install_xlit.sh"
 
 # Clone to get the Chromium Source
 clone=true
@@ -90,6 +91,9 @@ mkdir -p "$_src_dir/third_party/rust-toolchain/bin"
 python3 "$_main_repo/utils/downloads.py" retrieve -i "$_root_dir/downloads-tark.ini" -c "$_download_cache"
 python3 "$_main_repo/utils/downloads.py" unpack -i "$_root_dir/downloads-tark.ini" -c "$_download_cache" "$_src_dir"
 python3 "$_root_dir/utils/ublock_key.py" "$_src_dir/third_party/ublock/manifest.json" "$_root_dir/resources/ublock/key.txt"
+
+# Tark: IndicXlit weights and word lists for the address bar (D1).
+_install_xlit
 
 cd "$_src_dir"
 
