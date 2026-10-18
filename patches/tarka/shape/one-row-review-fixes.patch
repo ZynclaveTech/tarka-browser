@@ -1,0 +1,77 @@
+--- a/chrome/browser/ui/views/frame/browser_view.cc
++++ b/chrome/browser/ui/views/frame/browser_view.cc
+@@ -4767,8 +4767,10 @@
+     // makes sense visually).
+     // TODO(tluk): Investigate the impact removing this has on draggable area
+     // given the tab strip no longer uses shadows.
++    // Tark: not in one row, where the tab strip is centred in the toolbar row
++    // and this band would cross the menu button, back and the address pill.
+     views::Widget* widget = GetWidget();
+-    if (!(widget->IsMaximized() || widget->IsFullscreen()) &&
++    if (!IsTarkOneRow() && !(widget->IsMaximized() || widget->IsFullscreen()) &&
+         (point_in_browser_view_coords.y() <
+          (horizontal_tab_strip_region_view_->y() + kTabShadowSize))) {
+       // We return HTNOWHERE as this is a signal to our containing
+--- a/chrome/browser/ui/views/frame/browser_view.h
++++ b/chrome/browser/ui/views/frame/browser_view.h
+@@ -273,6 +273,12 @@
+   // over the toolbar's tab well (one row) instead of a row of its own.
+   bool IsTarkOneRow() const;
+ 
++  // Tark (M3c): the horizontal tab strip region, whether or not vertical tabs
++  // are showing; the toolbar's tab well follows its size and visibility.
++  TabStripRegionView* tark_horizontal_tab_strip_region_view() const {
++    return horizontal_tab_strip_region_view_.get();
++  }
++
+   // Test only function. When the VerticalTabs feature is enabled,
+   // `vertical_tab_strip_container_` will have a value for normal tabbed
+   // browsers even if it is not the active TabStrip. Prefer to use
+--- a/chrome/browser/ui/views/toolbar/toolbar_view.cc
++++ b/chrome/browser/ui/views/toolbar/toolbar_view.cc
+@@ -239,9 +239,10 @@
+     const views::View* tab_strip = GetHorizontalTabStrip();
+     return gfx::Size(tab_strip ? tab_strip->GetMinimumSize().width() : 0, 0);
+   }
+-  // The well's flex rule, in turn: the tabs get up to kTabsFloor, then the
+-  // address pill gets kAddressReserve above its own minimum, then the tabs
+-  // take the rest up to the tab strip's preferred width. Never below the tab
++  // The well's flex rule, in turn: the tabs get up to kTabsFloor, then
++  // kAddressReserve is left for the flex children laid out after the well
++  // (the address pill first, as it has the next order), then the tabs take
++  // the rest up to the tab strip's preferred width. Never below the tab
+   // strip's minimum.
+   static gfx::Size FlexRule(const views::View* view,
+                             const views::SizeBounds& bounds) {
+@@ -259,7 +260,8 @@
+   }
+ 
+   void AddedToWidget() override {
+-    if (views::View* tab_strip = browser_view_->tab_strip_view();
++    if (views::View* tab_strip =
++            browser_view_->tark_horizontal_tab_strip_region_view();
+         tab_strip && !observation_.IsObserving()) {
+       observation_.Observe(tab_strip);
+     }
+@@ -269,6 +271,12 @@
+   void OnViewPreferredSizeChanged(views::View* observed_view) override {
+     PreferredSizeChanged();
+   }
++  // Switching vertical tabs on or off shows or hides the horizontal strip.
++  void OnViewVisibilityChanged(views::View* observed_view,
++                               views::View* starting_view,
++                               bool visible) override {
++    PreferredSizeChanged();
++  }
+   void OnViewIsDeleting(views::View* observed_view) override {
+     observation_.Reset();
+   }
+@@ -279,7 +287,7 @@
+         browser_view_->ShouldDrawVerticalTabStrip()) {
+       return nullptr;
+     }
+-    return browser_view_->tab_strip_view();
++    return browser_view_->tark_horizontal_tab_strip_region_view();
+   }
+ 
+   raw_ptr<BrowserView> browser_view_;
