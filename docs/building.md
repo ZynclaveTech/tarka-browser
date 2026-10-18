@@ -216,3 +216,30 @@ hand focus back, open tabs with DevTools `Target.createTarget` and
 `background: true`, capture pages with `Page.captureScreenshot` and native
 windows with `screencapture -l <window id>`, and read the address bar
 through Accessibility. Never bring the window forward to screenshot it.
+
+## M3c notes (one row, the Tark sheet)
+
+- **Two Tarks on one Mac.** Once the user runs an installed Tark, AppleScript
+  `tell application "Tark"` / `process "Tark"` can reach *their* browser,
+  not the dev build — both have the same name and bundle id. Address the dev
+  build only by its process id: launch with `open -g -n` on
+  `out/Default/Tark.app`, find it with `pgrep -f "out/Default/Tark.app/.../Tark --user-data-dir"`,
+  stop it with `pkill -f` on that same path (never `quit app "Tark"`), and
+  read or press its controls through `AXUIElementCreateApplication(pid)`
+  (a 30-line Swift helper), never System Events by name.
+- **Fullscreen moves the user's screen.** `Browser.setWindowBounds`
+  `windowState: fullscreen` puts the window in its own Space and macOS
+  switches to it; fullscreen checks are user-assisted.
+- **Views gotchas met here.** `FlexSpecification::WithOrder` DCHECKs on
+  orders below 1; a view with no height is `IsEmpty()`, so test widths
+  when a placeholder only carries width; a custom `FlexRule` plus
+  `WithOrder` is allowed and is how the tab well shares the row.
+- **Inherited defaults to check.** inox's `0006-modify-default-prefs`
+  flips several prefs Tark does not want: `kShowBookmarkBar` (now false
+  again, `tarka/shape/bookmarks-bar-default.patch`) and
+  `kCredentialsEnableService` (now true again,
+  `tarka/settings/offer-to-save-passwords.patch`); read that patch before
+  assuming a Chromium default.
+- **Copyright.** Name substitution writes "Zynclave Tech Private Limited"
+  for "(The) Chromium Authors" in UI strings and translations;
+  `branding.patch` sets the company and the Finder copyright line.
