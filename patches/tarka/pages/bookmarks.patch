@@ -1,0 +1,293 @@
+--- a/chrome/browser/resources/bookmarks/item.css
++++ b/chrome/browser/resources/bookmarks/item.css
+@@ -15,6 +15,8 @@
+       --color-bookmark-manager-item-outline);
+   --iron-icon-fill-color: var(--google-grey-700);
+   align-items: center;
++  /* Tark (M3d): rows on hairlines. */
++  border-top: 1px solid var(--tark-rule);
+   color: inherit;
+   display: flex;
+   flex-direction: row;
+@@ -161,3 +163,30 @@
+   text-overflow: ellipsis;
+   white-space: nowrap;
+ }
++
++/* Tark (M3d): Edit in indigo, Delete quieter, as text. */
++#tarkActions {
++  align-items: center;
++  display: flex;
++  gap: 14px;
++  margin-inline-end: 8px;
++}
++
++.tark-link {
++  background: none;
++  border: none;
++  color: var(--tark-indigo);
++  cursor: pointer;
++  font: inherit;
++  font-size: 12px;
++  padding: 0;
++  white-space: nowrap;
++}
++
++.tark-link.quiet {
++  color: var(--tark-soft);
++}
++
++.tark-link[hidden] {
++  display: none;
++}
+--- a/chrome/browser/resources/bookmarks/item.html.ts
++++ b/chrome/browser/resources/bookmarks/item.html.ts
+@@ -33,8 +33,19 @@
+     </cr-icon-button>
+   ` : ''}
+ </div>
++<!-- Tark (M3d): Edit and Delete as quiet links beside the menu. -->
++<div role="gridcell" id="tarkActions">
++  <button class="tark-link" id="quickEdit" data-tark-action
++      tabindex="${this.ironListTabIndex}"
++      ?hidden="${!this.canEdit_()}" aria-label="${this.editLabel_()}"
++      @click="${this.onQuickEditClick_}">${this.editLabel_()}</button>
++  <button class="tark-link quiet" id="quickDelete" data-tark-action
++      tabindex="${this.ironListTabIndex}"
++      ?hidden="${!this.canDelete_()}" aria-label="${this.deleteLabel_()}"
++      @click="${this.onQuickDeleteClick_}">${this.deleteLabel_()}</button>
++</div>
+ <div role="gridcell">
+-  <cr-icon-button class="icon-more-vert" id="menuButton"
++  <cr-icon-button class="icon-more-vert" id="menuButton" data-tark-action
+       tabindex="${this.ironListTabIndex}" title="$i18n{moreActionsButtonTitle}"
+       aria-label="${this.getButtonAriaLabel_()}"
+       @click="${this.onMenuButtonClick_}" aria-haspopup="menu">
+--- a/chrome/browser/resources/bookmarks/item.ts
++++ b/chrome/browser/resources/bookmarks/item.ts
+@@ -64,6 +64,40 @@
+   }
+ 
+   accessor itemId: string = '';
++  // Tark (M3d): the row's Edit and Delete links run the menu's commands.
++  private canRun_(command: Command): boolean {
++    const manager = BookmarksCommandManagerElement.getInstanceIfExists();
++    return !!this.itemId && !!manager &&
++        manager.canExecute(command, new Set([this.itemId]));
++  }
++
++  protected canEdit_(): boolean {
++    return this.canRun_(Command.EDIT);
++  }
++
++  protected canDelete_(): boolean {
++    return this.canRun_(Command.DELETE);
++  }
++
++  protected editLabel_(): string {
++    return loadTimeData.getString('menuEdit');
++  }
++
++  protected deleteLabel_(): string {
++    return loadTimeData.getString('menuDelete');
++  }
++
++  protected onQuickEditClick_(e: Event) {
++    e.stopPropagation();
++    BookmarksCommandManagerElement.getInstance().handle(
++        Command.EDIT, new Set([this.itemId]));
++  }
++
++  protected onQuickDeleteClick_(e: Event) {
++    e.stopPropagation();
++    BookmarksCommandManagerElement.getInstance().handle(
++        Command.DELETE, new Set([this.itemId]));
++  }
+   accessor ironListTabIndex: number|undefined;
+   protected accessor item_: BookmarkNode|undefined;
+   private accessor isSelectedItem_: boolean = false;
+--- a/chrome/browser/resources/bookmarks/list.css
++++ b/chrome/browser/resources/bookmarks/list.css
+@@ -50,3 +50,22 @@
+ [role='row']:focus-within {
+   z-index: 1;
+ }
++
++/* Tark (M3d): the footer's links under the rows. */
++#tarkFooter {
++  display: flex;
++  gap: 18px;
++  margin: 0 auto;
++  max-width: var(--card-max-width, 960px);
++  padding: 14px 0;
++}
++
++.tark-link {
++  background: none;
++  border: none;
++  color: var(--tark-indigo);
++  cursor: pointer;
++  font: inherit;
++  font-size: 13px;
++  padding: 0;
++}
+--- a/chrome/browser/resources/bookmarks/list.html.ts
++++ b/chrome/browser/resources/bookmarks/list.html.ts
+@@ -22,7 +22,7 @@
+     ?hidden="${this.isEmptyList_()}" role="grid" no-restore-focus
+     aria-label="$i18n{listAxLabel}" aria-multiselectable="true"
+     .template="${(id: string, index: number) => html`
+-      <bookmarks-item data-index="${index}" id="bookmark_${index}"
++      <bookmarks-item data-tark-row data-index="${index}" id="bookmark_${index}"
+           item-id="${id}" draggable="true" role="row"
+           tabindex="${this.getTabindex_(index)}"
+           .ironListTabIndex="${this.getTabindex_(index)}"
+@@ -32,6 +32,15 @@
+       </bookmarks-item>
+     `}">
+ </cr-lazy-list>
++<!-- Tark (M3d): Add folder, Import and Export under the list. -->
++<div id="tarkFooter">
++  ${this.footerCommands_().map(command => html`
++    <button class="tark-link" data-command="${command}"
++        @click="${this.onFooterClick_}">
++      ${this.footerLabel_(command)}
++    </button>
++  `)}
++</div>
+ <div id="message" class="centered-message" ?hidden="${!this.isEmptyList_()}">
+   ${this.emptyListMessage_()}
+ </div>
+--- a/chrome/browser/resources/bookmarks/list.ts
++++ b/chrome/browser/resources/bookmarks/list.ts
+@@ -20,7 +20,7 @@
+ 
+ import {deselectItems, selectAll, selectItem, updateAnchor} from './actions.js';
+ import {BookmarksCommandManagerElement} from './command_manager.js';
+-import {MenuSource, ROOT_NODE_ID} from './constants.js';
++import {Command, MenuSource, ROOT_NODE_ID} from './constants.js';
+ import type {BookmarksItemElement} from './item.js';
+ import {getCss} from './list.css.js';
+ import {getHtml} from './list.html.js';
+@@ -139,6 +139,28 @@
+     }
+   }
+ 
++  // Tark (M3d): the footer's commands, as the toolbar menu offers them.
++  protected footerCommands_(): Command[] {
++    const manager = BookmarksCommandManagerElement.getInstanceIfExists();
++    if (!manager) {
++      return [];
++    }
++    return [Command.ADD_FOLDER, Command.IMPORT, Command.EXPORT].filter(
++        command => manager.canExecute(command, new Set()));
++  }
++
++  protected footerLabel_(command: Command): string {
++    return loadTimeData.getString(
++        command === Command.ADD_FOLDER ? 'menuAddFolder' :
++            command === Command.IMPORT ? 'menuImport' : 'menuExport');
++  }
++
++  protected onFooterClick_(e: Event) {
++    const command =
++        Number((e.currentTarget as HTMLElement).dataset['command']) as Command;
++    BookmarksCommandManagerElement.getInstance().handle(command, new Set());
++  }
++
+   override onStateChanged(state: BookmarksPageState) {
+     // The tree may be ill-formed, temporarily during updates. In that case,
+     // ignore the update.
+--- a/chrome/browser/resources/bookmarks/toolbar.html.ts
++++ b/chrome/browser/resources/bookmarks/toolbar.html.ts
+@@ -10,6 +10,7 @@
+   // clang-format off
+   return html`<!--_html_template_start_-->
+ <cr-toolbar page-name="$i18n{title}" ?has-overlay="${this.showSelectionOverlay}"
++    .pageSentence="${this.sentence_}"
+     clear-label="$i18n{clearSearch}" search-prompt="$i18n{searchPrompt}"
+     ?narrow="${this.narrow_}" @narrow-changed="${this.onNarrowChanged_}"
+     autofocus always-show-logo @search-changed="${this.onSearchChanged_}">
+--- a/chrome/browser/resources/bookmarks/toolbar.ts
++++ b/chrome/browser/resources/bookmarks/toolbar.ts
+@@ -14,6 +14,7 @@
+ import type {CrToolbarSearchFieldElement} from 'chrome://resources/cr_elements/cr_toolbar/cr_toolbar_search_field.js';
+ import {assert} from 'chrome://resources/js/assert.js';
+ import {loadTimeData} from 'chrome://resources/js/load_time_data.js';
++import {PluralStringProxyImpl} from 'chrome://resources/js/plural_string_proxy.js';
+ import {CrLitElement} from 'chrome://resources/lit/v3_0/lit.rollup.js';
+ import type {PropertyValues} from 'chrome://resources/lit/v3_0/lit.rollup.js';
+ 
+@@ -53,6 +54,7 @@
+       searchTerm_: {type: String},
+       selectedItems_: {type: Object},
+       globalCanEdit_: {type: Boolean},
++      sentence_: {type: String},
+     };
+   }
+ 
+@@ -62,6 +64,8 @@
+   private accessor searchTerm_: string = '';
+   private accessor selectedItems_: Set<string> = new Set();
+   private accessor globalCanEdit_: boolean = false;
++  protected accessor sentence_: string = '';
++  private counts_: string = '';
+ 
+   override connectedCallback() {
+     super.connectedCallback();
+@@ -97,6 +101,26 @@
+     this.searchTerm_ = state.search.term;
+     this.selectedItems_ = state.selection.items;
+     this.globalCanEdit_ = state.prefs.canEdit;
++    this.updateSentence_(state);
++  }
++
++  // Tark (M3d): "12 bookmarks in 3 folders, kept on this Mac." Folders are
++  // the ones holding bookmarks directly.
++  private async updateSentence_(state: BookmarksPageState) {
++    const nodes = Object.values(state.nodes);
++    const bookmarks = nodes.filter(node => !!node.url);
++    const folders = new Set(bookmarks.map(node => node.parentId));
++    const counts = `${bookmarks.length}/${folders.size}`;
++    if (counts === this.counts_) {
++      return;
++    }
++    this.counts_ = counts;
++    const proxy = PluralStringProxyImpl.getInstance();
++    const [sentence, folderText] = await Promise.all([
++      proxy.getPluralString('tarkBookmarksSentence', bookmarks.length),
++      proxy.getPluralString('tarkBookmarksFolders', folders.size),
++    ]);
++    this.sentence_ = sentence.replace('$1', folderText);
+   }
+ 
+   get searchField(): CrToolbarSearchFieldElement {
+--- a/chrome/browser/ui/webui/bookmarks/bookmarks_ui.cc
++++ b/chrome/browser/ui/webui/bookmarks/bookmarks_ui.cc
+@@ -210,6 +210,11 @@
+       "toastItemsDeleted", IDS_BOOKMARK_MANAGER_TOAST_ITEMS_DELETED);
+   plural_string_handler->AddLocalizedString(
+       "toastItemsCopied", IDS_BOOKMARK_MANAGER_TOAST_ITEMS_COPIED);
++  // Tark (M3d): the header sentence.
++  plural_string_handler->AddLocalizedString(
++      "tarkBookmarksSentence", IDS_TARK_PAGES_BOOKMARKS_SENTENCE);
++  plural_string_handler->AddLocalizedString(
++      "tarkBookmarksFolders", IDS_TARK_PAGES_BOOKMARKS_FOLDERS);
+   web_ui->AddMessageHandler(std::move(plural_string_handler));
+ 
+   web_ui->AddMessageHandler(std::make_unique<BookmarksMessageHandler>());
+--- a/chrome/browser/resources/bookmarks/command_manager.ts
++++ b/chrome/browser/resources/bookmarks/command_manager.ts
+@@ -954,6 +954,12 @@
+     assert(instance);
+     return instance;
+   }
++
++  // Tark (M3d): for elements that render before the command manager exists
++  // (the list and its rows come first in the page).
++  static getInstanceIfExists(): BookmarksCommandManagerElement|null {
++    return instance;
++  }
+ }
+ 
+ declare global {
