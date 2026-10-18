@@ -89,3 +89,20 @@ def test_pages_cover_the_spec():
     assert set(page_audit.PAGES) == {'downloads', 'extensions', 'history', 'bookmarks',
                                      'passwords', 'version', 'urls'}
     assert page_audit.PAGES['passwords'] == 'chrome://password-manager/passwords'
+
+
+def test_downloads_danger_row_kept():
+    sentence = 'Saved to your Downloads folder'
+    kept = {'text': 'This file is dangerous, so Tark has blocked it.',
+            'buttons': ['More actions']}
+    assert not page_audit.problems('downloads', facts(
+        sentence=sentence, sidebar_selected_border=None, danger_row=kept))
+    lost = {'text': '', 'buttons': []}
+    assert page_audit.problems('downloads', facts(
+        sentence=sentence, sidebar_selected_border=None, danger_row=lost))
+
+
+def test_downloads_zero_is_empty_state():
+    assert page_audit.problems('downloads', facts(
+        sentence='0 files today, saved to your Downloads folder',
+        sidebar_selected_border=None))

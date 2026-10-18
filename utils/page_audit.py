@@ -43,7 +43,7 @@ INDIGO = ('rgb(67, 56, 202)', 'rgb(143, 136, 255)')
 CORAL = ('rgb(230, 62, 92)', 'rgb(255, 107, 133)')
 
 SENTENCES = {
-    'downloads': r'^(\d+ files? today, saved to your .+ folder|Saved to your .+ folder)$',
+    'downloads': r'^([1-9]\d* files? today, saved to your .+ folder|Saved to your .+ folder)$',
     'extensions': r'^\d+ extensions? on\.',
     'history': r'^Kept on this Mac only\. \d+ pages? today\.$',
     'bookmarks': r'^\d+ bookmarks? in \d+ folders?, kept on this Mac\.$',
@@ -69,6 +69,9 @@ def problems(page, facts):
         found.append('sentence takes %s lines' % facts.get('sentence_lines'))
     if facts.get('row_shadows'):
         found.append('%d elements with a box-shadow' % facts['row_shadows'])
+    danger = facts.get('danger_row')
+    if danger is not None and (not danger.get('text') or not danger.get('buttons')):
+        found.append('a dangerous download lost its warning or its actions')
     border = facts.get('sidebar_selected_border')
     if border is not None and border != '2px ' + CORAL[dark]:
         found.append('selected sidebar row has %r, not a 2px coral line' % border)
@@ -100,8 +103,12 @@ FACTS_JS = r"""(() => {
   }
   const inToolbar = (el) => toolbar && (toolbar.contains(el) ||
       toolbar.shadowRoot.contains(el));
-  const shadows = all.filter((e) => !inToolbar(e) && visible(e) &&
-      getComputedStyle(e).boxShadow !== 'none').length;
+  // Rows and their parts only: toasts, menus, dialogs and the scroll-edge
+  // shadow are page furniture, not rows.
+  const furniture = (e) => e.matches && e.matches(
+      'cr-toast, cr-toast *, cr-action-menu, dialog, .cr-scrollable-top-shadow');
+  const shadows = all.filter((e) => !inToolbar(e) && !furniture(e) &&
+      visible(e) && getComputedStyle(e).boxShadow !== 'none').length;
   const selected = all.find((e) => visible(e) && e.matches &&
       e.matches('cr-menu-selector .selected, cr-menu-selector [selected], ' +
                 '.cr-nav-menu-item.selected, a.cr-nav-menu-item[aria-current="page"], ' +
