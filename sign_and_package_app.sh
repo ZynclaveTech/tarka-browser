@@ -14,6 +14,11 @@ _libraries="$_framework/Libraries"
 _pkg_dmg="$_src_dir/chrome/installer/mac/pkg-dmg"
 
 _ad_hoc="${MACOS_AD_HOC_SIGNING:-0}"
+# S1: development signing for the author's own Mac — an Apple Development
+# certificate (MACOS_CERTIFICATE_NAME) and a development provisioning
+# profile (TARKA_PROVISIONING_PROFILE) that names this Mac. Touch ID passkeys
+# need it; the result runs only on Macs in the profile. No notarization.
+_dev="${MACOS_DEV_SIGNING:-0}"
 _target_dmg="${1:-}"
 if [[ -z "$_target_dmg" ]]; then
   _chromium_version="$(cat "$_root_dir/ungoogled-chromium/chromium_version.txt")"
@@ -36,6 +41,8 @@ sign() {
       args+=("$a")
     done
     codesign --sign - --force "${args[@]}"
+  elif (( _dev )); then
+    codesign --sign "$MACOS_CERTIFICATE_NAME" --force --timestamp=none "$@"
   else
     codesign --sign "$MACOS_CERTIFICATE_NAME" --force --timestamp "$@"
   fi
@@ -77,7 +84,14 @@ for _dylib in "$_libraries"/*.dylib; do
 done
 
 sign --identifier "$_bundle_id.framework" "$_framework"
-if (( _ad_hoc )); then
+if (( _dev )); then
+  _profile="${TARKA_PROVISIONING_PROFILE:?set TARKA_PROVISIONING_PROFILE to the development profile}"
+  _dev_entitlements="$(mktemp -t tark-entitlements).plist"
+  python3 -I "$_root_dir/utils/dev_entitlements.py" "$_root_dir/entitlements/app-entitlements.plist" \
+    "$_profile" "$_bundle_id" "$_dev_entitlements"
+  cp "$_profile" "$_app/Contents/embedded.provisionprofile"
+  sign --identifier "$_bundle_id" --options restrict,library,runtime,kill --entitlements "$_dev_entitlements" "$_app"
+elif (( _ad_hoc )); then
   sign --identifier "$_bundle_id" --options restrict,library,runtime,kill --entitlements "$_root_dir/entitlements/app-entitlements.plist" "$_app"
 else
   sign --identifier "$_bundle_id" --options restrict,library,runtime,kill --entitlements "$_root_dir/entitlements/app-entitlements.plist" --requirements "=designated => identifier \"$_bundle_id\" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */" "$_app"
@@ -90,7 +104,7 @@ verify_dylib() {
 
   codesign --verify --strict --verbose=4 "$dylib"
 
-  if (( _ad_hoc )); then
+  if (( _ad_hoc || _dev )); then
     return
   fi
 
@@ -173,6 +187,11 @@ notarize_app() {
 
 if (( _ad_hoc )); then
   printf 'Ad-hoc signing enabled; skipping notarization and stapling.\n'
+elif (( _dev )); then
+  printf 'Development signing; skipping notarization and stapling.\n'
+  if [[ "${TARKA_SKIP_DMG:-0}" == 1 ]]; then
+    exit 0
+  fi
 else
   notarize_app
 fi
