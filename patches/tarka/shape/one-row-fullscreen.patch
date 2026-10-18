@@ -1,0 +1,100 @@
+--- a/chrome/browser/ui/views/frame/browser_view.cc
++++ b/chrome/browser/ui/views/frame/browser_view.cc
+@@ -3840,7 +3840,14 @@
+ #if BUILDFLAG(IS_MAC)
+   if (!WindowFeatureController::From(browser())
+            ->UsesImmersiveFullscreenTabbedMode()) {
+-    top_container()->AddChildViewAt(horizontal_tab_strip_region_view_.get(), 0);
++    // Tark (M3c): with one row the tab strip sits over the toolbar's tab
++    // well, so it goes above the toolbar in z-order.
++    if (toolbar_ && toolbar_->HasTarkTabWell()) {
++      top_container()->AddChildView(horizontal_tab_strip_region_view_.get());
++    } else {
++      top_container()->AddChildViewAt(horizontal_tab_strip_region_view_.get(),
++                                      0);
++    }
+   }
+ #endif  // BUILDFLAG(IS_MAC)
+ 
+--- a/chrome/browser/ui/views/frame/layout/browser_view_tabbed_layout_impl.cc
++++ b/chrome/browser/ui/views/frame/layout/browser_view_tabbed_layout_impl.cc
+@@ -1394,10 +1394,22 @@
+     bool needs_exclusion) const {
+   const int original_top = params.visual_client_area.y();
+ 
++  // Tark (M3c): in fullscreen the tab strip is in the top container; keep one
++  // row there too and place it over the toolbar's tab well below.
++  const auto* const tark_toolbar =
++      views::AsViewClass<ToolbarView>(views().toolbar.get());
++  const bool tark_one_row =
++      tark_toolbar && tark_toolbar->HasTarkTabWell() &&
++      layout_data_->tab_strip_type == TabStripType::kHorizontal &&
++      IsParentedTo(views().horizontal_tab_strip_region_view,
++                   views().top_container);
++  ProposedLayout* tark_tab_strip_layout = nullptr;
++
+   if (IsParentedTo(views().horizontal_tab_strip_region_view,
+                    views().top_container)) {
+     gfx::Rect tabstrip_bounds;
+-    if (layout_data_->tab_strip_type == TabStripType::kHorizontal) {
++    if (layout_data_->tab_strip_type == TabStripType::kHorizontal &&
++        !tark_one_row) {
+       const int leading_margin = GetHorizontalTabStripLeadingMargin(params);
+       tabstrip_bounds = GetBoundsWithExclusion(
+           params, views().horizontal_tab_strip_region_view, leading_margin);
+@@ -1405,8 +1417,12 @@
+                     GetLayoutConstant(LayoutConstant::kTabstripToolbarOverlap));
+       needs_exclusion = false;
+     }
+-    layout.AddChild(views().horizontal_tab_strip_region_view, tabstrip_bounds,
+-                    layout_data_->tab_strip_type == TabStripType::kHorizontal);
++    ProposedLayout& tab_strip_layout = layout.AddChild(
++        views().horizontal_tab_strip_region_view, tabstrip_bounds,
++        layout_data_->tab_strip_type == TabStripType::kHorizontal);
++    if (tark_one_row) {
++      tark_tab_strip_layout = &tab_strip_layout;
++    }
+   }
+ 
+   // Lay out toolbar. If tabstrip is completely absent (or vertical), this can
+@@ -1426,6 +1442,23 @@
+       needs_exclusion = false;
+     }
+     layout.AddChild(views().toolbar, toolbar_bounds, toolbar_visible);
++
++    // Tark (M3c): the tab strip over the tab well, in this container's
++    // coordinates.
++    if (tark_tab_strip_layout && toolbar_visible) {
++      gfx::Rect well = tark_toolbar->GetTarkTabWellBounds(toolbar_bounds.size());
++      if (well.width() <= 0) {
++        tark_tab_strip_layout->bounds = gfx::Rect();
++      } else {
++        well.Offset(toolbar_bounds.OffsetFromOrigin());
++        const int height = std::min(
++            views().horizontal_tab_strip_region_view->GetPreferredSize().height(),
++            toolbar_bounds.height());
++        tark_tab_strip_layout->bounds = gfx::Rect(
++            well.x(), toolbar_bounds.y() + (toolbar_bounds.height() - height) / 2,
++            well.width(), height);
++      }
++    }
+   }
+ 
+   // Lay out the bookmarks bar if one is present.
+--- a/chrome/browser/ui/window_feature_controller/window_feature_controller.cc
++++ b/chrome/browser/ui/window_feature_controller/window_feature_controller.cc
+@@ -67,10 +67,10 @@
+ }
+ 
+ bool WindowFeatureController::UsesImmersiveFullscreenTabbedMode() const {
+-  const bool is_pwa = app_controller_ != nullptr;
+-  const bool is_tabbed_window =
+-      CanSupportWindowFeature(WindowFeature::kFeatureTabStrip);
+-  return is_tabbed_window && !is_pwa;
++  // Tark (M3c, spec 6.4): normal windows keep one row in fullscreen, so the
++  // tab strip moves into the top container with the toolbar instead of a
++  // separate overlay above it.
++  return false;
+ }
+ #endif
+ 
