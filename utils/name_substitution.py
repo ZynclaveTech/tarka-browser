@@ -45,7 +45,7 @@ def replacement_sanity():
         ('Chrome Root Program', 'Chrome Root Program'),
         ('Chrome Remote Desktop', 'Chrome Remote Desktop'),
         ('chrome://about', 'chrome://about'),
-        ('The Chromium Authors', 'The Tark Authors'),
+        ('The Chromium Authors', 'Zynclave Tech Private Limited'),
         ("Chromium's", "Tark's"),
         ('Chrome Google Chrome Chrome Chromium', 'Tark Tark Tark Tark'),
     ]

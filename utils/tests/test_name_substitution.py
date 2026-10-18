@@ -15,7 +15,7 @@ CASES = [
     ("Chrome Root Program", "Chrome Root Program"),
     ("chrome://about", "chrome://about"),
     ("chrome://settings/search", "chrome://settings/search"),
-    ("The Chromium Authors", "The Tark Authors"),
+    ("The Chromium Authors", "Zynclave Tech Private Limited"),
     ("Chromium's", "Tark's"),
     ("ChromiumOS", "ChromiumOS"),
     ("chromium.org", "chromium.org"),
@@ -26,6 +26,17 @@ def test_replace_text():
     for source, expected in CASES:
         got, _ = util.replace_text(source)
         assert got == expected, f"{source!r}: {got!r} != {expected!r}"
+
+
+# The copyright line on About and chrome://version names the company that
+# makes Tark, in English and in every translation.
+def test_copyright_names_the_company():
+    english = "Copyright {0,date,y} The Chromium Authors. All rights reserved."
+    assert util.replace_text(english)[0] == (
+        "Copyright {0,date,y} Zynclave Tech Private Limited. All rights reserved.")
+    hindi = "\u0915\u0949\u092a\u0940\u0930\u093e\u0907\u091f YEAR The Chromium Authors."
+    assert util.replace_text(hindi, translation=True)[0] == (
+        "\u0915\u0949\u092a\u0940\u0930\u093e\u0907\u091f YEAR Zynclave Tech Private Limited.")
 
 
 # M3 Task 7: "Incognito" becomes "private" in English UI text only.
