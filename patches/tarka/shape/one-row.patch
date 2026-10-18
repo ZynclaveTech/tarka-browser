@@ -1,0 +1,399 @@
+--- a/chrome/browser/ui/views/frame/layout/browser_view_tabbed_layout_impl.cc
++++ b/chrome/browser/ui/views/frame/layout/browser_view_tabbed_layout_impl.cc
+@@ -2,6 +2,7 @@
+ // Use of this source code is governed by a BSD-style license that can be
+ // found in the LICENSE file.
+ 
++#include "chrome/browser/ui/views/toolbar/toolbar_view.h"
+ #include "chrome/browser/ui/views/frame/layout/browser_view_tabbed_layout_impl.h"
+ 
+ #include <algorithm>
+@@ -742,11 +743,25 @@
+   bool needs_exclusion = true;
+   const HorizontalLayout& horizontal_layout = layout_data_->horizontal_layout;
+ 
++  // Tark (M3c, spec 6.4): one row. With a tab well in the toolbar the
++  // horizontal tab strip gets no row of its own: the toolbar takes the
++  // traffic-light row and the tab strip is placed over the well once the
++  // top container is laid out (`PlaceTarkTabStripInWell`).
++  const auto* const tark_toolbar =
++      views::AsViewClass<ToolbarView>(views().toolbar.get());
++  const bool tark_one_row =
++      tark_toolbar && tark_toolbar->HasTarkTabWell() &&
++      layout_data_->tab_strip_type == TabStripType::kHorizontal &&
++      IsParentedTo(views().horizontal_tab_strip_region_view,
++                   views().browser_view);
++  ProposedLayout* tark_tab_strip_layout = nullptr;
++
+   // Lay out horizontal tab strip region if present.
+   if (IsParentedTo(views().horizontal_tab_strip_region_view,
+                    views().browser_view)) {
+     gfx::Rect tabstrip_bounds;
+-    if (layout_data_->tab_strip_type == TabStripType::kHorizontal) {
++    if (layout_data_->tab_strip_type == TabStripType::kHorizontal &&
++        !tark_one_row) {
+       const int leading_margin = GetHorizontalTabStripLeadingMargin(params);
+       tabstrip_bounds = GetBoundsWithExclusion(
+           params, views().horizontal_tab_strip_region_view, leading_margin);
+@@ -754,8 +769,12 @@
+                     GetLayoutConstant(LayoutConstant::kTabstripToolbarOverlap));
+       needs_exclusion = false;
+     }
+-    layout.AddChild(views().horizontal_tab_strip_region_view, tabstrip_bounds,
+-                    layout_data_->tab_strip_type == TabStripType::kHorizontal);
++    ProposedLayout& tab_strip_layout = layout.AddChild(
++        views().horizontal_tab_strip_region_view, tabstrip_bounds,
++        layout_data_->tab_strip_type == TabStripType::kHorizontal);
++    if (tark_one_row) {
++      tark_tab_strip_layout = &tab_strip_layout;
++    }
+   }
+ 
+   // This will be the area next to the vertical tab strip (if present) that will
+@@ -948,6 +967,7 @@
+     top_container_layout.bounds =
+         GetTopContainerBoundsInParent(top_container_local_bounds, params);
+     params.SetTop(top_container_layout.bounds.bottom());
++    PlaceTarkTabStripInWell(tark_tab_strip_layout, top_container_layout);
+ 
+     // Possibly bump the leading margin of the top container out to cover the
+     // caption buttons, leaving all of the child views in the same absolute
+@@ -1080,6 +1100,7 @@
+     top_container_layout.bounds =
+         GetTopContainerBoundsInParent(top_container_local_bounds, params);
+     params.SetTop(top_container_layout.bounds.bottom());
++    PlaceTarkTabStripInWell(tark_tab_strip_layout, top_container_layout);
+   }
+ 
+   // Lay out infobar container.
+@@ -1333,6 +1354,40 @@
+   return layout;
+ }
+ 
++void BrowserViewTabbedLayoutImpl::PlaceTarkTabStripInWell(
++    ProposedLayout* tab_strip_layout,
++    const ProposedLayout& top_container_layout) const {
++  if (!tab_strip_layout) {
++    return;
++  }
++  const auto* const toolbar =
++      views::AsViewClass<ToolbarView>(views().toolbar.get());
++  const auto it = top_container_layout.children.find(views().toolbar);
++  if (!toolbar || it == top_container_layout.children.end() ||
++      it->second.bounds.IsEmpty()) {
++    return;
++  }
++  const gfx::Rect& toolbar_bounds = it->second.bounds;
++  gfx::Rect well = toolbar->GetTarkTabWellBounds(toolbar_bounds.size());
++  // The well has no height of its own (the toolbar centres it), so only its
++  // width says whether there is room for tabs.
++  if (well.width() <= 0) {
++    tab_strip_layout->bounds = gfx::Rect();
++    return;
++  }
++  // Toolbar coordinates → top container → browser view.
++  well.Offset(toolbar_bounds.OffsetFromOrigin());
++  well.Offset(top_container_layout.bounds.OffsetFromOrigin());
++  const int height = std::min(
++      views().horizontal_tab_strip_region_view->GetPreferredSize().height(),
++      toolbar_bounds.height());
++  tab_strip_layout->bounds =
++      gfx::Rect(well.x(), toolbar_bounds.y() +
++                              top_container_layout.bounds.y() +
++                              (toolbar_bounds.height() - height) / 2,
++                well.width(), height);
++}
++
+ gfx::Rect BrowserViewTabbedLayoutImpl::CalculateTopContainerLayout(
+     ProposedLayout& layout,
+     BrowserLayoutParams params,
+--- a/chrome/browser/ui/views/frame/layout/browser_view_tabbed_layout_impl.h
++++ b/chrome/browser/ui/views/frame/layout/browser_view_tabbed_layout_impl.h
+@@ -34,6 +34,9 @@
+   gfx::Size GetMinimumSize(const views::View* host) const override;
+   ProposedLayout CalculateProposedLayout(
+       const BrowserLayoutParams& params) const override;
++  // Tark (M3c): places the horizontal tab strip over the toolbar's tab well.
++  void PlaceTarkTabStripInWell(ProposedLayout* tab_strip_layout,
++                               const ProposedLayout& top_container_layout) const;
+   gfx::Rect CalculateTopContainerLayout(ProposedLayout& layout,
+                                         BrowserLayoutParams params,
+                                         bool needs_exclusion) const override;
+--- a/chrome/browser/ui/views/toolbar/toolbar_view.cc
++++ b/chrome/browser/ui/views/toolbar/toolbar_view.cc
+@@ -8,6 +8,8 @@
+ #include <memory>
+ #include <utility>
+ 
++#include "ui/views/view_observer.h"
++#include "base/scoped_observation.h"
+ #include "base/command_line.h"
+ #include "base/containers/fixed_flat_map.h"
+ #include "base/feature_list.h"
+@@ -217,6 +219,76 @@
+ constexpr int kInsideBorderAroundGlicButtons = 2;
+ constexpr int kGlicButtonMargin = 5;
+ 
++// Tark (M3c, spec 6.4): the empty place in the toolbar row where the
++// horizontal tab strip is laid out. It reserves the tab strip's width and
++// counts as caption area (the tab strip, a BrowserView child, sits over it).
++class TarkTabWell : public views::View, public views::ViewObserver {
++  METADATA_HEADER(TarkTabWell, views::View)
++
++ public:
++  explicit TarkTabWell(BrowserView* browser_view)
++      : browser_view_(browser_view) {}
++
++  // views::View:
++  gfx::Size CalculatePreferredSize(
++      const views::SizeBounds& available_size) const override {
++    const views::View* tab_strip = GetHorizontalTabStrip();
++    return gfx::Size(tab_strip ? tab_strip->GetPreferredSize().width() : 0, 0);
++  }
++  gfx::Size GetMinimumSize() const override {
++    const views::View* tab_strip = GetHorizontalTabStrip();
++    return gfx::Size(tab_strip ? tab_strip->GetMinimumSize().width() : 0, 0);
++  }
++  // The well's flex rule, in turn: the tabs get up to kTabsFloor, then the
++  // address pill gets kAddressReserve above its own minimum, then the tabs
++  // take the rest up to the tab strip's preferred width. Never below the tab
++  // strip's minimum.
++  static gfx::Size FlexRule(const views::View* view,
++                            const views::SizeBounds& bounds) {
++    constexpr int kTabsFloor = 200;
++    constexpr int kAddressReserve = 220;
++    const int preferred = view->GetPreferredSize().width();
++    const int minimum = view->GetMinimumSize().width();
++    int width = preferred;
++    if (bounds.width().is_bounded()) {
++      width = std::max(
++          std::min(preferred, bounds.width().value() - kAddressReserve),
++          std::min({preferred, kTabsFloor, bounds.width().value()}));
++    }
++    return gfx::Size(std::max(width, minimum), 0);
++  }
++
++  void AddedToWidget() override {
++    if (views::View* tab_strip = browser_view_->tab_strip_view();
++        tab_strip && !observation_.IsObserving()) {
++      observation_.Observe(tab_strip);
++    }
++  }
++
++  // views::ViewObserver:
++  void OnViewPreferredSizeChanged(views::View* observed_view) override {
++    PreferredSizeChanged();
++  }
++  void OnViewIsDeleting(views::View* observed_view) override {
++    observation_.Reset();
++  }
++
++ private:
++  const views::View* GetHorizontalTabStrip() const {
++    if (!browser_view_->ShouldDrawTabStrip() ||
++        browser_view_->ShouldDrawVerticalTabStrip()) {
++      return nullptr;
++    }
++    return browser_view_->tab_strip_view();
++  }
++
++  raw_ptr<BrowserView> browser_view_;
++  base::ScopedObservation<views::View, views::ViewObserver> observation_{this};
++};
++
++BEGIN_METADATA(TarkTabWell)
++END_METADATA
++
+ // Returns whether `point` should be treated as part of the caption area in
+ // `view`. Recursively traverses into icon containers to correctly handle
+ // padding between buttons.
+@@ -234,9 +306,10 @@
+       return IsPositionInWindowCaptionForView(child, point_in_child);
+     }
+     // Separators and dividers are non-interactive and should be treated
+-    // as caption area.
++    // as caption area; so is Tark's tab well.
+     if (views::IsViewClass<views::Separator>(child) ||
+-        views::IsViewClass<ToolbarDivider>(child)) {
++        views::IsViewClass<ToolbarDivider>(child) ||
++        views::IsViewClass<TarkTabWell>(child)) {
+       return true;
+     }
+     // The point hit an interactive control (button, location bar, etc.).
+@@ -640,6 +713,15 @@
+     app_menu_button_ = AddChildView(std::move(app_menu_button));
+   }
+ 
++  // Tark (M3c, spec 6.4): one row — the menu button (the mark) first, then
++  // the tab well, then back/reload and the address pill.
++  if (display_mode_ == DisplayMode::kNormal && app_menu_button_ &&
++      browser_->GetType() == BrowserWindowInterface::Type::TYPE_NORMAL) {
++    ReorderChildView(app_menu_button_, 0);
++    tab_well_ =
++        AddChildViewAt(std::make_unique<TarkTabWell>(browser_view_), 1);
++  }
++
+   if (base::FeatureList::IsEnabled(contextual_tasks::kContextualTasks) &&
+       contextual_tasks::GetExpandButtonOption() ==
+           contextual_tasks::ExpandButtonOption::kToolbarCloseButton) {
+@@ -1299,6 +1381,17 @@
+   return IsPositionInWindowCaptionForView(this, test_point);
+ }
+ 
++gfx::Rect ToolbarView::GetTarkTabWellBounds(
++    const gfx::Size& toolbar_size) const {
++  if (!tab_well_ || !layout_manager_) {
++    return gfx::Rect();
++  }
++  const views::ProposedLayout layout =
++      layout_manager_->GetProposedLayout(toolbar_size);
++  const views::ChildLayout* well = layout.GetLayoutFor(tab_well_);
++  return well && well->visible ? well->bounds : gfx::Rect();
++}
++
+ void ToolbarView::RecordHitTestMetrics(bool is_caption_area) {
+   const bool is_mouse_down = GetWidget() && GetWidget()->IsMouseButtonDown();
+ 
+@@ -1555,9 +1648,11 @@
+   // If kOmniboxResizingPrioritization is enabled, give the location bar the
+   // highest priority as it will first shrink down to its soft minimum but won't
+   // hit its hard minimum until all other items have dropped out.
++  // Tark: with one row the tab well takes order 1 (FlexLayout orders start
++  // at 1), so a prioritized location bar moves to 2, still ahead of the rest.
+   const int location_bar_flex_order =
+       base::FeatureList::IsEnabled(features::kOmniboxResizingPrioritization)
+-          ? 1
++          ? (tab_well_ ? 2 : 1)
+           : kOrderOffset + 1;
+   constexpr int kToolbarActionsFlexOrder = kOrderOffset + 2;
+   constexpr int kExtensionsFlexOrder = kOrderOffset + 3;
+@@ -1575,6 +1670,16 @@
+       .SetCollapseMargins(true)
+       .SetDefault(views::kMarginsKey, gfx::Insets::VH(0, default_margin));
+ 
++  // Tark: the tab well is laid out first (order 1); TarkTabWell::FlexRule
++  // shares the row between the tabs and the address pill.
++  if (tab_well_) {
++    tab_well_->SetProperty(
++        views::kFlexBehaviorKey,
++        views::FlexSpecification(base::BindRepeating(&TarkTabWell::FlexRule))
++            .WithOrder(1));
++    tab_well_->SetProperty(views::kMarginsKey, gfx::Insets());
++  }
++
+   // If the Views location bar is in use, set its properties here.
+   if (location_bar_view_) {
+     location_bar_view_->SetProperty(views::kFlexBehaviorKey,
+--- a/chrome/browser/ui/views/toolbar/toolbar_view.h
++++ b/chrome/browser/ui/views/toolbar/toolbar_view.h
+@@ -170,6 +170,13 @@
+   // area.
+   bool IsPositionInWindowCaption(const gfx::Point& test_point) const;
+ 
++  // Tark (M3c, spec 6.4): normal windows have one row — the horizontal tab
++  // strip is laid out over an empty "tab well" in this toolbar, after the
++  // menu button. Returns the well's bounds in toolbar coordinates for a
++  // toolbar of `toolbar_size`, or an empty rect without a well.
++  bool HasTarkTabWell() const { return tab_well_ != nullptr; }
++  gfx::Rect GetTarkTabWellBounds(const gfx::Size& toolbar_size) const;
++
+   // Records user metrics based on hit test results within the toolbar view.
+   void RecordHitTestMetrics(bool is_caption_area);
+ 
+@@ -433,6 +440,7 @@
+   raw_ptr<AvatarToolbarButton> avatar_ = nullptr;
+   raw_ptr<MediaToolbarButton> media_button_ = nullptr;
+   raw_ptr<BrowserAppMenuButton> app_menu_button_ = nullptr;
++  raw_ptr<views::View> tab_well_ = nullptr;
+ 
+   // The button currently holding the lock to be shown/hidden.
+   raw_ptr<glic::GlicButtonInterface> locked_expansion_button_ = nullptr;
+--- a/chrome/browser/ui/views/frame/browser_native_widget_mac.mm
++++ b/chrome/browser/ui/views/frame/browser_native_widget_mac.mm
+@@ -303,7 +303,10 @@
+   // to prevent glass frame artifacts when one of the dimensions is too small.
+   const auto top_element_info = browser_view_->GetFrameElementInfo();
+   height += top_element_info.top_area_height();
+-  height += top_element_info.toolbar_preferred_height;
++  // Tark (M3c): one row — the toolbar row is the top area, not added twice.
++  if (!browser_view_->IsTarkOneRow()) {
++    height += top_element_info.toolbar_preferred_height;
++  }
+   return height;
+ }
+ 
+--- a/chrome/browser/ui/views/frame/browser_view.cc
++++ b/chrome/browser/ui/views/frame/browser_view.cc
+@@ -1250,7 +1250,7 @@
+                 ->GetPreferredSize()
+                 .height()
+           : 0;
+-  if (toolbar_ && ShouldDrawVerticalTabStrip()) {
++  if (toolbar_ && (ShouldDrawVerticalTabStrip() || IsTarkOneRow())) {
+     info.toolbar_minimum_height = toolbar_->GetMinimumSize().height();
+   } else if (web_app_frame_toolbar_ && ShouldDrawWebAppFrameToolbar()) {
+     info.toolbar_minimum_height =
+@@ -1259,9 +1259,19 @@
+   if (toolbar_ && IsToolbarVisible()) {
+     info.toolbar_preferred_height = toolbar_->GetPreferredSize().height();
+   }
++  // Tark (M3c): the tab strip sits in the toolbar row, not a row of its own,
++  // so the traffic lights centre on the toolbar.
++  if (IsTarkOneRow()) {
++    info.tabstrip_preferred_height = 0;
++  }
+   return info;
+ }
+ 
++bool BrowserView::IsTarkOneRow() const {
++  return toolbar_ && toolbar_->HasTarkTabWell() && ShouldDrawTabStrip() &&
++         !ShouldDrawVerticalTabStrip();
++}
++
+ gfx::Size BrowserView::GetWebAppFrameToolbarPreferredSize() const {
+   return web_app_frame_toolbar_ ? web_app_frame_toolbar_->GetPreferredSize()
+                                 : gfx::Size();
+@@ -4735,6 +4745,16 @@
+       return HTCLIENT;
+     }
+ 
++    // Tark (M3c, spec 6.4): in one row the toolbar shares the traffic-light
++    // row; its gaps drag the window, as they do with vertical tabs.
++    if (IsTarkOneRow()) {
++      gfx::Point test_point2(point);
++      if (ConvertedHitTest(parent(), top_container_, &test_point2) &&
++          top_container_->IsPositionInWindowCaption(test_point2)) {
++        return HTNOWHERE;
++      }
++    }
++
+     // The top few pixels of the TabStrip are a drop-shadow - as we're pretty
+     // starved of draggable area, let's give it to window dragging (this also
+     // makes sense visually).
+--- a/chrome/browser/ui/views/frame/browser_view.h
++++ b/chrome/browser/ui/views/frame/browser_view.h
+@@ -269,6 +269,10 @@
+   // Returns either the Horizontal or Vertical TabStrip.
+   TabStripRegionView* tab_strip_view() const;
+ 
++  // Tark (M3c, spec 6.4): whether this window lays its horizontal tab strip
++  // over the toolbar's tab well (one row) instead of a row of its own.
++  bool IsTarkOneRow() const;
++
+   // Test only function. When the VerticalTabs feature is enabled,
+   // `vertical_tab_strip_container_` will have a value for normal tabbed
+   // browsers even if it is not the active TabStrip. Prefer to use
+--- a/chrome/browser/ui/views/frame/horizontal_tab_strip_region_view.cc
++++ b/chrome/browser/ui/views/frame/horizontal_tab_strip_region_view.cc
+@@ -449,8 +449,9 @@
+ gfx::Size HorizontalTabStripRegionViewOld::GetMinimumSize() const {
+   gfx::Size tab_strip_min_size = tab_strip_->GetMinimumSize();
+   // Cap the tabstrip minimum width to a reasonable value so browser windows
+-  // aren't forced to grow arbitrarily wide.
+-  const int max_min_width = 520;
++  // aren't forced to grow arbitrarily wide. Tark (M3c): the tab strip shares
++  // its row with the address pill, so the cap is lower.
++  const int max_min_width = 320;
+   tab_strip_min_size.set_width(
+       std::min(max_min_width, tab_strip_min_size.width()));
+   return tab_strip_min_size;
