@@ -10,6 +10,8 @@ substitution; the Chromium tree is never committed.
 The design is in [docs/superpowers/specs/2026-10-16-tarka-browser-design.md](docs/superpowers/specs/2026-10-16-tarka-browser-design.md)
 and the current plan in [docs/superpowers/plans/](docs/superpowers/plans/).
 
+![A Tark window in light mode: one row with the three-dot menu button, the tabs, back, forward and reload, and the address pill; below it the settings home](docs/screenshots/m3c/one-row-light.png)
+
 ![Tark's settings home in dark mode: one line on how Tark is set up and eight tiles showing each section's state](docs/screenshots/m3/task12-home-dark.png)
 
 Internal pages answer to `tark://` (`tark://settings`, `tark://extensions`),
