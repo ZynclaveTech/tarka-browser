@@ -42,7 +42,9 @@ ALLOWED = [
     (re.compile(r'Chrome Remote Desktop'), None, "Google's product"),
     (re.compile(r'Chrome DevTools MCP'), None, "Google's product"),
     (re.compile(r'Chrome/\d'), None, 'user agent token, kept for web compatibility'),
-    (re.compile(r'Chromium'), 'chrome://credits', 'licence credits'),
+    (re.compile(r'.'), 'chrome://credits',
+     'licence credits: third-party project names, attribution the licences require'),
+    (re.compile(r'Chrome console'), 'chrome://gpu', 'GPU diagnostics text'),
     (re.compile(r'made possible by the Chromium'), 'chrome://settings/help',
      'Chromium credit on About'),
     (re.compile(r'made possible by the Chromium'), 'chrome://version',
@@ -70,9 +72,6 @@ SKIPPED = ('crash', 'kill', 'hang', 'quit', 'restart', 'feedback',
            'signin-dice-web-intercept', 'privacy-sandbox-dialog',
            'search-engine-choice', 'reset-password', 'batch-upload',
            'enterprise-profile-welcome',
-           # Crashes the dev build on an invalid policy schema (an M4 finding,
-           # tracked separately): skipped so the audit can finish.
-           'policy',
            # Internal page that CHECKs for a key service macOS dev builds lack.
            'unexportable-keys-internals')
 

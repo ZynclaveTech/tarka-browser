@@ -77,3 +77,12 @@ def test_addresses_count_in_titles_and_error_pages_only():
     assert hits('chrome://flags/', 'can be internal (e.g. chrome://new-tab-page)') == []
     assert hits('chrome://foo/', 'The webpage at chrome://foo/ might be temporarily down') != []
     assert hits('chrome://foo/', 'TAB TITLE: chrome://foo/') != []
+
+
+# Release audit: third-party project names on the licence page and GPU
+# diagnostics text are not Tark's own wording.
+def test_credits_and_gpu_diagnostics_pass():
+    assert hits('chrome://credits/', 'ARCore SDK client library for Chrome homepage') == []
+    assert hits('chrome://credits/', 'Google Chrome Content Analysis Connector Agent SDK') == []
+    assert hits('chrome://gpu/', 'will be log via EmitLog, thus printed in Chrome console') == []
+    assert hits('chrome://policy/', 'Chrome Policies') != []
