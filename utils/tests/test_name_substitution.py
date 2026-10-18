@@ -137,3 +137,10 @@ def test_m3b_text_cases():
     for source, expected in M3B_TEXT_CASES:
         got, _ = util.replace_text(source)
         assert got == expected, f"{source!r}: {got!r} != {expected!r}"
+
+
+# M3d: Tark's own sentences say "Chromium" on purpose and must stay as written.
+def test_tark_sentences_keep_chromium():
+    sentence = "Tark 155.0.1, built on Chromium for this Mac."
+    assert util.replace_text(sentence)[0] == sentence
+    assert util.replace_text("Chromium")[0] == "Tark"

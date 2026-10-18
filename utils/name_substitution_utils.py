@@ -18,6 +18,8 @@ REPLACEMENT_REGEXES_STR = [
     (r'(\w+) Web( S|s)tore', r'\1_unreplace Web Store'),
     (r'(\w+) Remote Desktop', r'\1_unreplace Remote Desktop'),
     (r'(\w+) DevTools MCP', r'\1_unreplace DevTools MCP'),
+    # Tark's own sentences name Chromium on purpose (M3d: tark://version).
+    (r'built on (Chromium)', r'built on \1_unreplace'),
 
     # main replacement
     (r'(?:Google )?Chrom(e|ium)(?!\w)', r'Tark'),
