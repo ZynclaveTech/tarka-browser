@@ -69,6 +69,8 @@ def problems(page, facts):
         found.append('sentence takes %s lines' % facts.get('sentence_lines'))
     if facts.get('row_shadows'):
         found.append('%d elements with a box-shadow' % facts['row_shadows'])
+    if page == 'version' and facts.get('rows', 0) < 3:
+        found.append('version page has %s label/value rows' % facts.get('rows', 0))
     danger = facts.get('danger_row')
     if danger is not None and (not danger.get('text') or not danger.get('buttons')):
         found.append('a dangerous download lost its warning or its actions')
@@ -90,9 +92,11 @@ FACTS_JS = r"""(() => {
   const visible = (el) => el && el.getClientRects().length > 0;
   const toolbar = all.find((e) => e.tagName === 'CR-TOOLBAR' && visible(e));
   const scope = toolbar ? toolbar.shadowRoot : document;
+  const plain = (selector) => all.find((e) => e.matches && e.matches(selector));
   const label = toolbar ? scope.querySelector('h1')
-                        : document.querySelector('.tark-page-header h1');
-  const sentenceEl = scope.querySelector('#pageSentence');
+                        : plain('.tark-page-header h1');
+  const sentenceEl = toolbar ? scope.querySelector('#pageSentence')
+                             : plain('#pageSentence');
   const sentence = sentenceEl && visible(sentenceEl) ?
       sentenceEl.textContent.trim() || null : null;
   let lines = 0;
@@ -135,6 +139,7 @@ FACTS_JS = r"""(() => {
     row_shadows: shadows,
     sidebar_selected_border: border,
     actions: actions,
+    rows: rows.length,
     danger_row: danger ? {text: danger.textContent.trim().slice(0, 200),
         buttons: [...danger.querySelectorAll('[data-tark-action]')].map(name)} : null,
   });

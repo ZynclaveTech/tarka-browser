@@ -22,6 +22,7 @@ def facts(dark=False, **overrides):
         'sidebar_selected_border': CORAL[dark],
         'actions': [],
         'danger_row': None,
+        'rows': 6,
     }
     clean.update(overrides)
     return clean
@@ -106,3 +107,10 @@ def test_downloads_zero_is_empty_state():
     assert page_audit.problems('downloads', facts(
         sentence='0 files today, saved to your Downloads folder',
         sidebar_selected_border=None))
+
+
+def test_version_rows():
+    version = dict(sentence='Tark 155.0.8059.39, built on Chromium for this Mac.',
+                   sidebar_selected_border=None)
+    assert page_audit.problems('version', facts(rows=6, **version)) == []
+    assert page_audit.problems('version', facts(rows=0, **version))
