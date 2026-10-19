@@ -25,6 +25,8 @@ def dryrun(*args):
             if (work / 'src' / 'out' / 'Default' / 'args.gn').exists() else '',
             'clone': (work / 'uc' / 'utils' / 'clone.py').read_text()
             if (work / 'uc' / 'utils' / 'clone.py').exists() else '',
+            'dt_patch': (work / 'uc' / 'utils' / 'depot_tools.patch').read_text()
+            if (work / 'uc' / 'utils' / 'depot_tools.patch').exists() else '',
             'uc_files': sorted(str(f.relative_to(work / 'uc')) for f in (work / 'uc').rglob('*')
                                if f.is_file()) if (work / 'uc').exists() else [],
         }
@@ -79,6 +81,14 @@ class TestAndroidBuildSh(unittest.TestCase):
         self.assertIn("environ['GCLIENT_FILE'] = str(args.output.parent / '.gclient')", files['clone'])
         self.assertIn("copy(args.custom_config, args.output.parent / '.gclient')", files['clone'])
         self.assertIn('def clone(args)', files['clone'])
+
+    def test_depot_tools_patch_keeps_gn_args_file_relative(self):
+        # Current depot_tools rejects an absolute gclient_gn_args_file; with
+        # .gclient beside src the relative one is right, so that hunk goes.
+        result, runs, files, tmp = dryrun('--stop-before-gn')
+        self.assertNotIn('self._gn_args_file = r"UC_OUT"', files['dt_patch'])
+        self.assertIn('name = r"UC_OUT"+name[3:]', files['dt_patch'])  # other hunks stay
+        self.assertIn("parser.add_option('--sysroot')", files['dt_patch'])
 
     def test_core_patches_then_tark_series(self):
         result, runs, files, tmp = dryrun('--stop-before-gn')

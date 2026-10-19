@@ -63,6 +63,10 @@ sed -i.orig \
   -e "s|environ\['GCLIENT_FILE'\] = str(ucstaging / '.gclient')|environ['GCLIENT_FILE'] = str(args.output.parent / '.gclient')|" \
   "$work/uc/utils/clone.py"
 rm -f "$work/uc/utils/clone.py.orig"
+# - ungoogled's depot_tools.patch makes gclient_gn_args_file absolute, which
+#   the pinned depot_tools rejects; with .gclient beside src the relative
+#   path is right, so that one hunk is dropped from the copy.
+python3 "$_root_dir/android/drop_gn_args_hunk.py" "$work/uc/utils/depot_tools.patch"
 if grep -q ".gclient').replace('UC_OUT'" "$work/uc/utils/clone.py" ||
    ! grep -q "environ\['GCLIENT_FILE'\] = str(args.output.parent / '.gclient')" "$work/uc/utils/clone.py"; then
   echo "tark: clone.py changed upstream; android/build.sh's fix no longer applies" >&2
