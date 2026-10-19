@@ -26,6 +26,18 @@ if [[ -z "$_target_dmg" ]]; then
   _target_dmg="$_root_dir/build/${_product_name}_${_chromium_version}-${_ungoogled_revision}.${_package_revision}_macos.dmg"
 fi
 
+# A release for other people must be an official build: non-official builds
+# keep Chromium's DCHECKs on, so an internal check that is harmless in an
+# official build kills the tab ("Aw, Snap!", error code 6). Revisions 1 and 2
+# shipped that way. Ad-hoc and development signing stay allowed for testing.
+if (( ! _ad_hoc && ! _dev )); then
+  _official="$(grep -E '^[[:space:]]*is_official_build[[:space:]]*=' "$_src_dir/out/Default/args.gn" | tail -1 | tr -d ' ')"
+  if [[ "$_official" != "is_official_build=true" ]]; then
+    printf '::error::refusing to sign a non-official build for release (%s in out/Default/args.gn)\n' "${_official:-no is_official_build}" >&2
+    exit 1
+  fi
+fi
+
 sign() {
   if (( _ad_hoc )); then
     # Library validation compares Team IDs, and an ad-hoc signature has
