@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/components/tark_captions/BUILD.gn
-@@ -0,0 +1,50 @@
+@@ -0,0 +1,53 @@
 +# Copyright 2026 The Tark Authors
 +# Use of this source code is governed by a BSD-style license that can be
 +# found in the LICENSE file.
@@ -14,6 +14,8 @@
 +
 +source_set("tark_captions") {
 +  sources = [
++    "asr_model.cc",
++    "asr_model.h",
 +    "mel_frontend.cc",
 +    "mel_frontend.h",
 +    "ort_runtime.cc",
@@ -40,6 +42,7 @@
 +
 +test("tark_captions_unittests") {
 +  sources = [
++    "asr_model_unittest.cc",
 +    "mel_frontend_unittest.cc",
 +    "ort_runtime_unittest.cc",
 +  ]
@@ -788,3 +791,264 @@
      "//content/public/browser:proto",
      "//google_apis",
      "//media/mojo/common",
+--- /dev/null
++++ b/components/tark_captions/asr_model.h
+@@ -0,0 +1,68 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef COMPONENTS_TARK_CAPTIONS_ASR_MODEL_H_
++#define COMPONENTS_TARK_CAPTIONS_ASR_MODEL_H_
++
++#include <map>
++#include <memory>
++#include <optional>
++#include <string>
++#include <string_view>
++#include <vector>
++
++#include "base/containers/span.h"
++#include "base/files/file_path.h"
++#include "base/memory/raw_ptr.h"
++
++namespace tark_captions {
++
++class MelFrontend;
++class OrtModel;
++class OrtRuntime;
++
++// The languages Phase 1 captions (measured in the D4 spike).
++enum class Language { kHindi, kTamil, kBengali };
++
++// "hi", "ta", "bn" (also the keys of vocab.json and language_masks.json).
++const char* LanguageCode(Language language);
++std::optional<Language> LanguageFromCode(std::string_view code);
++
++// AI4Bharat IndicConformer 600M (MIT), its int8 encoder and CTC decoder:
++// whole-segment recognition, greedy CTC per language.
++class AsrModel {
++ public:
++  // Null if a model file is missing or invalid.
++  static std::unique_ptr<AsrModel> Load(OrtRuntime* runtime,
++                                        const base::FilePath& models_dir,
++                                        int threads);
++
++  AsrModel(const AsrModel&) = delete;
++  AsrModel& operator=(const AsrModel&) = delete;
++  ~AsrModel();
++
++  // UTF-8 text of 16 kHz mono speech; empty if nothing was recognised or
++  // the model failed.
++  std::string Decode(base::span<const float> pcm16k, Language language);
++
++ private:
++  struct Vocabulary {
++    std::vector<int> logit_indices;   // the language's columns of the logits
++    std::vector<std::string> tokens;  // token id -> piece
++  };
++
++  AsrModel(std::unique_ptr<MelFrontend> frontend,
++           std::unique_ptr<OrtModel> encoder,
++           std::unique_ptr<OrtModel> ctc,
++           std::map<Language, Vocabulary> vocabularies);
++
++  std::unique_ptr<MelFrontend> frontend_;
++  std::unique_ptr<OrtModel> encoder_;
++  std::unique_ptr<OrtModel> ctc_;
++  std::map<Language, Vocabulary> vocabularies_;
++};
++
++}  // namespace tark_captions
++
++#endif  // COMPONENTS_TARK_CAPTIONS_ASR_MODEL_H_
+--- /dev/null
++++ b/components/tark_captions/asr_model.cc
+@@ -0,0 +1,138 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/tark_captions/asr_model.h"
++
++#include <utility>
++
++#include "base/files/file_util.h"
++#include "base/json/json_reader.h"
++#include "base/memory/ptr_util.h"
++#include "base/strings/string_util.h"
++#include "components/tark_captions/mel_frontend.h"
++#include "components/tark_captions/ort_runtime.h"
++
++namespace tark_captions {
++namespace {
++
++constexpr int kBlank = 256;
++constexpr Language kLanguages[] = {Language::kHindi, Language::kTamil, Language::kBengali};
++
++std::optional<base::Value> ReadJson(const base::FilePath& path) {
++  std::string json;
++  if (!base::ReadFileToString(path, &json)) {
++    return std::nullopt;
++  }
++  return base::JSONReader::Read(json, base::JSON_PARSE_RFC);
++}
++
++}  // namespace
++
++const char* LanguageCode(Language language) {
++  switch (language) {
++    case Language::kHindi:
++      return "hi";
++    case Language::kTamil:
++      return "ta";
++    case Language::kBengali:
++      return "bn";
++  }
++}
++
++std::optional<Language> LanguageFromCode(std::string_view code) {
++  for (Language language : kLanguages) {
++    if (code == LanguageCode(language)) {
++      return language;
++    }
++  }
++  return std::nullopt;
++}
++
++// static
++std::unique_ptr<AsrModel> AsrModel::Load(OrtRuntime* runtime,
++                                         const base::FilePath& models_dir,
++                                         int threads) {
++  std::unique_ptr<MelFrontend> frontend = MelFrontend::Load(models_dir);
++  std::unique_ptr<OrtModel> encoder =
++      runtime->LoadModel(models_dir.Append("encoder.int8.onnx"), threads);
++  std::unique_ptr<OrtModel> ctc = runtime->LoadModel(models_dir.Append("ctc_decoder.onnx"), threads);
++  std::optional<base::Value> vocab = ReadJson(models_dir.Append("vocab.json"));
++  std::optional<base::Value> masks = ReadJson(models_dir.Append("language_masks.json"));
++  if (!frontend || !encoder || !ctc || !vocab || !vocab->is_dict() || !masks || !masks->is_dict()) {
++    return nullptr;
++  }
++  std::map<Language, Vocabulary> vocabularies;
++  for (Language language : kLanguages) {
++    const base::ListValue* tokens = vocab->GetDict().FindList(LanguageCode(language));
++    const base::ListValue* mask = masks->GetDict().FindList(LanguageCode(language));
++    if (!tokens || !mask) {
++      return nullptr;
++    }
++    Vocabulary v;
++    for (size_t i = 0; i < mask->size(); ++i) {
++      if ((*mask)[i].is_bool() && (*mask)[i].GetBool()) {
++        v.logit_indices.push_back(static_cast<int>(i));
++      }
++    }
++    for (const base::Value& token : *tokens) {
++      v.tokens.push_back(token.is_string() ? token.GetString() : std::string());
++    }
++    if (v.logit_indices.size() != v.tokens.size() || v.tokens.size() <= kBlank) {
++      return nullptr;
++    }
++    vocabularies.emplace(language, std::move(v));
++  }
++  return base::WrapUnique(new AsrModel(std::move(frontend), std::move(encoder), std::move(ctc),
++                                       std::move(vocabularies)));
++}
++
++AsrModel::AsrModel(std::unique_ptr<MelFrontend> frontend,
++                   std::unique_ptr<OrtModel> encoder,
++                   std::unique_ptr<OrtModel> ctc,
++                   std::map<Language, Vocabulary> vocabularies)
++    : frontend_(std::move(frontend)),
++      encoder_(std::move(encoder)),
++      ctc_(std::move(ctc)),
++      vocabularies_(std::move(vocabularies)) {}
++
++AsrModel::~AsrModel() = default;
++
++std::string AsrModel::Decode(base::span<const float> pcm16k, Language language) {
++  int frames = 0;
++  std::vector<float> features = frontend_->Compute(pcm16k, &frames);
++  std::vector<Tensor> inputs(2);
++  inputs[0] = {.name = "audio_signal", .shape = {1, MelFrontend::kMels, frames}, .f32 = std::move(features)};
++  inputs[1] = {.name = "length", .shape = {1}, .i64 = {frames}};
++  std::vector<Tensor> encoded;
++  if (!encoder_->Run(inputs, {"outputs"}, &encoded)) {
++    return std::string();
++  }
++  encoded[0].name = "encoder_output";
++  std::vector<Tensor> logits;
++  if (!ctc_->Run(encoded, {"logprobs"}, &logits) || logits[0].shape.size() != 3) {
++    return std::string();
++  }
++  const Vocabulary& v = vocabularies_.at(language);
++  const int64_t steps = logits[0].shape[1];
++  const int64_t width = logits[0].shape[2];
++  std::string text;
++  int previous = -1;
++  for (int64_t t = 0; t < steps; ++t) {
++    const float* row = logits[0].f32.data() + t * width;
++    int best = 0;
++    for (size_t i = 1; i < v.logit_indices.size(); ++i) {
++      if (row[v.logit_indices[i]] > row[v.logit_indices[best]]) {
++        best = static_cast<int>(i);
++      }
++    }
++    if (best != previous && best != kBlank) {
++      text += v.tokens[best];
++    }
++    previous = best;
++  }
++  base::ReplaceSubstringsAfterOffset(&text, 0, "\xE2\x96\x81", " ");  // '▁'
++  return std::string(base::TrimWhitespaceASCII(text, base::TRIM_ALL));
++}
++
++}  // namespace tark_captions
+--- /dev/null
++++ b/components/tark_captions/asr_model_unittest.cc
+@@ -0,0 +1,46 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/tark_captions/asr_model.h"
++
++#include "components/tark_captions/ort_runtime.h"
++#include "components/tark_captions/test_util.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace tark_captions {
++namespace {
++
++TEST(AsrModelTest, MatchesGoldenText) {
++  std::optional<base::FilePath> ort = test::OrtPath();
++  std::optional<base::FilePath> models = test::ModelsDir();
++  std::optional<base::FilePath> testdata = test::TestDataDir();
++  if (!ort || !models || !testdata) {
++    GTEST_SKIP() << "set TARK_CAPTIONS_ORT, TARK_CAPTIONS_MODELS and TARK_CAPTIONS_TESTDATA";
++  }
++  std::unique_ptr<OrtRuntime> runtime = OrtRuntime::Load(*ort);
++  ASSERT_TRUE(runtime);
++  std::unique_ptr<AsrModel> asr = AsrModel::Load(runtime.get(), *models, /*threads=*/2);
++  ASSERT_TRUE(asr);
++  base::ListValue clips = test::GoldenClips(*testdata);
++  ASSERT_EQ(clips.size(), 4u);
++  for (const base::Value& clip : clips) {
++    const std::string& wav = *clip.GetDict().FindString("wav");
++    std::optional<Language> language = LanguageFromCode(*clip.GetDict().FindString("lang"));
++    ASSERT_TRUE(language) << wav;
++    int rate = 0;
++    std::vector<float> pcm = test::ReadWav(testdata->AppendASCII(wav), &rate);
++    EXPECT_EQ(asr->Decode(pcm, *language), *clip.GetDict().FindString("ctc_text")) << wav;
++  }
++}
++
++TEST(AsrModelTest, LanguageCodes) {
++  EXPECT_EQ(LanguageFromCode("hi"), Language::kHindi);
++  EXPECT_EQ(LanguageFromCode("ta"), Language::kTamil);
++  EXPECT_EQ(LanguageFromCode("bn"), Language::kBengali);
++  EXPECT_EQ(LanguageFromCode("sw"), std::nullopt);
++  EXPECT_STREQ(LanguageCode(Language::kTamil), "ta");
++}
++
++}  // namespace
++}  // namespace tark_captions
