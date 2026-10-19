@@ -181,6 +181,14 @@ class TestAndroidBuildSh(unittest.TestCase):
         self.assertNotIn('bootstrap.py', section)
         self.assertNotIn('chrome_public_apk', section)
 
+    def test_gn_uses_system_python_like_the_tarball(self):
+        # Chromium's tarball .gn says script_executable = "python3"; a git
+        # checkout points at a bundled Python the Android tree lacks.
+        script = SCRIPT.read_text()
+        build = script[script.index('# --- end prepare ---'):]
+        self.assertIn('script_executable = \\"python3\\"', build)
+        self.assertLess(build.index('script_executable'), build.index('gn" gen'))
+
     def test_core_patches_then_tark_series(self):
         result, runs, files, tmp = dryrun('--stop-before-gn')
         apply = runs[index_of(runs, 'utils/patches.py apply')]

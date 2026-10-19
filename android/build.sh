@@ -169,6 +169,9 @@ export PATH="$_src_dir/third_party/llvm-build/Release+Asserts/bin:$PATH"
 export CC=clang CXX=clang++ AR=llvm-ar
 cat "$_main_repo/flags.gn" "$_root_dir/android/args.gn" > "$_src_dir/out/Default/args.gn"
 run python3 "$_src_dir/tools/gn/bootstrap/bootstrap.py" -o "$_src_dir/out/Default/gn" --skip-generate-buildfiles
+# Scripts run with the machine's python3, as in Chromium's source tarball (a
+# git checkout's .gn names a bundled Python the Android tree does not have).
+run sed -i "s|^script_executable = .*|script_executable = \"python3\"|" "$_src_dir/.gn"
 run "$_src_dir/out/Default/gn" gen "$_src_dir/out/Default" --root="$_src_dir" --fail-on-unused-args
 run ninja -C "$_src_dir/out/Default" chrome_public_apk
 log "built $_src_dir/out/Default/apks/ChromePublic.apk"
