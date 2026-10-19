@@ -23,14 +23,6 @@ import filescfg
 from _common import ENCODING, get_chromium_version
 sys.path.pop(0)
 
-def _get_release_revision():
-    revision_path = Path(__file__).resolve().parent / 'ungoogled-chromium' / 'revision.txt'
-    return revision_path.read_text(encoding=ENCODING).strip()
-
-def _get_packaging_revision():
-    revision_path = Path(__file__).resolve().parent / 'revision.txt'
-    return revision_path.read_text(encoding=ENCODING).strip()
-
 _cached_target_cpu = None
 
 def _get_target_cpu(build_outputs):
@@ -44,6 +36,14 @@ def _get_target_cpu(build_outputs):
                     break
     assert _cached_target_cpu
     return _cached_target_cpu
+
+def tark_stem(build_outputs):
+    """Tark: Tark-<chromium>-<Tark revision>-<cpu>, as the DMG is named. The
+    Tark repo is named in tark_repo.txt (windows/prepare_workdir.py)."""
+    here = Path(__file__).resolve().parent
+    repo = Path((here / 'tark_repo.txt').read_text(encoding=ENCODING).strip())
+    revision = (repo / 'revision.txt').read_text(encoding=ENCODING).strip()
+    return 'Tark-{}-{}-{}'.format(get_chromium_version(), revision, _get_target_cpu(build_outputs))
 
 def main():
     """Entrypoint"""
@@ -62,9 +62,7 @@ def main():
     build_outputs = Path('build/src/out/Default')
 
     shutil.copyfile('build/src/out/Default/mini_installer.exe',
-        'build/ungoogled-chromium_{}-{}.{}_installer_{}.exe'.format(
-            get_chromium_version(), _get_release_revision(),
-            _get_packaging_revision(), _get_target_cpu(build_outputs)))
+        'build/{}-setup.exe'.format(tark_stem(build_outputs)))
 
     timestamp = None
     try:
@@ -73,9 +71,7 @@ def main():
     except FileNotFoundError:
         pass
 
-    output = Path('build/ungoogled-chromium_{}-{}.{}_windows_{}.zip'.format(
-        get_chromium_version(), _get_release_revision(),
-        _get_packaging_revision(), _get_target_cpu(build_outputs)))
+    output = Path('build/{}.zip'.format(tark_stem(build_outputs)))
 
     excluded_files = set([
         Path('mini_installer.exe'),

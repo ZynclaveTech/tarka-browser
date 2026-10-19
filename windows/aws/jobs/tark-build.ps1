@@ -43,6 +43,9 @@ try {
     Remove-Item -Force "$work\build\namesubs.tar" -ErrorAction SilentlyContinue
   }
   python3 "$repo\windows\prepare_workdir.py" $repo $work *>> $log
+  # The last build's packages, so only this build's are uploaded.
+  Get-ChildItem "$work\build" -File -ErrorAction SilentlyContinue |
+    Where-Object { $_.Extension -in '.zip', '.exe' } | Remove-Item -Force
   Set-Location $work
   $vcvars = "$env:vs2022_install\VC\Auxiliary\Build\vcvars64.bat"
   if ($PatchOnly) {
@@ -54,8 +57,8 @@ try {
   "exit $LASTEXITCODE" | Add-Content $log
   # Only package.py's installer and zip, which sit directly in build\ (a
   # recursive search also picked up hundreds of tool files).
-  Get-ChildItem "$work\build" -File | Where-Object { $_.Extension -in '.zip', '.exe' } |
-    ForEach-Object { Upload $_.FullName ($_.Name -replace '^ungoogled-chromium_', 'Tark-') }
+  Get-ChildItem "$work\build" -File -Filter 'Tark-*' | Where-Object { $_.Extension -in '.zip', '.exe' } |
+    ForEach-Object { Upload $_.FullName $_.Name }
 } finally {
   Upload $log 'tark-build.log'
   # Stop the machine unless another job is still building on it; the idle

@@ -38,7 +38,7 @@ try {
   icacls $base /grant 'tarkdesk:(OI)(CI)RX' /L | Out-Null
   if (Test-Path $out) { cmd.exe /c "rmdir /s /q `"$out`"" }
   if (Test-Path $app) { cmd.exe /c "rmdir /s /q `"$app`"" }
-  $zip = Get-ChildItem 'C:\tw\build' -File -Filter '*_windows_x64.zip' | Select-Object -First 1
+  $zip = Get-ChildItem 'C:\tw\build' -File -Filter 'Tark-*.zip' | Select-Object -First 1
   Expand-Archive -Path $zip.FullName -DestinationPath $app -Force
   $exe = (Get-ChildItem $app -Recurse -Filter 'chrome.exe' | Select-Object -First 1).FullName
   "exe $exe" | Add-Content $log

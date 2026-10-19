@@ -18,7 +18,7 @@ function Upload($file, $key) {
   if (Test-Path $file) { Write-S3Object -BucketName $Bucket -Key "$Prefix/$key" -File $file -Region ap-south-1 }
 }
 try {
-  $zip = Get-ChildItem 'C:\tw\build' -File -Filter '*_windows_x64.zip' | Select-Object -First 1
+  $zip = Get-ChildItem 'C:\tw\build' -File -Filter 'Tark-*.zip' | Select-Object -First 1
   Expand-Archive -Path $zip.FullName -DestinationPath "$out\app" -Force
   $exe = Get-ChildItem "$out\app" -Recurse -Filter 'chrome.exe' | Select-Object -First 1
   "exe $($exe.FullName)" | Add-Content $log
