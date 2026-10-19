@@ -9,7 +9,7 @@
 PORT is the --remote-debugging-port of a running dev build. Each page in
 PAGES (or the ones named) is opened in a background tab; FACTS_JS reads the
 facts below from it, through open shadow roots; problems() compares them
-with the pattern in docs/superpowers/specs/2026-10-18-tark-own-pages-design.md.
+with Tark's page pattern: header label, one sentence, flat rows.
 Prints PAGE<TAB>problem lines; exit status 1 if there are any.
 
 Facts: dark, label, label_transform, label_color, sentence, sentence_lines,

@@ -7,8 +7,8 @@ searches [Shodhya](https://shodhya.com) by default, and looks like it.
 Everything Tark changes is a patch under `patches/` or a build-time
 substitution; the Chromium tree is never committed.
 
-The design is in [docs/superpowers/specs/2026-10-16-tarka-browser-design.md](docs/superpowers/specs/2026-10-16-tarka-browser-design.md)
-and the current plan in [docs/superpowers/plans/](docs/superpowers/plans/).
+How to build it is in [docs/building.md](docs/building.md), and how the
+patches are kept in [docs/patching.md](docs/patching.md).
 
 ![Tark's downloads page: an uppercase DOWNLOADS label with one sentence, then flat rows with coloured file chips and text links](docs/screenshots/m3d/downloads-light.png)
 
