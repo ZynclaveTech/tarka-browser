@@ -151,7 +151,8 @@ else
   run cp "$_root_dir"/resources/fonts/inter-latin.woff2 "$_root_dir"/resources/fonts/inter-latin-ext.woff2 \
     "$_src_dir/ui/webui/resources/fonts/"
   run python3 "$_main_repo/utils/downloads.py" retrieve -i "$_root_dir/downloads-tark.ini" -c "$_download_cache"
-  run python3 "$_main_repo/utils/downloads.py" unpack -i "$_root_dir/downloads-tark.ini" -c "$_download_cache" "$_src_dir"
+  run python3 "$_main_repo/utils/downloads.py" unpack -i "$_root_dir/downloads-tark.ini" -c "$_download_cache" \
+    --tar-path bsdtar "$_src_dir"
   run python3 "$_root_dir/utils/ublock_key.py" "$_src_dir/third_party/ublock/manifest.json" \
     "$_root_dir/resources/ublock/key.txt"
   echo "tark: run _install_xlit"

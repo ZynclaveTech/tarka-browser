@@ -14,7 +14,7 @@ export DEBIAN_FRONTEND=noninteractive
 VERSION=155.0.8059.39
 
 apt-get update
-apt-get install -y git python3 python3-pip curl xz-utils unzip zstd lsb-release sudo ninja-build
+apt-get install -y git python3 python3-pip curl xz-utils unzip zstd lsb-release sudo ninja-build libarchive-tools
 snap install aws-cli --classic || true
 
 # Chromium's own dependency script for this version, with --android.

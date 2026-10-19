@@ -216,6 +216,8 @@ class TestAndroidBuildSh(unittest.TestCase):
         retrieve = index_of(runs, 'downloads-tark.ini')
         self.assertLess(index_of(runs, 'name_substitution.py --sub'), retrieve)
         self.assertLess(retrieve, index_of(runs, 'ublock_key.py'))
+        # uBlock ships as a .zip: GNU tar cannot read it, bsdtar can (as on the Mac).
+        self.assertIn('--tar-path bsdtar', runs[index_of(runs, 'downloads.py unpack -i')])
 
     def test_full_build_writes_args_and_builds_the_apk(self):
         result, runs, files, tmp = dryrun()

@@ -51,6 +51,7 @@ class TestBootstrap(unittest.TestCase):
         self.assertIn('install-build-deps', self.s)
         self.assertIn('--android', self.s)
         self.assertIn('swapon', self.s)
+        self.assertIn('libarchive-tools', self.s)  # bsdtar, for .zip downloads
         # install-build-deps.sh execs the .py directly: both must be executable.
         self.assertIn('chmod +x install-build-deps.sh install-build-deps.py', self.s)
         # googlesource answers 503 under load: the fetch retries.
