@@ -37,6 +37,16 @@ start)
 job)
   job=$2; shift 2
   [[ $(state) == running ]] || $0 start >&2
+  # A job that just ended may have scheduled a shutdown (2 minutes); cancel it
+  # before this job starts, and wait for the answer. If the machine is
+  # already going down, start it again.
+  abort=$(aws ssm send-command --region $R --instance-ids $I --document-name AWS-RunPowerShellScript \
+    --parameters 'commands=["shutdown.exe /a 2>$null; exit 0"]' --query Command.CommandId --output text 2>/dev/null || true)
+  if [[ -n $abort ]]; then
+    until s=$(aws ssm get-command-invocation --region $R --command-id $abort --instance-id $I --query Status --output text 2>/dev/null) \
+        && [[ $s != InProgress && $s != Pending && $s != Delayed ]]; do sleep 3; done
+  fi
+  [[ $(state) == running ]] || { aws ec2 wait instance-stopped --region $R --instance-ids $I; $0 start >&2; }
   name=${job:t:r}
   prefix=jobs/$name-$(date +%Y%m%d-%H%M%S)
   aws s3 cp --quiet $job s3://$B/$prefix/$name.ps1
