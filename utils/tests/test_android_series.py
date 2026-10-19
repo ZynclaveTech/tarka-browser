@@ -41,6 +41,16 @@ class TestAndroidSeries(unittest.TestCase):
         self.assertNotIn('android/locales-android-branch.patch',
                          (REPO / 'patches' / 'series').read_text())
 
+    def test_reset_template_url_callers_fixed(self):
+        # ungoogled's add-suggestions-url-field.patch gives ResetTemplateURL a
+        # fifth argument (and makes it overwrite suggestions_url); the
+        # Android-only callers keep each engine's own suggestions URL.
+        self.assertIn('android/search-engines-android-suggestions-url.patch', self.series)
+        patch = (ANDROID / 'patches' / 'search-engines-android-suggestions-url.patch').read_text()
+        self.assertIn('+++ b/components/search_engines/android/template_url_service_android.cc', patch)
+        self.assertIn('+          regulatory_api_turl->suggestions_url());', patch)
+        self.assertIn('+                                          search_url, template_url->suggestions_url());', patch)
+
     def test_skip_list_entries_exist(self):
         self.assertTrue(self.skip)
         for entry in self.skip:
