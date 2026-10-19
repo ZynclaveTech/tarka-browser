@@ -29,10 +29,13 @@ function Upload($file, $key) {
   }
 }
 try {
-  # The locked part: SYSTEM and Administrators write, tarkdesk reads and runs.
-  New-Item -ItemType Directory -Force -Path $base | Out-Null
-  if ((Get-Item $base -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "$base is a reparse point" }
-  icacls $base /inheritance:r /grant:r 'SYSTEM:(OI)(CI)F' 'Administrators:(OI)(CI)F' 'tarkdesk:(OI)(CI)RX' | Out-Null
+  # The locked part, made by desktop-setup before tarkdesk existed. Refuse it
+  # unless it is a real folder owned by SYSTEM or Administrators.
+  $item = Get-Item $base -Force -ErrorAction Stop
+  if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "$base is a reparse point" }
+  $owner = (Get-Acl $base).Owner
+  if ($owner -notin 'NT AUTHORITY\SYSTEM', 'BUILTIN\Administrators') { throw "$base is owned by $owner" }
+  icacls $base /grant 'tarkdesk:(OI)(CI)RX' /L | Out-Null
   if (Test-Path $out) { cmd.exe /c "rmdir /s /q `"$out`"" }
   if (Test-Path $app) { cmd.exe /c "rmdir /s /q `"$app`"" }
   $zip = Get-ChildItem 'C:\tw\build' -File -Filter '*_windows_x64.zip' | Select-Object -First 1
@@ -41,8 +44,9 @@ try {
   "exe $exe" | Add-Content $log
 
   # The one folder tarkdesk may write, created fresh.
-  New-Item -ItemType Directory -Path $out | Out-Null
-  icacls $out /grant 'tarkdesk:(OI)(CI)M' | Out-Null
+  New-Item -ItemType Directory -Path $out -ErrorAction Stop | Out-Null
+  if ((Get-Item $out -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "$out is a reparse point" }
+  icacls $out /grant 'tarkdesk:(OI)(CI)M' /L | Out-Null
 
   $urlArgs = ($Urls -split ' ' | ForEach-Object { "'$_'" }) -join ', '
   $inner = @"

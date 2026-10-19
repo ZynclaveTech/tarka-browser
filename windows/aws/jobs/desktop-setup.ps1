@@ -20,7 +20,8 @@ cmd.exe /c "shutdown /a >nul 2>&1"
 function Lock-Folder($path) {
   New-Item -ItemType Directory -Force -Path $path | Out-Null
   if ((Get-Item $path -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "$path is a reparse point" }
-  icacls $path /inheritance:r /grant:r 'SYSTEM:(OI)(CI)F' 'Administrators:(OI)(CI)F' | Out-Null
+  icacls $path /setowner SYSTEM /L | Out-Null
+  icacls $path /inheritance:r /grant:r 'SYSTEM:(OI)(CI)F' 'Administrators:(OI)(CI)F' /L | Out-Null
 }
 
 $base = Join-Path $env:ProgramData 'TarkSetup'
@@ -29,6 +30,12 @@ $log = Join-Path $base 'desktop-setup.log'
 Set-Content $log "desktop-setup $(Get-Date -Format o)"
 $ok = $false
 try {
+  # The lock below is complete only while no non-admin user has ever
+  # existed (Windows re-applies the new DACL to everything inside, and no
+  # user-owned objects exist yet). A second run could not prove that.
+  if (Get-LocalUser -Name 'tarkdesk' -ErrorAction SilentlyContinue) {
+    throw 'tarkdesk already exists: desktop-setup runs only once (rebuild the machine to redo it)'
+  }
   # Before any non-admin user exists: Windows' default ACL on C:\ lets any
   # signed-in user add files inside folders SYSTEM creates there, and modify
   # files SYSTEM creates at the root. Lock everything the build machine runs
@@ -37,6 +44,11 @@ try {
     if (Test-Path $dir) { Lock-Folder $dir; "locked $dir" | Add-Content $log }
   }
   Remove-Item -Force 'C:\tark-job.ps1', 'C:\bootstrap.ps1' -ErrorAction SilentlyContinue
+  # window-shot.ps1's folder exists, SYSTEM-owned and locked, before the
+  # user does: a user could otherwise create it first and own it.
+  $desk = Join-Path $env:ProgramData 'TarkDesk'
+  Lock-Folder $desk
+  'locked TarkDesk' | Add-Content $log
   $bytes = New-Object byte[] 24
   [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
   $plain = [Convert]::ToBase64String($bytes) + 'aA1!'

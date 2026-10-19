@@ -12,4 +12,11 @@ if ((Get-Item $d -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { t
 icacls $d /inheritance:r /grant:r 'SYSTEM:(OI)(CI)F' 'Administrators:(OI)(CI)F' | Out-Null
 $job = Join-Path $d 'tark-job.ps1'
 Read-S3Object -BucketName '__BUCKET__' -Key '__KEY__' -File $job -Region ap-south-1 | Out-Null
-powershell -NoProfile -ExecutionPolicy Bypass -File $job __ARGS__
+# The idle watchdog (bootstrap.ps1) treats a running job as busy.
+$marker = Join-Path $d 'job.running'
+Set-Content $marker (Get-Date -Format o)
+try {
+  powershell -NoProfile -ExecutionPolicy Bypass -File $job __ARGS__
+} finally {
+  Remove-Item -Force $marker -ErrorAction SilentlyContinue
+}
