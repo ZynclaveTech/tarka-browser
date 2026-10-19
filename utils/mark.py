@@ -2,7 +2,7 @@
 # Copyright 2026 The Tark Authors
 # Use of this source code is governed by a BSD-style license that can be
 # found in the LICENSE file.
-"""Tark's three-dot mark as a Chromium vector icon, an SVG and PNGs (spec 6.3).
+"""Tark's three-dot mark as a Chromium vector icon, an SVG, PNGs and Windows .ico files (spec 6.3).
 
 The mark comes from the Shodhya site's masthead (resources/branding/app-icon.svg):
 three circles of radius 7 in a 44x36 box, amber top, coral bottom-left, indigo
@@ -102,35 +102,83 @@ def _chunk(kind, data):
             struct.pack('>I', zlib.crc32(kind + data) & 0xffffffff))
 
 
-def png(width, height, align='center', palette='mid'):
-    """An RGBA PNG of the mark on a transparent background."""
+def _pixels(width, height, align='center', palette='mid'):
+    """Rows of (r, g, b, a): the mark, anti-aliased, on transparency."""
     colours = PALETTES[palette]
     scale, dx, dy = _fit(width, height, align)
-    circles = [(dx + cx * scale, dy + cy * scale, (RADIUS * scale) ** 2,
+    radius = RADIUS * scale
+    circles = [(dx + cx * scale, dy + cy * scale, radius * radius,
                 tuple(int(colours[name][i:i + 2], 16) for i in (1, 3, 5)))
                for name, cx, cy in CIRCLES]
     offsets = [(i + 0.5) / _SAMPLES for i in range(_SAMPLES)]
     total = _SAMPLES * _SAMPLES
-    raw = bytearray()
+    # A pixel whose centre is further than half its diagonal from the edge
+    # is all inside or all outside: every sample agrees, so skip sampling.
+    inner, outer = max(radius - 0.75, 0) ** 2, (radius + 0.75) ** 2
+    rows = []
     for y in range(height):
-        raw.append(0)
+        row = []
         for x in range(width):
             pixel = (0, 0, 0, 0)
             for ccx, ccy, r2, colour in circles:
+                d2 = (x + 0.5 - ccx) ** 2 + (y + 0.5 - ccy) ** 2
+                if d2 >= outer:
+                    continue
+                if d2 <= inner:
+                    pixel = colour + (255,)
+                    break
                 hits = sum(1 for oy in offsets for ox in offsets
                            if (x + ox - ccx) ** 2 + (y + oy - ccy) ** 2 <= r2)
                 if hits:
                     pixel = colour + ((hits * 255 + total // 2) // total,)
                     break
+            row.append(pixel)
+        rows.append(row)
+    return rows
+
+
+def png(width, height, align='center', palette='mid'):
+    """An RGBA PNG of the mark on a transparent background."""
+    raw = bytearray()
+    for row in _pixels(width, height, align, palette):
+        raw.append(0)
+        for pixel in row:
             raw.extend(pixel)
     header = struct.pack('>IIBBBBB', width, height, 8, 6, 0, 0, 0)
     return (b'\x89PNG\r\n\x1a\n' + _chunk(b'IHDR', header) +
             _chunk(b'IDAT', zlib.compress(bytes(raw), 9)) + _chunk(b'IEND', b''))
 
 
+def _dib(size, palette):
+    """A 32-bit bottom-up BGRA bitmap for an .ico entry: the header gives
+    twice the height (image plus AND mask); the mask is all zero, since the
+    alpha channel carries the shape."""
+    header = struct.pack('<IiiHHIIiiII', 40, size, size * 2, 1, 32, 0, 0, 0, 0, 0, 0)
+    body = bytearray()
+    for row in reversed(_pixels(size, size, palette=palette)):
+        for r, g, b, a in row:
+            body.extend((b, g, r, a))
+    mask = bytes(((size + 31) // 32) * 4 * size)
+    return header + bytes(body) + mask
+
+
+def ico(sizes, palette='mid'):
+    """A Windows .ico of the mark: 32-bit bitmaps below 256 px and a PNG at
+    256, as Chromium's own icons are made."""
+    images = [png(size, size, palette=palette) if size >= 256 else _dib(size, palette)
+              for size in sizes]
+    offset = 6 + 16 * len(sizes)
+    out = struct.pack('<HHH', 0, 1, len(sizes))
+    for size, image in zip(sizes, images):
+        side = 0 if size >= 256 else size
+        out += struct.pack('<BBBBHHII', side, side, 0, 0, 1, 32, len(image), offset)
+        offset += len(image)
+    return out + b''.join(images)
+
+
 def read_manifest(path):
     """Entries of install.txt: 'icon 32,16 <dest>', 'png 97x22 left mid <dest>',
-    'svg mid <dest>'. Blank lines and # comments are skipped."""
+    'svg mid <dest>', 'ico 16,32,256 mid <dest>'. Blank lines and # comments are skipped."""
     entries = []
     with open(path) as f:
         for line in f:
@@ -152,6 +200,9 @@ def render(entry):
         return png(width, height, align, palette)
     if entry.kind == 'svg':
         return svg(entry.spec[0]).encode()
+    if entry.kind == 'ico':
+        sizes, palette = entry.spec
+        return ico([int(v) for v in sizes.split(',')], palette)
     raise ValueError('unknown kind %r in %s' % (entry.kind, entry.dest))
 
 
