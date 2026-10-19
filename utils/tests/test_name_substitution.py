@@ -144,3 +144,12 @@ def test_tark_sentences_keep_chromium():
     sentence = "Tark 155.0.1, built on Chromium for this Mac."
     assert util.replace_text(sentence)[0] == sentence
     assert util.replace_text("Chromium")[0] == "Tark"
+
+
+def test_default_workers_fit_windows_limit():
+    # W1: ProcessPoolExecutor on Windows refuses more than 61 workers; the
+    # 64-core build machine hit it ("max_workers must be <= 61").
+    import name_substitution
+    assert name_substitution.default_workers(64) == 61
+    assert name_substitution.default_workers(8) == 8
+    assert name_substitution.default_workers(None) == 1

@@ -57,6 +57,12 @@ def replacement_sanity():
         assert modified == expected, f"sanity: {modified} != {expected}"
 
 
+def default_workers(cpus):
+    """Tark: one worker per CPU, capped at 61, the most ProcessPoolExecutor
+    accepts on Windows (the W1 build machine has 64)."""
+    return min(cpus or 1, 61)
+
+
 def parse_args():
     """CLI argument parsing logic"""
     parser = argparse.ArgumentParser()
@@ -67,7 +73,7 @@ def parse_args():
     group.add_argument('--backup-path', metavar='<tarball-path>', type=Path)
     group.add_argument('--dry-run', action='store_true')
     parser.add_argument('-t', metavar='source_tree', type=Path, required=True)
-    parser.add_argument('--workers', type=int, default=os.cpu_count())
+    parser.add_argument('--workers', type=int, default=default_workers(os.cpu_count()))
     parser.add_argument('--only-literals', action='store_true',
                         help='Tark: only LITERAL_FILES, for a dev tree that '
                         'already had its .grd files substituted')
