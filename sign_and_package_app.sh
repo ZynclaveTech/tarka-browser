@@ -78,6 +78,17 @@ else
   rm -rf "$_sparkle"
 fi
 
+# Tark (D4): ONNX Runtime for live captions. Signed below with Tark's identity
+# (the speech helper runs with library validation).
+_ort_src="${TARKA_ONNXRUNTIME_DIR:-$_src_dir/third_party/tark_onnxruntime}"
+_ort="$_app/Contents/Frameworks/libonnxruntime.1.31.0.dylib"
+if [[ -d "$_ort_src" ]]; then
+  "$_root_dir/utils/install_onnxruntime.sh" "$_app" "$_ort_src"
+else
+  warning "No ONNX Runtime at $_ort_src: this build has no live captions"
+  rm -f "$_ort"
+fi
+
 # Fix issue where macOS requests permission for incoming network connections
 # See https://github.com/ungoogled-software/ungoogled-chromium-macos/issues/17
 xattr -cs "$_app"
@@ -112,6 +123,9 @@ if [[ -d "$_sparkle" ]]; then
   sign --options runtime "$_sparkle/Versions/B/Autoupdate"
   sign --options runtime "$_sparkle/Versions/B/Updater.app"
   sign --options runtime "$_sparkle"
+fi
+if [[ -f "$_ort" ]]; then
+  sign --identifier "libonnxruntime" --options runtime "$_ort"
 fi
 if (( _dev )); then
   _profile="${TARKA_PROVISIONING_PROFILE:?set TARKA_PROVISIONING_PROFILE to the development profile}"

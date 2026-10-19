@@ -363,3 +363,17 @@ unpacked to `build/src/third_party/sparkle` by `dev.sh setup` and
 - **Bump `revision.txt`** for every Tark release on the same Chromium
   version; reset it to 1 on a new Chromium version.
 - Tests: `python3 -m pytest utils/tests/test_install_sparkle.py`.
+
+## Live captions (D4)
+
+- **ONNX Runtime** runs the caption models: Microsoft's official macOS
+  arm64 release (MIT), pinned by hash in `downloads-onnxruntime.ini` and
+  unpacked into `build/src/third_party/tark_onnxruntime/` by `dev.sh` and
+  `build.sh`. `components/tark_captions` compiles against its `include/` and
+  `dlopen()`s `libonnxruntime.1.31.0.dylib` at run time, as Chromium does
+  with SODA; nothing links against it. `sign_and_package_app.sh` copies the
+  dylib into `Tark.app/Contents/Frameworks` (`utils/install_onnxruntime.sh`)
+  and signs it with Tark's identity, because the speech helper runs with
+  library validation. Bump: new version and hash in the ini, the dylib name
+  in `install_onnxruntime.sh` and `sign_and_package_app.sh`, and check
+  github.com/microsoft/onnxruntime/security/advisories first.
