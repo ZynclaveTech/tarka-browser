@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/components/tark_captions/BUILD.gn
-@@ -0,0 +1,32 @@
+@@ -0,0 +1,50 @@
 +# Copyright 2026 The Tark Authors
 +# Use of this source code is governed by a BSD-style license that can be
 +# found in the LICENSE file.
@@ -14,20 +14,38 @@
 +
 +source_set("tark_captions") {
 +  sources = [
++    "mel_frontend.cc",
++    "mel_frontend.h",
 +    "ort_runtime.cc",
 +    "ort_runtime.h",
 +  ]
 +  include_dirs = [ "//third_party/tark_onnxruntime/include" ]
-+  deps = [ "//base" ]
++  deps = [
++    "//base",
++    "//third_party/pffft",
++  ]
 +}
 +
 +# Tests read ONNX Runtime, the models and the test clips from the paths in
 +# TARK_CAPTIONS_ORT, TARK_CAPTIONS_MODELS and TARK_CAPTIONS_TESTDATA; tests
 +# that need one are skipped when it is unset.
++source_set("test_support") {
++  testonly = true
++  sources = [
++    "test_util.cc",
++    "test_util.h",
++  ]
++  deps = [ "//base" ]
++}
++
 +test("tark_captions_unittests") {
-+  sources = [ "ort_runtime_unittest.cc" ]
++  sources = [
++    "mel_frontend_unittest.cc",
++    "ort_runtime_unittest.cc",
++  ]
 +  deps = [
 +    ":tark_captions",
++    ":test_support",
 +    "//base",
 +    "//base/test:run_all_unittests",
 +    "//testing/gtest",
@@ -383,6 +401,379 @@
 +  std::unique_ptr<OrtRuntime> runtime = OrtRuntime::Load(ort_path_);
 +  ASSERT_TRUE(runtime);
 +  EXPECT_FALSE(runtime->LoadModel(base::FilePath("/nonexistent/model.onnx"), 1));
++}
++
++}  // namespace
++}  // namespace tark_captions
+--- /dev/null
++++ b/components/tark_captions/test_util.h
+@@ -0,0 +1,31 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef COMPONENTS_TARK_CAPTIONS_TEST_UTIL_H_
++#define COMPONENTS_TARK_CAPTIONS_TEST_UTIL_H_
++
++#include <optional>
++#include <vector>
++
++#include "base/files/file_path.h"
++#include "base/values.h"
++
++namespace tark_captions::test {
++
++// Paths from TARK_CAPTIONS_ORT, TARK_CAPTIONS_MODELS, TARK_CAPTIONS_TESTDATA;
++// nullopt when the variable is unset or empty.
++std::optional<base::FilePath> OrtPath();
++std::optional<base::FilePath> ModelsDir();
++std::optional<base::FilePath> TestDataDir();
++
++// A mono WAV (16-bit PCM, or 32-bit float as FLEURS ships) as floats;
++// empty on any other format.
++std::vector<float> ReadWav(const base::FilePath& path, int* sample_rate);
++
++// TESTDATA/golden.json's "clips" list (utils/captions_export.py golden).
++base::ListValue GoldenClips(const base::FilePath& testdata);
++
++}  // namespace tark_captions::test
++
++#endif  // COMPONENTS_TARK_CAPTIONS_TEST_UTIL_H_
+--- /dev/null
++++ b/components/tark_captions/test_util.cc
+@@ -0,0 +1,99 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/tark_captions/test_util.h"
++
++#include <cstring>
++#include <string>
++
++#include "base/environment.h"
++#include "base/files/file_util.h"
++#include "base/json/json_reader.h"
++#include "base/strings/cstring_view.h"
++
++namespace tark_captions::test {
++namespace {
++
++std::optional<base::FilePath> PathFromEnv(base::cstring_view name) {
++  std::optional<std::string> value = base::Environment::Create()->GetVar(name);
++  if (!value || value->empty()) {
++    return std::nullopt;
++  }
++  return base::FilePath(*value);
++}
++
++uint32_t U32(const std::string& s, size_t at) {
++  uint32_t v;
++  memcpy(&v, s.data() + at, 4);
++  return v;
++}
++
++uint16_t U16(const std::string& s, size_t at) {
++  uint16_t v;
++  memcpy(&v, s.data() + at, 2);
++  return v;
++}
++
++}  // namespace
++
++std::optional<base::FilePath> OrtPath() {
++  return PathFromEnv("TARK_CAPTIONS_ORT");
++}
++std::optional<base::FilePath> ModelsDir() {
++  return PathFromEnv("TARK_CAPTIONS_MODELS");
++}
++std::optional<base::FilePath> TestDataDir() {
++  return PathFromEnv("TARK_CAPTIONS_TESTDATA");
++}
++
++std::vector<float> ReadWav(const base::FilePath& path, int* sample_rate) {
++  std::string bytes;
++  if (!base::ReadFileToString(path, &bytes) || bytes.size() < 12 ||
++      bytes.compare(0, 4, "RIFF") != 0 || bytes.compare(8, 4, "WAVE") != 0) {
++    return {};
++  }
++  size_t at = 12;
++  int format = 0;  // 1: 16-bit PCM, 3: 32-bit float
++  while (at + 8 <= bytes.size()) {
++    const std::string id = bytes.substr(at, 4);
++    const uint32_t size = U32(bytes, at + 4);
++    const size_t body = at + 8;
++    if (body + size > bytes.size()) {
++      return {};
++    }
++    if (id == "fmt ") {
++      const bool mono = size >= 16 && U16(bytes, body + 2) == 1;
++      const uint16_t tag = U16(bytes, body);
++      const uint16_t bits = U16(bytes, body + 14);
++      format = !mono ? 0 : (tag == 1 && bits == 16) ? 1 : (tag == 3 && bits == 32) ? 3 : 0;
++      *sample_rate = static_cast<int>(U32(bytes, body + 4));
++    } else if (id == "data" && format == 1) {
++      std::vector<float> out(size / 2);
++      for (size_t i = 0; i < out.size(); ++i) {
++        out[i] = static_cast<int16_t>(U16(bytes, body + 2 * i)) / 32768.0f;
++      }
++      return out;
++    } else if (id == "data" && format == 3) {
++      std::vector<float> out(size / 4);
++      memcpy(out.data(), bytes.data() + body, out.size() * 4);
++      return out;
++    }
++    at = body + size + (size & 1);
++  }
++  return {};
++}
++
++base::ListValue GoldenClips(const base::FilePath& testdata) {
++  std::string json;
++  if (!base::ReadFileToString(testdata.Append("golden.json"), &json)) {
++    return {};
++  }
++  std::optional<base::Value> value = base::JSONReader::Read(json, base::JSON_PARSE_RFC);
++  if (!value || !value->is_dict() || !value->GetDict().FindList("clips")) {
++    return {};
++  }
++  return value->GetDict().FindList("clips")->Clone();
++}
++
++}  // namespace tark_captions::test
+--- /dev/null
++++ b/components/tark_captions/mel_frontend.h
+@@ -0,0 +1,49 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef COMPONENTS_TARK_CAPTIONS_MEL_FRONTEND_H_
++#define COMPONENTS_TARK_CAPTIONS_MEL_FRONTEND_H_
++
++#include <memory>
++#include <vector>
++
++#include "base/containers/span.h"
++#include "base/files/file_path.h"
++
++struct PFFFT_Setup;
++
++namespace tark_captions {
++
++// IndicConformer's audio front end (its TorchScript preprocessor), in C++:
++// pre-emphasis 0.97; reflect padding of 256 on each side; 512-point STFT,
++// hop 160, the model's 400-sample window centred in 512; power spectrum;
++// 80 mel bands (the model's 257x80 matrix); log(x + 2^-24); each band
++// normalised to zero mean and unit deviation over the clip.
++class MelFrontend {
++ public:
++  static constexpr int kMels = 80;
++
++  // Reads window.f32 and mel_fb.f32 (utils/captions_export.py export) from
++  // `models_dir`; null if either is missing or the wrong size.
++  static std::unique_ptr<MelFrontend> Load(const base::FilePath& models_dir);
++
++  MelFrontend(const MelFrontend&) = delete;
++  MelFrontend& operator=(const MelFrontend&) = delete;
++  ~MelFrontend();
++
++  // Features of 16 kHz mono audio, [kMels x frames] row-major (the
++  // encoder's audio_signal); `frames` = samples / 160 + 1.
++  std::vector<float> Compute(base::span<const float> pcm16k, int* frames) const;
++
++ private:
++  MelFrontend(std::vector<float> window512, std::vector<float> mel_fb);
++
++  std::vector<float> window512_;  // the 400-sample window, zero-padded to 512
++  std::vector<float> mel_fb_;     // 257 x 80
++  PFFFT_Setup* fft_;
++};
++
++}  // namespace tark_captions
++
++#endif  // COMPONENTS_TARK_CAPTIONS_MEL_FRONTEND_H_
+--- /dev/null
++++ b/components/tark_captions/mel_frontend.cc
+@@ -0,0 +1,131 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/tark_captions/mel_frontend.h"
++
++#include <algorithm>
++#include <cmath>
++#include <cstring>
++#include <string>
++
++#include "base/files/file_util.h"
++#include "base/memory/ptr_util.h"
++#include "third_party/pffft/src/pffft.h"
++
++namespace tark_captions {
++namespace {
++
++constexpr int kFft = 512;
++constexpr int kBins = kFft / 2 + 1;  // 257
++constexpr int kHop = 160;
++constexpr int kWindow = 400;
++constexpr int kPad = kFft / 2;  // reflect padding on each side
++constexpr float kPreemphasis = 0.97f;
++constexpr float kLogGuard = 5.960464477539063e-08f;  // 2^-24
++constexpr float kStdGuard = 1e-5f;
++
++std::vector<float> ReadFloats(const base::FilePath& path, size_t count) {
++  std::string bytes;
++  if (!base::ReadFileToString(path, &bytes) || bytes.size() != count * sizeof(float)) {
++    return {};
++  }
++  std::vector<float> out(count);
++  memcpy(out.data(), bytes.data(), bytes.size());
++  return out;
++}
++
++}  // namespace
++
++// static
++std::unique_ptr<MelFrontend> MelFrontend::Load(const base::FilePath& models_dir) {
++  std::vector<float> window = ReadFloats(models_dir.Append("window.f32"), kWindow);
++  std::vector<float> mel_fb = ReadFloats(models_dir.Append("mel_fb.f32"), kBins * kMels);
++  if (window.empty() || mel_fb.empty()) {
++    return nullptr;
++  }
++  // torch.stft centres a shorter window in n_fft.
++  std::vector<float> window512(kFft, 0.0f);
++  std::copy(window.begin(), window.end(), window512.begin() + (kFft - kWindow) / 2);
++  return base::WrapUnique(new MelFrontend(std::move(window512), std::move(mel_fb)));
++}
++
++MelFrontend::MelFrontend(std::vector<float> window512, std::vector<float> mel_fb)
++    : window512_(std::move(window512)),
++      mel_fb_(std::move(mel_fb)),
++      fft_(pffft_new_setup(kFft, PFFFT_REAL)) {}
++
++MelFrontend::~MelFrontend() {
++  pffft_destroy_setup(fft_);
++}
++
++std::vector<float> MelFrontend::Compute(base::span<const float> pcm16k, int* frames) const {
++  const int n = static_cast<int>(pcm16k.size());
++  *frames = n / kHop + 1;
++  // Pre-emphasis, then reflect padding (the edge sample is not repeated).
++  std::vector<float> y(n);
++  for (int i = 0; i < n; ++i) {
++    y[i] = pcm16k[i] - kPreemphasis * (i > 0 ? pcm16k[i - 1] : 0.0f);
++  }
++  std::vector<float> padded(n + 2 * kPad, 0.0f);
++  for (int i = 0; i < n + 2 * kPad; ++i) {
++    int j = i - kPad;
++    if (j < 0) {
++      j = -j;
++    } else if (j >= n) {
++      j = 2 * (n - 1) - j;
++    }
++    padded[i] = (n > 0 && j >= 0 && j < n) ? y[j] : 0.0f;
++  }
++
++  float* in = static_cast<float*>(pffft_aligned_malloc(kFft * sizeof(float)));
++  float* out = static_cast<float*>(pffft_aligned_malloc(kFft * sizeof(float)));
++  float* work = static_cast<float*>(pffft_aligned_malloc(kFft * sizeof(float)));
++  std::vector<float> power(kBins);
++  std::vector<float> features(static_cast<size_t>(kMels) * *frames);
++  for (int f = 0; f < *frames; ++f) {
++    const float* frame = padded.data() + f * kHop;
++    for (int i = 0; i < kFft; ++i) {
++      in[i] = frame[i] * window512_[i];
++    }
++    pffft_transform_ordered(fft_, in, out, work, PFFFT_FORWARD);
++    // Ordered real output: out[0] = F(0), out[1] = F(n/2), then re/im pairs.
++    power[0] = out[0] * out[0];
++    power[kBins - 1] = out[1] * out[1];
++    for (int k = 1; k < kBins - 1; ++k) {
++      power[k] = out[2 * k] * out[2 * k] + out[2 * k + 1] * out[2 * k + 1];
++    }
++    for (int m = 0; m < kMels; ++m) {
++      float sum = 0;
++      for (int k = 0; k < kBins; ++k) {
++        sum += power[k] * mel_fb_[k * kMels + m];
++      }
++      features[m * *frames + f] = std::log(sum + kLogGuard);
++    }
++  }
++  pffft_aligned_free(in);
++  pffft_aligned_free(out);
++  pffft_aligned_free(work);
++
++  // Per band: mean and (n - 1) deviation over the frames.
++  for (int m = 0; m < kMels; ++m) {
++    float* band = features.data() + m * *frames;
++    double mean = 0;
++    for (int f = 0; f < *frames; ++f) {
++      mean += band[f];
++    }
++    mean /= *frames;
++    double var = 0;
++    for (int f = 0; f < *frames; ++f) {
++      var += (band[f] - mean) * (band[f] - mean);
++    }
++    var = std::max(var / std::max(*frames - 1, 1), static_cast<double>(kLogGuard));
++    const double scale = 1.0 / (std::sqrt(var) + kStdGuard);
++    for (int f = 0; f < *frames; ++f) {
++      band[f] = static_cast<float>((band[f] - mean) * scale);
++    }
++  }
++  return features;
++}
++
++}  // namespace tark_captions
+--- /dev/null
++++ b/components/tark_captions/mel_frontend_unittest.cc
+@@ -0,0 +1,48 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/tark_captions/mel_frontend.h"
++
++#include <cmath>
++
++#include "components/tark_captions/test_util.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace tark_captions {
++namespace {
++
++TEST(MelFrontendTest, MatchesGolden) {
++  std::optional<base::FilePath> models = test::ModelsDir();
++  std::optional<base::FilePath> testdata = test::TestDataDir();
++  if (!models || !testdata) {
++    GTEST_SKIP() << "set TARK_CAPTIONS_MODELS and TARK_CAPTIONS_TESTDATA";
++  }
++  std::unique_ptr<MelFrontend> frontend = MelFrontend::Load(*models);
++  ASSERT_TRUE(frontend);
++  base::ListValue clips = test::GoldenClips(*testdata);
++  ASSERT_EQ(clips.size(), 4u);
++  for (const base::Value& clip : clips) {
++    const std::string& wav = *clip.GetDict().FindString("wav");
++    int rate = 0;
++    std::vector<float> pcm = test::ReadWav(testdata->AppendASCII(wav), &rate);
++    ASSERT_EQ(rate, 16000) << wav;
++    int frames = 0;
++    std::vector<float> features = frontend->Compute(pcm, &frames);
++    ASSERT_EQ(frames, *clip.GetDict().FindInt("features_frames")) << wav;
++    ASSERT_EQ(features.size(), static_cast<size_t>(80 * frames)) << wav;
++    const base::ListValue& head = *clip.GetDict().FindList("features_head");
++    float worst = 0;
++    for (int f = 0; f < 5; ++f) {
++      const base::ListValue& row = head[f].GetList();
++      for (int m = 0; m < 80; ++m) {
++        worst = std::max(worst, std::abs(features[m * frames + f] -
++                                         static_cast<float>(row[m].GetDouble())));
++      }
++    }
++    EXPECT_LE(worst, 1e-3f) << wav;
++  }
 +}
 +
 +}  // namespace
