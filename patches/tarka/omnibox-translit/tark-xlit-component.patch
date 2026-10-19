@@ -1,0 +1,3762 @@
+--- a/chrome/browser/BUILD.gn
++++ b/chrome/browser/BUILD.gn
+@@ -2403,6 +2403,7 @@
+     "//components/storage_monitor",
+     "//components/strike_database:features",
+     "//components/tab_groups",
++    "//components/tark_xlit",
+     "//components/tracing:background_tracing_utils",
+     "//components/tracing:tracing_config",
+     "//components/tracing:tracing_metrics",
+--- /dev/null
++++ b/components/tark_xlit/BUILD.gn
+@@ -0,0 +1,57 @@
++# Copyright 2026 The Tark Authors
++# Use of this source code is governed by a BSD-style license that can be
++# found in the LICENSE file.
++
++import("//testing/test.gni")
++
++# Tark is macOS-only, and the model runs on Accelerate.
++assert(is_mac, "tark_xlit needs macOS (Accelerate)")
++
++# Indian-language transliteration for the address bar. Everything here runs on
++# the device; nothing in this component touches the network.
++static_library("tark_xlit") {
++  sources = [
++    "languages.cc",
++    "languages.h",
++    "model.cc",
++    "model.h",
++    "transliterator.cc",
++    "transliterator.h",
++    "word_list.cc",
++    "word_list.h",
++  ]
++  public_deps = [ "//base" ]
++
++  # The model's matrix products run through Accelerate's BLAS.
++  frameworks = [ "Accelerate.framework" ]
++}
++
++test("tark_xlit_unittests") {
++  testonly = true
++  sources = [
++    "languages_unittest.cc",
++    "model_unittest.cc",
++    "transliterator_unittest.cc",
++  ]
++  deps = [
++    ":tark_xlit",
++    "//base",
++    "//base/test:run_all_unittests",
++    "//base/test:test_support",
++    "//testing/gtest",
++  ]
++
++  # The xlit setup step (utils/install_xlit.sh) puts the converted model, the
++  # packed word lists and the goldens (resources/xlit/) here.
++  data = [ "test/data/" ]
++}
++
++# How long a phrase takes to transliterate: prints p50/p95 for uncached words.
++# Run it against the test data, see xlit_bench.cc.
++executable("tark_xlit_bench") {
++  sources = [ "xlit_bench.cc" ]
++  deps = [
++    ":tark_xlit",
++    "//base",
++  ]
++}
+--- /dev/null
++++ b/components/tark_xlit/README.md
+@@ -0,0 +1,48 @@
++# tark_xlit
++
++Tark's on-device transliteration for the address bar: type `namaste`, get
++`नमस्ते` offered next to the search row, in the Indian languages you have
++set in Tark's language settings.
++
++The component holds:
++
++- `languages.{h,cc}`: the 20 supported languages (accept-language code,
++  IndicXlit tag, script, name in its own script from CLDR), script detection,
++  the choice of which languages to offer rows for, the test for "could this be
++  an Indian-language word typed in Latin letters", and the choice of
++  Wikipedia language for `@wiki`.
++- `model.{h,cc}`: IndicXlit itself, a fairseq transformer read from the TXLM
++  blob into float32 and run with Accelerate's BLAS, and fairseq's beam search
++  (four candidates per word). `utils/xlit_reference.py` is its specification;
++  `test/data/golden.tsv` is that reference's output, and the tests check
++  every line of it.
++- `word_list.{h,cc}`: the per-language word-frequency lists and the
++  common-English list (TXLW blob), and IndicXlit's dictionary rescoring.
++- `transliterator.{h,cc}`: a typed phrase to the phrase in a script. Words on
++  the common-English list stay as typed, the others become the model's top
++  candidate after rescoring, with a per-instance cache of 5,000 words.
++  `LoadResourcesFromBundle()` loads the model and word lists from `indicxlit/`
++  in the app's assets into a `Resources` that any number of `Transliterator`s
++  share read-only, each with its own cache; `LoadFromBundle()` builds one
++  `Transliterator` over them. Both block on file IO, so call them off the UI
++  thread.
++- `xlit_bench.cc`: `tark_xlit_bench` prints p50/p95 of `Phrase` for uncached
++  words in three languages; the budget is 50 ms at p95.
++
++The model is AI4Bharat's IndicXlit (MIT licence, `third_party/indicxlit`),
++converted at setup into a flat weight file that ships inside the app and runs
++on the CPU. **This component never touches the network.** It has no
++dependency on any networking, URL-loading or profile code, and the model is
++read from the app bundle, never downloaded at run time.
++
++`tark_xlit_unittests` tests it without building the browser:
++
++```sh
++ninja -C out/Default tark_xlit_unittests && out/Default/tark_xlit_unittests
++```
++
++The latency check:
++
++```sh
++ninja -C out/Default tark_xlit_bench && out/Default/tark_xlit_bench
++```
+--- /dev/null
++++ b/components/tark_xlit/languages.cc
+@@ -0,0 +1,350 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/tark_xlit/languages.h"
++
++#include <array>
++#include <cstddef>
++#include <string>
++#include <string_view>
++#include <vector>
++
++#include "base/containers/span.h"
++
++namespace tark_xlit {
++
++namespace {
++
++// IndicXlit's 21 languages minus Sinhala, which is not an Indian language.
++//
++// `native_name` is the language's name in itself, taken from the CLDR
++// localeDisplayNames/languages data (unicode-org/cldr-json, package
++// cldr-localenames-full, file main/<locale>/languages.json, key = the
++// locale's own code), checked on 2026-10-19:
++//   as   অসমীয়া          main/as
++//   bn   বাংলা            main/bn
++//   brx  बर’             main/brx (the apostrophe is U+2019, as in CLDR)
++//   kok  कोंकणी          main/kok
++//   gu   ગુજરાતી         main/gu
++//   hi   हिन्दी           main/hi
++//   kn   ಕನ್ನಡ           main/kn
++//   ks   کٲشُر           main/ks (Arabic script, as the model writes it)
++//   mai  मैथिली          main/mai
++//   ml   മലയാളം         main/ml
++//   mni  ꯃꯤꯇꯩꯂꯣꯟ         main/mni-Mtei; CLDR's plain main/mni is Bengali
++//                         script, but the model writes Meetei Mayek
++//   mr   मराठी           main/mr
++//   ne   नेपाली           main/ne
++//   or   ଓଡ଼ିଆ           main/or
++//   pa   ਪੰਜਾਬੀ          main/pa (Gurmukhi)
++//   sa   संस्कृत भाषा      main/sa (CLDR's own-language name is the long form)
++//   sd   سنڌي            main/sd (Arabic script, as the model writes it)
++//   ta   தமிழ்            main/ta
++//   te   తెలుగు           main/te
++//   ur   اردو            main/ur
++//
++// Konkani is `kok` in Chromium's accept-languages and `gom` for IndicXlit and
++// Wikipedia.
++constexpr Language kLanguages[] = {
++    {"as", "as", Script::kBengali, u"অসমীয়া"},
++    {"bn", "bn", Script::kBengali, u"বাংলা"},
++    {"brx", "brx", Script::kDevanagari, u"बर’"},
++    {"kok", "gom", Script::kDevanagari, u"कोंकणी"},
++    {"gu", "gu", Script::kGujarati, u"ગુજરાતી"},
++    {"hi", "hi", Script::kDevanagari, u"हिन्दी"},
++    {"kn", "kn", Script::kKannada, u"ಕನ್ನಡ"},
++    {"ks", "ks", Script::kArabic, u"کٲشُر"},
++    {"mai", "mai", Script::kDevanagari, u"मैथिली"},
++    {"ml", "ml", Script::kMalayalam, u"മലയാളം"},
++    {"mni", "mni", Script::kMeeteiMayek, u"ꯃꯤꯇꯩꯂꯣꯟ"},
++    {"mr", "mr", Script::kDevanagari, u"मराठी"},
++    {"ne", "ne", Script::kDevanagari, u"नेपाली"},
++    {"or", "or", Script::kOdia, u"ଓଡ଼ିଆ"},
++    {"pa", "pa", Script::kGurmukhi, u"ਪੰਜਾਬੀ"},
++    {"sa", "sa", Script::kDevanagari, u"संस्कृत भाषा"},
++    {"sd", "sd", Script::kArabic, u"سنڌي"},
++    {"ta", "ta", Script::kTamil, u"தமிழ்"},
++    {"te", "te", Script::kTelugu, u"తెలుగు"},
++    {"ur", "ur", Script::kArabic, u"اردو"},
++};
++
++constexpr size_t kMaxRows = 3;
++constexpr size_t kMaxWords = 12;
++constexpr size_t kMinLetters = 2;
++
++// The Indic scripts each have a 0x80-wide block in this order, with the same
++// layout: offsets 0x64-0x6F hold the danda marks and the digits.
++struct IndicBlock {
++  char16_t first;
++  Script script;
++};
++constexpr IndicBlock kIndicBlocks[] = {
++    {0x0900, Script::kDevanagari}, {0x0980, Script::kBengali},
++    {0x0A00, Script::kGurmukhi},   {0x0A80, Script::kGujarati},
++    {0x0B00, Script::kOdia},       {0x0B80, Script::kTamil},
++    {0x0C00, Script::kTelugu},     {0x0C80, Script::kKannada},
++    {0x0D00, Script::kMalayalam},
++};
++constexpr char16_t kIndicBlockSize = 0x80;
++constexpr char16_t kIndicNonLetterFirst = 0x64;
++constexpr char16_t kIndicNonLetterLast = 0x6F;
++
++constexpr bool InRange(char16_t c, char16_t first, char16_t last) {
++  return c >= first && c <= last;
++}
++
++// The script `c` is a letter (or a combining mark of a letter) of, or kOther
++// for everything else: digits, punctuation, joiners and scripts Tark does not
++// tell apart.
++Script LetterScript(char16_t c) {
++  if (c < 0x80) {
++    const bool is_letter = InRange(c, u'a', u'z') || InRange(c, u'A', u'Z');
++    return is_letter ? Script::kLatin : Script::kOther;
++  }
++  // Latin-1 Supplement and Latin Extended-A/B, minus the multiplication and
++  // division signs; Latin Extended Additional.
++  if (InRange(c, 0x00C0, 0x024F)) {
++    return (c == 0x00D7 || c == 0x00F7) ? Script::kOther : Script::kLatin;
++  }
++  if (InRange(c, 0x1E00, 0x1EFF)) {
++    return Script::kLatin;
++  }
++  for (const IndicBlock& block : kIndicBlocks) {
++    if (c >= block.first && c < block.first + kIndicBlockSize) {
++      const char16_t offset = static_cast<char16_t>(c - block.first);
++      if (InRange(offset, kIndicNonLetterFirst, kIndicNonLetterLast)) {
++        return Script::kOther;
++      }
++      return block.script;
++    }
++  }
++  // Devanagari Extended.
++  if (InRange(c, 0xA8E0, 0xA8FF)) {
++    return Script::kDevanagari;
++  }
++  // Arabic letters and diacritics: not the Arabic-Indic digits (0660-0669,
++  // 06F0-06F9), Arabic punctuation, or U+FEFF (the byte order mark).
++  if (InRange(c, 0x0620, 0x065F) || InRange(c, 0x066E, 0x06D3) || c == 0x06D5 ||
++      InRange(c, 0x06FA, 0x06FF) || InRange(c, 0x0750, 0x077F) ||
++      InRange(c, 0x08A0, 0x08FF) || InRange(c, 0xFB50, 0xFDFF) ||
++      InRange(c, 0xFE70, 0xFEFE)) {
++    return Script::kArabic;
++  }
++  // Meetei Mayek and Meetei Mayek Extensions, minus the digits (ABF0-ABF9)
++  // and the cheikhei punctuation (ABEB).
++  if ((InRange(c, 0xABC0, 0xABED) && c != 0xABEB) ||
++      InRange(c, 0xAAE0, 0xAAF6)) {
++    return Script::kMeeteiMayek;
++  }
++  return Script::kOther;
++}
++
++bool IsAsciiLetter(char16_t c) {
++  return InRange(c, u'a', u'z') || InRange(c, u'A', u'Z');
++}
++
++bool IsSeparator(char16_t c) {
++  return c == u' ' || InRange(c, 0x0009, 0x000D) || c == 0x0085 ||
++         c == 0x00A0 || c == 0x1680 || InRange(c, 0x2000, 0x200A) ||
++         c == 0x2028 || c == 0x2029 || c == 0x202F || c == 0x205F ||
++         c == 0x3000;
++}
++
++// Non-ASCII characters that are neither letters nor separators and so do not
++// stop a phrase from being transliterable: Latin-1 punctuation and symbols,
++// zero-width characters and general punctuation (quotes, dashes, ellipsis).
++bool IsHarmlessNonAscii(char16_t c) {
++  if (InRange(c, 0x00A1, 0x00BF)) {
++    // Not the letters ª (00AA), µ (00B5) and º (00BA).
++    return c != 0x00AA && c != 0x00B5 && c != 0x00BA;
++  }
++  return InRange(c, 0x200B, 0x200F) || InRange(c, 0x2010, 0x2027) ||
++         InRange(c, 0x2030, 0x205E);
++}
++
++char ToLowerAscii(char c) {
++  return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
++}
++
++// The lowercase primary language subtag of one accept-languages entry:
++// "HI-IN;q=0.9" -> "hi".
++std::string PrimarySubtag(std::string_view entry) {
++  const size_t semicolon = entry.find(';');
++  if (semicolon != std::string_view::npos) {
++    entry = entry.substr(0, semicolon);
++  }
++  while (!entry.empty() && (entry.front() == ' ' || entry.front() == '\t')) {
++    entry.remove_prefix(1);
++  }
++  while (!entry.empty() && (entry.back() == ' ' || entry.back() == '\t')) {
++    entry.remove_suffix(1);
++  }
++  const size_t dash = entry.find_first_of("-_");
++  if (dash != std::string_view::npos) {
++    entry = entry.substr(0, dash);
++  }
++  std::string subtag;
++  for (char c : entry) {
++    subtag.push_back(ToLowerAscii(c));
++  }
++  return subtag;
++}
++
++// The table entry for an accept-languages code or an IndicXlit tag, or null.
++const Language* FindLanguage(std::string_view code) {
++  for (const Language& language : kLanguages) {
++    if (language.accept_code == code || language.tag == code) {
++      return &language;
++    }
++  }
++  return nullptr;
++}
++
++// Every supported language in `accept_languages`, in order, each once.
++std::vector<const Language*> AcceptedLanguages(
++    std::string_view accept_languages) {
++  std::vector<const Language*> found;
++  std::string_view rest = accept_languages;
++  while (true) {
++    const size_t comma = rest.find(',');
++    const std::string code = PrimarySubtag(rest.substr(0, comma));
++    const Language* language = FindLanguage(code);
++    if (language) {
++      bool seen = false;
++      for (const Language* earlier : found) {
++        seen = seen || earlier == language;
++      }
++      if (!seen) {
++        found.push_back(language);
++      }
++    }
++    if (comma == std::string_view::npos) {
++      break;
++    }
++    rest.remove_prefix(comma + 1);
++  }
++  return found;
++}
++
++// Deliberate exclusion: Bodo (brx) has no live Wikipedia as of 2026-10, so
++// WikipediaLanguage skips it and a Bodo speaker is sent to the next accepted
++// language of the same script, or the script's default, instead of a host
++// that does not exist. To lift the exclusion, make this return true for brx
++// once brx.wikipedia.org is live.
++bool HasWikipedia(const Language& language) {
++  return language.tag != "brx";
++}
++
++std::string_view DefaultWikipediaLanguage(Script script) {
++  switch (script) {
++    case Script::kDevanagari:
++      return "hi";
++    case Script::kBengali:
++      return "bn";
++    case Script::kArabic:
++      return "ur";
++    case Script::kGurmukhi:
++      return "pa";
++    case Script::kGujarati:
++      return "gu";
++    case Script::kOdia:
++      return "or";
++    case Script::kTamil:
++      return "ta";
++    case Script::kTelugu:
++      return "te";
++    case Script::kKannada:
++      return "kn";
++    case Script::kMalayalam:
++      return "ml";
++    case Script::kMeeteiMayek:
++      return "mni";
++    case Script::kLatin:
++    case Script::kOther:
++      return "en";
++  }
++  return "en";
++}
++
++}  // namespace
++
++Script DominantScript(std::u16string_view text) {
++  std::array<size_t, static_cast<size_t>(Script::kOther)> counts = {};
++  for (char16_t c : text) {
++    const Script script = LetterScript(c);
++    if (script != Script::kOther) {
++      ++counts[static_cast<size_t>(script)];
++    }
++  }
++  // Non-Latin scripts first, with a strict comparison, so that on a tie the
++  // earliest non-Latin script beats Latin.
++  Script best = Script::kOther;
++  size_t best_count = 0;
++  for (size_t i = static_cast<size_t>(Script::kDevanagari);
++       i <= static_cast<size_t>(Script::kMeeteiMayek); ++i) {
++    if (counts[i] > best_count) {
++      best_count = counts[i];
++      best = static_cast<Script>(i);
++    }
++  }
++  if (counts[static_cast<size_t>(Script::kLatin)] > best_count) {
++    best = Script::kLatin;
++  }
++  return best;
++}
++
++base::span<const Language> AllLanguages() {
++  return base::span<const Language>(kLanguages);
++}
++
++std::vector<const Language*> RowLanguages(std::string_view accept_languages) {
++  std::vector<const Language*> rows = AcceptedLanguages(accept_languages);
++  if (rows.empty()) {
++    rows.push_back(FindLanguage("hi"));
++  }
++  if (rows.size() > kMaxRows) {
++    rows.resize(kMaxRows);
++  }
++  return rows;
++}
++
++bool LooksTransliterable(std::u16string_view text) {
++  size_t letters = 0;
++  size_t words = 0;
++  bool in_word = false;
++  for (char16_t c : text) {
++    if (IsSeparator(c)) {
++      in_word = false;
++      continue;
++    }
++    if (c < 0x80) {
++      if (IsAsciiLetter(c)) {
++        ++letters;
++      }
++    } else if (!IsHarmlessNonAscii(c)) {
++      return false;
++    }
++    if (!in_word) {
++      in_word = true;
++      ++words;
++    }
++  }
++  return letters >= kMinLetters && words <= kMaxWords;
++}
++
++std::string WikipediaLanguage(std::u16string_view query,
++                              std::string_view accept_languages) {
++  const Script script = DominantScript(query);
++  if (script == Script::kLatin || script == Script::kOther) {
++    return "en";
++  }
++  for (const Language* language : AcceptedLanguages(accept_languages)) {
++    if (language->script == script && HasWikipedia(*language)) {
++      return std::string(language->tag);
++    }
++  }
++  return std::string(DefaultWikipediaLanguage(script));
++}
++
++}  // namespace tark_xlit
+--- /dev/null
++++ b/components/tark_xlit/languages.h
+@@ -0,0 +1,75 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef COMPONENTS_TARK_XLIT_LANGUAGES_H_
++#define COMPONENTS_TARK_XLIT_LANGUAGES_H_
++
++#include <string>
++#include <string_view>
++#include <vector>
++
++#include "base/containers/span.h"
++
++namespace tark_xlit {
++
++// The scripts Tark tells apart. kOther means "no letters we know" (an empty
++// query, digits only, or a script outside this list).
++enum class Script {
++  kLatin,
++  kDevanagari,
++  kBengali,
++  kGurmukhi,
++  kGujarati,
++  kOdia,
++  kTamil,
++  kTelugu,
++  kKannada,
++  kMalayalam,
++  kArabic,
++  kMeeteiMayek,
++  kOther,
++};
++
++// One language IndicXlit can write.
++struct Language {
++  // The language subtag as it appears in Chromium's accept-languages list
++  // ("kok" for Konkani).
++  std::string_view accept_code;
++  // The tag IndicXlit and Wikipedia use ("gom" for Konkani). Equal to
++  // `accept_code` for every other language.
++  std::string_view tag;
++  // The script IndicXlit writes this language in.
++  Script script;
++  // The language's name in itself, from CLDR.
++  std::u16string_view native_name;
++};
++
++// The script that most of `text`'s letters belong to, or kOther when there are
++// no letters. Digits, punctuation, danda marks and joiners do not vote. On a
++// tie a non-Latin script wins: someone who typed native letters meant them.
++Script DominantScript(std::u16string_view text);
++
++// All 20 supported languages, in a fixed order.
++base::span<const Language> AllLanguages();
++
++// The languages to offer rows for: the first (at most) three Indian languages
++// in `accept_languages` (a comma list such as "en-US,ta;q=0.9,hi"), in order,
++// each once. Hindi alone when the list has none. The pointers refer to the
++// static table and stay valid for the life of the process.
++std::vector<const Language*> RowLanguages(std::string_view accept_languages);
++
++// Whether `text` might be an Indian-language word or phrase typed in Latin
++// letters: every letter is ASCII Latin, at least two letters, at most 12
++// whitespace-separated words.
++bool LooksTransliterable(std::u16string_view text);
++
++// The Wikipedia language code for a query: "en" for Latin text or text with no
++// letters. Otherwise the first language in `accept_languages` whose script
++// matches the query's dominant script, else that script's default.
++std::string WikipediaLanguage(std::u16string_view query,
++                              std::string_view accept_languages);
++
++}  // namespace tark_xlit
++
++#endif  // COMPONENTS_TARK_XLIT_LANGUAGES_H_
+--- /dev/null
++++ b/components/tark_xlit/languages_unittest.cc
+@@ -0,0 +1,191 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/tark_xlit/languages.h"
++
++#include <string>
++#include <vector>
++
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace tark_xlit {
++
++namespace {
++
++std::vector<std::string> Tags(const std::vector<const Language*>& languages) {
++  std::vector<std::string> tags;
++  for (const Language* language : languages) {
++    tags.emplace_back(language->tag);
++  }
++  return tags;
++}
++
++}  // namespace
++
++TEST(TarkXlitLanguagesTest, TableHasTwentyDistinctLanguages) {
++  base::span<const Language> all = AllLanguages();
++  ASSERT_EQ(20u, all.size());
++  for (size_t i = 0; i < all.size(); ++i) {
++    EXPECT_FALSE(all[i].accept_code.empty());
++    EXPECT_FALSE(all[i].tag.empty());
++    EXPECT_FALSE(all[i].native_name.empty());
++    EXPECT_NE(Script::kLatin, all[i].script);
++    EXPECT_NE(Script::kOther, all[i].script);
++    for (size_t j = i + 1; j < all.size(); ++j) {
++      EXPECT_NE(all[i].accept_code, all[j].accept_code);
++      EXPECT_NE(all[i].tag, all[j].tag);
++    }
++  }
++}
++
++TEST(TarkXlitLanguagesTest, NativeNamesAreInTheirOwnScript) {
++  for (const Language& language : AllLanguages()) {
++    // The own-language name of every language is written in that language's
++    // script (Meitei in Meetei Mayek, Urdu, Sindhi and Kashmiri in Arabic).
++    EXPECT_EQ(language.script, DominantScript(language.native_name))
++        << language.tag;
++  }
++}
++
++TEST(TarkXlitLanguagesTest, DominantScript) {
++  EXPECT_EQ(Script::kLatin, DominantScript(u"namaste"));
++  EXPECT_EQ(Script::kDevanagari, DominantScript(u"नमस्ते"));
++  EXPECT_EQ(Script::kBengali, DominantScript(u"বাংলা"));
++  EXPECT_EQ(Script::kGurmukhi, DominantScript(u"ਪੰਜਾਬੀ"));
++  EXPECT_EQ(Script::kGujarati, DominantScript(u"ગુજરાતી"));
++  EXPECT_EQ(Script::kOdia, DominantScript(u"ଓଡ଼ିଆ"));
++  EXPECT_EQ(Script::kTamil, DominantScript(u"தமிழ்"));
++  EXPECT_EQ(Script::kTelugu, DominantScript(u"తెలుగు"));
++  EXPECT_EQ(Script::kKannada, DominantScript(u"ಕನ್ನಡ"));
++  EXPECT_EQ(Script::kMalayalam, DominantScript(u"മലയാളം"));
++  EXPECT_EQ(Script::kArabic, DominantScript(u"اردو"));
++  EXPECT_EQ(Script::kMeeteiMayek, DominantScript(u"ꯃꯤꯇꯩꯂꯣꯟ"));
++}
++
++TEST(TarkXlitLanguagesTest, DominantScriptWithoutLetters) {
++  EXPECT_EQ(Script::kOther, DominantScript(u""));
++  EXPECT_EQ(Script::kOther, DominantScript(u"   "));
++  EXPECT_EQ(Script::kOther, DominantScript(u"2024-10-18 !?"));
++  // Devanagari digits and the danda are not letters.
++  EXPECT_EQ(Script::kOther, DominantScript(u"१२३ ।"));
++}
++
++TEST(TarkXlitLanguagesTest, DominantScriptCountsMostLetters) {
++  EXPECT_EQ(Script::kDevanagari, DominantScript(u"a ताज महल"));
++  EXPECT_EQ(Script::kLatin, DominantScript(u"taj mahal ताज"));
++  // Digits and punctuation do not vote.
++  EXPECT_EQ(Script::kTamil, DominantScript(u"2024 தாஜ் - a"));
++}
++
++TEST(TarkXlitLanguagesTest, RowLanguagesTakesFirstThreeIndianInOrder) {
++  EXPECT_EQ((std::vector<std::string>{"ta", "hi", "mr"}),
++            Tags(RowLanguages("en-US,ta,hi,mr,bn")));
++}
++
++TEST(TarkXlitLanguagesTest, RowLanguagesFallsBackToHindi) {
++  EXPECT_EQ((std::vector<std::string>{"hi"}),
++            Tags(RowLanguages("en-US,en-GB")));
++  EXPECT_EQ((std::vector<std::string>{"hi"}), Tags(RowLanguages("si,en")));
++  EXPECT_EQ((std::vector<std::string>{"hi"}), Tags(RowLanguages("")));
++}
++
++TEST(TarkXlitLanguagesTest, RowLanguagesKonkaniUsesGomTag) {
++  std::vector<const Language*> rows = RowLanguages("kok,en");
++  ASSERT_EQ(1u, rows.size());
++  EXPECT_EQ("gom", rows[0]->tag);
++  EXPECT_EQ(Script::kDevanagari, rows[0]->script);
++
++  // The tag itself is accepted as well.
++  rows = RowLanguages("gom");
++  ASSERT_EQ(1u, rows.size());
++  EXPECT_EQ("gom", rows[0]->tag);
++}
++
++TEST(TarkXlitLanguagesTest, RowLanguagesIgnoresRegionsQualityAndCase) {
++  EXPECT_EQ((std::vector<std::string>{"hi", "bn"}),
++            Tags(RowLanguages("en-US, HI-IN;q=0.9, bn_BD ;q=0.8")));
++}
++
++TEST(TarkXlitLanguagesTest, RowLanguagesDeduplicates) {
++  EXPECT_EQ((std::vector<std::string>{"hi", "ta"}),
++            Tags(RowLanguages("hi,hi-IN,ta,hi")));
++  // kok and gom are the same language.
++  EXPECT_EQ((std::vector<std::string>{"gom", "hi"}),
++            Tags(RowLanguages("kok,gom,hi")));
++}
++
++TEST(TarkXlitLanguagesTest, RowLanguagesCapsAtThree) {
++  EXPECT_EQ(3u, RowLanguages("hi,ta,te,kn,ml").size());
++}
++
++TEST(TarkXlitLanguagesTest, LooksTransliterable) {
++  EXPECT_TRUE(LooksTransliterable(u"namaste"));
++  EXPECT_TRUE(LooksTransliterable(u"Namaste"));
++  EXPECT_TRUE(LooksTransliterable(u"heart attack ke lakshan"));
++  EXPECT_TRUE(LooksTransliterable(u"covid-19 ke lakshan"));
++  EXPECT_TRUE(LooksTransliterable(u"  namaste  "));
++}
++
++TEST(TarkXlitLanguagesTest, LooksTransliterableRejects) {
++  EXPECT_FALSE(LooksTransliterable(u""));
++  EXPECT_FALSE(LooksTransliterable(u"n"));
++  EXPECT_FALSE(LooksTransliterable(u"2024 7"));
++  EXPECT_FALSE(LooksTransliterable(u"नमस्ते"));
++  EXPECT_FALSE(LooksTransliterable(u"namaste नमस्ते"));
++  EXPECT_FALSE(LooksTransliterable(u"café"));
++}
++
++TEST(TarkXlitLanguagesTest, LooksTransliterableWordLimit) {
++  EXPECT_TRUE(LooksTransliterable(u"a b c d e f g h i j k l"));
++  EXPECT_TRUE(LooksTransliterable(u"aa bb cc dd ee ff gg hh ii jj kk ll"));
++  EXPECT_FALSE(LooksTransliterable(u"aa bb cc dd ee ff gg hh ii jj kk ll mm"));
++  // Runs of whitespace do not make extra words.
++  EXPECT_TRUE(LooksTransliterable(
++      u"aa  bb   cc dd ee ff gg hh ii jj kk\tll"));
++}
++
++TEST(TarkXlitLanguagesTest, WikipediaLanguage) {
++  EXPECT_EQ("mr", WikipediaLanguage(u"ताज महल", "en,mr"));
++  EXPECT_EQ("hi", WikipediaLanguage(u"ताज महल", "en"));
++  EXPECT_EQ("ta", WikipediaLanguage(u"தாஜ் மஹால்", "en"));
++  EXPECT_EQ("en", WikipediaLanguage(u"taj mahal", "hi"));
++}
++
++TEST(TarkXlitLanguagesTest, WikipediaLanguageNoLettersIsEnglish) {
++  EXPECT_EQ("en", WikipediaLanguage(u"", "hi"));
++  EXPECT_EQ("en", WikipediaLanguage(u"2024", "hi,ta"));
++}
++
++TEST(TarkXlitLanguagesTest, WikipediaLanguageScriptDefaults) {
++  EXPECT_EQ("hi", WikipediaLanguage(u"नमस्ते", ""));
++  EXPECT_EQ("bn", WikipediaLanguage(u"বাংলা", "en"));
++  EXPECT_EQ("ur", WikipediaLanguage(u"اردو", "en"));
++  EXPECT_EQ("pa", WikipediaLanguage(u"ਪੰਜਾਬੀ", "en"));
++  EXPECT_EQ("gu", WikipediaLanguage(u"ગુજરાતી", "en"));
++  EXPECT_EQ("or", WikipediaLanguage(u"ଓଡ଼ିଆ", "en"));
++  EXPECT_EQ("te", WikipediaLanguage(u"తెలుగు", "en"));
++  EXPECT_EQ("kn", WikipediaLanguage(u"ಕನ್ನಡ", "en"));
++  EXPECT_EQ("ml", WikipediaLanguage(u"മലയാളം", "en"));
++  EXPECT_EQ("mni", WikipediaLanguage(u"ꯃꯤꯇꯩꯂꯣꯟ", "en"));
++}
++
++TEST(TarkXlitLanguagesTest, WikipediaLanguageSkipsBodoWhichHasNoWikipedia) {
++  // Deliberate: no live Bodo Wikipedia as of 2026-10.
++  EXPECT_EQ("hi", WikipediaLanguage(u"बर", "brx"));
++  EXPECT_EQ("mr", WikipediaLanguage(u"ताज महल", "brx,mr"));
++}
++
++TEST(TarkXlitLanguagesTest, WikipediaLanguagePrefersAcceptOrderWithinScript) {
++  // Marathi comes before Hindi in the list, both are Devanagari.
++  EXPECT_EQ("mr", WikipediaLanguage(u"ताज महल", "en,mr,hi"));
++  EXPECT_EQ("hi", WikipediaLanguage(u"ताज महल", "hi-IN,mr"));
++  // A Tamil speaker who searches in Devanagari still gets a Devanagari wiki.
++  EXPECT_EQ("hi", WikipediaLanguage(u"ताज महल", "ta"));
++  // Arabic script: Sindhi is listed, so it wins over the Urdu default.
++  EXPECT_EQ("sd", WikipediaLanguage(u"سنڌي", "en,sd"));
++  // Konkani is `gom` on Wikipedia.
++  EXPECT_EQ("gom", WikipediaLanguage(u"ताज महल", "kok"));
++}
++
++}  // namespace tark_xlit
+--- /dev/null
++++ b/components/tark_xlit/model.cc
+@@ -0,0 +1,962 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/tark_xlit/model.h"
++
++#include <Accelerate/Accelerate.h>
++
++#include <algorithm>
++#include <array>
++#include <bit>
++#include <cmath>
++#include <cstddef>
++#include <cstdint>
++#include <functional>
++#include <initializer_list>
++#include <iterator>
++#include <limits>
++#include <map>
++#include <memory>
++#include <numeric>
++#include <optional>
++#include <string>
++#include <string_view>
++#include <utility>
++#include <vector>
++
++#include "base/check.h"
++#include "base/check_op.h"
++#include "base/containers/heap_array.h"
++#include "base/containers/span.h"
++#include "base/containers/span_reader.h"
++#include "base/json/json_reader.h"
++#include "base/memory/ptr_util.h"
++#include "base/memory/stack_allocated.h"
++#include "base/numerics/byte_conversions.h"
++#include "base/numerics/safe_conversions.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/strings/string_view_util.h"
++#include "base/strings/utf_string_conversions.h"
++#include "base/values.h"
++
++namespace tark_xlit {
++
++namespace internal {
++
++// Where a tensor lives in ModelData::weights, in floats.
++struct Tensor {
++  size_t offset = 0;
++  size_t size = 0;
++};
++
++struct Norm {
++  Tensor weight;
++  Tensor bias;
++};
++
++// y = x W^T + b, W being `out` x `in` (torch's nn.Linear layout).
++struct Linear {
++  Tensor weight;
++  Tensor bias;
++  size_t out = 0;
++  size_t in = 0;
++};
++
++struct EncoderLayer {
++  Norm self_attention_norm;
++  Linear query, key, value, attention_out;
++  Norm ffn_norm;
++  Linear fc1, fc2;
++};
++
++struct DecoderLayer {
++  Norm self_attention_norm;
++  Linear query, key, value, attention_out;
++  Norm cross_attention_norm;
++  Linear cross_query, cross_key, cross_value, cross_attention_out;
++  Norm ffn_norm;
++  Linear fc1, fc2;
++};
++
++struct ModelData {
++  size_t dim = 0;
++  size_t heads = 0;
++  size_t head_dim = 0;
++  float embed_scale = 0;  // sqrt(dim)
++  float query_scale = 0;  // 1 / sqrt(head_dim)
++
++  size_t pad = 1;
++  size_t eos = 2;
++  size_t unk = 3;
++  // Source token of each letter a-z.
++  std::array<size_t, 26> letter_ids;
++  // Source token of each language tag: "hi" for "__hi__".
++  std::map<std::string, size_t, std::less<>> tag_ids;
++  std::vector<std::u16string> target_vocab;
++
++  Tensor encoder_embed;
++  Norm encoder_embed_norm;
++  std::vector<EncoderLayer> encoder_layers;
++  Norm encoder_final_norm;
++  Tensor decoder_embed;
++  Norm decoder_embed_norm;
++  std::vector<DecoderLayer> decoder_layers;
++  Norm decoder_final_norm;
++  Tensor output_projection;
++
++  // Every tensor, float32.
++  base::HeapArray<float> weights;
++  // fairseq's sinusoidal position table, kMaxPositions x dim.
++  base::HeapArray<float> positions;
++
++  base::span<const float> Get(const Tensor& tensor) const {
++    return weights.subspan(tensor.offset, tensor.size);
++  }
++  base::span<const float> Position(size_t index) const {
++    return positions.subspan(index * dim, dim);
++  }
++};
++
++}  // namespace internal
++
++namespace {
++
++using internal::DecoderLayer;
++using internal::EncoderLayer;
++using internal::Linear;
++using internal::ModelData;
++using internal::Norm;
++using internal::Tensor;
++
++constexpr std::array<uint8_t, 8> kMagic = {'T', 'X', 'L', 'M', 1, 0, 0, 0};
++
++// fairseq SequenceGenerator as ai4bharat-transliteration 1.1.3 runs it (see
++// utils/xlit_reference.py): beam 4, four results, max_len_a 0, max_len_b 200,
++// min_len 1, length penalty 1, unknown-word penalty 0, normalised scores.
++constexpr size_t kBeam = 4;
++constexpr size_t kMaxLength = 200;
++constexpr size_t kMinLength = 1;
++
++constexpr size_t kMaxWordLetters = 32;
++// The first token is at position 2 (the padding index plus one).
++constexpr size_t kFirstPosition = 2;
++constexpr size_t kMaxPositions = 256;
++// The tag, the letters and </s> on the encoder side; </s> plus up to
++// kMaxLength tokens on the decoder side.
++static_assert(kFirstPosition + kMaxWordLetters + 2 <= kMaxPositions);
++static_assert(kFirstPosition + kMaxLength < kMaxPositions);
++
++constexpr float kLayerNormEpsilon = 1e-5f;
++constexpr float kNegativeInfinity = -std::numeric_limits<float>::infinity();
++
++// Bounds on the header's sizes, so that no product of them overflows.
++constexpr size_t kMaxDim = 4096;
++constexpr size_t kMaxLayers = 64;
++constexpr size_t kMaxVocab = 1 << 16;
++
++// IEEE half to single precision, exactly (every half is a float). Infinities
++// and NaNs (exponent 0x1F) are not weights: nullopt.
++std::optional<float> HalfToFloat(uint16_t half) {
++  const uint32_t sign = static_cast<uint32_t>(half & 0x8000u) << 16;
++  uint32_t exponent = (half >> 10) & 0x1Fu;
++  uint32_t mantissa = half & 0x3FFu;
++  uint32_t bits;
++  if (exponent == 0) {
++    if (mantissa == 0) {
++      bits = sign;
++    } else {
++      // A subnormal half is a normal float: shift the mantissa up to its
++      // implicit leading one.
++      exponent = 127 - 15 + 1;
++      while ((mantissa & 0x400u) == 0) {
++        mantissa <<= 1;
++        --exponent;
++      }
++      mantissa &= 0x3FFu;
++      bits = sign | (exponent << 23) | (mantissa << 13);
++    }
++  } else if (exponent == 0x1F) {
++    return std::nullopt;
++  } else {
++    bits = sign | ((exponent + 127 - 15) << 23) | (mantissa << 13);
++  }
++  return std::bit_cast<float>(bits);
++}
++
++std::optional<size_t> ReadSize(const base::DictValue& dict,
++                               std::string_view key) {
++  const std::optional<int> value = dict.FindInt(key);
++  if (!value || *value < 0) {
++    return std::nullopt;
++  }
++  return static_cast<size_t>(*value);
++}
++
++// Whether the optional flag `key` is absent or has the value this class
++// implements.
++bool FlagIs(const base::DictValue& config, std::string_view key, bool value) {
++  return config.FindBool(key).value_or(value) == value;
++}
++
++std::optional<std::vector<std::string>> ReadStrings(const base::ListValue* list,
++                                                    size_t max_size) {
++  if (!list || list->empty() || list->size() > max_size) {
++    return std::nullopt;
++  }
++  std::vector<std::string> out;
++  for (const base::Value& value : *list) {
++    const std::string* text = value.GetIfString();
++    if (!text) {
++      return std::nullopt;
++    }
++    out.push_back(*text);
++  }
++  return out;
++}
++
++// Collects the tensors the model needs from the header's "tensors" table,
++// checking each one's shape and extent, then converts them all to float32.
++class TensorReader {
++  STACK_ALLOCATED();
++
++ public:
++  TensorReader(const base::DictValue& tensors, base::span<const uint8_t> data)
++      : tensors_(tensors), data_(data) {}
++
++  // The tensor `name`, which must have exactly `shape`. On a failure, returns
++  // an empty tensor and ok() turns false.
++  Tensor Take(std::string_view name, std::initializer_list<size_t> shape) {
++    const base::DictValue* info = tensors_.FindDict(name);
++    const base::ListValue* dims = info ? info->FindList("shape") : nullptr;
++    const std::optional<size_t> offset =
++        info ? ReadSize(*info, "offset") : std::nullopt;
++    if (!dims || !offset || dims->size() != shape.size()) {
++      ok_ = false;
++      return Tensor();
++    }
++    size_t size = 1;
++    size_t index = 0;
++    for (size_t want : shape) {
++      const std::optional<int> dim = (*dims)[index++].GetIfInt();
++      if (!dim || *dim < 0 || static_cast<size_t>(*dim) != want) {
++        ok_ = false;
++        return Tensor();
++      }
++      size *= want;
++    }
++    // Two bytes per value.
++    if (size == 0 || *offset > data_.size() ||
++        size > (data_.size() - *offset) / 2) {
++      ok_ = false;
++      return Tensor();
++    }
++    pending_.push_back({*offset, size, total_});
++    const Tensor tensor{total_, size};
++    total_ += size;
++    return tensor;
++  }
++
++  Norm TakeNorm(const std::string& prefix, size_t dim) {
++    return Norm{Take(prefix + ".weight", {dim}), Take(prefix + ".bias", {dim})};
++  }
++
++  Linear TakeLinear(const std::string& prefix, size_t out, size_t in) {
++    return Linear{Take(prefix + ".weight", {out, in}),
++                  Take(prefix + ".bias", {out}), out, in};
++  }
++
++  bool ok() const { return ok_; }
++
++  // nullopt when a weight is infinite or NaN.
++  std::optional<base::HeapArray<float>> Convert() const {
++    CHECK(ok_);
++    auto weights = base::HeapArray<float>::Uninit(total_);
++    for (const Pending& tensor : pending_) {
++      base::span<const uint8_t> source =
++          data_.subspan(tensor.source, 2 * tensor.size);
++      for (float& value : weights.subspan(tensor.destination, tensor.size)) {
++        const std::optional<float> weight =
++            HalfToFloat(base::U16FromLittleEndian(source.take_first<2>()));
++        if (!weight) {
++          return std::nullopt;
++        }
++        value = *weight;
++      }
++    }
++    return weights;
++  }
++
++ private:
++  struct Pending {
++    size_t source;       // byte offset in `data_`
++    size_t size;         // values
++    size_t destination;  // float offset in the weights
++  };
++
++  const base::DictValue& tensors_;
++  base::span<const uint8_t> data_;
++  std::vector<Pending> pending_;
++  size_t total_ = 0;
++  bool ok_ = true;
++};
++
++// fairseq's SinusoidalPositionalEmbedding table, computed in float32 as the
++// reference does; the padding row is zero.
++base::HeapArray<float> Sinusoids(size_t dim, size_t pad) {
++  auto table = base::HeapArray<float>::WithSize(kMaxPositions * dim);
++  const size_t half = dim / 2;
++  const float scale =
++      static_cast<float>(-std::log(10000.0) / static_cast<double>(half - 1));
++  for (size_t position = 0; position < kMaxPositions; ++position) {
++    if (position == pad) {
++      continue;
++    }
++    base::span<float> row = table.subspan(position * dim, dim);
++    for (size_t i = 0; i < half; ++i) {
++      const float frequency = std::exp(static_cast<float>(i) * scale);
++      const float angle = static_cast<float>(position) * frequency;
++      row[i] = std::sin(angle);
++      row[half + i] = std::cos(angle);
++    }
++  }
++  return table;
++}
++
++std::unique_ptr<ModelData> ParseModel(const base::DictValue& header,
++                                      base::span<const uint8_t> data) {
++  const base::DictValue* config = header.FindDict("config");
++  const base::DictValue* tensors = header.FindDict("tensors");
++  if (!config || !tensors) {
++    return nullptr;
++  }
++
++  // The architecture this file implements (see the header comment of
++  // utils/xlit_reference.py): a pre-norm transformer with layer norm on the
++  // embeddings, scaled embeddings, sinusoidal positions, GELU, and separate
++  // input and output embeddings.
++  const std::string* activation = config->FindString("activation_fn");
++  if ((activation && *activation != "gelu") ||
++      !FlagIs(*config, "encoder_normalize_before", true) ||
++      !FlagIs(*config, "decoder_normalize_before", true) ||
++      !FlagIs(*config, "layernorm_embedding", true) ||
++      !FlagIs(*config, "no_scale_embedding", false) ||
++      !FlagIs(*config, "encoder_learned_pos", false) ||
++      !FlagIs(*config, "decoder_learned_pos", false) ||
++      !FlagIs(*config, "no_token_positional_embeddings", false) ||
++      !FlagIs(*config, "share_decoder_input_output_embed", false) ||
++      !FlagIs(*config, "share_all_embeddings", false)) {
++    return nullptr;
++  }
++  const std::optional<size_t> dim = ReadSize(*config, "encoder_embed_dim");
++  const std::optional<size_t> heads =
++      ReadSize(*config, "encoder_attention_heads");
++  const std::optional<size_t> encoder_ffn =
++      ReadSize(*config, "encoder_ffn_embed_dim");
++  const std::optional<size_t> decoder_ffn =
++      ReadSize(*config, "decoder_ffn_embed_dim");
++  const std::optional<size_t> encoder_layers =
++      ReadSize(*config, "encoder_layers");
++  const std::optional<size_t> decoder_layers =
++      ReadSize(*config, "decoder_layers");
++  if (!dim || !heads || !encoder_ffn || !decoder_ffn || !encoder_layers ||
++      !decoder_layers || ReadSize(*config, "decoder_embed_dim") != dim ||
++      ReadSize(*config, "decoder_attention_heads") != heads) {
++    return nullptr;
++  }
++  if (*dim < 4 || *dim > kMaxDim || *dim % 2 != 0 || *heads == 0 ||
++      *dim % *heads != 0 || *encoder_ffn == 0 || *encoder_ffn > 4 * kMaxDim ||
++      *decoder_ffn == 0 || *decoder_ffn > 4 * kMaxDim || *encoder_layers == 0 ||
++      *encoder_layers > kMaxLayers || *decoder_layers == 0 ||
++      *decoder_layers > kMaxLayers) {
++    return nullptr;
++  }
++
++  auto m = std::make_unique<ModelData>();
++  m->dim = *dim;
++  m->heads = *heads;
++  m->head_dim = *dim / *heads;
++  m->embed_scale = static_cast<float>(std::sqrt(static_cast<double>(*dim)));
++  m->query_scale =
++      static_cast<float>(1.0 / std::sqrt(static_cast<double>(m->head_dim)));
++
++  if (const base::DictValue* special = config->FindDict("special_ids")) {
++    m->pad = ReadSize(*special, "pad").value_or(m->pad);
++    m->eos = ReadSize(*special, "eos").value_or(m->eos);
++    m->unk = ReadSize(*special, "unk").value_or(m->unk);
++  }
++
++  const std::optional<std::vector<std::string>> source =
++      ReadStrings(header.FindList("src_vocab"), kMaxVocab);
++  const std::optional<std::vector<std::string>> target =
++      ReadStrings(header.FindList("tgt_vocab"), kMaxVocab);
++  if (!source || !target) {
++    return nullptr;
++  }
++  for (size_t id : {m->pad, m->eos, m->unk}) {
++    if (id >= source->size() || id >= target->size()) {
++      return nullptr;
++    }
++  }
++  m->letter_ids.fill(m->unk);
++  for (size_t id = 0; id < source->size(); ++id) {
++    const std::string& symbol = (*source)[id];
++    if (symbol.size() == 1 && symbol[0] >= 'a' && symbol[0] <= 'z') {
++      m->letter_ids[static_cast<size_t>(symbol[0] - 'a')] = id;
++    } else if (symbol.size() > 4 && symbol.starts_with("__") &&
++               symbol.ends_with("__")) {
++      m->tag_ids.emplace(symbol.substr(2, symbol.size() - 4), id);
++    }
++  }
++  for (const std::string& symbol : *target) {
++    m->target_vocab.push_back(base::UTF8ToUTF16(symbol));
++  }
++
++  TensorReader reader(*tensors, data);
++  const size_t d = m->dim;
++  m->encoder_embed =
++      reader.Take("encoder.embed_tokens.weight", {source->size(), d});
++  m->encoder_embed_norm = reader.TakeNorm("encoder.layernorm_embedding", d);
++  for (size_t i = 0; i < *encoder_layers; ++i) {
++    const std::string p = "encoder.layers." + base::NumberToString(i);
++    EncoderLayer layer;
++    layer.self_attention_norm = reader.TakeNorm(p + ".self_attn_layer_norm", d);
++    layer.query = reader.TakeLinear(p + ".self_attn.q_proj", d, d);
++    layer.key = reader.TakeLinear(p + ".self_attn.k_proj", d, d);
++    layer.value = reader.TakeLinear(p + ".self_attn.v_proj", d, d);
++    layer.attention_out = reader.TakeLinear(p + ".self_attn.out_proj", d, d);
++    layer.ffn_norm = reader.TakeNorm(p + ".final_layer_norm", d);
++    layer.fc1 = reader.TakeLinear(p + ".fc1", *encoder_ffn, d);
++    layer.fc2 = reader.TakeLinear(p + ".fc2", d, *encoder_ffn);
++    m->encoder_layers.push_back(layer);
++  }
++  m->encoder_final_norm = reader.TakeNorm("encoder.layer_norm", d);
++
++  m->decoder_embed =
++      reader.Take("decoder.embed_tokens.weight", {target->size(), d});
++  m->decoder_embed_norm = reader.TakeNorm("decoder.layernorm_embedding", d);
++  for (size_t i = 0; i < *decoder_layers; ++i) {
++    const std::string p = "decoder.layers." + base::NumberToString(i);
++    DecoderLayer layer;
++    layer.self_attention_norm = reader.TakeNorm(p + ".self_attn_layer_norm", d);
++    layer.query = reader.TakeLinear(p + ".self_attn.q_proj", d, d);
++    layer.key = reader.TakeLinear(p + ".self_attn.k_proj", d, d);
++    layer.value = reader.TakeLinear(p + ".self_attn.v_proj", d, d);
++    layer.attention_out = reader.TakeLinear(p + ".self_attn.out_proj", d, d);
++    layer.cross_attention_norm =
++        reader.TakeNorm(p + ".encoder_attn_layer_norm", d);
++    layer.cross_query = reader.TakeLinear(p + ".encoder_attn.q_proj", d, d);
++    layer.cross_key = reader.TakeLinear(p + ".encoder_attn.k_proj", d, d);
++    layer.cross_value = reader.TakeLinear(p + ".encoder_attn.v_proj", d, d);
++    layer.cross_attention_out =
++        reader.TakeLinear(p + ".encoder_attn.out_proj", d, d);
++    layer.ffn_norm = reader.TakeNorm(p + ".final_layer_norm", d);
++    layer.fc1 = reader.TakeLinear(p + ".fc1", *decoder_ffn, d);
++    layer.fc2 = reader.TakeLinear(p + ".fc2", d, *decoder_ffn);
++    m->decoder_layers.push_back(layer);
++  }
++  m->decoder_final_norm = reader.TakeNorm("decoder.layer_norm", d);
++  m->output_projection =
++      reader.Take("decoder.output_projection.weight", {target->size(), d});
++  if (!reader.ok()) {
++    return nullptr;
++  }
++
++  std::optional<base::HeapArray<float>> weights = reader.Convert();
++  if (!weights) {
++    return nullptr;
++  }
++  m->weights = std::move(*weights);
++  m->positions = Sinusoids(d, m->pad);
++  return m;
++}
++
++// The forward pass. Activations are row-major `rows` x width float32 buffers.
++
++int Int(size_t value) {
++  return base::checked_cast<int>(value);
++}
++
++void AddTo(base::span<float> x, base::span<const float> y) {
++  CHECK_EQ(x.size(), y.size());
++  for (size_t i = 0; i < x.size(); ++i) {
++    x[i] += y[i];
++  }
++}
++
++void Scale(base::span<float> x, float factor) {
++  for (float& value : x) {
++    value *= factor;
++  }
++}
++
++// out = x W^T + b.
++void ApplyLinear(const ModelData& m,
++                 const Linear& linear,
++                 base::span<const float> x,
++                 size_t rows,
++                 base::span<float> out) {
++  CHECK_EQ(x.size(), rows * linear.in);
++  CHECK_EQ(out.size(), rows * linear.out);
++  const base::span<const float> bias = m.Get(linear.bias);
++  for (size_t r = 0; r < rows; ++r) {
++    out.subspan(r * linear.out, linear.out).copy_from(bias);
++  }
++  const base::span<const float> weight = m.Get(linear.weight);
++  cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, Int(rows),
++              Int(linear.out), Int(linear.in), 1.0f, x.data(), Int(linear.in),
++              weight.data(), Int(linear.in), 1.0f, out.data(), Int(linear.out));
++}
++
++void LayerNorm(const ModelData& m,
++               const Norm& norm,
++               base::span<const float> x,
++               size_t rows,
++               base::span<float> out) {
++  const size_t dim = m.dim;
++  CHECK_EQ(x.size(), rows * dim);
++  CHECK_EQ(out.size(), rows * dim);
++  const base::span<const float> weight = m.Get(norm.weight);
++  const base::span<const float> bias = m.Get(norm.bias);
++  const float n = static_cast<float>(dim);
++  for (size_t r = 0; r < rows; ++r) {
++    const base::span<const float> in = x.subspan(r * dim, dim);
++    const base::span<float> row = out.subspan(r * dim, dim);
++    float sum = 0;
++    for (float value : in) {
++      sum += value;
++    }
++    const float mean = sum / n;
++    float squares = 0;
++    for (float value : in) {
++      squares += (value - mean) * (value - mean);
++    }
++    const float denominator = std::sqrt(squares / n + kLayerNormEpsilon);
++    for (size_t i = 0; i < dim; ++i) {
++      row[i] = (in[i] - mean) / denominator * weight[i] + bias[i];
++    }
++  }
++}
++
++// The exact (erf, not tanh) GELU, in float32 as the reference computes it.
++// The reference evaluates erf in double and rounds; float erf differs from
++// that by at most an ulp and is several times faster (erf was a fifth of the
++// decoder's time).
++void Gelu(base::span<float> x) {
++  constexpr float kSqrtHalf = 0.70710678118654752f;
++  for (float& value : x) {
++    value = 0.5f * value * (1.0f + std::erf(value * kSqrtHalf));
++  }
++}
++
++void LogSoftmax(base::span<float> row) {
++  float max = kNegativeInfinity;
++  for (float value : row) {
++    max = std::max(max, value);
++  }
++  float sum = 0;
++  for (float& value : row) {
++    value -= max;
++    sum += std::exp(value);
++  }
++  const float log_sum = std::log(sum);
++  for (float& value : row) {
++    value -= log_sum;
++  }
++}
++
++// Multi-head attention of one (already scaled) query row over `count`
++// positions. The key of position j, all heads, starts at keys[j * stride]; the
++// same for values. Writes `dim` values to `out`.
++void Attend(const ModelData& m,
++            base::span<const float> query,
++            base::span<const float> keys,
++            base::span<const float> values,
++            size_t count,
++            size_t stride,
++            base::span<float> out,
++            std::vector<float>& weights) {
++  CHECK_GT(count, 0u);
++  CHECK_GE(stride, m.dim);
++  const size_t head_dim = m.head_dim;
++  const size_t extent = (count - 1) * stride + head_dim;
++  weights.resize(count);
++  for (size_t h = 0; h < m.heads; ++h) {
++    const size_t offset = h * head_dim;
++    const base::span<const float> head_keys = keys.subspan(offset, extent);
++    const base::span<const float> head_values = values.subspan(offset, extent);
++    const base::span<const float> head_query = query.subspan(offset, head_dim);
++    const base::span<float> head_out = out.subspan(offset, head_dim);
++    // weights = K q
++    cblas_sgemv(CblasRowMajor, CblasNoTrans, Int(count), Int(head_dim), 1.0f,
++                head_keys.data(), Int(stride), head_query.data(), 1, 0.0f,
++                weights.data(), 1);
++    float max = kNegativeInfinity;
++    for (float weight : weights) {
++      max = std::max(max, weight);
++    }
++    float sum = 0;
++    for (float& weight : weights) {
++      weight = std::exp(weight - max);
++      sum += weight;
++    }
++    for (float& weight : weights) {
++      weight /= sum;
++    }
++    // out = V^T weights
++    cblas_sgemv(CblasRowMajor, CblasTrans, Int(count), Int(head_dim), 1.0f,
++                head_values.data(), Int(stride), weights.data(), 1, 0.0f,
++                head_out.data(), 1);
++  }
++}
++
++// The encoder's output, projected once into each decoder layer's
++// cross-attention keys and values (length x dim each).
++struct Encoded {
++  size_t length = 0;
++  std::vector<std::vector<float>> keys;
++  std::vector<std::vector<float>> values;
++};
++
++Encoded Encode(const ModelData& m, base::span<const size_t> ids) {
++  const size_t n = ids.size();
++  const size_t dim = m.dim;
++  std::vector<float> x(n * dim);
++  std::vector<float> h(n * dim);
++  std::vector<float> q(n * dim);
++  std::vector<float> k(n * dim);
++  std::vector<float> v(n * dim);
++  std::vector<float> attention(n * dim);
++  std::vector<float> weights;
++
++  const base::span<const float> embed = m.Get(m.encoder_embed);
++  for (size_t i = 0; i < n; ++i) {
++    const base::span<const float> token = embed.subspan(ids[i] * dim, dim);
++    const base::span<const float> position = m.Position(kFirstPosition + i);
++    const base::span<float> row = base::span(x).subspan(i * dim, dim);
++    for (size_t j = 0; j < dim; ++j) {
++      row[j] = m.embed_scale * token[j] + position[j];
++    }
++  }
++  LayerNorm(m, m.encoder_embed_norm, x, n, h);
++  std::swap(x, h);
++
++  for (const EncoderLayer& layer : m.encoder_layers) {
++    LayerNorm(m, layer.self_attention_norm, x, n, h);
++    ApplyLinear(m, layer.query, h, n, q);
++    Scale(q, m.query_scale);
++    ApplyLinear(m, layer.key, h, n, k);
++    ApplyLinear(m, layer.value, h, n, v);
++    for (size_t i = 0; i < n; ++i) {
++      Attend(m, base::span(q).subspan(i * dim, dim), k, v, n, dim,
++             base::span(attention).subspan(i * dim, dim), weights);
++    }
++    ApplyLinear(m, layer.attention_out, attention, n, h);
++    AddTo(x, h);
++
++    LayerNorm(m, layer.ffn_norm, x, n, h);
++    std::vector<float> ffn(n * layer.fc1.out);
++    ApplyLinear(m, layer.fc1, h, n, ffn);
++    Gelu(ffn);
++    ApplyLinear(m, layer.fc2, ffn, n, h);
++    AddTo(x, h);
++  }
++  LayerNorm(m, m.encoder_final_norm, x, n, h);
++
++  Encoded encoded;
++  encoded.length = n;
++  for (const DecoderLayer& layer : m.decoder_layers) {
++    encoded.keys.emplace_back(n * dim);
++    encoded.values.emplace_back(n * dim);
++    ApplyLinear(m, layer.cross_key, h, n, encoded.keys.back());
++    ApplyLinear(m, layer.cross_value, h, n, encoded.values.back());
++  }
++  return encoded;
++}
++
++// The incremental decoder: one row per live hypothesis, with a cache of every
++// layer's self-attention keys and values laid out [position][row][dim].
++class Decoder {
++ public:
++  explicit Decoder(size_t layers) : keys_(layers), values_(layers) {}
++
++  // Feeds `last` (one token per row) at decoder position `step` and writes
++  // the log-probabilities of the next token, rows x target vocabulary, to
++  // `log_probs`.
++  void Step(const ModelData& m,
++            const Encoded& encoded,
++            base::span<const size_t> last,
++            size_t step,
++            std::vector<float>& log_probs) {
++    const size_t rows = last.size();
++    CHECK_EQ(rows, rows_);
++    const size_t dim = m.dim;
++    std::vector<float> x(rows * dim);
++    std::vector<float> h(rows * dim);
++    std::vector<float> q(rows * dim);
++    std::vector<float> projected(rows * dim);
++    std::vector<float> attention(rows * dim);
++    std::vector<float> weights;
++
++    const base::span<const float> embed = m.Get(m.decoder_embed);
++    const base::span<const float> position = m.Position(kFirstPosition + step);
++    for (size_t r = 0; r < rows; ++r) {
++      const base::span<const float> token = embed.subspan(last[r] * dim, dim);
++      const base::span<float> row = base::span(x).subspan(r * dim, dim);
++      for (size_t j = 0; j < dim; ++j) {
++        row[j] = m.embed_scale * token[j] + position[j];
++      }
++    }
++    LayerNorm(m, m.decoder_embed_norm, x, rows, h);
++    std::swap(x, h);
++
++    const size_t length = length_ + 1;
++    for (size_t i = 0; i < m.decoder_layers.size(); ++i) {
++      const DecoderLayer& layer = m.decoder_layers[i];
++      std::vector<float>& keys = keys_[i];
++      std::vector<float>& values = values_[i];
++
++      LayerNorm(m, layer.self_attention_norm, x, rows, h);
++      ApplyLinear(m, layer.query, h, rows, q);
++      Scale(q, m.query_scale);
++      ApplyLinear(m, layer.key, h, rows, projected);
++      keys.insert(keys.end(), projected.begin(), projected.end());
++      ApplyLinear(m, layer.value, h, rows, projected);
++      values.insert(values.end(), projected.begin(), projected.end());
++      for (size_t r = 0; r < rows; ++r) {
++        Attend(m, base::span(q).subspan(r * dim, dim),
++               base::span(keys).subspan(r * dim),
++               base::span(values).subspan(r * dim), length, rows * dim,
++               base::span(attention).subspan(r * dim, dim), weights);
++      }
++      ApplyLinear(m, layer.attention_out, attention, rows, h);
++      AddTo(x, h);
++
++      LayerNorm(m, layer.cross_attention_norm, x, rows, h);
++      ApplyLinear(m, layer.cross_query, h, rows, q);
++      Scale(q, m.query_scale);
++      for (size_t r = 0; r < rows; ++r) {
++        Attend(m, base::span(q).subspan(r * dim, dim), encoded.keys[i],
++               encoded.values[i], encoded.length, dim,
++               base::span(attention).subspan(r * dim, dim), weights);
++      }
++      ApplyLinear(m, layer.cross_attention_out, attention, rows, h);
++      AddTo(x, h);
++
++      LayerNorm(m, layer.ffn_norm, x, rows, h);
++      std::vector<float> ffn(rows * layer.fc1.out);
++      ApplyLinear(m, layer.fc1, h, rows, ffn);
++      Gelu(ffn);
++      ApplyLinear(m, layer.fc2, ffn, rows, h);
++      AddTo(x, h);
++    }
++    length_ = length;
++
++    LayerNorm(m, m.decoder_final_norm, x, rows, h);
++    const size_t vocab = m.target_vocab.size();
++    log_probs.assign(rows * vocab, 0.0f);
++    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, Int(rows), Int(vocab),
++                Int(dim), 1.0f, h.data(), Int(dim),
++                m.Get(m.output_projection).data(), Int(dim), 0.0f,
++                log_probs.data(), Int(vocab));
++    for (size_t r = 0; r < rows; ++r) {
++      LogSoftmax(base::span(log_probs).subspan(r * vocab, vocab));
++    }
++  }
++
++  // Keeps the cache rows of the hypotheses that go on: new row r continues
++  // old row source[r].
++  void Reorder(const ModelData& m, base::span<const size_t> source) {
++    const size_t dim = m.dim;
++    const size_t rows = source.size();
++    for (std::vector<std::vector<float>>* cache : {&keys_, &values_}) {
++      for (std::vector<float>& layer : *cache) {
++        std::vector<float> next(length_ * rows * dim);
++        for (size_t t = 0; t < length_; ++t) {
++          for (size_t r = 0; r < rows; ++r) {
++            CHECK_LT(source[r], rows_);
++            base::span(next)
++                .subspan((t * rows + r) * dim, dim)
++                .copy_from(base::span(layer).subspan(
++                    (t * rows_ + source[r]) * dim, dim));
++          }
++        }
++        layer = std::move(next);
++      }
++    }
++    rows_ = rows;
++  }
++
++ private:
++  size_t length_ = 0;
++  size_t rows_ = 1;
++  std::vector<std::vector<float>> keys_;
++  std::vector<std::vector<float>> values_;
++};
++
++struct Hypothesis {
++  std::vector<size_t> tokens;  // without the leading and closing </s>
++  float score = 0;             // mean log-probability, counting </s>
++};
++
++// fairseq v0.12.2 SequenceGenerator._generate for one sentence, exactly as
++// utils/xlit_reference.py's beam_search() spells it out.
++std::vector<Hypothesis> BeamSearch(const ModelData& m, const Encoded& encoded) {
++  const size_t vocab = m.target_vocab.size();
++  Decoder decoder(m.decoder_layers.size());
++  std::vector<std::vector<size_t>> tokens(1);
++  std::vector<size_t> last = {m.eos};  // the decoder starts from </s>
++  std::vector<float> scores = {0.0f};
++  std::vector<Hypothesis> finished;
++  std::vector<float> totals;
++  std::vector<size_t> order;
++
++  for (size_t step = 0; step <= kMaxLength; ++step) {
++    decoder.Step(m, encoded, last, step, totals);
++    for (size_t r = 0; r < last.size(); ++r) {
++      const base::span<float> row =
++          base::span(totals).subspan(r * vocab, vocab);
++      row[m.pad] = kNegativeInfinity;
++      // The unknown-word penalty is 0, so <unk> is left as it is.
++      if (step >= kMaxLength) {
++        // Forced end: only </s> remains.
++        const float end = row[m.eos];
++        std::ranges::fill(row, kNegativeInfinity);
++        row[m.eos] = end;
++      } else if (step < kMinLength) {
++        row[m.eos] = kNegativeInfinity;
++      }
++      for (float& value : row) {
++        value += scores[r];
++      }
++    }
++
++    // The 2 * beam best (hypothesis, token) pairs by cumulative score, ties
++    // broken by the lower flat index.
++    const size_t k = std::min(2 * kBeam, totals.size() - 1);
++    order.resize(totals.size());
++    std::iota(order.begin(), order.end(), size_t{0});
++    std::partial_sort(order.begin(),
++                      std::next(order.begin(), static_cast<std::ptrdiff_t>(k)),
++                      order.end(), [&totals](size_t a, size_t b) {
++                        if (totals[a] != totals[b]) {
++                          return totals[a] > totals[b];
++                        }
++                        return a < b;
++                      });
++    const base::span<const size_t> best = base::span(order).first(k);
++
++    // Only a </s> among the first `beam` of them ends a hypothesis; one
++    // ranked lower is dropped.
++    for (size_t candidate : best.first(std::min(k, kBeam))) {
++      const size_t row = candidate / vocab;
++      if (candidate % vocab == m.eos &&
++          totals[candidate] != kNegativeInfinity && finished.size() < kBeam) {
++        finished.push_back(Hypothesis{
++            tokens[row], totals[candidate] / static_cast<float>(step + 1)});
++      }
++    }
++
++    // The beam goes on with the first `beam` candidates that are not </s>.
++    std::vector<size_t> source;
++    std::vector<std::vector<size_t>> next_tokens;
++    std::vector<size_t> next_last;
++    std::vector<float> next_scores;
++    for (size_t candidate : best) {
++      if (source.size() == kBeam) {
++        break;
++      }
++      const size_t row = candidate / vocab;
++      const size_t token = candidate % vocab;
++      if (token == m.eos) {
++        continue;
++      }
++      source.push_back(row);
++      next_tokens.push_back(tokens[row]);
++      next_tokens.back().push_back(token);
++      next_last.push_back(token);
++      next_scores.push_back(totals[candidate]);
++    }
++    if (finished.size() >= kBeam || step >= kMaxLength || source.empty()) {
++      break;
++    }
++    tokens = std::move(next_tokens);
++    last = std::move(next_last);
++    scores = std::move(next_scores);
++    decoder.Reorder(m, source);
++  }
++
++  std::ranges::stable_sort(finished, std::ranges::greater(),
++                           &Hypothesis::score);
++  return finished;
++}
++
++}  // namespace
++
++// static
++std::unique_ptr<Model> Model::Load(base::span<const uint8_t> txlm) {
++  base::SpanReader<const uint8_t> reader(txlm);
++  const std::optional<base::span<const uint8_t, 8>> magic = reader.Read<8>();
++  uint32_t header_length = 0;
++  if (!magic || !std::ranges::equal(*magic, kMagic) ||
++      !reader.ReadU32LittleEndian(header_length)) {
++    return nullptr;
++  }
++  const std::optional<base::span<const uint8_t>> header_bytes =
++      reader.Read(header_length);
++  if (!header_bytes) {
++    return nullptr;
++  }
++  const std::optional<base::DictValue> header = base::JSONReader::ReadDict(
++      base::as_string_view(*header_bytes), base::JSON_PARSE_RFC);
++  if (!header) {
++    return nullptr;
++  }
++  std::unique_ptr<ModelData> data =
++      ParseModel(*header, reader.remaining_span());
++  if (!data) {
++    return nullptr;
++  }
++  return base::WrapUnique(new Model(std::move(data)));
++}
++
++Model::Model(std::unique_ptr<const internal::ModelData> data)
++    : data_(std::move(data)) {}
++
++Model::~Model() = default;
++
++std::vector<Candidate> Model::Transliterate(std::string_view word,
++                                            std::string_view tag) const {
++  const ModelData& m = *data_;
++  // English is a source-side tag; the model does not write it.
++  if (word.empty() || word.size() > kMaxWordLetters || tag == "en") {
++    return {};
++  }
++  const auto tag_id = m.tag_ids.find(tag);
++  if (tag_id == m.tag_ids.end()) {
++    return {};
++  }
++  // __tag__ letters </s>, the tag on the encoder side.
++  std::vector<size_t> ids = {tag_id->second};
++  for (char c : word) {
++    if (c < 'a' || c > 'z') {
++      return {};
++    }
++    ids.push_back(m.letter_ids[static_cast<size_t>(c - 'a')]);
++  }
++  ids.push_back(m.eos);
++
++  const Encoded encoded = Encode(m, ids);
++  std::vector<Candidate> candidates;
++  for (const Hypothesis& hypothesis : BeamSearch(m, encoded)) {
++    Candidate candidate;
++    for (size_t token : hypothesis.tokens) {
++      candidate.text += m.target_vocab[token];
++    }
++    candidate.score = std::exp(static_cast<double>(hypothesis.score));
++    candidates.push_back(std::move(candidate));
++  }
++  return candidates;
++}
++
++}  // namespace tark_xlit
+--- /dev/null
++++ b/components/tark_xlit/model.h
+@@ -0,0 +1,64 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef COMPONENTS_TARK_XLIT_MODEL_H_
++#define COMPONENTS_TARK_XLIT_MODEL_H_
++
++#include <cstdint>
++#include <memory>
++#include <string>
++#include <string_view>
++#include <vector>
++
++#include "base/containers/span.h"
++
++namespace tark_xlit {
++
++namespace internal {
++struct ModelData;
++}  // namespace internal
++
++// One spelling of a Latin word in an Indian script.
++struct Candidate {
++  std::u16string text;
++  // The model's confidence, exp(the mean log-probability of the output tokens
++  // counting the closing </s>), in (0, 1]. This is the T of IndicXlit's
++  // dictionary rescoring.
++  double score = 0;
++};
++
++// AI4Bharat's IndicXlit (a fairseq transformer, 6+6 layers, d=256) running on
++// the CPU, with fairseq's beam search. The weights come from a TXLM v1 blob
++// (utils/xlit_convert.py) and are held as float32. utils/xlit_reference.py is
++// the specification this class follows; components/tark_xlit/test/data/
++// golden.tsv is that reference's output, which the tests check.
++class Model {
++ public:
++  // Reads a TXLM v1 blob. nullptr on a wrong magic or version, a malformed
++  // header, an architecture this class does not implement, a missing tensor or
++  // one of the wrong shape, a tensor that runs past the end, or an infinite
++  // or NaN weight. Does not keep a reference to `txlm`.
++  static std::unique_ptr<Model> Load(base::span<const uint8_t> txlm);
++
++  Model(const Model&) = delete;
++  Model& operator=(const Model&) = delete;
++  ~Model();
++
++  // Up to four spellings of `word` in the language `tag` (an IndicXlit tag
++  // such as "hi" or "gom"), best first, in the model's order (before any
++  // dictionary rescoring). `word` must be 1 to 32 letters a-z; anything else,
++  // or a tag the model does not write, gives an empty result. Thread-safe:
++  // the model is not modified.
++  std::vector<Candidate> Transliterate(std::string_view word,
++                                       std::string_view tag) const;
++
++ private:
++  explicit Model(std::unique_ptr<const internal::ModelData> data);
++
++  std::unique_ptr<const internal::ModelData> data_;
++};
++
++}  // namespace tark_xlit
++
++#endif  // COMPONENTS_TARK_XLIT_MODEL_H_
+--- /dev/null
++++ b/components/tark_xlit/model_unittest.cc
+@@ -0,0 +1,551 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/tark_xlit/model.h"
++
++#include <cmath>
++#include <cstddef>
++#include <cstdint>
++#include <map>
++#include <memory>
++#include <optional>
++#include <string>
++#include <string_view>
++#include <utility>
++#include <vector>
++
++#include "base/base_paths.h"
++#include "base/containers/span.h"
++#include "base/files/file_path.h"
++#include "base/files/file_util.h"
++#include "base/files/memory_mapped_file.h"
++#include "base/files/scoped_temp_dir.h"
++#include "base/no_destructor.h"
++#include "base/numerics/byte_conversions.h"
++#include "base/path_service.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/strings/string_split.h"
++#include "base/strings/utf_string_conversions.h"
++#include "components/tark_xlit/word_list.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace tark_xlit {
++
++namespace {
++
++// The goldens are utils/xlit_reference.py's output for every word of
++// golden-inputs.txt in each of the model's 21 languages, before rescoring.
++constexpr size_t kGoldenLines = 60 * 21;
++// Two reference scores closer than this are a tie: float rounding may order
++// the pair either way.
++constexpr double kTie = 1e-4;
++constexpr double kScoreTolerance = 1e-3;
++
++base::FilePath TestDataPath(std::string_view name) {
++  return base::PathService::CheckedGet(base::DIR_SRC_TEST_DATA_ROOT)
++      .AppendASCII("components/tark_xlit/test/data")
++      .AppendASCII(name);
++}
++
++std::vector<uint8_t> ReadTestData(std::string_view name) {
++  return base::ReadFileToBytes(TestDataPath(name))
++      .value_or(std::vector<uint8_t>());
++}
++
++// The real model, loaded once per test process and shared (it is const and
++// thread-safe).
++const Model* TestModel() {
++  static const base::NoDestructor<std::unique_ptr<Model>> model(
++      Model::Load(ReadTestData("xlit-model.bin")));
++  return model->get();
++}
++
++std::unique_ptr<base::MemoryMappedFile> MapFile(const base::FilePath& path) {
++  auto file = std::make_unique<base::MemoryMappedFile>();
++  if (!file->Initialize(path)) {
++    return nullptr;
++  }
++  return file;
++}
++
++// The real word lists, mapped from the file as the browser maps them, once
++// per test process.
++const WordList* TestWordList() {
++  static const base::NoDestructor<std::unique_ptr<WordList>> list(
++      WordList::Load(MapFile(TestDataPath("xlit-words.bin"))));
++  return list->get();
++}
++
++// `bytes` written to a new file in `dir` and loaded through a mapping of it.
++// Each call writes a file of its own, so no live mapping is overwritten.
++std::unique_ptr<WordList> LoadMapped(const base::ScopedTempDir& dir,
++                                     const std::vector<uint8_t>& bytes) {
++  static size_t files = 0;
++  const base::FilePath path = dir.GetPath().AppendASCII(
++      "words" + base::NumberToString(files++) + ".bin");
++  if (!base::WriteFile(path, bytes)) {
++    return nullptr;
++  }
++  return WordList::Load(MapFile(path));
++}
++
++void AppendU32(std::vector<uint8_t>& out, uint32_t value) {
++  for (uint8_t byte : base::U32ToLittleEndian(value)) {
++    out.push_back(byte);
++  }
++}
++
++void AppendU16(std::vector<uint8_t>& out, uint16_t value) {
++  for (uint8_t byte : base::U16ToLittleEndian(value)) {
++    out.push_back(byte);
++  }
++}
++
++// A TXLW v1 blob laid out as utils/xlit_wordlist.py packs it: per language,
++// the words (sorted by their UTF-8 bytes, as std::map sorts std::string) and
++// their counts.
++using Lists = std::map<std::string, std::map<std::string, uint32_t>>;
++std::vector<uint8_t> PackWordList(const Lists& lists) {
++  constexpr size_t kHeaderSize = 500;  // 12 + 500 is a multiple of 4.
++  std::vector<std::vector<uint8_t>> blocks;
++  std::string header = "{";
++  size_t offset = 12 + kHeaderSize;
++  for (const auto& [tag, words] : lists) {
++    std::vector<uint8_t> table;
++    std::vector<uint8_t> records;
++    for (const auto& [word, count] : words) {
++      AppendU32(table,
++                static_cast<uint32_t>(4 * words.size() + records.size()));
++      AppendU32(records, count);
++      AppendU16(records, static_cast<uint16_t>(word.size()));
++      for (char c : word) {
++        records.push_back(static_cast<uint8_t>(c));
++      }
++    }
++    std::vector<uint8_t> block = table;
++    block.insert(block.end(), records.begin(), records.end());
++    while (block.size() % 4 != 0) {
++      block.push_back(0);
++    }
++    if (header.size() > 1) {
++      header += ",";
++    }
++    header += "\"" + tag + "\":{\"offset\":" + base::NumberToString(offset) +
++              ",\"count\":" + base::NumberToString(words.size()) + "}";
++    offset += block.size();
++    blocks.push_back(std::move(block));
++  }
++  header += "}";
++  EXPECT_LE(header.size(), kHeaderSize);
++  header.resize(kHeaderSize, ' ');
++
++  std::vector<uint8_t> out = {'T', 'X', 'L', 'W', 1, 0, 0, 0};
++  AppendU32(out, static_cast<uint32_t>(kHeaderSize));
++  for (char c : header) {
++    out.push_back(static_cast<uint8_t>(c));
++  }
++  for (const std::vector<uint8_t>& block : blocks) {
++    out.insert(out.end(), block.begin(), block.end());
++  }
++  return out;
++}
++
++struct GoldenCandidate {
++  std::string text;
++  double score = 0;
++};
++
++std::string Describe(const std::vector<GoldenCandidate>& want,
++                     const std::vector<Candidate>& got) {
++  std::string out = "\n    want:";
++  for (const GoldenCandidate& candidate : want) {
++    out += " " + candidate.text + "|" + base::NumberToString(candidate.score);
++  }
++  out += "\n    got: ";
++  for (const Candidate& candidate : got) {
++    out += " " + base::UTF16ToUTF8(candidate.text) + "|" +
++           base::NumberToString(candidate.score);
++  }
++  return out;
++}
++
++// Empty when `got` matches the reference `want`, else why not. Texts must come
++// in the reference's order, except that two candidates whose reference scores
++// tie (closer than kTie) may come in either order; each score must be within
++// kScoreTolerance (relative) of the reference's score for that text.
++std::string Compare(const std::vector<GoldenCandidate>& want,
++                    const std::vector<Candidate>& got) {
++  if (want.size() != got.size()) {
++    return "expected " + base::NumberToString(want.size()) +
++           " candidates, got " + base::NumberToString(got.size()) +
++           Describe(want, got);
++  }
++  for (size_t i = 0; i < got.size(); ++i) {
++    const std::string text = base::UTF16ToUTF8(got[i].text);
++    std::optional<size_t> found;
++    for (size_t j = 0; j < want.size(); ++j) {
++      if (want[j].text == text) {
++        found = j;
++      }
++    }
++    if (!found) {
++      return "candidate " + base::NumberToString(i) + " is not a reference " +
++             "candidate" + Describe(want, got);
++    }
++    if (*found != i && std::abs(want[*found].score - want[i].score) >= kTie) {
++      return "candidate " + base::NumberToString(i) + " is out of order" +
++             Describe(want, got);
++    }
++    const double expected = want[*found].score;
++    if (std::abs(got[i].score - expected) > kScoreTolerance * expected) {
++      return "candidate " + base::NumberToString(i) + " score differs" +
++             Describe(want, got);
++    }
++  }
++  return std::string();
++}
++
++std::vector<Candidate> Candidates(
++    std::vector<std::pair<std::u16string, double>> list) {
++  std::vector<Candidate> out;
++  for (auto& [text, score] : list) {
++    out.push_back(Candidate{std::move(text), score});
++  }
++  return out;
++}
++
++std::vector<std::u16string> Texts(const std::vector<Candidate>& candidates) {
++  std::vector<std::u16string> out;
++  for (const Candidate& candidate : candidates) {
++    out.push_back(candidate.text);
++  }
++  return out;
++}
++
++}  // namespace
++
++TEST(TarkXlitModelTest, LoadsTestModel) {
++  EXPECT_TRUE(TestModel());
++}
++
++TEST(TarkXlitModelTest, LoadRejectsBadMagic) {
++  const std::vector<uint8_t> good = ReadTestData("xlit-model.bin");
++  ASSERT_FALSE(good.empty());
++
++  std::vector<uint8_t> bytes = good;
++  bytes[0] = 'X';
++  EXPECT_FALSE(Model::Load(bytes));
++
++  // Version 2 of the format.
++  bytes = good;
++  bytes[4] = 2;
++  EXPECT_FALSE(Model::Load(bytes));
++
++  // A word list is not a model.
++  EXPECT_FALSE(Model::Load(PackWordList({{"hi", {{"a", 1}}}})));
++  EXPECT_FALSE(Model::Load(base::span<const uint8_t>()));
++}
++
++TEST(TarkXlitModelTest, LoadRejectsTruncated) {
++  const std::vector<uint8_t> good = ReadTestData("xlit-model.bin");
++  ASSERT_GT(good.size(), 4096u);
++
++  // The last tensor ends exactly at the end of the file.
++  for (size_t size : {good.size() - 1, good.size() / 2, size_t{4096},
++                      size_t{100}, size_t{12}, size_t{8}}) {
++    EXPECT_FALSE(Model::Load(base::span(good).first(size))) << size;
++  }
++
++  // A header length that runs past the end.
++  std::vector<uint8_t> bytes = good;
++  bytes[11] = 0x7F;
++  EXPECT_FALSE(Model::Load(bytes));
++}
++
++TEST(TarkXlitModelTest, LoadRejectsNonFiniteWeights) {
++  const std::vector<uint8_t> good = ReadTestData("xlit-model.bin");
++  ASSERT_GT(good.size(), 4096u);
++  // The first weight of the first tensor is the first fp16 after the header.
++  const size_t data_start =
++      12 + base::U32FromLittleEndian(base::span(good).subspan(8u).first<4>());
++  ASSERT_LT(data_start + 2, good.size());
++
++  for (uint16_t half : {uint16_t{0x7C00}, uint16_t{0xFC00}, uint16_t{0x7E00}}) {
++    std::vector<uint8_t> bytes = good;
++    base::span(bytes)
++        .subspan(data_start)
++        .first<2>()
++        .copy_from(base::U16ToLittleEndian(half));
++    EXPECT_FALSE(Model::Load(bytes)) << half;
++  }
++  // The largest finite half is a weight like any other.
++  std::vector<uint8_t> bytes = good;
++  base::span(bytes)
++      .subspan(data_start)
++      .first<2>()
++      .copy_from(base::U16ToLittleEndian(0x7BFF));
++  EXPECT_TRUE(Model::Load(bytes));
++}
++
++TEST(TarkXlitModelTest, RejectsWordsItCannotTake) {
++  const Model* model = TestModel();
++  ASSERT_TRUE(model);
++  EXPECT_TRUE(model->Transliterate("", "hi").empty());
++  EXPECT_TRUE(model->Transliterate("Namaste", "hi").empty());
++  EXPECT_TRUE(model->Transliterate("nama ste", "hi").empty());
++  EXPECT_TRUE(model->Transliterate("covid19", "hi").empty());
++  // 33 letters.
++  EXPECT_TRUE(
++      model->Transliterate("abcdefghijklmnopqrstuvwxyzabcdefg", "hi").empty());
++  // Not a language of the model; English is a source tag, not a target.
++  EXPECT_TRUE(model->Transliterate("namaste", "xx").empty());
++  EXPECT_TRUE(model->Transliterate("namaste", "en").empty());
++  EXPECT_TRUE(model->Transliterate("namaste", "").empty());
++
++  // 32 letters is still taken.
++  EXPECT_FALSE(
++      model->Transliterate("abcdefghijklmnopqrstuvwxyzabcdef", "hi").empty());
++}
++
++TEST(TarkXlitModelTest, MatchesGoldens) {
++  const Model* model = TestModel();
++  ASSERT_TRUE(model);
++  std::string golden;
++  ASSERT_TRUE(base::ReadFileToString(TestDataPath("golden.tsv"), &golden));
++
++  size_t lines = 0;
++  std::vector<std::string> mismatches;
++  for (std::string_view line : base::SplitStringPiece(
++           golden, "\n", base::KEEP_WHITESPACE, base::SPLIT_WANT_NONEMPTY)) {
++    const std::vector<std::string_view> fields = base::SplitStringPiece(
++        line, "\t", base::KEEP_WHITESPACE, base::SPLIT_WANT_ALL);
++    ASSERT_GE(fields.size(), 3u) << line;
++    ++lines;
++    std::vector<GoldenCandidate> want;
++    for (size_t i = 2; i < fields.size(); ++i) {
++      const size_t bar = fields[i].rfind('|');
++      ASSERT_NE(std::string_view::npos, bar) << line;
++      GoldenCandidate candidate;
++      candidate.text = std::string(fields[i].substr(0, bar));
++      ASSERT_TRUE(
++          base::StringToDouble(fields[i].substr(bar + 1), &candidate.score))
++          << line;
++      want.push_back(std::move(candidate));
++    }
++    const std::string problem =
++        Compare(want, model->Transliterate(fields[1], fields[0]));
++    if (!problem.empty()) {
++      mismatches.push_back(std::string(fields[0]) + " " +
++                           std::string(fields[1]) + ": " + problem);
++    }
++  }
++
++  EXPECT_EQ(kGoldenLines, lines);
++  std::string report;
++  for (const std::string& mismatch : mismatches) {
++    report += "\n  " + mismatch;
++  }
++  EXPECT_TRUE(mismatches.empty()) << mismatches.size() << " of " << lines
++                                  << " golden lines do not match:" << report;
++}
++
++TEST(TarkXlitModelTest, WordListCounts) {
++  const std::vector<uint8_t> bytes =
++      PackWordList({{"hi", {{"नमस्ते", 301}, {"सीता", 1612}, {"कृष्ण", 0}}},
++                    {"en", {{"school", 0}, {"the", 0}}}});
++  std::unique_ptr<WordList> list = WordList::Load(bytes);
++  ASSERT_TRUE(list);
++
++  EXPECT_EQ(301u, list->Count("hi", u"नमस्ते"));
++  EXPECT_EQ(1612u, list->Count("hi", u"सीता"));
++  EXPECT_EQ(0u, list->Count("hi", u"कृष्ण"));
++  EXPECT_FALSE(list->Count("hi", u"सिता").has_value());
++  EXPECT_FALSE(list->Count("hi", u"").has_value());
++  EXPECT_FALSE(list->Count("ta", u"नमस्ते").has_value());
++  EXPECT_TRUE(list->HasLanguage("hi"));
++  EXPECT_FALSE(list->HasLanguage("ta"));
++
++  EXPECT_TRUE(list->IsCommonEnglish("school"));
++  EXPECT_TRUE(list->IsCommonEnglish("the"));
++  EXPECT_FALSE(list->IsCommonEnglish("namaste"));
++  EXPECT_FALSE(list->IsCommonEnglish(""));
++}
++
++TEST(TarkXlitModelTest, WordListLoadRejectsBadInput) {
++  const std::vector<uint8_t> good = PackWordList({{"hi", {{"नमस्ते", 301}}}});
++  ASSERT_TRUE(WordList::Load(good));
++
++  std::vector<uint8_t> bytes = good;
++  bytes[3] = 'M';
++  EXPECT_FALSE(WordList::Load(bytes));
++  bytes = good;
++  bytes[4] = 2;
++  EXPECT_FALSE(WordList::Load(bytes));
++  EXPECT_FALSE(WordList::Load(base::span<const uint8_t>()));
++  // The record-offset table runs past the end (the file is 512 bytes of
++  // header, a 4-byte record-offset table and a 24-byte record).
++  ASSERT_EQ(540u, good.size());
++  EXPECT_FALSE(WordList::Load(base::span(good).first(514u)));
++  // A model is not a word list.
++  EXPECT_FALSE(WordList::Load(ReadTestData("xlit-model.bin")));
++}
++
++TEST(TarkXlitModelTest, WordListFromMappedFile) {
++  base::ScopedTempDir dir;
++  ASSERT_TRUE(dir.CreateUniqueTempDir());
++  std::unique_ptr<WordList> list =
++      LoadMapped(dir, PackWordList({{"hi", {{"नमस्ते", 301}, {"सीता", 1612}}},
++                                    {"en", {{"the", 0}}}}));
++  ASSERT_TRUE(list);
++  EXPECT_EQ(301u, list->Count("hi", u"नमस्ते"));
++  EXPECT_EQ(1612u, list->Count("hi", u"सीता"));
++  EXPECT_FALSE(list->Count("hi", u"सिता").has_value());
++  EXPECT_FALSE(list->Count("ta", u"नमस्ते").has_value());
++  EXPECT_TRUE(list->IsCommonEnglish("the"));
++  EXPECT_FALSE(list->IsCommonEnglish("namaste"));
++
++  EXPECT_FALSE(WordList::Load(std::unique_ptr<base::MemoryMappedFile>()));
++  EXPECT_FALSE(WordList::Load(std::make_unique<base::MemoryMappedFile>()));
++  EXPECT_FALSE(LoadMapped(dir, ReadTestData("xlit-model.bin")));
++}
++
++TEST(TarkXlitModelTest, WordListCorruptRecordIsNotFound) {
++  // Records are only checked when a lookup reaches them; a bad one reads as
++  // "not found", never as a crash. The file is 512 bytes of header, then the
++  // "hi" block: three record offsets (12 bytes) and three 9-byte records.
++  const std::vector<uint8_t> good =
++      PackWordList({{"hi", {{"क", 1}, {"ख", 2}, {"ग", 3}}}});
++  ASSERT_EQ(512u + 12u + 3u * 9u + 1u, good.size());
++  constexpr size_t kTable = 512;
++  constexpr size_t kLastRecord = kTable + 12 + 2 * 9;
++  base::ScopedTempDir dir;
++  ASSERT_TRUE(dir.CreateUniqueTempDir());
++
++  // The middle record's offset (the first one a search reads) points far
++  // past the end.
++  std::vector<uint8_t> bytes = good;
++  base::span(bytes)
++      .subspan(kTable + 4)
++      .first<4>()
++      .copy_from(base::U32ToLittleEndian(0xFFFFFF00u));
++  std::unique_ptr<WordList> list = LoadMapped(dir, bytes);
++  ASSERT_TRUE(list);
++  EXPECT_FALSE(list->Count("hi", u"क").has_value());
++  EXPECT_FALSE(list->Count("hi", u"ख").has_value());
++  EXPECT_FALSE(list->Count("hi", u"ग").has_value());
++
++  // The last record's length runs past the end; the others are still found.
++  bytes = good;
++  base::span(bytes)
++      .subspan(kLastRecord + 4)
++      .first<2>()
++      .copy_from(base::U16ToLittleEndian(0xFFFF));
++  list = LoadMapped(dir, bytes);
++  ASSERT_TRUE(list);
++  EXPECT_EQ(2u, list->Count("hi", u"ख"));
++  EXPECT_FALSE(list->Count("hi", u"ग").has_value());
++
++  // The same through the copying loader, and a record cut off by the end of
++  // the blob.
++  list = WordList::Load(bytes);
++  ASSERT_TRUE(list);
++  EXPECT_FALSE(list->Count("hi", u"ग").has_value());
++  list = WordList::Load(base::span(good).first(good.size() - 2));
++  ASSERT_TRUE(list);
++  EXPECT_EQ(1u, list->Count("hi", u"क"));
++  EXPECT_FALSE(list->Count("hi", u"ग").has_value());
++}
++
++TEST(TarkXlitModelTest, RealWordListLoads) {
++  const WordList* list = TestWordList();
++  ASSERT_TRUE(list);
++  EXPECT_EQ(301u, list->Count("hi", u"नमस्ते"));
++  EXPECT_TRUE(list->IsCommonEnglish("the"));
++  EXPECT_FALSE(list->IsCommonEnglish("namaste"));
++}
++
++TEST(TarkXlitModelTest, RescorePrefersListedWord) {
++  const std::vector<uint8_t> bytes = PackWordList({{"hi", {{"सीता", 10}}}});
++  std::unique_ptr<WordList> list = WordList::Load(bytes);
++  ASSERT_TRUE(list);
++
++  const std::vector<Candidate> rescored =
++      Rescore(Candidates({{u"सिता", 0.6}, {u"सीता", 0.4}}), list.get(), "hi");
++  EXPECT_EQ((std::vector<std::u16string>{u"सीता", u"सिता"}), Texts(rescored));
++  // The scores stay the model's.
++  ASSERT_EQ(2u, rescored.size());
++  EXPECT_DOUBLE_EQ(0.4, rescored[0].score);
++  EXPECT_DOUBLE_EQ(0.6, rescored[1].score);
++}
++
++TEST(TarkXlitModelTest, RescoreWeighsModelAndCounts) {
++  // F = 0.9 * score / 1.0 + 0.1 * count / 100: 0.9*0.5 + 0.1*0.1 = 0.46 for
++  // the first, 0.9*0.3 + 0.1*0.9 = 0.36 for the second; the third is not in
++  // the list (0).
++  const std::vector<uint8_t> bytes =
++      PackWordList({{"hi", {{"क", 10}, {"ख", 90}}}});
++  std::unique_ptr<WordList> list = WordList::Load(bytes);
++  ASSERT_TRUE(list);
++  EXPECT_EQ((std::vector<std::u16string>{u"क", u"ख", u"ग"}),
++            Texts(Rescore(Candidates({{u"ग", 0.2}, {u"ख", 0.3}, {u"क", 0.5}}),
++                          list.get(), "hi")));
++  // A count heavy enough outweighs the model: 0.9*0.45 + 0.1*0.01 = 0.406
++  // against 0.9*0.35 + 0.1*0.99 = 0.414.
++  const std::vector<uint8_t> heavy =
++      PackWordList({{"hi", {{"क", 1}, {"ख", 99}}}});
++  list = WordList::Load(heavy);
++  ASSERT_TRUE(list);
++  EXPECT_EQ((std::vector<std::u16string>{u"ख", u"क", u"ग"}),
++            Texts(Rescore(Candidates({{u"क", 0.45}, {u"ख", 0.35}, {u"ग", 0.2}}),
++                          list.get(), "hi")));
++}
++
++TEST(TarkXlitModelTest, RescoreNoListKeepsOrder) {
++  const std::vector<Candidate> candidates =
++      Candidates({{u"सिता", 0.6}, {u"सीता", 0.4}, {u"सिटा", 0.3}});
++  const std::vector<std::u16string> model_order = Texts(candidates);
++
++  EXPECT_EQ(model_order, Texts(Rescore(candidates, nullptr, "hi")));
++
++  // A list without the language.
++  const std::vector<uint8_t> bytes = PackWordList({{"ta", {{"சீதா", 10}}}});
++  std::unique_ptr<WordList> list = WordList::Load(bytes);
++  ASSERT_TRUE(list);
++  EXPECT_EQ(model_order, Texts(Rescore(candidates, list.get(), "hi")));
++
++  // A list with the language but none of the candidates: all score 0, and the
++  // sort is stable.
++  const std::vector<uint8_t> other = PackWordList({{"hi", {{"राम", 10}}}});
++  list = WordList::Load(other);
++  ASSERT_TRUE(list);
++  EXPECT_EQ(model_order, Texts(Rescore(candidates, list.get(), "hi")));
++
++  EXPECT_TRUE(Rescore({}, list.get(), "hi").empty());
++}
++
++TEST(TarkXlitModelTest, NamasteIsNamaste) {
++  const Model* model = TestModel();
++  ASSERT_TRUE(model);
++  const WordList* list = TestWordList();
++  ASSERT_TRUE(list);
++
++  std::vector<Candidate> rescored =
++      Rescore(model->Transliterate("namaste", "hi"), list, "hi");
++  ASSERT_FALSE(rescored.empty());
++  EXPECT_EQ(u"नमस्ते", rescored[0].text);
++
++  // The list fixes spellings the model ranks second (both are in the
++  // goldens): सिता → सीता, धान्यवाद → धन्यवाद.
++  std::vector<Candidate> sita = model->Transliterate("sita", "hi");
++  ASSERT_FALSE(sita.empty());
++  EXPECT_EQ(u"सिता", sita[0].text);
++  rescored = Rescore(std::move(sita), list, "hi");
++  EXPECT_EQ(u"सीता", rescored[0].text);
++
++  rescored = Rescore(model->Transliterate("dhanyavad", "mr"), list, "mr");
++  ASSERT_FALSE(rescored.empty());
++  EXPECT_EQ(u"धन्यवाद", rescored[0].text);
++}
++
++}  // namespace tark_xlit
+--- /dev/null
++++ b/components/tark_xlit/word_list.cc
+@@ -0,0 +1,235 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/tark_xlit/word_list.h"
++
++#include <algorithm>
++#include <array>
++#include <cstddef>
++#include <cstdint>
++#include <functional>
++#include <map>
++#include <memory>
++#include <numeric>
++#include <optional>
++#include <string>
++#include <string_view>
++#include <utility>
++#include <vector>
++
++#include "base/containers/heap_array.h"
++#include "base/containers/span.h"
++#include "base/containers/span_reader.h"
++#include "base/files/memory_mapped_file.h"
++#include "base/json/json_reader.h"
++#include "base/memory/ptr_util.h"
++#include "base/numerics/byte_conversions.h"
++#include "base/strings/string_view_util.h"
++#include "base/strings/utf_string_conversions.h"
++#include "base/values.h"
++
++namespace tark_xlit {
++
++namespace {
++
++constexpr std::array<uint8_t, 8> kMagic = {'T', 'X', 'L', 'W', 1, 0, 0, 0};
++constexpr std::string_view kEnglishTag = "en";
++
++// IndicXlit's rescoring weight of the model score against the word count.
++constexpr double kAlpha = 0.9;
++
++std::optional<size_t> ReadSize(const base::DictValue& dict,
++                               std::string_view key) {
++  const std::optional<int> value = dict.FindInt(key);
++  if (!value || *value < 0) {
++    return std::nullopt;
++  }
++  return static_cast<size_t>(*value);
++}
++
++}  // namespace
++
++// static
++std::optional<WordList::Blocks> WordList::ParseBlocks(
++    base::span<const uint8_t> txlw) {
++  base::SpanReader<const uint8_t> reader(txlw);
++  const std::optional<base::span<const uint8_t, 8>> magic = reader.Read<8>();
++  uint32_t header_length = 0;
++  if (!magic || !std::ranges::equal(*magic, kMagic) ||
++      !reader.ReadU32LittleEndian(header_length)) {
++    return std::nullopt;
++  }
++  const std::optional<base::span<const uint8_t>> header_bytes =
++      reader.Read(header_length);
++  if (!header_bytes) {
++    return std::nullopt;
++  }
++  const std::optional<base::DictValue> header = base::JSONReader::ReadDict(
++      base::as_string_view(*header_bytes), base::JSON_PARSE_RFC);
++  if (!header) {
++    return std::nullopt;
++  }
++
++  // Block offsets are absolute file offsets; no block may overlap the magic
++  // and the header. Only the record-offset tables are checked here: the
++  // records are checked as lookups reach them.
++  const size_t data_start = reader.num_read();
++  Blocks blocks;
++  for (const auto [tag, value] : *header) {
++    const base::DictValue* entry = value.GetIfDict();
++    if (!entry) {
++      return std::nullopt;
++    }
++    const std::optional<size_t> offset = ReadSize(*entry, "offset");
++    const std::optional<size_t> count = ReadSize(*entry, "count");
++    if (!offset || !count || *offset < data_start || *offset > txlw.size() ||
++        *count > (txlw.size() - *offset) / 4) {
++      return std::nullopt;
++    }
++    blocks.emplace(tag, Block{*offset, *count});
++  }
++  return blocks;
++}
++
++// static
++std::unique_ptr<WordList> WordList::Load(base::span<const uint8_t> txlw) {
++  std::optional<Blocks> blocks = ParseBlocks(txlw);
++  if (!blocks) {
++    return nullptr;
++  }
++  return base::WrapUnique(new WordList(
++      base::HeapArray<uint8_t>::CopiedFrom(txlw), nullptr, std::move(*blocks)));
++}
++
++// static
++std::unique_ptr<WordList> WordList::Load(
++    std::unique_ptr<base::MemoryMappedFile> file) {
++  if (!file || !file->IsValid()) {
++    return nullptr;
++  }
++  std::optional<Blocks> blocks = ParseBlocks(file->bytes());
++  if (!blocks) {
++    return nullptr;
++  }
++  return base::WrapUnique(new WordList(base::HeapArray<uint8_t>(),
++                                       std::move(file), std::move(*blocks)));
++}
++
++WordList::WordList(base::HeapArray<uint8_t> copy,
++                   std::unique_ptr<base::MemoryMappedFile> file,
++                   Blocks blocks)
++    : copy_(std::move(copy)),
++      file_(std::move(file)),
++      blocks_(std::move(blocks)),
++      data_(file_ ? file_->bytes()
++                  : base::span<const uint8_t>(copy_.as_span())) {}
++
++WordList::~WordList() = default;
++
++std::optional<uint32_t> WordList::Count(std::string_view tag,
++                                        std::u16string_view word) const {
++  return Find(tag, base::UTF16ToUTF8(word));
++}
++
++bool WordList::HasLanguage(std::string_view tag) const {
++  return blocks_.find(tag) != blocks_.end();
++}
++
++bool WordList::IsCommonEnglish(std::string_view word) const {
++  return Find(kEnglishTag, word).has_value();
++}
++
++std::optional<WordList::Record> WordList::RecordAt(const Block& block,
++                                                   size_t index) const {
++  // ParseBlocks() checked that the block's record-offset table is inside the
++  // blob; the record it points to may not be.
++  const base::span<const uint8_t> data(data_);
++  const base::span<const uint8_t> block_bytes = data.subspan(block.offset);
++  const size_t relative =
++      base::U32FromLittleEndian(block_bytes.subspan(4 * index).first<4>());
++  if (relative > block_bytes.size()) {
++    return std::nullopt;
++  }
++  // A record is a u32 count, a u16 byte length and the UTF-8 bytes.
++  base::SpanReader<const uint8_t> reader(block_bytes.subspan(relative));
++  Record record;
++  uint16_t length = 0;
++  if (!reader.ReadU32LittleEndian(record.count) ||
++      !reader.ReadU16LittleEndian(length)) {
++    return std::nullopt;
++  }
++  const std::optional<base::span<const uint8_t>> bytes = reader.Read(length);
++  if (!bytes) {
++    return std::nullopt;
++  }
++  record.word = base::as_string_view(*bytes);
++  return record;
++}
++
++std::optional<uint32_t> WordList::Find(std::string_view tag,
++                                       std::string_view utf8) const {
++  const auto block = blocks_.find(tag);
++  if (block == blocks_.end() || utf8.empty()) {
++    return std::nullopt;
++  }
++  // The records are sorted by their bytes, which is std::string_view's order.
++  size_t low = 0;
++  size_t high = block->second.count;
++  while (low < high) {
++    const size_t middle = low + (high - low) / 2;
++    const std::optional<Record> record = RecordAt(block->second, middle);
++    if (!record) {
++      return std::nullopt;
++    }
++    if (record->word == utf8) {
++      return record->count;
++    }
++    if (record->word < utf8) {
++      low = middle + 1;
++    } else {
++      high = middle;
++    }
++  }
++  return std::nullopt;
++}
++
++std::vector<Candidate> Rescore(std::vector<Candidate> candidates,
++                               const WordList* list,
++                               std::string_view tag) {
++  if (!list || !list->HasLanguage(tag) || candidates.empty()) {
++    return candidates;
++  }
++  const size_t n = candidates.size();
++  std::vector<std::optional<uint32_t>> counts;
++  double score_sum = 0;
++  double count_sum = 0;
++  for (const Candidate& candidate : candidates) {
++    counts.push_back(list->Count(tag, candidate.text));
++    score_sum += candidate.score;
++    count_sum += counts.back().value_or(0);
++  }
++  std::vector<double> final_scores(n, 0.0);
++  for (size_t i = 0; i < n; ++i) {
++    if (!counts[i]) {
++      continue;
++    }
++    const double model = score_sum > 0 ? candidates[i].score / score_sum : 0;
++    const double frequency = count_sum > 0 ? *counts[i] / count_sum : 0;
++    final_scores[i] = kAlpha * model + (1 - kAlpha) * frequency;
++  }
++
++  std::vector<size_t> order(n);
++  std::iota(order.begin(), order.end(), size_t{0});
++  std::ranges::stable_sort(order, [&final_scores](size_t a, size_t b) {
++    return final_scores[a] > final_scores[b];
++  });
++  std::vector<Candidate> out;
++  out.reserve(n);
++  for (size_t i : order) {
++    out.push_back(std::move(candidates[i]));
++  }
++  return out;
++}
++
++}  // namespace tark_xlit
+--- /dev/null
++++ b/components/tark_xlit/word_list.h
+@@ -0,0 +1,114 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef COMPONENTS_TARK_XLIT_WORD_LIST_H_
++#define COMPONENTS_TARK_XLIT_WORD_LIST_H_
++
++#include <cstddef>
++#include <cstdint>
++#include <functional>
++#include <map>
++#include <memory>
++#include <optional>
++#include <string>
++#include <string_view>
++#include <vector>
++
++#include "base/containers/heap_array.h"
++#include "base/containers/span.h"
++#include "base/memory/raw_span.h"
++#include "components/tark_xlit/model.h"
++
++namespace base {
++class MemoryMappedFile;
++}  // namespace base
++
++namespace tark_xlit {
++
++// Word-frequency lists, one per language, and the list of common English words
++// that stay in Latin letters; the TXLW v1 file that utils/xlit_wordlist.py
++// packs. Lookups binary-search the file's sorted records.
++//
++// Loading checks the header and that each language's record-offset table lies
++// in the file, but not the records themselves (walking them would read all of
++// a 36 MB mapping). A malformed record makes a lookup that meets it report
++// "not found"; it never crashes.
++class WordList {
++ public:
++  // Reads a TXLW v1 blob, copying it (for tests and small lists). nullptr on
++  // a wrong magic or version, a malformed header, or a record-offset table
++  // that runs past the end.
++  static std::unique_ptr<WordList> Load(base::span<const uint8_t> txlw);
++
++  // As above, but reads the blob in place from `file`, which the list keeps
++  // mapped for its lifetime. nullptr also when `file` is null or not valid.
++  static std::unique_ptr<WordList> Load(
++      std::unique_ptr<base::MemoryMappedFile> file);
++
++  WordList(const WordList&) = delete;
++  WordList& operator=(const WordList&) = delete;
++  ~WordList();
++
++  // How often `word` occurs in the corpus of the language `tag`; nullopt when
++  // the word is not in that language's list or there is no list for `tag`.
++  std::optional<uint32_t> Count(std::string_view tag,
++                                std::u16string_view word) const;
++
++  // Whether there is a list for the language `tag`.
++  bool HasLanguage(std::string_view tag) const;
++
++  // Whether `word` (lower-case a-z) is on the common-English list.
++  bool IsCommonEnglish(std::string_view word) const;
++
++ private:
++  struct Block {
++    // Absolute file offset of the record-offset table.
++    size_t offset = 0;
++    size_t count = 0;
++  };
++  struct Record {
++    uint32_t count = 0;
++    std::string_view word;
++  };
++
++  using Blocks = std::map<std::string, Block, std::less<>>;
++
++  // Exactly one of `copy` and `file` holds the blob.
++  WordList(base::HeapArray<uint8_t> copy,
++           std::unique_ptr<base::MemoryMappedFile> file,
++           Blocks blocks);
++
++  // The header's blocks, each checked to start after the header and to have
++  // its record-offset table inside `txlw`; nullopt when the blob is not a
++  // usable TXLW v1 file.
++  static std::optional<Blocks> ParseBlocks(base::span<const uint8_t> txlw);
++
++  // The `index`th record of `block` (index < block.count), or nullopt when
++  // that record does not lie inside the blob.
++  std::optional<Record> RecordAt(const Block& block, size_t index) const;
++  std::optional<uint32_t> Find(std::string_view tag,
++                               std::string_view utf8) const;
++
++  base::HeapArray<uint8_t> copy_;
++  std::unique_ptr<base::MemoryMappedFile> file_;
++  Blocks blocks_;
++  // The blob, in `copy_` or `file_`. Declared last so that it is destroyed
++  // before what it points into.
++  base::raw_span<const uint8_t> data_;
++};
++
++// IndicXlit's dictionary rescoring with alpha = 0.9. For each candidate that
++// is in the list for `tag`, F = 0.9 * T / sum(T) + 0.1 * P / sum(P), where T
++// is the model score and P the list count, the sums taken over the candidates
++// (sum(P) over those in the list); F = 0 for the others. Returns the
++// candidates sorted by F, highest first, the sort stable so ties keep the
++// model's order. The scores stay the model's. `candidates` comes back
++// unchanged when `list` is null or has no list for `tag`.
++std::vector<Candidate> Rescore(std::vector<Candidate> candidates,
++                               const WordList* list,
++                               std::string_view tag);
++
++}  // namespace tark_xlit
++
++#endif  // COMPONENTS_TARK_XLIT_WORD_LIST_H_
+--- /dev/null
++++ b/components/tark_xlit/transliterator.cc
+@@ -0,0 +1,258 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/tark_xlit/transliterator.h"
++
++#include <algorithm>
++#include <array>
++#include <cstddef>
++#include <memory>
++#include <optional>
++#include <string>
++#include <string_view>
++#include <utility>
++#include <vector>
++
++#include "base/base_paths.h"
++#include "base/check.h"
++#include "base/files/file_path.h"
++#include "base/files/memory_mapped_file.h"
++#include "base/functional/bind.h"
++#include "base/memory/scoped_refptr.h"
++#include "base/path_service.h"
++#include "components/tark_xlit/languages.h"
++#include "components/tark_xlit/model.h"
++#include "components/tark_xlit/word_list.h"
++
++namespace tark_xlit {
++
++namespace {
++
++// The cache is emptied when it would otherwise grow past this many words.
++constexpr size_t kMaxCacheEntries = 5000;
++
++// Model::Transliterate takes words of at most this many letters.
++constexpr size_t kMaxWordLetters = 32;
++
++constexpr char16_t kZeroWidthNonJoiner = u'\u200c';
++
++constexpr std::string_view kMarathiTag = "mr";
++constexpr std::string_view kModelFileName = "xlit-model.bin";
++constexpr std::string_view kWordsFileName = "xlit-words.bin";
++constexpr std::string_view kBundleDirectoryName = "indicxlit";
++
++// The model's vocabulary has these tokens, and a candidate that spells one out
++// is not a word.
++constexpr std::array<std::u16string_view, 4> kSpecialSymbols = {
++    u"<unk>", u"<s>", u"</s>", u"<pad>"};
++
++// Marathi's अॅ (a, candra e) as the model writes it, and the single letter ॲ
++// (candra a) that the word lists, built from a corpus, use for it.
++constexpr std::u16string_view kMarathiAndCandraE = u"अॅ";
++constexpr std::u16string_view kMarathiCandraA = u"ॲ";
++
++bool IsAsciiLetter(char16_t c) {
++  return (c >= u'a' && c <= u'z') || (c >= u'A' && c <= u'Z');
++}
++
++char ToLowerAscii(char16_t c) {
++  return static_cast<char>(c >= u'A' && c <= u'Z' ? c - u'A' + u'a' : c);
++}
++
++bool IsSpecialSymbol(std::u16string_view text) {
++  return std::ranges::any_of(kSpecialSymbols, [text](std::u16string_view s) {
++    return text.find(s) != std::u16string_view::npos;
++  });
++}
++
++void NormaliseMarathi(std::u16string& text) {
++  for (size_t pos = text.find(kMarathiAndCandraE);
++       pos != std::u16string::npos;
++       pos = text.find(kMarathiAndCandraE, pos + kMarathiCandraA.size())) {
++    text.replace(pos, kMarathiAndCandraE.size(), kMarathiCandraA);
++  }
++}
++
++}  // namespace
++
++Resources::Resources(std::unique_ptr<const Model> model,
++                     std::unique_ptr<const WordList> words)
++    : model(std::move(model)), words(std::move(words)) {
++  CHECK(this->model);
++}
++
++Resources::~Resources() = default;
++
++Transliterator::Transliterator(scoped_refptr<const Resources> resources)
++    : resources_(std::move(resources)) {
++  CHECK(resources_);
++  words_ = resources_->words.get();
++  // `resources_` keeps the model alive for as long as this instance.
++  word_function_ = base::BindRepeating(
++      &Model::Transliterate, base::Unretained(resources_->model.get()));
++}
++
++Transliterator::Transliterator(std::unique_ptr<Model> model,
++                               std::unique_ptr<WordList> words)
++    : Transliterator(base::MakeRefCounted<Resources>(std::move(model),
++                                                     std::move(words))) {}
++
++Transliterator::Transliterator(WordFunction word_function,
++                               std::unique_ptr<WordList> words)
++    : own_words_(std::move(words)),
++      words_(own_words_.get()),
++      word_function_(std::move(word_function)) {
++  CHECK(word_function_);
++}
++
++Transliterator::~Transliterator() = default;
++
++std::optional<std::u16string> Transliterator::Phrase(std::u16string_view input,
++                                                     std::string_view tag) {
++  if (!LooksTransliterable(input)) {
++    return std::nullopt;
++  }
++
++  std::u16string out;
++  out.reserve(input.size());
++  size_t pos = 0;
++  while (pos < input.size()) {
++    if (!IsAsciiLetter(input[pos])) {
++      out.push_back(input[pos]);
++      ++pos;
++      continue;
++    }
++
++    // A run of Latin letters: one word.
++    std::string word;
++    size_t end = pos;
++    while (end < input.size() && IsAsciiLetter(input[end])) {
++      word.push_back(ToLowerAscii(input[end]));
++      ++end;
++    }
++    const std::u16string_view typed = input.substr(pos, end - pos);
++    pos = end;
++
++    // Too long for the model: leave it, and keep it out of the cache.
++    if (typed.size() > kMaxWordLetters) {
++      out += typed;
++      continue;
++    }
++    if (words_ && words_->IsCommonEnglish(word)) {
++      out += typed;
++      continue;
++    }
++    const std::u16string text = Word(word, tag);
++    if (text.empty()) {
++      out += typed;
++    } else {
++      out += text;
++    }
++  }
++
++  if (out == input) {
++    return std::nullopt;
++  }
++  return out;
++}
++
++std::u16string Transliterator::Word(std::string_view word,
++                                    std::string_view tag) {
++  std::string key;
++  key.reserve(tag.size() + 1 + word.size());
++  key.append(tag);
++  key.push_back(' ');
++  key.append(word);
++
++  const auto it = cache_.find(key);
++  if (it != cache_.end()) {
++    return it->second;
++  }
++  std::u16string text = ComputeWord(word, tag);
++  if (cache_.size() >= kMaxCacheEntries) {
++    cache_.clear();
++  }
++  cache_.emplace(std::move(key), text);
++  return text;
++}
++
++std::u16string Transliterator::ComputeWord(std::string_view word,
++                                           std::string_view tag) const {
++  std::vector<Candidate> candidates = word_function_.Run(word, tag);
++  // The model's output has no ZWNJ (a word-final virama + ZWNJ, say, must
++  // never reach the row), so strip any that appears; a candidate left empty is
++  // dropped with the special symbols.
++  for (Candidate& candidate : candidates) {
++    std::erase(candidate.text, kZeroWidthNonJoiner);
++  }
++  std::erase_if(candidates, [](const Candidate& candidate) {
++    return candidate.text.empty() || IsSpecialSymbol(candidate.text);
++  });
++  if (tag == kMarathiTag) {
++    // Before rescoring, so that the list lookups see the corpus's spelling.
++    for (Candidate& candidate : candidates) {
++      NormaliseMarathi(candidate.text);
++    }
++  }
++  candidates = Rescore(std::move(candidates), words_.get(), tag);
++  if (candidates.empty()) {
++    return std::u16string();
++  }
++  return std::move(candidates.front().text);
++}
++
++scoped_refptr<Resources> LoadResourcesFromDirectory(
++    const base::FilePath& directory) {
++  // The model is converted into memory by Load(), so its file is not needed
++  // afterwards.
++  std::unique_ptr<Model> model;
++  {
++    base::MemoryMappedFile model_file;
++    if (!model_file.Initialize(directory.AppendASCII(kModelFileName))) {
++      return nullptr;
++    }
++    model = Model::Load(model_file.bytes());
++  }
++  if (!model) {
++    return nullptr;
++  }
++
++  // The word lists are read in place, and stay mapped.
++  auto words_file = std::make_unique<base::MemoryMappedFile>();
++  if (!words_file->Initialize(directory.AppendASCII(kWordsFileName))) {
++    return nullptr;
++  }
++  std::unique_ptr<WordList> words = WordList::Load(std::move(words_file));
++  if (!words) {
++    return nullptr;
++  }
++  return base::MakeRefCounted<Resources>(std::move(model), std::move(words));
++}
++
++scoped_refptr<Resources> LoadResourcesFromBundle() {
++  base::FilePath assets;
++  if (!base::PathService::Get(base::DIR_ASSETS, &assets)) {
++    return nullptr;
++  }
++  return LoadResourcesFromDirectory(assets.AppendASCII(kBundleDirectoryName));
++}
++
++std::unique_ptr<Transliterator> LoadFromDirectory(
++    const base::FilePath& directory) {
++  scoped_refptr<Resources> resources = LoadResourcesFromDirectory(directory);
++  if (!resources) {
++    return nullptr;
++  }
++  return std::make_unique<Transliterator>(std::move(resources));
++}
++
++std::unique_ptr<Transliterator> LoadFromBundle() {
++  scoped_refptr<Resources> resources = LoadResourcesFromBundle();
++  if (!resources) {
++    return nullptr;
++  }
++  return std::make_unique<Transliterator>(std::move(resources));
++}
++
++}  // namespace tark_xlit
+--- /dev/null
++++ b/components/tark_xlit/transliterator.h
+@@ -0,0 +1,139 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef COMPONENTS_TARK_XLIT_TRANSLITERATOR_H_
++#define COMPONENTS_TARK_XLIT_TRANSLITERATOR_H_
++
++#include <cstddef>
++#include <memory>
++#include <optional>
++#include <string>
++#include <string_view>
++#include <unordered_map>
++#include <vector>
++
++#include "base/functional/callback.h"
++#include "base/memory/raw_ptr.h"
++#include "base/memory/ref_counted.h"
++#include "components/tark_xlit/model.h"
++#include "components/tark_xlit/word_list.h"
++
++namespace base {
++class FilePath;
++}  // namespace base
++
++namespace tark_xlit {
++
++// The model and the word lists, loaded once and shared read-only by any number
++// of Transliterators, each of which keeps its own cache. Model::Transliterate()
++// and the WordList lookups are const and keep no mutable state, so one
++// Resources may be used from several sequences at once.
++struct Resources : public base::RefCountedThreadSafe<Resources> {
++  // `model` must not be null. `words` may be null (no English words, no
++  // rescoring).
++  Resources(std::unique_ptr<const Model> model,
++            std::unique_ptr<const WordList> words);
++  Resources(const Resources&) = delete;
++  Resources& operator=(const Resources&) = delete;
++
++  const std::unique_ptr<const Model> model;
++  const std::unique_ptr<const WordList> words;
++
++ private:
++  friend class base::RefCountedThreadSafe<Resources>;
++  ~Resources();
++};
++
++// Turns a typed phrase such as "heart attack ke lakshan" into the phrase in an
++// Indian script ("heart attack के लक्षण"): English words stay as typed, the
++// rest are transliterated word by word with the model, and the model's
++// candidates are rescored with the word lists.
++//
++// Not thread-safe: Phrase() fills a cache. Use one instance on one sequence.
++class Transliterator {
++ public:
++  // The per-word transliteration: up to four candidates for `word` (lower-case
++  // letters a-z) in the language `tag`, best first, as Model::Transliterate
++  // gives them.
++  using WordFunction = base::RepeatingCallback<
++      std::vector<Candidate>(std::string_view word, std::string_view tag)>;
++
++  // Uses the shared `resources`, which must not be null, and keeps them alive.
++  explicit Transliterator(scoped_refptr<const Resources> resources);
++
++  // `model` must not be null. `words` may be null, in which case no word is
++  // treated as English and the candidates are not rescored.
++  Transliterator(std::unique_ptr<Model> model,
++                 std::unique_ptr<WordList> words);
++
++  // For tests: `word_function` stands in for the model.
++  Transliterator(WordFunction word_function, std::unique_ptr<WordList> words);
++
++  Transliterator(const Transliterator&) = delete;
++  Transliterator& operator=(const Transliterator&) = delete;
++  ~Transliterator();
++
++  // `input` written in the script of the language `tag` (an IndicXlit tag
++  // such as "hi"). Each run of Latin letters is a word, lower-cased for the
++  // model; every other character (spaces, digits, punctuation) stays where it
++  // is. A word on the common-English list stays as typed. Any other word
++  // becomes the best of the model's candidates after rescoring, with candidates
++  // that spell out a special symbol ("<unk>") left out and, for Marathi, अॅ
++  // written as the corpus writes it, ॲ. A word with no candidate stays as
++  // typed.
++  //
++  // nullopt when `input` does not look like transliterable Latin text
++  // (LooksTransliterable) or when nothing in it changed.
++  std::optional<std::u16string> Phrase(std::u16string_view input,
++                                       std::string_view tag);
++
++  size_t cache_size_for_testing() const { return cache_.size(); }
++
++ private:
++  // The script text for `word` (lower-case a-z), or empty when the model has
++  // none. Cached per (tag, word).
++  std::u16string Word(std::string_view word, std::string_view tag);
++  std::u16string ComputeWord(std::string_view word, std::string_view tag) const;
++
++  // The model and words, unless this instance was made with a WordFunction;
++  // then `own_words_` holds the words. `word_function_` calls the model.
++  scoped_refptr<const Resources> resources_;
++  std::unique_ptr<const WordList> own_words_;
++  // The word lists in use, from `resources_` or `own_words_`; may be null.
++  // Declared after both so that it is destroyed first.
++  raw_ptr<const WordList> words_;
++  WordFunction word_function_;
++  // "<tag> <word>" -> text, empty for a word the model could not do. Emptied
++  // when it reaches kMaxCacheEntries.
++  std::unordered_map<std::string, std::u16string> cache_;
++};
++
++// The model and word lists in `directory` (xlit-model.bin and
++// xlit-words.bin), or nullptr if either is missing or not valid. The word
++// lists are memory-mapped; the model is read and converted, and its file is
++// closed again. This blocks on file IO and converts the whole model (tens of
++// milliseconds with a warm disk cache on a development Mac, more on a cold
++// start): call it where blocking is allowed (a thread pool task with
++// MayBlock), never on the UI thread.
++scoped_refptr<Resources> LoadResourcesFromDirectory(
++    const base::FilePath& directory);
++
++// LoadResourcesFromDirectory() on indicxlit/ in the app's assets directory
++// (base::DIR_ASSETS, which in a bundled macOS app is the Resources directory of
++// the framework bundle, FrameworkBundlePath()/Resources, not the app's
++// Contents/Resources). Same threading rules.
++scoped_refptr<Resources> LoadResourcesFromBundle();
++
++// A Transliterator over LoadResourcesFromDirectory(`directory`), or nullptr.
++// Same threading rules.
++std::unique_ptr<Transliterator> LoadFromDirectory(
++    const base::FilePath& directory);
++
++// A Transliterator over LoadResourcesFromBundle(), or nullptr. Same threading
++// rules.
++std::unique_ptr<Transliterator> LoadFromBundle();
++
++}  // namespace tark_xlit
++
++#endif  // COMPONENTS_TARK_XLIT_TRANSLITERATOR_H_
+--- /dev/null
++++ b/components/tark_xlit/transliterator_unittest.cc
+@@ -0,0 +1,518 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/tark_xlit/transliterator.h"
++
++#include <cstddef>
++#include <memory>
++#include <optional>
++#include <string>
++#include <string_view>
++#include <utility>
++#include <vector>
++
++#include "base/base_paths.h"
++#include "base/files/file_path.h"
++#include "base/files/file_util.h"
++#include "base/files/memory_mapped_file.h"
++#include "base/files/scoped_temp_dir.h"
++#include "base/memory/scoped_refptr.h"
++#include "base/no_destructor.h"
++#include "base/path_service.h"
++#include "base/strings/utf_string_conversions.h"
++#include "base/test/bind.h"
++#include "base/test/scoped_path_override.h"
++#include "components/tark_xlit/languages.h"
++#include "components/tark_xlit/model.h"
++#include "components/tark_xlit/word_list.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace tark_xlit {
++
++namespace {
++
++// What Convert() reports for a Phrase() that gave nothing.
++constexpr std::string_view kNothing = "<nullopt>";
++
++base::FilePath TestDataDir() {
++  return base::PathService::CheckedGet(base::DIR_SRC_TEST_DATA_ROOT)
++      .AppendASCII("components/tark_xlit/test/data");
++}
++
++std::unique_ptr<WordList> LoadTestWords() {
++  auto file = std::make_unique<base::MemoryMappedFile>();
++  if (!file->Initialize(TestDataDir().AppendASCII("xlit-words.bin"))) {
++    return nullptr;
++  }
++  return WordList::Load(std::move(file));
++}
++
++// The real model and word lists, loaded once per test process. Phrase() fills
++// the instance's cache, which only makes later tests faster.
++Transliterator* RealTransliterator() {
++  static base::NoDestructor<std::unique_ptr<Transliterator>> transliterator(
++      LoadFromDirectory(TestDataDir()));
++  return transliterator->get();
++}
++
++// UTF-8 of what `transliterator` makes of `input`, or kNothing.
++std::string Convert(Transliterator* transliterator,
++                    std::u16string_view input,
++                    std::string_view tag) {
++  const std::optional<std::u16string> result =
++      transliterator->Phrase(input, tag);
++  return result ? base::UTF16ToUTF8(*result) : std::string(kNothing);
++}
++
++std::string Convert(std::u16string_view input, std::string_view tag) {
++  Transliterator* transliterator = RealTransliterator();
++  if (!transliterator) {
++    return "<no transliterator>";
++  }
++  return Convert(transliterator, input, tag);
++}
++
++bool HasAsciiLetter(std::u16string_view text) {
++  for (char16_t c : text) {
++    if ((c >= u'a' && c <= u'z') || (c >= u'A' && c <= u'Z')) {
++      return true;
++    }
++  }
++  return false;
++}
++
++// A new directory `name` in `temp` with symbolic links xlit-model.bin to
++// `model` and xlit-words.bin to `words`, each left out when its path is empty.
++base::FilePath MakeDirectory(const base::ScopedTempDir& temp,
++                             std::string_view name,
++                             const base::FilePath& model,
++                             const base::FilePath& words) {
++  const base::FilePath directory = temp.GetPath().AppendASCII(name);
++  EXPECT_TRUE(base::CreateDirectory(directory));
++  if (!model.value().empty()) {
++    EXPECT_TRUE(base::CreateSymbolicLink(
++        model, directory.AppendASCII("xlit-model.bin")));
++  }
++  if (!words.value().empty()) {
++    EXPECT_TRUE(base::CreateSymbolicLink(
++        words, directory.AppendASCII("xlit-words.bin")));
++  }
++  return directory;
++}
++
++// A stand-in for Model::Transliterate: records each call as "<tag> <word>" and
++// answers `answer`, by default one candidate, the word behind a Bengali ba.
++struct FakeModel {
++  std::vector<std::string> calls;
++  Transliterator::WordFunction answer;
++
++  Transliterator::WordFunction Callback() {
++    return base::BindLambdaForTesting(
++        [this](std::string_view word, std::string_view tag) {
++          calls.push_back(std::string(tag) + " " + std::string(word));
++          if (answer) {
++            return answer.Run(word, tag);
++          }
++          return std::vector<Candidate>{
++              Candidate{u"ব" + base::UTF8ToUTF16(word), 0.5}};
++        });
++  }
++};
++
++}  // namespace
++
++TEST(TarkXlitTransliteratorTest, HeartAttackKeLakshan) {
++  EXPECT_EQ(Convert(u"heart attack ke lakshan", "hi"),
++            "heart attack के लक्षण");
++}
++
++TEST(TarkXlitTransliteratorTest, Namaste) {
++  EXPECT_EQ(Convert(u"namaste", "hi"), "नमस्ते");
++}
++
++TEST(TarkXlitTransliteratorTest, UpperCaseLettersAreLowerCased) {
++  EXPECT_EQ(Convert(u"Namaste", "hi"), "नमस्ते");
++  EXPECT_EQ(Convert(u"NAMASTE", "hi"), "नमस्ते");
++}
++
++TEST(TarkXlitTransliteratorTest, Covid19KeepsEnglishAndDigits) {
++  EXPECT_EQ(Convert(u"covid-19 ke lakshan", "hi"), "covid-19 के लक्षण");
++}
++
++TEST(TarkXlitTransliteratorTest, DigitsStayAndLettersChange) {
++  const std::string result = Convert(u"pnr 4512345678", "hi");
++  ASSERT_NE(result, std::string(kNothing));
++  const std::u16string text = base::UTF8ToUTF16(result);
++  ASSERT_GT(text.size(), 11u);
++  EXPECT_EQ(text.substr(text.size() - 11), u" 4512345678");
++  EXPECT_FALSE(HasAsciiLetter(text));
++}
++
++TEST(TarkXlitTransliteratorTest, PunctuationInsideAWordStays) {
++  const std::string result = Convert(u"c++ seekho", "hi");
++  ASSERT_NE(result, std::string(kNothing));
++  const std::u16string text = base::UTF8ToUTF16(result);
++  EXPECT_EQ(text.substr(0, 4), u"c++ ");
++  EXPECT_FALSE(HasAsciiLetter(text.substr(4)));
++  EXPECT_GT(text.size(), 4u);
++}
++
++TEST(TarkXlitTransliteratorTest, AllEnglishChangesNothing) {
++  EXPECT_EQ(Convert(u"the weather today", "hi"), kNothing);
++  // Upper-case English stays as typed, and so still changes nothing.
++  EXPECT_EQ(Convert(u"The Weather TODAY", "hi"), kNothing);
++}
++
++TEST(TarkXlitTransliteratorTest, NotLatinTextIsNothing) {
++  EXPECT_EQ(Convert(u"नमस्ते", "hi"), kNothing);
++  EXPECT_EQ(Convert(u"", "hi"), kNothing);
++  EXPECT_EQ(Convert(u"a", "hi"), kNothing);
++  EXPECT_EQ(Convert(u"1234 5678", "hi"), kNothing);
++  EXPECT_EQ(Convert(u"namaste दुनिया", "hi"), kNothing);
++}
++
++TEST(TarkXlitTransliteratorTest, UnknownTagIsNothing) {
++  EXPECT_EQ(Convert(u"namaste", "xx"), kNothing);
++  EXPECT_EQ(Convert(u"namaste", ""), kNothing);
++}
++
++TEST(TarkXlitTransliteratorTest, ManyWordsNeverReachTheModel) {
++  FakeModel fake;
++  Transliterator transliterator(fake.Callback(), LoadTestWords());
++
++  std::u16string forty;
++  for (size_t i = 0; i < 40; ++i) {
++    forty += (i == 0 ? u"" : u" ");
++    forty += u"namaste";
++  }
++  EXPECT_EQ(Convert(&transliterator, forty, "hi"), kNothing);
++  EXPECT_TRUE(fake.calls.empty());
++
++  // 13 words are one too many; 12 are fine, and the repeated word is asked of
++  // the model once.
++  std::u16string twelve;
++  for (size_t i = 0; i < 12; ++i) {
++    twelve += (i == 0 ? u"" : u" ");
++    twelve += u"namaste";
++  }
++  EXPECT_EQ(Convert(&transliterator, twelve + u" namaste", "hi"), kNothing);
++  EXPECT_TRUE(fake.calls.empty());
++  EXPECT_NE(Convert(&transliterator, twelve, "hi"), kNothing);
++  EXPECT_EQ(fake.calls, std::vector<std::string>{"hi namaste"});
++}
++
++TEST(TarkXlitTransliteratorTest, KeepsEverythingButLetterRuns) {
++  FakeModel fake;
++  Transliterator transliterator(fake.Callback(), nullptr);
++  // Spaces (several, and a tab), punctuation, digits and a non-ASCII dash stay
++  // where they are; each run of Latin letters, lower-cased, is one word.
++  EXPECT_EQ(Convert(&transliterator, u"ab-cd  12x_y\tEf—gh", "bn"),
++            "বab-বcd  12বx_বy\tবef—বgh");
++  EXPECT_EQ(fake.calls,
++            (std::vector<std::string>{"bn ab", "bn cd", "bn x", "bn y",
++                                      "bn ef", "bn gh"}));
++}
++
++TEST(TarkXlitTransliteratorTest, EnglishWordsStayAsTyped) {
++  FakeModel fake;
++  Transliterator transliterator(fake.Callback(), LoadTestWords());
++  EXPECT_EQ(Convert(&transliterator, u"Heart zzkx covid-19", "hi"),
++            "Heart বzzkx covid-19");
++  EXPECT_EQ(fake.calls, std::vector<std::string>{"hi zzkx"});
++}
++
++TEST(TarkXlitTransliteratorTest, WithoutAWordListNothingIsEnglish) {
++  FakeModel fake;
++  Transliterator transliterator(fake.Callback(), nullptr);
++  EXPECT_EQ(Convert(&transliterator, u"the weather", "hi"), "বthe বweather");
++}
++
++TEST(TarkXlitTransliteratorTest, AWordTheModelCannotDoStaysAsTyped) {
++  FakeModel fake;
++  fake.answer = base::BindLambdaForTesting(
++      [](std::string_view, std::string_view) {
++        return std::vector<Candidate>();
++      });
++  Transliterator transliterator(fake.Callback(), nullptr);
++  EXPECT_EQ(Convert(&transliterator, u"Zzkx Qqrt", "hi"), kNothing);
++
++  // Another word still changes.
++  fake.answer = base::BindLambdaForTesting(
++      [](std::string_view word, std::string_view) {
++        if (word == "zzkx") {
++          return std::vector<Candidate>();
++        }
++        return std::vector<Candidate>{Candidate{u"क", 0.5}};
++      });
++  EXPECT_EQ(Convert(&transliterator, u"Zzkx Qqrtw", "hi"), "Zzkx क");
++}
++
++TEST(TarkXlitTransliteratorTest, SpecialSymbolCandidatesAreDropped) {
++  FakeModel fake;
++  fake.answer = base::BindLambdaForTesting(
++      [](std::string_view word, std::string_view) {
++        std::vector<Candidate> candidates = {
++            Candidate{u"<unk>", 0.9}, Candidate{u"क<s>ख", 0.8},
++            Candidate{u"</s>", 0.7},  Candidate{u"<pad>", 0.6}};
++        if (word == "ok") {
++          candidates.push_back(Candidate{u"ठीक", 0.1});
++        }
++        return candidates;
++      });
++  Transliterator transliterator(fake.Callback(), nullptr);
++  // Every candidate is a symbol: the word stays.
++  EXPECT_EQ(Convert(&transliterator, u"zzkx", "hi"), kNothing);
++  // The one real candidate wins whatever the model scored the symbols.
++  EXPECT_EQ(Convert(&transliterator, u"ok", "hi"), "ठीक");
++}
++
++TEST(TarkXlitTransliteratorTest, EmptyCandidatesAreDropped) {
++  FakeModel fake;
++  fake.answer = base::BindLambdaForTesting(
++      [](std::string_view, std::string_view) {
++        return std::vector<Candidate>{Candidate{u"", 0.9},
++                                      Candidate{u"क", 0.1}};
++      });
++  Transliterator transliterator(fake.Callback(), nullptr);
++  EXPECT_EQ(Convert(&transliterator, u"ka", "hi"), "क");
++}
++
++TEST(TarkXlitTransliteratorTest, ZeroWidthNonJoinersAreStripped) {
++  FakeModel fake;
++  fake.answer = base::BindLambdaForTesting(
++      [](std::string_view word, std::string_view) {
++        if (word == "zzkx") {
++          // Only a ZWNJ: nothing is left, so the word stays.
++          return std::vector<Candidate>{Candidate{u"\u200c", 0.9}};
++        }
++        // A word-final virama followed by a ZWNJ.
++        return std::vector<Candidate>{
++            Candidate{u"\u0930\u093e\u092e\u094d\u200c", 0.9}};
++      });
++  Transliterator transliterator(fake.Callback(), nullptr);
++  const std::u16string result =
++      base::UTF8ToUTF16(Convert(&transliterator, u"ram", "hi"));
++  EXPECT_EQ(result, u"\u0930\u093e\u092e\u094d");
++  EXPECT_EQ(result.find(u'\u200c'), std::u16string::npos);
++  EXPECT_EQ(Convert(&transliterator, u"zzkx", "hi"), kNothing);
++}
++
++TEST(TarkXlitTransliteratorTest, LongRunsOfLettersStayAndAreNotAsked) {
++  FakeModel fake;
++  Transliterator transliterator(fake.Callback(), nullptr);
++  const std::u16string long_run(33, u'a');
++  const std::u16string longest(32, u'a');
++  EXPECT_EQ(Convert(&transliterator, u"ab " + long_run, "hi"),
++            "বab " + base::UTF16ToUTF8(long_run));
++  EXPECT_EQ(fake.calls, std::vector<std::string>{"hi ab"});
++  // 32 letters are still asked of the model.
++  EXPECT_NE(Convert(&transliterator, longest, "hi"), kNothing);
++  EXPECT_EQ(fake.calls.size(), 2u);
++}
++
++TEST(TarkXlitTransliteratorTest, RescoringPicksTheCommonerSpelling) {
++  FakeModel fake;
++  fake.answer = base::BindLambdaForTesting(
++      [](std::string_view, std::string_view) {
++        // The model prefers the first, but only the second is in the list.
++        return std::vector<Candidate>{Candidate{u"नमसते", 0.6},
++                                      Candidate{u"नमस्ते", 0.3}};
++      });
++  Transliterator transliterator(fake.Callback(), LoadTestWords());
++  EXPECT_EQ(Convert(&transliterator, u"zznamaste", "hi"), "नमस्ते");
++}
++
++TEST(TarkXlitTransliteratorTest, MarathiCandraAIsNormalisedBeforeRescoring) {
++  // "ॲक्टीव" is in the Marathi list; its अॅ spelling is not. The model's
++  // first candidate is in neither form of anything. Without the
++  // normalisation both would score zero and the first would win.
++  FakeModel fake;
++  fake.answer = base::BindLambdaForTesting(
++      [](std::string_view, std::string_view) {
++        return std::vector<Candidate>{Candidate{u"ठठठ", 0.9},
++                                      Candidate{u"अॅक्टीव", 0.1}};
++      });
++  Transliterator transliterator(fake.Callback(), LoadTestWords());
++  EXPECT_EQ(Convert(&transliterator, u"aktiv", "mr"), "ॲक्टीव");
++  // Only Marathi's spelling is normalised.
++  EXPECT_EQ(Convert(&transliterator, u"aktiv", "hi"), "ठठठ");
++}
++
++TEST(TarkXlitTransliteratorTest, MarathiCandraAIsKeptWithoutAWordList) {
++  FakeModel fake;
++  fake.answer = base::BindLambdaForTesting(
++      [](std::string_view, std::string_view) {
++        return std::vector<Candidate>{Candidate{u"अॅप", 0.9}};
++      });
++  Transliterator transliterator(fake.Callback(), nullptr);
++  EXPECT_EQ(Convert(&transliterator, u"epp", "mr"), "ॲप");
++}
++
++TEST(TarkXlitTransliteratorTest, NoZeroWidthNonJoinerInMarathi) {
++  const std::string result = Convert(u"namaste", "mr");
++  ASSERT_NE(result, std::string(kNothing));
++  EXPECT_EQ(base::UTF8ToUTF16(result).find(u'\u200c'),
++            std::u16string::npos);
++}
++
++TEST(TarkXlitTransliteratorTest, NoZeroWidthNonJoinerInAnyLanguage) {
++  Transliterator* transliterator = RealTransliterator();
++  ASSERT_TRUE(transliterator);
++  for (const Language& language : AllLanguages()) {
++    for (std::u16string_view word :
++         {u"namaste", u"kitab", u"krishna", u"school"}) {
++      const std::string result = Convert(transliterator, word, language.tag);
++      EXPECT_EQ(base::UTF8ToUTF16(result).find(u'\u200c'),
++                std::u16string::npos)
++          << language.tag << " " << result;
++    }
++  }
++}
++
++TEST(TarkXlitTransliteratorTest, CacheKeysOnTagAndLowerCaseWord) {
++  FakeModel fake;
++  Transliterator transliterator(fake.Callback(), nullptr);
++  EXPECT_EQ(Convert(&transliterator, u"namaste", "hi"), "বnamaste");
++  EXPECT_EQ(Convert(&transliterator, u"Namaste", "hi"), "বnamaste");
++  EXPECT_EQ(Convert(&transliterator, u"namaste ji namaste", "hi"),
++            "বnamaste বji বnamaste");
++  EXPECT_EQ(fake.calls,
++            (std::vector<std::string>{"hi namaste", "hi ji"}));
++
++  // Another language is another entry.
++  EXPECT_EQ(Convert(&transliterator, u"namaste", "ta"), "বnamaste");
++  EXPECT_EQ(fake.calls.size(), 3u);
++  EXPECT_EQ(fake.calls.back(), "ta namaste");
++}
++
++TEST(TarkXlitTransliteratorTest, CacheRemembersWordsTheModelCannotDo) {
++  FakeModel fake;
++  fake.answer = base::BindLambdaForTesting(
++      [](std::string_view, std::string_view) {
++        return std::vector<Candidate>();
++      });
++  Transliterator transliterator(fake.Callback(), nullptr);
++  EXPECT_EQ(Convert(&transliterator, u"zzkx", "hi"), kNothing);
++  EXPECT_EQ(Convert(&transliterator, u"zzkx", "hi"), kNothing);
++  EXPECT_EQ(fake.calls.size(), 1u);
++}
++
++TEST(TarkXlitTransliteratorTest, CacheIsEmptiedWhenItHolds5000Words) {
++  constexpr size_t kLimit = 5000;
++  // Distinct three-letter words: aaa, aab, ..., in base 26.
++  const auto word = [](size_t i) {
++    std::u16string out(3, u'a');
++    out[0] = static_cast<char16_t>(u'a' + (i / 676) % 26);
++    out[1] = static_cast<char16_t>(u'a' + (i / 26) % 26);
++    out[2] = static_cast<char16_t>(u'a' + i % 26);
++    return out;
++  };
++
++  FakeModel fake;
++  Transliterator transliterator(fake.Callback(), nullptr);
++  for (size_t i = 0; i < kLimit; ++i) {
++    ASSERT_NE(Convert(&transliterator, word(i), "hi"), kNothing);
++  }
++  ASSERT_EQ(fake.calls.size(), kLimit);
++
++  // The 5,000 words so far are all remembered.
++  EXPECT_NE(Convert(&transliterator, word(0), "hi"), kNothing);
++  EXPECT_NE(Convert(&transliterator, word(kLimit - 1), "hi"), kNothing);
++  EXPECT_EQ(fake.calls.size(), kLimit);
++
++  // One more fills the cache past its limit: it is emptied and holds only the
++  // new word.
++  EXPECT_NE(Convert(&transliterator, word(kLimit), "hi"), kNothing);
++  EXPECT_EQ(fake.calls.size(), kLimit + 1);
++  EXPECT_NE(Convert(&transliterator, word(kLimit), "hi"), kNothing);
++  EXPECT_EQ(fake.calls.size(), kLimit + 1);
++  EXPECT_NE(Convert(&transliterator, word(0), "hi"), kNothing);
++  EXPECT_EQ(fake.calls.size(), kLimit + 2);
++}
++
++TEST(TarkXlitTransliteratorTest, LoadFromDirectory) {
++  EXPECT_TRUE(RealTransliterator());
++}
++
++TEST(TarkXlitTransliteratorTest, LoadFromDirectoryNeedsBothFiles) {
++  base::ScopedTempDir temp;
++  ASSERT_TRUE(temp.CreateUniqueTempDir());
++  const base::FilePath model = TestDataDir().AppendASCII("xlit-model.bin");
++  const base::FilePath words = TestDataDir().AppendASCII("xlit-words.bin");
++  const base::FilePath garbage = temp.GetPath().AppendASCII("garbage.bin");
++  ASSERT_TRUE(base::WriteFile(garbage, std::string("not a blob at all")));
++
++  // No directory, an empty one.
++  EXPECT_FALSE(LoadFromDirectory(temp.GetPath().AppendASCII("missing")));
++  EXPECT_FALSE(LoadFromDirectory(temp.GetPath()));
++
++  // Only one of the two files.
++  EXPECT_FALSE(LoadFromDirectory(MakeDirectory(temp, "only-model", model, {})));
++  EXPECT_FALSE(LoadFromDirectory(MakeDirectory(temp, "only-words", {}, words)));
++
++  // Both, but one of them is not what it should be.
++  EXPECT_FALSE(
++      LoadFromDirectory(MakeDirectory(temp, "bad-model", garbage, words)));
++  EXPECT_FALSE(
++      LoadFromDirectory(MakeDirectory(temp, "bad-words", model, garbage)));
++  EXPECT_TRUE(LoadFromDirectory(MakeDirectory(temp, "good", model, words)));
++}
++
++TEST(TarkXlitTransliteratorTest, LoadFromBundleReadsIndicxlitInAssets) {
++  base::ScopedTempDir assets;
++  ASSERT_TRUE(assets.CreateUniqueTempDir());
++  base::ScopedPathOverride override_assets(base::DIR_ASSETS, assets.GetPath());
++
++  // Nothing there yet.
++  EXPECT_FALSE(LoadFromBundle());
++
++  MakeDirectory(assets, "indicxlit",
++                TestDataDir().AppendASCII("xlit-model.bin"),
++                TestDataDir().AppendASCII("xlit-words.bin"));
++  const std::unique_ptr<Transliterator> transliterator = LoadFromBundle();
++  ASSERT_TRUE(transliterator);
++  EXPECT_EQ(Convert(transliterator.get(), u"namaste", "hi"), "नमस्ते");
++}
++
++TEST(TarkXlitTransliteratorTest, LoadResourcesFromBundle) {
++  base::ScopedTempDir assets;
++  ASSERT_TRUE(assets.CreateUniqueTempDir());
++  base::ScopedPathOverride override_assets(base::DIR_ASSETS, assets.GetPath());
++  EXPECT_FALSE(LoadResourcesFromBundle());
++
++  MakeDirectory(assets, "indicxlit",
++                TestDataDir().AppendASCII("xlit-model.bin"),
++                TestDataDir().AppendASCII("xlit-words.bin"));
++  const scoped_refptr<Resources> resources = LoadResourcesFromBundle();
++  ASSERT_TRUE(resources);
++  EXPECT_TRUE(resources->model);
++  EXPECT_TRUE(resources->words);
++}
++
++TEST(TarkXlitTransliteratorTest, SharedResourcesSeparateCaches) {
++  scoped_refptr<const Resources> resources =
++      LoadResourcesFromDirectory(TestDataDir());
++  ASSERT_TRUE(resources);
++
++  Transliterator first(resources);
++  auto second = std::make_unique<Transliterator>(resources);
++  EXPECT_FALSE(resources->HasOneRef());
++
++  // A phrase fills only the cache of the instance that worked it out.
++  EXPECT_EQ(Convert(&first, u"namaste", "hi"), "नमस्ते");
++  EXPECT_EQ(first.cache_size_for_testing(), 1u);
++  EXPECT_EQ(second->cache_size_for_testing(), 0u);
++  EXPECT_EQ(Convert(second.get(), u"ke lakshan", "hi"), "के लक्षण");
++  EXPECT_EQ(second->cache_size_for_testing(), 2u);
++  EXPECT_EQ(first.cache_size_for_testing(), 1u);
++
++  // Each instance keeps the resources alive on its own: a word `first` has not
++  // cached still reaches the model.
++  second.reset();
++  resources = nullptr;
++  EXPECT_EQ(Convert(&first, u"lakshan", "hi"), "लक्षण");
++  EXPECT_EQ(first.cache_size_for_testing(), 2u);
++}
++
++}  // namespace tark_xlit
+--- /dev/null
++++ b/components/tark_xlit/xlit_bench.cc
+@@ -0,0 +1,148 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// How long Transliterator::Phrase() takes for one uncached word, which is the
++// cost of the first keystrokes of a new word in the address bar. For each of
++// three languages it times 200 different words and prints the median and the
++// 95th percentile; the address bar's budget is 50 ms at the 95th percentile.
++//
++//   tark_xlit_bench [directory-with-xlit-model.bin-and-xlit-words.bin]
++//
++// The directory defaults to components/tark_xlit/test/data in the source tree.
++// The exit code is 1 when a 95th percentile is over the budget, 2 when the
++// data cannot be loaded.
++
++#include <algorithm>
++#include <array>
++#include <cmath>
++#include <cstddef>
++#include <cstdio>
++#include <memory>
++#include <optional>
++#include <set>
++#include <string>
++#include <string_view>
++#include <utility>
++#include <vector>
++
++#include "base/base_paths.h"
++#include "base/command_line.h"
++#include "base/files/file_path.h"
++#include "base/path_service.h"
++#include "base/strings/utf_string_conversions.h"
++#include "base/time/time.h"
++#include "components/tark_xlit/transliterator.h"
++
++namespace {
++
++constexpr double kBudgetMs = 50;
++constexpr size_t kWordsPerLanguage = 200;
++constexpr std::array<std::string_view, 3> kTags = {"hi", "ta", "bn"};
++
++// Names and words typed in Latin letters for Indian languages. None is an
++// English word, which Phrase() would pass over without asking the model.
++constexpr std::array<std::string_view, 48> kBaseWords = {
++    "namaste", "vanakkam", "namaskar", "pranam", "shukriya", "dhanyavad",
++    "swagat", "salaam", "nandri", "ramesh", "sooraj", "priya", "mohan",
++    "krishna", "lakshmi", "arjun", "gopal", "rahul", "deepika", "suresh",
++    "kavita", "dilli", "mumbai", "nagpur", "kolkata", "bengaluru",
++    "hyderabad", "jaipur", "varanasi", "kerala", "punjab", "bharat",
++    "himalaya", "ganga", "kitab", "pani", "ghar", "doston", "samay", "pyar",
++    "zindagi", "mausam", "darwaza", "khana", "mandir", "shanti", "vidyalaya",
++    "lakshan"};
++
++// Endings that make more words out of the base words.
++constexpr std::array<std::string_view, 6> kEndings = {"",     "a",   "ji",
++                                                      "wala", "pur", "ke"};
++
++// The first 200 different words made of a base word and an ending, taking the
++// endings in order: every base word as it is, then with "a", and so on.
++std::vector<std::string> Words() {
++  std::vector<std::string> words;
++  std::set<std::string> seen;
++  for (std::string_view ending : kEndings) {
++    for (std::string_view base : kBaseWords) {
++      std::string word = std::string(base) + std::string(ending);
++      if (words.size() < kWordsPerLanguage && seen.insert(word).second) {
++        words.push_back(std::move(word));
++      }
++    }
++  }
++  return words;
++}
++
++// The value below which `fraction` of the sorted `times` lie.
++double Percentile(const std::vector<double>& sorted, double fraction) {
++  const size_t rank = static_cast<size_t>(
++      std::ceil(fraction * static_cast<double>(sorted.size())));
++  return sorted[std::clamp<size_t>(rank, 1, sorted.size()) - 1];
++}
++
++}  // namespace
++
++int main(int argc, char** argv) {
++  base::CommandLine::Init(argc, argv);
++  const base::CommandLine::StringVector args =
++      base::CommandLine::ForCurrentProcess()->GetArgs();
++
++  base::FilePath directory;
++  if (!args.empty()) {
++    directory = base::FilePath(args[0]);
++  } else if (base::PathService::Get(base::DIR_SRC_TEST_DATA_ROOT,
++                                    &directory)) {
++    directory = directory.AppendASCII("components/tark_xlit/test/data");
++  } else {
++    std::printf("usage: tark_xlit_bench <directory with the xlit files>\n");
++    return 2;
++  }
++
++  const base::TimeTicks load_start = base::TimeTicks::Now();
++  std::unique_ptr<tark_xlit::Transliterator> transliterator =
++      tark_xlit::LoadFromDirectory(directory);
++  if (!transliterator) {
++    std::printf("cannot load xlit-model.bin and xlit-words.bin from %s\n",
++                directory.value().c_str());
++    return 2;
++  }
++  std::printf("load: %.0f ms\n",
++              (base::TimeTicks::Now() - load_start).InMillisecondsF());
++
++  // The first word goes through cold code and caches; it is not timed.
++  transliterator->Phrase(u"warmup", "hi");
++
++  const std::vector<std::string> words = Words();
++  int exit_code = 0;
++  for (std::string_view tag : kTags) {
++    // The cache is keyed on the language as well as the word, so no word here
++    // has been asked for before.
++    std::vector<double> times;
++    size_t unchanged = 0;
++    for (const std::string& word : words) {
++      const std::u16string input = base::UTF8ToUTF16(word);
++      const base::TimeTicks start = base::TimeTicks::Now();
++      const std::optional<std::u16string> result =
++          transliterator->Phrase(input, tag);
++      times.push_back((base::TimeTicks::Now() - start).InMillisecondsF());
++      if (!result) {
++        ++unchanged;
++      }
++    }
++    std::ranges::sort(times);
++    const double p95 = Percentile(times, 0.95);
++    std::printf("%s: n=%zu p50=%.2f ms p95=%.2f ms max=%.2f ms%s\n",
++                std::string(tag).c_str(), times.size(), Percentile(times, 0.5),
++                p95, times.back(), p95 > kBudgetMs ? "  OVER BUDGET" : "");
++    if (unchanged > 0) {
++      // The timings above include words the model never saw.
++      std::printf("%s: %zu words came back unchanged\n",
++                  std::string(tag).c_str(), unchanged);
++      exit_code = std::max(exit_code, 2);
++    }
++    if (p95 > kBudgetMs) {
++      exit_code = std::max(exit_code, 1);
++    }
++  }
++  std::printf("budget: p95 <= %.0f ms\n", kBudgetMs);
++  return exit_code;
++}
