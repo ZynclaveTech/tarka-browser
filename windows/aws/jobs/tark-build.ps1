@@ -8,6 +8,8 @@
 # (stops) at the end, success or not.
 param([string]$Bucket, [string]$Prefix, [string]$Ref = 'main', [switch]$Fresh, [switch]$PatchOnly)
 $ErrorActionPreference = 'Continue'
+# Windows PowerShell 5.1 redirects (*>>) as UTF-16; logs are read on the Mac.
+$PSDefaultParameterValues['Out-File:Encoding'] = 'utf8'
 $repo = 'C:\tarka-browser'
 $work = 'C:\tw'
 $log = 'C:\tark-logs\tark-build.log'

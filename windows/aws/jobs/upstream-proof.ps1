@@ -8,6 +8,8 @@
 # machine shuts down (stops) at the end, success or not.
 param([string]$Bucket, [string]$Prefix, [string]$Tag = '155.0.8059.39-1.1')
 $ErrorActionPreference = 'Continue'
+# Windows PowerShell 5.1 redirects (*>>) as UTF-16; logs are read on the Mac.
+$PSDefaultParameterValues['Out-File:Encoding'] = 'utf8'
 $root = 'C:\ucw'
 $log = 'C:\tark-logs\upstream-proof.log'
 New-Item -ItemType Directory -Force -Path 'C:\tark-logs' | Out-Null
