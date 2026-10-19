@@ -64,6 +64,8 @@ class TestAndroidConfig(unittest.TestCase):
         self.assertNotIn('UC_OUT', text)
         self.assertIn("target_os = ['android']", text)
         self.assertIn('target_os_only = False', text)
+        # DEPS gates the Android SDK on 'checkout_android and non_git_source'.
+        self.assertIn('"non_git_source": "True"', text)
         compile(text, 'gclient.android', 'exec')
 
 
