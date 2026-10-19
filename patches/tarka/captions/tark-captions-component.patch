@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/components/tark_captions/BUILD.gn
-@@ -0,0 +1,53 @@
+@@ -0,0 +1,58 @@
 +# Copyright 2026 The Tark Authors
 +# Use of this source code is governed by a BSD-style license that can be
 +# found in the LICENSE file.
@@ -20,6 +20,10 @@
 +    "mel_frontend.h",
 +    "ort_runtime.cc",
 +    "ort_runtime.h",
++    "segmenter.cc",
++    "segmenter.h",
++    "vad.cc",
++    "vad.h",
 +  ]
 +  include_dirs = [ "//third_party/tark_onnxruntime/include" ]
 +  deps = [
@@ -45,6 +49,7 @@
 +    "asr_model_unittest.cc",
 +    "mel_frontend_unittest.cc",
 +    "ort_runtime_unittest.cc",
++    "segmenter_unittest.cc",
 +  ]
 +  deps = [
 +    ":tark_captions",
@@ -1048,6 +1053,372 @@
 +  EXPECT_EQ(LanguageFromCode("bn"), Language::kBengali);
 +  EXPECT_EQ(LanguageFromCode("sw"), std::nullopt);
 +  EXPECT_STREQ(LanguageCode(Language::kTamil), "ta");
++}
++
++}  // namespace
++}  // namespace tark_captions
+--- /dev/null
++++ b/components/tark_captions/vad.h
+@@ -0,0 +1,47 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef COMPONENTS_TARK_CAPTIONS_VAD_H_
++#define COMPONENTS_TARK_CAPTIONS_VAD_H_
++
++#include <memory>
++#include <vector>
++
++#include "base/containers/span.h"
++#include "base/files/file_path.h"
++
++namespace tark_captions {
++
++class OrtModel;
++class OrtRuntime;
++
++// Silero VAD (MIT): the probability that a 32 ms chunk of 16 kHz audio is
++// speech. Keeps the model's recurrent state and a 64-sample context
++// between chunks, as Silero's own wrapper does.
++class Vad {
++ public:
++  static constexpr size_t kChunk = 512;
++
++  // Reads silero_vad.onnx from `models_dir`; null if missing or invalid.
++  static std::unique_ptr<Vad> Load(OrtRuntime* runtime, const base::FilePath& models_dir);
++
++  Vad(const Vad&) = delete;
++  Vad& operator=(const Vad&) = delete;
++  ~Vad();
++
++  // 0 on a model error.
++  float Process(base::span<const float, kChunk> chunk);
++  void Reset();
++
++ private:
++  explicit Vad(std::unique_ptr<OrtModel> model);
++
++  std::unique_ptr<OrtModel> model_;
++  std::vector<float> state_;    // (2, 1, 128)
++  std::vector<float> context_;  // the previous chunk's last 64 samples
++};
++
++}  // namespace tark_captions
++
++#endif  // COMPONENTS_TARK_CAPTIONS_VAD_H_
+--- /dev/null
++++ b/components/tark_captions/vad.cc
+@@ -0,0 +1,54 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/tark_captions/vad.h"
++
++#include <utility>
++
++#include "base/memory/ptr_util.h"
++#include "components/tark_captions/ort_runtime.h"
++
++namespace tark_captions {
++namespace {
++
++constexpr size_t kContext = 64;
++constexpr size_t kState = 2 * 1 * 128;
++
++}  // namespace
++
++// static
++std::unique_ptr<Vad> Vad::Load(OrtRuntime* runtime, const base::FilePath& models_dir) {
++  std::unique_ptr<OrtModel> model = runtime->LoadModel(models_dir.Append("silero_vad.onnx"), 1);
++  return model ? base::WrapUnique(new Vad(std::move(model))) : nullptr;
++}
++
++Vad::Vad(std::unique_ptr<OrtModel> model) : model_(std::move(model)) {
++  Reset();
++}
++
++Vad::~Vad() = default;
++
++void Vad::Reset() {
++  state_.assign(kState, 0.0f);
++  context_.assign(kContext, 0.0f);
++}
++
++float Vad::Process(base::span<const float, kChunk> chunk) {
++  std::vector<Tensor> inputs(3);
++  inputs[0] = {.name = "input", .shape = {1, static_cast<int64_t>(kContext + kChunk)}};
++  inputs[0].f32 = context_;
++  inputs[0].f32.insert(inputs[0].f32.end(), chunk.begin(), chunk.end());
++  inputs[1] = {.name = "state", .shape = {2, 1, 128}, .f32 = state_};
++  inputs[2] = {.name = "sr", .shape = {}, .i64 = {16000}};
++  std::vector<Tensor> outputs;
++  context_.assign(chunk.end() - kContext, chunk.end());
++  if (!model_->Run(inputs, {"output", "stateN"}, &outputs) || outputs[0].f32.empty() ||
++      outputs[1].f32.size() != kState) {
++    return 0.0f;
++  }
++  state_ = std::move(outputs[1].f32);
++  return outputs[0].f32[0];
++}
++
++}  // namespace tark_captions
+--- /dev/null
++++ b/components/tark_captions/segmenter.h
+@@ -0,0 +1,58 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef COMPONENTS_TARK_CAPTIONS_SEGMENTER_H_
++#define COMPONENTS_TARK_CAPTIONS_SEGMENTER_H_
++
++#include <optional>
++#include <utility>
++#include <vector>
++
++namespace tark_captions {
++
++// What to decode after a chunk: nothing, a draft of the current segment,
++// or the segment's final text. Times are seconds of audio.
++struct SegmenterAction {
++  enum Kind { kNone, kDraft, kFinal } kind = kNone;
++  double start_s = 0;
++  double end_s = 0;
++};
++
++// Turns per-chunk speech probabilities into decode actions (the D4 spike's
++// CPU fix, measured at ~25% of a core and ~0.5 s lag): nothing is decoded
++// in silence; while someone speaks the segment is redrafted every 0.8 s;
++// a 0.5 s pause makes it final; a segment reaching 5 s is cut at its
++// quietest chunk of the last 2.5 s (never in its first second) so a draft
++// never spans more than 5 s. Segments under 0.3 s are not decoded.
++class Segmenter {
++ public:
++  static constexpr float kSpeech = 0.5f;
++  static constexpr double kPreRoll = 0.3;
++  static constexpr double kPostRoll = 0.2;
++  static constexpr double kPause = 0.5;
++  static constexpr double kDraftEvery = 0.8;
++  static constexpr double kMaxSegment = 5.0;
++  static constexpr double kMinSegment = 0.3;
++
++  Segmenter();
++  ~Segmenter();
++
++  // `chunk_end_s`: the end of the chunk `speech_prob` describes.
++  SegmenterAction OnChunk(double chunk_end_s, float speech_prob);
++  // At the end of the audio: the open segment's final, if any.
++  std::optional<SegmenterAction> Flush(double audio_end_s);
++
++ private:
++  SegmenterAction Make(SegmenterAction::Kind kind, double start_s, double end_s) const;
++
++  bool speaking_ = false;
++  double segment_start_ = 0;
++  double last_speech_ = 0;
++  double last_draft_ = 0;
++  std::vector<std::pair<double, float>> probs_;  // this segment's chunks
++};
++
++}  // namespace tark_captions
++
++#endif  // COMPONENTS_TARK_CAPTIONS_SEGMENTER_H_
+--- /dev/null
++++ b/components/tark_captions/segmenter.cc
+@@ -0,0 +1,69 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/tark_captions/segmenter.h"
++
++#include <algorithm>
++
++namespace tark_captions {
++
++Segmenter::Segmenter() = default;
++Segmenter::~Segmenter() = default;
++
++SegmenterAction Segmenter::Make(SegmenterAction::Kind kind, double start_s, double end_s) const {
++  if (end_s - start_s < kMinSegment) {
++    return {};
++  }
++  return {.kind = kind, .start_s = start_s, .end_s = end_s};
++}
++
++SegmenterAction Segmenter::OnChunk(double now, float speech_prob) {
++  if (speech_prob >= kSpeech) {
++    last_speech_ = now;
++    if (!speaking_) {
++      speaking_ = true;
++      segment_start_ = std::max(0.0, now - kPreRoll);
++      last_draft_ = now;
++      probs_.clear();
++    }
++  }
++  if (!speaking_) {
++    return {};
++  }
++  probs_.emplace_back(now, speech_prob);
++  if (now - last_speech_ >= kPause) {
++    speaking_ = false;
++    return Make(SegmenterAction::kFinal, segment_start_, last_speech_ + kPostRoll);
++  }
++  if (now - segment_start_ >= kMaxSegment) {
++    double cut = now;
++    float lowest = 2.0f;
++    for (const auto& [t, p] : probs_) {
++      if (t >= now - kMaxSegment / 2 && t >= segment_start_ + 1.0 && p < lowest) {
++        cut = t;
++        lowest = p;
++      }
++    }
++    const double start = segment_start_;
++    segment_start_ = cut;
++    std::erase_if(probs_, [cut](const auto& tp) { return tp.first <= cut; });
++    return Make(SegmenterAction::kFinal, start, cut);
++  }
++  if (now - last_draft_ >= kDraftEvery) {
++    last_draft_ = now;
++    return Make(SegmenterAction::kDraft, segment_start_, now);
++  }
++  return {};
++}
++
++std::optional<SegmenterAction> Segmenter::Flush(double audio_end_s) {
++  if (!speaking_) {
++    return std::nullopt;
++  }
++  speaking_ = false;
++  SegmenterAction a = Make(SegmenterAction::kFinal, segment_start_, audio_end_s);
++  return a.kind == SegmenterAction::kNone ? std::nullopt : std::optional(a);
++}
++
++}  // namespace tark_captions
+--- /dev/null
++++ b/components/tark_captions/segmenter_unittest.cc
+@@ -0,0 +1,123 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/tark_captions/segmenter.h"
++
++#include <cmath>
++#include <functional>
++#include <vector>
++
++#include "components/tark_captions/ort_runtime.h"
++#include "components/tark_captions/test_util.h"
++#include "components/tark_captions/vad.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace tark_captions {
++namespace {
++
++constexpr double kChunk = 512.0 / 16000.0;  // 32 ms
++
++// Feeds `seconds` of chunks whose probability is prob(chunk end time) and
++// returns every action that is not kNone.
++std::vector<SegmenterAction> Feed(Segmenter& segmenter, double seconds,
++                                  const std::function<float(double)>& prob) {
++  std::vector<SegmenterAction> actions;
++  for (int i = 1; i * kChunk <= seconds + 1e-9; ++i) {
++    const double t = i * kChunk;
++    SegmenterAction a = segmenter.OnChunk(t, prob(t));
++    if (a.kind != SegmenterAction::kNone) {
++      actions.push_back(a);
++    }
++  }
++  return actions;
++}
++
++TEST(SegmenterTest, NoSpeechNoDecode) {
++  Segmenter segmenter;
++  EXPECT_TRUE(Feed(segmenter, 60, [](double) { return 0.05f; }).empty());
++  EXPECT_FALSE(segmenter.Flush(60));
++}
++
++TEST(SegmenterTest, PauseFinalises) {
++  Segmenter segmenter;
++  std::vector<SegmenterAction> actions =
++      Feed(segmenter, 2.6, [](double t) { return t <= 2.0 ? 0.9f : 0.05f; });
++  const double last_speech = std::floor(2.0 / kChunk) * kChunk;
++  int finals = 0;
++  for (const SegmenterAction& a : actions) {
++    if (a.kind == SegmenterAction::kFinal) {
++      ++finals;
++      EXPECT_NEAR(a.start_s, 0.0, 1e-9);
++      EXPECT_NEAR(a.end_s, last_speech + 0.2, 1e-9);
++    }
++  }
++  EXPECT_EQ(finals, 1);
++}
++
++TEST(SegmenterTest, DraftEveryPointEight) {
++  Segmenter segmenter;
++  std::vector<double> draft_ends;
++  for (const SegmenterAction& a : Feed(segmenter, 4.0, [](double) { return 0.9f; })) {
++    ASSERT_EQ(a.kind, SegmenterAction::kDraft);
++    draft_ends.push_back(a.end_s);
++  }
++  ASSERT_GE(draft_ends.size(), 4u);
++  for (size_t i = 1; i < draft_ends.size(); ++i) {
++    const double gap = draft_ends[i] - draft_ends[i - 1];
++    EXPECT_GE(gap, 0.8 - 1e-9);
++    EXPECT_LT(gap, 0.8 + kChunk + 1e-9);
++  }
++}
++
++TEST(SegmenterTest, LongSpeechCutAtFive) {
++  Segmenter segmenter;
++  const double dip = std::round(4.1 / kChunk) * kChunk;
++  std::vector<SegmenterAction> actions = Feed(segmenter, 20, [&](double t) {
++    return std::abs(t - dip) < 1e-6 ? 0.3f : 0.9f;
++  });
++  bool first_final = true;
++  for (const SegmenterAction& a : actions) {
++    EXPECT_LE(a.end_s - a.start_s, 5.0 + 1e-9);
++    if (a.kind == SegmenterAction::kFinal && first_final) {
++      EXPECT_NEAR(a.end_s, dip, 1e-9);
++      first_final = false;
++    }
++  }
++  EXPECT_FALSE(first_final);
++}
++
++TEST(SegmenterTest, ShortBlipIsNotDecoded) {
++  Segmenter segmenter;
++  // One 32 ms chunk of speech: its segment would be [0, 0.232], under 0.3 s.
++  EXPECT_TRUE(Feed(segmenter, 2, [](double t) { return t <= kChunk ? 0.9f : 0.05f; }).empty());
++}
++
++TEST(VadTest, VadMatchesGolden) {
++  std::optional<base::FilePath> ort = test::OrtPath();
++  std::optional<base::FilePath> models = test::ModelsDir();
++  std::optional<base::FilePath> testdata = test::TestDataDir();
++  if (!ort || !models || !testdata) {
++    GTEST_SKIP() << "set TARK_CAPTIONS_ORT, TARK_CAPTIONS_MODELS and TARK_CAPTIONS_TESTDATA";
++  }
++  std::unique_ptr<OrtRuntime> runtime = OrtRuntime::Load(*ort);
++  ASSERT_TRUE(runtime);
++  for (const base::Value& clip : test::GoldenClips(*testdata)) {
++    std::unique_ptr<Vad> vad = Vad::Load(runtime.get(), *models);
++    ASSERT_TRUE(vad);
++    const std::string& wav = *clip.GetDict().FindString("wav");
++    int rate = 0;
++    std::vector<float> pcm = test::ReadWav(testdata->AppendASCII(wav), &rate);
++    const base::ListValue& golden = *clip.GetDict().FindList("vad_probs");
++    ASSERT_EQ(golden.size(), pcm.size() / 512) << wav;
++    float worst = 0;
++    for (size_t i = 0; i < golden.size(); ++i) {
++      const float p = vad->Process(base::span(pcm).subspan(i * 512).first<512>());
++      worst = std::max(worst, std::abs(p - static_cast<float>(golden[i].GetDouble())));
++    }
++    EXPECT_LE(worst, 0.02f) << wav;
++  }
 +}
 +
 +}  // namespace
