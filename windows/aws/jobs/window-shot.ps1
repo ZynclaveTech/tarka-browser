@@ -4,29 +4,47 @@
 #
 # W1: screenshot Tark's real window in the `tarkdesk` desktop session
 # (jobs/desktop-setup.ps1). Runs Tark from the last build's zip with a
-# scratch profile, opens a few pages, and captures the whole screen a few
-# times: the window frame, the one row, the Tark sheet's mark, a page.
+# scratch profile, opens a few pages, and captures the whole screen.
+#
+# Folders: everything SYSTEM installs or runs (the app, the inner script) is
+# in a folder only SYSTEM and Administrators can write; tarkdesk may read
+# and run it. tarkdesk writes only to out\ (profile, screenshots), which
+# SYSTEM never deletes recursively or re-permissions: it is removed with
+# rmdir (which does not follow junctions) and recreated fresh, and files are
+# uploaded only if they are not reparse points.
 param([string]$Bucket, [string]$Prefix, [string]$Urls = 'https://gettarka.com/ chrome://settings/ chrome://downloads/')
 $ErrorActionPreference = 'Continue'
 $PSDefaultParameterValues['Out-File:Encoding'] = 'utf8'
 cmd.exe /c "shutdown /a >nul 2>&1"
-$dir = 'C:\desk'
-$log = "$dir\window-shot.log"
-Remove-Item -Recurse -Force $dir -ErrorAction SilentlyContinue
-New-Item -ItemType Directory -Force -Path $dir | Out-Null
-icacls $dir /grant 'tarkdesk:(OI)(CI)M' | Out-Null
+
+$base = Join-Path $env:ProgramData 'TarkDesk'
+$app = Join-Path $base 'app'
+$out = Join-Path $base 'out'
+$log = Join-Path $env:ProgramData 'TarkSetup\window-shot.log'
+New-Item -ItemType Directory -Force -Path (Split-Path $log) | Out-Null
+Set-Content $log "window-shot $(Get-Date -Format o)"
 function Upload($file, $key) {
-  if (Test-Path $file) { Write-S3Object -BucketName $Bucket -Key "$Prefix/$key" -File $file -Region ap-south-1 }
+  if ((Test-Path $file) -and -not ((Get-Item $file -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+    Write-S3Object -BucketName $Bucket -Key "$Prefix/$key" -File $file -Region ap-south-1
+  }
 }
 try {
-  $session = (quser 2>$null | Select-String 'tarkdesk')
-  "session: $session" | Add-Content $log
+  # The locked part: SYSTEM and Administrators write, tarkdesk reads and runs.
+  New-Item -ItemType Directory -Force -Path $base | Out-Null
+  if ((Get-Item $base -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "$base is a reparse point" }
+  icacls $base /inheritance:r /grant:r 'SYSTEM:(OI)(CI)F' 'Administrators:(OI)(CI)F' 'tarkdesk:(OI)(CI)RX' | Out-Null
+  if (Test-Path $out) { cmd.exe /c "rmdir /s /q `"$out`"" }
+  if (Test-Path $app) { cmd.exe /c "rmdir /s /q `"$app`"" }
   $zip = Get-ChildItem 'C:\tw\build' -File -Filter '*_windows_x64.zip' | Select-Object -First 1
-  Expand-Archive -Path $zip.FullName -DestinationPath "$dir\app" -Force
-  $exe = (Get-ChildItem "$dir\app" -Recurse -Filter 'chrome.exe' | Select-Object -First 1).FullName
-  icacls "$dir\app" /grant 'tarkdesk:(OI)(CI)RX' /T | Out-Null
+  Expand-Archive -Path $zip.FullName -DestinationPath $app -Force
+  $exe = (Get-ChildItem $app -Recurse -Filter 'chrome.exe' | Select-Object -First 1).FullName
+  "exe $exe" | Add-Content $log
 
-  # The script the desktop session runs: start Tark, wait, screenshot.
+  # The one folder tarkdesk may write, created fresh.
+  New-Item -ItemType Directory -Path $out | Out-Null
+  icacls $out /grant 'tarkdesk:(OI)(CI)M' | Out-Null
+
+  $urlArgs = ($Urls -split ' ' | ForEach-Object { "'$_'" }) -join ', '
   $inner = @"
 Add-Type -AssemblyName System.Windows.Forms, System.Drawing
 function Shot(`$name) {
@@ -34,29 +52,29 @@ function Shot(`$name) {
   `$bmp = New-Object System.Drawing.Bitmap `$b.Width, `$b.Height
   `$g = [System.Drawing.Graphics]::FromImage(`$bmp)
   `$g.CopyFromScreen(`$b.Location, [System.Drawing.Point]::Empty, `$b.Size)
-  `$bmp.Save("$dir\`$name.png", [System.Drawing.Imaging.ImageFormat]::Png)
+  `$bmp.Save('$out\' + `$name + '.png', [System.Drawing.Imaging.ImageFormat]::Png)
   `$g.Dispose(); `$bmp.Dispose()
 }
-Start-Process -FilePath '$exe' -ArgumentList @('--user-data-dir=$dir\profile', '--no-first-run', '--start-maximized', $(($Urls -split ' ' | ForEach-Object { "'$_'" }) -join ', '))
+Start-Process -FilePath '$exe' -ArgumentList @('--user-data-dir=$out\profile', '--no-first-run', '--start-maximized', $urlArgs)
 Start-Sleep -Seconds 20
 Shot 'window-1'
 Start-Sleep -Seconds 5
-Add-Type -AssemblyName Microsoft.VisualBasic
-[System.Windows.Forms.SendKeys]::SendWait('^1')
-Start-Sleep -Seconds 3
 Shot 'window-2'
-Set-Content '$dir\done.txt' 'done'
+Set-Content '$out\done.txt' 'done'
 "@
-  Set-Content -Path "$dir\inner.ps1" -Value $inner
-  $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -File $dir\inner.ps1"
+  Set-Content -Path (Join-Path $base 'inner.ps1') -Value $inner
+  $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$base\inner.ps1`""
   $principal = New-ScheduledTaskPrincipal -UserId 'tarkdesk' -LogonType Interactive -RunLevel Limited
   Register-ScheduledTask -TaskName 'tark-window-shot' -Action $action -Principal $principal -Force | Out-Null
+  "session: $(quser 2>$null | Select-String 'tarkdesk')" | Add-Content $log
   Start-ScheduledTask -TaskName 'tark-window-shot'
-  for ($i = 0; $i -lt 60 -and -not (Test-Path "$dir\done.txt"); $i++) { Start-Sleep -Seconds 2 }
-  "done: $(Test-Path "$dir\done.txt")" | Add-Content $log
+  for ($i = 0; $i -lt 60 -and -not (Test-Path "$out\done.txt"); $i++) { Start-Sleep -Seconds 2 }
+  "done: $(Test-Path "$out\done.txt")" | Add-Content $log
   Get-Process chrome -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
   Unregister-ScheduledTask -TaskName 'tark-window-shot' -Confirm:$false
-  Get-ChildItem $dir -Filter 'window-*.png' | ForEach-Object { Upload $_.FullName $_.Name }
+  foreach ($name in 'window-1.png', 'window-2.png') { Upload (Join-Path $out $name) $name }
+} catch {
+  "ERROR: $($_.Exception.Message)" | Add-Content $log
 } finally {
   Upload $log 'window-shot.log'
   if (-not (Get-Process ninja, clang-cl, lld-link, python, python3, 7z -ErrorAction SilentlyContinue)) {

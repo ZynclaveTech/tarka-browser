@@ -51,11 +51,20 @@ job)
   prefix=jobs/$name-$(date +%Y%m%d-%H%M%S)
   aws s3 cp --quiet $job s3://$B/$prefix/$name.ps1
   args="-Bucket $B -Prefix $prefix ${*:-}"
+  params=$(python3 - "${0:A:h}/ssm-prelude.ps1" $B $prefix/$name.ps1 "$args" <<'PY'
+import base64, json, sys
+prelude, bucket, key, args = sys.argv[1:]
+text = open(prelude, encoding='utf-8').read()
+text = text.replace('__BUCKET__', bucket).replace('__KEY__', key).replace('__ARGS__', args)
+encoded = base64.b64encode(text.encode('utf-16-le')).decode()
+print(json.dumps({"executionTimeout": ["172800"],
+                  "commands": [f"powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand {encoded}"]}))
+PY
+)
   id=$(aws ssm send-command --region $R --instance-ids $I --document-name AWS-RunPowerShellScript \
     --comment "tark $name" --timeout-seconds 600 \
     --output-s3-bucket-name $B --output-s3-key-prefix $prefix/ssm \
-    --parameters "$(python3 -c 'import json,sys; b,p,n,a=sys.argv[1:]; print(json.dumps({"executionTimeout":["172800"],"commands":[f"Read-S3Object -BucketName {b} -Key {p}/{n}.ps1 -File C:\\\\tark-job.ps1 -Region ap-south-1 | Out-Null", f"powershell -NoProfile -ExecutionPolicy Bypass -File C:\\\\tark-job.ps1 {a}"]}))' $B $prefix $name "$args")" \
-    --query Command.CommandId --output text)
+    --parameters "$params" --query Command.CommandId --output text)
   echo "command $id"; echo "prefix $prefix";;
 wait)
   until s=$(aws ssm get-command-invocation --region $R --command-id $2 --instance-id $I --query Status --output text 2>/dev/null) \
