@@ -61,5 +61,40 @@ class TestPaperPalette(unittest.TestCase):
         self.assertNotIn('material_dynamic_', self.add)
 
 
+class TestAddressBar(unittest.TestCase):
+    def setUp(self):
+        self.assertIn('android/look-address-bar.patch', series())
+        self.p = patch('look-address-bar.patch')
+        self.add = added(self.p)
+
+    def test_no_home_or_profile_button(self):
+        self.assertIn('boolean defaultEnabled = false;', self.add)
+        self.assertIn('mButtonDataProviders = List.of(adaptiveToolbarButtonController);', self.add)
+        self.assertIn('-            mButtonDataProviders = List.of(identityDiscController, adaptiveToolbarButtonController);', self.p)
+
+    def test_mark_is_the_menu_button(self):
+        self.assertIn('android:src="@drawable/tark_mark_menu"', self.add)
+        self.assertIn('-           app:tint="@color/default_icon_color_tint_list" />', self.p)
+        # MenuButton cast the icon to BitmapDrawable: a vector would crash it.
+        self.assertIn('-                (BitmapDrawable)', self.p)
+        self.assertIn('-        ImageViewCompat.setImageTintList(mMenuImageButton, tintList);', self.p)
+
+    def test_mark_vectors(self):
+        for name in ('tark_mark_menu.xml', 'tark_mark_24dp.xml'):
+            self.assertIn(name, self.p)
+        # Three circles in the mid palette, no tint.
+        for colour in ('#B78100', '#E63E5C', '#6C63FF'):
+            self.assertEqual(self.p.count(f'android:fillColor="{colour}"'), 2, colour)
+
+    def test_shodhya_shows_the_mark(self):
+        # The user's report: Shodhya's favicon showed as a dark square.
+        self.assertIn('"shodhya.com".equals(templateUrl.getKeyword())', self.add)
+        self.assertIn('new StatusIconResource(R.drawable.tark_mark_24dp, Resources.ID_NULL)', self.add)
+
+    def test_pill_hairline(self):
+        self.assertIn('setHairlineBehavior(HairlineBehavior.SOLID)', self.add)
+        self.assertIn('R.color.tark_rule_dark', self.add)
+
+
 if __name__ == '__main__':
     unittest.main()
