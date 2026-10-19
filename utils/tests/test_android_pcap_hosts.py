@@ -77,6 +77,17 @@ class TestPcapHosts(unittest.TestCase):
         result = subprocess.run([sys.executable, str(TOOL), str(good)], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def test_baseline_names_are_left_out(self):
+        # The emulator's own traffic (an idle capture) is not Tark's.
+        run = self.write([ethernet(udp_ipv4(dns_query('time.android.com')), 0x0800),
+                          ethernet(udp_ipv4(dns_query('shodhya.com')), 0x0800)])
+        idle = self.write([ethernet(udp_ipv4(dns_query('time.android.com')), 0x0800)])
+        result = subprocess.run([sys.executable, str(TOOL), str(run), '--baseline', str(idle)],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn('time.android.com', result.stdout)
+        self.assertIn('shodhya.com', result.stdout)
+
     def test_not_a_pcap(self):
         path = pathlib.Path(tempfile.mkdtemp()) / 'x.pcap'
         path.write_bytes(b'nope')

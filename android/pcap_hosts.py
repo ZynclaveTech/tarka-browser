@@ -10,9 +10,10 @@ A1's second network check, beside check_netlog.sh: the emulator's capture
 Services, which never reach Chromium's net log. Run it with Play Services and
 the system's own probes turned off, so every name left is Tark's.
 
-usage: pcap_hosts.py CAPTURE.pcap [--allowed ALLOWED.txt]
+usage: pcap_hosts.py CAPTURE.pcap [--baseline IDLE.pcap] [--allowed ALLOWED.txt]
 Prints each name with its count and the names not on the list; exits 1 if
-there are any, 2 if the file is not a capture it can read.
+there are any, 2 if a file is not a capture it can read. Names in the
+baseline (the same emulator left idle, without Tark) are left out.
 """
 import argparse
 import collections
@@ -93,24 +94,31 @@ def _query_name(dns):
 def queried_hosts(path):
     """Counter of name -> number of DNS queries in a capture."""
     hosts = collections.Counter()
-    for linktype, frame in _frames(pathlib.Path(path).read_bytes()):
-        dns = _udp_payload_to_53(linktype, frame)
-        name = _query_name(dns) if dns else None
-        if name:
-            hosts[name.rstrip('.')] += 1
+    try:
+        for linktype, frame in _frames(pathlib.Path(path).read_bytes()):
+            dns = _udp_payload_to_53(linktype, frame)
+            name = _query_name(dns) if dns else None
+            if name:
+                hosts[name.rstrip('.')] += 1
+    except NotACapture as e:
+        raise NotACapture(f'{path}: {e}') from None
     return hosts
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument('capture')
+    parser.add_argument('--baseline')
     parser.add_argument('--allowed', default=str(pathlib.Path(__file__).with_name('allowed_hosts.txt')))
     args = parser.parse_args(argv)
     try:
         hosts = queried_hosts(args.capture)
+        idle = queried_hosts(args.baseline) if args.baseline else {}
     except NotACapture as e:
-        print(f'{args.capture}: {e}', file=sys.stderr)
+        print(f'{e}', file=sys.stderr)
         return 2
+    for host in idle:
+        hosts.pop(host, None)
     for host, count in sorted(hosts.items(), key=lambda kv: (-kv[1], kv[0])):
         print(f'{count:6d}  {host}')
     unknown = strangers(hosts, load_allowed(args.allowed))
