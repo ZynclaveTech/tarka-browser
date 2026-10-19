@@ -23,7 +23,10 @@ def dryrun(*args):
             if (work / 'tark-patches' / 'series').exists() else '',
             'args': (work / 'src' / 'out' / 'Default' / 'args.gn').read_text()
             if (work / 'src' / 'out' / 'Default' / 'args.gn').exists() else '',
-            'clone': (work / 'clone.py').read_text() if (work / 'clone.py').exists() else '',
+            'clone': (work / 'uc' / 'utils' / 'clone.py').read_text()
+            if (work / 'uc' / 'utils' / 'clone.py').exists() else '',
+            'uc_files': sorted(str(f.relative_to(work / 'uc')) for f in (work / 'uc').rglob('*')
+                               if f.is_file()) if (work / 'uc').exists() else [],
         }
         runs = [l[len('tark: run '):] for l in result.stdout.splitlines()
                 if l.startswith('tark: run ')]
@@ -67,8 +70,11 @@ class TestAndroidBuildSh(unittest.TestCase):
         # on the path copy() returns); build.sh runs a copy with that line fixed.
         result, runs, files, tmp = dryrun('--stop-before-gn')
         clone = runs[index_of(runs, '/clone.py')]
-        self.assertIn(f'{tmp}/clone.py', clone)
-        self.assertIn('PYTHONPATH=', clone)
+        self.assertIn(f'{tmp}/uc/utils/clone.py', clone)
+        # clone.py reads files beside it and ../chromium_version.txt.
+        for f in ('utils/depot_tools.patch', 'utils/gsutil.patch', 'utils/_common.py',
+                  'chromium_version.txt'):
+            self.assertIn(f, files['uc_files'])
         self.assertIn("copy(args.custom_config, ucstaging / '.gclient')\n", files['clone'])
         self.assertNotIn(".gclient').replace('UC_OUT'", files['clone'])
         self.assertIn('def clone(args)', files['clone'])

@@ -48,15 +48,21 @@ mkdir -p "$_src_dir" "$_download_cache"
 #    in a custom config, so the config is filled in here.
 sed "s|UC_OUT|$_src_dir|g" "$_root_dir/android/gclient.android" > "$work/gclient"
 # ...and its -c path crashes on current Python (it calls Path.replace(old,
-# new) on the path copy() returns), so a copy with that line fixed runs, with
-# ungoogled's utils on PYTHONPATH for its imports. The submodule is untouched.
-sed "s|copy(args.custom_config, ucstaging / '.gclient').replace('UC_OUT', str(args.output))|copy(args.custom_config, ucstaging / '.gclient')|" \
-  "$_main_repo/utils/clone.py" > "$work/clone.py"
-if grep -q ".gclient').replace('UC_OUT'" "$work/clone.py"; then
+# new) on the path copy() returns). A copy of ungoogled's utils/ (clone.py
+# reads depot_tools.patch and gsutil.patch beside it, and
+# ../chromium_version.txt) runs instead, with that one line fixed. The
+# submodule is untouched.
+rm -rf "$work/uc" && mkdir -p "$work/uc"
+cp -R "$_main_repo/utils" "$work/uc/utils"
+cp "$_main_repo/chromium_version.txt" "$work/uc/"
+sed -i.orig "s|copy(args.custom_config, ucstaging / '.gclient').replace('UC_OUT', str(args.output))|copy(args.custom_config, ucstaging / '.gclient')|" \
+  "$work/uc/utils/clone.py"
+rm -f "$work/uc/utils/clone.py.orig"
+if grep -q ".gclient').replace('UC_OUT'" "$work/uc/utils/clone.py"; then
   echo "tark: clone.py changed upstream; android/build.sh's fix no longer applies" >&2
   exit 1
 fi
-run env PYTHONPATH="$_main_repo/utils" python3 "$work/clone.py" -o "$_src_dir" -c "$work/gclient" -s amd64
+run python3 "$work/uc/utils/clone.py" -o "$_src_dir" -c "$work/gclient" -s amd64
 
 # 2. Prune binaries, as every ungoogled-chromium build does.
 run python3 "$_main_repo/utils/prune_binaries.py" "$_src_dir" "$_main_repo/pruning.list"
