@@ -51,6 +51,8 @@ class TestBootstrap(unittest.TestCase):
         self.assertIn('install-build-deps', self.s)
         self.assertIn('--android', self.s)
         self.assertIn('swapon', self.s)
+        # install-build-deps.sh execs the .py directly: both must be executable.
+        self.assertIn('chmod +x install-build-deps.sh install-build-deps.py', self.s)
 
     def test_idle_watchdog_30_minutes(self):
         self.assertIn('tark-idle-stop', self.s)

@@ -22,7 +22,7 @@ mkdir -p /opt/tark && cd /opt/tark
 for f in install-build-deps.sh install-build-deps.py; do
   curl -fsSL "https://chromium.googlesource.com/chromium/src/+/refs/tags/$VERSION/build/$f?format=TEXT" | base64 -d > $f
 done
-chmod +x install-build-deps.sh
+chmod +x install-build-deps.sh install-build-deps.py
 ./install-build-deps.sh --android --no-prompt --no-chromeos-fonts --no-nacl
 
 # Swap: the framework link wants more than RAM on smaller types.
