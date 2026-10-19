@@ -131,6 +131,16 @@ class TestAndroidSeries(unittest.TestCase):
         self.assertIn('+#include "components/safe_browsing/core/browser/password_protection/'
                       'password_reuse_detection_manager_client.h"', patch)
 
+    def test_direct_apk_size(self):
+        # Spec: direct APK ≤ 130 MB, native library compressed, no XR module
+        # (the user's decision, 2026-10-20).
+        self.assertIn('android/direct-apk-size.patch', self.series)
+        patch = (ANDROID / 'patches' / 'direct-apk-size.patch').read_text()
+        self.assertIn('-  xr_module_desc,', patch)
+        self.assertIn('+    library_always_compress = [ "libchrome.so" ]', patch)
+        self.assertIn('+    jinja_extra_variables = [ "extract_native_libs=true" ]', patch)
+        self.assertIn('+        android:extractNativeLibs="true"', patch)
+
     def test_skip_list_entries_exist(self):
         self.assertTrue(self.skip)
         for entry in self.skip:
@@ -157,6 +167,11 @@ class TestAndroidConfig(unittest.TestCase):
                      'chrome_public_manifest_package = "com.gettarka.tarka"',
                      'use_clang_modules = false'):
             self.assertIn(line, args)
+
+    def test_no_arcore(self):
+        # The XR module (left out for size) carries the ARCore client; WebXR AR
+        # is built out so nothing reaches for its classes.
+        self.assertIn('enable_arcore = false', (ANDROID / 'args.gn').read_text())
 
     def test_sysroot_stays_on(self):
         # base/BUILD.gn links a system libatomic on Android when use_sysroot is

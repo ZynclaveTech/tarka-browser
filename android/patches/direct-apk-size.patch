@@ -1,0 +1,41 @@
+--- a/chrome/android/modules/chrome_feature_modules.gni
++++ b/chrome/android/modules/chrome_feature_modules.gni
+@@ -27,10 +27,11 @@
+ #   paks: (Optional) PAKs going into module.
+ # Each new module needs to add a desc to one of the lists below.
+ 
++# Tark: no XR module (Android XR headsets, ARCore); the direct APK must stay
++# under 130 MB.
+ chrome_module_descs = [
+   on_demand_module_desc,
+   stack_unwinder_module_desc,
+-  xr_module_desc,
+ ]
+ if (dfmify_dev_ui) {
+   chrome_module_descs += [ dev_ui_module_desc ]
+--- a/chrome/android/BUILD.gn
++++ b/chrome/android/BUILD.gn
+@@ -2111,6 +2111,11 @@
+   chrome_public_apk_or_module_tmpl("chrome_public_apk") {
+     target_type = "android_apk"
+     apk_name = "ChromePublic"
++
++    # Tark: the direct APK stores libchrome.so compressed (half the download)
++    # and Android extracts it at install.
++    library_always_compress = [ "libchrome.so" ]
++    jinja_extra_variables = [ "extract_native_libs=true" ]
+     if (defined(android_app_secondary_abi)) {
+       # Ensure 64-bit chrome does not depend on 32-bit things.
+       assert_no_deps =
+--- a/chrome/android/java/AndroidManifest.xml
++++ b/chrome/android/java/AndroidManifest.xml
+@@ -226,6 +226,9 @@
+         android:largeHeap="false"
+         android:manageSpaceActivity="@string/manage_space_activity"
+         android:supportsRtl="true"
++        {% if extract_native_libs is defined %}
++        android:extractNativeLibs="true"
++        {% endif %}
+         android:zygotePreloadName="{{ zygote_preload_class }}"
+         {% if backup_key is defined %}
+         android:allowBackup="true"
