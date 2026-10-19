@@ -165,5 +165,35 @@ class TestTabSwitcher(unittest.TestCase):
         self.assertIn('R.color.gm3_baseline_surface_container_high_dark', self.add)
 
 
+class TestSettings(unittest.TestCase):
+    def setUp(self):
+        self.assertIn('android/look-settings.patch', series())
+        self.p = patch('look-settings.patch')
+        self.add = added(self.p)
+
+    def test_google_rows_gone(self):
+        for key in ('PREF_SIGN_IN', 'PREF_GOOGLE_SERVICES', 'PREF_ACCOUNT_AND_GOOGLE_SERVICES_SECTION'):
+            self.assertIn(f'removePreferenceIfPresent({key});', self.add)
+        # Safety check is Google's checks.
+        self.assertIn('-        return !DeviceInfo.isAutomotive();', self.p)
+
+    def test_header_with_tiles(self):
+        self.assertIn('mTarkHeader.setOrder(-1);', self.add)
+        for key in ('search_engine', 'privacy', 'appearance', 'passwords', 'content_settings',
+                    'languages', 'downloads', 'about_chrome'):
+            self.assertIn(f'"{key}"', self.add.split('TARK_TILE_KEYS')[1], key)
+        # Tiles open their row through its own listener or the fragment, never
+        # Preference.performClick (restricted API: lint fails the build).
+        self.assertNotIn('performClick', self.add)
+        self.assertIn('onPreferenceTreeClick(row)', self.add)
+
+    def test_summary_strings_in_english_and_hindi(self):
+        self.assertIn('name="IDS_TARK_SETTINGS_SUMMARY_TITLE"', self.add)
+        self.assertIn('Private by default.', self.add)
+        self.assertIn('name="IDS_TARK_SETTINGS_SUMMARY_DETAIL"', self.add)
+        self.assertIn('डिफ़ॉल्ट रूप से निजी।', self.add)
+        self.assertIn('Google नहीं · सिंक नहीं', self.add)
+
+
 if __name__ == '__main__':
     unittest.main()

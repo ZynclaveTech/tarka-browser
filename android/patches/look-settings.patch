@@ -1,0 +1,243 @@
+--- a/chrome/android/java/src/org/chromium/chrome/browser/settings/MainSettings.java
++++ b/chrome/android/java/src/org/chromium/chrome/browser/settings/MainSettings.java
+@@ -6,20 +6,31 @@
+ 
+ import static org.chromium.build.NullUtil.assumeNonNull;
+ 
++import com.google.android.material.color.MaterialColors;
+ import android.app.Activity;
+ import android.content.Context;
+ import android.content.Intent;
+ import android.content.SharedPreferences;
+ import android.content.pm.PackageManager;
+ import android.content.res.Configuration;
++import android.graphics.Typeface;
++import android.graphics.drawable.GradientDrawable;
+ import android.os.Bundle;
+ import android.os.Handler;
+ import android.os.Parcelable;
+ import android.provider.Settings;
++import android.text.SpannableStringBuilder;
++import android.text.TextUtils;
++import android.text.style.StyleSpan;
++import android.util.TypedValue;
+ import android.view.View;
++import android.view.ViewGroup;
++import android.widget.LinearLayout;
++import android.widget.TextView;
+ 
+ import androidx.lifecycle.Lifecycle;
+ import androidx.preference.Preference;
++import androidx.preference.PreferenceViewHolder;
+ import androidx.recyclerview.widget.RecyclerView.LayoutManager;
+ 
+ import org.chromium.base.CallbackController;
+@@ -170,6 +181,7 @@
+ 
+     // Avoids using large numbers of dependencies to simplify testing / mocking.
+     private boolean mSkipUpdatePreferencesForTesting;
++    private @Nullable TarkHeaderPreference mTarkHeader;
+ 
+     public MainSettings() {
+         setHasOptionsMenu(true);
+@@ -415,6 +427,7 @@
+         googleServicePreference.setViewId(R.id.account_management_google_services_row);
+ 
+         cachePreferences();
++        addTarkHeader();
+         updateAutofillPreferences();
+         updateGlicPreference();
+ 
+@@ -461,7 +474,8 @@
+     }
+ 
+     private static boolean shouldShowSafetyHubPref() {
+-        return !DeviceInfo.isAutomotive();
++        // Tark: no Safety check (Google's checks).
++        return false;
+     }
+ 
+     private static boolean shouldShowNotificationPref(Context context, Intent intent) {
+@@ -572,11 +586,10 @@
+             promoCardPreference.updatePreferences();
+         }
+ 
+-        if (shouldShowSignInPref(getProfile())) {
+-            addPreferenceIfAbsent(PREF_SIGN_IN);
+-        } else {
+-            removePreferenceIfPresent(PREF_SIGN_IN);
+-        }
++        // Tark: no Google rows (sign-in, Google services, the account section).
++        removePreferenceIfPresent(PREF_SIGN_IN);
++        removePreferenceIfPresent(PREF_GOOGLE_SERVICES);
++        removePreferenceIfPresent(PREF_ACCOUNT_AND_GOOGLE_SERVICES_SECTION);
+ 
+         updateSearchEnginePreference();
+         updateAutofillPreferences();
+@@ -599,9 +612,140 @@
+             removePreferenceIfPresent(PREF_DEFAULT_BROWSER);
+         }
+ 
++        if (mTarkHeader != null) mTarkHeader.refresh();
+         notifyPreferencesUpdated();
+     }
+ 
++    // Tark: the Mac's Settings header (spec §13): the summary line, then tiles
++    // that open the rows below. A tile opens its row as a tap on the row would:
++    // the row's own listener, else the fragment.
++    private static final String[] TARK_TILE_KEYS = {
++        "search_engine", "privacy", "appearance", "passwords",
++        "content_settings", "languages", "downloads", "about_chrome"
++    };
++
++    private void addTarkHeader() {
++        mTarkHeader = new TarkHeaderPreference(getPreferenceManager().getContext());
++        mTarkHeader.setKey("tark_header");
++        mTarkHeader.setOrder(-1);
++        mTarkHeader.setSelectable(false);
++        mTarkHeader.setTitle(R.string.tark_settings_summary_title);
++        mTarkHeader.setSummary(R.string.tark_settings_summary_detail);
++        getPreferenceScreen().addPreference(mTarkHeader);
++    }
++
++    private class TarkHeaderPreference extends Preference {
++        TarkHeaderPreference(Context context) {
++            super(context);
++        }
++
++        void refresh() {
++            notifyChanged();
++        }
++
++        @Override
++        public void onBindViewHolder(PreferenceViewHolder holder) {
++            super.onBindViewHolder(holder);
++            if (!(holder.itemView instanceof ViewGroup root)) return;
++            Context context = root.getContext();
++            root.removeAllViews();
++            LinearLayout column = new LinearLayout(context);
++            column.setOrientation(LinearLayout.VERTICAL);
++            column.setPadding(0, tarkDp(context, 8), 0, tarkDp(context, 8));
++
++            SpannableStringBuilder line = new SpannableStringBuilder();
++            line.append(context.getString(R.string.tark_settings_summary_title));
++            line.setSpan(new StyleSpan(Typeface.BOLD), 0, line.length(), 0);
++            line.append(' ').append(context.getString(R.string.tark_settings_summary_detail));
++            TextView summary = new TextView(context);
++            summary.setText(line);
++            summary.setTextColor(MaterialColors.getColor(context, R.attr.colorOnSurface, 0));
++            summary.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
++            int pad = tarkDp(context, 12);
++            summary.setPadding(pad, pad, pad, pad);
++            GradientDrawable outline = new GradientDrawable();
++            outline.setCornerRadius(tarkDp(context, 12));
++            outline.setStroke(
++                    tarkDp(context, 1), MaterialColors.getColor(context, R.attr.colorPrimary, 0));
++            summary.setBackground(outline);
++            LinearLayout.LayoutParams summaryParams =
++                    new LinearLayout.LayoutParams(
++                            ViewGroup.LayoutParams.MATCH_PARENT,
++                            ViewGroup.LayoutParams.WRAP_CONTENT);
++            summaryParams.setMargins(tarkDp(context, 4), 0, tarkDp(context, 4), tarkDp(context, 8));
++            column.addView(summary, summaryParams);
++
++            LinearLayout row = null;
++            int count = 0;
++            for (String key : TARK_TILE_KEYS) {
++                Preference target = findPreference(key);
++                if (target == null || !target.isVisible()) continue;
++                if (count % 2 == 0) {
++                    row = new LinearLayout(context);
++                    row.setOrientation(LinearLayout.HORIZONTAL);
++                    column.addView(row);
++                }
++                LinearLayout.LayoutParams params =
++                        new LinearLayout.LayoutParams(
++                                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
++                int margin = tarkDp(context, 4);
++                params.setMargins(margin, margin, margin, margin);
++                assumeNonNull(row).addView(buildTarkTile(context, target), params);
++                count++;
++            }
++            root.addView(
++                    column,
++                    new ViewGroup.LayoutParams(
++                            ViewGroup.LayoutParams.MATCH_PARENT,
++                            ViewGroup.LayoutParams.WRAP_CONTENT));
++        }
++    }
++
++    private View buildTarkTile(Context context, Preference row) {
++        LinearLayout tile = new LinearLayout(context);
++        tile.setOrientation(LinearLayout.VERTICAL);
++        int pad = tarkDp(context, 12);
++        tile.setPadding(pad, pad, pad, pad);
++        GradientDrawable background = new GradientDrawable();
++        background.setCornerRadius(tarkDp(context, 14));
++        background.setColor(
++                MaterialColors.getColor(context, R.attr.colorSurfaceContainerHigh, 0));
++        background.setStroke(
++                tarkDp(context, 1), MaterialColors.getColor(context, R.attr.colorOutlineVariant, 0));
++        tile.setBackground(background);
++
++        TextView title = new TextView(context);
++        title.setText(row.getTitle());
++        title.setTextColor(MaterialColors.getColor(context, R.attr.colorOnSurface, 0));
++        title.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
++        title.setTypeface(Typeface.DEFAULT_BOLD);
++        tile.addView(title);
++        CharSequence state = row.getSummary();
++        if (!TextUtils.isEmpty(state)) {
++            TextView stateView = new TextView(context);
++            stateView.setText(state);
++            stateView.setTextColor(
++                    MaterialColors.getColor(context, R.attr.colorOnSurfaceVariant, 0));
++            stateView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
++            stateView.setMaxLines(1);
++            stateView.setEllipsize(TextUtils.TruncateAt.END);
++            tile.addView(stateView);
++        }
++        tile.setContentDescription(row.getTitle());
++        tile.setOnClickListener(v -> openTarkRow(row));
++        return tile;
++    }
++
++    private void openTarkRow(Preference row) {
++        Preference.OnPreferenceClickListener listener = row.getOnPreferenceClickListener();
++        if (listener != null && listener.onPreferenceClick(row)) return;
++        onPreferenceTreeClick(row);
++    }
++
++    private static int tarkDp(Context context, int dp) {
++        return Math.round(dp * context.getResources().getDisplayMetrics().density);
++    }
++
+     private static boolean showDefaultBrowserSettings(Activity activity) {
+         // We decided not to show the Role Model Dialog at all when the menu item in
+         // Settings is clicked.
+--- a/chrome/browser/ui/android/strings/android_chrome_strings.grd
++++ b/chrome/browser/ui/android/strings/android_chrome_strings.grd
+@@ -840,6 +840,13 @@
+       <message name="IDS_PASSWORD_LIST_TITLE" desc="Title for a list of saved passwords, e.g. the list of passwords displayed in Chrome > Settings > Password Manager. [CHAR_LIMIT=32]">
+         Passwords
+       </message>
++      <!-- Tark: the summary line at the top of Settings. -->
++      <message name="IDS_TARK_SETTINGS_SUMMARY_TITLE" desc="Tark: first, bold words of the summary line at the top of Settings.">
++        Private by default.
++      </message>
++      <message name="IDS_TARK_SETTINGS_SUMMARY_DETAIL" desc="Tark: the rest of the summary line at the top of Settings.">
++        No Google · no sync
++      </message>
+       <message name="IDS_PASSWORD_MANAGER_SETTINGS_TITLE" desc="Title for the settings menu item leading to the Password Manager UI surface. This allows users to e.g. manage their saved passwords, toggle saving and auto-sign-in on/off, etc. [CHAR_LIMIT=32]">
+         Google Password Manager
+       </message>
+--- a/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb
++++ b/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb
+@@ -2153,4 +2153,6 @@
+ <translation id="992745192656291733"><ph name="TAB_COUNT" /> टैब</translation>
+ <translation id="996149300115483134">फ़ीड कार्ड मेन्यू बंद हो गया है</translation>
+ <translation id="99907655649633293"><ph name="TAB_TITLE" />, गुप्त टैब</translation>
++<translation id="4052894432451380501">डिफ़ॉल्ट रूप से निजी।</translation>
++<translation id="4895029394010859418">Google नहीं · सिंक नहीं</translation>
+ </translationbundle>
+\ No newline at end of file
