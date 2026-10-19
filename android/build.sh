@@ -9,7 +9,8 @@
 # Mac's build.sh for an Android tree: clone Chromium with Android's
 # dependencies (ungoogled's clone.py and android/gclient.android; no pruning),
 # apply ungoogled-chromium's core patches then Tark's Android series, domain
-# and name substitution, the mark, Inter, IndicXlit, then gn and ninja.
+# and name substitution, the mark, Inter, uBlock Origin's sources, IndicXlit,
+# then gn and ninja.
 # The APK lands in WORKDIR/src/out/Default/apks/ChromePublic.apk.
 #
 # --stop-before-gn stops after the patches and Tark's steps with exit 3 (the
@@ -141,13 +142,18 @@ else
     -f "$work/domain_substitution.list" "$_src_dir"
   run python3 "$_root_dir/utils/name_substitution.py" --sub -t "$_src_dir" --backup-path "$work/namesubs.tar"
 
-  # 5. Tark's steps: the mark, Inter for WebUI pages, IndicXlit (D1). No
-  #    uBlock Origin: Chromium on Android runs no extensions (A2 blocks ads in
-  #    the engine instead).
+  # 5. Tark's steps: the mark, Inter for WebUI pages, uBlock Origin's sources
+  #    (Tark's shared patches put its files into the resource paks on every
+  #    platform; Android never loads them, having no extension system, and
+  #    A2's engine-level blocker removes them), IndicXlit (D1).
   run python3 "$_root_dir/utils/install_branding.py" "$_root_dir/resources/branding/mark" "$_src_dir"
   run mkdir -p "$_src_dir/ui/webui/resources/fonts"
   run cp "$_root_dir"/resources/fonts/inter-latin.woff2 "$_root_dir"/resources/fonts/inter-latin-ext.woff2 \
     "$_src_dir/ui/webui/resources/fonts/"
+  run python3 "$_main_repo/utils/downloads.py" retrieve -i "$_root_dir/downloads-tark.ini" -c "$_download_cache"
+  run python3 "$_main_repo/utils/downloads.py" unpack -i "$_root_dir/downloads-tark.ini" -c "$_download_cache" "$_src_dir"
+  run python3 "$_root_dir/utils/ublock_key.py" "$_src_dir/third_party/ublock/manifest.json" \
+    "$_root_dir/resources/ublock/key.txt"
   echo "tark: run _install_xlit"
   if [[ "$dryrun" != 1 ]]; then
     export _root_dir _src_dir _main_repo _download_cache

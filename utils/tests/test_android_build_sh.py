@@ -207,10 +207,15 @@ class TestAndroidBuildSh(unittest.TestCase):
         self.assertIn('ln -sfn', SCRIPT.read_text())
         self.assertIn('android/patches" "$work/tark-patches/android"', SCRIPT.read_text())
 
-    def test_no_ublock_on_android(self):
+    def test_ublock_sources_unpacked_until_a2(self):
+        # Tark's shared patches put uBlock Origin's files into the resource
+        # paks (chrome_paks.gni) on every platform; A1 unpacks them as the Mac
+        # does. Android never loads them (no extension system); A2's
+        # engine-level blocker removes them.
         result, runs, files, tmp = dryrun('--stop-before-gn')
-        self.assertNotIn('downloads-tark.ini', '\n'.join(runs))
-        self.assertNotIn('ublock', '\n'.join(runs).lower())
+        retrieve = index_of(runs, 'downloads-tark.ini')
+        self.assertLess(index_of(runs, 'name_substitution.py --sub'), retrieve)
+        self.assertLess(retrieve, index_of(runs, 'ublock_key.py'))
 
     def test_full_build_writes_args_and_builds_the_apk(self):
         result, runs, files, tmp = dryrun()
