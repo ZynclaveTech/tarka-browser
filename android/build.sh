@@ -7,7 +7,7 @@
 #
 # Builds Tark for Android (A1) on a Linux x86-64 machine, the steps of the
 # Mac's build.sh for an Android tree: clone Chromium with Android's
-# dependencies (ungoogled's clone.py and android/gclient.android), prune,
+# dependencies (ungoogled's clone.py and android/gclient.android; no pruning),
 # apply ungoogled-chromium's core patches then Tark's Android series, domain
 # and name substitution, the mark, Inter, IndicXlit, then gn and ninja.
 # The APK lands in WORKDIR/src/out/Default/apks/ChromePublic.apk.
