@@ -1,0 +1,76 @@
+--- a/chrome/android/features/tab_ui/java/src/org/chromium/chrome/browser/tasks/tab_management/TabGroupListMediator.java
++++ b/chrome/android/features/tab_ui/java/src/org/chromium/chrome/browser/tasks/tab_management/TabGroupListMediator.java
+@@ -70,7 +70,8 @@
+     private final PaneManager mPaneManager;
+     private final TabGroupUiActionHandler mTabGroupUiActionHandler;
+     private final ActionConfirmationManager mActionConfirmationManager;
+-    private final SyncService mSyncService;
++    // Tark: null, since ungoogled builds no sync service; sync then reads as off.
++    private final @Nullable SyncService mSyncService;
+     private final CallbackController mCallbackController = new CallbackController();
+     private final MessagingBackendService mMessagingBackendService;
+     private final PendingRunnable mPendingRefresh =
+@@ -136,7 +137,10 @@
+                 @Override
+                 public void syncStateChanged() {
+                     boolean enabled =
+-                            mSyncService.getActiveDataTypes().contains(DataType.SAVED_TAB_GROUP);
++                            mSyncService != null
++                                    && mSyncService
++                                            .getActiveDataTypes()
++                                            .contains(DataType.SAVED_TAB_GROUP);
+                     mPropertyModel.set(TabGroupListProperties.SYNC_ENABLED, enabled);
+                     if (!enabled) {
+                         // When sign out happens, we need to clear the message cards. There is no
+@@ -220,7 +224,7 @@
+             PaneManager paneManager,
+             TabGroupUiActionHandler tabGroupUiActionHandler,
+             ActionConfirmationManager actionConfirmationManager,
+-            SyncService syncService,
++            @Nullable SyncService syncService,
+             boolean enableContainment,
+             DataSharingTabManager dataSharingTabManager,
+             TabGroupRemovedMessageMediator tabGroupRemovedMessageMediator,
+@@ -248,7 +252,9 @@
+             mTabGroupSyncService.addObserver(mTabGroupSyncObserver);
+         }
+         mDataSharingService.addObserver(mDataSharingObserver);
+-        mSyncService.addSyncStateChangedListener(mSyncStateChangeListener);
++        if (mSyncService != null) {
++            mSyncService.addSyncStateChangedListener(mSyncStateChangeListener);
++        }
+         mMessagingBackendService.addPersistentMessageObserver(mPersistentMessageObserver);
+         mContext.registerComponentCallbacks(mComponentsCallbacks);
+ 
+@@ -264,7 +270,9 @@
+             mTabGroupSyncService.removeObserver(mTabGroupSyncObserver);
+         }
+         mDataSharingService.removeObserver(mDataSharingObserver);
+-        mSyncService.removeSyncStateChangedListener(mSyncStateChangeListener);
++        if (mSyncService != null) {
++            mSyncService.removeSyncStateChangedListener(mSyncStateChangeListener);
++        }
+         mCallbackController.destroy();
+         mMessagingBackendService.removePersistentMessageObserver(mPersistentMessageObserver);
+         mContext.unregisterComponentCallbacks(mComponentsCallbacks);
+--- a/chrome/android/features/tab_ui/java/src/org/chromium/chrome/browser/tasks/tab_management/TabGroupListCoordinator.java
++++ b/chrome/android/features/tab_ui/java/src/org/chromium/chrome/browser/tasks/tab_management/TabGroupListCoordinator.java
+@@ -4,7 +4,6 @@
+ 
+ package org.chromium.chrome.browser.tasks.tab_management;
+ 
+-import static org.chromium.build.NullUtil.assumeNonNull;
+ import static org.chromium.chrome.browser.tasks.tab_management.TabGroupListProperties.ENABLE_CONTAINMENT;
+ import static org.chromium.chrome.browser.tasks.tab_management.TabGroupListProperties.ON_IS_SCROLLED_CHANGED;
+ 
+@@ -163,8 +162,8 @@
+ 
+         ActionConfirmationManager actionConfirmationManager =
+                 new ActionConfirmationManager(profile, context, modalDialogManager);
+-        SyncService syncService = SyncServiceFactory.getForProfile(profile);
+-        assumeNonNull(syncService);
++        // Tark: null without sync (ungoogled); the mediator handles it.
++        @Nullable SyncService syncService = SyncServiceFactory.getForProfile(profile);
+ 
+         TabGroupRemovedMessageMediator tabGroupRemovedMessageMediator =
+                 new TabGroupRemovedMessageMediator(context, messagingBackendService, modelList);

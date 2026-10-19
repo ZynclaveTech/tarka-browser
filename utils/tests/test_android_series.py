@@ -211,6 +211,17 @@ class TestAndroidSeries(unittest.TestCase):
         self.assertIn('+++ b/chrome/android/java/src/org/chromium/chrome/browser/firstrun/FirstRunFlowSequencer.java', patch)
         self.assertIn('+        if (TARK_NO_FIRST_RUN\n', patch)
 
+    def test_tab_groups_pane_without_sync(self):
+        # The user's phone: tapping the tab switcher's tab-groups button
+        # crashed (NullPointerException): ungoogled builds no sync service, and
+        # the tab groups list registered a listener on it.
+        self.assertIn('android/tab-groups-without-sync.patch', self.series)
+        patch = (ANDROID / 'patches' / 'tab-groups-without-sync.patch').read_text()
+        self.assertIn('+    private final @Nullable SyncService mSyncService;', patch)
+        self.assertIn('+        if (mSyncService != null) {\n+            mSyncService.addSyncStateChangedListener', patch)
+        self.assertIn('+        if (mSyncService != null) {\n+            mSyncService.removeSyncStateChangedListener', patch)
+        self.assertIn('-        assumeNonNull(syncService);', patch)
+
     def test_skip_list_entries_exist(self):
         self.assertTrue(self.skip)
         for entry in self.skip:
