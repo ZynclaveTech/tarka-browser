@@ -65,7 +65,7 @@ class TestAndroidConfig(unittest.TestCase):
                      'is_official_build = true', 'is_component_build = false',
                      'chrome_pgo_phase = 0', 'symbol_level = 0',
                      'chrome_public_manifest_package = "com.gettarka.tarka"',
-                     'use_sysroot = false'):
+                     'use_sysroot = false', 'use_clang_modules = false'):
             self.assertIn(line, args)
 
     def test_gclient_template(self):
