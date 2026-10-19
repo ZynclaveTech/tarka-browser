@@ -153,6 +153,16 @@ class TestAndroidSeries(unittest.TestCase):
         self.assertIn('-  CHECK_NE(fire_refresh_token_loaded_, RT_LOAD_NOT_START);', patch)
         self.assertIn('+  if (fire_refresh_token_loaded_ == RT_LOAD_NOT_START) {\n+    return;\n+  }', patch)
 
+    def test_signin_allowed_registered_off(self):
+        # Android's first run reads signin.allowed, which ungoogled stops
+        # registering (PrefService CHECK on first start, A1 emulator run).
+        self.assertIn('android/signin-android-allowed-pref.patch', self.series)
+        patch = (ANDROID / 'patches' / 'signin-android-allowed-pref.patch').read_text()
+        self.assertIn('+++ b/components/signin/internal/identity_manager/primary_account_manager.cc', patch)
+        self.assertIn('+#include "components/signin/public/base/signin_pref_names.h"', patch)
+        self.assertIn('+#if BUILDFLAG(IS_ANDROID)\n', patch)
+        self.assertIn('+  registry->RegisterBooleanPref(prefs::kSigninAllowed, false);', patch)
+
     def test_skip_list_entries_exist(self):
         self.assertTrue(self.skip)
         for entry in self.skip:
