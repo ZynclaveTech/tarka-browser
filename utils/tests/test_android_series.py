@@ -51,6 +51,18 @@ class TestAndroidSeries(unittest.TestCase):
         self.assertIn('+          regulatory_api_turl->suggestions_url());', patch)
         self.assertIn('+                                          search_url, template_url->suggestions_url());', patch)
 
+    def test_rlz_ping_never_sent(self):
+        # ungoogled's disable-untraceable-urls.patch removes Google's RLZ
+        # server (kFinancialServer); Android's ping handler reports failure
+        # without a request.
+        self.assertIn('android/rlz-ping-handler-no-ping.patch', self.series)
+        patch = (ANDROID / 'patches' / 'rlz-ping-handler-no-ping.patch').read_text()
+        self.assertIn('+++ b/chrome/browser/android/rlz/rlz_ping_handler.cc', patch)
+        self.assertIn('-  handler->Ping(brand, language, events, id, std::move(callback));', patch)
+        self.assertIn('+  std::move(callback).Run(false);', patch)
+        added = [l for l in patch.splitlines() if l.startswith('+') and not l.startswith('+++')]
+        self.assertFalse(any('kFinancialServer' in l for l in added))
+
     def test_skip_list_entries_exist(self):
         self.assertTrue(self.skip)
         for entry in self.skip:
