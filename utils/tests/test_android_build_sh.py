@@ -48,7 +48,6 @@ class TestAndroidBuildSh(unittest.TestCase):
         self.assertEqual(result.returncode, 3, result.stderr)
         order = [index_of(runs, n) for n in (
             '/clone.py',
-            'utils/prune_binaries.py',
             'utils/patches.py apply',
             'utils/filter_substitution_list.py',
             'utils/domain_substitution.py apply',
@@ -104,7 +103,7 @@ class TestAndroidBuildSh(unittest.TestCase):
         result, runs, files, tmp = dryrun('--stop-before-gn')
         sync = index_of(runs, 'depot_tools-stock/gclient sync')
         self.assertLess(index_of(runs, '/clone.py'), sync)
-        self.assertLess(sync, index_of(runs, 'utils/prune_binaries.py'))
+        self.assertLess(sync, index_of(runs, 'utils/patches.py apply'))
         line = runs[sync]
         self.assertIn('--nohooks', line)
         self.assertNotIn(' -D', line)  # never delete what clone.py fetched
@@ -160,8 +159,7 @@ class TestAndroidBuildSh(unittest.TestCase):
         result, runs, files, tmp = dryrun('--stop-before-gn')
         clang = index_of(runs, 'tools/clang/scripts/update.py')
         rust = index_of(runs, 'tools/rust/update_rust.py')
-        # ...and after pruning, which deletes prebuilt toolchains.
-        self.assertLess(index_of(runs, 'utils/prune_binaries.py'), clang)
+        self.assertLess(index_of(runs, 'depot_tools-stock/gclient sync'), clang)
         self.assertLess(max(clang, rust), index_of(runs, 'utils/domain_substitution.py apply'))
 
     def test_chromium_clang_on_path_for_gn_and_ninja(self):
@@ -188,6 +186,14 @@ class TestAndroidBuildSh(unittest.TestCase):
         build = script[script.index('# --- end prepare ---'):]
         self.assertIn('script_executable = \\"python3\\"', build)
         self.assertLess(build.index('script_executable'), build.index('gn" gen'))
+
+    def test_no_pruning_on_android(self):
+        # ungoogled's pruning is for the desktop lite tarball: it deletes
+        # chrome/android/, android_webview/, the JDK and other CIPD folders,
+        # and r8's custom_d8.jar/custom_r8.jar, all of which Android needs.
+        result, runs, files, tmp = dryrun('--stop-before-gn')
+        self.assertNotIn('prune_binaries.py', '\n'.join(runs))
+        self.assertIn('chrome/android/', SCRIPT.read_text())  # the reason is written down
 
     def test_core_patches_then_tark_series(self):
         result, runs, files, tmp = dryrun('--stop-before-gn')

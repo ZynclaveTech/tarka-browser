@@ -114,12 +114,15 @@ else
     exit 1
   fi
 
-  # 2. Prune binaries, as every ungoogled-chromium build does.
-  run python3 "$_main_repo/utils/prune_binaries.py" "$_src_dir" "$_main_repo/pruning.list"
+  # 2. No pruning on Android. ungoogled's prune_binaries.py serves the desktop
+  #    lite tarball: its contingent paths delete chrome/android/,
+  #    android_webview/, the JDK and other CIPD folders, and its list deletes
+  #    third_party/r8/custom_d8.jar and custom_r8.jar — all of which an
+  #    Android build needs. The Android toolchain is Google's prebuilt one, as
+  #    in every Android build; nothing pruning would remove is compiled in.
 
-  # 2b. Chromium's own clang and Rust, fetched by their update scripts: after
-  #     pruning (which deletes prebuilt toolchains) and before domain
-  #     substitution (which rewrites googleapis.com inside those scripts).
+  # 2b. Chromium's own clang and Rust, fetched by their update scripts before
+  #     domain substitution (which rewrites googleapis.com inside them).
   run python3 "$_src_dir/tools/clang/scripts/update.py"
   run python3 "$_src_dir/tools/rust/update_rust.py"
 
