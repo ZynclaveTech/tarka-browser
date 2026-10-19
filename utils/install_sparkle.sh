@@ -53,4 +53,7 @@ plutil -replace SUEnableAutomaticChecks -bool YES "$plist"
 plutil -replace SUScheduledCheckInterval -integer 86400 "$plist"
 plutil -replace SUEnableSystemProfiling -bool NO "$plist"
 plutil -replace SUAllowsAutomaticUpdates -bool YES "$plist"
+# Install updates by themselves when Tark quits (security fixes reach everyone);
+# Sparkle's update prompt lets a person turn this off.
+plutil -replace SUAutomaticallyUpdate -bool YES "$plist"
 echo "Sparkle installed; CFBundleVersion $build.$patch.$revision; feed $feed"

@@ -345,7 +345,8 @@ unpacked to `build/src/third_party/sparkle` by `dev.sh setup` and
 - **At signing:** `sign_and_package_app.sh` runs `utils/install_sparkle.sh`,
   which copies the framework in without its XPC services (only sandboxed
   apps need them), writes `SUFeedURL` (https://gettarka.com/appcast.xml),
-  `SUPublicEDKey`, a daily automatic check, no system profiling, and sets
+  `SUPublicEDKey`, a daily automatic check that installs updates when Tark
+  quits (`SUAutomaticallyUpdate`), no system profiling, and sets
   `CFBundleVersion` to `BUILD.PATCH.REVISION` from `revision.txt`, so two
   releases of one Chromium version still order correctly. Sparkle's
   Autoupdate and Updater.app are signed before its framework, all before

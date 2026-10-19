@@ -84,6 +84,9 @@ class TestInstallSparkle(unittest.TestCase):
         self.assertEqual(p['SUScheduledCheckInterval'], 86400)
         self.assertIs(p['SUEnableSystemProfiling'], False)
         self.assertIs(p['SUAllowsAutomaticUpdates'], True)
+        # Updates install by themselves when Tark quits, as Chrome's do; the
+        # user can still turn this off in Sparkle's update prompt.
+        self.assertIs(p['SUAutomaticallyUpdate'], True)
         self.assertEqual(p['CFBundleShortVersionString'], '155.0.8059.39')
 
     def test_bundle_version_carries_the_revision_and_is_idempotent(self):
