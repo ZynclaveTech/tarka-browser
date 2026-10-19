@@ -24,15 +24,20 @@ finish() {
 }
 trap finish EXIT
 
+# Setting up the source is all-or-nothing: any failure ends the job before a
+# build can run on a missing or wrong tree.
+must() { "$@" >> $log 2>&1 || { echo "failed: $*" >> $log; exit 1; }; }
 repo=/tark/repo
-rm -rf $repo && mkdir -p $repo
-aws s3 cp --quiet "s3://$B/$P/src.tar.gz" /tark/src.tar.gz >> $log 2>&1
-tar -xzf /tark/src.tar.gz -C $repo >> $log 2>&1
-cache=/tark/ungoogled-chromium.git
-[[ -d $cache ]] || git clone --quiet --bare https://github.com/ungoogled-software/ungoogled-chromium.git $cache >> $log 2>&1
-git -C $cache fetch --quiet origin >> $log 2>&1
-git clone --quiet --reference $cache https://github.com/ungoogled-software/ungoogled-chromium.git $repo/ungoogled-chromium >> $log 2>&1
-git -C $repo/ungoogled-chromium checkout --quiet $SUB >> $log 2>&1
+must rm -rf $repo
+must mkdir -p $repo
+must aws s3 cp --quiet "s3://$B/$P/src.tar.gz" /tark/src.tar.gz
+must tar -xzf /tark/src.tar.gz -C $repo
+# ungoogled-chromium at exactly the submodule's commit, verified.
+[[ $SUB =~ ^[0-9a-f]{40}$ ]] || { echo "bad submodule commit '$SUB'" >> $log; exit 1; }
+must git clone --quiet --no-checkout https://github.com/ungoogled-software/ungoogled-chromium.git $repo/ungoogled-chromium
+must git -C $repo/ungoogled-chromium fetch --quiet origin "$SUB"
+must git -C $repo/ungoogled-chromium checkout --quiet --detach "$SUB"
+[[ $(git -C $repo/ungoogled-chromium rev-parse HEAD) == "$SUB" ]] || { echo "submodule is not $SUB" >> $log; exit 1; }
 echo "submodule $SUB" >> $log
 
 (( fresh )) && rm -rf /tark/work/src

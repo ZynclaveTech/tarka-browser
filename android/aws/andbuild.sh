@@ -42,8 +42,9 @@ job)
   name=${job:t:r}
   prefix=jobs/$name-$(date +%Y%m%d-%H%M%S)
   sub=$(git -C $REPO rev-parse HEAD:ungoogled-chromium)
-  git -C $REPO archive --format=tar.gz -o /tmp/tark-src-$$.tar.gz HEAD
-  aws s3 cp --quiet /tmp/tark-src-$$.tar.gz s3://$B/$prefix/src.tar.gz && rm -f /tmp/tark-src-$$.tar.gz
+  tmp=$(mktemp -d); trap 'rm -rf $tmp' EXIT
+  git -C $REPO archive --format=tar.gz -o $tmp/src.tar.gz HEAD
+  aws s3 cp --quiet $tmp/src.tar.gz s3://$B/$prefix/src.tar.gz
   aws s3 cp --quiet $job s3://$B/$prefix/$name.sh
   id=$(aws ssm send-command --region $R --instance-ids $I --document-name AWS-RunShellScript \
     --comment "tark $name" --timeout-seconds 600 \

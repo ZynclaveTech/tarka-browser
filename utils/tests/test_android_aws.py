@@ -76,6 +76,21 @@ class TestDriverAndJob(unittest.TestCase):
         self.assertIn('tark-build.log', s)
         self.assertIn('poweroff', s)
 
+    def test_driver_archive_in_private_temp_dir(self):
+        s = text('andbuild.sh')
+        self.assertIn('mktemp -d', s)
+        self.assertNotIn('/tmp/tark-src-$$', s)
+
+    def test_job_setup_is_fatal_and_pins_the_submodule(self):
+        s = text('jobs/tark-build.sh')
+        # The exact commit is fetched, checked out, and verified before building.
+        self.assertIn('fetch --quiet origin "$SUB"', s)
+        self.assertIn('rev-parse HEAD', s)
+        self.assertIn('must ', s)
+        for step in ('aws s3 cp --quiet "s3://$B/$P/src.tar.gz"', 'tar -xzf', 'git clone'):
+            line = next(l for l in s.splitlines() if step in l)
+            self.assertTrue(line.lstrip().startswith(('must ', '[[')), line)
+
     def test_shell_syntax(self):
         for name in ('create.sh', 'andbuild.sh'):
             self.assertEqual(subprocess.run(['zsh', '-n', str(AWS / name)]).returncode, 0, name)
