@@ -10,20 +10,18 @@
      "//components/tracing:tracing_metrics",
 --- /dev/null
 +++ b/components/tark_xlit/BUILD.gn
-@@ -0,0 +1,57 @@
+@@ -0,0 +1,78 @@
 +# Copyright 2026 The Tark Authors
 +# Use of this source code is governed by a BSD-style license that can be
 +# found in the LICENSE file.
 +
 +import("//testing/test.gni")
 +
-+# Tark is macOS-only, and the model runs on Accelerate.
-+assert(is_mac, "tark_xlit needs macOS (Accelerate)")
-+
 +# Indian-language transliteration for the address bar. Everything here runs on
 +# the device; nothing in this component touches the network.
 +static_library("tark_xlit") {
 +  sources = [
++    "blas.h",
 +    "languages.cc",
 +    "languages.h",
 +    "model.cc",
@@ -35,8 +33,31 @@
 +  ]
 +  public_deps = [ "//base" ]
 +
-+  # The model's matrix products run through Accelerate's BLAS.
-+  frameworks = [ "Accelerate.framework" ]
++  # The model's matrix products (blas.h): Apple's Accelerate on the Mac,
++  # Eigen elsewhere (Windows, W1).
++  if (is_mac) {
++    sources += [ "blas_accelerate.cc" ]
++    frameworks = [ "Accelerate.framework" ]
++  } else {
++    deps = [ ":blas_eigen" ]
++  }
++}
++
++# Eigen's headers trip Chromium's own warnings, so its one file builds
++# outside chromium_code, as TFLite's do.
++if (!is_mac) {
++  source_set("blas_eigen") {
++    visibility = [ ":tark_xlit" ]
++    sources = [
++      "blas.h",
++      "blas_eigen.cc",
++    ]
++    configs -= [ "//build/config/compiler:chromium_code" ]
++    configs += [
++      "//build/config/compiler:no_chromium_code",
++      "//third_party/eigen3:eigen_includes",
++    ]
++  }
 +}
 +
 +test("tark_xlit_unittests") {
@@ -119,6 +140,134 @@
 +```sh
 +ninja -C out/Default tark_xlit_bench && out/Default/tark_xlit_bench
 +```
+--- /dev/null
++++ b/components/tark_xlit/blas.h
+@@ -0,0 +1,33 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef COMPONENTS_TARK_XLIT_BLAS_H_
++#define COMPONENTS_TARK_XLIT_BLAS_H_
++
++// The three matrix products the model needs, row-major, single precision.
++// blas_accelerate.cc implements them with Apple's Accelerate (macOS),
++// blas_eigen.cc with Eigen (every other platform).
++namespace tark_xlit::blas {
++
++// c[m x n] = a[m x k] * b[n x k]^T + beta * c (beta is 0 or 1).
++void GemmNT(int m,
++            int n,
++            int k,
++            const float* a,
++            int lda,
++            const float* b,
++            int ldb,
++            float beta,
++            float* c,
++            int ldc);
++
++// y[m] = a[m x n] * x[n].
++void Gemv(int m, int n, const float* a, int lda, const float* x, float* y);
++
++// y[n] = a[m x n]^T * x[m].
++void GemvT(int m, int n, const float* a, int lda, const float* x, float* y);
++
++}  // namespace tark_xlit::blas
++
++#endif  // COMPONENTS_TARK_XLIT_BLAS_H_
+--- /dev/null
++++ b/components/tark_xlit/blas_accelerate.cc
+@@ -0,0 +1,34 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include <Accelerate/Accelerate.h>
++
++#include "components/tark_xlit/blas.h"
++
++namespace tark_xlit::blas {
++
++void GemmNT(int m,
++            int n,
++            int k,
++            const float* a,
++            int lda,
++            const float* b,
++            int ldb,
++            float beta,
++            float* c,
++            int ldc) {
++  cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, m, n, k, 1.0f, a, lda,
++              b, ldb, beta, c, ldc);
++}
++
++void Gemv(int m, int n, const float* a, int lda, const float* x, float* y) {
++  cblas_sgemv(CblasRowMajor, CblasNoTrans, m, n, 1.0f, a, lda, x, 1, 0.0f, y,
++              1);
++}
++
++void GemvT(int m, int n, const float* a, int lda, const float* x, float* y) {
++  cblas_sgemv(CblasRowMajor, CblasTrans, m, n, 1.0f, a, lda, x, 1, 0.0f, y, 1);
++}
++
++}  // namespace tark_xlit::blas
+--- /dev/null
++++ b/components/tark_xlit/blas_eigen.cc
+@@ -0,0 +1,52 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/tark_xlit/blas.h"
++
++#include "third_party/eigen3/src/Eigen/Core"
++
++namespace tark_xlit::blas {
++
++namespace {
++
++using RowMajor =
++    Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
++using ConstMatrix = Eigen::Map<const RowMajor, 0, Eigen::OuterStride<>>;
++using Matrix = Eigen::Map<RowMajor, 0, Eigen::OuterStride<>>;
++
++}  // namespace
++
++void GemmNT(int m,
++            int n,
++            int k,
++            const float* a,
++            int lda,
++            const float* b,
++            int ldb,
++            float beta,
++            float* c,
++            int ldc) {
++  const ConstMatrix am(a, m, k, Eigen::OuterStride<>(lda));
++  const ConstMatrix bm(b, n, k, Eigen::OuterStride<>(ldb));
++  Matrix cm(c, m, n, Eigen::OuterStride<>(ldc));
++  if (beta == 0.0f) {
++    cm.noalias() = am * bm.transpose();
++  } else {
++    cm.noalias() += am * bm.transpose();
++  }
++}
++
++void Gemv(int m, int n, const float* a, int lda, const float* x, float* y) {
++  const ConstMatrix am(a, m, n, Eigen::OuterStride<>(lda));
++  Eigen::Map<Eigen::VectorXf>(y, m).noalias() =
++      am * Eigen::Map<const Eigen::VectorXf>(x, n);
++}
++
++void GemvT(int m, int n, const float* a, int lda, const float* x, float* y) {
++  const ConstMatrix am(a, m, n, Eigen::OuterStride<>(lda));
++  Eigen::Map<Eigen::VectorXf>(y, n).noalias() =
++      am.transpose() * Eigen::Map<const Eigen::VectorXf>(x, m);
++}
++
++}  // namespace tark_xlit::blas
 --- /dev/null
 +++ b/components/tark_xlit/languages.cc
 @@ -0,0 +1,350 @@
@@ -746,14 +895,12 @@
 +}  // namespace tark_xlit
 --- /dev/null
 +++ b/components/tark_xlit/model.cc
-@@ -0,0 +1,962 @@
+@@ -0,0 +1,958 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
 +
 +#include "components/tark_xlit/model.h"
-+
-+#include <Accelerate/Accelerate.h>
 +
 +#include <algorithm>
 +#include <array>
@@ -788,6 +935,7 @@
 +#include "base/strings/string_view_util.h"
 +#include "base/strings/utf_string_conversions.h"
 +#include "base/values.h"
++#include "components/tark_xlit/blas.h"
 +
 +namespace tark_xlit {
 +
@@ -1252,9 +1400,9 @@
 +    out.subspan(r * linear.out, linear.out).copy_from(bias);
 +  }
 +  const base::span<const float> weight = m.Get(linear.weight);
-+  cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, Int(rows),
-+              Int(linear.out), Int(linear.in), 1.0f, x.data(), Int(linear.in),
-+              weight.data(), Int(linear.in), 1.0f, out.data(), Int(linear.out));
++  blas::GemmNT(Int(rows), Int(linear.out), Int(linear.in), x.data(),
++               Int(linear.in), weight.data(), Int(linear.in), /*beta=*/1.0f,
++               out.data(), Int(linear.out));
 +}
 +
 +void LayerNorm(const ModelData& m,
@@ -1337,9 +1485,8 @@
 +    const base::span<const float> head_query = query.subspan(offset, head_dim);
 +    const base::span<float> head_out = out.subspan(offset, head_dim);
 +    // weights = K q
-+    cblas_sgemv(CblasRowMajor, CblasNoTrans, Int(count), Int(head_dim), 1.0f,
-+                head_keys.data(), Int(stride), head_query.data(), 1, 0.0f,
-+                weights.data(), 1);
++    blas::Gemv(Int(count), Int(head_dim), head_keys.data(), Int(stride),
++               head_query.data(), weights.data());
 +    float max = kNegativeInfinity;
 +    for (float weight : weights) {
 +      max = std::max(max, weight);
@@ -1353,9 +1500,8 @@
 +      weight /= sum;
 +    }
 +    // out = V^T weights
-+    cblas_sgemv(CblasRowMajor, CblasTrans, Int(count), Int(head_dim), 1.0f,
-+                head_values.data(), Int(stride), weights.data(), 1, 0.0f,
-+                head_out.data(), 1);
++    blas::GemvT(Int(count), Int(head_dim), head_values.data(), Int(stride),
++                weights.data(), head_out.data());
 +  }
 +}
 +
@@ -1504,10 +1650,9 @@
 +    LayerNorm(m, m.decoder_final_norm, x, rows, h);
 +    const size_t vocab = m.target_vocab.size();
 +    log_probs.assign(rows * vocab, 0.0f);
-+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, Int(rows), Int(vocab),
-+                Int(dim), 1.0f, h.data(), Int(dim),
-+                m.Get(m.output_projection).data(), Int(dim), 0.0f,
-+                log_probs.data(), Int(vocab));
++    blas::GemmNT(Int(rows), Int(vocab), Int(dim), h.data(), Int(dim),
++                 m.Get(m.output_projection).data(), Int(dim), /*beta=*/0.0f,
++                 log_probs.data(), Int(vocab));
 +    for (size_t r = 0; r < rows; ++r) {
 +      LogSoftmax(base::span(log_probs).subspan(r * vocab, vocab));
 +    }
