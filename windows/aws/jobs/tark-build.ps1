@@ -46,5 +46,9 @@ try {
   Get-ChildItem "$work\build" -File -Include *.zip, *.exe -Recurse -Depth 0 | ForEach-Object { Upload $_.FullName $_.Name }
 } finally {
   Upload $log 'tark-build.log'
-  shutdown.exe /s /t 120 /c "Tark builder: job done"
+  # Stop the machine unless another job is still building on it; the idle
+  # watchdog (bootstrap.ps1) stops it after that one.
+  if (-not (Get-Process ninja, clang-cl, lld-link, python, python3, 7z -ErrorAction SilentlyContinue)) {
+    shutdown.exe /s /t 120 /c "Tark builder: job done"
+  }
 }
