@@ -79,14 +79,35 @@ class TestPcapHosts(unittest.TestCase):
 
     def test_baseline_names_are_left_out(self):
         # The emulator's own traffic (an idle capture) is not Tark's.
-        run = self.write([ethernet(udp_ipv4(dns_query('time.android.com')), 0x0800),
+        run = self.write([ethernet(udp_ipv4(dns_query('pool.ntp.org')), 0x0800),
                           ethernet(udp_ipv4(dns_query('shodhya.com')), 0x0800)])
-        idle = self.write([ethernet(udp_ipv4(dns_query('time.android.com')), 0x0800)])
+        idle = self.write([ethernet(udp_ipv4(dns_query('pool.ntp.org')), 0x0800)])
         result = subprocess.run([sys.executable, str(TOOL), str(run), '--baseline', str(idle)],
                                 capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertNotIn('time.android.com', result.stdout)
+        self.assertNotIn('pool.ntp.org', result.stdout.split('Left out')[0])
         self.assertIn('shodhya.com', result.stdout)
+
+    def test_baseline_never_hides_google(self):
+        # Final review: Android's own idle traffic includes Google names; the
+        # baseline must not hide Tark contacting the same ones.
+        run = self.write([ethernet(udp_ipv4(dns_query('www.google.com')), 0x0800)])
+        idle = self.write([ethernet(udp_ipv4(dns_query('www.google.com')), 0x0800)])
+        result = subprocess.run([sys.executable, str(TOOL), str(run), '--baseline', str(idle)],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn('www.google.com', result.stdout.split('Not on the allowed list:')[1])
+
+    def test_os_host_is_named_and_shown(self):
+        # A Google name Android itself looks up is left out only when named.
+        run = self.write([ethernet(udp_ipv4(dns_query('android.googleapis.com')), 0x0800),
+                          ethernet(udp_ipv4(dns_query('shodhya.com')), 0x0800)])
+        idle = self.write([ethernet(udp_ipv4(dns_query('android.googleapis.com')), 0x0800)])
+        result = subprocess.run([sys.executable, str(TOOL), str(run), '--baseline', str(idle),
+                                 '--os-host', 'android.googleapis.com'], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('Left out (the idle baseline', result.stdout)
+        self.assertIn('android.googleapis.com', result.stdout)
 
     def test_not_a_pcap(self):
         path = pathlib.Path(tempfile.mkdtemp()) / 'x.pcap'

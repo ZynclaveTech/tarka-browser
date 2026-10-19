@@ -49,7 +49,10 @@ class TestAllowedHosts(unittest.TestCase):
         self.assertLessEqual(android, mac)
         self.assertIn('shodhya.com', android)
         self.assertIn('api.shodhya.com', android)
-        for gone in ('chromewebstore.google.com', 'clients2.google.com',
+        # Widevine on Android comes from the OS (MediaDrm), not the component
+        # updater: its desktop hosts would only hide updater traffic.
+        for gone in ('update.googleapis.com', 'edgedl.me.gvt1.com',
+                     'chromewebstore.google.com', 'clients2.google.com',
                      'ublockorigin.github.io', 'cdn.jsdelivr.net', 'raw.githubusercontent.com'):
             self.assertNotIn(gone, android)
 

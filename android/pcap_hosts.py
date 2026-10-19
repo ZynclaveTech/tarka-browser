@@ -10,10 +10,13 @@ A1's second network check, beside check_netlog.sh: the emulator's capture
 Services, which never reach Chromium's net log. Run it with Play Services and
 the system's own probes turned off, so every name left is Tark's.
 
-usage: pcap_hosts.py CAPTURE.pcap [--baseline IDLE.pcap] [--allowed ALLOWED.txt]
+usage: pcap_hosts.py CAPTURE.pcap [--baseline IDLE.pcap] [--os-host NAME ...]
+                      [--allowed ALLOWED.txt]
 Prints each name with its count and the names not on the list; exits 1 if
 there are any, 2 if a file is not a capture it can read. Names in the
-baseline (the same emulator left idle, without Tark) are left out.
+baseline (the same emulator left idle, without Tark) are left out, and
+printed, except Google's: one of those is left out only when named with
+--os-host, after checking Android itself looks it up.
 """
 import argparse
 import collections
@@ -25,6 +28,9 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / 'utils'))
 from net_hosts import load_allowed, strangers  # noqa: E402
 
 _ETHERNET, _RAW, _IPV4, _IPV6 = 1, 101, 228, 229
+_GOOGLE = ('google', 'gstatic', 'googleapis', 'gvt1', 'gvt2', 'youtube', 'doubleclick',
+           'googlesyndication', 'googleusercontent', 'firebase', 'app-measurement',
+           'android.com', 'ggpht')
 _MAGIC = {b'\xd4\xc3\xb2\xa1': '<', b'\xa1\xb2\xc3\xd4': '>',
           b'\x4d\x3c\xb2\xa1': '<', b'\xa1\xb2\x3c\x4d': '>'}
 
@@ -109,6 +115,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument('capture')
     parser.add_argument('--baseline')
+    parser.add_argument('--os-host', action='append', default=[])
     parser.add_argument('--allowed', default=str(pathlib.Path(__file__).with_name('allowed_hosts.txt')))
     args = parser.parse_args(argv)
     try:
@@ -117,10 +124,15 @@ def main(argv=None):
     except NotACapture as e:
         print(f'{e}', file=sys.stderr)
         return 2
-    for host in idle:
-        hosts.pop(host, None)
+    left_out = sorted(h for h in idle if h in hosts and (h in args.os_host or not is_google(h)))
+    for host in left_out:
+        hosts.pop(host)
     for host, count in sorted(hosts.items(), key=lambda kv: (-kv[1], kv[0])):
         print(f'{count:6d}  {host}')
+    if left_out:
+        print('\nLeft out (the idle baseline, Android itself):')
+        for host in left_out:
+            print(f'  {host}')
     unknown = strangers(hosts, load_allowed(args.allowed))
     if unknown:
         print('\nNot on the allowed list:')
@@ -128,6 +140,11 @@ def main(argv=None):
             print(f'  {host}')
         return 1
     return 0
+
+
+def is_google(host):
+    """Whether a name belongs to Google (the baseline never hides these)."""
+    return any(part in host.split('.') or host.endswith('.' + part) for part in _GOOGLE)
 
 
 if __name__ == '__main__':
