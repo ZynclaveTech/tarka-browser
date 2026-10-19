@@ -113,6 +113,11 @@ else
     exit 1
   fi
 
+  # 1c. Chromium's own clang and Rust, fetched by their update scripts before
+  #     domain substitution rewrites googleapis.com inside those scripts.
+  run python3 "$_src_dir/tools/clang/scripts/update.py"
+  run python3 "$_src_dir/tools/rust/update_rust.py"
+
   # 2. Prune binaries, as every ungoogled-chromium build does.
   run python3 "$_main_repo/utils/prune_binaries.py" "$_src_dir" "$_main_repo/pruning.list"
 
@@ -153,12 +158,10 @@ if (( stop_before_gn )); then
   exit 3
 fi
 
-# 6. gn and ninja: Chromium's own clang and Rust (fetched by their update
-#    scripts on the build machine), gn bootstrapped from source as on the Mac.
+# 6. gn and ninja, with the clang and Rust fetched while preparing; gn is
+#    bootstrapped from source as on the Mac.
 mkdir -p "$_src_dir/out/Default"
 cat "$_main_repo/flags.gn" "$_root_dir/android/args.gn" > "$_src_dir/out/Default/args.gn"
-run python3 "$_src_dir/tools/clang/scripts/update.py"
-run python3 "$_src_dir/tools/rust/update_rust.py"
 run python3 "$_src_dir/tools/gn/bootstrap/bootstrap.py" -o "$_src_dir/out/Default/gn" --skip-generate-buildfiles
 run "$_src_dir/out/Default/gn" gen "$_src_dir/out/Default" --root="$_src_dir" --fail-on-unused-args
 run ninja -C "$_src_dir/out/Default" chrome_public_apk

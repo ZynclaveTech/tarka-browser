@@ -154,6 +154,15 @@ class TestAndroidBuildSh(unittest.TestCase):
             self.assertIn('tark: run rm -rf', result.stdout)
             self.assertIn('clone.py', result.stdout)
 
+    def test_toolchains_fetched_before_domain_substitution(self):
+        # Domain substitution rewrites googleapis.com inside the clang and
+        # Rust update scripts, so both toolchains are fetched while preparing.
+        result, runs, files, tmp = dryrun('--stop-before-gn')
+        clang = index_of(runs, 'tools/clang/scripts/update.py')
+        rust = index_of(runs, 'tools/rust/update_rust.py')
+        self.assertLess(index_of(runs, 'depot_tools-stock/gclient sync'), clang)
+        self.assertLess(max(clang, rust), index_of(runs, 'utils/domain_substitution.py apply'))
+
     def test_core_patches_then_tark_series(self):
         result, runs, files, tmp = dryrun('--stop-before-gn')
         apply = runs[index_of(runs, 'utils/patches.py apply')]
