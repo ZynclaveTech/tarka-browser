@@ -121,5 +121,34 @@ class TestAppIcon(unittest.TestCase):
             self.assertTrue((REPO / 'resources' / 'branding' / 'mark' / 'tree' / path).is_file(), path)
 
 
+class TestMenu(unittest.TestCase):
+    def setUp(self):
+        self.assertIn('android/look-menu.patch', series())
+        self.p = patch('look-menu.patch')
+        self.add = added(self.p)
+
+    def test_removed_items(self):
+        for gone in ('            modelList.add(buildQuickDeleteItem());',
+                     '            modelList.add(mHistoryItemBuilder.buildRecentTabsItem(shouldShowIconBeforeItem));',
+                     '        modelList.add(buildHelpItem());',
+                     '                    mMoreToolsItemBuilder.buildNtpCustomizationsItem(shouldShowIconBeforeItem));'):
+            self.assertIn('-' + gone, self.p, gone)
+
+    def test_tiles_type(self):
+        self.assertIn('int TARK_TILES = AppMenuHandler.AppMenuItemType.NUM_ENTRIES + 3;', self.add)
+        self.assertIn('TabbedAppMenuItemType.TARK_TILES,', self.add)
+        self.assertIn('<item type="id" name="tark_tiles_menu_id" />', self.add)
+
+    def test_tiles_use_the_old_items(self):
+        # Review focus 3: each tile is the old item's own model, so a tap does
+        # what the old row did (the menu's click handler, by menu item id).
+        for builder in ('buildNewTabItem(isIncognitoForced).model', 'buildNewIncognitoTabItem().model',
+                        'mHistoryItemBuilder.buildHistoryItem(shouldShowIconBeforeItem).model',
+                        'buildDownloadsItem().model'):
+            self.assertIn(builder, self.add)
+        self.assertIn('handler.onItemClick(item)', self.add)
+        self.assertIn('R.id.tark_tiles_menu_id', self.add)
+
+
 if __name__ == '__main__':
     unittest.main()
