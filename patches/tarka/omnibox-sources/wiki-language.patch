@@ -1,0 +1,266 @@
+Tark: @wiki opens the Wikipedia of the query's language. The URL has a new
+`{tark:wikiLang}` replacement, filled from tark_xlit::WikipediaLanguage()
+with the query's script and the user's accept-languages (SearchTermsArgs::
+tark_accept_languages): Devanagari goes to the first Devanagari language the
+user accepts (else Hindi), Tamil to Tamil, Latin to English. KeywordProvider,
+SearchProvider, the transliteration rows (each puts its own language first)
+and the controller's destination recompute all supply the languages.
+search_engines depends only on the small //components/tark_xlit:languages
+target. The starter pack data version is bumped so existing profiles get the
+new @wiki URL.
+
+--- a/components/omnibox/browser/autocomplete_controller.cc
++++ b/components/omnibox/browser/autocomplete_controller.cc
+@@ -1339,6 +1339,16 @@
+     return GURL(OmniboxFieldTrial::kGeminiUrlOverride.Get());
+   }
+ 
++  // Tark: a URL with `{tark:wikiLang}` (@wiki) reads the user's languages.
++  // Matches that were not built with them get them here.
++  if (search_terms_args.tark_accept_languages.empty()) {
++    TemplateURLRef::SearchTermsArgs with_languages(search_terms_args);
++    with_languages.tark_accept_languages =
++        provider_client_->GetAcceptLanguages();
++    return GURL(template_url->url_ref().ReplaceSearchTerms(
++        with_languages, template_url_service_->search_terms_data()));
++  }
++
+   return GURL(template_url->url_ref().ReplaceSearchTerms(
+       search_terms_args, template_url_service_->search_terms_data()));
+ }
+--- a/components/omnibox/browser/base_search_provider.cc
++++ b/components/omnibox/browser/base_search_provider.cc
+@@ -140,7 +140,8 @@
+     const TemplateURL* template_url,
+     const SearchTermsData& search_terms_data,
+     int accepted_suggestion,
+-    bool append_extra_query_params_from_command_line) {
++    bool append_extra_query_params_from_command_line,
++    std::string_view tark_accept_languages) {
+   AutocompleteMatch match(autocomplete_provider, suggestion.relevance(), false,
+                           suggestion.type());
+ 
+@@ -245,6 +246,8 @@
+   }
+   match.search_terms_args->append_extra_query_params_from_command_line =
+       append_extra_query_params_from_command_line;
++  match.search_terms_args->tark_accept_languages =
++      std::string(tark_accept_languages);
+   // Must be set for deduplication and navigation. AutocompleteController will
+   // ultimately overwrite this with the searchbox stats before navigation.
+   match.destination_url = GURL(search_url.ReplaceSearchTerms(
+@@ -575,9 +578,12 @@
+     bool mark_as_deletable,
+     bool in_keyword_mode,
+     MatchMap* map) {
++  // Tark: a URL with `{tark:wikiLang}` (@wiki) reads the user's languages, the
++  // same as KeywordProvider gives it.
+   AutocompleteMatch match = CreateSearchSuggestion(
+       this, input, in_keyword_mode, result, template_url, search_terms_data,
+-      accepted_suggestion, ShouldAppendExtraParams(result));
++      accepted_suggestion, ShouldAppendExtraParams(result),
++      client_->GetAcceptLanguages());
+   if (!match.destination_url.is_valid())
+     return;
+   if (match.IsSearchAimSuggestion() &&
+--- a/components/omnibox/browser/base_search_provider.h
++++ b/components/omnibox/browser/base_search_provider.h
+@@ -13,6 +13,7 @@
+ #include <memory>
+ #include <optional>
+ #include <string>
++#include <string_view>
+ #include <utility>
+ #include <vector>
+ 
+@@ -71,6 +72,8 @@
+   // |append_extra_query_params_from_command_line| should be set if
+   // |template_url| is the default search engine, so the destination URL will
+   // contain any command-line-specified query params.
++  // |tark_accept_languages| is the user's accept-languages list, for a
++  // |template_url| whose URL has `{tark:wikiLang}` (the starter pack @wiki).
+   static AutocompleteMatch CreateSearchSuggestion(
+       AutocompleteProvider* autocomplete_provider,
+       const AutocompleteInput& input,
+@@ -79,7 +82,8 @@
+       const TemplateURL* template_url,
+       const SearchTermsData& search_terms_data,
+       int accepted_suggestion,
+-      bool append_extra_query_params_from_command_line);
++      bool append_extra_query_params_from_command_line,
++      std::string_view tark_accept_languages = std::string_view());
+ 
+   // A helper function to return an AutocompleteMatch suitable for persistence
+   // in ShortcutsDatabase.
+--- a/components/omnibox/browser/keyword_provider.cc
++++ b/components/omnibox/browser/keyword_provider.cc
+@@ -442,6 +442,8 @@
+     search_terms_args.page_classification = input.current_page_classification();
+     search_terms_args.append_extra_query_params_from_command_line =
+         turl == GetTemplateURLService()->GetDefaultSearchProvider();
++    // Tark: `{tark:wikiLang}` needs the user's languages.
++    search_terms_args.tark_accept_languages = client_->GetAcceptLanguages();
+     match->destination_url = GURL(turl_ref.ReplaceSearchTerms(
+         search_terms_args, GetTemplateURLService()->search_terms_data()));
+     match->contents = AutocompleteMatch::SanitizeString(remaining_input);
+--- a/components/omnibox/browser/tark_transliteration_provider.cc
++++ b/components/omnibox/browser/tark_transliteration_provider.cc
+@@ -456,7 +456,10 @@
+           suggestion, engine, template_url_service->search_terms_data(),
+           TemplateURLRef::NO_SUGGESTION_CHOSEN,
+           /*append_extra_query_params_from_command_line=*/
+-          !request.keyword_mode);
++          !request.keyword_mode,
++          // The row's own language first, so `{tark:wikiLang}` opens that
++          // language's Wikipedia and not another of the same script.
++          base::StrCat({language.tag, ",", client_->GetAcceptLanguages()}));
+       // Enter searches what was typed; a row is chosen only by arrowing to it.
+       match.allowed_to_be_default_match = false;
+       match.inline_autocompletion.clear();
+--- a/components/search_engines/BUILD.gn
++++ b/components/search_engines/BUILD.gn
+@@ -111,6 +111,7 @@
+     "//components/search_provider_logos:switches",
+     "//components/signin/public/base",
+     "//components/strings",
++    "//components/tark_xlit:languages",
+     "//components/url_formatter",
+     "//components/variations",
+     "//google_apis",
+--- a/components/search_engines/DEPS
++++ b/components/search_engines/DEPS
+@@ -19,6 +19,7 @@
+   "+components/signin",
+   "+components/sync",
+   "+components/sync_preferences/testing_pref_service_syncable.h",
++  "+components/tark_xlit/languages.h",
+   "+components/url_formatter",
+   "+components/variations",
+   "+components/version_info/version_info.h",
+--- a/components/search_engines/template_url.cc
++++ b/components/search_engines/template_url.cc
+@@ -49,6 +49,7 @@
+ #include "components/search_engines/template_url_starter_pack_data.h"
+ #include "components/strings/grit/components_strings.h"
+ #include "components/sync/base/features.h"
++#include "components/tark_xlit/languages.h"
+ #include "components/url_formatter/url_formatter.h"
+ #include "google_apis/google_api_keys.h"
+ #include "net/base/mime_util.h"
+@@ -285,6 +286,7 @@
+   res += base::trace_event::EstimateMemoryUsage(image_translate_source_locale);
+   res += base::trace_event::EstimateMemoryUsage(image_translate_target_locale);
+   res += base::trace_event::EstimateMemoryUsage(previous_query);
++  res += base::trace_event::EstimateMemoryUsage(tark_accept_languages);
+ 
+   return res;
+ }
+@@ -872,6 +874,8 @@
+     replacements->push_back(Replacement(ENCODING, start));
+   } else if (parameter == "language") {
+     replacements->push_back(Replacement(LANGUAGE, start));
++  } else if (parameter == "tark:wikiLang") {
++    replacements->push_back(Replacement(TARK_WIKI_LANGUAGE, start));
+   } else if (parameter == "outputEncoding") {
+     if (!optional) {
+       url->insert(start, kOutputEncodingType);
+@@ -1535,6 +1539,14 @@
+                           replacement, &url);
+         break;
+ 
++      case TARK_WIKI_LANGUAGE:
++        HandleReplacement(std::string(),
++                          tark_xlit::WikipediaLanguage(
++                              search_terms_args.search_terms,
++                              search_terms_args.tark_accept_languages),
++                          replacement, &url);
++        break;
++
+       case GOOGLE_IMAGE_THUMBNAIL:
+         HandleReplacement(std::string(),
+                           search_terms_args.image_thumbnail_content,
+--- a/components/search_engines/template_url.h
++++ b/components/search_engines/template_url.h
+@@ -313,6 +313,11 @@
+     // The method in which the last input was entered. This is an enum that
+     // gets mapped to third_party/omnibox_proto/chrome_searchbox_stats.proto.
+     int input_method = 0;
++
++    // The user's accept-languages list (a comma list such as "en-US,hi"),
++    // which `{tark:wikiLang}` reads to pick the Wikipedia of the query's
++    // script. Empty falls back to each script's default language.
++    std::string tark_accept_languages;
+   };
+ 
+   TemplateURLRef(const TemplateURL* owner, Type type);
+@@ -494,6 +499,8 @@
+     LANGUAGE,
+     MAIL_RU_REFERRAL_ID,
+     SEARCH_TERMS,
++    // The language code of the Wikipedia that matches the query's script.
++    TARK_WIKI_LANGUAGE,
+     YANDEX_REFERRAL_ID,
+     IMAGE_TRANSLATE_SOURCE_LOCALE,
+     IMAGE_TRANSLATE_TARGET_LOCALE
+--- a/components/search_engines/template_url_starter_pack_data.cc
++++ b/components/search_engines/template_url_starter_pack_data.cc
+@@ -17,7 +17,7 @@
+ namespace template_url_starter_pack_data {
+ 
+ // Update this whenever a change is made to any starter pack data.
+-const int kCurrentDataVersion = 15;
++const int kCurrentDataVersion = 16;
+ 
+ // Only update this if there's an incompatible change that requires force
+ // updating the user's starter pack data. This will overwrite any of the
+@@ -98,10 +98,10 @@
+     .name_message_id = 0,
+     .keyword_message_id = 0,
+     .favicon_url = nullptr,
+-    // Tark: the language is fixed to English for now.
++    // Tark: the Wikipedia follows the script of the query.
+     .search_url =
+         "https://www.wikipedia.org/search-redirect.php"
+-        "?family=wikipedia&language=en&search={searchTerms}",
++        "?family=wikipedia&language={tark:wikiLang}&search={searchTerms}",
+     .destination_url = "https://www.wikipedia.org",
+     .id = StarterPackId::kTarkWiki,
+     .type = SEARCH_ENGINE_OTHER,
+--- a/components/tark_xlit/BUILD.gn
++++ b/components/tark_xlit/BUILD.gn
+@@ -7,12 +7,21 @@
+ # Tark is macOS-only, and the model runs on Accelerate.
+ assert(is_mac, "tark_xlit needs macOS (Accelerate)")
+ 
++# The script and language tables. A separate target so that components that only
++# need to tell scripts and languages apart (search_engines, for the Wikipedia
++# language) do not link the model or Accelerate.
++source_set("languages") {
++  sources = [
++    "languages.cc",
++    "languages.h",
++  ]
++  public_deps = [ "//base" ]
++}
++
+ # Indian-language transliteration for the address bar. Everything here runs on
+ # the device; nothing in this component touches the network.
+ static_library("tark_xlit") {
+   sources = [
+-    "languages.cc",
+-    "languages.h",
+     "model.cc",
+     "model.h",
+     "transliterator.cc",
+@@ -20,7 +29,10 @@
+     "word_list.cc",
+     "word_list.h",
+   ]
+-  public_deps = [ "//base" ]
++  public_deps = [
++    ":languages",
++    "//base",
++  ]
+ 
+   # The model's matrix products run through Accelerate's BLAS.
+   frameworks = [ "Accelerate.framework" ]
