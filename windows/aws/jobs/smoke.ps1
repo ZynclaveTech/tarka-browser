@@ -9,7 +9,7 @@
 param([string]$Bucket, [string]$Prefix, [string]$Url = 'https://gettarka.com/')
 $ErrorActionPreference = 'Continue'
 $PSDefaultParameterValues['Out-File:Encoding'] = 'utf8'
-shutdown.exe /a 2>$null | Out-Null
+cmd.exe /c "shutdown /a >nul 2>&1"
 $out = 'C:\smoke'
 $log = "$out\smoke.log"
 Remove-Item -Recurse -Force $out -ErrorAction SilentlyContinue

@@ -9,7 +9,7 @@
 param([string]$Bucket, [string]$Prefix, [string]$Urls = 'https://gettarka.com/ chrome://settings/ chrome://downloads/')
 $ErrorActionPreference = 'Continue'
 $PSDefaultParameterValues['Out-File:Encoding'] = 'utf8'
-shutdown.exe /a 2>$null | Out-Null
+cmd.exe /c "shutdown /a >nul 2>&1"
 $dir = 'C:\desk'
 $log = "$dir\window-shot.log"
 Remove-Item -Recurse -Force $dir -ErrorAction SilentlyContinue

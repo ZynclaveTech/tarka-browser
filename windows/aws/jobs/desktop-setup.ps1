@@ -14,7 +14,7 @@
 param([string]$Bucket, [string]$Prefix)
 $ErrorActionPreference = 'Stop'
 $PSDefaultParameterValues['Out-File:Encoding'] = 'utf8'
-shutdown.exe /a 2>$null | Out-Null
+cmd.exe /c "shutdown /a >nul 2>&1"
 $log = 'C:\tark-logs\desktop-setup.log'
 New-Item -ItemType Directory -Force -Path 'C:\tark-logs', 'C:\tark-setup' | Out-Null
 try {

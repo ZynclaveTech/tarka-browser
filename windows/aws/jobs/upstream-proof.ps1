@@ -11,7 +11,7 @@ $ErrorActionPreference = 'Continue'
 # Windows PowerShell 5.1 redirects (*>>) as UTF-16; logs are read on the Mac.
 $PSDefaultParameterValues['Out-File:Encoding'] = 'utf8'
 # A job that just finished may have scheduled a shutdown; this one needs the machine.
-shutdown.exe /a 2>$null | Out-Null
+cmd.exe /c "shutdown /a >nul 2>&1"
 $root = 'C:\ucw'
 $log = 'C:\tark-logs\upstream-proof.log'
 New-Item -ItemType Directory -Force -Path 'C:\tark-logs' | Out-Null
