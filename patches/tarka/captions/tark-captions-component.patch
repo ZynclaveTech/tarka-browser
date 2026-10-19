@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/components/tark_captions/BUILD.gn
-@@ -0,0 +1,58 @@
+@@ -0,0 +1,76 @@
 +# Copyright 2026 The Tark Authors
 +# Use of this source code is governed by a BSD-style license that can be
 +# found in the LICENSE file.
@@ -16,6 +16,8 @@
 +  sources = [
 +    "asr_model.cc",
 +    "asr_model.h",
++    "caption_engine.cc",
++    "caption_engine.h",
 +    "mel_frontend.cc",
 +    "mel_frontend.h",
 +    "ort_runtime.cc",
@@ -28,6 +30,7 @@
 +  include_dirs = [ "//third_party/tark_onnxruntime/include" ]
 +  deps = [
 +    "//base",
++    "//media",
 +    "//third_party/pffft",
 +  ]
 +}
@@ -47,6 +50,7 @@
 +test("tark_captions_unittests") {
 +  sources = [
 +    "asr_model_unittest.cc",
++    "caption_engine_unittest.cc",
 +    "mel_frontend_unittest.cc",
 +    "ort_runtime_unittest.cc",
 +    "segmenter_unittest.cc",
@@ -56,7 +60,21 @@
 +    ":test_support",
 +    "//base",
 +    "//base/test:run_all_unittests",
++    "//base/test:test_support",
++    "//media",
 +    "//testing/gtest",
++  ]
++}
++
++# Cores used and draft lag on a 5-minute Hindi track (the D4 spike measured
++# 0.26 cores and 0.50 s on an M3 Pro). Same environment variables as the tests.
++executable("tark_captions_bench") {
++  testonly = true
++  sources = [ "bench.cc" ]
++  deps = [
++    ":tark_captions",
++    ":test_support",
++    "//base",
 +  ]
 +}
 --- /dev/null
@@ -1423,3 +1441,465 @@
 +
 +}  // namespace
 +}  // namespace tark_captions
+--- /dev/null
++++ b/components/tark_captions/caption_engine.h
+@@ -0,0 +1,95 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef COMPONENTS_TARK_CAPTIONS_CAPTION_ENGINE_H_
++#define COMPONENTS_TARK_CAPTIONS_CAPTION_ENGINE_H_
++
++#include <cstdint>
++#include <memory>
++#include <string>
++#include <vector>
++
++#include "base/containers/span.h"
++#include "base/files/file_path.h"
++#include "base/functional/callback.h"
++#include "components/tark_captions/asr_model.h"
++
++namespace media {
++class SincResampler;
++}
++
++namespace tark_captions {
++
++class OrtRuntime;
++class Segmenter;
++class Vad;
++
++// A caption: a draft of what is being said, or the final text of a segment.
++struct CaptionEvent {
++  bool is_final = false;
++  std::string text;
++};
++
++// Live captions of a call's audio: speech detection, segmenting and
++// IndicConformer, in the D4 spike's measured configuration (2 threads,
++// drafts every 0.8 s, segments of at most 5 s). Not thread-safe; use on one
++// sequence. Decoding happens inside AddAudio(), so call it off the audio
++// thread.
++class CaptionEngine {
++ public:
++  struct Stats {
++    int decodes = 0;
++    std::vector<double> decode_seconds;  // wall time of each decode
++  };
++
++  // Null if ONNX Runtime or any model is missing.
++  static std::unique_ptr<CaptionEngine> Create(const base::FilePath& models_dir,
++                                               const base::FilePath& ort_dylib);
++
++  CaptionEngine(const CaptionEngine&) = delete;
++  CaptionEngine& operator=(const CaptionEngine&) = delete;
++  ~CaptionEngine();
++
++  void SetLanguage(Language language);
++
++  // Interleaved float audio at any rate and channel count; downmixed and
++  // resampled to 16 kHz mono. `on_event` runs for each draft and final.
++  using EventCallback = base::RepeatingCallback<void(CaptionEvent)>;
++  void AddAudio(base::span<const float> interleaved, int channels, int sample_rate,
++                const EventCallback& on_event);
++  // The end of the audio: finalises an open segment.
++  void Flush(const EventCallback& on_event);
++
++  const Stats& stats() const { return stats_; }
++
++ private:
++  CaptionEngine(std::unique_ptr<OrtRuntime> runtime,
++                std::unique_ptr<AsrModel> asr,
++                std::unique_ptr<Vad> vad);
++
++  void AddMono16k(base::span<const float> pcm, const EventCallback& on_event);
++  void Decode(bool is_final, double start_s, double end_s, const EventCallback& on_event);
++
++  std::unique_ptr<OrtRuntime> runtime_;
++  std::unique_ptr<AsrModel> asr_;
++  std::unique_ptr<Vad> vad_;
++  std::unique_ptr<Segmenter> segmenter_;
++  Language language_ = Language::kHindi;
++
++  // 16 kHz mono audio from absolute sample `audio_start_` to `total_`.
++  std::vector<float> audio_;
++  int64_t audio_start_ = 0;
++  int64_t total_ = 0;
++  std::vector<float> chunk_;  // the next VAD chunk, being filled
++
++  int input_rate_ = 16000;
++  std::unique_ptr<media::SincResampler> resampler_;
++  std::vector<float> fifo_;  // mono input waiting for the resampler
++
++  Stats stats_;
++};
++
++}  // namespace tark_captions
++
++#endif  // COMPONENTS_TARK_CAPTIONS_CAPTION_ENGINE_H_
+--- /dev/null
++++ b/components/tark_captions/caption_engine.cc
+@@ -0,0 +1,149 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/tark_captions/caption_engine.h"
++
++#include <algorithm>
++#include <utility>
++
++#include "base/functional/bind.h"
++#include "base/memory/ptr_util.h"
++#include "base/time/time.h"
++#include "components/tark_captions/ort_runtime.h"
++#include "components/tark_captions/segmenter.h"
++#include "components/tark_captions/vad.h"
++#include "media/base/sinc_resampler.h"
++
++namespace tark_captions {
++namespace {
++
++constexpr int kRate = 16000;
++constexpr int kThreads = 2;
++// Audio kept for decoding: more than a 5 s segment plus its pre-roll.
++constexpr int64_t kKeep = 12 * kRate;
++
++}  // namespace
++
++// static
++std::unique_ptr<CaptionEngine> CaptionEngine::Create(const base::FilePath& models_dir,
++                                                     const base::FilePath& ort_dylib) {
++  std::unique_ptr<OrtRuntime> runtime = OrtRuntime::Load(ort_dylib);
++  if (!runtime) {
++    return nullptr;
++  }
++  std::unique_ptr<AsrModel> asr = AsrModel::Load(runtime.get(), models_dir, kThreads);
++  std::unique_ptr<Vad> vad = Vad::Load(runtime.get(), models_dir);
++  if (!asr || !vad) {
++    return nullptr;
++  }
++  return base::WrapUnique(new CaptionEngine(std::move(runtime), std::move(asr), std::move(vad)));
++}
++
++CaptionEngine::CaptionEngine(std::unique_ptr<OrtRuntime> runtime,
++                             std::unique_ptr<AsrModel> asr,
++                             std::unique_ptr<Vad> vad)
++    : runtime_(std::move(runtime)),
++      asr_(std::move(asr)),
++      vad_(std::move(vad)),
++      segmenter_(std::make_unique<Segmenter>()) {}
++
++CaptionEngine::~CaptionEngine() {
++  // Models before the runtime that loaded them.
++  asr_.reset();
++  vad_.reset();
++}
++
++void CaptionEngine::SetLanguage(Language language) {
++  language_ = language;
++}
++
++void CaptionEngine::AddAudio(base::span<const float> interleaved, int channels, int sample_rate,
++                             const EventCallback& on_event) {
++  if (channels < 1 || sample_rate < 8000) {
++    return;
++  }
++  std::vector<float> mono(interleaved.size() / channels);
++  for (size_t i = 0; i < mono.size(); ++i) {
++    float sum = 0;
++    for (int c = 0; c < channels; ++c) {
++      sum += interleaved[i * channels + c];
++    }
++    mono[i] = sum / channels;
++  }
++  if (sample_rate == kRate) {
++    AddMono16k(mono, on_event);
++    return;
++  }
++  if (!resampler_ || sample_rate != input_rate_) {
++    input_rate_ = sample_rate;
++    fifo_.clear();
++    resampler_ = std::make_unique<media::SincResampler>(
++        static_cast<double>(sample_rate) / kRate, media::SincResampler::kDefaultRequestSize,
++        base::BindRepeating(
++            [](std::vector<float>* fifo, base::span<float> dest) {
++              const size_t n = std::min(dest.size(), fifo->size());
++              std::copy_n(fifo->begin(), n, dest.begin());
++              std::fill(dest.begin() + n, dest.end(), 0.0f);
++              fifo->erase(fifo->begin(), fifo->begin() + n);
++            },
++            base::Unretained(&fifo_)));
++    resampler_->PrimeWithSilence();
++  }
++  fifo_.insert(fifo_.end(), mono.begin(), mono.end());
++  std::vector<float> out(resampler_->ChunkSize());
++  while (fifo_.size() >= static_cast<size_t>(media::SincResampler::kDefaultRequestSize)) {
++    resampler_->Resample(out);
++    AddMono16k(out, on_event);
++  }
++}
++
++void CaptionEngine::AddMono16k(base::span<const float> pcm, const EventCallback& on_event) {
++  audio_.insert(audio_.end(), pcm.begin(), pcm.end());
++  for (float sample : pcm) {
++    chunk_.push_back(sample);
++    if (chunk_.size() < Vad::kChunk) {
++      continue;
++    }
++    total_ += Vad::kChunk;
++    const float p = vad_->Process(base::span(chunk_).first<Vad::kChunk>());
++    chunk_.clear();
++    const SegmenterAction a = segmenter_->OnChunk(static_cast<double>(total_) / kRate, p);
++    if (a.kind != SegmenterAction::kNone) {
++      Decode(a.kind == SegmenterAction::kFinal, a.start_s, a.end_s, on_event);
++    }
++  }
++  if (static_cast<int64_t>(audio_.size()) > 2 * kKeep) {
++    const int64_t drop = static_cast<int64_t>(audio_.size()) - kKeep;
++    audio_.erase(audio_.begin(), audio_.begin() + drop);
++    audio_start_ += drop;
++  }
++}
++
++void CaptionEngine::Flush(const EventCallback& on_event) {
++  if (std::optional<SegmenterAction> a = segmenter_->Flush(static_cast<double>(total_) / kRate)) {
++    Decode(/*is_final=*/true, a->start_s, a->end_s, on_event);
++  }
++}
++
++void CaptionEngine::Decode(bool is_final, double start_s, double end_s,
++                           const EventCallback& on_event) {
++  const int64_t end_total = audio_start_ + static_cast<int64_t>(audio_.size());
++  const int64_t begin = std::clamp<int64_t>(start_s * kRate, audio_start_, end_total);
++  const int64_t end = std::clamp<int64_t>(end_s * kRate, begin, end_total);
++  if (end - begin < kRate / 4) {
++    return;
++  }
++  const base::TimeTicks started = base::TimeTicks::Now();
++  std::string text = asr_->Decode(
++      base::span(audio_).subspan(static_cast<size_t>(begin - audio_start_),
++                                 static_cast<size_t>(end - begin)),
++      language_);
++  stats_.decodes++;
++  stats_.decode_seconds.push_back((base::TimeTicks::Now() - started).InSecondsF());
++  if (!text.empty()) {
++    on_event.Run({.is_final = is_final, .text = std::move(text)});
++  }
++}
++
++}  // namespace tark_captions
+--- /dev/null
++++ b/components/tark_captions/caption_engine_unittest.cc
+@@ -0,0 +1,137 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/tark_captions/caption_engine.h"
++
++#include <algorithm>
++#include <string>
++#include <vector>
++
++#include "base/functional/bind.h"
++#include "base/test/bind.h"
++#include "base/strings/utf_string_conversions.h"
++#include "components/tark_captions/test_util.h"
++#include "media/base/sinc_resampler.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace tark_captions {
++namespace {
++
++// Character error rate of `hyp` against `ref` (UTF-16 units; the test
++// scripts are in the BMP).
++double Cer(const std::string& ref, const std::string& hyp) {
++  const std::u16string r = base::UTF8ToUTF16(ref);
++  const std::u16string h = base::UTF8ToUTF16(hyp);
++  std::vector<size_t> row(h.size() + 1);
++  for (size_t j = 0; j <= h.size(); ++j) {
++    row[j] = j;
++  }
++  for (size_t i = 1; i <= r.size(); ++i) {
++    size_t diagonal = row[0];
++    row[0] = i;
++    for (size_t j = 1; j <= h.size(); ++j) {
++      const size_t up = row[j];
++      row[j] = std::min({row[j] + 1, row[j - 1] + 1, diagonal + (r[i - 1] != h[j - 1])});
++      diagonal = up;
++    }
++  }
++  return r.empty() ? 0 : static_cast<double>(row[h.size()]) / r.size();
++}
++
++std::string NoSpaces(std::string s) {
++  std::erase(s, ' ');
++  return s;
++}
++
++class CaptionEngineTest : public testing::Test {
++ protected:
++  void SetUp() override {
++    std::optional<base::FilePath> ort = test::OrtPath();
++    std::optional<base::FilePath> models = test::ModelsDir();
++    std::optional<base::FilePath> testdata = test::TestDataDir();
++    if (!ort || !models || !testdata) {
++      GTEST_SKIP() << "set TARK_CAPTIONS_ORT, TARK_CAPTIONS_MODELS and TARK_CAPTIONS_TESTDATA";
++    }
++    ort_ = *ort;
++    models_ = *models;
++    // The two Hindi clips joined by 1 s of silence, and their golden text.
++    for (const base::Value& clip : test::GoldenClips(*testdata)) {
++      if (*clip.GetDict().FindString("lang") != "hi") {
++        continue;
++      }
++      int rate = 0;
++      std::vector<float> pcm =
++          test::ReadWav(testdata->AppendASCII(*clip.GetDict().FindString("wav")), &rate);
++      track_.insert(track_.end(), pcm.begin(), pcm.end());
++      track_.insert(track_.end(), 16000, 0.0f);
++      reference_ += *clip.GetDict().FindString("ctc_text") + " ";
++    }
++    ASSERT_GT(track_.size(), 16000u * 10);
++  }
++
++  // Feeds `audio` in 10 ms blocks and returns the finals, joined.
++  std::string Finals(const std::vector<float>& audio, int channels, int rate) {
++    std::unique_ptr<CaptionEngine> engine = CaptionEngine::Create(models_, ort_);
++    EXPECT_TRUE(engine);
++    if (!engine) {
++      return std::string();
++    }
++    engine->SetLanguage(Language::kHindi);
++    std::string finals;
++    auto on_event = base::BindLambdaForTesting([&](CaptionEvent e) {
++      if (e.is_final) {
++        finals += e.text + " ";
++      }
++    });
++    const size_t block = static_cast<size_t>(rate / 100) * channels;
++    for (size_t i = 0; i < audio.size(); i += block) {
++      engine->AddAudio(base::span(audio).subspan(i, std::min(block, audio.size() - i)), channels,
++                       rate, on_event);
++    }
++    engine->Flush(on_event);
++    return finals;
++  }
++
++  base::FilePath ort_;
++  base::FilePath models_;
++  std::vector<float> track_;
++  std::string reference_;
++};
++
++TEST_F(CaptionEngineTest, JoinedTrackFinals) {
++  const std::string finals = Finals(track_, 1, 16000);
++  EXPECT_LE(Cer(NoSpaces(reference_), NoSpaces(finals)), 0.05) << finals;
++}
++
++TEST_F(CaptionEngineTest, Resample48kMatches16k) {
++  // The track at 48 kHz stereo, as Meet plays it.
++  std::vector<float> mono48;
++  size_t read = 0;
++  media::SincResampler up(16000.0 / 48000.0, media::SincResampler::kDefaultRequestSize,
++                          base::BindLambdaForTesting([&](base::span<float> dest) {
++                            for (float& s : dest) {
++                              s = read < track_.size() ? track_[read++] : 0.0f;
++                            }
++                          }));
++  mono48.resize(track_.size() * 3);
++  up.Resample(mono48);
++  std::vector<float> stereo48;
++  for (float s : mono48) {
++    stereo48.push_back(s);
++    stereo48.push_back(s);
++  }
++  const std::string at16 = Finals(track_, 1, 16000);
++  const std::string at48 = Finals(stereo48, 2, 48000);
++  const double cer16 = Cer(NoSpaces(reference_), NoSpaces(at16));
++  const double cer48 = Cer(NoSpaces(reference_), NoSpaces(at48));
++  // 48 kHz stereo is captioned as well as 16 kHz mono (within a point).
++  EXPECT_LE(cer48, cer16 + 0.01) << "16k " << cer16 << ": " << at16 << " | 48k " << cer48 << ": " << at48;
++}
++
++TEST_F(CaptionEngineTest, MissingModelsFail) {
++  EXPECT_FALSE(CaptionEngine::Create(base::FilePath("/nonexistent"), ort_));
++}
++
++}  // namespace
++}  // namespace tark_captions
+--- /dev/null
++++ b/components/tark_captions/bench.cc
+@@ -0,0 +1,69 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// tark_captions_bench: cores used and draft lag of the caption engine on a
++// 5-minute Hindi track (the test clips repeated, with 0.8-2 s pauses).
++
++#include <sys/resource.h>
++
++#include <algorithm>
++#include <cstdio>
++
++#include "base/functional/callback_helpers.h"
++#include "components/tark_captions/caption_engine.h"
++#include "components/tark_captions/segmenter.h"
++#include "components/tark_captions/test_util.h"
++
++namespace {
++
++double CpuSeconds() {
++  rusage u;
++  getrusage(RUSAGE_SELF, &u);
++  return u.ru_utime.tv_sec + u.ru_utime.tv_usec / 1e6 + u.ru_stime.tv_sec + u.ru_stime.tv_usec / 1e6;
++}
++
++}  // namespace
++
++int main() {
++  using namespace tark_captions;
++  std::optional<base::FilePath> ort = test::OrtPath();
++  std::optional<base::FilePath> models = test::ModelsDir();
++  std::optional<base::FilePath> testdata = test::TestDataDir();
++  if (!ort || !models || !testdata) {
++    fprintf(stderr, "set TARK_CAPTIONS_ORT, TARK_CAPTIONS_MODELS and TARK_CAPTIONS_TESTDATA\n");
++    return 2;
++  }
++  std::vector<std::vector<float>> clips;
++  for (const base::Value& clip : test::GoldenClips(*testdata)) {
++    if (*clip.GetDict().FindString("lang") == "hi") {
++      int rate = 0;
++      clips.push_back(test::ReadWav(testdata->AppendASCII(*clip.GetDict().FindString("wav")), &rate));
++    }
++  }
++  std::vector<float> track;
++  for (int i = 0; track.size() < 300u * 16000; ++i) {
++    const std::vector<float>& clip = clips[i % clips.size()];
++    track.insert(track.end(), clip.begin(), clip.end());
++    track.insert(track.end(), static_cast<size_t>((0.8 + 0.4 * (i % 4)) * 16000), 0.0f);
++  }
++  std::unique_ptr<CaptionEngine> engine = CaptionEngine::Create(*models, *ort);
++  if (!engine) {
++    fprintf(stderr, "engine not created\n");
++    return 1;
++  }
++  const double cpu0 = CpuSeconds();
++  for (size_t i = 0; i < track.size(); i += 160) {
++    engine->AddAudio(base::span(track).subspan(i, std::min<size_t>(160, track.size() - i)), 1,
++                     16000, base::DoNothing());
++  }
++  engine->Flush(base::DoNothing());
++  const double cpu = CpuSeconds() - cpu0;
++  std::vector<double> times = engine->stats().decode_seconds;
++  std::sort(times.begin(), times.end());
++  const double audio = track.size() / 16000.0;
++  printf("audio %.0f s, decodes %d, cores used %.2f, decode median %.3f s p90 %.3f s, draft lag %.2f s\n",
++         audio, engine->stats().decodes, cpu / audio, times[times.size() / 2],
++         times[times.size() * 9 / 10], Segmenter::kDraftEvery / 2 + times[times.size() / 2]);
++  return 0;
++}
