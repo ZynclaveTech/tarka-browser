@@ -53,13 +53,10 @@ try {
   [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
   $plain = [Convert]::ToBase64String($bytes) + 'aA1!'
   $secure = ConvertTo-SecureString $plain -AsPlainText -Force
-  if (Get-LocalUser -Name 'tarkdesk' -ErrorAction SilentlyContinue) {
-    Set-LocalUser -Name 'tarkdesk' -Password $secure
-  } else {
-    New-LocalUser -Name 'tarkdesk' -Password $secure -PasswordNeverExpires -AccountNeverExpires `
-      -Description 'Tark build machine desktop session for window screenshots' | Out-Null
-    Add-LocalGroupMember -Group 'Users' -Member 'tarkdesk'
-  }
+  # Description: Windows allows at most 48 characters.
+  New-LocalUser -Name 'tarkdesk' -Password $secure -PasswordNeverExpires -AccountNeverExpires `
+    -Description 'Tark desktop session for window screenshots' | Out-Null
+  Add-LocalGroupMember -Group 'Users' -Member 'tarkdesk'
   'user tarkdesk ready' | Add-Content $log
 
   $zip = Join-Path $base 'AutoLogon.zip'
