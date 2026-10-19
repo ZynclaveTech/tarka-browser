@@ -65,8 +65,13 @@ class TestAndroidConfig(unittest.TestCase):
                      'is_official_build = true', 'is_component_build = false',
                      'chrome_pgo_phase = 0', 'symbol_level = 0',
                      'chrome_public_manifest_package = "com.gettarka.tarka"',
-                     'use_sysroot = false', 'use_clang_modules = false'):
+                     'use_clang_modules = false'):
             self.assertIn(line, args)
+
+    def test_sysroot_stays_on(self):
+        # base/BUILD.gn links a system libatomic on Android when use_sysroot is
+        # false, which the NDK copy lacks; host tools get the Debian sysroot.
+        self.assertNotIn('use_sysroot', (ANDROID / 'args.gn').read_text())
 
     def test_gclient_template(self):
         text = (ANDROID / 'gclient.android').read_text()

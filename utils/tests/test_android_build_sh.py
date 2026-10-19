@@ -195,6 +195,12 @@ class TestAndroidBuildSh(unittest.TestCase):
         self.assertNotIn('prune_binaries.py', '\n'.join(runs))
         self.assertIn('chrome/android/', SCRIPT.read_text())  # the reason is written down
 
+    def test_host_sysroot_installed_before_domain_substitution(self):
+        result, runs, files, tmp = dryrun('--stop-before-gn')
+        sysroot = index_of(runs, 'install-sysroot.py --arch=amd64')
+        self.assertLess(index_of(runs, 'depot_tools-stock/gclient sync'), sysroot)
+        self.assertLess(sysroot, index_of(runs, 'utils/domain_substitution.py apply'))
+
     def test_core_patches_then_tark_series(self):
         result, runs, files, tmp = dryrun('--stop-before-gn')
         apply = runs[index_of(runs, 'utils/patches.py apply')]

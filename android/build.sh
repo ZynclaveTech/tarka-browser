@@ -126,6 +126,10 @@ else
   #     domain substitution (which rewrites googleapis.com inside them).
   run python3 "$_src_dir/tools/clang/scripts/update.py"
   run python3 "$_src_dir/tools/rust/update_rust.py"
+  # The Debian sysroot the Linux host tools build against (gclient fetches it
+  # only for checkout_linux, which an Android checkout does not set). Also
+  # before domain substitution, which rewrites its download URL.
+  run python3 "$_src_dir/build/linux/sysroot_scripts/install-sysroot.py" --arch=amd64
 
   # 3. ungoogled-chromium's core patches, then Tark's Android series.
   mkdir -p "$work/tark-patches"
