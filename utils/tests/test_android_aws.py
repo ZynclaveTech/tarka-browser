@@ -64,6 +64,34 @@ class TestBootstrap(unittest.TestCase):
         self.assertIn('poweroff', self.s)
 
 
+class TestNoRunawayBilling(unittest.TestCase):
+    # Final review: the machine must stop itself whatever fails.
+    def test_watchdog_before_dependencies(self):
+        s = text('bootstrap.sh')
+        self.assertLess(s.index('systemctl enable --now tark-idle-stop.timer'), s.index('apt-get update'))
+        self.assertIn("trap 'poweroff' ERR", s)
+        self.assertNotIn('aws-cli --classic || true', s)
+
+    def test_job_time_cap(self):
+        self.assertRegex(text('jobs/tark-build.sh'), r'timeout \d+h bash \$repo/android/build\.sh')
+
+
+class TestJobResults(unittest.TestCase):
+    def setUp(self):
+        self.s = text('jobs/tark-build.sh')
+
+    def test_no_stale_apk(self):
+        # A failed or patch-only job never uploads an earlier build's APK.
+        self.assertLess(self.s.index('rm -f /tark/work/src/out/Default/apks/ChromePublic.apk'),
+                        self.s.index('android/build.sh $stop'))
+        upload = next(l for l in self.s.splitlines() if 'upload /tark/work/src/out/Default/apks' in l)
+        self.assertIn('code == 0', upload)
+
+    def test_one_job_at_a_time(self):
+        self.assertIn('flock -n 9', self.s)
+        self.assertLess(self.s.index('flock -n 9'), self.s.index('rm -rf $repo'))
+
+
 class TestDriverAndJob(unittest.TestCase):
     def test_driver_subcommands(self):
         s = text('andbuild.sh')

@@ -13,27 +13,12 @@ exec > >(tee -a /var/log/tark-bootstrap.log) 2>&1
 export DEBIAN_FRONTEND=noninteractive
 VERSION=155.0.8059.39
 
-apt-get update
-apt-get install -y git python3 python3-pip curl xz-utils unzip zstd lsb-release sudo ninja-build libarchive-tools
-snap install aws-cli --classic || true
+# A setup step that fails powers the machine off rather than leave it billing.
+trap 'poweroff' ERR
 
-# Chromium's own dependency script for this version, with --android.
-mkdir -p /opt/tark && cd /opt/tark
-for f in install-build-deps.sh install-build-deps.py; do
-  curl -fsSL --retry 8 --retry-delay 15 --retry-all-errors "https://chromium.googlesource.com/chromium/src/+/refs/tags/$VERSION/build/$f?format=TEXT" | base64 -d > $f
-done
-chmod +x install-build-deps.sh install-build-deps.py
-./install-build-deps.sh --android --no-prompt --no-chromeos-fonts --no-nacl
-
-# Swap: the framework link wants more than RAM on smaller types.
-if ! swapon --show | grep -q /swapfile; then
-  fallocate -l 32G /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile
-  echo '/swapfile none swap sw 0 0' >> /etc/fstab
-fi
-mkdir -p /tark && chown ubuntu:ubuntu /tark
-
-# Idle watchdog: every 10 minutes; three idle checks in a row (30 min) power
-# the machine off, which stops the instance.
+# Idle watchdog first, so the machine stops itself even if setup fails:
+# every 10 minutes; three idle checks in a row (30 min) power the machine
+# off, which stops the instance.
 cat > /usr/local/bin/tark-idle-check <<'WATCH'
 #!/bin/bash
 flag=/var/lib/tark-idle-count
@@ -60,4 +45,23 @@ WantedBy=timers.target
 UNIT
 systemctl daemon-reload
 systemctl enable --now tark-idle-stop.timer
+
+apt-get update
+apt-get install -y git python3 python3-pip curl xz-utils unzip zstd lsb-release sudo ninja-build libarchive-tools
+snap install aws-cli --classic
+
+# Chromium's own dependency script for this version, with --android.
+mkdir -p /opt/tark && cd /opt/tark
+for f in install-build-deps.sh install-build-deps.py; do
+  curl -fsSL --retry 8 --retry-delay 15 --retry-all-errors "https://chromium.googlesource.com/chromium/src/+/refs/tags/$VERSION/build/$f?format=TEXT" | base64 -d > $f
+done
+chmod +x install-build-deps.sh install-build-deps.py
+./install-build-deps.sh --android --no-prompt --no-chromeos-fonts --no-nacl
+
+# Swap: the framework link wants more than RAM on smaller types.
+if ! swapon --show | grep -q /swapfile; then
+  fallocate -l 32G /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile
+  echo '/swapfile none swap sw 0 0' >> /etc/fstab
+fi
+mkdir -p /tark && chown ubuntu:ubuntu /tark
 echo 'bootstrap done'

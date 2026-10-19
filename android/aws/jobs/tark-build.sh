@@ -17,6 +17,9 @@ for a in "$@"; do
 done
 # Never the SSM agent's folder: tools write state into their working directory.
 cd /tark
+# One job at a time: jobs share /tark/repo, /tark/work and the log.
+exec 9>/tark/job.lock
+flock -n 9 || { echo "another Tark job is running on this machine"; exit 1; }
 log=/tark/tark-build.log
 echo "tark-build $P $(date -Is)" > $log
 upload() { [[ -f $1 ]] && aws s3 cp --quiet "$1" "s3://$B/$P/$2"; }
@@ -43,8 +46,11 @@ must git -C $repo/ungoogled-chromium checkout --quiet --detach "$SUB"
 echo "submodule $SUB" >> $log
 
 (( fresh )) && rm -rf /tark/work/src /tark/work/prepared.stamp
-bash $repo/android/build.sh $stop /tark/work >> $log 2>&1
+# An earlier build's APK must never be uploaded as this job's.
+rm -f /tark/work/src/out/Default/apks/ChromePublic.apk
+# A hung step (a stalled sync, a stuck link) ends here instead of billing on.
+timeout 8h bash $repo/android/build.sh $stop /tark/work >> $log 2>&1
 code=$?
 echo "exit $code" >> $log
-upload /tark/work/src/out/Default/apks/ChromePublic.apk ChromePublic.apk
+(( code == 0 )) && upload /tark/work/src/out/Default/apks/ChromePublic.apk ChromePublic.apk
 exit $code
