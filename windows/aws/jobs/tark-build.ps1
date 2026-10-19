@@ -52,7 +52,10 @@ try {
   }
   cmd.exe /c "call `"$vcvars`" && python3 build.py --tarball -j 64 && python3 package.py" *>> $log
   "exit $LASTEXITCODE" | Add-Content $log
-  Get-ChildItem "$work\build" -File -Include *.zip, *.exe -Recurse -Depth 0 | ForEach-Object { Upload $_.FullName $_.Name }
+  # Only package.py's installer and zip, which sit directly in build\ (a
+  # recursive search also picked up hundreds of tool files).
+  Get-ChildItem "$work\build" -File | Where-Object { $_.Extension -in '.zip', '.exe' } |
+    ForEach-Object { Upload $_.FullName ($_.Name -replace '^ungoogled-chromium_', 'Tark-') }
 } finally {
   Upload $log 'tark-build.log'
   # Stop the machine unless another job is still building on it; the idle
