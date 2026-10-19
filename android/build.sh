@@ -188,5 +188,6 @@ run python3 "$_src_dir/tools/gn/bootstrap/bootstrap.py" -o "$_src_dir/out/Defaul
 # git checkout's .gn names a bundled Python the Android tree does not have).
 run sed -i "s|^script_executable = .*|script_executable = \"python3\"|" "$_src_dir/.gn"
 run "$_src_dir/out/Default/gn" gen "$_src_dir/out/Default" --root="$_src_dir" --fail-on-unused-args
-run ninja -C "$_src_dir/out/Default" chrome_public_apk
+# -k 0: one run reports every failing step, not only the first.
+run ninja -k 0 -C "$_src_dir/out/Default" chrome_public_apk
 log "built $_src_dir/out/Default/apks/ChromePublic.apk"

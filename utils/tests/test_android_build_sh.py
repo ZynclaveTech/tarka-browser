@@ -235,6 +235,13 @@ class TestAndroidBuildSh(unittest.TestCase):
         self.assertLess(index_of(runs, '_install_xlit'), gn)
         self.assertLess(gn, ninja)
 
+    def test_ninja_keeps_going_past_failures(self):
+        # A build is ~an hour on the machine: one run reports every failing
+        # step, not just the first.
+        result, runs, files, tmp = dryrun()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('ninja -k 0 -C', runs[index_of(runs, 'chrome_public_apk')])
+
 
 if __name__ == '__main__':
     unittest.main()
