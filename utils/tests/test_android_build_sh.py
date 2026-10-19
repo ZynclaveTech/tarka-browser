@@ -23,6 +23,7 @@ def dryrun(*args):
             if (work / 'tark-patches' / 'series').exists() else '',
             'args': (work / 'src' / 'out' / 'Default' / 'args.gn').read_text()
             if (work / 'src' / 'out' / 'Default' / 'args.gn').exists() else '',
+            'clone': (work / 'clone.py').read_text() if (work / 'clone.py').exists() else '',
         }
         runs = [l[len('tark: run '):] for l in result.stdout.splitlines()
                 if l.startswith('tark: run ')]
@@ -41,7 +42,7 @@ class TestAndroidBuildSh(unittest.TestCase):
         result, runs, files, tmp = dryrun('--stop-before-gn')
         self.assertEqual(result.returncode, 3, result.stderr)
         order = [index_of(runs, n) for n in (
-            'utils/clone.py',
+            '/clone.py',
             'utils/prune_binaries.py',
             'utils/patches.py apply',
             'utils/filter_substitution_list.py',
@@ -56,10 +57,21 @@ class TestAndroidBuildSh(unittest.TestCase):
 
     def test_clone_uses_the_filled_android_config(self):
         result, runs, files, tmp = dryrun('--stop-before-gn')
-        self.assertIn(f'-c {tmp}/gclient', runs[index_of(runs, 'utils/clone.py')])
+        self.assertIn(f'-c {tmp}/gclient', runs[index_of(runs, '/clone.py')])
         self.assertNotIn('UC_OUT', files['gclient'])
         self.assertIn(f'"name": "{tmp}/src"', files['gclient'])
         self.assertIn("target_os = ['android']", files['gclient'])
+
+    def test_clone_runs_a_copy_with_the_custom_config_fixed(self):
+        # ungoogled's clone.py crashes on -c (it calls Path.replace(old, new)
+        # on the path copy() returns); build.sh runs a copy with that line fixed.
+        result, runs, files, tmp = dryrun('--stop-before-gn')
+        clone = runs[index_of(runs, '/clone.py')]
+        self.assertIn(f'{tmp}/clone.py', clone)
+        self.assertIn('PYTHONPATH=', clone)
+        self.assertIn("copy(args.custom_config, ucstaging / '.gclient')\n", files['clone'])
+        self.assertNotIn(".gclient').replace('UC_OUT'", files['clone'])
+        self.assertIn('def clone(args)', files['clone'])
 
     def test_core_patches_then_tark_series(self):
         result, runs, files, tmp = dryrun('--stop-before-gn')
