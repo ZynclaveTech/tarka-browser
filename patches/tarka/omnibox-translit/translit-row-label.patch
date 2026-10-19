@@ -1,0 +1,152 @@
+--- a/chrome/browser/ui/webui/cr_components/searchbox/searchbox_handler.cc
++++ b/chrome/browser/ui/webui/cr_components/searchbox/searchbox_handler.cc
+@@ -138,6 +138,11 @@
+ constexpr int kPromptHeightBuffer = 40;
+ constexpr int kPromptWidthBuffer = 40;
+ 
++// The AutocompleteMatch::additional_info key that the Indian-language rows
++// (TarkTransliterationProvider, macOS only) carry; the provider's header is not
++// included here as this file is built on every platform.
++constexpr char kTransliterationLanguageInfoKey[] = "tark_xlit_lang";
++
+ constexpr char kAnswerCurrencyIconResourceName[] =
+     "//resources/cr_components/searchbox/icons/currency_cr23.svg";
+ constexpr char kAnswerDefaultIconResourceName[] =
+@@ -999,6 +1004,13 @@
+   mojom_match->is_search_type = AutocompleteMatch::IsSearchType(match.type);
+   mojom_match->swap_contents_and_description =
+       match.swap_contents_and_description;
++  // The Indian-language rows show their language name (the description) at the
++  // row's right edge. The page already appends the description to the row's
++  // aria-label (SearchboxMatchElement::computeAriaLabel_()), so `a11y_label`
++  // needs no change.
++  mojom_match->description_on_right =
++      !match.description.empty() &&
++      match.additional_info.contains(kTransliterationLanguageInfoKey);
+   mojom_match->show_contextual_description = false;
+   mojom_match->type = AutocompleteMatchType::ToString(match.type);
+   mojom_match->supports_deletion = match.SupportsDeletion();
+--- a/components/omnibox/browser/searchbox.mojom
++++ b/components/omnibox/browser/searchbox.mojom
+@@ -110,6 +110,9 @@
+   string type;  // Result of AutocompleteMatchType::ToString().
+   mojo_base.mojom.String16 remove_button_a11y_label;
+   bool swap_contents_and_description;
++  // Whether the description is shown at the right edge of the row, without the
++  // contents/description separator (Tark's Indian-language rows).
++  bool description_on_right;
+   // Whether to show the description for a contextual match.
+   bool show_contextual_description;
+   // ID of the group the suggestion belongs to. 0 if it does not belong to any.
+--- a/ui/webui/resources/cr_components/searchbox/searchbox_browser_proxy.ts
++++ b/ui/webui/resources/cr_components/searchbox/searchbox_browser_proxy.ts
+@@ -26,6 +26,7 @@
+     isSearchType: false,
+     isEnterpriseSearchAggregatorPeopleType: false,
+     swapContentsAndDescription: false,
++    descriptionOnRight: false,
+     showContextualDescription: false,
+     supportsDeletion: false,
+     suggestionGroupId: -1,
+--- a/ui/webui/resources/cr_components/searchbox/searchbox_match.css
++++ b/ui/webui/resources/cr_components/searchbox/searchbox_match.css
+@@ -222,6 +222,33 @@
+   padding-inline-end: 4px;
+ }
+ 
++/* Tark: an Indian-language row shows its language name (the description) at
++ * the row's right edge, in the dimmed description colour set below (the
++ * element empties the separator text). The text container takes the row's
++ * free space (the empty actions container no longer shares it) and the
++ * description sits 16px, the row's end padding, from the edge. */
++:host([description-on-right]) .actions.container {
++  flex-grow: 0;
++}
++
++:host([description-on-right]) #text-container {
++  flex-grow: 1;
++  min-width: 0;
++  padding-inline-end: 0;
++}
++
++:host([description-on-right]) #text-container #suggestion {
++  display: flex;
++  flex: 1 1 auto;
++  min-width: 0;
++}
++
++:host([description-on-right]) #description {
++  flex-shrink: 0;
++  margin-inline-start: auto;
++  padding-inline-start: 16px;
++}
++
+ :host([is-two-row-suggestion]) #text-container {
+   align-items: flex-start;
+   flex-direction: column;
+--- a/ui/webui/resources/cr_components/searchbox/searchbox_match.ts
++++ b/ui/webui/resources/cr_components/searchbox/searchbox_match.ts
+@@ -93,6 +93,15 @@
+         reflect: true,
+       },
+ 
++      /**
++       * Whether the description is shown at the row's right edge, without the
++       * separator (Tark's Indian-language rows).
++       */
++      descriptionOnRight: {
++        type: Boolean,
++        reflect: true,
++      },
++
+       showContextualDescription: {
+         type: Boolean,
+         reflect: true,
+@@ -196,6 +205,7 @@
+ 
+   override accessor ariaLabel: string = '';
+   accessor hasAction: boolean = false;
++  accessor descriptionOnRight: boolean = false;
+   accessor showContextualDescription: boolean = false;
+   accessor hasImage: boolean = false;
+   accessor hasKeywordChip: boolean = false;
+@@ -242,6 +252,7 @@
+       this.ariaLabel = this.computeAriaLabel_();
+       this.contentsHtml_ = this.computeContentsHtml_();
+       this.descriptionHtml_ = this.computeDescriptionHtml_();
++      this.descriptionOnRight = this.computeDescriptionOnRight_();
+       this.hasAction = this.computeHasAction_();
+       this.hasKeywordChip = this.computeHasKeywordChip_();
+       this.hasImage = this.computeHasImage_();
+@@ -461,6 +472,10 @@
+             .innerHTML);
+   }
+ 
++  private computeDescriptionOnRight_(): boolean {
++    return !!this.match && this.match.descriptionOnRight;
++  }
++
+   private computeHasAction_() {
+     return this.match?.actions?.length > 0;
+   }
+@@ -496,6 +511,10 @@
+   }
+ 
+   private computeSeparatorText_(): string {
++    // A description at the row's right edge needs no separator.
++    if (this.descriptionOnRight) {
++      return '';
++    }
+     return this.getMatchDescription_() ?
+         loadTimeData.getString('searchboxSeparator') :
+         '';
+--- a/ui/webui/resources/cr_components/composebox/composebox_proxy.ts
++++ b/ui/webui/resources/cr_components/composebox/composebox_proxy.ts
+@@ -17,6 +17,7 @@
+     isSearchType: false,
+     isEnterpriseSearchAggregatorPeopleType: false,
+     swapContentsAndDescription: false,
++    descriptionOnRight: false,
+     showContextualDescription: false,
+     supportsDeletion: false,
+     suggestionGroupId: -1,
