@@ -11,7 +11,6 @@ _app="$_src_dir/out/Default/$_product_name.app"
 _framework="$_app/Contents/Frameworks/$_product_name Framework.framework"
 _helpers="$_framework/Helpers"
 _libraries="$_framework/Libraries"
-_pkg_dmg="$_src_dir/chrome/installer/mac/pkg-dmg"
 
 _ad_hoc="${MACOS_AD_HOC_SIGNING:-0}"
 # S1: development signing for the author's own Mac — an Apple Development
@@ -129,21 +128,26 @@ done
 
 codesign --verify --deep --strict --verbose=4 "$_app"
 
-notarize_app() {
-  local archive="$TMPDIR/notarize.zip"
+# Notarizes and staples the app or the DMG given (M5). The credentials are a
+# notarytool keychain profile the user saved once
+# (`xcrun notarytool store-credentials tark-notary`); no password passes
+# through the environment.
+notarize() {
+  local target="$1"
+  local upload="$target"
   local result="$TMPDIR/notary-result.json"
   local log="$TMPDIR/notary-log.json"
   local status submission_id
   local submit_exit=0
-  local credentials=(
-    --apple-id "$PROD_MACOS_NOTARIZATION_APPLE_ID"
-    --team-id "$PROD_MACOS_NOTARIZATION_TEAM_ID"
-    --password "$PROD_MACOS_NOTARIZATION_PWD"
-  )
+  local credentials=(--keychain-profile "${TARKA_NOTARY_PROFILE:-tark-notary}")
 
-  ditto -c -k --keepParent "$_app" "$archive"
+  if [[ -d "$target" ]]; then
+    upload="$TMPDIR/notarize.zip"
+    rm -f "$upload"
+    ditto -c -k --keepParent "$target" "$upload"
+  fi
 
-  xcrun notarytool submit --wait --output-format json "${credentials[@]}" "$archive" \
+  xcrun notarytool submit --wait --output-format json "${credentials[@]}" "$upload" \
     > "$result" || submit_exit=$?
 
   cat "$result"
@@ -181,8 +185,8 @@ notarize_app() {
     return 1
   fi
 
-  xcrun stapler staple "$_app"
-  xcrun stapler validate "$_app"
+  xcrun stapler staple "$target"
+  xcrun stapler validate "$target"
 }
 
 if (( _ad_hoc )); then
@@ -193,12 +197,14 @@ elif (( _dev )); then
     exit 0
   fi
 else
-  notarize_app
+  notarize "$_app"
 fi
 
-# Package the app
-"$_pkg_dmg" \
-  --sourcefile --source "$_app" \
-  --target "$_target_dmg" \
-  --volname "$_product_name" --symlink /Applications:/Applications \
-  --format UDBZ --verbosity 2
+# Package the app (an APFS image, never pkg-dmg's HFS hybrid; see the script).
+"$_root_dir/utils/package_dmg.sh" "$_app" "$_target_dmg"
+
+# A release DMG is notarized and stapled too, so it opens offline without a
+# Gatekeeper prompt about the image itself.
+if (( ! _ad_hoc && ! _dev )); then
+  notarize "$_target_dmg"
+fi

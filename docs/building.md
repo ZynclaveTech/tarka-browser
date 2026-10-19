@@ -298,16 +298,32 @@ row label, and the row fixes) and `core/webui-js-error-no-crash.patch`.
   (every Tark build until M5) used to `LOG(FATAL)` on a JavaScript error in
   some WebUI pages, the omnibox popup among them. Pass
   `--tark-crash-on-webui-js-error` to get the crash back while developing.
-- **Packaging a DMG to share.** `sign_and_package_app.sh`'s `pkg-dmg`
-  builds an HFS hybrid image whose files all carry `com.apple.FinderInfo`,
-  so an app dragged out of it fails `codesign --verify --deep --strict`
-  ("resource fork, Finder information, or similar detritus"). Sign with the
-  script (`TARKA_SKIP_DMG=1`, or let it build its DMG and ignore it), then
-  package from a clean copy:
+- **Packaging a DMG to share.** `pkg-dmg`'s HFS hybrid image gave every
+  file `com.apple.FinderInfo`, so an app dragged out of it failed
+  `codesign --verify --deep --strict` ("resource fork, Finder information,
+  or similar detritus"). Since M5 `sign_and_package_app.sh` packages with
+  `utils/package_dmg.sh` instead (an APFS image from a copy without
+  extended attributes), which refuses to keep an image whose app does not
+  verify.
 
-      ditto --noextattr --norsrc build/src/out/Default/Tark.app stage/Tark.app
-      ln -s /Applications stage/Applications
-      hdiutil create -volname Tark -srcfolder stage -fs APFS -format ULFO Tark.dmg
+## Release signing (M5)
 
-  Mount it and check `codesign --verify --deep --strict` on the app inside
-  before publishing.
+A release is signed with the team's **Developer ID Application**
+certificate, notarized, and stapled, the app and then the DMG:
+
+    MACOS_CERTIFICATE_NAME="Developer ID Application: <name> (UMTJNNPK6C)" \
+      CHROMIUM_SRC_DIR=$PWD/build/src ./sign_and_package_app.sh out.dmg
+
+- **Once per Mac:** the certificate in the login keychain (Xcode →
+  Settings → Accounts → Manage Certificates → + → Developer ID
+  Application; only the team's Account Holder can create it), and the
+  notarization login saved as a keychain profile:
+  `xcrun notarytool store-credentials tark-notary --apple-id <Apple ID>
+  --team-id UMTJNNPK6C`, with an app-specific password from
+  account.apple.com. `TARKA_NOTARY_PROFILE` names another profile.
+- **Check a release:** `spctl -a -vvv -t exec Tark.app` says
+  `source=Notarized Developer ID`; `xcrun stapler validate out.dmg` passes.
+- `MACOS_AD_HOC_SIGNING=1` (shareable, no notarization) and
+  `MACOS_DEV_SIGNING=1` (this Mac only, Touch ID passkeys) still work and
+  skip notarization.
+- Test: `python3 -m pytest utils/tests/test_package_dmg.py`.
