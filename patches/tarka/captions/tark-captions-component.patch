@@ -1,0 +1,399 @@
+--- /dev/null
++++ b/components/tark_captions/BUILD.gn
+@@ -0,0 +1,32 @@
++# Copyright 2026 The Tark Authors
++# Use of this source code is governed by a BSD-style license that can be
++# found in the LICENSE file.
++
++# Tark's live captions engine (D4): IndicConformer (AI4Bharat, MIT) and
++# Silero VAD (MIT) on ONNX Runtime, which is loaded at run time with
++# dlopen() from Tark.app/Contents/Frameworks (see downloads-onnxruntime.ini).
++# Runs in the speech recognition utility process.
++
++import("//testing/test.gni")
++
++source_set("tark_captions") {
++  sources = [
++    "ort_runtime.cc",
++    "ort_runtime.h",
++  ]
++  include_dirs = [ "//third_party/tark_onnxruntime/include" ]
++  deps = [ "//base" ]
++}
++
++# Tests read ONNX Runtime, the models and the test clips from the paths in
++# TARK_CAPTIONS_ORT, TARK_CAPTIONS_MODELS and TARK_CAPTIONS_TESTDATA; tests
++# that need one are skipped when it is unset.
++test("tark_captions_unittests") {
++  sources = [ "ort_runtime_unittest.cc" ]
++  deps = [
++    ":tark_captions",
++    "//base",
++    "//base/test:run_all_unittests",
++    "//testing/gtest",
++  ]
++}
+--- /dev/null
++++ b/components/tark_captions/README.md
+@@ -0,0 +1,24 @@
++# tark_captions
++
++Tark's live captions engine (D4): the client's words on a call, computed on
++the Mac. Runs in the speech recognition utility process in place of SODA.
++
++- `ort_runtime.*` — ONNX Runtime, `dlopen()`ed from
++  `Tark.app/Contents/Frameworks/libonnxruntime.1.31.0.dylib` (the official
++  release, pinned in `downloads-onnxruntime.ini`); nothing links against it.
++
++Models (Phase 1: from `~/Library/Application Support/Tark/Captions/models/`,
++made by `utils/captions_export.py export`): AI4Bharat IndicConformer 600M
++(MIT; int8 encoder + CTC decoder), Silero VAD (MIT).
++
++`tark_captions_unittests` tests it without building the browser:
++
++```
++ninja -C out/Default tark_captions_unittests
++TARK_CAPTIONS_ORT=third_party/tark_onnxruntime/lib/libonnxruntime.1.31.0.dylib \
++TARK_CAPTIONS_MODELS=~/Library/Application\ Support/Tark/Captions/models \
++TARK_CAPTIONS_TESTDATA=<tarka-browser>/resources/captions/testdata \
++  out/Default/tark_captions_unittests
++```
++
++Tests that need a path skip when its variable is unset.
+--- /dev/null
++++ b/components/tark_captions/ort_runtime.h
+@@ -0,0 +1,82 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef COMPONENTS_TARK_CAPTIONS_ORT_RUNTIME_H_
++#define COMPONENTS_TARK_CAPTIONS_ORT_RUNTIME_H_
++
++#include <cstdint>
++#include <memory>
++#include <string>
++#include <vector>
++
++#include "base/files/file_path.h"
++#include "base/memory/raw_ptr.h"
++#include "base/native_library.h"
++
++struct OrtApi;
++struct OrtEnv;
++struct OrtSession;
++
++namespace tark_captions {
++
++// A dense tensor passed to or returned from a model: float32 data in `f32`
++// or int64 data in `i64` (exactly one is used), row-major in `shape`. An
++// empty shape is a scalar.
++struct Tensor {
++  std::string name;
++  std::vector<int64_t> shape;
++  std::vector<float> f32;
++  std::vector<int64_t> i64;
++};
++
++class OrtModel;
++
++// ONNX Runtime, loaded at run time from its dylib (Tark.app/Contents/
++// Frameworks/libonnxruntime.1.31.0.dylib) the way Chromium loads SODA:
++// nothing links against it. Use on one sequence.
++class OrtRuntime {
++ public:
++  // Null if the library or its C API (ORT_API_VERSION) is unavailable.
++  static std::unique_ptr<OrtRuntime> Load(const base::FilePath& dylib);
++
++  OrtRuntime(const OrtRuntime&) = delete;
++  OrtRuntime& operator=(const OrtRuntime&) = delete;
++  ~OrtRuntime();
++
++  // Null if the model is missing or invalid. `threads` is ONNX Runtime's
++  // intra-op thread count.
++  std::unique_ptr<OrtModel> LoadModel(const base::FilePath& onnx, int threads);
++
++ private:
++  OrtRuntime(base::NativeLibrary library, const OrtApi* api, OrtEnv* env);
++
++  base::NativeLibrary library_;
++  raw_ptr<const OrtApi> api_;
++  raw_ptr<OrtEnv> env_;
++};
++
++// One loaded model (an ONNX Runtime session). The runtime must outlive it.
++class OrtModel {
++ public:
++  OrtModel(const OrtModel&) = delete;
++  OrtModel& operator=(const OrtModel&) = delete;
++  ~OrtModel();
++
++  // Runs the model on `inputs` (float32 or int64, by name) and fills
++  // `outputs` with `output_names`, in that order. False on any error.
++  bool Run(const std::vector<Tensor>& inputs,
++           const std::vector<std::string>& output_names,
++           std::vector<Tensor>* outputs);
++
++ private:
++  friend class OrtRuntime;
++  OrtModel(const OrtApi* api, OrtSession* session);
++
++  raw_ptr<const OrtApi> api_;
++  raw_ptr<OrtSession> session_;
++};
++
++}  // namespace tark_captions
++
++#endif  // COMPONENTS_TARK_CAPTIONS_ORT_RUNTIME_H_
+--- /dev/null
++++ b/components/tark_captions/ort_runtime.cc
+@@ -0,0 +1,161 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/tark_captions/ort_runtime.h"
++
++#include <utility>
++
++#include "base/logging.h"
++#include "base/memory/ptr_util.h"
++#include "onnxruntime_c_api.h"
++
++namespace tark_captions {
++namespace {
++
++using GetApiBaseFn = const OrtApiBase* (*)();
++
++// Logs and frees `status`; true when there was no error.
++bool Ok(const OrtApi* api, OrtStatus* status) {
++  if (!status) {
++    return true;
++  }
++  LOG(ERROR) << "ONNX Runtime: " << api->GetErrorMessage(status);
++  api->ReleaseStatus(status);
++  return false;
++}
++
++}  // namespace
++
++// static
++std::unique_ptr<OrtRuntime> OrtRuntime::Load(const base::FilePath& dylib) {
++  base::NativeLibraryLoadError error;
++  base::NativeLibrary library = base::LoadNativeLibrary(dylib, &error);
++  if (!library) {
++    LOG(ERROR) << "ONNX Runtime not loaded from " << dylib << ": " << error.ToString();
++    return nullptr;
++  }
++  auto get_api_base = reinterpret_cast<GetApiBaseFn>(
++      base::GetFunctionPointerFromNativeLibrary(library, "OrtGetApiBase"));
++  const OrtApi* api = get_api_base ? get_api_base()->GetApi(ORT_API_VERSION) : nullptr;
++  OrtEnv* env = nullptr;
++  if (!api || !Ok(api, api->CreateEnv(ORT_LOGGING_LEVEL_WARNING, "tark_captions", &env))) {
++    base::UnloadNativeLibrary(library);
++    return nullptr;
++  }
++  return base::WrapUnique(new OrtRuntime(library, api, env));
++}
++
++OrtRuntime::OrtRuntime(base::NativeLibrary library, const OrtApi* api, OrtEnv* env)
++    : library_(library), api_(api), env_(env) {}
++
++OrtRuntime::~OrtRuntime() {
++  api_->ReleaseEnv(env_.ExtractAsDangling());
++  api_ = nullptr;
++  base::UnloadNativeLibrary(library_);
++}
++
++std::unique_ptr<OrtModel> OrtRuntime::LoadModel(const base::FilePath& onnx, int threads) {
++  OrtSessionOptions* options = nullptr;
++  if (!Ok(api_, api_->CreateSessionOptions(&options))) {
++    return nullptr;
++  }
++  OrtSession* session = nullptr;
++  const bool ok = Ok(api_, api_->SetIntraOpNumThreads(options, threads)) &&
++                  Ok(api_, api_->SetInterOpNumThreads(options, 1)) &&
++                  Ok(api_, api_->SetSessionGraphOptimizationLevel(options, ORT_ENABLE_ALL)) &&
++                  Ok(api_, api_->CreateSession(env_, onnx.value().c_str(), options, &session));
++  api_->ReleaseSessionOptions(options);
++  if (!ok) {
++    return nullptr;
++  }
++  return base::WrapUnique(new OrtModel(api_, session));
++}
++
++OrtModel::OrtModel(const OrtApi* api, OrtSession* session) : api_(api), session_(session) {}
++
++OrtModel::~OrtModel() {
++  api_->ReleaseSession(session_.ExtractAsDangling());
++}
++
++bool OrtModel::Run(const std::vector<Tensor>& inputs,
++                   const std::vector<std::string>& output_names,
++                   std::vector<Tensor>* outputs) {
++  OrtMemoryInfo* memory = nullptr;
++  if (!Ok(api_, api_->CreateCpuMemoryInfo(OrtArenaAllocator, OrtMemTypeDefault, &memory))) {
++    return false;
++  }
++  std::vector<OrtValue*> in_values(inputs.size(), nullptr);
++  std::vector<const char*> in_names;
++  bool ok = true;
++  for (size_t i = 0; ok && i < inputs.size(); ++i) {
++    const Tensor& t = inputs[i];
++    in_names.push_back(t.name.c_str());
++    // ONNX Runtime reads the data in place; it does not write inputs.
++    void* data = t.i64.empty() ? static_cast<void*>(const_cast<float*>(t.f32.data()))
++                               : static_cast<void*>(const_cast<int64_t*>(t.i64.data()));
++    const size_t bytes = t.i64.empty() ? t.f32.size() * sizeof(float) : t.i64.size() * sizeof(int64_t);
++    ok = Ok(api_, api_->CreateTensorWithDataAsOrtValue(
++                      memory, data, bytes, t.shape.data(), t.shape.size(),
++                      t.i64.empty() ? ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT
++                                    : ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64,
++                      &in_values[i]));
++  }
++  std::vector<const char*> out_names;
++  for (const std::string& name : output_names) {
++    out_names.push_back(name.c_str());
++  }
++  std::vector<OrtValue*> out_values(output_names.size(), nullptr);
++  ok = ok && Ok(api_, api_->Run(session_, nullptr, in_names.data(), in_values.data(),
++                                in_values.size(), out_names.data(), out_names.size(),
++                                out_values.data()));
++  outputs->clear();
++  for (size_t i = 0; ok && i < out_values.size(); ++i) {
++    Tensor t{.name = output_names[i]};
++    OrtTensorTypeAndShapeInfo* info = nullptr;
++    size_t count = 0;
++    size_t dims = 0;
++    ONNXTensorElementDataType type = ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED;
++    void* data = nullptr;
++    ok = Ok(api_, api_->GetTensorTypeAndShape(out_values[i], &info));
++    if (ok) {
++      ok = Ok(api_, api_->GetDimensionsCount(info, &dims)) &&
++           Ok(api_, api_->GetTensorElementType(info, &type)) &&
++           Ok(api_, api_->GetTensorShapeElementCount(info, &count));
++      if (ok) {
++        t.shape.resize(dims);
++        ok = Ok(api_, api_->GetDimensions(info, t.shape.data(), dims));
++      }
++      api_->ReleaseTensorTypeAndShapeInfo(info);
++    }
++    ok = ok && Ok(api_, api_->GetTensorMutableData(out_values[i], &data));
++    if (ok && type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
++      const float* f = static_cast<const float*>(data);
++      t.f32.assign(f, f + count);
++    } else if (ok && type == ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64) {
++      const int64_t* v = static_cast<const int64_t*>(data);
++      t.i64.assign(v, v + count);
++    } else if (ok) {
++      LOG(ERROR) << "ONNX Runtime: output " << t.name << " has unsupported type " << type;
++      ok = false;
++    }
++    outputs->push_back(std::move(t));
++  }
++  for (OrtValue* value : in_values) {
++    if (value) {
++      api_->ReleaseValue(value);
++    }
++  }
++  for (OrtValue* value : out_values) {
++    if (value) {
++      api_->ReleaseValue(value);
++    }
++  }
++  api_->ReleaseMemoryInfo(memory);
++  if (!ok) {
++    outputs->clear();
++  }
++  return ok;
++}
++
++}  // namespace tark_captions
+--- /dev/null
++++ b/components/tark_captions/ort_runtime_unittest.cc
+@@ -0,0 +1,75 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/tark_captions/ort_runtime.h"
++
++#include <optional>
++#include <string>
++
++#include "base/environment.h"
++#include "base/files/file_path.h"
++#include "base/strings/cstring_view.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace tark_captions {
++namespace {
++
++std::optional<base::FilePath> PathFromEnv(base::cstring_view name) {
++  std::optional<std::string> value = base::Environment::Create()->GetVar(name);
++  if (!value || value->empty()) {
++    return std::nullopt;
++  }
++  return base::FilePath(*value);
++}
++
++class OrtRuntimeTest : public testing::Test {
++ protected:
++  void SetUp() override {
++    std::optional<base::FilePath> ort = PathFromEnv("TARK_CAPTIONS_ORT");
++    std::optional<base::FilePath> models = PathFromEnv("TARK_CAPTIONS_MODELS");
++    if (!ort || !models) {
++      GTEST_SKIP() << "set TARK_CAPTIONS_ORT and TARK_CAPTIONS_MODELS";
++    }
++    ort_path_ = *ort;
++    models_ = *models;
++  }
++
++  base::FilePath ort_path_;
++  base::FilePath models_;
++};
++
++TEST_F(OrtRuntimeTest, LoadsRuntime) {
++  EXPECT_TRUE(OrtRuntime::Load(ort_path_));
++}
++
++TEST_F(OrtRuntimeTest, MissingRuntimeFails) {
++  EXPECT_FALSE(OrtRuntime::Load(base::FilePath("/nonexistent/libonnxruntime.dylib")));
++}
++
++TEST_F(OrtRuntimeTest, RunsVadOnSilence) {
++  std::unique_ptr<OrtRuntime> runtime = OrtRuntime::Load(ort_path_);
++  ASSERT_TRUE(runtime);
++  std::unique_ptr<OrtModel> vad =
++      runtime->LoadModel(models_.Append("silero_vad.onnx"), /*threads=*/1);
++  ASSERT_TRUE(vad);
++  std::vector<Tensor> inputs(3);
++  inputs[0] = {.name = "input", .shape = {1, 576}, .f32 = std::vector<float>(576)};
++  inputs[1] = {.name = "state", .shape = {2, 1, 128}, .f32 = std::vector<float>(256)};
++  inputs[2] = {.name = "sr", .shape = {}, .i64 = {16000}};
++  std::vector<Tensor> outputs;
++  ASSERT_TRUE(vad->Run(inputs, {"output", "stateN"}, &outputs));
++  ASSERT_EQ(outputs.size(), 2u);
++  ASSERT_EQ(outputs[0].f32.size(), 1u);
++  EXPECT_LT(outputs[0].f32[0], 0.1f);
++  EXPECT_EQ(outputs[1].shape, (std::vector<int64_t>{2, 1, 128}));
++}
++
++TEST_F(OrtRuntimeTest, MissingModelFails) {
++  std::unique_ptr<OrtRuntime> runtime = OrtRuntime::Load(ort_path_);
++  ASSERT_TRUE(runtime);
++  EXPECT_FALSE(runtime->LoadModel(base::FilePath("/nonexistent/model.onnx"), 1));
++}
++
++}  // namespace
++}  // namespace tark_captions
+--- a/chrome/services/speech/BUILD.gn
++++ b/chrome/services/speech/BUILD.gn
+@@ -36,6 +36,7 @@
+     "//chrome/services/speech/soda:soda_api_proto",
+     "//components/soda:constants",
+     "//components/speech",
++    "//components/tark_captions",
+     "//content/public/browser:proto",
+     "//google_apis",
+     "//media/mojo/common",
