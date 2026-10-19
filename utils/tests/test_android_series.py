@@ -58,11 +58,13 @@ class TestAndroidConfig(unittest.TestCase):
 
     def test_gclient_template(self):
         text = (ANDROID / 'gclient.android').read_text()
-        # build.sh fills UC_OUT in: clone.py does not substitute a custom config.
-        self.assertIn('"name": "UC_OUT"', text)
+        # gclient's standard layout: .gclient beside a solution named "src"
+        # (depot_tools rejects an absolute solution name).
+        self.assertIn('"name": "src"', text)
+        self.assertNotIn('UC_OUT', text)
         self.assertIn("target_os = ['android']", text)
         self.assertIn('target_os_only = False', text)
-        compile(text.replace('UC_OUT', '/w/src'), 'gclient.android', 'exec')
+        compile(text, 'gclient.android', 'exec')
 
 
 if __name__ == '__main__':

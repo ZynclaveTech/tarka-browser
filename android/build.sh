@@ -44,21 +44,27 @@ run() {
 
 mkdir -p "$_src_dir" "$_download_cache"
 
-# 1. Chromium with Android's dependencies. clone.py -c does not fill UC_OUT
-#    in a custom config, so the config is filled in here.
-sed "s|UC_OUT|$_src_dir|g" "$_root_dir/android/gclient.android" > "$work/gclient"
-# ...and its -c path crashes on current Python (it calls Path.replace(old,
-# new) on the path copy() returns). A copy of ungoogled's utils/ (clone.py
+# 1. Chromium with Android's dependencies, from ungoogled's clone.py with
+#    android/gclient.android (a solution named "src").
+cp "$_root_dir/android/gclient.android" "$work/gclient"
+# clone.py needs two fixes, made in a copy of ungoogled's utils/ (clone.py
 # reads depot_tools.patch and gsutil.patch beside it, and
-# ../chromium_version.txt) runs instead, with that one line fixed. The
-# submodule is untouched.
+# ../chromium_version.txt); the submodule is untouched:
+# - its -c path crashes on current Python (Path.replace(old, new) on the
+#   path copy() returns);
+# - it keeps .gclient in src/uc_staging with the absolute output path as the
+#   solution name, which current depot_tools rejects; .gclient goes beside
+#   src instead (WORKDIR), the standard layout.
 rm -rf "$work/uc" && mkdir -p "$work/uc"
 cp -R "$_main_repo/utils" "$work/uc/utils"
 cp "$_main_repo/chromium_version.txt" "$work/uc/"
-sed -i.orig "s|copy(args.custom_config, ucstaging / '.gclient').replace('UC_OUT', str(args.output))|copy(args.custom_config, ucstaging / '.gclient')|" \
+sed -i.orig \
+  -e "s|copy(args.custom_config, ucstaging / '.gclient').replace('UC_OUT', str(args.output))|copy(args.custom_config, args.output.parent / '.gclient')|" \
+  -e "s|environ\['GCLIENT_FILE'\] = str(ucstaging / '.gclient')|environ['GCLIENT_FILE'] = str(args.output.parent / '.gclient')|" \
   "$work/uc/utils/clone.py"
 rm -f "$work/uc/utils/clone.py.orig"
-if grep -q ".gclient').replace('UC_OUT'" "$work/uc/utils/clone.py"; then
+if grep -q ".gclient').replace('UC_OUT'" "$work/uc/utils/clone.py" ||
+   ! grep -q "environ\['GCLIENT_FILE'\] = str(args.output.parent / '.gclient')" "$work/uc/utils/clone.py"; then
   echo "tark: clone.py changed upstream; android/build.sh's fix no longer applies" >&2
   exit 1
 fi
