@@ -34,7 +34,12 @@ try {
   git -C $repo submodule update --init --depth 1 ungoogled-chromium *>> $log
   "commit $(git -C $repo rev-parse HEAD)" | Add-Content $log
 
-  if ($Fresh -and (Test-Path "$work\build\src")) { Remove-Item -Recurse -Force "$work\build\src" }
+  if ($Fresh) {
+    # A fresh tree: the source and name substitution's backup of the old one
+    # (name_substitution.py refuses to overwrite an existing backup).
+    if (Test-Path "$work\build\src") { Remove-Item -Recurse -Force "$work\build\src" }
+    Remove-Item -Force "$work\build\namesubs.tar" -ErrorAction SilentlyContinue
+  }
   python3 "$repo\windows\prepare_workdir.py" $repo $work *>> $log
   Set-Location $work
   $vcvars = "$env:vs2022_install\VC\Auxiliary\Build\vcvars64.bat"
