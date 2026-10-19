@@ -91,6 +91,43 @@ class TestAndroidSeries(unittest.TestCase):
         self.assertIn(' #if BUILDFLAG(ENABLE_EXTENSIONS_CORE)\n+#include "extensions/browser/extension_util.h"\n'
                       ' #include "extensions/browser/webstore_installer.h"', patch)
 
+    def test_safe_browsing_link_fixed(self):
+        # libchrome.so links: Java's Safe Browsing natives and the settings
+        # launchers get Tark's stand-ins (Safe Browsing reads as off); the
+        # other callers of removed code drop or guard the call.
+        self.assertIn('android/safe-browsing-android-link.patch', self.series)
+        patch = (ANDROID / 'patches' / 'safe-browsing-android-link.patch').read_text()
+        stubs = 'chrome/browser/android/tark/safe_browsing_stubs_android.cc'
+        self.assertIn('--- /dev/null\n+++ b/' + stubs, patch)
+        self.assertIn('+      "tark/safe_browsing_stubs_android.cc",', patch)
+        prefix = 'Muxed_org_chromium_chrome_browser_safe_1browsing_'
+        for native in ('SafeBrowsingBridge_enableSafeBrowsingSettingSetLocallyPref',
+                       'SafeBrowsingBridge_getSafeBrowsingExtendedReportingEnabled',
+                       'SafeBrowsingBridge_getSafeBrowsingExtendedReportingManaged',
+                       'SafeBrowsingBridge_getSafeBrowsingState',
+                       'SafeBrowsingBridge_isHashRealTimeLookupEligibleInSession',
+                       'SafeBrowsingBridge_isSafeBrowsingManaged',
+                       'SafeBrowsingBridge_setSafeBrowsingExtendedReportingEnabled',
+                       'SafeBrowsingBridge_setSafeBrowsingState',
+                       'SafeBrowsingBridge_umaValueForFile',
+                       'SafeBrowsingPasswordReuseDialogBridge_checkPasswords',
+                       'SafeBrowsingPasswordReuseDialogBridge_close',
+                       'SafeBrowsingPasswordReuseDialogBridge_ignore',
+                       'SafeBrowsingSuspiciousSiteDialogBridge_close',
+                       'SafeBrowsingSuspiciousSiteDialogBridge_continueAnyway',
+                       'SafeBrowsingSuspiciousSiteDialogBridge_goBack',
+                       'SafeBrowsingSuspiciousSiteDialogBridge_onLearnMoreClicked'):
+            self.assertIn('JNI_ZERO_MUXED_ENTRYPOINT', patch)
+            self.assertIn(prefix + native + '(', patch, native)
+        self.assertIn('+void ShowSafeBrowsingSettings(ui::WindowAndroid* window,', patch)
+        self.assertIn('+void ShowAdvancedProtectionSettings(ui::WindowAndroid* window)', patch)
+        added = '\n'.join(l for l in patch.splitlines() if l.startswith('+') and not l.startswith('+++'))
+        for gone in ('GetSafeBrowsingState(', 'RecordSuspiciousNotificationInteractionUkm',
+                     'ChromePasswordReuseDetectionManagerClient'):
+            self.assertNotIn(gone, added)
+        # No Safe Browsing client is attached: the sheet must not call through null.
+        self.assertIn('+  if (password_reuse_detection_manager_client_) {', patch)
+
     def test_skip_list_entries_exist(self):
         self.assertTrue(self.skip)
         for entry in self.skip:
