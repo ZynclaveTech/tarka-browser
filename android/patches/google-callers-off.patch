@@ -1,0 +1,115 @@
+--- a/chrome/android/java/src/org/chromium/chrome/browser/init/AsyncInitTaskRunner.java
++++ b/chrome/android/java/src/org/chromium/chrome/browser/init/AsyncInitTaskRunner.java
+@@ -38,7 +38,8 @@
+ 
+     @VisibleForTesting
+     boolean shouldFetchVariationsSeedDuringFirstRun() {
+-        return VersionInfo.isOfficialBuild();
++        // Tark: no variations seed from Google's server.
++        return false;
+     }
+ 
+     private class FetchSeedTask implements Runnable {
+--- a/components/gcm_driver/instance_id/instance_id_android.cc
++++ b/components/gcm_driver/instance_id/instance_id_android.cc
+@@ -69,11 +69,9 @@
+ void InstanceIDAndroid::GetID(GetIDCallback callback) {
+   DCHECK(thread_checker_.CalledOnValidThread());
+ 
+-  int32_t request_id = get_id_callbacks_.Add(
+-      std::make_unique<GetIDCallback>(std::move(callback)));
+-
+-  JNIEnv* env = AttachCurrentThread();
+-  Java_InstanceIDBridge_getId(env, java_ref_, request_id);
++  // Tark: Play Services' Instance ID is never used.
++  base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
++      FROM_HERE, base::BindOnce(std::move(callback), std::string()));
+ }
+ 
+ void InstanceIDAndroid::GetCreationTime(GetCreationTimeCallback callback) {
+@@ -94,21 +92,11 @@
+     GetTokenCallback callback) {
+   DCHECK(thread_checker_.CalledOnValidThread());
+ 
+-  if (!time_to_live.is_zero()) {
+-    LOG(WARNING) << "Non-zero TTL requested for InstanceID token, while TTLs"
+-                    " are not supported by Android Firebase IID API.";
+-  }
+-
+-  int32_t request_id = get_token_callbacks_.Add(
+-      std::make_unique<GetTokenCallback>(std::move(callback)));
+-
+-  int java_flags = std::accumulate(
+-      flags.begin(), flags.end(), 0,
+-      [](int sum, Flags flag) { return sum + static_cast<int>(flag); });
+-
+-  JNIEnv* env = AttachCurrentThread();
+-  Java_InstanceIDBridge_getToken(env, java_ref_, request_id, authorized_entity,
+-                                 scope, java_flags);
++  // Tark: no Firebase Cloud Messaging; Play Services stay unused. Callers
++  // (policy invalidations, Web Push) see the service as disabled.
++  base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
++      FROM_HERE, base::BindOnce(std::move(callback), std::string(),
++                                InstanceID::DISABLED));
+ }
+ 
+ void InstanceIDAndroid::ValidateToken(const std::string& authorized_entity,
+--- a/components/ntp_tiles/resources/default_popular_sites.json
++++ b/components/ntp_tiles/resources/default_popular_sites.json
+@@ -1,42 +1 @@
+-[
+-    {
+-        "large_icon_url": "https://www.chromium.org/_/rsrc/1484148948583/apple-touch-icon.png",
+-        "title": "The Chromium Projects `",
+-        "url": "https://www.chromium.org/"
+-    },
+-    {
+-        "favicon_url": "https://codereview.chromium.org/static/favicon.ico",
+-        "title": "Chromium Code Reviews",
+-        "url": "https://codereview.chromium.org/"
+-    },
+-    {
+-        "large_icon_url": "https://www.chromium.org/_/rsrc/1484148948583/apple-touch-icon.png",
+-        "title": "Git Repositories on chromium",
+-        "url": "https://chromium.googlesource.com/"
+-    },
+-    {
+-        "large_icon_url": "https://developers.google.com/_static/9bce7b6017/images/touch-icon.png",
+-        "title": "Google Open Source Programs Office",
+-        "url": "https://developers.google.com/open-source/"
+-    },
+-    {
+-        "large_icon_url": "https://freenode.net/static/img/logos/coloured-alphabg-sq-120.png",
+-        "title": "freenode",
+-        "url": "https://freenode.net/"
+-    },
+-    {
+-        "large_icon_url": "https://assets-cdn.github.com/pinned-octocat.svg",
+-        "title": "Github Page of the Chromium Project",
+-        "url": "https://github.com/chromium/"
+-    },
+-    {
+-        "large_icon_url": "https://cdn2.iconfinder.com/data/icons/minimalism/512/Chromium.png",
+-        "title": "Chrome Flags",
+-        "url": "chrome://flags"
+-    },
+-    {
+-        "large_icon_url": "https://cdn2.iconfinder.com/data/icons/minimalism/512/Chromium.png",
+-        "title": "Chrome Version",
+-        "url": "chrome://version/"
+-    }
+-]
++[]
+--- a/media/base/media_switches.cc
++++ b/media/base/media_switches.cc
+@@ -1324,7 +1324,9 @@
+ // Enables MediaDrmOriginIdManager to provide preprovisioned origin IDs for
+ // MediaDrmBridge. If disabled, MediaDrmBridge will get unprovisioned origin IDs
+ // which will trigger provisioning process after MediaDrmBridge is created.
+-BASE_FEATURE(kMediaDrmPreprovisioning, base::FEATURE_ENABLED_BY_DEFAULT);
++// Tark: off, so Widevine provisions (www.googleapis.com) only when a page
++// uses protected content.
++BASE_FEATURE(kMediaDrmPreprovisioning, base::FEATURE_DISABLED_BY_DEFAULT);
+ 
+ // Determines if MediaDrmOriginIdManager should attempt to pre-provision origin
+ // IDs at startup (whenever a profile is loaded). Also used by tests that

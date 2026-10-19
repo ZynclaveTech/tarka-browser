@@ -166,6 +166,26 @@ class TestAndroidSeries(unittest.TestCase):
         self.assertIn('+#if BUILDFLAG(IS_ANDROID)\n', patch)
         self.assertIn('+  registry->RegisterBooleanPref("signin.allowed", false);', patch)
 
+    def test_google_callers_off(self):
+        # A1's emulator run: Google contacts the Mac build never makes.
+        self.assertIn('android/google-callers-off.patch', self.series)
+        patch = (ANDROID / 'patches' / 'google-callers-off.patch').read_text()
+        # First-run variations seed from clientservices.googleapis.com (Java,
+        # outside the net log).
+        self.assertIn('-        return VersionInfo.isOfficialBuild();', patch)
+        self.assertIn('+        return false;', patch)
+        # FCM tokens and IDs from Play Services (policy invalidations asked
+        # at startup; Web Push uses the same door).
+        self.assertIn('-  Java_InstanceIDBridge_getToken(env, java_ref_, request_id, authorized_entity,', patch)
+        self.assertIn('-  Java_InstanceIDBridge_getId(env, java_ref_, request_id);', patch)
+        self.assertIn('InstanceID::DISABLED', patch)
+        # Widevine provisioning at startup (www.googleapis.com).
+        self.assertIn('+BASE_FEATURE(kMediaDrmPreprovisioning, base::FEATURE_DISABLED_BY_DEFAULT);', patch)
+        # The new tab page's built-in tiles fetched icons from freenode.net,
+        # github.com and others.
+        self.assertIn('+++ b/components/ntp_tiles/resources/default_popular_sites.json', patch)
+        self.assertIn('-        "url": "https://freenode.net/"', patch)
+
     def test_skip_list_entries_exist(self):
         self.assertTrue(self.skip)
         for entry in self.skip:
