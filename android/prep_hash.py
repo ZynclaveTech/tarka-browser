@@ -20,7 +20,7 @@ sys.path.insert(0, str(HERE))
 import series  # noqa: E402
 
 INPUTS = [
-    'android/build.sh', 'android/gclient.android', 'android/desktop-only-patches.txt',
+    'android/gclient.android', 'android/desktop-only-patches.txt',
     'android/series.py', 'android/drop_gn_args_hunk.py',
     'ungoogled-chromium/chromium_version.txt', 'ungoogled-chromium/patches/series',
     'ungoogled-chromium/pruning.list', 'ungoogled-chromium/domain_substitution.list',
@@ -34,6 +34,14 @@ GLOBS = ['resources/branding/mark/*', 'resources/fonts/inter-latin*.woff2', 'res
          'ungoogled-chromium/patches/**/*.patch']
 
 
+def prep_section(build_sh):
+    """android/build.sh up to its '# --- end prepare ---' marker: the setup
+    and the preparation. Editing how gn and ninja run must not force an hour
+    of re-preparation. Both markers must be there (ValueError otherwise)."""
+    build_sh.index('# --- prepare ---')
+    return build_sh[:build_sh.index('# --- end prepare ---')]
+
+
 def prep_hash(repo):
     repo = pathlib.Path(repo)
     files = [repo / f for f in INPUTS]
@@ -41,6 +49,7 @@ def prep_hash(repo):
         files += sorted(p for p in repo.glob(pattern) if p.is_file())
     files += [repo / 'patches' / e for e in series.series(repo)]
     h = hashlib.sha256()
+    h.update(prep_section((repo / 'android' / 'build.sh').read_text()).encode() + b'\0')
     for f in files:
         h.update(str(f.relative_to(repo)).encode() + b'\0')
         h.update(f.read_bytes() if f.exists() else b'(missing)')

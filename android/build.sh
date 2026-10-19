@@ -49,6 +49,7 @@ cd "$work"
 # backup is stale (and name_substitution.py refuses to overwrite it).
 rm -f "$work/namesubs.tar"
 
+# --- prepare --- (android/prep_hash.py hashes this section and the inputs)
 # A tree prepared from the same inputs (android/prep_hash.py) is reused:
 # straight to gn and ninja. Different inputs wipe it and prepare again.
 stamp="$work/prepared.stamp"
@@ -152,6 +153,7 @@ else
   log "every patch applied and Tark's steps done"
   echo "$prep" > "$stamp"
 fi
+# --- end prepare ---
 
 if (( stop_before_gn )); then
   log "stopping before gn gen (--stop-before-gn)"
@@ -161,6 +163,9 @@ fi
 # 6. gn and ninja, with the clang and Rust fetched while preparing; gn is
 #    bootstrapped from source as on the Mac.
 mkdir -p "$_src_dir/out/Default"
+# Chromium's own clang (fetched while preparing) builds gn and everything else.
+export PATH="$_src_dir/third_party/llvm-build/Release+Asserts/bin:$PATH"
+export CC=clang CXX=clang++ AR=llvm-ar
 cat "$_main_repo/flags.gn" "$_root_dir/android/args.gn" > "$_src_dir/out/Default/args.gn"
 run python3 "$_src_dir/tools/gn/bootstrap/bootstrap.py" -o "$_src_dir/out/Default/gn" --skip-generate-buildfiles
 run "$_src_dir/out/Default/gn" gen "$_src_dir/out/Default" --root="$_src_dir" --fail-on-unused-args

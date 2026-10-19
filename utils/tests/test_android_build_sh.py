@@ -163,6 +163,23 @@ class TestAndroidBuildSh(unittest.TestCase):
         self.assertLess(index_of(runs, 'depot_tools-stock/gclient sync'), clang)
         self.assertLess(max(clang, rust), index_of(runs, 'utils/domain_substitution.py apply'))
 
+    def test_chromium_clang_on_path_for_gn_and_ninja(self):
+        script = SCRIPT.read_text()
+        build = script[script.index('# --- end prepare ---'):]
+        self.assertIn('third_party/llvm-build/Release+Asserts/bin', build)
+        self.assertIn('CXX=clang++', build)
+        self.assertLess(build.index('llvm-build'), build.index('bootstrap.py'))
+
+    def test_prep_hash_covers_only_the_preparation(self):
+        import sys
+        sys.path.insert(0, str(REPO / 'android'))
+        import prep_hash
+        section = prep_hash.prep_section(SCRIPT.read_text())
+        self.assertIn('clone.py', section)
+        self.assertIn('patches.py', section)
+        self.assertNotIn('bootstrap.py', section)
+        self.assertNotIn('chrome_public_apk', section)
+
     def test_core_patches_then_tark_series(self):
         result, runs, files, tmp = dryrun('--stop-before-gn')
         apply = runs[index_of(runs, 'utils/patches.py apply')]
