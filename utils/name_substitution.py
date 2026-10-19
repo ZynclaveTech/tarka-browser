@@ -132,7 +132,7 @@ def substitute_grit_file(args):
 
     text = original_text.replace('&#36;', '!!dollar-sign-literal!!')
     replaced, fp_map = util.replace_grit_tree(text)
-    if not fp_map:
+    if not fp_map and not util.has_message_renames(text):
         return None
 
     print(f"Replaced strings in {arcname}")

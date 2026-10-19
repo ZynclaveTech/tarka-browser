@@ -58,6 +58,57 @@ ENGLISH_ONLY_REGEXES = [
 ]
 
 
+# Tark (A4, Android): plain words for whole messages, by message name:
+# name -> (English, old id, new id, {language: Tark's wording}). The English
+# text is replaced; translations stay under the old id (other messages can
+# share the old English) and are copied to the new id, Hindi with Tark's
+# wording, unless the new id already has a translation of its own. The ids
+# are grit's fingerprints, pinned so the .xtb pass needs no grit
+# (utils/tests/test_name_substitution.py checks them against grit).
+MESSAGE_RENAMES = {
+    'IDS_PASSWORD_MANAGER_SETTINGS_TITLE':
+        ('Passwords', '6247557882553405851', '7029809446516969842', {'hi': 'पासवर्ड'}),
+    'IDS_CLEAR_BROWSING_DATA_TITLE':
+        ('Clear history and site data', '961856697154696964', '7602233293931907714',
+         {'hi': 'इतिहास और साइट का डेटा मिटाएं'}),
+    'IDS_PREFS_SITE_SETTINGS':
+        ('Site permissions', '4165986682804962316', '523862956770478816',
+         {'hi': 'साइट की अनुमतियां'}),
+}
+
+
+def has_message_renames(text):
+    """Whether a .grd/.grdp text holds a message MESSAGE_RENAMES renames."""
+    return any(f'name="{name}"' in text for name in MESSAGE_RENAMES)
+
+
+def rename_message(message):
+    """Tark's plain word for a whole message (MESSAGE_RENAMES)."""
+    rename = MESSAGE_RENAMES.get(message.get('name'))
+    if rename and message.text and not len(message):
+        message.text = message.text.replace(message.text.strip(), rename[0])
+
+
+def copy_renamed_translations(xml_tree):
+    """Adds each renamed message's translation under its new id (see
+    MESSAGE_RENAMES); returns whether any was added."""
+    lang = xml_tree.get('lang', '')
+    by_id = {t.get('id'): t for t in xml_tree.findall('.//translation')}
+    added = False
+    for _, old_id, new_id, by_lang in MESSAGE_RENAMES.values():
+        if new_id in by_id or old_id not in by_id:
+            continue
+        old = by_id[old_id]
+        copy = xml.Element('translation', {'id': new_id})
+        copy.text = by_lang.get(lang, old.text)
+        if lang not in by_lang:
+            copy.extend(list(old))
+        copy.tail = old.tail
+        xml_tree.append(copy)
+        added = True
+    return added
+
+
 def add_grit_to_path(tree):
     """Inserts the grit/ folder into the module loading path."""
     grit_path = tree / 'tools' / 'grit'
@@ -201,6 +252,7 @@ def replace_grit_tree(text):
 
     for message in xml_tree.findall('.//message'):
         old_fp = compute_fp(message)
+        rename_message(message)
         if replace_grit_message(message):
             new_fp = compute_fp(message)
             if old_fp != new_fp:
@@ -233,6 +285,7 @@ def replace_xtb_tree(text, fp_map):
     changed = False
     ids_seen = set()
 
+    changed |= copy_renamed_translations(xml_tree)
     for translation in xml_tree.findall('.//translation'):
         assert translation.get('id')
         changed |= replace_xtb_translation(translation, fp_map)

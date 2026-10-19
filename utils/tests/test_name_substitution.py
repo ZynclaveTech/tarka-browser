@@ -153,3 +153,61 @@ def test_default_workers_fit_windows_limit():
     assert name_substitution.default_workers(64) == 61
     assert name_substitution.default_workers(8) == 8
     assert name_substitution.default_workers(None) == 1
+
+
+# A4 Task 6: Android's plain words for whole messages, by message name.
+def test_plain_word_renames_have_hindi():
+    assert set(util.MESSAGE_RENAMES) == {'IDS_PASSWORD_MANAGER_SETTINGS_TITLE',
+                                         'IDS_CLEAR_BROWSING_DATA_TITLE', 'IDS_PREFS_SITE_SETTINGS'}
+    for english, old_id, new_id, by_lang in util.MESSAGE_RENAMES.values():
+        assert english and old_id != new_id and 'hi' in by_lang
+
+
+def _xtb(lang, *translations):
+    body = ''.join(f'<translation id="{i}">{t}</translation>' for i, t in translations)
+    return f'<?xml version="1.0" ?><translationbundle lang="{lang}">{body}</translationbundle>'
+
+
+def test_hindi_gets_tark_words_and_old_translations_stay():
+    out = util.replace_xtb_tree(_xtb('hi', ('961856697154696964', 'ब्राउज़िंग डेटा मिटाएं'),
+                                     ('4165986682804962316', 'साइट सेटिंग')), {})
+    # The old ids stay: other messages share their English text ("Site settings").
+    assert '<translation id="961856697154696964">ब्राउज़िंग डेटा मिटाएं</translation>' in out
+    assert '<translation id="7602233293931907714">इतिहास और साइट का डेटा मिटाएं</translation>' in out
+    assert '<translation id="523862956770478816">साइट की अनुमतियां</translation>' in out
+
+
+def test_other_languages_keep_their_word_under_the_new_id():
+    out = util.replace_xtb_tree(_xtb('ta', ('961856697154696964', 'உலாவல் தரவை நீக்கு')), {})
+    assert '<translation id="7602233293931907714">உலாவல் தரவை நீக்கு</translation>' in out
+
+
+def test_an_existing_translation_is_not_duplicated():
+    # "Passwords" is already a message: its own translation stays the only one.
+    out = util.replace_xtb_tree(_xtb('ta', ('6247557882553405851', 'Google கடவுச்சொல் நிர்வாகி'),
+                                     ('7029809446516969842', 'கடவுச்சொற்கள்')), {})
+    assert out is None or out.count('id="7029809446516969842"') == 1
+    assert out is None or '<translation id="7029809446516969842">கடவுச்சொற்கள்</translation>' in out
+
+
+def test_a_grd_with_only_a_rename_is_written():
+    assert util.has_message_renames('<message name="IDS_PREFS_SITE_SETTINGS" desc="x">')
+    assert not util.has_message_renames('<message name="IDS_OTHER" desc="x">')
+
+
+def test_rename_ids_match_grit():
+    import os
+    import xml.etree.ElementTree as xml
+    tree = os.environ.get('TARK_SRC')
+    if not tree or not pathlib.Path(tree, 'tools', 'grit').is_dir():
+        import pytest
+        pytest.skip('set TARK_SRC to a Chromium tree with tools/grit')
+    util.add_grit_to_path(pathlib.Path(tree))
+    grd = ('<grit><release><messages><message name="IDS_CLEAR_BROWSING_DATA_TITLE" desc="d">\n'
+           '        Delete browsing data\n      </message></messages></release></grit>')
+    out, _ = util.replace_grit_tree(grd)
+    assert 'Clear history and site data' in out
+    for english, old_id, new_id, _ in util.MESSAGE_RENAMES.values():
+        m = xml.Element('message')
+        m.text = english
+        assert util.compute_fp(m) == new_id, english
