@@ -1,0 +1,39 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Tark captions loopback</title>
+<!-- D4 test page: plays a clip as the remote side of a call. Two
+     RTCPeerConnections on one page; the clip goes out of the first and is
+     played from the second, so the browser handles it as WebRTC remote
+     audio (WebRtcAudioRenderer, Chromium's caption hook). ?clip=hi_1.wav
+     picks the clip; ?mic=1 also asks for the microphone, as a call does. -->
+<p id="status">starting</p>
+<audio id="remote" autoplay></audio>
+<script>
+(async () => {
+  const status = document.getElementById('status');
+  const params = new URLSearchParams(location.search);
+  const clip = params.get('clip') || 'hi_1.wav';
+  if (params.get('mic') === '1') {
+    window.mic = await navigator.mediaDevices.getUserMedia({audio: true});
+  }
+  const ctx = window.ctx = new AudioContext();
+  const buffer = await ctx.decodeAudioData(await (await fetch(clip)).arrayBuffer());
+  const source = ctx.createBufferSource();
+  source.buffer = buffer;
+  source.loop = true;
+  const out = ctx.createMediaStreamDestination();
+  source.connect(out);
+  const a = new RTCPeerConnection(), b = new RTCPeerConnection();
+  window.pcs = [a, b];
+  a.onicecandidate = e => e.candidate && b.addIceCandidate(e.candidate);
+  b.onicecandidate = e => e.candidate && a.addIceCandidate(e.candidate);
+  b.ontrack = e => { document.getElementById('remote').srcObject = e.streams[0]; };
+  out.stream.getTracks().forEach(t => a.addTrack(t, out.stream));
+  await a.setLocalDescription(await a.createOffer());
+  await b.setRemoteDescription(a.localDescription);
+  await b.setLocalDescription(await b.createAnswer());
+  await a.setRemoteDescription(b.localDescription);
+  source.start();
+  status.textContent = 'playing ' + clip + ' as remote call audio';
+})().catch(e => { document.getElementById('status').textContent = 'error: ' + e; });
+</script>

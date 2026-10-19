@@ -1,0 +1,665 @@
+--- a/chrome/services/speech/BUILD.gn
++++ b/chrome/services/speech/BUILD.gn
+@@ -3,6 +3,7 @@
+ # found in the LICENSE file.
+ 
+ import("//chrome/services/speech/buildflags/buildflags.gni")
++import("//testing/test.gni")
+ 
+ assert(enable_speech_service)
+ 
+@@ -19,6 +20,8 @@
+     "speech_recognition_service_impl.h",
+     "speech_timestamp_estimator.cc",
+     "speech_timestamp_estimator.h",
++    "tark_caption_recognizer.cc",
++    "tark_caption_recognizer.h",
+   ]
+ 
+   configs += [ "//build/config/compiler:wexit_time_destructors" ]
+@@ -106,3 +109,20 @@
+     "//mojo/public/cpp/bindings",
+   ]
+ }
++
++# Tark (D4): the speech service's caption recognizer with Tark's engine.
++# Same environment variables as tark_captions_unittests.
++test("tark_speech_unittests") {
++  sources = [ "tark_caption_recognizer_unittest.cc" ]
++  deps = [
++    ":lib",
++    "//base",
++    "//base/test:test_support",
++    "//components/tark_captions",
++    "//components/tark_captions:test_support",
++    "//media/mojo/mojom",
++    "//mojo/core/test:run_all_unittests",
++    "//mojo/public/cpp/bindings",
++    "//testing/gtest",
++  ]
++}
+--- a/chrome/services/speech/speech_recognition_service_impl.cc
++++ b/chrome/services/speech/speech_recognition_service_impl.cc
+@@ -13,6 +13,7 @@
+ #include "chrome/services/speech/audio_source_fetcher_impl.h"
+ #include "chrome/services/speech/soda_speech_recognizer_impl.h"
+ #include "chrome/services/speech/speech_recognition_recognizer_impl.h"
++#include "chrome/services/speech/tark_caption_recognizer.h"
+ #include "media/mojo/mojom/speech_recognition.mojom.h"
+ #include "media/mojo/mojom/speech_recognition_service.mojom.h"
+ #include "mojo/public/cpp/bindings/pending_receiver.h"
+@@ -197,10 +198,14 @@
+   auto language = options->language.has_value()
+                       ? options->language.value()
+                       : default_live_caption_language_;
+-  SpeechRecognitionRecognizerImpl::Create(
+-      std::move(receiver), std::move(client), std::move(options), binary_path_,
+-      config_paths_, language, mask_offensive_words_,
+-      weak_factory_.GetWeakPtr());
++  // Tark (D4): Tark's caption engine instead of SODA. binary_path_ is ONNX
++  // Runtime and the one config path is the captions models folder (see
++  // ChromeSpeechRecognitionService::LaunchIfNotRunning()).
++  if (config_paths_.empty()) {
++    return false;
++  }
++  TarkCaptionRecognizer::Create(std::move(receiver), std::move(client), binary_path_,
++                                config_paths_.begin()->second, language);
+ 
+   return true;
+ }
+--- /dev/null
++++ b/chrome/services/speech/tark_caption_recognizer.h
+@@ -0,0 +1,74 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_SERVICES_SPEECH_TARK_CAPTION_RECOGNIZER_H_
++#define CHROME_SERVICES_SPEECH_TARK_CAPTION_RECOGNIZER_H_
++
++#include <optional>
++#include <string>
++
++#include "base/files/file_path.h"
++#include "base/memory/weak_ptr.h"
++#include "base/threading/sequence_bound.h"
++#include "components/tark_captions/caption_engine.h"
++#include "media/mojo/mojom/speech_recognition.mojom.h"
++#include "mojo/public/cpp/bindings/pending_receiver.h"
++#include "mojo/public/cpp/bindings/pending_remote.h"
++#include "mojo/public/cpp/bindings/remote.h"
++
++namespace speech {
++
++// Tark (D4): the speech service's recognizer, with Tark's caption engine
++// (components/tark_captions) in place of SODA. Audio arrives from the
++// renderer's caption hook (for a call: the tab's WebRTC remote audio);
++// drafts and finals go back to the client as SpeechRecognitionResults. The
++// engine runs on its own sequence so decoding never blocks the IPC thread.
++class TarkCaptionRecognizer : public media::mojom::SpeechRecognitionRecognizer {
++ public:
++  // Binds a self-owned recognizer to `receiver`. `language` is a code such
++  // as "hi" or "hi-IN"; an unsupported one means Hindi.
++  static void Create(
++      mojo::PendingReceiver<media::mojom::SpeechRecognitionRecognizer> receiver,
++      mojo::PendingRemote<media::mojom::SpeechRecognitionRecognizerClient> client,
++      const base::FilePath& ort_dylib,
++      const base::FilePath& models_dir,
++      const std::string& language);
++
++  TarkCaptionRecognizer(
++      mojo::PendingRemote<media::mojom::SpeechRecognitionRecognizerClient> client,
++      const base::FilePath& ort_dylib,
++      const base::FilePath& models_dir,
++      const std::string& language);
++  TarkCaptionRecognizer(const TarkCaptionRecognizer&) = delete;
++  TarkCaptionRecognizer& operator=(const TarkCaptionRecognizer&) = delete;
++  ~TarkCaptionRecognizer() override;
++
++  // "hi", "hi-IN", "ta-IN"... -> the engine's language, if it has one.
++  static std::optional<tark_captions::Language> ParseLanguage(const std::string& code);
++
++  // media::mojom::SpeechRecognitionRecognizer:
++  void SendAudioToSpeechRecognitionService(
++      media::mojom::AudioDataS16Ptr buffer,
++      std::optional<base::TimeDelta> media_start_pts) final;
++  void MarkDone() final;
++  void OnLanguageChanged(const std::string& language) final;
++  void OnMaskOffensiveWordsChanged(bool mask_offensive_words) final;
++  void UpdateRecognitionContext(
++      const media::SpeechRecognitionRecognitionContext& recognition_context) final;
++
++ private:
++  class Engine;
++
++  void OnEvent(tark_captions::CaptionEvent event);
++  void OnEngineFailed();
++
++  mojo::Remote<media::mojom::SpeechRecognitionRecognizerClient> client_;
++  base::SequenceBound<Engine> engine_;
++  bool failed_ = false;
++  base::WeakPtrFactory<TarkCaptionRecognizer> weak_factory_{this};
++};
++
++}  // namespace speech
++
++#endif  // CHROME_SERVICES_SPEECH_TARK_CAPTION_RECOGNIZER_H_
+--- /dev/null
++++ b/chrome/services/speech/tark_caption_recognizer.cc
+@@ -0,0 +1,143 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/services/speech/tark_caption_recognizer.h"
++
++#include <memory>
++#include <utility>
++#include <vector>
++
++#include "base/functional/bind.h"
++#include "base/functional/callback_helpers.h"
++#include "base/logging.h"
++#include "base/task/bind_post_task.h"
++#include "base/task/sequenced_task_runner.h"
++#include "base/task/thread_pool.h"
++#include "media/mojo/mojom/audio_data.mojom.h"
++#include "media/mojo/mojom/speech_recognition_result.h"
++#include "mojo/public/cpp/bindings/self_owned_receiver.h"
++
++namespace speech {
++
++// The caption engine and its models, on a thread-pool sequence.
++class TarkCaptionRecognizer::Engine {
++ public:
++  Engine(const base::FilePath& ort_dylib,
++         const base::FilePath& models_dir,
++         tark_captions::Language language,
++         tark_captions::CaptionEngine::EventCallback on_event,
++         base::OnceClosure on_failed)
++      : engine_(tark_captions::CaptionEngine::Create(models_dir, ort_dylib)),
++        on_event_(std::move(on_event)) {
++    if (!engine_) {
++      std::move(on_failed).Run();
++      return;
++    }
++    engine_->SetLanguage(language);
++  }
++
++  void AddAudio(std::vector<int16_t> samples, int channels, int sample_rate) {
++    if (!engine_) {
++      return;
++    }
++    std::vector<float> floats(samples.size());
++    for (size_t i = 0; i < samples.size(); ++i) {
++      floats[i] = samples[i] / 32768.0f;
++    }
++    engine_->AddAudio(floats, channels, sample_rate, on_event_);
++  }
++
++  void Flush() {
++    if (engine_) {
++      engine_->Flush(on_event_);
++    }
++  }
++
++  void SetLanguage(tark_captions::Language language) {
++    if (engine_) {
++      engine_->SetLanguage(language);
++    }
++  }
++
++ private:
++  std::unique_ptr<tark_captions::CaptionEngine> engine_;
++  tark_captions::CaptionEngine::EventCallback on_event_;
++};
++
++// static
++void TarkCaptionRecognizer::Create(
++    mojo::PendingReceiver<media::mojom::SpeechRecognitionRecognizer> receiver,
++    mojo::PendingRemote<media::mojom::SpeechRecognitionRecognizerClient> client,
++    const base::FilePath& ort_dylib,
++    const base::FilePath& models_dir,
++    const std::string& language) {
++  mojo::MakeSelfOwnedReceiver(
++      std::make_unique<TarkCaptionRecognizer>(std::move(client), ort_dylib, models_dir, language),
++      std::move(receiver));
++}
++
++// static
++std::optional<tark_captions::Language> TarkCaptionRecognizer::ParseLanguage(
++    const std::string& code) {
++  return tark_captions::LanguageFromCode(code.substr(0, code.find('-')));
++}
++
++TarkCaptionRecognizer::TarkCaptionRecognizer(
++    mojo::PendingRemote<media::mojom::SpeechRecognitionRecognizerClient> client,
++    const base::FilePath& ort_dylib,
++    const base::FilePath& models_dir,
++    const std::string& language)
++    : client_(std::move(client)) {
++  scoped_refptr<base::SequencedTaskRunner> here = base::SequencedTaskRunner::GetCurrentDefault();
++  engine_ = base::SequenceBound<Engine>(
++      base::ThreadPool::CreateSequencedTaskRunner(
++          {base::MayBlock(), base::TaskPriority::USER_VISIBLE}),
++      ort_dylib, models_dir, ParseLanguage(language).value_or(tark_captions::Language::kHindi),
++      base::BindPostTask(here, base::BindRepeating(&TarkCaptionRecognizer::OnEvent,
++                                                   weak_factory_.GetWeakPtr())),
++      base::BindPostTask(here, base::BindOnce(&TarkCaptionRecognizer::OnEngineFailed,
++                                              weak_factory_.GetWeakPtr())));
++}
++
++TarkCaptionRecognizer::~TarkCaptionRecognizer() = default;
++
++void TarkCaptionRecognizer::SendAudioToSpeechRecognitionService(
++    media::mojom::AudioDataS16Ptr buffer,
++    std::optional<base::TimeDelta> media_start_pts) {
++  if (failed_ || !buffer || buffer->channel_count < 1) {
++    return;
++  }
++  engine_.AsyncCall(&Engine::AddAudio)
++      .WithArgs(std::move(buffer->data), buffer->channel_count, buffer->sample_rate);
++}
++
++void TarkCaptionRecognizer::MarkDone() {
++  engine_.AsyncCall(&Engine::Flush);
++}
++
++void TarkCaptionRecognizer::OnLanguageChanged(const std::string& language) {
++  if (std::optional<tark_captions::Language> parsed = ParseLanguage(language)) {
++    engine_.AsyncCall(&Engine::SetLanguage).WithArgs(*parsed);
++  }
++}
++
++void TarkCaptionRecognizer::OnMaskOffensiveWordsChanged(bool mask_offensive_words) {}
++
++void TarkCaptionRecognizer::UpdateRecognitionContext(
++    const media::SpeechRecognitionRecognitionContext& recognition_context) {}
++
++void TarkCaptionRecognizer::OnEvent(tark_captions::CaptionEvent event) {
++  // Never the text: call content stays out of logs.
++  VLOG(1) << "Tark captions: " << (event.is_final ? "final" : "draft") << ", "
++          << event.text.size() << " bytes";
++  client_->OnSpeechRecognitionRecognitionEvent(
++      media::SpeechRecognitionResult(event.text, event.is_final), base::DoNothing());
++}
++
++void TarkCaptionRecognizer::OnEngineFailed() {
++  failed_ = true;
++  client_->OnSpeechRecognitionError();
++}
++
++}  // namespace speech
+--- /dev/null
++++ b/chrome/services/speech/tark_caption_recognizer_unittest.cc
+@@ -0,0 +1,102 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/services/speech/tark_caption_recognizer.h"
++
++#include <string>
++#include <vector>
++
++#include "base/test/run_until.h"
++#include "base/test/task_environment.h"
++#include "components/tark_captions/test_util.h"
++#include "media/mojo/mojom/audio_data.mojom.h"
++#include "media/mojo/mojom/speech_recognition_result.h"
++#include "mojo/public/cpp/bindings/receiver.h"
++#include "mojo/public/cpp/bindings/remote.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace speech {
++namespace {
++
++class FakeClient : public media::mojom::SpeechRecognitionRecognizerClient {
++ public:
++  void OnSpeechRecognitionRecognitionEvent(
++      const media::SpeechRecognitionResult& result,
++      OnSpeechRecognitionRecognitionEventCallback reply) override {
++    (result.is_final ? finals : drafts).push_back(result.transcription);
++    std::move(reply).Run(true);
++  }
++  void OnSpeechRecognitionStopped() override {}
++  void OnSpeechRecognitionError() override { error = true; }
++  void OnLanguageIdentificationEvent(media::mojom::LanguageIdentificationEventPtr) override {}
++
++  std::vector<std::string> finals;
++  std::vector<std::string> drafts;
++  bool error = false;
++};
++
++class TarkCaptionRecognizerTest : public testing::Test {
++ protected:
++  void Bind(const base::FilePath& ort, const base::FilePath& models, const std::string& lang) {
++    TarkCaptionRecognizer::Create(recognizer_.BindNewPipeAndPassReceiver(),
++                                  client_receiver_.BindNewPipeAndPassRemote(), ort, models, lang);
++  }
++
++  base::test::TaskEnvironment env_;
++  FakeClient client_;
++  mojo::Receiver<media::mojom::SpeechRecognitionRecognizerClient> client_receiver_{&client_};
++  mojo::Remote<media::mojom::SpeechRecognitionRecognizer> recognizer_;
++};
++
++TEST_F(TarkCaptionRecognizerTest, ForwardsFinalAndDrafts) {
++  std::optional<base::FilePath> ort = tark_captions::test::OrtPath();
++  std::optional<base::FilePath> models = tark_captions::test::ModelsDir();
++  std::optional<base::FilePath> testdata = tark_captions::test::TestDataDir();
++  if (!ort || !models || !testdata) {
++    GTEST_SKIP() << "set TARK_CAPTIONS_ORT, TARK_CAPTIONS_MODELS and TARK_CAPTIONS_TESTDATA";
++  }
++  Bind(*ort, *models, "hi-IN");
++  int rate = 0;
++  std::vector<float> pcm = tark_captions::test::ReadWav(testdata->Append("hi_1.wav"), &rate);
++  pcm.insert(pcm.end(), 16000, 0.0f);
++  for (size_t i = 0; i < pcm.size(); i += 160) {
++    auto buffer = media::mojom::AudioDataS16::New();
++    buffer->channel_count = 1;
++    buffer->sample_rate = 16000;
++    for (size_t j = i; j < std::min(i + 160, pcm.size()); ++j) {
++      buffer->data.push_back(static_cast<int16_t>(pcm[j] * 32767));
++    }
++    buffer->frame_count = static_cast<int>(buffer->data.size());
++    recognizer_->SendAudioToSpeechRecognitionService(std::move(buffer), std::nullopt);
++  }
++  recognizer_->MarkDone();
++  // The clip's second half ("...पैदल यात्रा मार्ग..."), after the 5 s cut.
++  const std::string yatra = "\xE0\xA4\xAF\xE0\xA4\xBE\xE0\xA4\xA4\xE0\xA5\x8D\xE0\xA4\xB0\xE0\xA4\xBE";
++  auto joined = [&] {
++    std::string all;
++    for (const std::string& f : client_.finals) {
++      all += f + " ";
++    }
++    return all;
++  };
++  ASSERT_TRUE(base::test::RunUntil([&] { return joined().find(yatra) != std::string::npos; }))
++      << joined();
++  EXPECT_FALSE(client_.error);
++  EXPECT_FALSE(client_.drafts.empty());
++}
++
++TEST_F(TarkCaptionRecognizerTest, ErrorWhenEngineMissing) {
++  Bind(base::FilePath("/nonexistent/libonnxruntime.dylib"), base::FilePath("/nonexistent"), "hi");
++  ASSERT_TRUE(base::test::RunUntil([&] { return client_.error; }));
++}
++
++TEST_F(TarkCaptionRecognizerTest, ParsesLanguages) {
++  EXPECT_EQ(TarkCaptionRecognizer::ParseLanguage("hi-IN"), tark_captions::Language::kHindi);
++  EXPECT_EQ(TarkCaptionRecognizer::ParseLanguage("ta"), tark_captions::Language::kTamil);
++  EXPECT_EQ(TarkCaptionRecognizer::ParseLanguage("bn-IN"), tark_captions::Language::kBengali);
++  EXPECT_EQ(TarkCaptionRecognizer::ParseLanguage("en-US"), std::nullopt);
++}
++
++}  // namespace
++}  // namespace speech
+--- a/chrome/browser/chrome_content_browser_client.cc
++++ b/chrome/browser/chrome_content_browser_client.cc
+@@ -482,6 +482,7 @@
+ #include "chrome/browser/enterprise/platform_auth/platform_auth_proxying_url_loader_factory.h"
+ #include "chrome/common/chrome_version.h"
+ #include "components/enterprise/platform_auth/platform_auth_features.h"
++#include "chrome/browser/speech/chrome_speech_recognition_service.h"
+ #include "components/soda/constants.h"
+ #include "sandbox/mac/sandbox_serializer.h"
+ #include "sandbox/policy/mac/params.h"
+@@ -8412,16 +8413,17 @@
+     sandbox::mojom::Sandbox sandbox_type,
+     sandbox::SandboxSerializer* serializer) {
+   if (sandbox_type == sandbox::mojom::Sandbox::kSpeechRecognition) {
+-    base::FilePath soda_component_path = speech::GetSodaDirectory();
+-    CHECK(!soda_component_path.empty());
++    // Tark (D4): the speech service runs Tark's caption engine; it reads its
++    // models from the captions folder (ONNX Runtime is in the app bundle,
++    // which the sandbox already lets it read).
++    const base::FilePath models_dir =
++        speech::ChromeSpeechRecognitionService::TarkCaptionsModelsDir();
++    CHECK(!models_dir.empty());
+     CHECK(serializer->SetParameter(sandbox::policy::kParamSodaComponentPath,
+-                                   soda_component_path.value()));
+-
+-    base::FilePath soda_language_pack_path =
+-        speech::GetSodaLanguagePacksDirectory();
+-    CHECK(!soda_language_pack_path.empty());
++                                   models_dir.value()));
+     CHECK(serializer->SetParameter(sandbox::policy::kParamSodaLanguagePackPath,
+-                                   soda_language_pack_path.value()));
++                                   models_dir.value()));
++    return true;
+   }
+ 
+   return false;
+--- a/chrome/browser/speech/chrome_speech_recognition_service.h
++++ b/chrome/browser/speech/chrome_speech_recognition_service.h
+@@ -32,6 +32,10 @@
+ // Provides a mojo endpoint in the browser that allows the renderer process to
+ // launch and initialize the sandboxed speech recognition service
+ // process.
++// Tark (D4), temporary until the caption pill: captions on for every tab,
++// in the given language ("hi", "ta" or "bn").
++inline constexpr char kTarkCaptionsForceSwitch[] = "tark-captions-force";
++
+ class ChromeSpeechRecognitionService
+     : public SpeechRecognitionService,
+       public media::mojom::SpeechRecognitionContext,
+@@ -45,6 +49,13 @@
+       const ChromeSpeechRecognitionService&) = delete;
+   ~ChromeSpeechRecognitionService() override;
+ 
++  // Tark (D4): the speech service runs Tark's caption engine. Its models
++  // are in Captions/models under Tark's default user data folder (the same
++  // for every profile and --user-data-dir); ONNX Runtime is in the app's
++  // Frameworks folder. Empty where captions are not built.
++  static base::FilePath TarkCaptionsModelsDir();
++  static base::FilePath TarkOnnxRuntimePath();
++
+   // SpeechRecognitionService:
+   void BindSpeechRecognitionContext(
+       mojo::PendingReceiver<media::mojom::SpeechRecognitionContext> receiver)
+--- a/chrome/browser/speech/chrome_speech_recognition_service.cc
++++ b/chrome/browser/speech/chrome_speech_recognition_service.cc
+@@ -7,16 +7,22 @@
+ #include <string>
+ #include <unordered_set>
+ 
++#include "base/command_line.h"
+ #include "base/containers/flat_map.h"
+ #include "base/metrics/histogram_functions.h"
+ #include "base/scoped_observation.h"
+ #include "base/strings/string_util.h"
+ #include "build/build_config.h"
++
++#if BUILDFLAG(IS_MAC)
++#include "base/apple/bundle_locations.h"
++#endif
+ #include "chrome/browser/browser_process.h"
+ #include "chrome/browser/component_updater/soda_language_pack_component_installer.h"
+ #include "chrome/browser/optimization_guide/optimization_guide_keyed_service.h"
+ #include "chrome/browser/optimization_guide/optimization_guide_keyed_service_factory.h"
+ #include "chrome/browser/profiles/profile.h"
++#include "chrome/common/chrome_paths_internal.h"
+ #include "chrome/browser/speech/on_device_live_caption_recognizer.h"
+ #include "chrome/grit/generated_resources.h"
+ #include "components/live_caption/pref_names.h"
+@@ -230,28 +236,21 @@
+   DCHECK(profile_prefs);
+   DCHECK(global_prefs);
+ 
+-  // TODO(crbug.com/40162502): Language pack path should be configurable per
+-  // SpeechRecognitionRecognizer to allow multiple features to use Speech
+-  // recognition. For now, only Live Caption uses SpeechRecognitionService on
+-  // non-Chrome OS Chrome, so hard-coding to the Live Caption language code.
+-  const std::string language_name =
+-      prefs::GetLiveCaptionLanguageCode(profile_prefs);
+-
+-  std::optional<speech::SodaLanguagePackComponentConfig> language_config =
+-      speech::GetLanguageComponentConfig(language_name);
+-  CHECK(language_config);
+-  base::UmaHistogramEnumeration("Accessibility.LiveCaption.SodaLanguage",
+-                                language_config.value().language_code);
+-
+-  base::FilePath binary_path;
+-  binary_path = global_prefs->GetFilePath(prefs::kSodaBinaryPath);
+-  base::flat_map<std::string, base::FilePath> config_paths =
+-      ChromeSpeechRecognitionService::GetSodaConfigPaths();
+-
+-  if (binary_path.empty() || config_paths[language_name].empty()) {
+-    LOG(ERROR) << "Unable to find SODA files on the device.";
++  // Tark (D4): Tark's caption engine instead of SODA. The "binary" is ONNX
++  // Runtime and the one "language pack" is the captions models folder; the
++  // utility process checks both exist before making a recognizer. Until the
++  // pill chooses the language per call, --tark-captions-force=LANG sets it.
++  const std::string forced = base::CommandLine::ForCurrentProcess()->GetSwitchValueASCII(
++      kTarkCaptionsForceSwitch);
++  const std::string language_name = forced.empty() ? "hi" : forced;
++  const base::FilePath binary_path = TarkOnnxRuntimePath();
++  const base::FilePath models_dir = TarkCaptionsModelsDir();
++  if (binary_path.empty() || models_dir.empty()) {
++    LOG(ERROR) << "Tark captions are not available on this platform.";
+     return;
+   }
++  base::flat_map<std::string, base::FilePath> config_paths = {{language_name, models_dir}};
++  (void)global_prefs;
+ 
+   content::ServiceProcessHost::Launch(
+       speech_recognition_service_.BindNewPipeAndPassReceiver(),
+@@ -276,6 +275,31 @@
+   }
+ }
+ 
++// static
++base::FilePath ChromeSpeechRecognitionService::TarkCaptionsModelsDir() {
++#if BUILDFLAG(IS_MAC)
++  base::FilePath user_data;
++  if (!chrome::GetDefaultUserDataDirectory(&user_data)) {
++    return base::FilePath();
++  }
++  return user_data.Append("Captions").Append("models");
++#else
++  return base::FilePath();
++#endif
++}
++
++// static
++base::FilePath ChromeSpeechRecognitionService::TarkOnnxRuntimePath() {
++#if BUILDFLAG(IS_MAC)
++  return base::apple::OuterBundlePath()
++      .Append("Contents")
++      .Append("Frameworks")
++      .Append("libonnxruntime.1.31.0.dylib");
++#else
++  return base::FilePath();
++#endif
++}
++
+ base::flat_map<std::string, base::FilePath>
+ ChromeSpeechRecognitionService::GetSodaConfigPaths() {
+   base::flat_map<std::string, base::FilePath> config_file_paths;
+--- a/chrome/browser/chrome_browser_interface_binders.cc
++++ b/chrome/browser/chrome_browser_interface_binders.cc
+@@ -6,6 +6,7 @@
+ 
+ #include <utility>
+ 
++#include "base/command_line.h"
+ #include "base/feature_list.h"
+ #include "base/functional/bind.h"
+ #include "build/build_config.h"
+@@ -129,6 +130,7 @@
+ #if BUILDFLAG(ENABLE_SPEECH_SERVICE)
+ #include "chrome/browser/accessibility/live_caption/live_caption_speech_recognition_host.h"
+ #include "chrome/browser/accessibility/live_caption/live_caption_unavailability_notifier.h"
++#include "chrome/browser/speech/chrome_speech_recognition_service.h"
+ #include "chrome/browser/speech/speech_recognition_client_browser_interface.h"
+ #include "chrome/browser/speech/speech_recognition_client_browser_interface_factory.h"
+ #include "chrome/browser/speech/speech_recognition_service.h"
+@@ -300,9 +302,13 @@
+     return;
+   }
+   PrefService* profile_prefs = profile->GetPrefs();
+-  if (!(profile_prefs->GetBoolean(prefs::kLiveCaptionEnabled) ||
+-        profile_prefs->GetBoolean(prefs::kHeadlessCaptionEnabled)) ||
+-      !captions::IsLiveCaptionFeatureSupported()) {
++  // Tark (D4): --tark-captions-force admits every frame until the pill.
++  const bool tark_forced = base::CommandLine::ForCurrentProcess()->HasSwitch(
++      speech::kTarkCaptionsForceSwitch);
++  if (!tark_forced &&
++      (!(profile_prefs->GetBoolean(prefs::kLiveCaptionEnabled) ||
++         profile_prefs->GetBoolean(prefs::kHeadlessCaptionEnabled)) ||
++       !captions::IsLiveCaptionFeatureSupported())) {
+     return;
+   }
+ 
+--- a/chrome/browser/speech/speech_recognition_client_browser_interface.cc
++++ b/chrome/browser/speech/speech_recognition_client_browser_interface.cc
+@@ -6,6 +6,7 @@
+ 
+ #include <memory>
+ 
++#include "base/command_line.h"
+ #include "base/feature_list.h"
+ #include "base/functional/bind.h"
+ #include "base/logging.h"
+@@ -14,6 +15,7 @@
+ #include "build/build_config.h"
+ #include "chrome/browser/browser_process.h"
+ #include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/speech/chrome_speech_recognition_service.h"
+ #include "components/live_caption/caption_util.h"
+ #include "components/live_caption/pref_names.h"
+ #include "components/prefs/pref_change_registrar.h"
+@@ -176,6 +178,14 @@
+   if (live_caption_availability_observers_.empty()) {
+     return;
+   }
++  // Tark (D4): --tark-captions-force makes captions available everywhere
++  // until the pill decides per call.
++  if (base::CommandLine::ForCurrentProcess()->HasSwitch(kTarkCaptionsForceSwitch)) {
++    for (auto& observer : live_caption_availability_observers_) {
++      observer->SpeechRecognitionAvailabilityChanged(true);
++    }
++    return;
++  }
+ 
+ #if !BUILDFLAG(IS_CHROMEOS)
+   if (base::FeatureList::IsEnabled(
+--- a/chrome/browser/accessibility/live_caption/live_caption_speech_recognition_host.cc
++++ b/chrome/browser/accessibility/live_caption/live_caption_speech_recognition_host.cc
+@@ -11,8 +11,10 @@
+ #include <utility>
+ #include <vector>
+ 
++#include "base/command_line.h"
+ #include "base/feature_list.h"
+ #include "base/i18n/legacy_language_tag_helpers.h"
++#include "base/logging.h"
+ #include "base/metrics/histogram_functions.h"
+ #include "base/strings/strcat.h"
+ #include "base/strings/string_util.h"
+@@ -23,6 +25,7 @@
+ #include "chrome/browser/accessibility/live_caption/live_translate_controller_factory.h"
+ #include "chrome/browser/browser_process.h"
+ #include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/speech/chrome_speech_recognition_service.h"
+ #include "components/live_caption/greedy_text_stabilizer.h"
+ #include "components/live_caption/live_caption_controller.h"
+ #include "components/live_caption/live_translate_controller.h"
+@@ -159,6 +162,16 @@
+ void LiveCaptionSpeechRecognitionHost::OnSpeechRecognitionRecognitionEvent(
+     const media::SpeechRecognitionResult& result,
+     OnSpeechRecognitionRecognitionEventCallback reply) {
++  // Tark (D4), until the caption pill: --tark-captions-force keeps
++  // recognition going and logs each result's kind and size (never the
++  // text, so call content stays out of logs).
++  if (base::CommandLine::ForCurrentProcess()->HasSwitch(
++          speech::kTarkCaptionsForceSwitch)) {
++    VLOG(1) << "Tark captions: " << (result.is_final ? "final" : "draft") << ", "
++            << result.transcription.size() << " bytes";
++    std::move(reply).Run(true);
++    return;
++  }
+   LiveCaptionController* live_caption_controller = GetLiveCaptionController();
+   if (!live_caption_controller) {
+     std::move(reply).Run(false);

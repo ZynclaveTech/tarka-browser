@@ -191,7 +191,7 @@
 +#endif  // COMPONENTS_TARK_CAPTIONS_ORT_RUNTIME_H_
 --- /dev/null
 +++ b/components/tark_captions/ort_runtime.cc
-@@ -0,0 +1,161 @@
+@@ -0,0 +1,172 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -200,6 +200,7 @@
 +
 +#include <utility>
 +
++#include "base/environment.h"
 +#include "base/logging.h"
 +#include "base/memory/ptr_util.h"
 +#include "onnxruntime_c_api.h"
@@ -223,6 +224,10 @@
 +
 +// static
 +std::unique_ptr<OrtRuntime> OrtRuntime::Load(const base::FilePath& dylib) {
++  // Microsoft's official builds send telemetry (1DS, over HTTPS) and keep a
++  // device identifier unless ORT_DISABLE_TELEMETRY=1 is set before ONNX
++  // Runtime initialises (its Privacy.md). Tark sends nothing home.
++  base::Environment::Create()->SetVar("ORT_DISABLE_TELEMETRY", "1");
 +  base::NativeLibraryLoadError error;
 +  base::NativeLibrary library = base::LoadNativeLibrary(dylib, &error);
 +  if (!library) {
@@ -234,6 +239,12 @@
 +  const OrtApi* api = get_api_base ? get_api_base()->GetApi(ORT_API_VERSION) : nullptr;
 +  OrtEnv* env = nullptr;
 +  if (!api || !Ok(api, api->CreateEnv(ORT_LOGGING_LEVEL_WARNING, "tark_captions", &env))) {
++    base::UnloadNativeLibrary(library);
++    return nullptr;
++  }
++  // And the API switch too; refuse to run if it is refused.
++  if (!Ok(api, api->DisableTelemetryEvents(env))) {
++    api->ReleaseEnv(env);
 +    base::UnloadNativeLibrary(library);
 +    return nullptr;
 +  }
@@ -355,7 +366,7 @@
 +}  // namespace tark_captions
 --- /dev/null
 +++ b/components/tark_captions/ort_runtime_unittest.cc
-@@ -0,0 +1,75 @@
+@@ -0,0 +1,84 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -399,6 +410,15 @@
 +
 +TEST_F(OrtRuntimeTest, LoadsRuntime) {
 +  EXPECT_TRUE(OrtRuntime::Load(ort_path_));
++}
++
++// Microsoft's official builds send telemetry unless ORT_DISABLE_TELEMETRY=1
++// is set before ONNX Runtime initialises (the release's Privacy.md); Tark
++// sends nothing home.
++TEST_F(OrtRuntimeTest, DisablesTelemetryBeforeLoading) {
++  ASSERT_TRUE(OrtRuntime::Load(ort_path_));
++  std::optional<std::string> value = base::Environment::Create()->GetVar("ORT_DISABLE_TELEMETRY");
++  EXPECT_EQ(value, "1");
 +}
 +
 +TEST_F(OrtRuntimeTest, MissingRuntimeFails) {
@@ -806,7 +826,24 @@
 +}  // namespace tark_captions
 --- a/chrome/services/speech/BUILD.gn
 +++ b/chrome/services/speech/BUILD.gn
-@@ -36,6 +36,7 @@
+@@ -3,6 +3,7 @@
+ # found in the LICENSE file.
+ 
+ import("//chrome/services/speech/buildflags/buildflags.gni")
++import("//testing/test.gni")
+ 
+ assert(enable_speech_service)
+ 
+@@ -19,6 +20,8 @@
+     "speech_recognition_service_impl.h",
+     "speech_timestamp_estimator.cc",
+     "speech_timestamp_estimator.h",
++    "tark_caption_recognizer.cc",
++    "tark_caption_recognizer.h",
+   ]
+ 
+   configs += [ "//build/config/compiler:wexit_time_destructors" ]
+@@ -36,6 +39,7 @@
      "//chrome/services/speech/soda:soda_api_proto",
      "//components/soda:constants",
      "//components/speech",
@@ -814,6 +851,27 @@
      "//content/public/browser:proto",
      "//google_apis",
      "//media/mojo/common",
+@@ -105,3 +109,20 @@
+     "//mojo/public/cpp/bindings",
+   ]
+ }
++
++# Tark (D4): the speech service's caption recognizer with Tark's engine.
++# Same environment variables as tark_captions_unittests.
++test("tark_speech_unittests") {
++  sources = [ "tark_caption_recognizer_unittest.cc" ]
++  deps = [
++    ":lib",
++    "//base",
++    "//base/test:test_support",
++    "//components/tark_captions",
++    "//components/tark_captions:test_support",
++    "//media/mojo/mojom",
++    "//mojo/core/test:run_all_unittests",
++    "//mojo/public/cpp/bindings",
++    "//testing/gtest",
++  ]
++}
 --- /dev/null
 +++ b/components/tark_captions/asr_model.h
 @@ -0,0 +1,68 @@
