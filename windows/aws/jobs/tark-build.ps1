@@ -10,6 +10,8 @@ param([string]$Bucket, [string]$Prefix, [string]$Ref = 'main', [switch]$Fresh, [
 $ErrorActionPreference = 'Continue'
 # Windows PowerShell 5.1 redirects (*>>) as UTF-16; logs are read on the Mac.
 $PSDefaultParameterValues['Out-File:Encoding'] = 'utf8'
+# A job that just finished may have scheduled a shutdown; this one needs the machine.
+shutdown.exe /a 2>$null | Out-Null
 $repo = 'C:\tarka-browser'
 $work = 'C:\tw'
 $log = 'C:\tark-logs\tark-build.log'

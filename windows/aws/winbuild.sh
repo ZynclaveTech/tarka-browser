@@ -36,6 +36,7 @@ start)
   echo "$I running, SSM online";;
 job)
   job=$2; shift 2
+  [[ $(state) == running ]] || $0 start >&2
   name=${job:t:r}
   prefix=jobs/$name-$(date +%Y%m%d-%H%M%S)
   aws s3 cp --quiet $job s3://$B/$prefix/$name.ps1
