@@ -127,6 +127,9 @@ class TestAndroidSeries(unittest.TestCase):
             self.assertNotIn(gone, added)
         # No Safe Browsing client is attached: the sheet must not call through null.
         self.assertIn('+  if (password_reuse_detection_manager_client_) {', patch)
+        # The call needs the client's interface, not Chrome's (unbuilt) class.
+        self.assertIn('+#include "components/safe_browsing/core/browser/password_protection/'
+                      'password_reuse_detection_manager_client.h"', patch)
 
     def test_skip_list_entries_exist(self):
         self.assertTrue(self.skip)
