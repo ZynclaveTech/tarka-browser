@@ -115,6 +115,17 @@ class TestAndroidBuildSh(unittest.TestCase):
         self.assertIn('third_party/android_sdk/public', script)
         self.assertIn('no Android SDK after the sync', script)
 
+    def test_stale_name_substitution_backup_is_cleared(self):
+        # clone.py resets the tree each run, so an earlier run's namesubs.tar
+        # is stale; name_substitution.py refuses to overwrite it.
+        with tempfile.TemporaryDirectory() as tmp:
+            (pathlib.Path(tmp) / 'namesubs.tar').write_text('stale')
+            env = dict(os.environ, TARK_ANDROID_DRYRUN='1')
+            result = subprocess.run(['bash', str(SCRIPT), '--stop-before-gn', tmp],
+                                    capture_output=True, text=True, env=env)
+            self.assertEqual(result.returncode, 3, result.stderr)
+            self.assertFalse((pathlib.Path(tmp) / 'namesubs.tar').exists())
+
     def test_core_patches_then_tark_series(self):
         result, runs, files, tmp = dryrun('--stop-before-gn')
         apply = runs[index_of(runs, 'utils/patches.py apply')]

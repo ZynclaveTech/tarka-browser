@@ -45,6 +45,9 @@ run() {
 mkdir -p "$_src_dir" "$_download_cache"
 # gclient writes state files into its working directory: work from WORKDIR.
 cd "$work"
+# clone.py resets the tree on every run, so an earlier run's name-substitution
+# backup is stale (and name_substitution.py refuses to overwrite it).
+rm -f "$work/namesubs.tar"
 
 # 1. Chromium with Android's dependencies, from ungoogled's clone.py with
 #    android/gclient.android (a solution named "src").
