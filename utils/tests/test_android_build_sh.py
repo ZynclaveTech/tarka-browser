@@ -97,6 +97,19 @@ class TestAndroidBuildSh(unittest.TestCase):
         self.assertIn('cd "$work"', script)
         self.assertLess(script.index('cd "$work"'), script.index('clone.py" -o'))
 
+    def test_android_cipd_deps_with_stock_gclient(self):
+        # ungoogled's depot_tools patch skips CIPD deps, which is how Chromium
+        # ships the Android SDK and NDK: a second sync with an unpatched
+        # depot_tools (same commit) fetches them, before pruning and patching.
+        result, runs, files, tmp = dryrun('--stop-before-gn')
+        sync = index_of(runs, 'depot_tools-stock/gclient sync')
+        self.assertLess(index_of(runs, '/clone.py'), sync)
+        self.assertLess(sync, index_of(runs, 'utils/prune_binaries.py'))
+        line = runs[sync]
+        self.assertIn('--nohooks', line)
+        self.assertNotIn(' -D', line)  # never delete what clone.py fetched
+        self.assertIn('depot_tools-stock fetch -q --depth=1 origin', runs[index_of(runs, 'depot_tools-stock fetch')])
+
     def test_core_patches_then_tark_series(self):
         result, runs, files, tmp = dryrun('--stop-before-gn')
         apply = runs[index_of(runs, 'utils/patches.py apply')]

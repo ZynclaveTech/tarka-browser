@@ -76,6 +76,24 @@ if grep -q ".gclient').replace('UC_OUT'" "$work/uc/utils/clone.py" ||
 fi
 run python3 "$work/uc/utils/clone.py" -o "$_src_dir" -c "$work/gclient" -s amd64
 
+# 1b. The Android SDK, NDK, build-tools and R8. Chromium ships them as CIPD
+#     packages, which ungoogled's depot_tools patch skips (it avoids
+#     prebuilt binaries); Android cannot be built without them. A second sync
+#     with an unpatched depot_tools at the same commit fetches them. It runs
+#     on the build machine only; no -D, so nothing clone.py fetched is removed.
+dt_commit=dca727ba1f8fa8f1e3b12a815d065818bb61d395
+if [[ "$dryrun" != 1 ]]; then
+  dt_commit=$(git -C "$_src_dir/uc_staging/depot_tools" rev-parse HEAD)
+fi
+if [[ ! -d "$work/depot_tools-stock/.git" ]]; then
+  run git init -q "$work/depot_tools-stock"
+  run git -C "$work/depot_tools-stock" remote add origin https://chromium.googlesource.com/chromium/tools/depot_tools
+fi
+run git -C "$work/depot_tools-stock" fetch -q --depth=1 origin "$dt_commit"
+run git -C "$work/depot_tools-stock" reset -q --hard FETCH_HEAD
+run env DEPOT_TOOLS_UPDATE=0 GCLIENT_FILE=.gclient PATH="$work/depot_tools-stock:$PATH" \
+  "$work/depot_tools-stock/gclient" sync --nohooks --no-history --shallow -j 32
+
 # 2. Prune binaries, as every ungoogled-chromium build does.
 run python3 "$_main_repo/utils/prune_binaries.py" "$_src_dir" "$_main_repo/pruning.list"
 
