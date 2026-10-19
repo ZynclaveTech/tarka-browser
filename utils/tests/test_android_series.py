@@ -63,6 +63,34 @@ class TestAndroidSeries(unittest.TestCase):
         added = [l for l in patch.splitlines() if l.startswith('+') and not l.startswith('+++')]
         self.assertFalse(any('kFinancialServer' in l for l in added))
 
+    def test_safe_browsing_leftovers_fixed(self):
+        # Android-only code that still names Safe Browsing pieces ungoogled
+        # removes (safe_browsing_mode=0) is compiled out or loses the call.
+        self.assertIn('android/safe-browsing-android-leftovers.patch', self.series)
+        patch = (ANDROID / 'patches' / 'safe-browsing-android-leftovers.patch').read_text()
+        for f in ('chrome/browser/download/chrome_download_manager_delegate.cc',
+                  'chrome/browser/download/download_ui_safe_browsing_util.cc',
+                  'chrome/browser/interstitials/enterprise_util.cc',
+                  'chrome/browser/notifications/persistent_notification_handler.cc',
+                  'components/enterprise/connectors/core/cloud_content_scanning/'
+                  'cloud_binary_upload_service_base.cc'):
+            self.assertIn('+++ b/' + f, patch)
+        added = '\n'.join(l for l in patch.splitlines() if l.startswith('+') and not l.startswith('+++'))
+        for gone in ('ShouldUploadBinaryForDeepScanning', 'kSafeBrowsingProceedAnywayDisabled',
+                     'AddToDeepScanRequests', 'NotificationContentDetectionUkmUtil'):
+            self.assertNotIn(gone, added)
+        self.assertIn('+#include "base/files/file_path.h"', patch)
+
+    def test_extension_util_include_only_with_extensions(self):
+        # ungoogled's add-flag-to-configure-extension-downloading.patch includes
+        # extensions/browser/extension_util.h unconditionally; Android builds
+        # no extensions, so the include follows the code's ENABLE_EXTENSIONS_CORE.
+        self.assertIn('android/download-extension-util-include.patch', self.series)
+        patch = (ANDROID / 'patches' / 'download-extension-util-include.patch').read_text()
+        self.assertIn('-#include "extensions/browser/extension_util.h"', patch)
+        self.assertIn(' #if BUILDFLAG(ENABLE_EXTENSIONS_CORE)\n+#include "extensions/browser/extension_util.h"\n'
+                      ' #include "extensions/browser/webstore_installer.h"', patch)
+
     def test_skip_list_entries_exist(self):
         self.assertTrue(self.skip)
         for entry in self.skip:
