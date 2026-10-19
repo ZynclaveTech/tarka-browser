@@ -126,6 +126,7 @@ else
   # 3. ungoogled-chromium's core patches, then Tark's Android series.
   mkdir -p "$work/tark-patches"
   ln -sfn "$_root_dir/patches/tarka" "$work/tark-patches/tarka"
+  ln -sfn "$_root_dir/android/patches" "$work/tark-patches/android"
   python3 "$_root_dir/android/series.py" "$_root_dir" "$work/tark-patches/series"
   run python3 "$_main_repo/utils/patches.py" apply "$_src_dir" "$_main_repo/patches" "$work/tark-patches"
 

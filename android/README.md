@@ -10,6 +10,9 @@ itself. Everything else (patches, scripts, fixes) is done on the Mac.
   `patches/series` minus `desktop-only-patches.txt`. The build applies
   ungoogled-chromium's own series first, then this one.
   Test: `pytest utils/tests/test_android_series.py`.
+- `patches/` — Android-only Tark patches with their own `series`, applied
+  after the shared ones. They live outside `patches/tarka/` so the Mac and
+  Windows builds never apply them.
 - `desktop-only-patches.txt` — Tark patches that cannot or must not apply on
   Android, with the reason. Desktop-only patches whose files exist in the
   Android tree stay in: they apply and are simply not compiled.

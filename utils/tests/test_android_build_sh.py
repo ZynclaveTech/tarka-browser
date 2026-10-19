@@ -197,6 +197,9 @@ class TestAndroidBuildSh(unittest.TestCase):
         self.assertLess(core, tark)
         self.assertNotIn('tarka/updater/sparkle.patch', files['series'])
         self.assertIn('tarka/omnibox-translit/translit-provider.patch', files['series'])
+        self.assertIn('android/locales-android-branch.patch', files['series'])
+        self.assertIn('ln -sfn', SCRIPT.read_text())
+        self.assertIn('android/patches" "$work/tark-patches/android"', SCRIPT.read_text())
 
     def test_no_ublock_on_android(self):
         result, runs, files, tmp = dryrun('--stop-before-gn')

@@ -7,7 +7,8 @@
     python3 android/series.py REPO OUT
 
 OUT gets the tarka/ entries of REPO/patches/series, in order, minus
-android/desktop-only-patches.txt. android/build.sh applies
+android/desktop-only-patches.txt, then android/patches/series (Android-only
+patches, as android/...). android/build.sh applies
 ungoogled-chromium's own series from the submodule first, then this one.
 """
 
@@ -24,8 +25,10 @@ def entries(path):
 
 def series(repo):
     skip = set(entries(HERE / 'desktop-only-patches.txt'))
-    return [e for e in entries(pathlib.Path(repo) / 'patches' / 'series')
-            if e.startswith('tarka/') and e not in skip]
+    shared = [e for e in entries(pathlib.Path(repo) / 'patches' / 'series')
+              if e.startswith('tarka/') and e not in skip]
+    # Android-only patches (android/patches/), last.
+    return shared + ['android/' + e for e in entries(HERE / 'patches' / 'series')]
 
 
 def main():

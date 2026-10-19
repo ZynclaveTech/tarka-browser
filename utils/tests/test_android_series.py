@@ -24,11 +24,22 @@ class TestAndroidSeries(unittest.TestCase):
         self.tark = [e for e in lines(REPO / 'patches' / 'series') if e.startswith('tarka/')]
         self.skip = set(lines(ANDROID / 'desktop-only-patches.txt'))
 
-    def test_only_tark_in_order(self):
+    def test_tark_in_order_then_android_only(self):
         self.assertTrue(self.series)
-        self.assertTrue(all(e.startswith('tarka/') for e in self.series))
-        self.assertEqual(self.series, [e for e in self.tark if e not in self.skip])
-        self.assertEqual(self.series[0], next(e for e in self.tark if e not in self.skip))
+        android = [e for e in self.series if e.startswith('android/')]
+        tark = [e for e in self.series if not e.startswith('android/')]
+        self.assertTrue(all(e.startswith('tarka/') for e in tark))
+        self.assertEqual(tark, [e for e in self.tark if e not in self.skip])
+        # Android-only patches (android/patches/series) come last.
+        self.assertEqual(self.series[len(tark):], android)
+        self.assertEqual(android, ['android/' + e for e in lines(ANDROID / 'patches' / 'series')])
+        for e in android:
+            self.assertTrue((ANDROID / 'patches' / e[len('android/'):]).is_file(), e)
+
+    def test_locales_fix_is_android_only(self):
+        self.assertIn('android/locales-android-branch.patch', self.series)
+        self.assertNotIn('android/locales-android-branch.patch',
+                         (REPO / 'patches' / 'series').read_text())
 
     def test_skip_list_entries_exist(self):
         self.assertTrue(self.skip)

@@ -21,7 +21,7 @@ import series  # noqa: E402
 
 INPUTS = [
     'android/gclient.android', 'android/desktop-only-patches.txt',
-    'android/series.py', 'android/drop_gn_args_hunk.py',
+    'android/series.py', 'android/drop_gn_args_hunk.py', 'android/patches/series',
     'ungoogled-chromium/chromium_version.txt', 'ungoogled-chromium/patches/series',
     'ungoogled-chromium/pruning.list', 'ungoogled-chromium/domain_substitution.list',
     'ungoogled-chromium/domain_regex.list', 'ungoogled-chromium/utils/clone.py',
@@ -47,7 +47,8 @@ def prep_hash(repo):
     files = [repo / f for f in INPUTS]
     for pattern in GLOBS:
         files += sorted(p for p in repo.glob(pattern) if p.is_file())
-    files += [repo / 'patches' / e for e in series.series(repo)]
+    files += [repo / ('android/patches/' + e[len('android/'):] if e.startswith('android/') else 'patches/' + e)
+              for e in series.series(repo)]
     h = hashlib.sha256()
     h.update(prep_section((repo / 'android' / 'build.sh').read_text()).encode() + b'\0')
     for f in files:
