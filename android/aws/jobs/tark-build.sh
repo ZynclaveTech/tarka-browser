@@ -15,6 +15,8 @@ stop=""; fresh=0
 for a in "$@"; do
   case $a in --stop-before-gn) stop=--stop-before-gn;; --fresh) fresh=1;; esac
 done
+# Never the SSM agent's folder: tools write state into their working directory.
+cd /tark
 log=/tark/tark-build.log
 echo "tark-build $P $(date -Is)" > $log
 upload() { [[ -f $1 ]] && aws s3 cp --quiet "$1" "s3://$B/$P/$2"; }

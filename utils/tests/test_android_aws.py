@@ -79,6 +79,7 @@ class TestDriverAndJob(unittest.TestCase):
         self.assertIn('ChromePublic.apk', s)
         self.assertIn('tark-build.log', s)
         self.assertIn('poweroff', s)
+        self.assertIn('cd /tark', s)  # never the SSM agent's folder
 
     def test_driver_archive_in_private_temp_dir(self):
         s = text('andbuild.sh')

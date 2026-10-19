@@ -43,6 +43,8 @@ run() {
 }
 
 mkdir -p "$_src_dir" "$_download_cache"
+# gclient writes state files into its working directory: work from WORKDIR.
+cd "$work"
 
 # 1. Chromium with Android's dependencies, from ungoogled's clone.py with
 #    android/gclient.android (a solution named "src").

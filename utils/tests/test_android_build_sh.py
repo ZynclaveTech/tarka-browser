@@ -90,6 +90,13 @@ class TestAndroidBuildSh(unittest.TestCase):
         self.assertIn('name = r"UC_OUT"+name[3:]', files['dt_patch'])  # other hunks stay
         self.assertIn("parser.add_option('--sysroot')", files['dt_patch'])
 
+    def test_runs_from_the_work_folder(self):
+        # gclient writes state files (.gcs_entries) into its working directory;
+        # under SSM that is the agent's folder, so build.sh works from WORKDIR.
+        script = SCRIPT.read_text()
+        self.assertIn('cd "$work"', script)
+        self.assertLess(script.index('cd "$work"'), script.index('clone.py" -o'))
+
     def test_core_patches_then_tark_series(self):
         result, runs, files, tmp = dryrun('--stop-before-gn')
         apply = runs[index_of(runs, 'utils/patches.py apply')]
