@@ -55,6 +55,17 @@ warning() {
   printf '::warning::%s\n' "$*" >&2
 }
 
+# Tark (M5): Sparkle 2 for updates from gettarka.com, with the update keys and
+# a CFBundleVersion that carries Tark's revision. Signed below, before the app.
+_sparkle_src="${TARKA_SPARKLE_FRAMEWORK:-$_src_dir/third_party/sparkle/Sparkle.framework}"
+_sparkle="$_app/Contents/Frameworks/Sparkle.framework"
+if [[ -d "$_sparkle_src" ]]; then
+  "$_root_dir/utils/install_sparkle.sh" "$_app" "$_sparkle_src" "$_src_dir" "${TARKA_REVISION:-$(cat "$_root_dir/revision.txt")}"
+else
+  warning "No Sparkle.framework at $_sparkle_src: this build has no updater"
+  rm -rf "$_sparkle"
+fi
+
 # Fix issue where macOS requests permission for incoming network connections
 # See https://github.com/ungoogled-software/ungoogled-chromium-macos/issues/17
 xattr -cs "$_app"
@@ -83,6 +94,13 @@ for _dylib in "$_libraries"/*.dylib; do
 done
 
 sign --identifier "$_bundle_id.framework" "$_framework"
+# Sparkle inside-out, as its documentation orders it: the helpers, then the
+# framework. Its own bundle identifiers are kept.
+if [[ -d "$_sparkle" ]]; then
+  sign --options runtime "$_sparkle/Versions/B/Autoupdate"
+  sign --options runtime "$_sparkle/Versions/B/Updater.app"
+  sign --options runtime "$_sparkle"
+fi
 if (( _dev )); then
   _profile="${TARKA_PROVISIONING_PROFILE:?set TARKA_PROVISIONING_PROFILE to the development profile}"
   _dev_entitlements="$(mktemp -t tark-entitlements).plist"

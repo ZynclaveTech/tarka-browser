@@ -328,3 +328,37 @@ code-signed, so Gatekeeper reports it as Notarized Developer ID):
   `MACOS_DEV_SIGNING=1` (this Mac only, Touch ID passkeys) still work and
   skip notarization.
 - Test: `python3 -m pytest utils/tests/test_package_dmg.py`.
+
+## Updates (Sparkle, M5)
+
+Tark updates itself with [Sparkle 2](https://sparkle-project.org) (MIT),
+the official prebuilt release pinned in `downloads-sparkle.ini` and
+unpacked to `build/src/third_party/sparkle` by `dev.sh setup` and
+`build.sh`.
+
+- **In the app:** `patches/tarka/updater/sparkle.patch` makes
+  `AppController` load `Contents/Frameworks/Sparkle.framework` at launch
+  and start `SPUStandardUpdaterController`, and adds "Check for Updates…"
+  under "About Tark". Nothing links against Sparkle: a build without the
+  framework (a dev build run from `out/Default` before signing) has no
+  updater and the menu item stays disabled.
+- **At signing:** `sign_and_package_app.sh` runs `utils/install_sparkle.sh`,
+  which copies the framework in without its XPC services (only sandboxed
+  apps need them), writes `SUFeedURL` (https://gettarka.com/appcast.xml),
+  `SUPublicEDKey`, a daily automatic check, no system profiling, and sets
+  `CFBundleVersion` to `BUILD.PATCH.REVISION` from `revision.txt`, so two
+  releases of one Chromium version still order correctly. Sparkle's
+  Autoupdate and Updater.app are signed before its framework, all before
+  the app. `TARKA_SPARKLE_FEED_URL` and `TARKA_REVISION` override the feed
+  and revision for tests.
+- **The key:** the EdDSA private key is in the release Mac's login
+  keychain, account `tark` (`third_party/sparkle/bin/generate_keys
+  --account tark -p` prints the public half). Back it up once with
+  `generate_keys --account tark -x <file>` and keep the file offline:
+  without it no installed Tark can ever be updated again.
+- **Publishing:** gettarka-site's `publish.sh` runs `generate_appcast
+  --account tark` over `releases/feed/` (signed, notarized DMGs only) and
+  uploads `appcast.xml` (five-minute cache) and any delta files.
+- **Bump `revision.txt`** for every Tark release on the same Chromium
+  version; reset it to 1 on a new Chromium version.
+- Tests: `python3 -m pytest utils/tests/test_install_sparkle.py`.
