@@ -20,7 +20,7 @@ snap install aws-cli --classic || true
 # Chromium's own dependency script for this version, with --android.
 mkdir -p /opt/tark && cd /opt/tark
 for f in install-build-deps.sh install-build-deps.py; do
-  curl -fsSL "https://chromium.googlesource.com/chromium/src/+/refs/tags/$VERSION/build/$f?format=TEXT" | base64 -d > $f
+  curl -fsSL --retry 8 --retry-delay 15 --retry-all-errors "https://chromium.googlesource.com/chromium/src/+/refs/tags/$VERSION/build/$f?format=TEXT" | base64 -d > $f
 done
 chmod +x install-build-deps.sh install-build-deps.py
 ./install-build-deps.sh --android --no-prompt --no-chromeos-fonts --no-nacl

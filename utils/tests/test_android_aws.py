@@ -53,6 +53,8 @@ class TestBootstrap(unittest.TestCase):
         self.assertIn('swapon', self.s)
         # install-build-deps.sh execs the .py directly: both must be executable.
         self.assertIn('chmod +x install-build-deps.sh install-build-deps.py', self.s)
+        # googlesource answers 503 under load: the fetch retries.
+        self.assertIn('--retry 8 --retry-delay 15 --retry-all-errors', self.s)
 
     def test_idle_watchdog_30_minutes(self):
         self.assertIn('tark-idle-stop', self.s)
