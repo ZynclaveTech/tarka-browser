@@ -126,6 +126,34 @@ class TestAndroidBuildSh(unittest.TestCase):
             self.assertEqual(result.returncode, 3, result.stderr)
             self.assertFalse((pathlib.Path(tmp) / 'namesubs.tar').exists())
 
+    def test_prepared_tree_is_reused_when_inputs_match(self):
+        # A tree prepared from the same inputs skips clone/patch/substitution
+        # and goes straight to gn and ninja.
+        with tempfile.TemporaryDirectory() as tmp:
+            env = dict(os.environ, TARK_ANDROID_DRYRUN='1')
+            first = subprocess.run(['bash', str(SCRIPT), '--stop-before-gn', tmp],
+                                   capture_output=True, text=True, env=env)
+            self.assertEqual(first.returncode, 3, first.stderr)
+            stamp = pathlib.Path(tmp) / 'prepared.stamp'
+            self.assertTrue(stamp.exists())
+            second = subprocess.run(['bash', str(SCRIPT), tmp], capture_output=True, text=True, env=env)
+            self.assertEqual(second.returncode, 0, second.stderr)
+            runs = [l for l in second.stdout.splitlines() if l.startswith('tark: run ')]
+            self.assertFalse(any('clone.py' in l or 'patches.py' in l for l in runs), runs)
+            self.assertTrue(any('chrome_public_apk' in l for l in runs))
+
+    def test_changed_inputs_wipe_and_prepare_again(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (pathlib.Path(tmp) / 'prepared.stamp').write_text('an older preparation\n')
+            (pathlib.Path(tmp) / 'src').mkdir()
+            (pathlib.Path(tmp) / 'src' / 'old-file').write_text('x')
+            env = dict(os.environ, TARK_ANDROID_DRYRUN='1')
+            result = subprocess.run(['bash', str(SCRIPT), '--stop-before-gn', tmp],
+                                    capture_output=True, text=True, env=env)
+            self.assertEqual(result.returncode, 3, result.stderr)
+            self.assertIn('tark: run rm -rf', result.stdout)
+            self.assertIn('clone.py', result.stdout)
+
     def test_core_patches_then_tark_series(self):
         result, runs, files, tmp = dryrun('--stop-before-gn')
         apply = runs[index_of(runs, 'utils/patches.py apply')]

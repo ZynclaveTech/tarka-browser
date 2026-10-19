@@ -42,7 +42,7 @@ must git -C $repo/ungoogled-chromium checkout --quiet --detach "$SUB"
 [[ $(git -C $repo/ungoogled-chromium rev-parse HEAD) == "$SUB" ]] || { echo "submodule is not $SUB" >> $log; exit 1; }
 echo "submodule $SUB" >> $log
 
-(( fresh )) && rm -rf /tark/work/src
+(( fresh )) && rm -rf /tark/work/src /tark/work/prepared.stamp
 bash $repo/android/build.sh $stop /tark/work >> $log 2>&1
 code=$?
 echo "exit $code" >> $log

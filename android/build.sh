@@ -49,90 +49,104 @@ cd "$work"
 # backup is stale (and name_substitution.py refuses to overwrite it).
 rm -f "$work/namesubs.tar"
 
-# 1. Chromium with Android's dependencies, from ungoogled's clone.py with
-#    android/gclient.android (a solution named "src").
-cp "$_root_dir/android/gclient.android" "$work/gclient"
-# clone.py needs two fixes, made in a copy of ungoogled's utils/ (clone.py
-# reads depot_tools.patch and gsutil.patch beside it, and
-# ../chromium_version.txt); the submodule is untouched:
-# - its -c path crashes on current Python (Path.replace(old, new) on the
-#   path copy() returns);
-# - it keeps .gclient in src/uc_staging with the absolute output path as the
-#   solution name, which current depot_tools rejects; .gclient goes beside
-#   src instead (WORKDIR), the standard layout.
-rm -rf "$work/uc" && mkdir -p "$work/uc"
-cp -R "$_main_repo/utils" "$work/uc/utils"
-cp "$_main_repo/chromium_version.txt" "$work/uc/"
-sed -i.orig \
-  -e "s|copy(args.custom_config, ucstaging / '.gclient').replace('UC_OUT', str(args.output))|copy(args.custom_config, args.output.parent / '.gclient')|" \
-  -e "s|environ\['GCLIENT_FILE'\] = str(ucstaging / '.gclient')|environ['GCLIENT_FILE'] = str(args.output.parent / '.gclient')|" \
-  "$work/uc/utils/clone.py"
-rm -f "$work/uc/utils/clone.py.orig"
-# - ungoogled's depot_tools.patch makes gclient_gn_args_file absolute, which
-#   the pinned depot_tools rejects; with .gclient beside src the relative
-#   path is right, so that one hunk is dropped from the copy.
-python3 "$_root_dir/android/drop_gn_args_hunk.py" "$work/uc/utils/depot_tools.patch"
-if grep -q ".gclient').replace('UC_OUT'" "$work/uc/utils/clone.py" ||
-   ! grep -q "environ\['GCLIENT_FILE'\] = str(args.output.parent / '.gclient')" "$work/uc/utils/clone.py"; then
-  echo "tark: clone.py changed upstream; android/build.sh's fix no longer applies" >&2
-  exit 1
-fi
-run python3 "$work/uc/utils/clone.py" -o "$_src_dir" -c "$work/gclient" -s amd64
+# A tree prepared from the same inputs (android/prep_hash.py) is reused:
+# straight to gn and ninja. Different inputs wipe it and prepare again.
+stamp="$work/prepared.stamp"
+prep="$(python3 "$_root_dir/android/prep_hash.py" "$_root_dir")"
+if [[ -f "$stamp" && "$(cat "$stamp")" == "$prep" ]]; then
+  log "prepared tree matches its inputs; skipping to gn"
+else
+  if [[ -f "$stamp" || -n "$(ls -A "$_src_dir" 2>/dev/null)" ]]; then
+    run rm -rf "$_src_dir"
+    rm -f "$stamp"
+    mkdir -p "$_src_dir"
+  fi
+  # 1. Chromium with Android's dependencies, from ungoogled's clone.py with
+  #    android/gclient.android (a solution named "src").
+  cp "$_root_dir/android/gclient.android" "$work/gclient"
+  # clone.py needs two fixes, made in a copy of ungoogled's utils/ (clone.py
+  # reads depot_tools.patch and gsutil.patch beside it, and
+  # ../chromium_version.txt); the submodule is untouched:
+  # - its -c path crashes on current Python (Path.replace(old, new) on the
+  #   path copy() returns);
+  # - it keeps .gclient in src/uc_staging with the absolute output path as the
+  #   solution name, which current depot_tools rejects; .gclient goes beside
+  #   src instead (WORKDIR), the standard layout.
+  rm -rf "$work/uc" && mkdir -p "$work/uc"
+  cp -R "$_main_repo/utils" "$work/uc/utils"
+  cp "$_main_repo/chromium_version.txt" "$work/uc/"
+  sed -i.orig \
+    -e "s|copy(args.custom_config, ucstaging / '.gclient').replace('UC_OUT', str(args.output))|copy(args.custom_config, args.output.parent / '.gclient')|" \
+    -e "s|environ\['GCLIENT_FILE'\] = str(ucstaging / '.gclient')|environ['GCLIENT_FILE'] = str(args.output.parent / '.gclient')|" \
+    "$work/uc/utils/clone.py"
+  rm -f "$work/uc/utils/clone.py.orig"
+  # - ungoogled's depot_tools.patch makes gclient_gn_args_file absolute, which
+  #   the pinned depot_tools rejects; with .gclient beside src the relative
+  #   path is right, so that one hunk is dropped from the copy.
+  python3 "$_root_dir/android/drop_gn_args_hunk.py" "$work/uc/utils/depot_tools.patch"
+  if grep -q ".gclient').replace('UC_OUT'" "$work/uc/utils/clone.py" ||
+     ! grep -q "environ\['GCLIENT_FILE'\] = str(args.output.parent / '.gclient')" "$work/uc/utils/clone.py"; then
+    echo "tark: clone.py changed upstream; android/build.sh's fix no longer applies" >&2
+    exit 1
+  fi
+  run python3 "$work/uc/utils/clone.py" -o "$_src_dir" -c "$work/gclient" -s amd64
 
-# 1b. The Android SDK, NDK, build-tools and R8. Chromium ships them as CIPD
-#     packages, which ungoogled's depot_tools patch skips (it avoids
-#     prebuilt binaries); Android cannot be built without them. A second sync
-#     with an unpatched depot_tools at the same commit fetches them. It runs
-#     on the build machine only; no -D, so nothing clone.py fetched is removed.
-dt_commit=dca727ba1f8fa8f1e3b12a815d065818bb61d395
-if [[ "$dryrun" != 1 ]]; then
-  dt_commit=$(git -C "$_src_dir/uc_staging/depot_tools" rev-parse HEAD)
-fi
-if [[ ! -d "$work/depot_tools-stock/.git" ]]; then
-  run git init -q "$work/depot_tools-stock"
-  run git -C "$work/depot_tools-stock" remote add origin https://chromium.googlesource.com/chromium/tools/depot_tools
-fi
-run git -C "$work/depot_tools-stock" fetch -q --depth=1 origin "$dt_commit"
-run git -C "$work/depot_tools-stock" reset -q --hard FETCH_HEAD
-run env DEPOT_TOOLS_UPDATE=0 GCLIENT_FILE=.gclient PATH="$work/depot_tools-stock:$PATH" \
-  "$work/depot_tools-stock/gclient" sync --nohooks --no-history --shallow -j 32
-if [[ "$dryrun" != 1 && ! -d "$_src_dir/third_party/android_sdk/public/platforms" ]]; then
-  echo "tark: no Android SDK after the sync (third_party/android_sdk/public/platforms)" >&2
-  exit 1
-fi
+  # 1b. The Android SDK, NDK, build-tools and R8. Chromium ships them as CIPD
+  #     packages, which ungoogled's depot_tools patch skips (it avoids
+  #     prebuilt binaries); Android cannot be built without them. A second sync
+  #     with an unpatched depot_tools at the same commit fetches them. It runs
+  #     on the build machine only; no -D, so nothing clone.py fetched is removed.
+  dt_commit=dca727ba1f8fa8f1e3b12a815d065818bb61d395
+  if [[ "$dryrun" != 1 ]]; then
+    dt_commit=$(git -C "$_src_dir/uc_staging/depot_tools" rev-parse HEAD)
+  fi
+  if [[ ! -d "$work/depot_tools-stock/.git" ]]; then
+    run git init -q "$work/depot_tools-stock"
+    run git -C "$work/depot_tools-stock" remote add origin https://chromium.googlesource.com/chromium/tools/depot_tools
+  fi
+  run git -C "$work/depot_tools-stock" fetch -q --depth=1 origin "$dt_commit"
+  run git -C "$work/depot_tools-stock" reset -q --hard FETCH_HEAD
+  run env DEPOT_TOOLS_UPDATE=0 GCLIENT_FILE=.gclient PATH="$work/depot_tools-stock:$PATH" \
+    "$work/depot_tools-stock/gclient" sync --nohooks --no-history --shallow -j 32
+  if [[ "$dryrun" != 1 && ! -d "$_src_dir/third_party/android_sdk/public/platforms" ]]; then
+    echo "tark: no Android SDK after the sync (third_party/android_sdk/public/platforms)" >&2
+    exit 1
+  fi
 
-# 2. Prune binaries, as every ungoogled-chromium build does.
-run python3 "$_main_repo/utils/prune_binaries.py" "$_src_dir" "$_main_repo/pruning.list"
+  # 2. Prune binaries, as every ungoogled-chromium build does.
+  run python3 "$_main_repo/utils/prune_binaries.py" "$_src_dir" "$_main_repo/pruning.list"
 
-# 3. ungoogled-chromium's core patches, then Tark's Android series.
-mkdir -p "$work/tark-patches"
-ln -sfn "$_root_dir/patches/tarka" "$work/tark-patches/tarka"
-python3 "$_root_dir/android/series.py" "$_root_dir" "$work/tark-patches/series"
-run python3 "$_main_repo/utils/patches.py" apply "$_src_dir" "$_main_repo/patches" "$work/tark-patches"
+  # 3. ungoogled-chromium's core patches, then Tark's Android series.
+  mkdir -p "$work/tark-patches"
+  ln -sfn "$_root_dir/patches/tarka" "$work/tark-patches/tarka"
+  python3 "$_root_dir/android/series.py" "$_root_dir" "$work/tark-patches/series"
+  run python3 "$_main_repo/utils/patches.py" apply "$_src_dir" "$_main_repo/patches" "$work/tark-patches"
 
-# 4. Domain substitution with Tark's filtered list (the Chrome Web Store's
-#    files stay unsubstituted, as on the Mac), then the product name.
-run python3 "$_root_dir/utils/filter_substitution_list.py" "$_main_repo/domain_substitution.list" \
-  "$_root_dir/utils/domain_substitution_skip.txt" "$work/domain_substitution.list"
-run python3 "$_main_repo/utils/domain_substitution.py" apply -r "$_main_repo/domain_regex.list" \
-  -f "$work/domain_substitution.list" "$_src_dir"
-run python3 "$_root_dir/utils/name_substitution.py" --sub -t "$_src_dir" --backup-path "$work/namesubs.tar"
+  # 4. Domain substitution with Tark's filtered list (the Chrome Web Store's
+  #    files stay unsubstituted, as on the Mac), then the product name.
+  run python3 "$_root_dir/utils/filter_substitution_list.py" "$_main_repo/domain_substitution.list" \
+    "$_root_dir/utils/domain_substitution_skip.txt" "$work/domain_substitution.list"
+  run python3 "$_main_repo/utils/domain_substitution.py" apply -r "$_main_repo/domain_regex.list" \
+    -f "$work/domain_substitution.list" "$_src_dir"
+  run python3 "$_root_dir/utils/name_substitution.py" --sub -t "$_src_dir" --backup-path "$work/namesubs.tar"
 
-# 5. Tark's steps: the mark, Inter for WebUI pages, IndicXlit (D1). No
-#    uBlock Origin: Chromium on Android runs no extensions (A2 blocks ads in
-#    the engine instead).
-run python3 "$_root_dir/utils/install_branding.py" "$_root_dir/resources/branding/mark" "$_src_dir"
-run mkdir -p "$_src_dir/ui/webui/resources/fonts"
-run cp "$_root_dir"/resources/fonts/inter-latin.woff2 "$_root_dir"/resources/fonts/inter-latin-ext.woff2 \
-  "$_src_dir/ui/webui/resources/fonts/"
-echo "tark: run _install_xlit"
-if [[ "$dryrun" != 1 ]]; then
-  export _root_dir _src_dir _main_repo _download_cache
-  # shellcheck source=../utils/install_xlit.sh
-  source "$_root_dir/utils/install_xlit.sh"
-  _install_xlit
+  # 5. Tark's steps: the mark, Inter for WebUI pages, IndicXlit (D1). No
+  #    uBlock Origin: Chromium on Android runs no extensions (A2 blocks ads in
+  #    the engine instead).
+  run python3 "$_root_dir/utils/install_branding.py" "$_root_dir/resources/branding/mark" "$_src_dir"
+  run mkdir -p "$_src_dir/ui/webui/resources/fonts"
+  run cp "$_root_dir"/resources/fonts/inter-latin.woff2 "$_root_dir"/resources/fonts/inter-latin-ext.woff2 \
+    "$_src_dir/ui/webui/resources/fonts/"
+  echo "tark: run _install_xlit"
+  if [[ "$dryrun" != 1 ]]; then
+    export _root_dir _src_dir _main_repo _download_cache
+    # shellcheck source=../utils/install_xlit.sh
+    source "$_root_dir/utils/install_xlit.sh"
+    _install_xlit
+  fi
+  log "every patch applied and Tark's steps done"
+  echo "$prep" > "$stamp"
 fi
-log "every patch applied and Tark's steps done"
 
 if (( stop_before_gn )); then
   log "stopping before gn gen (--stop-before-gn)"
