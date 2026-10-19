@@ -93,6 +93,10 @@ run git -C "$work/depot_tools-stock" fetch -q --depth=1 origin "$dt_commit"
 run git -C "$work/depot_tools-stock" reset -q --hard FETCH_HEAD
 run env DEPOT_TOOLS_UPDATE=0 GCLIENT_FILE=.gclient PATH="$work/depot_tools-stock:$PATH" \
   "$work/depot_tools-stock/gclient" sync --nohooks --no-history --shallow -j 32
+if [[ "$dryrun" != 1 && ! -d "$_src_dir/third_party/android_sdk/public/platforms" ]]; then
+  echo "tark: no Android SDK after the sync (third_party/android_sdk/public/platforms)" >&2
+  exit 1
+fi
 
 # 2. Prune binaries, as every ungoogled-chromium build does.
 run python3 "$_main_repo/utils/prune_binaries.py" "$_src_dir" "$_main_repo/pruning.list"

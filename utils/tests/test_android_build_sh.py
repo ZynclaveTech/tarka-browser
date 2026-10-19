@@ -110,6 +110,11 @@ class TestAndroidBuildSh(unittest.TestCase):
         self.assertNotIn(' -D', line)  # never delete what clone.py fetched
         self.assertIn('depot_tools-stock fetch -q --depth=1 origin', runs[index_of(runs, 'depot_tools-stock fetch')])
 
+    def test_fails_without_the_android_sdk(self):
+        script = SCRIPT.read_text()
+        self.assertIn('third_party/android_sdk/public', script)
+        self.assertIn('no Android SDK after the sync', script)
+
     def test_core_patches_then_tark_series(self):
         result, runs, files, tmp = dryrun('--stop-before-gn')
         apply = runs[index_of(runs, 'utils/patches.py apply')]
