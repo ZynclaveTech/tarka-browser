@@ -36,8 +36,11 @@ try {
   $owner = (Get-Acl $base).Owner
   if ($owner -notin 'NT AUTHORITY\SYSTEM', 'BUILTIN\Administrators') { throw "$base is owned by $owner" }
   icacls $base /grant 'tarkdesk:(OI)(CI)RX' /L | Out-Null
-  if (Test-Path $out) { cmd.exe /c "rmdir /s /q `"$out`"" }
-  if (Test-Path $app) { cmd.exe /c "rmdir /s /q `"$app`"" }
+  # The \\?\ prefix lets rmdir delete paths past 260 characters (Chrome's
+  # profile has them); rmdir still does not follow junctions.
+  if (Test-Path $out) { cmd.exe /c "rmdir /s /q `"\\?\$out`"" }
+  if (Test-Path $app) { cmd.exe /c "rmdir /s /q `"\\?\$app`"" }
+  if (Test-Path $out) { throw "could not remove $out" }
   $zip = Get-ChildItem 'C:\tw\build' -File -Filter 'Tark-*.zip' | Select-Object -First 1
   Expand-Archive -Path $zip.FullName -DestinationPath $app -Force
   $exe = (Get-ChildItem $app -Recurse -Filter 'chrome.exe' | Select-Object -First 1).FullName
