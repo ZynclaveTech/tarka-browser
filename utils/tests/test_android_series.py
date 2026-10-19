@@ -132,8 +132,8 @@ class TestAndroidSeries(unittest.TestCase):
                       'password_reuse_detection_manager_client.h"', patch)
 
     def test_direct_apk_size(self):
-        # Spec: direct APK ≤ 130 MB, native library compressed, no XR module
-        # (the user's decision, 2026-10-20).
+        # Spec: direct APK ≤ 180 MB (the user's decision, 2026-10-20), native
+        # library compressed, no XR module.
         self.assertIn('android/direct-apk-size.patch', self.series)
         patch = (ANDROID / 'patches' / 'direct-apk-size.patch').read_text()
         self.assertIn('-  xr_module_desc,', patch)
