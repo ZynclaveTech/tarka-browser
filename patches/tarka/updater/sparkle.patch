@@ -1,0 +1,125 @@
+--- a/chrome/app/tark_pages_strings.grdp
++++ b/chrome/app/tark_pages_strings.grdp
+@@ -42,4 +42,7 @@
+   <message name="IDS_TARK_PAGES_VERSION_SENTENCE" desc="Sentence under the Version page title. $1 is Tark's version number.">
+     Tark <ph name="VERSION">$1<ex>155.0.8059.39</ex></ph>, built on Chromium for this Mac.
+   </message>
++  <message name="IDS_TARK_CHECK_FOR_UPDATES" desc="Mac app menu item, under About Tark: check gettarka.com for a new version of Tark now.">
++    Check for Updates…
++  </message>
+ </grit-part>
+--- a/chrome/browser/app_controller_mac.h
++++ b/chrome/browser/app_controller_mac.h
+@@ -123,6 +123,10 @@
+ - (IBAction)orderFrontStandardAboutPanel:(id)sender;
+ - (IBAction)orderFrontStandardAboutPanelForProfile:(Profile*)profile;
+ 
++// Tark (M5): asks Sparkle to check gettarka.com for a new version now.
++// Enabled only when Sparkle.framework is in the app and has started.
++- (IBAction)tarkCheckForUpdates:(id)sender;
++
+ // Toggles the "Confirm to Quit" preference.
+ - (IBAction)toggleConfirmToQuit:(id)sender;
+ 
+--- a/chrome/browser/app_controller_mac.mm
++++ b/chrome/browser/app_controller_mac.mm
+@@ -677,7 +677,21 @@
+   AppController* const app_controller_;  // Weak; owns us.
+ };
+ 
++// Tark (M5): the part of Sparkle 2's SPUStandardUpdaterController that Tark
++// calls. Sparkle.framework is loaded at run time from the app's Frameworks
++// folder (the signing script puts it there), so nothing links against it and
++// a build without it simply has no updater.
++@protocol TarkSparkleUpdaterController <NSObject>
++- (instancetype)initWithStartingUpdater:(BOOL)startUpdater
++                        updaterDelegate:(id)updaterDelegate
++                     userDriverDelegate:(id)userDriverDelegate;
++- (void)checkForUpdates:(id)sender;
++@end
++
+ @implementation AppController {
++  // Tark (M5): Sparkle's updater controller, or nil without Sparkle.
++  id<TarkSparkleUpdaterController> _tarkUpdater;
++
+   // Manages the state of the command menu items.
+   std::unique_ptr<CommandUpdater> _menuState;
+ 
+@@ -1300,6 +1314,7 @@
+   }
+ 
+   [self setUpdateCheckInterval];
++  [self tarkStartUpdater];
+ 
+   // If enabled, keep Chrome alive when apps are open instead of quitting all
+   // apps.
+@@ -1666,10 +1681,44 @@
+   } else if (action == @selector(toggleConfirmToQuit:)) {
+     [self updateConfirmToQuitPrefMenuItem:static_cast<NSMenuItem*>(item)];
+     enable = [self shouldEnableConfirmToQuitPrefMenuItem];
++  } else if (action == @selector(tarkCheckForUpdates:)) {
++    enable = _tarkUpdater != nil;
+   }
+   return enable;
+ }
+ 
++// Tark (M5): starts Sparkle, which checks gettarka.com/appcast.xml on the
++// schedule in Info.plist (SUFeedURL, SUScheduledCheckInterval) and verifies
++// every update with SUPublicEDKey and the app's own code signature.
++- (void)tarkStartUpdater {
++  if (_tarkUpdater) {
++    return;
++  }
++  NSString* path = [NSBundle.mainBundle.privateFrameworksPath
++      stringByAppendingPathComponent:@"Sparkle.framework"];
++  NSBundle* sparkle = [NSBundle bundleWithPath:path];
++  NSError* error = nil;
++  if (!sparkle || ![sparkle loadAndReturnError:&error]) {
++    if (error) {
++      LOG(ERROR) << "Sparkle did not load: "
++                 << base::SysNSStringToUTF8(error.localizedDescription);
++    }
++    return;
++  }
++  Class controller = NSClassFromString(@"SPUStandardUpdaterController");
++  if (!controller) {
++    return;
++  }
++  _tarkUpdater = [(id<TarkSparkleUpdaterController>)[controller alloc]
++      initWithStartingUpdater:YES
++              updaterDelegate:nil
++           userDriverDelegate:nil];
++}
++
++- (IBAction)tarkCheckForUpdates:(id)sender {
++  [_tarkUpdater checkForUpdates:sender];
++}
++
+ - (void)commandDispatch:(id)sender {
+   // Drop commands received after shutdown was initiated.
+   if (g_browser_process->IsShuttingDown() ||
+--- a/chrome/browser/ui/cocoa/main_menu_builder.mm
++++ b/chrome/browser/ui/cocoa/main_menu_builder.mm
+@@ -4,6 +4,11 @@
+ 
+ #import "chrome/browser/ui/cocoa/main_menu_builder.h"
+ 
++// Tark (M5): AppController's action for "Check for Updates…".
++@protocol TarkUpdaterMenuActions
++- (void)tarkCheckForUpdates:(id)sender;
++@end
++
+ #include <AvailabilityVersions.h>
+ 
+ #include "base/feature_list.h"
+@@ -72,6 +77,10 @@
+                   .tag(IDC_ABOUT)
+                   .target(app_delegate)
+                   .action(@selector(orderFrontStandardAboutPanel:)),
++              Item(IDS_TARK_CHECK_FOR_UPDATES)
++                  .target(app_delegate)
++                  .action(@selector(tarkCheckForUpdates:))
++                  .remove_if(is_pwa),
+               Item().is_separator(),
+               Item(IDS_PREFERENCES)
+                   .tag(IDC_OPTIONS)
