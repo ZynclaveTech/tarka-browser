@@ -96,5 +96,30 @@ class TestAddressBar(unittest.TestCase):
         self.assertIn('R.color.tark_rule_dark', self.add)
 
 
+class TestAppIcon(unittest.TestCase):
+    def setUp(self):
+        self.assertIn('android/look-app-icon.patch', series())
+        self.p = patch('look-app-icon.patch')
+
+    def test_launcher_is_the_mark_on_dark_paper(self):
+        self.assertEqual(self.p.count('+    <background android:drawable="@color/tark_paper_dark"/>'), 2)
+        self.assertEqual(self.p.count('+    <foreground android:drawable="@mipmap/layered_app_icon_foreground"/>'), 1)
+        # The Mac icon's dots: amber, coral, indigo of the dark palette.
+        for colour in ('#FFC53D', '#FF6B85', '#8F88FF'):
+            self.assertIn(f'android:fillColor="{colour}"', self.p)
+
+    def test_themed_icon_is_the_mark(self):
+        themed = self.p.split('+++ b/chrome/android/java/res_chromium_base/drawable/themed_app_icon.xml')[1]
+        themed = themed.split('\n--- ')[0]
+        self.assertEqual(themed.count('+        android:pathData="M'), 3)
+
+    def test_in_app_icon_pngs(self):
+        lines = (REPO / 'resources' / 'branding' / 'mark' / 'install.txt').read_text().splitlines()
+        for size, dpi in ((48, 'mdpi'), (72, 'hdpi'), (96, 'xhdpi'), (144, 'xxhdpi'), (192, 'xxxhdpi')):
+            path = f'chrome/android/java/res_chromium_base/mipmap-{dpi}/app_icon.png'
+            self.assertIn(f'png {size}x{size} center mid {path}', lines)
+            self.assertTrue((REPO / 'resources' / 'branding' / 'mark' / 'tree' / path).is_file(), path)
+
+
 if __name__ == '__main__':
     unittest.main()
