@@ -1,0 +1,90 @@
+"""A1: android/build.sh runs the Android build's steps in order. With
+TARK_ANDROID_DRYRUN=1 every external command is printed ("tark: run ...")
+instead of run, so the order is tested on the Mac without a Chromium tree."""
+import os
+import pathlib
+import subprocess
+import tempfile
+import unittest
+
+REPO = pathlib.Path(__file__).resolve().parents[2]
+SCRIPT = REPO / 'android' / 'build.sh'
+
+
+def dryrun(*args):
+    with tempfile.TemporaryDirectory() as tmp:
+        env = dict(os.environ, TARK_ANDROID_DRYRUN='1')
+        result = subprocess.run(['bash', str(SCRIPT), *args, tmp], capture_output=True,
+                                text=True, env=env)
+        work = pathlib.Path(tmp)
+        files = {
+            'gclient': (work / 'gclient').read_text() if (work / 'gclient').exists() else '',
+            'series': (work / 'tark-patches' / 'series').read_text()
+            if (work / 'tark-patches' / 'series').exists() else '',
+            'args': (work / 'src' / 'out' / 'Default' / 'args.gn').read_text()
+            if (work / 'src' / 'out' / 'Default' / 'args.gn').exists() else '',
+        }
+        runs = [l[len('tark: run '):] for l in result.stdout.splitlines()
+                if l.startswith('tark: run ')]
+        return result, runs, files, tmp
+
+
+def index_of(runs, needle):
+    for i, line in enumerate(runs):
+        if needle in line:
+            return i
+    raise AssertionError(f'{needle!r} not run; runs were:\n' + '\n'.join(runs))
+
+
+class TestAndroidBuildSh(unittest.TestCase):
+    def test_steps_in_order_and_stop_before_gn(self):
+        result, runs, files, tmp = dryrun('--stop-before-gn')
+        self.assertEqual(result.returncode, 3, result.stderr)
+        order = [index_of(runs, n) for n in (
+            'utils/clone.py',
+            'utils/prune_binaries.py',
+            'utils/patches.py apply',
+            'utils/filter_substitution_list.py',
+            'utils/domain_substitution.py apply',
+            'utils/name_substitution.py --sub',
+            'utils/install_branding.py',
+            '_install_xlit',
+        )]
+        self.assertEqual(order, sorted(order))
+        self.assertNotIn('gn gen', '\n'.join(runs))
+        self.assertNotIn('ninja', '\n'.join(runs))
+
+    def test_clone_uses_the_filled_android_config(self):
+        result, runs, files, tmp = dryrun('--stop-before-gn')
+        self.assertIn(f'-c {tmp}/gclient', runs[index_of(runs, 'utils/clone.py')])
+        self.assertNotIn('UC_OUT', files['gclient'])
+        self.assertIn(f'"name": "{tmp}/src"', files['gclient'])
+        self.assertIn("target_os = ['android']", files['gclient'])
+
+    def test_core_patches_then_tark_series(self):
+        result, runs, files, tmp = dryrun('--stop-before-gn')
+        apply = runs[index_of(runs, 'utils/patches.py apply')]
+        core = apply.index('ungoogled-chromium/patches')
+        tark = apply.index(f'{tmp}/tark-patches')
+        self.assertLess(core, tark)
+        self.assertNotIn('tarka/updater/sparkle.patch', files['series'])
+        self.assertIn('tarka/omnibox-translit/translit-provider.patch', files['series'])
+
+    def test_no_ublock_on_android(self):
+        result, runs, files, tmp = dryrun('--stop-before-gn')
+        self.assertNotIn('downloads-tark.ini', '\n'.join(runs))
+        self.assertNotIn('ublock', '\n'.join(runs).lower())
+
+    def test_full_build_writes_args_and_builds_the_apk(self):
+        result, runs, files, tmp = dryrun()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('enable_hangout_services_extension=false', files['args'])  # core flags.gn
+        self.assertIn('chrome_public_manifest_package = "com.gettarka.tarka"', files['args'])
+        gn = index_of(runs, 'gn gen')
+        ninja = index_of(runs, 'chrome_public_apk')
+        self.assertLess(index_of(runs, '_install_xlit'), gn)
+        self.assertLess(gn, ninja)
+
+
+if __name__ == '__main__':
+    unittest.main()
