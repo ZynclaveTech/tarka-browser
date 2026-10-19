@@ -159,9 +159,12 @@ class TestAndroidSeries(unittest.TestCase):
         self.assertIn('android/signin-android-allowed-pref.patch', self.series)
         patch = (ANDROID / 'patches' / 'signin-android-allowed-pref.patch').read_text()
         self.assertIn('+++ b/components/signin/internal/identity_manager/primary_account_manager.cc', patch)
-        self.assertIn('+#include "components/signin/public/base/signin_pref_names.h"', patch)
+        # ungoogled drops signin_pref_names.cc from the build: the constant
+        # does not link, so the pref is named by its string.
+        self.assertNotIn('signin_pref_names.h', patch)
+        self.assertNotIn('prefs::kSigninAllowed', patch)
         self.assertIn('+#if BUILDFLAG(IS_ANDROID)\n', patch)
-        self.assertIn('+  registry->RegisterBooleanPref(prefs::kSigninAllowed, false);', patch)
+        self.assertIn('+  registry->RegisterBooleanPref("signin.allowed", false);', patch)
 
     def test_skip_list_entries_exist(self):
         self.assertTrue(self.skip)
