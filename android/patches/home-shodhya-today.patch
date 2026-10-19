@@ -1,0 +1,66 @@
+--- a/chrome/android/java/src/org/chromium/chrome/browser/tab/TabImpl.java
++++ b/chrome/android/java/src/org/chromium/chrome/browser/tab/TabImpl.java
+@@ -101,6 +101,7 @@
+ import org.chromium.components.dom_distiller.core.DomDistillerUrlUtils;
+ import org.chromium.components.embedder_support.contextmenu.ContextMenuPopulatorFactory;
+ import org.chromium.components.embedder_support.util.UrlConstants;
++import org.chromium.components.embedder_support.util.UrlUtilities;
+ import org.chromium.components.embedder_support.view.ContentView;
+ import org.chromium.components.embedder_support.virtual_structure.PageContentProtoViewStructureBuilder;
+ import org.chromium.components.prefs.PrefChangeRegistrar;
+@@ -123,6 +124,7 @@
+ import org.chromium.content_public.browser.WebContentsAccessibility;
+ import org.chromium.content_public.browser.back_forward_transition.AnimationStage;
+ import org.chromium.content_public.browser.navigation_controller.UserAgentOverrideOption;
++import org.chromium.net.NetworkChangeNotifier;
+ import org.chromium.ui.UiUtils;
+ import org.chromium.ui.base.ImmutableWeakReference;
+ import org.chromium.ui.base.PageTransition;
+@@ -907,6 +909,8 @@
+         return pdfInfo;
+     }
+ 
++    private static final String TARK_NEW_TAB_URL = "https://shodhya.com/";
++
+     @Override
+     public LoadUrlResult loadUrl(LoadUrlParams params) {
+         try {
+@@ -916,6 +920,15 @@
+                         TabLoadStatus.DEFAULT_PAGE_LOAD, /* navigationHandle= */ null);
+             }
+ 
++            // Tark: as on the Mac, a new tab opens Shodhya Today (shodhya.com).
++            // Incognito and offline keep Android's own new tab page.
++            if (!isIncognito()
++                    && UrlUtilities.isNtpUrl(UrlFormatter.fixupUrl(params.getUrl()))
++                    && NetworkChangeNotifier.isInitialized()
++                    && NetworkChangeNotifier.isOnline()) {
++                params.setUrl(TARK_NEW_TAB_URL);
++            }
++
+             // TODO(tedchoc): When showing the android NTP, delay the call to
+             // TabImplJni.get().loadUrl until the android view has entirely rendered.
+             if (!mIsNativePageCommitPending) {
+--- a/chrome/android/java/src/org/chromium/chrome/browser/firstrun/FirstRunFlowSequencer.java
++++ b/chrome/android/java/src/org/chromium/chrome/browser/firstrun/FirstRunFlowSequencer.java
+@@ -57,6 +57,10 @@
+ public abstract class FirstRunFlowSequencer {
+     private static final String TAG = "firstrun";
+ 
++    // Tark: no first-run welcome, as on the Mac; the first window opens Shodhya
++    // Today. Skipping it leaves usage and crash reporting off.
++    private static final boolean TARK_NO_FIRST_RUN = true;
++
+     /**
+      * A delegate class to determine if first run promo pages should be shown based on various
+      * signals. Some methods may be overridden by tests to fake desired behavior.
+@@ -246,7 +250,8 @@
+         // Retail demo mode suppresses the FRE, except on desktop devices where the signed-in
+         // experience needs to be showcased. Account visibility controls whether sign-in is
+         // actually available on those devices.
+-        if (CommandLine.getInstance().hasSwitch(ChromeSwitches.DISABLE_FIRST_RUN_EXPERIENCE)
++        if (TARK_NO_FIRST_RUN
++                || CommandLine.getInstance().hasSwitch(ChromeSwitches.DISABLE_FIRST_RUN_EXPERIENCE)
+                 || (DeviceInfo.isRetailDemoMode() && !DeviceInfo.isDesktop())
+                 || ApiCompatibilityUtils.isRunningInUserTestHarness()) {
+             return false;

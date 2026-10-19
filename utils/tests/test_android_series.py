@@ -197,6 +197,20 @@ class TestAndroidSeries(unittest.TestCase):
         self.assertEqual(len(added), 4)
         self.assertFalse(any('Chromium' in l for l in added if 'string name' in l))
 
+    def test_home_is_shodhya_today(self):
+        # As on the Mac: new tabs open shodhya.com (Shodhya Today); Incognito
+        # and offline keep Android's own page; no first-run welcome.
+        self.assertIn('android/home-shodhya-today.patch', self.series)
+        patch = (ANDROID / 'patches' / 'home-shodhya-today.patch').read_text()
+        self.assertIn('+++ b/chrome/android/java/src/org/chromium/chrome/browser/tab/TabImpl.java', patch)
+        self.assertIn('"https://shodhya.com/"', patch)
+        self.assertIn('UrlUtilities.isNtpUrl(UrlFormatter.fixupUrl(params.getUrl()))', patch)
+        self.assertIn('!isIncognito()', patch)
+        self.assertIn('NetworkChangeNotifier.isInitialized()', patch)
+        self.assertIn('NetworkChangeNotifier.isOnline()', patch)
+        self.assertIn('+++ b/chrome/android/java/src/org/chromium/chrome/browser/firstrun/FirstRunFlowSequencer.java', patch)
+        self.assertIn('+        if (TARK_NO_FIRST_RUN\n', patch)
+
     def test_skip_list_entries_exist(self):
         self.assertTrue(self.skip)
         for entry in self.skip:
