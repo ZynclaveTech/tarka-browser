@@ -268,3 +268,46 @@ model, convert it and install it (`utils/install_xlit.sh`, the function
   step on an existing tree without a reset, source the function and call it
   (see the variables at the top of `utils/install_xlit.sh`).
 - Test: `python3 -m pytest utils/tests/test_install_xlit.py`.
+
+## D1 notes (the address bar)
+
+D1 is seven patches at the end of `patches/series`: `omnibox-sources/`
+(the `@` sources, and `@wiki` opening the Wikipedia of the query's
+language), `omnibox-translit/` (the on-device component, the provider, the
+row label, and the row fixes) and `core/webui-js-error-no-crash.patch`.
+
+- **Tests:** `ninja -C out/Default tark_xlit_unittests tark_xlit_bench`, then
+  `out/Default/tark_xlit_unittests` (65 tests, 1,260 golden phrases, about
+  25 s) and `out/Default/tark_xlit_bench` (model load about 70 ms; p95 per
+  phrase 34–43 ms for Hindi, Tamil and Bengali, against a 50 ms budget).
+- **Where the rows come from:** `TarkTransliterationProvider` uses the
+  provider type `TYPE_QUERY_TILE`, which Chromium does not use on desktop;
+  its rows carry `additional_info["tark_xlit_lang"]`.
+  `translit-rows-fixes.patch` keys two upstream behaviours off those: the
+  controller keeps the rows' own description (the language name) instead of
+  the engine name, and does not carry the previous text's rows into the
+  first result for new text. Both are easy to lose in a rebase, and the
+  unit tests do not cover them: check `namaste` in a running build (rows
+  labelled हिन्दी on the right; no `namast` rows flashing first).
+- **Rebase trap: starter-pack ids.** The ten `@` sources are starter-pack
+  entries 7–16 and `kCurrentDataVersion` is 16. When an upstream bump adds
+  its own starter-pack entries, renumber Tark's above upstream's and bump
+  the version past both, or a profile keeps whichever entry got the id
+  first.
+- **WebUI JavaScript errors no longer crash a build.** Unofficial builds
+  (every Tark build until M5) used to `LOG(FATAL)` on a JavaScript error in
+  some WebUI pages, the omnibox popup among them. Pass
+  `--tark-crash-on-webui-js-error` to get the crash back while developing.
+- **Packaging a DMG to share.** `sign_and_package_app.sh`'s `pkg-dmg`
+  builds an HFS hybrid image whose files all carry `com.apple.FinderInfo`,
+  so an app dragged out of it fails `codesign --verify --deep --strict`
+  ("resource fork, Finder information, or similar detritus"). Sign with the
+  script (`TARKA_SKIP_DMG=1`, or let it build its DMG and ignore it), then
+  package from a clean copy:
+
+      ditto --noextattr --norsrc build/src/out/Default/Tark.app stage/Tark.app
+      ln -s /Applications stage/Applications
+      hdiutil create -volname Tark -srcfolder stage -fs APFS -format ULFO Tark.dmg
+
+  Mount it and check `codesign --verify --deep --strict` on the app inside
+  before publishing.
