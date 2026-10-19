@@ -114,13 +114,14 @@ else
     exit 1
   fi
 
-  # 1c. Chromium's own clang and Rust, fetched by their update scripts before
-  #     domain substitution rewrites googleapis.com inside those scripts.
-  run python3 "$_src_dir/tools/clang/scripts/update.py"
-  run python3 "$_src_dir/tools/rust/update_rust.py"
-
   # 2. Prune binaries, as every ungoogled-chromium build does.
   run python3 "$_main_repo/utils/prune_binaries.py" "$_src_dir" "$_main_repo/pruning.list"
+
+  # 2b. Chromium's own clang and Rust, fetched by their update scripts: after
+  #     pruning (which deletes prebuilt toolchains) and before domain
+  #     substitution (which rewrites googleapis.com inside those scripts).
+  run python3 "$_src_dir/tools/clang/scripts/update.py"
+  run python3 "$_src_dir/tools/rust/update_rust.py"
 
   # 3. ungoogled-chromium's core patches, then Tark's Android series.
   mkdir -p "$work/tark-patches"

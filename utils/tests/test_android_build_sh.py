@@ -160,7 +160,8 @@ class TestAndroidBuildSh(unittest.TestCase):
         result, runs, files, tmp = dryrun('--stop-before-gn')
         clang = index_of(runs, 'tools/clang/scripts/update.py')
         rust = index_of(runs, 'tools/rust/update_rust.py')
-        self.assertLess(index_of(runs, 'depot_tools-stock/gclient sync'), clang)
+        # ...and after pruning, which deletes prebuilt toolchains.
+        self.assertLess(index_of(runs, 'utils/prune_binaries.py'), clang)
         self.assertLess(max(clang, rust), index_of(runs, 'utils/domain_substitution.py apply'))
 
     def test_chromium_clang_on_path_for_gn_and_ninja(self):
