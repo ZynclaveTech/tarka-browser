@@ -141,6 +141,18 @@ class TestAndroidSeries(unittest.TestCase):
         self.assertIn('+    jinja_extra_variables = [ "extract_native_libs=true" ]', patch)
         self.assertIn('+        android:extractNativeLibs="true"', patch)
 
+    def test_no_device_account_seeding(self):
+        # ungoogled never calls LoadCredentials, so Android's account seeding
+        # hit CHECK_NE(fire_refresh_token_loaded_, RT_LOAD_NOT_START) on every
+        # start (A1 emulator run). Tark uses no Google accounts: seeding is
+        # skipped when credentials were never loaded.
+        self.assertIn('android/signin-android-no-account-seeding.patch', self.series)
+        patch = (ANDROID / 'patches' / 'signin-android-no-account-seeding.patch').read_text()
+        self.assertIn('+++ b/components/signin/internal/identity_manager/'
+                      'profile_oauth2_token_service_delegate_android.cc', patch)
+        self.assertIn('-  CHECK_NE(fire_refresh_token_loaded_, RT_LOAD_NOT_START);', patch)
+        self.assertIn('+  if (fire_refresh_token_loaded_ == RT_LOAD_NOT_START) {\n+    return;\n+  }', patch)
+
     def test_skip_list_entries_exist(self):
         self.assertTrue(self.skip)
         for entry in self.skip:
