@@ -168,10 +168,12 @@ class TestAndroidConfig(unittest.TestCase):
                      'use_clang_modules = false'):
             self.assertIn(line, args)
 
-    def test_no_arcore(self):
-        # The XR module (left out for size) carries the ARCore client; WebXR AR
-        # is built out so nothing reaches for its classes.
-        self.assertIn('enable_arcore = false', (ANDROID / 'args.gn').read_text())
+    def test_arcore_stays_on(self):
+        # enable_arcore=false leaves components/webxr's Java without its
+        # generated natives (javac and the JNI registration check fail).
+        # Without the XR module only its ARCore .so files are gone, which
+        # WebXR AR loads on demand.
+        self.assertNotIn('enable_arcore', (ANDROID / 'args.gn').read_text())
 
     def test_sysroot_stays_on(self):
         # base/BUILD.gn links a system libatomic on Android when use_sysroot is
