@@ -150,5 +150,20 @@ class TestMenu(unittest.TestCase):
         self.assertIn('R.id.tark_tiles_menu_id', self.add)
 
 
+class TestTabSwitcher(unittest.TestCase):
+    def setUp(self):
+        self.assertIn('android/look-tab-switcher.patch', series())
+        self.p = patch('look-tab-switcher.patch')
+        self.add = added(self.p)
+
+    def test_pane_switcher_is_a_pill(self):
+        self.assertIn('<corners android:radius="999dp" />', self.add)
+
+    def test_cards_are_raised(self):
+        # Paper cards: raised, not Chromium's darkest container.
+        self.assertIn('SemanticColorUtils.getColorSurfaceContainerHigh(context)', self.add)
+        self.assertIn('R.color.gm3_baseline_surface_container_high_dark', self.add)
+
+
 if __name__ == '__main__':
     unittest.main()
