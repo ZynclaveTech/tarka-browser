@@ -1,0 +1,291 @@
+Tark: the `@` sources (@wiki, @maps, @gov, @irctc, @kanoon, @yt, @dict,
+@archive, @flipkart, @amazon) are starter pack entries, ids 7-16, with
+literal names and keywords (proper nouns, not translated). They rank above
+the local entries so `@` alone lists them first. @page is dropped from the
+list like the AI entries were. Updating the starter pack data no longer
+turns an entry the user switched off back on.
+
+--- a/components/omnibox/browser/featured_search_provider.cc
++++ b/components/omnibox/browser/featured_search_provider.cc
+@@ -51,13 +51,13 @@
+ 
+ // Max number of featured enterprise suggestions to show when the user types '@'
+ // or '@...'. 4 is a good limit because:
+-// - When the user types '@', the existing 4 starter packs, 1 trivial search,
+-//   and 4 enterprise suggestions will all fit in the total limit of 9
+-//   suggestions. This may change if more starter packs are launched.
+-// - When the user types '@...', the at-most-1 matching starter pack (no
+-//   starter packs share the same 1st character), 1 trivial search, at least 2
+-//   non-trivial searches, and 4 enterprise suggestions will fit in the total
+-//   limit of 8 suggestions.
++// - Tark: there are 13 starter packs (3 local, 10 web sources), more than the
++//   limit of 9 suggestions, so when the user types '@' the 10 web sources
++//   fill the list (see StarterPackRelevance) and the local ones show once a
++//   letter narrows it. Enterprise suggestions are not used in Tark.
++// - When the user types '@...', a few matching starter packs ("@a" matches
++//   @archive and @amazon), 1 trivial search, and at least 2 non-trivial
++//   searches fit in the total limit of 8 suggestions.
+ // This constant can be replaced with a function if we want to show a different
+ // # of enterprise suggestions in these 2 cases.
+ constexpr int kMaxEnterpriseSuggestions = 4;
+@@ -90,6 +90,28 @@
+       return 1456;
+     case template_url_starter_pack_data::StarterPackId::kTabs:
+       return 1455;
++    // Tark: the web sources score above everything else and in the order the
++    // table lists them, so '@' alone shows them first.
++    case template_url_starter_pack_data::StarterPackId::kTarkWiki:
++      return 1469;
++    case template_url_starter_pack_data::StarterPackId::kTarkMaps:
++      return 1468;
++    case template_url_starter_pack_data::StarterPackId::kTarkGov:
++      return 1467;
++    case template_url_starter_pack_data::StarterPackId::kTarkIrctc:
++      return 1466;
++    case template_url_starter_pack_data::StarterPackId::kTarkKanoon:
++      return 1465;
++    case template_url_starter_pack_data::StarterPackId::kTarkYouTube:
++      return 1464;
++    case template_url_starter_pack_data::StarterPackId::kTarkDict:
++      return 1463;
++    case template_url_starter_pack_data::StarterPackId::kTarkArchive:
++      return 1462;
++    case template_url_starter_pack_data::StarterPackId::kTarkFlipkart:
++      return 1461;
++    case template_url_starter_pack_data::StarterPackId::kTarkAmazon:
++      return 1460;
+     case template_url_starter_pack_data::StarterPackId::kMaxStarterPackId:
+       break;
+   }
+--- a/components/search_engines/template_url_data_util.cc
++++ b/components/search_engines/template_url_data_util.cc
+@@ -517,8 +517,15 @@
+ std::unique_ptr<TemplateURLData> TemplateURLDataFromStarterPackEngine(
+     const template_url_starter_pack_data::StarterPackEngine& engine) {
+   auto turl = std::make_unique<TemplateURLData>();
+-  turl->SetShortName(l10n_util::GetStringUTF16(engine.name_message_id));
+-  turl->SetKeyword(u"@" + l10n_util::GetStringUTF16(engine.keyword_message_id));
++  // Tark: a source named for a site has a literal name and keyword, not a
++  // translated message.
++  turl->SetShortName(engine.name_message_id != 0
++                         ? l10n_util::GetStringUTF16(engine.name_message_id)
++                         : base::UTF8ToUTF16(engine.literal_name));
++  turl->SetKeyword(u"@" + (engine.keyword_message_id != 0
++                               ? l10n_util::GetStringUTF16(
++                                     engine.keyword_message_id)
++                               : base::UTF8ToUTF16(engine.literal_keyword)));
+   turl->SetURL(engine.search_url);
+   turl->favicon_url = GURL(ToStringView(engine.favicon_url));
+   turl->starter_pack_id = static_cast<int>(engine.id);
+--- a/components/search_engines/template_url_starter_pack_data.cc
++++ b/components/search_engines/template_url_starter_pack_data.cc
+@@ -17,7 +17,7 @@
+ namespace template_url_starter_pack_data {
+ 
+ // Update this whenever a change is made to any starter pack data.
+-const int kCurrentDataVersion = 14;
++const int kCurrentDataVersion = 15;
+ 
+ // Only update this if there's an incompatible change that requires force
+ // updating the user's starter pack data. This will overwrite any of the
+@@ -92,8 +92,149 @@
+     .type = SEARCH_ENGINE_STARTER_PACK_AI_MODE,
+ };
+ 
++// Tark: web sources reachable with '@'. Search urls are loaded in the tab as
++// typed; none is fetched by the browser itself.
++const StarterPackEngine tark_wiki = {
++    .name_message_id = 0,
++    .keyword_message_id = 0,
++    .favicon_url = nullptr,
++    // Tark: the language is fixed to English for now.
++    .search_url =
++        "https://www.wikipedia.org/search-redirect.php"
++        "?family=wikipedia&language=en&search={searchTerms}",
++    .destination_url = "https://www.wikipedia.org",
++    .id = StarterPackId::kTarkWiki,
++    .type = SEARCH_ENGINE_OTHER,
++    .literal_name = "Wikipedia",
++    .literal_keyword = "wiki",
++};
++
++const StarterPackEngine tark_maps = {
++    .name_message_id = 0,
++    .keyword_message_id = 0,
++    .favicon_url = nullptr,
++    .search_url = "https://www.openstreetmap.org/search?query={searchTerms}",
++    .destination_url = "https://www.openstreetmap.org",
++    .id = StarterPackId::kTarkMaps,
++    .type = SEARCH_ENGINE_OTHER,
++    .literal_name = "OpenStreetMap",
++    .literal_keyword = "maps",
++};
++
++const StarterPackEngine tark_gov = {
++    .name_message_id = 0,
++    .keyword_message_id = 0,
++    .favicon_url = nullptr,
++    // Found by reading the portal's own search code (its pages push
++    // /search?search=<terms>) and confirming the address answers 200.
++    .search_url = "https://www.india.gov.in/search?search={searchTerms}",
++    .destination_url = "https://www.india.gov.in",
++    .id = StarterPackId::kTarkGov,
++    .type = SEARCH_ENGINE_OTHER,
++    .literal_name = "India.gov.in",
++    .literal_keyword = "gov",
++};
++
++const StarterPackEngine tark_irctc = {
++    .name_message_id = 0,
++    .keyword_message_id = 0,
++    .favicon_url = nullptr,
++    // IRCTC has no linkable search, and its PNR status lookup is a form behind
++    // a captcha with no address that takes the number. The page ignores the
++    // query. The term still sits in the fragment so the url has a
++    // {searchTerms} slot: without one the template does not support
++    // replacement, and typing after "@irctc " would fall through to the
++    // default search engine. The fragment never leaves the browser.
++    .search_url = "https://www.irctc.co.in/nget/train-search#{searchTerms}",
++    .destination_url = "https://www.irctc.co.in/nget/train-search",
++    .id = StarterPackId::kTarkIrctc,
++    .type = SEARCH_ENGINE_OTHER,
++    .literal_name = "IRCTC",
++    .literal_keyword = "irctc",
++};
++
++const StarterPackEngine tark_kanoon = {
++    .name_message_id = 0,
++    .keyword_message_id = 0,
++    .favicon_url = nullptr,
++    .search_url = "https://indiankanoon.org/search/?formInput={searchTerms}",
++    .destination_url = "https://indiankanoon.org",
++    .id = StarterPackId::kTarkKanoon,
++    .type = SEARCH_ENGINE_OTHER,
++    .literal_name = "Indian Kanoon",
++    .literal_keyword = "kanoon",
++};
++
++const StarterPackEngine tark_youtube = {
++    .name_message_id = 0,
++    .keyword_message_id = 0,
++    .favicon_url = nullptr,
++    // The host is split in two so that ungoogled-chromium's domain
++    // substitution, which rewrites YouTube's host in this file, leaves it alone.
++    .search_url =
++        "https://www.youtu"
++        "be.com/results?search_query={searchTerms}",
++    .destination_url =
++        "https://www.youtu"
++        "be.com",
++    .id = StarterPackId::kTarkYouTube,
++    .type = SEARCH_ENGINE_OTHER,
++    .literal_name = "YouTube",
++    .literal_keyword = "yt",
++};
++
++const StarterPackEngine tark_dict = {
++    .name_message_id = 0,
++    .keyword_message_id = 0,
++    .favicon_url = nullptr,
++    .search_url = "https://en.wiktionary.org/w/index.php?search={searchTerms}",
++    .destination_url = "https://en.wiktionary.org",
++    .id = StarterPackId::kTarkDict,
++    .type = SEARCH_ENGINE_OTHER,
++    .literal_name = "Wiktionary",
++    .literal_keyword = "dict",
++};
++
++const StarterPackEngine tark_archive = {
++    .name_message_id = 0,
++    .keyword_message_id = 0,
++    .favicon_url = nullptr,
++    .search_url = "https://archive.org/search?query={searchTerms}",
++    .destination_url = "https://archive.org",
++    .id = StarterPackId::kTarkArchive,
++    .type = SEARCH_ENGINE_OTHER,
++    .literal_name = "Internet Archive",
++    .literal_keyword = "archive",
++};
++
++const StarterPackEngine tark_flipkart = {
++    .name_message_id = 0,
++    .keyword_message_id = 0,
++    .favicon_url = nullptr,
++    .search_url = "https://www.flipkart.com/search?q={searchTerms}",
++    .destination_url = "https://www.flipkart.com",
++    .id = StarterPackId::kTarkFlipkart,
++    .type = SEARCH_ENGINE_OTHER,
++    .literal_name = "Flipkart",
++    .literal_keyword = "flipkart",
++};
++
++const StarterPackEngine tark_amazon = {
++    .name_message_id = 0,
++    .keyword_message_id = 0,
++    .favicon_url = nullptr,
++    .search_url = "https://www.amazon.in/s?k={searchTerms}",
++    .destination_url = "https://www.amazon.in",
++    .id = StarterPackId::kTarkAmazon,
++    .type = SEARCH_ENGINE_OTHER,
++    .literal_name = "Amazon India",
++    .literal_keyword = "amazon",
++};
++
+ const StarterPackEngine* engines[] = {
+-    &bookmarks, &history, &tabs, &page,
++    &bookmarks,    &history,      &tabs,        &tark_wiki,   &tark_maps,
++    &tark_gov,     &tark_irctc,   &tark_kanoon, &tark_youtube, &tark_dict,
++    &tark_archive, &tark_flipkart, &tark_amazon,
+ };
+ 
+ int GetDataVersion() {
+--- a/components/search_engines/template_url_starter_pack_data.h
++++ b/components/search_engines/template_url_starter_pack_data.h
+@@ -34,6 +34,19 @@
+   kPage = 5,
+   kAiMode = 6,
+ 
++  // Tark: web sources reachable with '@', in the order the omnibox lists them.
++  // Ids are persisted in the keywords table: never renumber, only append.
++  kTarkWiki = 7,
++  kTarkMaps = 8,
++  kTarkGov = 9,
++  kTarkIrctc = 10,
++  kTarkKanoon = 11,
++  kTarkYouTube = 12,
++  kTarkDict = 13,
++  kTarkArchive = 14,
++  kTarkFlipkart = 15,
++  kTarkAmazon = 16,
++
+   kMaxStarterPackId
+ };
+ 
+@@ -50,6 +63,11 @@
+   const char* const destination_url;
+   const StarterPackId id;
+   const SearchEngineType type;
++  // Tark: sources named for a site rather than a Chrome feature are proper
++  // nouns and are not translated. They are used when the message id is 0.
++  // `literal_keyword` is without the leading '@', like the message string.
++  const char* const literal_name = nullptr;
++  const char* const literal_keyword = nullptr;
+ };
+ 
+ extern const int kCurrentDataVersion;
+--- a/components/search_engines/util.cc
++++ b/components/search_engines/util.cc
+@@ -602,6 +602,13 @@
+     data_to_update.sync_guid = original_turl.sync_guid;
+   }
+ 
++  // Tark: a starter pack entry the user switched off stays off when the
++  // starter pack data is updated. Other states are repaired to the new data's.
++  if (original_turl.starter_pack_id != 0 &&
++      original_turl.is_active == TemplateURLData::ActiveStatus::kFalse) {
++    data_to_update.is_active = TemplateURLData::ActiveStatus::kFalse;
++  }
++
+   if (merge_option == TemplateURLMergeOption::kSettingAsDefaultProvider) {
+     data_to_update.last_visited = original_turl.last_visited;
+     data_to_update.favicon_url = original_turl.favicon_url;
