@@ -309,7 +309,8 @@ row label, and the row fixes) and `core/webui-js-error-no-crash.patch`.
 ## Release signing (M5)
 
 A release is signed with the team's **Developer ID Application**
-certificate, notarized, and stapled, the app and then the DMG:
+certificate, notarized, and stapled: the app, then the DMG (which is also
+code-signed, so Gatekeeper reports it as Notarized Developer ID):
 
     MACOS_CERTIFICATE_NAME="Developer ID Application: <name> (UMTJNNPK6C)" \
       CHROMIUM_SRC_DIR=$PWD/build/src ./sign_and_package_app.sh out.dmg

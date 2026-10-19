@@ -206,5 +206,7 @@ fi
 # A release DMG is notarized and stapled too, so it opens offline without a
 # Gatekeeper prompt about the image itself.
 if (( ! _ad_hoc && ! _dev )); then
+  codesign --sign "$MACOS_CERTIFICATE_NAME" --timestamp "$_target_dmg"
+  codesign --verify --strict "$_target_dmg"
   notarize "$_target_dmg"
 fi
