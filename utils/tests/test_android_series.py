@@ -186,6 +186,17 @@ class TestAndroidSeries(unittest.TestCase):
         self.assertIn('+++ b/components/ntp_tiles/resources/default_popular_sites.json', patch)
         self.assertIn('-        "url": "https://freenode.net/"', patch)
 
+    def test_app_named_tark(self):
+        # The launcher label comes from Android resources, which name
+        # substitution does not reach (A1's first APK was labelled Chromium).
+        self.assertIn('android/app-name-tark.patch', self.series)
+        patch = (ANDROID / 'patches' / 'app-name-tark.patch').read_text()
+        self.assertIn('+++ b/chrome/android/java/res_chromium_base/values/channel_constants.xml', patch)
+        self.assertIn('+    <string name="app_name" translatable="false">Tark</string>', patch)
+        added = [l for l in patch.splitlines() if l.startswith('+') and not l.startswith('+++')]
+        self.assertEqual(len(added), 4)
+        self.assertFalse(any('Chromium' in l for l in added if 'string name' in l))
+
     def test_skip_list_entries_exist(self):
         self.assertTrue(self.skip)
         for entry in self.skip:
