@@ -459,3 +459,18 @@ unpacked to `build/src/third_party/sparkle` by `dev.sh setup` and
   as metadata, and reads every file back through CloudFront. v1 never
   changes: new models go to `v2/` with a new manifest. gettarka-site's
   `publish.sh` keeps `models/` out of its `--delete` sync.
+
+- **Auto-detect (Phase 3):** the speech process starts in "auto": Silero VAD
+  keeps the client's speech, SpeechBrain's VoxLingua107 ECAPA (Apache-2.0,
+  `utils/lid_export.py export` → `lid.onnx` + `lid_labels.txt`, fp32: int8
+  lost 2.7% top-1) decides at 3 s of speech, 5 s when unsure
+  (`components/tark_captions/detection_policy.cc`, tuned with
+  `lid_export.py policy` on FLEURS: hi .96, ta .94, bn .96, en/es/fr/zh 1.0,
+  Swahili called unsupported .96). The recognizer reports it as a
+  LanguageIdentificationEvent and captions from the first word (what it
+  heard is replayed); Apple languages go to the browser through
+  `SpeechRecognitionService.BindTarkAudioTap` (Part B captions them).
+  `language_id` is a download unit holding the detector and the VAD, so
+  detection never needs the 679 MB captions unit. The pill's chip reads
+  "Auto-detect", then "Tamil · detected"; a language Tark can't caption
+  gets a line and "Choose a language".
