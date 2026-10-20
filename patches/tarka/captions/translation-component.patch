@@ -1,0 +1,688 @@
+--- /dev/null
++++ b/components/tark_captions/indic_text.h
+@@ -0,0 +1,51 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef COMPONENTS_TARK_CAPTIONS_INDIC_TEXT_H_
++#define COMPONENTS_TARK_CAPTIONS_INDIC_TEXT_H_
++
++#include <string>
++#include <string_view>
++
++#include "components/tark_captions/asr_model.h"
++
++namespace tark_captions {
++
++// The text steps around the translation model (D4 Phase 2): ports of the
++// parts of IndicTransToolkit's IndicProcessor (IndicNLP's normaliser,
++// tokeniser and script converter; sacremoses' English detokeniser) that
++// caption text reaches. Captions are Indian letters and spaces, so the
++// processor's URL, number and punctuation handling is not ported.
++
++enum class Script { kDevanagari, kTamil, kBengali, kLatin };
++
++Script ScriptOf(Language language);
++
++// IndicNLP's BaseNormalizer and the Devanagari, Tamil or Bengali normaliser
++// with IndicTransToolkit's settings (nuktas kept, nasals and chandras
++// untouched). Its colon-to-visarga step never matches (its pattern is
++// double-escaped upstream) and is left out.
++std::u16string NormalizeIndic(std::u16string_view text, Language language);
++
++// IndicNLP's UnicodeIndicTransliterator between Indian scripts: the letter
++// at the same offset in the other script's Unicode block (dandas kept;
++// Tamil, which lacks voiced and aspirated plosives, gets the unvoiced one).
++// Text is returned unchanged when either script is Latin.
++std::u16string ConvertScript(std::u16string_view text, Script from, Script to);
++
++// IndicNLP's trivial_tokenize / trivial_detokenize for Brahmi scripts.
++std::u16string TokenizeIndic(std::u16string_view text);
++std::u16string DetokenizeIndic(std::u16string_view text);
++
++// sacremoses' MosesDetokenizer(lang="en") on space-separated tokens.
++std::string DetokenizeEnglish(std::string_view tokens);
++
++// What IndicTransToolkit feeds the model for a caption in `language`
++// (without the two language tags): normalised, tokenised and written in
++// Devanagari (IndicTrans2's script unification).
++std::string ModelInput(std::string_view caption, Language language);
++
++}  // namespace tark_captions
++
++#endif  // COMPONENTS_TARK_CAPTIONS_INDIC_TEXT_H_
+--- /dev/null
++++ b/components/tark_captions/indic_text.cc
+@@ -0,0 +1,472 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/tark_captions/indic_text.h"
++
++#include <map>
++#include <vector>
++
++#include "base/strings/string_split.h"
++#include "base/strings/string_util.h"
++#include "base/strings/utf_string_conversions.h"
++#include "third_party/icu/source/common/unicode/uchar.h"
++#include "third_party/icu/source/common/unicode/utf16.h"
++
++namespace tark_captions {
++namespace {
++
++constexpr char16_t kNukta = u'़';
++constexpr char16_t kBengaliNukta = u'়';
++constexpr char16_t kDanda = u'।';
++constexpr char16_t kDoubleDanda = u'॥';
++// IndicNLP's coordinated range: offsets 0x00-0x6f line up across scripts.
++constexpr int kCoordinatedEnd = 0x6F;
++
++char16_t BlockStart(Script script) {
++  switch (script) {
++    case Script::kDevanagari:
++      return 0x0900;
++    case Script::kTamil:
++      return 0x0B80;
++    case Script::kBengali:
++      return 0x0980;
++    case Script::kLatin:
++      return 0;
++  }
++}
++
++void ReplaceAll(std::u16string& text, std::u16string_view from, std::u16string_view to) {
++  base::ReplaceSubstringsAfterOffset(&text, 0, from, to);
++}
++
++// Collapses runs of spaces to one and trims spaces at both ends.
++std::u16string CollapseSpaces(std::u16string_view text) {
++  std::u16string out;
++  for (char16_t c : text) {
++    if (c == u' ' && (out.empty() || out.back() == u' ')) {
++      continue;
++    }
++    out.push_back(c);
++  }
++  if (!out.empty() && out.back() == u' ') {
++    out.pop_back();
++  }
++  return out;
++}
++
++// IndicNLP's _correct_tamil_mapping.
++int CorrectTamilOffset(int offset) {
++  if (offset >= 0x15 && offset <= 0x28 && offset != 0x1C &&
++      !((offset - 0x15) % 5 == 0 || (offset - 0x15) % 5 == 4)) {
++    offset = 0x15 + 5 * ((offset - 0x15) / 5);
++  }
++  if (offset == 0x2B || offset == 0x2C || offset == 0x2D) {
++    offset = 0x2A;
++  }
++  if (offset == 0x36) {
++    offset = 0x37;
++  }
++  return offset;
++}
++
++bool IsTokenPunctuation(char16_t c) {
++  // Python's string.punctuation and IndicNLP's Indian punctuation.
++  static constexpr std::u16string_view kAscii = u"!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~";
++  static constexpr std::u16string_view kIndic =
++      u"।॥꫱꫰꯫꯬꯭꯮꯯᱾᱿";
++  return kAscii.find(c) != std::u16string_view::npos ||
++         kIndic.find(c) != std::u16string_view::npos;
++}
++
++bool IsAsciiDigit(char16_t c) {
++  return c >= u'0' && c <= u'9';
++}
++
++// IndicNLP's pat_num_seq, ([0-9]+ [,.:/] )+[0-9]+: the length of a match
++// starting at `i`, or 0.
++size_t NumberSequenceAt(std::u16string_view s, size_t i) {
++  size_t end = 0;
++  size_t p = i;
++  while (true) {
++    size_t q = p;
++    while (q < s.size() && IsAsciiDigit(s[q])) {
++      ++q;
++    }
++    if (q == p) {
++      break;
++    }
++    // A complete "[0-9]+" here ends a match if at least one group came first.
++    if (end != 0 || p != i) {
++      end = q;
++    }
++    if (q + 2 < s.size() && s[q] == u' ' &&
++        std::u16string_view(u",.:/").find(s[q + 1]) != std::u16string_view::npos &&
++        s[q + 2] == u' ') {
++      p = q + 3;
++      continue;
++    }
++    break;
++  }
++  return end == 0 ? 0 : end - i;
++}
++
++std::u16string JoinNumberSequences(std::u16string_view s) {
++  std::u16string out;
++  size_t i = 0;
++  while (i < s.size()) {
++    const bool at_start = i == 0 || !IsAsciiDigit(s[i - 1]);
++    const size_t length = at_start ? NumberSequenceAt(s, i) : 0;
++    if (length == 0) {
++      out.push_back(s[i++]);
++      continue;
++    }
++    for (char16_t c : s.substr(i, length)) {
++      if (c != u' ') {
++        out.push_back(c);
++      }
++    }
++    i += length;
++  }
++  return out;
++}
++
++std::u16string AsciiDigits(std::u16string_view text) {
++  std::u16string out(text);
++  for (char16_t& c : out) {
++    // IndicTransToolkit's digit table: Devanagari and Bengali here (it has
++    // no Tamil digits).
++    if (c >= 0x0966 && c <= 0x096F) {
++      c = u'0' + (c - 0x0966);
++    } else if (c >= 0x09E6 && c <= 0x09EF) {
++      c = u'0' + (c - 0x09E6);
++    }
++  }
++  return out;
++}
++
++// sacremoses' character classes, via ICU.
++bool IsCjk(UChar32 c) {
++  static constexpr std::pair<UChar32, UChar32> kRanges[] = {
++      {4352, 4607},     {11904, 42191},   {43072, 43135},   {44032, 55215},
++      {63744, 64255},   {65072, 65103},   {65381, 65500},   {94208, 101119},
++      {110592, 110895}, {110960, 111359}, {131072, 196607},
++  };
++  for (const auto& [low, high] : kRanges) {
++    if (c >= low && c <= high) {
++      return true;
++    }
++  }
++  return false;
++}
++
++std::vector<UChar32> CodePoints(const std::u16string& s) {
++  std::vector<UChar32> out;
++  for (size_t i = 0; i < s.size();) {
++    UChar32 c;
++    U16_NEXT(s.data(), i, s.size(), c);
++    out.push_back(c);
++  }
++  return out;
++}
++
++bool AllOf(const std::u16string& token, bool (*pred)(UChar32)) {
++  const std::vector<UChar32> cps = CodePoints(token);
++  if (cps.empty()) {
++    return false;
++  }
++  for (UChar32 c : cps) {
++    if (!pred(c)) {
++      return false;
++    }
++  }
++  return true;
++}
++
++bool IsCurrencyOrOpener(UChar32 c) {
++  return u_charType(c) == U_CURRENCY_SYMBOL || c == '(' || c == '[' || c == '{' || c == 0xBF ||
++         c == 0xA1;
++}
++
++bool IsPunct(UChar32 c) {
++  return c == ',' || c == '.' || c == '?' || c == '!' || c == ':' || c == ';' || c == '\\' ||
++         c == '%' || c == '}' || c == ']' || c == ')';
++}
++
++bool IsOpenQuote(UChar32 c) {
++  return c == '\'' || c == '"' || c == 0x201E || c == 0x201C || c == '`';
++}
++
++bool IsCurlyDoubleQuote(UChar32 c) {
++  return c == 0x201E || c == 0x201C || c == 0x201D;
++}
++
++}  // namespace
++
++Script ScriptOf(Language language) {
++  switch (language) {
++    case Language::kHindi:
++      return Script::kDevanagari;
++    case Language::kTamil:
++      return Script::kTamil;
++    case Language::kBengali:
++      return Script::kBengali;
++  }
++}
++
++std::u16string NormalizeIndic(std::u16string_view input, Language language) {
++  std::u16string text(input);
++  // BaseNormalizer.
++  for (std::u16string_view gone : {u"﻿", u"￾", u"⁠", u"­"}) {
++    ReplaceAll(text, gone, u"");
++  }
++  ReplaceAll(text, u"​", u" ");
++  ReplaceAll(text, u" ", u" ");
++  ReplaceAll(text, u"‌", u"");
++  ReplaceAll(text, u"‍", u"");
++  // NormalizerI._normalize_punctuations, in its order.
++  static constexpr std::pair<std::u16string_view, std::u16string_view> kPunctuation[] = {
++      {u"﻿", u""},   {u"„", u"\""}, {u"“", u"\""}, {u"”", u"\""},
++      {u"–", u"-"},  {u"—", u" - "}, {u"´", u"'"},  {u"‘", u"'"},
++      {u"‚", u"'"},  {u"’", u"'"},  {u"''", u"\""},     {u"´´", u"\""},
++      {u"…", u"..."},
++  };
++  for (const auto& [from, to] : kPunctuation) {
++    ReplaceAll(text, from, to);
++  }
++  switch (language) {
++    case Language::kHindi: {
++      ReplaceAll(text, u"ॲ", u"ए");
++      static constexpr std::pair<char16_t, char16_t> kNuktaForms[] = {
++          {0x0929, 0x0928}, {0x0931, 0x0930}, {0x0934, 0x0933}, {0x0958, 0x0915},
++          {0x0959, 0x0916}, {0x095A, 0x0917}, {0x095B, 0x091C}, {0x095C, 0x0921},
++          {0x095D, 0x0922}, {0x095E, 0x092B}, {0x095F, 0x092F},
++      };
++      for (const auto& [composite, base] : kNuktaForms) {
++        ReplaceAll(text, std::u16string(1, composite), std::u16string{base, kNukta});
++      }
++      ReplaceAll(text, u"|", u"।");
++      break;
++    }
++    case Language::kBengali: {
++      ReplaceAll(text, u"ড়", std::u16string{0x09A1, kBengaliNukta});
++      ReplaceAll(text, u"ঢ়", std::u16string{0x09A2, kBengaliNukta});
++      ReplaceAll(text, u"য়", std::u16string{0x09AF, kBengaliNukta});
++      ReplaceAll(text, u"৤", u"।");
++      ReplaceAll(text, u"৥", u"॥");
++      ReplaceAll(text, u"|", u"।");
++      ReplaceAll(text, u"৷", u"।");
++      ReplaceAll(text, u"ো", u"ো");
++      ReplaceAll(text, u"ৌ", u"ৌ");
++      break;
++    }
++    case Language::kTamil: {
++      ReplaceAll(text, u"௤", u"।");
++      ReplaceAll(text, u"௥", u"॥");
++      ReplaceAll(text, u"ஔ", u"ஔ");
++      ReplaceAll(text, u"ொ", u"ொ");
++      ReplaceAll(text, u"ோ", u"ோ");
++      ReplaceAll(text, u"ௌ", u"ௌ");
++      break;
++    }
++  }
++  return text;
++}
++
++std::u16string ConvertScript(std::u16string_view text, Script from, Script to) {
++  if (from == Script::kLatin || to == Script::kLatin || from == to) {
++    return std::u16string(text);
++  }
++  const int from_start = BlockStart(from);
++  const int to_start = BlockStart(to);
++  std::u16string out;
++  out.reserve(text.size());
++  for (char16_t c : text) {
++    int offset = static_cast<int>(c) - from_start;
++    if (offset >= 0 && offset <= kCoordinatedEnd && c != kDanda && c != kDoubleDanda) {
++      if (to == Script::kTamil) {
++        offset = CorrectTamilOffset(offset);
++      }
++      out.push_back(static_cast<char16_t>(to_start + offset));
++    } else {
++      out.push_back(c);
++    }
++  }
++  return out;
++}
++
++std::u16string TokenizeIndic(std::u16string_view text) {
++  std::u16string spaced;
++  for (char16_t c : text) {
++    if (c == u'\t') {
++      c = u' ';
++    }
++    if (IsTokenPunctuation(c)) {
++      spaced += u' ';
++      spaced += c;
++      spaced += u' ';
++    } else {
++      spaced += c;
++    }
++  }
++  return JoinNumberSequences(CollapseSpaces(CollapseSpaces(spaced)));
++}
++
++std::u16string DetokenizeIndic(std::u16string_view text) {
++  // Number sequences, as IndicNLP does it: a match at the very start of the
++  // remaining text is skipped (its loop only appends when start > prev).
++  std::u16string s;
++  {
++    size_t prev = 0;
++    size_t i = 0;
++    std::u16string_view in(text);
++    while (i < in.size()) {
++      const bool at_start = i == 0 || !IsAsciiDigit(in[i - 1]);
++      const size_t length = at_start ? NumberSequenceAt(in, i) : 0;
++      if (length == 0) {
++        ++i;
++        continue;
++      }
++      if (i > prev) {
++        s += in.substr(prev, i - prev);
++        for (char16_t c : in.substr(i, length)) {
++          if (c != u' ') {
++            s.push_back(c);
++          }
++        }
++        prev = i + length;
++      }
++      i += length;
++    }
++    s += in.substr(prev);
++  }
++  auto drop_space = [](std::u16string& str, std::u16string_view set, bool before, bool after) {
++    std::u16string out;
++    for (size_t i = 0; i < str.size(); ++i) {
++      const bool in_set = set.find(str[i]) != std::u16string_view::npos;
++      if (in_set && before && after) {
++        if (!out.empty() && out.back() == u' ' && i + 1 < str.size() && str[i + 1] == u' ') {
++          out.back() = str[i];
++          ++i;
++          continue;
++        }
++      } else if (in_set && before) {
++        if (!out.empty() && out.back() == u' ') {
++          out.back() = str[i];
++          continue;
++        }
++      } else if (in_set && after) {
++        if (i + 1 < str.size() && str[i + 1] == u' ') {
++          out.push_back(str[i]);
++          ++i;
++          continue;
++        }
++      }
++      out.push_back(str[i]);
++    }
++    str = out;
++  };
++  drop_space(s, u"-/\\", true, true);
++  drop_space(s, u"!%)]},.:;>?।॥", true, false);
++  drop_space(s, u"#$([{<@", false, true);
++  // Quotes alternate between attaching right and left.
++  for (char16_t quote : std::u16string_view(u"'\"`")) {
++    std::u16string marked;
++    int count = 0;
++    for (char16_t c : s) {
++      if (c == quote) {
++        marked += count % 2 == 0 ? u"@RA" : u"@LA";
++        ++count;
++      } else {
++        marked.push_back(c);
++      }
++    }
++    const std::u16string q(1, quote);
++    ReplaceAll(marked, u"@RA ", q);
++    ReplaceAll(marked, u" @LA", q);
++    ReplaceAll(marked, u"@RA", q);
++    ReplaceAll(marked, u"@LA", q);
++    s = marked;
++  }
++  return s;
++}
++
++std::string DetokenizeEnglish(std::string_view input) {
++  std::u16string text = u" " + base::UTF8ToUTF16(input) + u" ";
++  ReplaceAll(text, u" @-@ ", u"-");
++  static constexpr std::pair<std::u16string_view, std::u16string_view> kUnescape[] = {
++      {u"&bar;", u"|"}, {u"&#124;", u"|"}, {u"&lt;", u"<"},  {u"&gt;", u">"},
++      {u"&bra;", u"["}, {u"&ket;", u"]"},  {u"&quot;", u"\""}, {u"&apos;", u"'"},
++      {u"&#91;", u"["}, {u"&#93;", u"]"},  {u"&amp;", u"&"},
++  };
++  for (const auto& [from, to] : kUnescape) {
++    ReplaceAll(text, from, to);
++  }
++  std::vector<std::u16string> tokens;
++  for (const std::u16string& t : base::SplitString(text, base::kWhitespaceUTF16,
++                                                   base::KEEP_WHITESPACE,
++                                                   base::SPLIT_WANT_NONEMPTY)) {
++    tokens.push_back(t);
++  }
++  std::map<std::u16string, int> quote_counts;
++  std::u16string prepend = u" ";
++  std::u16string out;
++  for (size_t i = 0; i < tokens.size(); ++i) {
++    const std::u16string& token = tokens[i];
++    const std::vector<UChar32> cps = CodePoints(token);
++    if (IsCjk(cps.front())) {
++      const std::vector<UChar32> prev = i > 0 ? CodePoints(tokens[i - 1]) : std::vector<UChar32>();
++      out += (i > 0 && IsCjk(prev.back())) ? token : prepend + token;
++      prepend = u" ";
++    } else if (AllOf(token, &IsCurrencyOrOpener)) {
++      out += prepend + token;
++      prepend = u"";
++    } else if (AllOf(token, &IsPunct)) {
++      out += token;
++      prepend = u" ";
++    } else if (i > 0 && cps.size() >= 2 && cps[0] == '\'' && u_isalpha(cps[1])) {
++      out += token;
++      prepend = u" ";
++    } else if (AllOf(token, &IsOpenQuote)) {
++      const std::u16string key = AllOf(token, &IsCurlyDoubleQuote) ? u"\"" : token;
++      int& count = quote_counts[key];
++      if (count % 2 == 0) {
++        if (token == u"'" && i > 0 && !tokens[i - 1].empty() && tokens[i - 1].back() == u's') {
++          out += token;
++          prepend = u" ";
++        } else {
++          out += prepend + token;
++          prepend = u"";
++          ++count;
++        }
++      } else {
++        out += token;
++        prepend = u" ";
++        ++count;
++      }
++    } else {
++      out += prepend + token;
++      prepend = u" ";
++    }
++  }
++  std::u16string collapsed;
++  for (char16_t c : out) {
++    if (c == u' ' && !collapsed.empty() && collapsed.back() == u' ') {
++      continue;
++    }
++    collapsed.push_back(c);
++  }
++  return base::UTF16ToUTF8(base::TrimWhitespace(collapsed, base::TRIM_ALL));
++}
++
++std::string ModelInput(std::string_view caption, Language language) {
++  std::u16string text = CollapseSpaces(base::UTF8ToUTF16(caption));
++  text = AsciiDigits(text);
++  text = NormalizeIndic(base::TrimWhitespace(text, base::TRIM_ALL), language);
++  text = TokenizeIndic(text);
++  text = ConvertScript(text, ScriptOf(language), Script::kDevanagari);
++  ReplaceAll(text, u" ् ", u"्");
++  return base::UTF16ToUTF8(base::TrimWhitespace(text, base::TRIM_ALL));
++}
++
++}  // namespace tark_captions
+--- /dev/null
++++ b/components/tark_captions/indic_text_unittest.cc
+@@ -0,0 +1,81 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/tark_captions/indic_text.h"
++
++#include <string>
++
++#include "base/strings/utf_string_conversions.h"
++#include "components/tark_captions/test_util.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace tark_captions {
++namespace {
++
++// The golden cases (utils/indictrans_export.py golden): real caption
++// hypotheses through IndicTransToolkit's IndicProcessor.
++base::ListValue Cases() {
++  std::optional<base::FilePath> testdata = test::TestDataDir();
++  return testdata ? test::MtGoldenCases(*testdata) : base::ListValue();
++}
++
++Language LanguageOf(const base::DictValue& c) {
++  return *LanguageFromCode(*c.FindString("lang"));
++}
++
++TEST(IndicTextTest, NormalizeMatchesReference) {
++  base::ListValue cases = Cases();
++  if (cases.empty()) {
++    GTEST_SKIP() << "set TARK_CAPTIONS_TESTDATA";
++  }
++  for (const base::Value& v : cases) {
++    const base::DictValue& c = v.GetDict();
++    EXPECT_EQ(base::UTF16ToUTF8(NormalizeIndic(base::UTF8ToUTF16(*c.FindString("caption")),
++                                               LanguageOf(c))),
++              *c.FindString("normalized"))
++        << *c.FindString("id");
++  }
++}
++
++TEST(IndicTextTest, ModelInputMatchesReference) {
++  base::ListValue cases = Cases();
++  if (cases.empty()) {
++    GTEST_SKIP() << "set TARK_CAPTIONS_TESTDATA";
++  }
++  for (const base::Value& v : cases) {
++    const base::DictValue& c = v.GetDict();
++    EXPECT_EQ(ModelInput(*c.FindString("caption"), LanguageOf(c)), *c.FindString("model_input"))
++        << *c.FindString("id");
++  }
++}
++
++TEST(IndicTextTest, EnglishDetokenizeMatchesReference) {
++  base::ListValue cases = Cases();
++  if (cases.empty()) {
++    GTEST_SKIP() << "set TARK_CAPTIONS_TESTDATA";
++  }
++  for (const base::Value& v : cases) {
++    const base::DictValue& c = v.GetDict();
++    EXPECT_EQ(DetokenizeEnglish(*c.FindString("english_tokens")), *c.FindString("english"))
++        << *c.FindString("id");
++  }
++}
++
++// Tamil has no voiced or aspirated plosives: ग and ड become க and ட.
++TEST(IndicTextTest, TamilTargetUsesUnvoicedPlosives) {
++  EXPECT_EQ(ConvertScript(u"गड", Script::kDevanagari, Script::kTamil), u"கட");
++}
++
++TEST(IndicTextTest, DandasUnchanged) {
++  EXPECT_EQ(ConvertScript(u"क।", Script::kDevanagari, Script::kBengali), u"ক।");
++}
++
++TEST(IndicTextTest, ScriptsOfLanguages) {
++  EXPECT_EQ(ScriptOf(Language::kHindi), Script::kDevanagari);
++  EXPECT_EQ(ScriptOf(Language::kTamil), Script::kTamil);
++  EXPECT_EQ(ScriptOf(Language::kBengali), Script::kBengali);
++}
++
++}  // namespace
++}  // namespace tark_captions
+--- a/components/tark_captions/BUILD.gn
++++ b/components/tark_captions/BUILD.gn
+@@ -19,6 +19,8 @@
+     "caption_engine.h",
+     "caption_text.cc",
+     "caption_text.h",
++    "indic_text.cc",
++    "indic_text.h",
+     "mel_frontend.cc",
+     "mel_frontend.h",
+     "ort_runtime.cc",
+@@ -32,6 +34,7 @@
+   deps = [
+     "//base",
+     "//media",
++    "//third_party/icu",
+     "//third_party/pffft",
+   ]
+ }
+@@ -54,6 +57,7 @@
+     "call_state_unittest.cc",
+     "caption_engine_unittest.cc",
+     "caption_text_unittest.cc",
++    "indic_text_unittest.cc",
+     "mel_frontend_unittest.cc",
+     "ort_runtime_unittest.cc",
+     "segmenter_unittest.cc",
+--- a/components/tark_captions/test_util.h
++++ b/components/tark_captions/test_util.h
+@@ -26,6 +26,10 @@
+ // TESTDATA/golden.json's "clips" list (utils/captions_export.py golden).
+ base::ListValue GoldenClips(const base::FilePath& testdata);
+ 
++// TESTDATA/mt_golden.json's "cases" list (utils/indictrans_export.py
++// golden): per caption, every stage of the reference translation pipeline.
++base::ListValue MtGoldenCases(const base::FilePath& testdata);
++
+ }  // namespace tark_captions::test
+ 
+ #endif  // COMPONENTS_TARK_CAPTIONS_TEST_UTIL_H_
+--- a/components/tark_captions/test_util.cc
++++ b/components/tark_captions/test_util.cc
+@@ -84,16 +84,28 @@
+   return {};
+ }
+ 
+-base::ListValue GoldenClips(const base::FilePath& testdata) {
++namespace {
++
++base::ListValue ReadList(const base::FilePath& file, std::string_view key) {
+   std::string json;
+-  if (!base::ReadFileToString(testdata.Append("golden.json"), &json)) {
++  if (!base::ReadFileToString(file, &json)) {
+     return {};
+   }
+   std::optional<base::Value> value = base::JSONReader::Read(json, base::JSON_PARSE_RFC);
+-  if (!value || !value->is_dict() || !value->GetDict().FindList("clips")) {
++  if (!value || !value->is_dict() || !value->GetDict().FindList(key)) {
+     return {};
+   }
+-  return value->GetDict().FindList("clips")->Clone();
++  return value->GetDict().FindList(key)->Clone();
++}
++
++}  // namespace
++
++base::ListValue GoldenClips(const base::FilePath& testdata) {
++  return ReadList(testdata.Append("golden.json"), "clips");
++}
++
++base::ListValue MtGoldenCases(const base::FilePath& testdata) {
++  return ReadList(testdata.Append("mt_golden.json"), "cases");
+ }
+ 
+ }  // namespace tark_captions::test
