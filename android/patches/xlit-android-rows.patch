@@ -264,45 +264,28 @@
    EnsureWorker();
  
    std::vector<std::string> tags;
-@@ -297,6 +326,45 @@
+@@ -297,6 +326,28 @@
                             weak_ptr_factory_.GetWeakPtr(), request_id_,
                             std::move(*request)));
  }
 +
 +#if BUILDFLAG(IS_ANDROID)
 +void TarkTransliterationProvider::AddOfferMatch(const Request& request) {
-+  const TemplateURLService* template_url_service =
-+      client_->GetTemplateURLService();
-+  const TemplateURL* engine =
-+      request.keyword_mode
-+          ? template_url_service->GetTemplateURLForKeyword(
-+                request.engine_keyword)
-+          : template_url_service->GetDefaultSearchProvider();
-+  if (!engine) {
-+    return;
-+  }
 +  const tark_xlit::Language& language = *request.languages.front();
-+  // A search for what was typed, so that the row is harmless if it is ever
-+  // chosen without Java's offer; the language's name is the description.
-+  SearchSuggestionParser::SuggestResult suggestion(
-+      /*suggestion=*/request.text, AutocompleteMatchType::SEARCH_SUGGEST,
-+      /*suggest_type=*/omnibox::TYPE_NATIVE_CHROME, /*subtypes=*/{},
-+      /*match_contents=*/request.text,
-+      /*match_contents_prefix=*/std::u16string(),
-+      /*annotation=*/std::u16string(language.native_name),
-+      /*deletion_url=*/std::string(),
-+      /*from_keyword=*/request.keyword_mode,
-+      /*navigational_intent=*/omnibox::NAV_INTENT_NONE, kOfferRelevance,
-+      /*relevance_from_server=*/false, /*should_prefetch=*/false,
-+      /*should_prerender=*/false, /*input_text=*/request.text);
-+  AutocompleteMatch match = BaseSearchProvider::CreateSearchSuggestion(
-+      this, request.input, /*in_keyword_mode=*/request.keyword_mode,
-+      suggestion, engine, template_url_service->search_terms_data(),
-+      TemplateURLRef::NO_SUGGESTION_CHOSEN,
-+      /*append_extra_query_params_from_command_line=*/!request.keyword_mode,
-+      client_->GetAcceptLanguages());
++  AutocompleteMatch match(this, kOfferRelevance, /*deletable=*/false,
++                          AutocompleteMatchType::SEARCH_SUGGEST);
++  // Its own address: a search for what was typed would have the "search for"
++  // row's URL, and the two would be merged into one. Java opens the offer and
++  // never loads it.
++  match.destination_url =
++      GURL(base::StrCat({"chrome://tark-xlit-offer/", language.tag}));
++  match.fill_into_edit = request.input.text();
++  match.contents = request.text;
++  match.contents_class.emplace_back(0, ACMatchClassification::NONE);
++  // The language's own name, which Java puts into "Type in हिन्दी?".
++  match.description = std::u16string(language.native_name);
++  match.description_class.emplace_back(0, ACMatchClassification::DIM);
 +  match.allowed_to_be_default_match = false;
-+  match.inline_autocompletion.clear();
 +  match.RecordAdditionalInfo(kOfferInfoKey, std::string(language.tag));
 +  matches_.push_back(std::move(match));
 +}
@@ -332,6 +315,18 @@
    // The worker's reply: one entry per language of `request`, nullopt where
    // nothing changed.
    void OnPhrases(uint64_t request_id,
+--- a/components/omnibox/browser/autocomplete_match.cc
++++ b/components/omnibox/browser/autocomplete_match.cc
+@@ -1710,7 +1710,8 @@
+ 
+   // Tark's Indian-language rows (TarkTransliterationProvider) carry their
+   // language name as the description; the engine name must not replace it.
+-  if (additional_info.contains("tark_xlit_lang")) {
++  if (additional_info.contains("tark_xlit_lang") ||
++      additional_info.contains("tark_xlit_offer")) {
+     return true;
+   }
+ 
 --- a/components/omnibox/browser/autocomplete_match_android.cc
 +++ b/components/omnibox/browser/autocomplete_match_android.cc
 @@ -131,6 +131,17 @@

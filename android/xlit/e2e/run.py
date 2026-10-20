@@ -93,8 +93,11 @@ class Device:
         self.run('logcat', '-c')
         self.shell('am', 'start', '-n', f'{PACKAGE}/com.google.android.apps.chrome.Main')
         time.sleep(6)
-        # A fresh profile asks about notifications first.
-        tap_text(self, 'Don’t allow', tries=2)
+        # A fresh profile asks about notifications first: Tark's own sheet,
+        # then Android's.
+        if 'notification_permission_rationale' in self.screen():
+            tap_text(self, 'No thanks', tries=2)
+            tap_text(self, 'Don’t allow', tries=2)
 
     def teardown(self):
         self.shell('rm', '-f', '/data/local/tmp/chrome-command-line')

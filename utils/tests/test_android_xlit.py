@@ -156,6 +156,20 @@ class TestRowsPatch(unittest.TestCase):
         self.assertIn('kOfferRelevance = 1296', provider)
         self.assertIn('tark_xlit::ShouldOffer(', provider)
 
+    def test_offer_row_has_its_own_address(self):
+        # Found on the emulator: a search for what was typed has the verbatim
+        # row's URL, and Chromium merges the two, so the offer never showed.
+        provider = self.section('components/omnibox/browser/tark_transliteration_provider.cc')
+        offer = provider[provider.index('::AddOfferMatch('):]
+        offer = offer[:offer.index('\n+}\n')]
+        self.assertIn('"chrome://tark-xlit-offer/"', offer)
+        self.assertNotIn('CreateSearchSuggestion', offer)
+
+    def test_offer_row_keeps_its_language_name(self):
+        # The engine's name must not replace the description ("Type in Shodhya?").
+        match = self.section('components/omnibox/browser/autocomplete_match.cc')
+        self.assertIn('additional_info.contains("tark_xlit_offer")', match)
+
     def test_jni_carries_both_fields(self):
         self.assertIn('Java_AutocompleteMatch_setTarkXlit(', self.section('components/omnibox/browser/autocomplete_match_android.cc'))
         java = self.section('components/omnibox/browser/android/java/src/org/chromium/components/omnibox/AutocompleteMatch.java')
