@@ -83,7 +83,7 @@ class TestOfflineNewTab(unittest.TestCase):
         mac = (REPO / 'patches' / 'tarka' / 'core' / 'offline-new-tab.patch').read_text().lower()
         palette = (ANDROID / 'patches' / 'look-paper-palette.patch').read_text()
         css = {'light': mac.split('@media')[0], 'dark': mac.split('@media')[1]}
-        for name in ('raised', 'rule', 'soft', 'amber', 'coral', 'indigo'):
+        for name in ('paper', 'raised', 'rule', 'soft', 'amber', 'coral', 'indigo'):
             for mode in ('light', 'dark'):
                 value = re.search(rf'<color name="tark_{name}_{mode}">#(\w+)</color>', palette).group(1)
                 self.assertIn(f'--{name}: #{value.lower()};', css[mode], (name, mode))
@@ -143,6 +143,24 @@ class TestOfflineNewTab(unittest.TestCase):
         java = self.add(NTP + 'NewTabPageCoordinator.java')
         self.assertIn('private static final boolean TARK_OFFLINE_NTP = true;', java)
         self.assertIn('if (TARK_OFFLINE_NTP || mModuleRegistrySupplier.get() == null) {', java)
+
+    def test_page_is_paper(self):
+        # Seen on the emulator: the home surface colour (the page, the feed
+        # surface that hosts it and the toolbar above it) was raised in light
+        # mode, so the raised pill only showed by its hairline. Dark mode
+        # already used colorSurface (paper).
+        light = 'components/browser_ui/widget/android/java/res/color/home_surface_background_color.xml'
+        self.assertIn('<item android:color="?attr/colorSurface"/>', self.add(light))
+        self.assertIn('<item android:color="?attr/colorSurfaceContainerHigh"/>', self.f[light][1])
+        # A4 makes colorSurface paper.
+        palette = (ANDROID / 'patches' / 'look-paper-palette.patch').read_text()
+        self.assertIn('<color name="gm3_baseline_surface_light">#F6F1E7</color>', palette)
+
+    def test_no_customize_sheet(self):
+        # Seen on the emulator: Chromium's one-time "Customize your homepage"
+        # theme sheet; A4 already took Customize new tab page out of the menu.
+        self.assertIn('if (!TARK_OFFLINE_NTP\n                    && NtpCustomizationPromoManager.canTriggerCustomizationBottomSheet(',
+                      self.add(NTP + 'NewTabPageCoordinator.java'))
 
     def test_english_and_hindi(self):
         grd = self.add('chrome/browser/ui/android/strings/android_chrome_strings.grd')
