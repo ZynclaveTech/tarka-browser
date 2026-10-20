@@ -206,3 +206,19 @@ class TestWorkflowHardening(unittest.TestCase):
     def test_the_key_is_never_echoed(self):
         self.assertNotIn('set -x', self.y)
         self.assertNotIn('echo "$TARK_LISTS_SIGNING_KEY"', self.y)
+
+
+class TestKeyOnlyOnMain(unittest.TestCase):
+    """The signing key and AWS are reachable only from main (the user,
+    2026-10-21): the job runs in the "lists" environment, which only main may
+    use and which holds the key; changes to the publishing path need the
+    code owner's review."""
+
+    def test_the_job_runs_in_the_lists_environment(self):
+        self.assertIn('\n    environment: lists\n', WORKFLOW.read_text())
+
+    def test_the_publishing_path_has_a_code_owner(self):
+        owners = (ADBLOCK.parents[1] / '.github' / 'CODEOWNERS').read_text().splitlines()
+        rules = {l.split()[0]: l.split()[1:] for l in owners if l.strip() and not l.startswith('#')}
+        for path in ('/.github/', '/android/adblock/'):
+            self.assertEqual(rules.get(path), ['@soorajpandey'], path)
