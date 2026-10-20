@@ -59,4 +59,10 @@ timeout 8h bash $repo/android/build.sh $stop /tark/work >> $log 2>&1
 code=$?
 echo "exit $code" >> $log
 (( code == 0 )) && upload /tark/work/src/out/Default/apks/ChromePublic.apk ChromePublic.apk
+# A3: the IndicXlit files this APK pins (android/xlit/files.py), for the
+# emulator checks and for publishing on gettarka.com.
+if (( code == 0 )); then
+  tar -czf /tark/xlit-files.tgz -C /tark/work/src/third_party/indicxlit android
+  upload /tark/xlit-files.tgz xlit-files.tgz
+fi
 exit $code

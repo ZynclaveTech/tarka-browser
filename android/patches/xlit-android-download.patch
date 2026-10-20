@@ -563,7 +563,7 @@
 +#endif  // CHROME_BROWSER_TARK_XLIT_XLIT_DOWNLOAD_SERVICE_H_
 --- /dev/null
 +++ b/chrome/browser/tark_xlit/xlit_download_service.cc
-@@ -0,0 +1,330 @@
+@@ -0,0 +1,349 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -573,10 +573,12 @@
 +#include <algorithm>
 +#include <utility>
 +
++#include "base/command_line.h"
 +#include "base/files/file_util.h"
 +#include "base/functional/bind.h"
 +#include "base/logging.h"
 +#include "base/path_service.h"
++#include "base/strings/strcat.h"
 +#include "base/strings/utf_string_conversions.h"
 +#include "base/task/thread_pool.h"
 +#include "chrome/browser/browser_process.h"
@@ -599,6 +601,11 @@
 +namespace {
 +
 +constexpr base::TimeDelta kTimeout = base::Minutes(10);
++
++// For android/xlit/e2e/run.py only: where the files are served instead of
++// gettarka.com. Chrome reads command-line flags from a file only on a
++// debuggable or rooted device, as with A2's --tark-adblock-extra-list.
++constexpr char kBaseUrlSwitch[] = "tark-xlit-base-url";
 +constexpr base::TimeDelta kRetryDelay = base::Seconds(30);
 +
 +constexpr net::NetworkTrafficAnnotationTag kTrafficAnnotation =
@@ -823,7 +830,14 @@
 +  }
 +  current_ = missing.front();
 +  auto request = std::make_unique<network::ResourceRequest>();
-+  request->url = GURL(FileUrl(*current_));
++  const base::CommandLine& command_line =
++      *base::CommandLine::ForCurrentProcess();
++  request->url =
++      command_line.HasSwitch(kBaseUrlSwitch)
++          ? GURL(base::StrCat({command_line.GetSwitchValueASCII(kBaseUrlSwitch),
++                               current_->sha256, ".bin"}))
++          : GURL(FileUrl(*current_));
++  LOG(WARNING) << "tark xlit: downloading " << current_->name;
 +  request->method = "GET";
 +  request->credentials_mode = network::mojom::CredentialsMode::kOmit;
 +  loader_ = network::SimpleURLLoader::Create(std::move(request),
@@ -890,7 +904,12 @@
 +}
 +
 +void XlitDownloadService::UpdateFilesReady() {
-+  SetFilesReady(GetOfferState() == OfferState::kAccepted && Ready(present_));
++  const bool ready =
++      GetOfferState() == OfferState::kAccepted && Ready(present_);
++  if (ready && !FilesReady()) {
++    LOG(WARNING) << "tark xlit: ready";
++  }
++  SetFilesReady(ready);
 +}
 +
 +}  // namespace tark_xlit

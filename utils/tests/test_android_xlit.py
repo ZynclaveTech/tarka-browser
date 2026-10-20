@@ -289,5 +289,38 @@ class TestSiteSearch(unittest.TestCase):
         self.assertIn('omnibox-site-search-on.patch', series())
 
 
+
+class TestE2E(unittest.TestCase):
+    """A3 Task 8: the emulator checks (android/xlit/e2e/run.py)."""
+    def setUp(self):
+        # By path: A2's e2e script is also called run.py.
+        import importlib.util
+        spec = importlib.util.spec_from_file_location('xlit_e2e_run', ROOT / 'android' / 'xlit' / 'e2e' / 'run.py')
+        self.run = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.run)
+
+    def test_every_case_of_the_plan(self):
+        self.assertEqual(set(self.run.CASES),
+                         {'offer', 'decline', 'wifi', 'now', 'rows', 'keyword', 'tamper', 'languages'})
+
+    def test_rows_read_the_label(self):
+        xml = ('<node text="नमस्ते" resource-id="com.gettarka.tarka:id/line_1" />'
+               '<node text="हिन्दी" resource-id="com.gettarka.tarka:id/tark_xlit_label" />'
+               '<node text="namaste" resource-id="com.gettarka.tarka:id/line_1" />')
+        self.assertEqual(self.run.rows(xml)[0], ('नमस्ते', 'हिन्दी'))
+
+    def test_the_build_uploads_the_files_it_pins(self):
+        job = (ROOT / 'android' / 'aws' / 'jobs' / 'tark-build.sh').read_text()
+        self.assertIn('-C /tark/work/src/third_party/indicxlit android', job)
+        self.assertIn('upload /tark/xlit-files.tgz xlit-files.tgz', job)
+
+    def test_served_under_their_hashes(self):
+        tmp = pathlib.Path(tempfile.mkdtemp())
+        (tmp / 'xlit-model.bin').write_bytes(b'model')
+        digest = hashlib.sha256(b'model').hexdigest()
+        (tmp / 'files.json').write_text(json.dumps({'xlit-model.bin': {'size': 5, 'sha256': digest}}))
+        self.assertEqual(self.run.load_files(tmp), {digest + '.bin': 'xlit-model.bin'})
+
+
 if __name__ == '__main__':
     unittest.main()
