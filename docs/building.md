@@ -386,8 +386,8 @@ unpacked to `build/src/third_party/sparkle` by `dev.sh setup` and
   IndicConformer encoder, CTC decoder, vocabulary, language masks, Silero
   VAD, the mel window and matrix) from IndicConformer's `assets/` and
   `silero_vad.onnx`. Tark reads it from
-  `~/Library/Application Support/Tark/Captions/models` (Phase 1; downloads
-  come in Phase 4).
+  `~/Library/Application Support/Tark/Captions/models`, and downloads what
+  is missing from gettarka.com (Phase 4, below).
 - **Tests:** set `TARK_CAPTIONS_ORT` (the dylib under
   `third_party/tark_onnxruntime/lib`), `TARK_CAPTIONS_MODELS` (the models
   folder) and `TARK_CAPTIONS_TESTDATA` (`resources/captions/testdata`), then
@@ -439,3 +439,23 @@ unpacked to `build/src/third_party/sparkle` by `dev.sh setup` and
   1.12 GB with captions and one direction, 1.47 GB with both).
   `--romanize` prints the test captions in English letters to review the
   spellings.
+- **Model downloads (Phase 4):** three units: captions (IndicConformer +
+  Silero VAD), to English (`it2_indic_en/`), from English (`it2_en_indic/`).
+  `utils/captions_manifest.py MODELS_DIR
+  components/tark_captions/model_manifest.cc` writes the table of every
+  file's size and SHA-256 compiled into Tark; `--check` compares a folder
+  with it. `CaptionModelStore` downloads a unit's files from
+  `https://gettarka.com/models/captions/v1/` (no cookies, system network
+  context), checks each hash in `.download/`, then moves them in and writes
+  `.ready-<unit>`. The pill waits for a missing unit with a progress bar;
+  Settings › Accessibility › Live captions downloads, cancels and removes
+  them. `--tark-captions-models-url=http://127.0.0.1:PORT/models/captions/v1/`
+  points a test copy at a local server. Every published name has an
+  extension: gettarka.com serves a path without one as `<path>/index.html`
+  (so the IndicTrans2 licences ship as `LICENSE.txt`).
+- **Publishing the models:** `utils/publish_caption_models.sh MODELS_DIR`
+  (`--dry-run` first) checks the folder against the manifest, uploads each
+  file once to the site bucket with an immutable cache header and its hash
+  as metadata, and reads every file back through CloudFront. v1 never
+  changes: new models go to `v2/` with a new manifest. gettarka-site's
+  `publish.sh` keeps `models/` out of its `--delete` sync.
