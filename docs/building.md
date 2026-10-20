@@ -377,3 +377,38 @@ unpacked to `build/src/third_party/sparkle` by `dev.sh setup` and
   library validation. Bump: new version and hash in the ini, the dylib name
   in `install_onnxruntime.sh` and `sign_and_package_app.sh`, and check
   github.com/microsoft/onnxruntime/security/advisories first.
+- **Telemetry stays off.** Microsoft's builds send telemetry unless
+  `ORT_DISABLE_TELEMETRY=1` is set before the library loads;
+  `components/tark_captions/ort_runtime.cc` sets it and also calls
+  `DisableTelemetryEvents`, and refuses to run if that call fails.
+- **The models** are not in the repository. `utils/captions_export.py export
+  MODELS_DIR SILERO_VAD OUT_DIR` writes the folder the engine loads (int8
+  IndicConformer encoder, CTC decoder, vocabulary, language masks, Silero
+  VAD, the mel window and matrix) from IndicConformer's `assets/` and
+  `silero_vad.onnx`. Tark reads it from
+  `~/Library/Application Support/Tark/Captions/models` (Phase 1; downloads
+  come in Phase 4).
+- **Tests:** set `TARK_CAPTIONS_ORT` (the dylib under
+  `third_party/tark_onnxruntime/lib`), `TARK_CAPTIONS_MODELS` (the models
+  folder) and `TARK_CAPTIONS_TESTDATA` (`resources/captions/testdata`), then
+  run `out/Default/tark_captions_unittests` (engine) and
+  `out/Default/tark_speech_unittests` (the speech service's recognizer).
+  `golden.json` there comes from `captions_export.py golden`; the clips are
+  FLEURS (CC-BY-4.0, test data only, see `ATTRIBUTION.md`).
+- **Bench:** `out/Default/tark_captions_bench` with the same variables plays
+  the test clips through the engine in real time and prints cores used,
+  decode times and draft lag (Phase 1: 0.23 cores, draft lag 0.51 s).
+- **Trying a call without a second device:** serve
+  `resources/captions/testdata` on `127.0.0.1:8765` and open
+  `loopback.html?clip=hi_1.wav`, which plays a clip as the remote side of a
+  same-page WebRTC call. Give the test profile
+  `{"webrtc":{"ip_handling_policy":"default"}}` in `Default/Preferences`
+  (Tark hides local addresses, so the loopback never connects otherwise),
+  grant the page the microphone, and launch with
+  `--use-fake-device-for-media-stream`. Starting the microphone puts the tab
+  in a call and the pill appears; `--vmodule=call_captions_tab_helper=1`
+  logs each caption's kind and size (never its text).
+- **Credits:** `utils/install_captions_credits.sh` (run by `dev.sh` and
+  `build.sh`) puts `README.chromium` and `LICENSE` for ONNX Runtime,
+  IndicConformer and Silero VAD under `third_party/`, from
+  `resources/captions/credits/`, for about:credits.

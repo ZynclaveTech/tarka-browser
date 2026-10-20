@@ -10,6 +10,7 @@ _download_cache="$_root_dir/build/download_cache"
 _src_dir="$_root_dir/build/src"
 _main_repo="$_root_dir/ungoogled-chromium"
 source "$_root_dir/utils/install_xlit.sh"
+source "$_root_dir/utils/install_captions_credits.sh"
 
 # Clone to get the Chromium Source
 clone=true
@@ -96,6 +97,7 @@ python3 "$_main_repo/utils/downloads.py" unpack -i "$_root_dir/downloads-sparkle
 # Tark: ONNX Runtime for live captions (D4); installed into the app when it is signed.
 python3 "$_main_repo/utils/downloads.py" retrieve -i "$_root_dir/downloads-onnxruntime.ini" -c "$_download_cache"
 python3 "$_main_repo/utils/downloads.py" unpack -i "$_root_dir/downloads-onnxruntime.ini" -c "$_download_cache" "$_src_dir"
+_install_captions_credits
 python3 "$_root_dir/utils/ublock_key.py" "$_src_dir/third_party/ublock/manifest.json" "$_root_dir/resources/ublock/key.txt"
 
 # Tark: IndicXlit weights and word lists for the address bar (D1).
