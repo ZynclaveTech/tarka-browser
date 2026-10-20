@@ -89,6 +89,18 @@ else
   rm -f "$_ort"
 fi
 
+# Tark (D4 Phase 3): the Swift library over macOS 26's speech and translation
+# (the Apple languages in live captions), built by GN next to Tark.app.
+# Signed below with Tark's identity; the browser loads it on macOS 26 only.
+_apple_src="${TARKA_APPLE_SPEECH_DYLIB:-$(dirname "$_app")/libtark_apple_speech.dylib}"
+_apple="$_app/Contents/Frameworks/libtark_apple_speech.dylib"
+if [[ -f "$_apple_src" ]]; then
+  "$_root_dir/utils/install_apple_speech.sh" "$_app" "$_apple_src"
+else
+  warning "No $_apple_src: this build has no Apple languages in live captions"
+  rm -f "$_apple"
+fi
+
 # Fix issue where macOS requests permission for incoming network connections
 # See https://github.com/ungoogled-software/ungoogled-chromium-macos/issues/17
 xattr -cs "$_app"
@@ -126,6 +138,9 @@ if [[ -d "$_sparkle" ]]; then
 fi
 if [[ -f "$_ort" ]]; then
   sign --identifier "libonnxruntime" --options runtime "$_ort"
+fi
+if [[ -f "$_apple" ]]; then
+  sign --identifier "libtark_apple_speech" --options runtime "$_apple"
 fi
 if (( _dev )); then
   _profile="${TARKA_PROVISIONING_PROFILE:?set TARKA_PROVISIONING_PROFILE to the development profile}"
