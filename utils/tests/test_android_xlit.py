@@ -117,5 +117,60 @@ class TestFilesPatch(unittest.TestCase):
         self.assertIn('xlit-words-ta.bin', sh)
 
 
+
+class TestRowsPatch(unittest.TestCase):
+    """A3 Task 3: the provider on Android, the offer row, rows Java can tell
+    apart (the language label on the right, as on the Mac)."""
+    def setUp(self):
+        self.patch = (PATCHES / 'xlit-android-rows.patch').read_text()
+
+    def section(self, path):
+        parts = self.patch.split('--- ')
+        return ''.join(p for p in parts if f'+++ b/{path}' in p)
+
+    def test_in_the_android_series_after_the_files(self):
+        s = series()
+        self.assertLess(s.index('xlit-android-files.patch'), s.index('xlit-android-rows.patch'))
+
+    def test_provider_built_on_android(self):
+        self.assertIn('+  if (is_mac || is_android) {', self.section('components/omnibox/browser/BUILD.gn'))
+        controller = self.section('components/omnibox/browser/autocomplete_controller.cc')
+        self.assertEqual(controller.count('+#if BUILDFLAG(IS_MAC) || BUILDFLAG(IS_ANDROID)'), 3)
+
+    def test_classifier_adds_query_tile_on_android(self):
+        classifier = self.section('components/omnibox/browser/autocomplete_classifier.cc')
+        # Right after TYPE_TAB_GROUP, which only the Android block lists.
+        self.assertIn(' AutocompleteProvider::TYPE_TAB_GROUP |\n+      // Tark (A3): Indian-language rows, as on macOS.\n'
+                      '+      AutocompleteProvider::TYPE_QUERY_TILE |', classifier)
+
+    def test_provider_waits_for_the_download(self):
+        provider = self.section('components/omnibox/browser/tark_transliteration_provider.cc')
+        self.assertIn('tark_xlit::FilesReady()', provider)
+        self.assertIn('kOfferInfoKey[] = "tark_xlit_offer"', provider)
+        self.assertIn('kOfferRelevance = 1296', provider)
+        self.assertIn('tark_xlit::ShouldOffer(', provider)
+
+    def test_jni_carries_both_fields(self):
+        self.assertIn('Java_AutocompleteMatch_setTarkXlit(', self.section('components/omnibox/browser/autocomplete_match_android.cc'))
+        java = self.section('components/omnibox/browser/android/java/src/org/chromium/components/omnibox/AutocompleteMatch.java')
+        self.assertIn('private void setTarkXlit(', java)
+        self.assertIn('public boolean isTarkTransliteration()', java)
+        self.assertIn('public @Nullable String getTarkXlitOfferTag()', java)
+
+    def test_label_drawn_at_the_right_and_read_out(self):
+        self.assertIn('@+id/tark_xlit_label', self.section('chrome/browser/ui/android/omnibox/java/res/layout/omnibox_basic_suggestion.xml'))
+        processor = self.section('chrome/browser/ui/android/omnibox/java/src/org/chromium/chrome/browser/omnibox/suggestions/basic/BasicSuggestionProcessor.java')
+        self.assertIn('SuggestionViewProperties.TARK_XLIT_LABEL', processor)
+        self.assertIn('TarkXlitOffer.show(', processor)
+        self.assertIn('TARK_XLIT_LABEL', self.section('chrome/browser/ui/android/omnibox/java/src/org/chromium/chrome/browser/omnibox/suggestions/basic/SuggestionViewViewBinder.java'))
+
+    def test_offer_strings_in_english_and_hindi(self):
+        grd = self.section('chrome/browser/ui/android/strings/android_chrome_strings.grd')
+        self.assertIn('name="IDS_TARK_XLIT_OFFER"', grd)
+        self.assertIn('Type in <ph name="LANGUAGE">%1$s<ex>हिन्दी</ex></ph>?', grd)
+        xtb = self.section('chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb')
+        self.assertIn('<ph name="LANGUAGE"/> में टाइप करें?', xtb)
+
+
 if __name__ == '__main__':
     unittest.main()
