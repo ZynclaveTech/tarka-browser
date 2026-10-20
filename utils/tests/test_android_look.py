@@ -379,3 +379,28 @@ class TestSettingsPadding(unittest.TestCase):
         self.assertIn('-        mHorizontalMargin = mDefaultMargin;', patch)
         self.assertIn('+        mHorizontalMargin = 0;', patch)
         self.assertIn('\nlook-settings-padding.patch\n', (ANDROID / 'patches' / 'series').read_text())
+
+
+class TestTarkHelp(unittest.TestCase):
+    """A3 (the user: "Open Tark help on gettarka.com"): every help and
+    feedback entry opened Google's Chrome help (support.google.com)."""
+
+    def setUp(self):
+        self.patch = (ANDROID / 'patches' / 'look-help-on-gettarka.patch').read_text()
+
+    def test_help_goes_to_gettarka(self):
+        self.assertIn('+    String FALLBACK_SUPPORT_URL = "https://gettarka.com/help/android/";', self.patch)
+        self.assertIn('-    String FALLBACK_SUPPORT_URL = "https://support.google.com/chrome/topic/6069782";', self.patch)
+        self.assertNotIn('+    String P_LINK_URL_PREFIX = "https://support.google.com', self.patch)
+
+    def test_each_screen_opens_its_own_section(self):
+        self.assertIn('+    String P_LINK_URL_PREFIX = "https://gettarka.com/help/android/#";', self.patch)
+        # Always the section for the screen, whatever Chrome's flags say.
+        self.assertNotIn('USE_P_LINK_IN_HELP', '\n'.join(l for l in self.patch.splitlines() if l.startswith('+')))
+        self.assertIn('replaceAll("[^a-z0-9_-]", "")', self.patch)
+
+    def test_feedback_goes_to_its_section(self):
+        self.assertIn('FALLBACK_SUPPORT_URL + "#feedback"', self.patch)
+
+    def test_in_the_series(self):
+        self.assertIn('\nlook-help-on-gettarka.patch\n', (ANDROID / 'patches' / 'series').read_text())
