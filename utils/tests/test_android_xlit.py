@@ -212,6 +212,12 @@ class TestDownloadPatch(unittest.TestCase):
         self.assertIn('tark_xlit::XlitDownloadService::Get();', self.section('chrome/browser/chrome_browser_main_android.cc'))
         self.assertIn('tark_xlit::XlitDownloadService::RegisterPrefs(registry);', self.section('chrome/browser/prefs/browser_prefs.cc'))
 
+    def test_the_dialog_can_use_the_browser_alert_style(self):
+        # Found building A3: R.style.ThemeOverlay_BrowserUI_AlertDialog lives in
+        # browser_ui/widget's resources.
+        build = self.section('chrome/browser/tark_xlit/android/BUILD.gn')
+        self.assertIn('"//components/browser_ui/widget/android:java_resources"', build)
+
     def test_the_dialog_offers_wifi_now_and_no(self):
         offer = self.section('chrome/browser/tark_xlit/android/java/src/org/chromium/chrome/browser/tark_xlit/TarkXlitOffer.java')
         for s in ('tark_xlit_download_on_wifi', 'tark_xlit_download_now', 'tark_xlit_no_thanks'):
