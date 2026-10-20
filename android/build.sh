@@ -237,4 +237,6 @@ run ninja -C "$_src_dir/out/Default" chrome/browser/tark_adblock:host_unittests
 run "$_src_dir/out/Default/clang_x64/tark_adblock_unittests"
 run ninja -C "$_src_dir/out/Default" components/tark_xlit:host_unittests
 run "$_src_dir/out/Default/clang_x64/tark_xlit_unittests"
+run ninja -C "$_src_dir/out/Default" chrome/browser/tark_xlit:host_unittests
+run "$_src_dir/out/Default/clang_x64/tark_xlit_files_unittests"
 log "built $_src_dir/out/Default/apks/ChromePublic.apk"

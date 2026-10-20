@@ -172,5 +172,72 @@ class TestRowsPatch(unittest.TestCase):
         self.assertIn('<ph name="LANGUAGE"/> में टाइप करें?', xtb)
 
 
+
+class TestDownloadPatch(unittest.TestCase):
+    """A3 Task 4: the download, only after the person says yes."""
+    def setUp(self):
+        self.patch = (PATCHES / 'xlit-android-download.patch').read_text()
+
+    def section(self, path):
+        return ''.join(p for p in self.patch.split('--- ') if f'+++ b/{path}' in p)
+
+    def test_in_the_android_series_after_the_rows(self):
+        s = series()
+        self.assertLess(s.index('xlit-android-rows.patch'), s.index('xlit-android-download.patch'))
+
+    def test_only_gettarka_without_cookies(self):
+        service = self.section('chrome/browser/tark_xlit/xlit_download_service.cc')
+        self.assertIn('DefineNetworkTrafficAnnotation("tark_xlit_download"', service)
+        self.assertIn('destination_other: "gettarka.com"', service)
+        self.assertIn('cookies_allowed: NO', service)
+        self.assertIn('CredentialsMode::kOmit', service)
+        files = self.section('chrome/browser/tark_xlit/xlit_files.cc')
+        self.assertIn('"https://gettarka.com/xlit/android/v1/"', files)
+
+    def test_no_redirects_and_a_timeout(self):
+        service = self.section('chrome/browser/tark_xlit/xlit_download_service.cc')
+        self.assertIn('SetOnRedirectCallback(', service)
+        self.assertIn('SetTimeoutDuration(kTimeout)', service)
+
+    def test_written_to_part_then_checked_then_renamed(self):
+        service = self.section('chrome/browser/tark_xlit/xlit_download_service.cc')
+        self.assertIn('".part"', service)
+        self.assertIn('VerifyFile(part, file) && base::ReplaceFile(part, target, nullptr)', service)
+
+    def test_nothing_fetched_until_accepted(self):
+        service = self.section('chrome/browser/tark_xlit/xlit_download_service.cc')
+        self.assertIn('GetOfferState() != OfferState::kAccepted) {\n+    return;', service)
+
+    def test_started_with_the_browser_and_prefs_registered(self):
+        self.assertIn('tark_xlit::XlitDownloadService::Get();', self.section('chrome/browser/chrome_browser_main_android.cc'))
+        self.assertIn('tark_xlit::XlitDownloadService::RegisterPrefs(registry);', self.section('chrome/browser/prefs/browser_prefs.cc'))
+
+    def test_the_dialog_offers_wifi_now_and_no(self):
+        offer = self.section('chrome/browser/tark_xlit/android/java/src/org/chromium/chrome/browser/tark_xlit/TarkXlitOffer.java')
+        for s in ('tark_xlit_download_on_wifi', 'tark_xlit_download_now', 'tark_xlit_no_thanks'):
+            self.assertIn('R.string.' + s, offer)
+        self.assertIn('TarkXlitBridge.accept(/* now= */ false)', offer)
+
+    def test_strings_in_english_and_hindi(self):
+        grd = self.section('chrome/browser/ui/android/strings/android_chrome_strings.grd')
+        for name in ('IDS_TARK_XLIT_OFFER_MESSAGE', 'IDS_TARK_XLIT_DOWNLOAD_ON_WIFI', 'IDS_TARK_XLIT_DOWNLOAD_NOW',
+                     'IDS_TARK_XLIT_NO_THANKS', 'IDS_TARK_CONNECTS_XLIT'):
+            self.assertIn(f'name="{name}"', grd)
+        xtb = self.section('chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb')
+        for i in ('8851795724424030803', '854019961256078494', '8273905181216423293', '8533623660476485480'):
+            self.assertIn(f'<translation id="{i}">', xtb)
+        # "No thanks" is already in the Hindi file; a second copy would clash.
+        self.assertNotIn('id="780301667611848630"', xtb)
+
+    def test_listed_in_what_tark_connects_to(self):
+        self.assertIn('android:summary="@string/tark_connects_xlit"', self.section('chrome/android/java/res/xml/privacy_preferences.xml'))
+
+    def test_files_unit_tests_run_on_the_machine(self):
+        self.assertIn('tark_xlit_files_unittests($host_toolchain)', self.section('chrome/browser/tark_xlit/BUILD.gn'))
+        sh = (ROOT / 'android' / 'build.sh').read_text()
+        self.assertIn('chrome/browser/tark_xlit:host_unittests', sh)
+        self.assertIn('clang_x64/tark_xlit_files_unittests', sh)
+
+
 if __name__ == '__main__':
     unittest.main()
