@@ -1,0 +1,184 @@
+--- a/chrome/browser/accessibility/live_caption/live_caption_speech_recognition_host.cc
++++ b/chrome/browser/accessibility/live_caption/live_caption_speech_recognition_host.cc
+@@ -222,6 +222,11 @@
+ 
+ void LiveCaptionSpeechRecognitionHost::OnLanguageIdentificationEvent(
+     media::mojom::LanguageIdentificationEventPtr event) {
++  // Tark (D4 Phase 3): the language the call's client speaks, for its tab.
++  if (CallCaptionsTabHelper* tab = GetTarkCallCaptions()) {
++    tab->OnLanguageDetected(event->language);
++    return;
++  }
+   LiveCaptionController* live_caption_controller = GetLiveCaptionController();
+   if (!live_caption_controller)
+     return;
+--- a/chrome/browser/speech/speech_recognition_client_browser_interface.h
++++ b/chrome/browser/speech/speech_recognition_client_browser_interface.h
+@@ -102,9 +102,10 @@
+   mojo::RemoteSet<media::mojom::SpeechRecognitionBrowserObserver>
+       live_caption_availability_observers_;
+ 
+-  // Tark (D4): tabs with call captions on, and their language.
++  // Tark (D4): tabs with call captions on, and their language ("auto":
++  // the speech process listens for it first, D4 Phase 3).
+   int tark_captions_tabs_ = 0;
+-  std::string tark_captions_language_ = "hi";
++  std::string tark_captions_language_ = "auto";
+ 
+   mojo::ReceiverSet<media::mojom::SpeechRecognitionClientBrowserInterface>
+       speech_recognition_client_browser_interface_;
+--- a/chrome/browser/tark_captions/call_captions_tab_helper.cc
++++ b/chrome/browser/tark_captions/call_captions_tab_helper.cc
+@@ -44,8 +44,8 @@
+   Captioning().Release(this);
+   if (holds_models_) {
+     for (tark_captions::ModelUnit unit :
+-         {tark_captions::ModelUnit::kCaptions, tark_captions::ModelUnit::kToEnglish,
+-          tark_captions::ModelUnit::kFromEnglish}) {
++         {tark_captions::ModelUnit::kLanguageId, tark_captions::ModelUnit::kCaptions,
++          tark_captions::ModelUnit::kToEnglish, tark_captions::ModelUnit::kFromEnglish}) {
+       tark_captions::TarkCaptionModels().SetInUse(unit, false);
+     }
+   }
+@@ -74,6 +74,7 @@
+ void CallCaptionsTabHelper::SetLanguage(tark_captions::Language language) {
+   const bool was_other_script = !effective_show_in().empty();
+   language_ = language;
++  client_language_.Choose(tark_captions::LanguageCode(language));
+   // Results asked in the old language are not shown; captions waiting keep
+   // the language they were heard in.
+   render_queue_.ChoicesChanged();
+@@ -86,6 +87,42 @@
+     }
+   }
+   UpdateModelsInUse();
++  observers_.Notify(&Observer::OnClientLanguageChanged, this);
++  observers_.Notify(&Observer::OnCallStateChanged, this);
++}
++
++void CallCaptionsTabHelper::ChooseAutoDetect() {
++  client_language_.ChooseAuto();
++  render_queue_.ChoicesChanged();
++  if (state_.captions_on()) {
++    Profile* profile = Profile::FromBrowserContext(GetWebContents().GetBrowserContext());
++    if (auto* speech =
++            SpeechRecognitionClientBrowserInterfaceFactory::GetForProfile(profile)) {
++      speech->OnTarkCaptionsLanguageChanged(client_language_.recognizer_code());
++    }
++  }
++  UpdateModelsInUse();
++  observers_.Notify(&Observer::OnClientLanguageChanged, this);
++  observers_.Notify(&Observer::OnCallStateChanged, this);
++}
++
++void CallCaptionsTabHelper::OnLanguageDetected(const std::string& code) {
++  if (!state_.captions_on()) {
++    return;
++  }
++  VLOG(1) << "Tark captions: the client speaks \"" << code << "\"";
++  const std::string before = client_language_.code();
++  client_language_.Detected(code);
++  if (client_language_.code() == before) {
++    return;  // Picked by the user, already locked, or "und".
++  }
++  if (client_language_.state() == tark_captions::ClientLanguage::State::kCaptioning) {
++    // The speech process already captions it; captions come after this.
++    language_ = *tark_captions::LanguageFromCode(client_language_.code());
++    render_queue_.ChoicesChanged();
++  }
++  UpdateModelsInUse();
++  observers_.Notify(&Observer::OnClientLanguageChanged, this);
+   observers_.Notify(&Observer::OnCallStateChanged, this);
+ }
+ 
+@@ -261,6 +298,10 @@
+   const bool was_on = state_.captions_on();
+   state_.OnMicCapturing(is_capturing_audio);
+   VLOG(1) << "Tark captions: in_call=" << state_.in_call();
++  if (!state_.in_call()) {
++    // The client's language is never remembered past the call.
++    client_language_.ChooseAuto();
++  }
+   if (was_on && !state_.captions_on()) {
+     CaptionsChanged(was_on);
+   }
+@@ -281,7 +322,12 @@
+         tark_captions::TargetFromCode(translate_to()).value_or(tark_captions::Target::kEnglish));
+   }
+   tark_captions::CaptionModelStore& models = tark_captions::TarkCaptionModels();
+-  models.SetInUse(tark_captions::ModelUnit::kCaptions, on);
++  // Detection and the captions engine both listen through the VAD in the
++  // language_id unit; Tark's own captions model only for its languages.
++  models.SetInUse(tark_captions::ModelUnit::kLanguageId, on);
++  models.SetInUse(tark_captions::ModelUnit::kCaptions,
++                  on && client_language_.state() ==
++                            tark_captions::ClientLanguage::State::kCaptioning);
+   for (tark_captions::ModelUnit unit :
+        {tark_captions::ModelUnit::kToEnglish, tark_captions::ModelUnit::kFromEnglish}) {
+     models.SetInUse(unit, std::ranges::find(translation, unit) != translation.end());
+@@ -302,7 +348,7 @@
+   speech::SpeechRecognitionClientBrowserInterface* speech =
+       SpeechRecognitionClientBrowserInterfaceFactory::GetForProfile(profile);
+   if (speech) {
+-    speech->OnTarkCaptionsChanged(/*on=*/!was_on, tark_captions::LanguageCode(language_));
++    speech->OnTarkCaptionsChanged(/*on=*/!was_on, client_language_.recognizer_code());
+   }
+ }
+ 
+--- a/chrome/browser/tark_captions/call_captions_tab_helper.h
++++ b/chrome/browser/tark_captions/call_captions_tab_helper.h
+@@ -15,6 +15,7 @@
+ #include "chrome/browser/media/webrtc/media_stream_capture_indicator.h"
+ #include "components/tark_captions/asr_model.h"
+ #include "components/tark_captions/call_state.h"
++#include "components/tark_captions/client_language.h"
+ #include "components/tark_captions/render_queue.h"
+ #include "media/mojo/mojom/tark_caption_translator.mojom.h"
+ #include "mojo/public/cpp/bindings/remote.h"
+@@ -40,6 +41,9 @@
+                            bool is_final,
+                            const std::string& text) {}
+     virtual void OnCaptionsUnavailable(CallCaptionsTabHelper* tab) {}
++    // The client's language was detected or picked, or Auto-detect began
++    // again (client_language()).
++    virtual void OnClientLanguageChanged(CallCaptionsTabHelper* tab) {}
+     // A caption in the script the user reads and, with Translate on, its
+     // translation (Phase 2). Sent instead of OnCaption's text when
+     // renders() is true; `translation_failed` when the translation models
+@@ -58,10 +62,16 @@
+   bool in_call() const { return state_.in_call(); }
+   bool captions_on() const { return state_.captions_on(); }
+   bool hidden() const { return state_.hidden(); }
++  // The language Tark's own captions decode: the one detected or picked.
+   tark_captions::Language language() const { return language_; }
++  // D4 Phase 3: Auto-detect, or what was detected or picked, for this call.
++  const tark_captions::ClientLanguage& client_language() const { return client_language_; }
+ 
+   void SetCaptionsOn(bool on);
++  // The user picked the client's language for this call.
+   void SetLanguage(tark_captions::Language language);
++  // The user picked "Auto-detect" again: listen afresh.
++  void ChooseAutoDetect();
+   void HideForThisCall();
+ 
+   // Translate is per call: off when a call starts and when captions go off.
+@@ -82,6 +92,9 @@
+   // From the speech recognition host of one of this tab's frames.
+   void OnCaption(const media::SpeechRecognitionResult& result);
+   void OnCaptionsError();
++  // The speech process heard which language the client speaks ("und" when
++  // it couldn't tell).
++  void OnLanguageDetected(const std::string& code);
+ 
+   void AddObserver(Observer* observer);
+   void RemoveObserver(Observer* observer);
+@@ -121,6 +134,9 @@
+ 
+   tark_captions::CallState state_;
+   tark_captions::Language language_ = tark_captions::Language::kHindi;
++  // Part A: macOS's own captions (Part B) are not wired yet, so an Apple
++  // language is shown as unavailable.
++  tark_captions::ClientLanguage client_language_{/*apple_available=*/false};
+   scoped_refptr<MediaStreamCaptureIndicator> indicator_;
+   base::ScopedObservation<MediaStreamCaptureIndicator,
+                           MediaStreamCaptureIndicator::Observer>

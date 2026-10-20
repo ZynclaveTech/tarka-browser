@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/components/tark_captions/detection_policy.h
-@@ -0,0 +1,45 @@
+@@ -0,0 +1,49 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -37,6 +37,10 @@
 +  std::string code;  // Empty when unsure. Urdu is reported as "hi".
 +};
 +
++// What Tark can do with a language code ("hi", "es", "te", "sw"...): never
++// kUnsure. Urdu counts as Hindi.
++Detection::Kind KindOfLanguage(const std::string& code);
++
 +// `logits`: the language detector's scores, one per label, for the first
 +// `speech_seconds` of the client's speech.
 +Detection DecideLanguage(base::span<const float> logits,
@@ -48,7 +52,7 @@
 +#endif  // COMPONENTS_TARK_CAPTIONS_DETECTION_POLICY_H_
 --- /dev/null
 +++ b/components/tark_captions/detection_policy.cc
-@@ -0,0 +1,88 @@
+@@ -0,0 +1,90 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -122,18 +126,20 @@
 +      }
 +    }
 +  }
-+  Detection out;
-+  out.code = code;
-+  if (In(kCaptioned, code)) {
-+    out.kind = Detection::Kind::kCaption;
-+  } else if (In(kApple, code)) {
-+    out.kind = Detection::Kind::kApple;
-+  } else if (In(kPlanned, code)) {
-+    out.kind = Detection::Kind::kPlanned;
-+  } else {
-+    out.kind = Detection::Kind::kUnsupported;
++  return {KindOfLanguage(code), code};
++}
++
++Detection::Kind KindOfLanguage(const std::string& code) {
++  if (code == "ur" || In(kCaptioned, code)) {
++    return Detection::Kind::kCaption;
 +  }
-+  return out;
++  if (In(kApple, code)) {
++    return Detection::Kind::kApple;
++  }
++  if (In(kPlanned, code)) {
++    return Detection::Kind::kPlanned;
++  }
++  return Detection::Kind::kUnsupported;
 +}
 +
 +}  // namespace tark_captions
@@ -837,12 +843,240 @@
 +
 +}  // namespace
 +}  // namespace tark_captions
+--- /dev/null
++++ b/components/tark_captions/client_language.h
+@@ -0,0 +1,64 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef COMPONENTS_TARK_CAPTIONS_CLIENT_LANGUAGE_H_
++#define COMPONENTS_TARK_CAPTIONS_CLIENT_LANGUAGE_H_
++
++#include <cstdint>
++#include <string>
++
++namespace tark_captions {
++
++// The language the client speaks on one call (D4 Phase 3): Auto-detect
++// until the speech process says which (it locks; it never switches by
++// itself), or the language the user picked, which wins over a detection
++// still on its way. Never remembered past the call.
++class ClientLanguage {
++ public:
++  enum class State {
++    kDetecting,         // Auto-detect, nothing decided yet.
++    kCaptioning,        // Tark's own captions (hi, ta, bn).
++    kApple,             // macOS 26 captions it.
++    kAppleUnavailable,  // macOS captions it, but not this Mac (before 26).
++    kPlanned,           // An Indian language not listed yet.
++    kUnsupported,       // Tark can't caption it.
++  };
++
++  explicit ClientLanguage(bool apple_available);
++  ClientLanguage(const ClientLanguage&) = delete;
++  ClientLanguage& operator=(const ClientLanguage&) = delete;
++  ~ClientLanguage();
++
++  // Auto-detect: a new call, or "Auto-detect" picked again.
++  void ChooseAuto();
++  // The user picked `code` for this call.
++  void Choose(const std::string& code);
++  // The speech process heard `code` ("und": it couldn't tell). Ignored once
++  // a language is locked or picked.
++  void Detected(const std::string& code);
++
++  State state() const { return state_; }
++  // "" while detecting.
++  const std::string& code() const { return code_; }
++  bool automatic() const { return automatic_; }
++  // Locked by detection (the pill says "· detected").
++  bool detected() const { return automatic_ && !code_.empty(); }
++  // Bumped by every choice, so answers about an older one can be dropped.
++  uint64_t generation() const { return generation_; }
++  // What the recognizer is told: "auto" until a language is known.
++  std::string recognizer_code() const { return code_.empty() ? "auto" : code_; }
++
++ private:
++  void Set(const std::string& code);
++
++  const bool apple_available_;
++  State state_ = State::kDetecting;
++  std::string code_;
++  bool automatic_ = true;
++  uint64_t generation_ = 0;
++};
++
++}  // namespace tark_captions
++
++#endif  // COMPONENTS_TARK_CAPTIONS_CLIENT_LANGUAGE_H_
+--- /dev/null
++++ b/components/tark_captions/client_language.cc
+@@ -0,0 +1,54 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/tark_captions/client_language.h"
++
++#include "components/tark_captions/detection_policy.h"
++
++namespace tark_captions {
++
++ClientLanguage::ClientLanguage(bool apple_available) : apple_available_(apple_available) {}
++
++ClientLanguage::~ClientLanguage() = default;
++
++void ClientLanguage::ChooseAuto() {
++  ++generation_;
++  automatic_ = true;
++  code_.clear();
++  state_ = State::kDetecting;
++}
++
++void ClientLanguage::Choose(const std::string& code) {
++  ++generation_;
++  automatic_ = false;
++  Set(code);
++}
++
++void ClientLanguage::Detected(const std::string& code) {
++  if (!automatic_ || !code_.empty() || code == "und" || code.empty()) {
++    return;
++  }
++  Set(code);
++}
++
++void ClientLanguage::Set(const std::string& code) {
++  code_ = code == "ur" ? "hi" : code;
++  switch (KindOfLanguage(code_)) {
++    case Detection::Kind::kCaption:
++      state_ = State::kCaptioning;
++      break;
++    case Detection::Kind::kApple:
++      state_ = apple_available_ ? State::kApple : State::kAppleUnavailable;
++      break;
++    case Detection::Kind::kPlanned:
++      state_ = State::kPlanned;
++      break;
++    case Detection::Kind::kUnsure:
++    case Detection::Kind::kUnsupported:
++      state_ = State::kUnsupported;
++      break;
++  }
++}
++
++}  // namespace tark_captions
+--- /dev/null
++++ b/components/tark_captions/client_language_unittest.cc
+@@ -0,0 +1,99 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/tark_captions/client_language.h"
++
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace tark_captions {
++namespace {
++
++using State = ClientLanguage::State;
++
++TEST(ClientLanguageTest, StartsDetecting) {
++  ClientLanguage language(/*apple_available=*/true);
++  EXPECT_EQ(language.state(), State::kDetecting);
++  EXPECT_TRUE(language.automatic());
++  EXPECT_EQ(language.code(), "");
++  EXPECT_EQ(language.recognizer_code(), "auto");
++}
++
++TEST(ClientLanguageTest, DetectedTamilCaptions) {
++  ClientLanguage language(true);
++  language.Detected("ta");
++  EXPECT_EQ(language.state(), State::kCaptioning);
++  EXPECT_EQ(language.code(), "ta");
++  EXPECT_TRUE(language.detected());
++  // Captions off and on again in the same call keep what was heard.
++  EXPECT_EQ(language.recognizer_code(), "ta");
++}
++
++TEST(ClientLanguageTest, ManualChoiceBeatsLateDetection) {
++  ClientLanguage language(true);
++  language.Choose("bn");
++  language.Detected("ta");
++  EXPECT_EQ(language.state(), State::kCaptioning);
++  EXPECT_EQ(language.code(), "bn");
++  EXPECT_FALSE(language.detected());
++  EXPECT_FALSE(language.automatic());
++}
++
++TEST(ClientLanguageTest, DetectionLocks) {
++  ClientLanguage language(true);
++  language.Detected("ta");
++  language.Detected("hi");
++  EXPECT_EQ(language.code(), "ta");
++}
++
++TEST(ClientLanguageTest, AutoAgainRedetects) {
++  ClientLanguage language(true);
++  language.Choose("hi");
++  const uint64_t before = language.generation();
++  language.ChooseAuto();
++  EXPECT_EQ(language.state(), State::kDetecting);
++  EXPECT_GT(language.generation(), before);
++  EXPECT_EQ(language.recognizer_code(), "auto");
++  language.Detected("bn");
++  EXPECT_EQ(language.code(), "bn");
++}
++
++TEST(ClientLanguageTest, AppleLanguageWithoutAppleSpeech) {
++  ClientLanguage language(/*apple_available=*/false);
++  language.Detected("es");
++  EXPECT_EQ(language.state(), State::kAppleUnavailable);
++  EXPECT_EQ(language.code(), "es");
++}
++
++TEST(ClientLanguageTest, AppleLanguageWithAppleSpeech) {
++  ClientLanguage language(true);
++  language.Detected("es");
++  EXPECT_EQ(language.state(), State::kApple);
++}
++
++TEST(ClientLanguageTest, UrduShownAsHindi) {
++  ClientLanguage language(true);
++  language.Detected("ur");
++  EXPECT_EQ(language.state(), State::kCaptioning);
++  EXPECT_EQ(language.code(), "hi");
++}
++
++TEST(ClientLanguageTest, UndeterminedKeepsDetecting) {
++  ClientLanguage language(true);
++  language.Detected("und");
++  EXPECT_EQ(language.state(), State::kDetecting);
++  EXPECT_FALSE(language.detected());
++}
++
++TEST(ClientLanguageTest, PlannedAndUnsupported) {
++  ClientLanguage telugu(true);
++  telugu.Detected("te");
++  EXPECT_EQ(telugu.state(), State::kPlanned);
++  ClientLanguage swahili(true);
++  swahili.Detected("sw");
++  EXPECT_EQ(swahili.state(), State::kUnsupported);
++  EXPECT_EQ(swahili.code(), "sw");
++}
++
++}  // namespace
++}  // namespace tark_captions
 --- a/components/tark_captions/BUILD.gn
 +++ b/components/tark_captions/BUILD.gn
-@@ -23,13 +23,21 @@
+@@ -23,13 +23,23 @@
      "caption_model_store.h",
      "caption_text.cc",
      "caption_text.h",
++    "client_language.cc",
++    "client_language.h",
 +    "detection_policy.cc",
 +    "detection_policy.h",
      "indic_text.cc",
@@ -861,10 +1095,11 @@
      "ort_runtime.cc",
      "ort_runtime.h",
      "render_queue.cc",
-@@ -78,9 +86,13 @@
+@@ -78,9 +88,14 @@
      "caption_engine_unittest.cc",
      "caption_model_store_unittest.cc",
      "caption_text_unittest.cc",
++    "client_language_unittest.cc",
 +    "detection_policy_unittest.cc",
      "indic_text_unittest.cc",
 +    "language_detector_unittest.cc",
