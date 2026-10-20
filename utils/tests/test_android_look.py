@@ -52,6 +52,12 @@ class TestPaperPalette(unittest.TestCase):
         self.assertIn('<item name="colorOnSurface">@color/tark_ink_light</item>', self.add)
         self.assertIn('<item name="colorOutlineVariant">@color/tark_rule_dark</item>', self.add)
 
+    def test_controls_keep_3_to_1(self):
+        # Final review: colorOutline draws off switches and field borders; the
+        # rule colour gave 1.3:1. Faint keeps 5:1; hairlines stay on rule.
+        self.assertIn('<item name="colorOutline">@color/tark_faint_light</item>', self.add)
+        self.assertIn('<item name="colorOutline">@color/tark_faint_dark</item>', self.add)
+
     def test_no_dynamic_colour(self):
         self.assertIn('private static final boolean TARK_DYNAMIC_COLORS = false;', self.add)
         self.assertIn('if (TARK_DYNAMIC_COLORS && shouldApplyDynamicColors()) {', self.add)
@@ -78,6 +84,9 @@ class TestAddressBar(unittest.TestCase):
         # MenuButton cast the icon to BitmapDrawable: a vector would crash it.
         self.assertIn('-                (BitmapDrawable)', self.p)
         self.assertIn('-        ImageViewCompat.setImageTintList(mMenuImageButton, tintList);', self.p)
+        # Final review: a vector fills its bounds (no gravity): the mark is
+        # centred at its own size, or it stretches while the toolbar slides.
+        self.assertIn('mMenuImageButtonAnimationDrawable.getIntrinsicWidth()', self.add)
 
     def test_mark_vectors(self):
         for name in ('tark_mark_menu.xml', 'tark_mark_24dp.xml'):
@@ -149,6 +158,11 @@ class TestMenu(unittest.TestCase):
         self.assertIn('handler.onItemClick(item)', self.add)
         self.assertIn('R.id.tark_tiles_menu_id', self.add)
 
+    def test_tiles_height_is_known_to_the_menu(self):
+        # Final review: without a sizing supplier the menu counts the tiles as
+        # one 48dp row and ends early.
+        self.assertIn('customSizingSuppliers.append(', self.add.split('TabbedAppMenuItemType.TARK_TILES,')[1][:600])
+
 
 class TestTabSwitcher(unittest.TestCase):
     def setUp(self):
@@ -176,6 +190,8 @@ class TestSettings(unittest.TestCase):
             self.assertIn(f'removePreferenceIfPresent({key});', self.add)
         # Safety check is Google's checks.
         self.assertIn('-        return !DeviceInfo.isAutomotive();', self.p)
+        # Final review: Settings search no longer finds them.
+        self.assertIn('indexData.removeEntry(getUniqueId(PREF_GOOGLE_SERVICES));', self.add)
 
     def test_header_with_tiles(self):
         self.assertIn('mTarkHeader.setOrder(-1);', self.add)

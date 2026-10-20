@@ -170,7 +170,7 @@ def _xtb(lang, *translations):
 
 def test_hindi_gets_tark_words_and_old_translations_stay():
     out = util.replace_xtb_tree(_xtb('hi', ('961856697154696964', 'ब्राउज़िंग डेटा मिटाएं'),
-                                     ('4165986682804962316', 'साइट सेटिंग')), {})
+                                     ('4165986682804962316', 'साइट सेटिंग')), {}, android=True)
     # The old ids stay: other messages share their English text ("Site settings").
     assert '<translation id="961856697154696964">ब्राउज़िंग डेटा मिटाएं</translation>' in out
     assert '<translation id="7602233293931907714">इतिहास और साइट का डेटा मिटाएं</translation>' in out
@@ -178,14 +178,14 @@ def test_hindi_gets_tark_words_and_old_translations_stay():
 
 
 def test_other_languages_keep_their_word_under_the_new_id():
-    out = util.replace_xtb_tree(_xtb('ta', ('961856697154696964', 'உலாவல் தரவை நீக்கு')), {})
+    out = util.replace_xtb_tree(_xtb('ta', ('961856697154696964', 'உலாவல் தரவை நீக்கு')), {}, android=True)
     assert '<translation id="7602233293931907714">உலாவல் தரவை நீக்கு</translation>' in out
 
 
 def test_an_existing_translation_is_not_duplicated():
     # "Passwords" is already a message: its own translation stays the only one.
     out = util.replace_xtb_tree(_xtb('ta', ('6247557882553405851', 'Google கடவுச்சொல் நிர்வாகி'),
-                                     ('7029809446516969842', 'கடவுச்சொற்கள்')), {})
+                                     ('7029809446516969842', 'கடவுச்சொற்கள்')), {}, android=True)
     assert out is None or out.count('id="7029809446516969842"') == 1
     assert out is None or '<translation id="7029809446516969842">கடவுச்சொற்கள்</translation>' in out
 
@@ -205,9 +205,20 @@ def test_rename_ids_match_grit():
     util.add_grit_to_path(pathlib.Path(tree))
     grd = ('<grit><release><messages><message name="IDS_CLEAR_BROWSING_DATA_TITLE" desc="d">\n'
            '        Delete browsing data\n      </message></messages></release></grit>')
-    out, _ = util.replace_grit_tree(grd)
+    out, _ = util.replace_grit_tree(grd, android=True)
     assert 'Clear history and site data' in out
     for english, old_id, new_id, _ in util.MESSAGE_RENAMES.values():
         m = xml.Element('message')
         m.text = english
         assert util.compute_fp(m) == new_id, english
+
+
+def test_renames_only_in_android_strings():
+    # Final review: IDS_CLEAR_BROWSING_DATA_TITLE also lives in the desktop
+    # .grd; the Mac's strings must not change.
+    assert util.is_android_strings('chrome/browser/ui/android/strings/android_chrome_strings.grd')
+    assert util.is_android_strings('components/browser_ui/strings/android/translations/browser_ui_strings_hi.xtb')
+    assert not util.is_android_strings('chrome/app/generated_resources.grd')
+    assert not util.is_android_strings('chrome/app/resources/generated_resources_hi.xtb')
+    out = util.replace_xtb_tree(_xtb('hi', ('961856697154696964', 'ब्राउज़िंग डेटा मिटाएं')), {}, android=False)
+    assert out is None

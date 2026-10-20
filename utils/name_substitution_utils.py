@@ -77,6 +77,12 @@ MESSAGE_RENAMES = {
 }
 
 
+def is_android_strings(path):
+    """Whether a .grd/.grdp/.xtb path holds Android UI strings, the only ones
+    MESSAGE_RENAMES applies to (the Mac's strings stay as they are)."""
+    return '/android/' in '/' + str(path)
+
+
 def has_message_renames(text):
     """Whether a .grd/.grdp text holds a message MESSAGE_RENAMES renames."""
     return any(f'name="{name}"' in text for name in MESSAGE_RENAMES)
@@ -245,14 +251,15 @@ def get_parser():
     return xml.XMLParser(target=xml.TreeBuilder(insert_comments=True))
 
 
-def replace_grit_tree(text):
+def replace_grit_tree(text, android=False):
     """Replaces instances of Chrom(e | ium) with Tark, where desired"""
     xml_tree = xml.fromstring(text, get_parser())
     fp_map = {}
 
     for message in xml_tree.findall('.//message'):
         old_fp = compute_fp(message)
-        rename_message(message)
+        if android:
+            rename_message(message)
         if replace_grit_message(message):
             new_fp = compute_fp(message)
             if old_fp != new_fp:
@@ -279,13 +286,14 @@ def dedup_translations_in_place(translation, seen):
     seen.add(translation_id)
 
 
-def replace_xtb_tree(text, fp_map):
+def replace_xtb_tree(text, fp_map, android=False):
     """Same as replace_grit_tree(), but on .xtb translation files."""
     xml_tree = xml.fromstring(text, get_parser())
     changed = False
     ids_seen = set()
 
-    changed |= copy_renamed_translations(xml_tree)
+    if android:
+        changed |= copy_renamed_translations(xml_tree)
     for translation in xml_tree.findall('.//translation'):
         assert translation.get('id')
         changed |= replace_xtb_translation(translation, fp_map)
