@@ -156,7 +156,7 @@
 +#endif  // CHROME_BROWSER_TARK_CAPTIONS_APPLE_TARK_APPLE_SPEECH_H_
 --- /dev/null
 +++ b/chrome/browser/tark_captions/apple/tark_apple_speech.swift
-@@ -0,0 +1,281 @@
+@@ -0,0 +1,289 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -226,24 +226,30 @@
 +  let identifier = String(cString: locale)
 +  let context = bits(ctx)
 +  Task {
++    var ok: Int32 = 1
++    var watch: Task<Void, Never>? = nil
 +    do {
 +      if let request = try await AssetInventory.assetInstallationRequest(
 +        supporting: [makeTranscriber(identifier)])
 +      {
-+        let watch = Task {
++        watch = Task {
 +          while !Task.isCancelled {
 +            progress(ptr(context), request.progress.fractionCompleted)
 +            try? await Task.sleep(for: .milliseconds(500))
 +          }
 +        }
-+        defer { watch.cancel() }
 +        try await request.downloadAndInstall()
 +      }
-+      progress(ptr(context), 1)
-+      done(ptr(context), 1)
 +    } catch {
-+      done(ptr(context), 0)
++      ok = 0
 +    }
++    // No progress after `done`: done is the caller's last use of ctx.
++    watch?.cancel()
++    await watch?.value
++    if ok == 1 {
++      progress(ptr(context), 1)
++    }
++    done(ptr(context), ok)
 +  }
 +}
 +
@@ -320,7 +326,9 @@
 +
 +  func append(_ samples: [Float]) {
 +    queue.async {
-+      if self.stopping {
++      // Stopped, or failed: nothing will read it, so nothing is kept.
++      if self.stopping || self.reportedFailure {
++        self.pending.removeAll()
 +        return
 +      }
 +      if self.converter == nil {

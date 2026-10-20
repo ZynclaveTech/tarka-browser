@@ -131,7 +131,7 @@
 +    return;
 +  }
 +  base::ThreadPool::PostTask(
-+      FROM_HERE, {base::MayBlock(), base::TaskPriority::BEST_EFFORT}, base::BindOnce([] {
++      FROM_HERE, {base::MayBlock(), base::TaskPriority::USER_VISIBLE}, base::BindOnce([] {
 +        std::unique_ptr<AppleSpeechLibrary> library = Load(
 +            base::apple::OuterBundlePath().Append("Contents").Append("Frameworks").Append(
 +                "libtark_apple_speech.dylib"));
@@ -159,7 +159,7 @@
 +}  // namespace tark_captions
 --- /dev/null
 +++ b/chrome/browser/tark_captions/apple_captioner.h
-@@ -0,0 +1,95 @@
+@@ -0,0 +1,100 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -221,8 +221,9 @@
 +  void OnLocaleStatus(int status);
 +  void OnProgress(double fraction);
 +  void OnInstalled(bool ok);
-+  void OnResult(bool is_final, std::string text);
-+  void OnFailed(int code);
++  void OnResult(uint64_t transcriber, bool is_final, std::string text);
++  void OnFailed(uint64_t transcriber, int code);
++  void StopTranscribing();
 +  void SetStatus(Status status, double fraction = 0);
 +  void StartTranscribing();
 +
@@ -234,6 +235,10 @@
 +  double fraction_ = 0;
 +  scoped_refptr<Context> context_;
 +  void* transcriber_ = nullptr;
++  // Which transcriber the library's answers are about (a new one after
++  // Retry); answers about an older one are dropped.
++  uint64_t transcriber_id_ = 0;
++  scoped_refptr<Context> transcriber_context_;
 +  std::vector<float> waiting_;  // Audio before the transcriber started.
 +  base::WeakPtrFactory<AppleCaptioner> weak_factory_{this};
 +};
@@ -257,7 +262,7 @@
 +#endif  // CHROME_BROWSER_TARK_CAPTIONS_APPLE_CAPTIONER_H_
 --- /dev/null
 +++ b/chrome/browser/tark_captions/apple_captioner.cc
-@@ -0,0 +1,295 @@
+@@ -0,0 +1,321 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -308,8 +313,10 @@
 +// to the captioner's sequence. One reference per call still to answer.
 +class AppleCaptioner::Context : public base::RefCountedThreadSafe<Context> {
 + public:
-+  Context(scoped_refptr<base::SequencedTaskRunner> runner, base::WeakPtr<AppleCaptioner> owner)
-+      : runner_(std::move(runner)), owner_(std::move(owner)) {}
++  Context(scoped_refptr<base::SequencedTaskRunner> runner,
++          base::WeakPtr<AppleCaptioner> owner,
++          uint64_t transcriber = 0)
++      : runner_(std::move(runner)), owner_(std::move(owner)), transcriber_(transcriber) {}
 +
 +  // Passed to the library as its `ctx`, with a reference the answer drops.
 +  void* Lend() {
@@ -336,12 +343,14 @@
 +  }
 +  static void Result(void* ctx, int is_final, const char* text) {
 +    Context* c = static_cast<Context*>(ctx);
-+    c->runner_->PostTask(FROM_HERE, base::BindOnce(&AppleCaptioner::OnResult, c->owner_,
-+                                                   is_final == 1, std::string(text ? text : "")));
++    c->runner_->PostTask(FROM_HERE,
++                         base::BindOnce(&AppleCaptioner::OnResult, c->owner_, c->transcriber_,
++                                        is_final == 1, std::string(text ? text : "")));
 +  }
 +  static void Failed(void* ctx, int code) {
 +    Context* c = static_cast<Context*>(ctx);
-+    c->runner_->PostTask(FROM_HERE, base::BindOnce(&AppleCaptioner::OnFailed, c->owner_, code));
++    c->runner_->PostTask(FROM_HERE, base::BindOnce(&AppleCaptioner::OnFailed, c->owner_,
++                                                   c->transcriber_, code));
 +  }
 +  static void Stopped(void* ctx) { static_cast<Context*>(ctx)->Release(); }
 +
@@ -351,6 +360,7 @@
 +
 +  const scoped_refptr<base::SequencedTaskRunner> runner_;
 +  const base::WeakPtr<AppleCaptioner> owner_;
++  const uint64_t transcriber_;
 +};
 +
 +AppleCaptioner::AppleCaptioner(AppleSpeechLibrary* library,
@@ -367,9 +377,14 @@
 +}
 +
 +AppleCaptioner::~AppleCaptioner() {
++  StopTranscribing();
++}
++
++void AppleCaptioner::StopTranscribing() {
 +  if (transcriber_) {
 +    // The library flushes, then drops the transcriber's reference.
-+    library_->functions().transcriber_stop(transcriber_, &Context::Stopped);
++    library_->functions().transcriber_stop(std::exchange(transcriber_, nullptr),
++                                           &Context::Stopped);
 +  }
 +}
 +
@@ -380,6 +395,11 @@
 +}
 +
 +void AppleCaptioner::OnAudio(const std::vector<float>& pcm16k_mono) {
++  // From the speech process: never an empty chunk to the library, nothing
++  // while failed (until Retry).
++  if (pcm16k_mono.empty() || status_ == Status::kFailed) {
++    return;
++  }
 +  if (transcriber_) {
 +    library_->functions().transcriber_append(transcriber_, pcm16k_mono.data(),
 +                                             static_cast<int>(pcm16k_mono.size()));
@@ -428,8 +448,11 @@
 +  if (transcriber_) {
 +    return;
 +  }
++  transcriber_context_ = base::MakeRefCounted<Context>(
++      base::SequencedTaskRunner::GetCurrentDefault(), weak_factory_.GetWeakPtr(),
++      ++transcriber_id_);
 +  transcriber_ = library_->functions().transcriber_start(
-+      locale_.c_str(), context_->Lend(), &Context::Result, &Context::Failed);
++      locale_.c_str(), transcriber_context_->Lend(), &Context::Result, &Context::Failed);
 +  SetStatus(Status::kReady);
 +  if (!waiting_.empty()) {
 +    library_->functions().transcriber_append(transcriber_, waiting_.data(),
@@ -438,15 +461,23 @@
 +  }
 +}
 +
-+void AppleCaptioner::OnResult(bool is_final, std::string text) {
++void AppleCaptioner::OnResult(uint64_t transcriber, bool is_final, std::string text) {
++  if (transcriber != transcriber_id_ || !transcriber_) {
++    return;
++  }
 +  // Never the text: call content stays out of logs.
 +  VLOG(1) << "Tark captions: macOS " << (is_final ? "final" : "draft") << ", " << text.size()
 +          << " bytes";
 +  on_event_.Run(is_final, text);
 +}
 +
-+void AppleCaptioner::OnFailed(int code) {
++void AppleCaptioner::OnFailed(uint64_t transcriber, int code) {
++  if (transcriber != transcriber_id_ || !transcriber_) {
++    return;
++  }
 +  VLOG(1) << "Tark captions: macOS speech failed, code " << code;
++  StopTranscribing();
++  waiting_.clear();
 +  SetStatus(Status::kFailed);
 +}
 +
@@ -555,7 +586,7 @@
 +}  // namespace tark_captions
 --- /dev/null
 +++ b/chrome/browser/tark_captions/apple_captioner_unittest.cc
-@@ -0,0 +1,217 @@
+@@ -0,0 +1,250 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -589,6 +620,9 @@
 +  void* install_ctx = nullptr;
 +  int installs = 0;
 +  size_t appended = 0;
++  int appends = 0;
++  int starts = 0;
++  tark_apple_failed_fn failed = nullptr;
 +  bool stopped = false;
 +  int handle = 0;
 +};
@@ -607,13 +641,18 @@
 +    g_fake->install_done = done;
 +  };
 +  f.transcriber_start = [](const char* locale, void* ctx, tark_apple_result_fn result,
-+                           tark_apple_failed_fn) -> void* {
++                           tark_apple_failed_fn failed) -> void* {
++    ++g_fake->starts;
 +    g_fake->started_locale = locale;
 +    g_fake->ctx = ctx;
 +    g_fake->result = result;
++    g_fake->failed = failed;
 +    return &g_fake->handle;
 +  };
-+  f.transcriber_append = [](void*, const float*, int count) { g_fake->appended += count; };
++  f.transcriber_append = [](void*, const float*, int count) {
++    ++g_fake->appends;
++    g_fake->appended += count;
++  };
 +  f.transcriber_stop = [](void*, tark_apple_stopped_fn stopped) {
 +    g_fake->stopped = true;
 +    stopped(g_fake->ctx);
@@ -771,42 +810,102 @@
 +  EXPECT_EQ(done.Get<0>(), AppleRenderError::kTranslationLanguageMissing);
 +}
 +
++// The transcriber failing (its format or model went away): it is stopped,
++// audio is dropped meanwhile, and Retry starts a new one.
++TEST_F(AppleCaptionerTest, TranscriberFailureThenRetry) {
++  Start("es");
++  ASSERT_TRUE(base::test::RunUntil([&] { return fake_.failed != nullptr; }));
++  fake_.failed(fake_.ctx, 1);
++  ASSERT_TRUE(base::test::RunUntil(
++      [&] { return statuses_.back() == AppleCaptioner::Status::kFailed; }));
++  EXPECT_TRUE(fake_.stopped);
++  captioner_->OnAudio(std::vector<float>(1600, 0.1f));
++  EXPECT_EQ(fake_.appended, 0u);
++  captioner_->Retry();
++  ASSERT_TRUE(base::test::RunUntil([&] { return fake_.starts == 2; }));
++  EXPECT_EQ(statuses_.back(), AppleCaptioner::Status::kReady);
++}
++
++// The speech process is less trusted than the browser: an empty chunk never
++// reaches the library (it would pass a null pointer).
++TEST_F(AppleCaptionerTest, EmptyAudioIsIgnored) {
++  Start("es");
++  ASSERT_TRUE(base::test::RunUntil([&] { return fake_.result != nullptr; }));
++  captioner_->OnAudio({});
++  EXPECT_EQ(fake_.appends, 0);
++}
++
 +}  // namespace
 +}  // namespace tark_captions
 --- a/chrome/browser/speech/chrome_speech_recognition_service.cc
 +++ b/chrome/browser/speech/chrome_speech_recognition_service.cc
-@@ -220,12 +220,12 @@
+@@ -94,6 +94,17 @@
+   if (options && !options->language.has_value()) {
+     options->language = language_name;
+   }
++  // Tark (D4 Phase 3): a fresh tap source with every recognizer, so a speech
++  // process restarted after idling (or a crash) can open taps too.
++  if (tark_tap_source_provider_) {
++    LaunchIfNotRunning();
++    if (speech_recognition_service_.is_bound()) {
++      if (mojo::PendingRemote<media::mojom::TarkAudioTapSource> source =
++              tark_tap_source_provider_.Run()) {
++        speech_recognition_service_->BindTarkAudioTapSource(std::move(source));
++      }
++    }
++  }
+ 
+ 
+   BindSodaRecognizer(std::move(receiver), std::move(client), std::move(options),
+@@ -220,13 +231,8 @@
    }
  }
  
 -void ChromeSpeechRecognitionService::BindTarkAudioTap(
 -    mojo::PendingRemote<media::mojom::TarkAudioTap> tap) {
-+void ChromeSpeechRecognitionService::BindTarkAudioTapSource(
-+    mojo::PendingRemote<media::mojom::TarkAudioTapSource> source) {
-   LaunchIfNotRunning();
- 
-   if (speech_recognition_service_.is_bound()) {
+-  LaunchIfNotRunning();
+-
+-  if (speech_recognition_service_.is_bound()) {
 -    speech_recognition_service_->BindTarkAudioTap(std::move(tap));
-+    speech_recognition_service_->BindTarkAudioTapSource(std::move(source));
-   }
+-  }
++void ChromeSpeechRecognitionService::SetTarkTapSourceProvider(TarkTapSourceProvider provider) {
++  tark_tap_source_provider_ = std::move(provider);
  }
  
+ void ChromeSpeechRecognitionService::OnSodaInstalled(
 --- a/chrome/browser/speech/chrome_speech_recognition_service.h
 +++ b/chrome/browser/speech/chrome_speech_recognition_service.h
-@@ -62,8 +62,8 @@
+@@ -62,8 +62,7 @@
    void BindTarkCaptionTranslator(
        mojo::PendingReceiver<media::mojom::TarkCaptionTranslator> receiver)
        override;
 -  void BindTarkAudioTap(
 -      mojo::PendingRemote<media::mojom::TarkAudioTap> tap) override;
-+  void BindTarkAudioTapSource(
-+      mojo::PendingRemote<media::mojom::TarkAudioTapSource> source) override;
++  void SetTarkTapSourceProvider(TarkTapSourceProvider provider) override;
  
    // media::mojom::SpeechRecognitionContext:
    void BindRecognizer(
+@@ -155,6 +154,9 @@
+                           SpeechRecognitionSmallExpertModelInstaller::Observer>
+       speech_recognition_small_expert_model_installer_observer_{this};
+ 
++  // Tark (D4 Phase 3): the captioning tab's tap sources.
++  TarkTapSourceProvider tark_tap_source_provider_;
++
+   base::WeakPtrFactory<ChromeSpeechRecognitionService> weak_factory_{this};
+ };
+ 
 --- a/chrome/browser/speech/speech_recognition_service.h
 +++ b/chrome/browser/speech/speech_recognition_service.h
-@@ -26,9 +26,10 @@
+@@ -9,6 +9,7 @@
+ #include "media/mojo/mojom/speech_recognition_service.mojom.h"
+ #include "mojo/public/cpp/bindings/pending_receiver.h"
+ #include "mojo/public/cpp/bindings/pending_remote.h"
++#include "base/functional/callback.h"
+ 
+ namespace speech {
+ 
+@@ -26,9 +27,13 @@
    virtual void BindTarkCaptionTranslator(
        mojo::PendingReceiver<media::mojom::TarkCaptionTranslator> receiver) {}
  
@@ -814,9 +913,12 @@
 -  // process forwards for the languages macOS captions.
 -  virtual void BindTarkAudioTap(mojo::PendingRemote<media::mojom::TarkAudioTap> tap) {}
 +  // Tark (D4 Phase 3): where the speech process opens taps for the call
-+  // audio of the languages macOS captions.
-+  virtual void BindTarkAudioTapSource(
-+      mojo::PendingRemote<media::mojom::TarkAudioTapSource> source) {}
++  // audio of the languages macOS captions. The captioning tab provides a
++  // source; the service hands the speech process a fresh one with every
++  // recognizer it binds (the process may have restarted). Null: none.
++  using TarkTapSourceProvider =
++      base::RepeatingCallback<mojo::PendingRemote<media::mojom::TarkAudioTapSource>()>;
++  virtual void SetTarkTapSourceProvider(TarkTapSourceProvider provider) {}
  };
  
  }  // namespace speech
@@ -873,7 +975,12 @@
  }
 --- a/chrome/browser/tark_captions/call_captions_tab_helper.cc
 +++ b/chrome/browser/tark_captions/call_captions_tab_helper.cc
-@@ -22,6 +22,12 @@
+@@ -18,10 +18,17 @@
+ #include "chrome/browser/speech/speech_recognition_client_browser_interface.h"
+ #include "chrome/browser/speech/speech_recognition_client_browser_interface_factory.h"
+ #include "components/tark_captions/caption_choices.h"
++#include "components/tark_captions/detection_policy.h"
+ #include "components/tark_captions/model_manifest.h"
  #include "content/public/browser/browser_context.h"
  #include "content/public/browser/web_contents.h"
  #include "media/mojo/mojom/speech_recognition_result.h"
@@ -886,7 +993,7 @@
  
  namespace {
  
-@@ -32,14 +38,27 @@
+@@ -32,14 +39,27 @@
  
  }  // namespace
  
@@ -914,7 +1021,7 @@
  CallCaptionsTabHelper::~CallCaptionsTabHelper() {
    Captioning().Release(this);
    if (holds_models_) {
-@@ -74,6 +93,7 @@
+@@ -74,6 +94,7 @@
  void CallCaptionsTabHelper::SetLanguage(tark_captions::Language language) {
    const bool was_other_script = !effective_show_in().empty();
    language_ = language;
@@ -922,7 +1029,7 @@
    client_language_.Choose(tark_captions::LanguageCode(language));
    // Results asked in the old language are not shown; captions waiting keep
    // the language they were heard in.
-@@ -91,6 +111,28 @@
+@@ -91,6 +112,28 @@
    observers_.Notify(&Observer::OnCallStateChanged, this);
  }
  
@@ -951,7 +1058,7 @@
  void CallCaptionsTabHelper::ChooseAutoDetect() {
    client_language_.ChooseAuto();
    render_queue_.ChoicesChanged();
-@@ -112,6 +154,7 @@
+@@ -112,6 +155,7 @@
    }
    VLOG(1) << "Tark captions: the client speaks \"" << code << "\"";
    const std::string before = client_language_.code();
@@ -959,7 +1066,7 @@
    // Every recognizer in the tab (one per audio player on the call page)
    // hears the lock, or is told it when it heard otherwise.
    if (std::optional<std::string> tell = client_language_.Detected(code)) {
-@@ -154,7 +197,12 @@
+@@ -154,7 +198,12 @@
            << result.transcription.size() << " bytes";
    observers_.Notify(&Observer::OnCaption, this, result.is_final, result.transcription);
    if (renders()) {
@@ -973,7 +1080,7 @@
      Pump();
    }
  }
-@@ -200,6 +248,10 @@
+@@ -200,6 +249,10 @@
  }
  
  std::string CallCaptionsTabHelper::effective_show_in() const {
@@ -984,7 +1091,7 @@
    const std::string code = show_in();
    return code == tark_captions::LanguageCode(language_) ? std::string() : code;
  }
-@@ -234,7 +286,26 @@
+@@ -234,7 +287,26 @@
    if (next->is_final) {
      in_flight_final_ = text;
    }
@@ -1012,7 +1119,7 @@
                        translate_on_ ? translate_to() : std::string(),
                        base::BindOnce(&CallCaptionsTabHelper::OnRendered,
                                       weak_factory_.GetWeakPtr(), next->is_final,
-@@ -260,6 +331,136 @@
+@@ -260,6 +332,164 @@
    Pump();
  }
  
@@ -1063,28 +1170,49 @@
 +#if BUILDFLAG(IS_MAC)
 +  apple_taps_.clear();
 +#endif
-+  if (!bind || !AppleAvailable()) {
++  Profile* profile = Profile::FromBrowserContext(GetWebContents().GetBrowserContext());
++  speech::SpeechRecognitionService* service =
++      SpeechRecognitionServiceFactory::GetForProfile(profile);
++  if (!service) {
 +    return;
 +  }
-+  Profile* profile = Profile::FromBrowserContext(GetWebContents().GetBrowserContext());
-+  if (speech::SpeechRecognitionService* service =
-+          SpeechRecognitionServiceFactory::GetForProfile(profile)) {
-+    service->BindTarkAudioTapSource(tap_source_.BindNewPipeAndPassRemote());
++  if (!bind) {
++    service->SetTarkTapSourceProvider({});
++    return;
 +  }
++  // A fresh source each time the service binds a recognizer; the taps
++  // opened through an older one go on. OpenTap checks that macOS's speech
++  // is here (it may still be loading now).
++  service->SetTarkTapSourceProvider(base::BindRepeating(
++      [](base::WeakPtr<CallCaptionsTabHelper> tab) {
++        mojo::PendingRemote<media::mojom::TarkAudioTapSource> source;
++        if (tab) {
++          tab->tap_source_.reset();
++          source = tab->tap_source_.BindNewPipeAndPassRemote();
++        }
++        return source;
++      },
++      weak_factory_.GetWeakPtr()));
 +}
 +
 +void CallCaptionsTabHelper::OpenTap(const std::string& language,
 +                                    mojo::PendingReceiver<media::mojom::TarkAudioTap> tap) {
 +#if BUILDFLAG(IS_MAC)
++  // From the speech process: only an Apple language, and a few streams.
++  constexpr size_t kMaxTaps = 8;
 +  tark_captions::AppleSpeechLibrary* library = tark_captions::AppleSpeechLibrary::Get();
-+  if (!state_.captions_on() || !library || !library->Available()) {
++  if (!state_.captions_on() || !library || !library->Available() ||
++      tark_captions::KindOfLanguage(language.substr(0, language.find('-'))) !=
++          tark_captions::Detection::Kind::kApple ||
++      apple_taps_.size() >= kMaxTaps) {
 +    return;
 +  }
 +  VLOG(1) << "Tark captions: macOS captions \"" << language << "\"";
 +  auto apple = std::make_unique<AppleTap>();
 +  apple->captioner = std::make_unique<tark_captions::AppleCaptioner>(
 +      library, language,
-+      base::BindRepeating(&CallCaptionsTabHelper::OnAppleCaption, weak_factory_.GetWeakPtr()),
++      base::BindRepeating(&CallCaptionsTabHelper::OnAppleCaption, weak_factory_.GetWeakPtr(),
++                          language),
 +      base::BindRepeating(
 +          [](base::WeakPtr<CallCaptionsTabHelper> tab, tark_captions::AppleCaptioner::Status,
 +             double) {
@@ -1108,7 +1236,14 @@
 +#endif
 +}
 +
-+void CallCaptionsTabHelper::OnAppleCaption(bool is_final, const std::string& text) {
++void CallCaptionsTabHelper::OnAppleCaption(const std::string& language,
++                                           bool is_final,
++                                           const std::string& text) {
++  // Only the call's language: a stream that heard another (before the lock
++  // reached it) shows nothing.
++  if (!client_language_.AcceptsAppleCaptions(language)) {
++    return;
++  }
 +  OnCaption(media::SpeechRecognitionResult(text, is_final));
 +}
 +
@@ -1149,7 +1284,7 @@
  void CallCaptionsTabHelper::StopRendering() {
    translate_on_ = false;
    render_queue_.Clear();
-@@ -309,6 +510,7 @@
+@@ -309,6 +539,7 @@
    if (!state_.in_call()) {
      // The client's language is never remembered past the call.
      client_language_.ChooseAuto();
@@ -1157,7 +1292,17 @@
    }
    if (was_on && !state_.captions_on()) {
      CaptionsChanged(was_on);
-@@ -352,6 +554,8 @@
+@@ -326,7 +557,8 @@
+   holds_models_ = on;
+   std::vector<tark_captions::ModelUnit> translation;
+   if (on && translate_on_) {
+-    translation = tark_captions::UnitsForTranslation(
++    translation = tark_captions::UnitsForTranslating(
++        client_language_,
+         tark_captions::TargetFromCode(translate_to()).value_or(tark_captions::Target::kEnglish));
+   }
+   tark_captions::CaptionModelStore& models = tark_captions::TarkCaptionModels();
+@@ -352,6 +584,8 @@
    if (was_on) {
      StopRendering();
    }
@@ -1259,7 +1404,7 @@
 +  bool AppleAvailable() const;
 +  // The speech process may open taps while captions are on.
 +  void BindTapSource(bool bind);
-+  void OnAppleCaption(bool is_final, const std::string& text);
++  void OnAppleCaption(const std::string& language, bool is_final, const std::string& text);
 +  void OnAppleStatusChanged();
 +  // Tark's own translator for the second hop of an Apple caption's
 +  // translation (English into an Indian language).
@@ -1613,6 +1758,41 @@
 +
  }  // namespace
  }  // namespace speech
+--- a/chrome/tools/build/mac/infoplist_strings_util.cc
++++ b/chrome/tools/build/mac/infoplist_strings_util.cc
+@@ -166,6 +166,11 @@
+         branded_data_pack.get(), lang, IDS_RUNTIME_PERMISSION_OS_REASON_TEXT,
+         "IDS_RUNTIME_PERMISSION_OS_REASON_TEXT");
+ 
++    // Tark (D4 Phase 3): macOS's speech for the Apple languages in captions.
++    std::string speech_recognition_reason = LoadStringFromDataPack(
++        branded_data_pack.get(), lang, IDS_TARK_SPEECH_RECOGNITION_OS_REASON_TEXT,
++        "IDS_TARK_SPEECH_RECOGNITION_OS_REASON_TEXT");
++
+     std::string local_network_access_permission_description =
+         LoadStringFromDataPack(branded_data_pack.get(), lang,
+                                IDS_LOCAL_NETWORK_ACCESS_PERMISSION_DESC,
+@@ -193,6 +198,7 @@
+          local_network_access_permission_description},
+         {"NSLocationUsageDescription", permission_reason},
+         {"NSMicrophoneUsageDescription", permission_reason},
++        {"NSSpeechRecognitionUsageDescription", speech_recognition_reason},
+         {"NSWebBrowserPublicKeyCredentialUsageDescription", permission_reason},
+ 
+         {"\"Chromium Shortcut\"", chromium_shortcut_description},
+--- a/components/tark_captions/client_language.cc
++++ b/components/tark_captions/client_language.cc
+@@ -38,6 +38,10 @@
+   return heard == code_ ? std::nullopt : std::optional<std::string>(recognizer_code());
+ }
+ 
++bool ClientLanguage::AcceptsAppleCaptions(const std::string& tap_language) const {
++  return state_ == State::kApple && tap_language.substr(0, tap_language.find('-')) == code_;
++}
++
+ std::string ClientLanguage::recognizer_code() const {
+   switch (state_) {
+     case State::kDetecting:
 --- a/components/tark_captions/client_language.h
 +++ b/components/tark_captions/client_language.h
 @@ -31,6 +31,9 @@
@@ -1625,7 +1805,18 @@
    // Auto-detect: a new call, or "Auto-detect" picked again.
    void ChooseAuto();
    // The user picked `code` for this call.
-@@ -56,7 +59,7 @@
+@@ -49,6 +52,10 @@
+   bool detected() const { return automatic_ && !code_.empty(); }
+   // Bumped by every choice, so answers about an older one can be dropped.
+   uint64_t generation() const { return generation_; }
++  // Captions macOS made for a tap in `tap_language` ("es", "es-US") belong
++  // to this call: its language is that Apple language.
++  bool AcceptsAppleCaptions(const std::string& tap_language) const;
++
+   // What the recognizers are told: "auto" until a language is known, then
+   // that language, or "none" when nothing on this Mac can caption it.
+   std::string recognizer_code() const;
+@@ -56,7 +63,7 @@
   private:
    void Set(const std::string& code);
  
@@ -1636,7 +1827,7 @@
    bool automatic_ = true;
 --- a/components/tark_captions/client_language_unittest.cc
 +++ b/components/tark_captions/client_language_unittest.cc
-@@ -127,5 +127,15 @@
+@@ -127,5 +127,37 @@
    EXPECT_EQ(apple.recognizer_code(), "es");
  }
  
@@ -1650,7 +1841,143 @@
 +  EXPECT_EQ(language.recognizer_code(), "es");
 +}
 +
++// Cantonese is in the menu on macOS 26 (VoxLingua107 can't detect it).
++TEST(ClientLanguageTest, CantoneseChosenIsApple) {
++  ClientLanguage language(/*apple_available=*/true);
++  language.Choose("yue");
++  EXPECT_EQ(language.state(), State::kApple);
++}
++
++// macOS's captions count only for the language the call has: a stream that
++// heard English while the call is locked to Tamil shows nothing.
++TEST(ClientLanguageTest, AcceptsAppleCaptionsOnlyInItsLanguage) {
++  ClientLanguage spanish(true);
++  spanish.Detected("es");
++  EXPECT_TRUE(spanish.AcceptsAppleCaptions("es"));
++  EXPECT_TRUE(spanish.AcceptsAppleCaptions("es-US"));
++  EXPECT_FALSE(spanish.AcceptsAppleCaptions("en"));
++  ClientLanguage tamil(true);
++  tamil.Detected("ta");
++  EXPECT_FALSE(tamil.AcceptsAppleCaptions("en"));
++  ClientLanguage detecting(true);
++  EXPECT_FALSE(detecting.AcceptsAppleCaptions("es"));
++}
++
  }  // namespace
+ }  // namespace tark_captions
+--- a/components/tark_captions/detection_policy.cc
++++ b/components/tark_captions/detection_policy.cc
+@@ -14,7 +14,9 @@
+ namespace {
+ 
+ constexpr std::string_view kCaptioned[] = {"hi", "ta", "bn"};
+-constexpr std::string_view kApple[] = {"en", "es", "fr", "de", "it", "pt", "ja", "ko", "zh"};
++// yue (Cantonese) is chosen by hand only: VoxLingua107 has no label for it.
++constexpr std::string_view kApple[] = {"en", "es", "fr", "de", "it",
++                                       "pt", "ja", "ko", "zh", "yue"};
+ // IndicConformer covers these too; they are listed once measured.
+ constexpr std::string_view kPlanned[] = {"as", "gu", "kn", "ml", "mr",
+                                          "ne", "pa", "sa", "sd", "te"};
+--- a/components/tark_captions/model_manifest.h
++++ b/components/tark_captions/model_manifest.h
+@@ -41,6 +41,14 @@
+ // Indian target, which goes through English) both.
+ std::vector<ModelUnit> UnitsForTranslation(Target target);
+ 
++class ClientLanguage;
++// What a call needs downloaded (D4 Phase 3). Captions: language_id (the
++// detector and the VAD) always, the captions unit for Tark's own languages.
++std::vector<ModelUnit> UnitsForCaptions(const ClientLanguage& language);
++// Translation: Tark's models for its own languages; for one macOS captions,
++// only English→Indian for an Indian target (Apple translates into English).
++std::vector<ModelUnit> UnitsForTranslating(const ClientLanguage& language, Target target);
++
+ }  // namespace tark_captions
+ 
+ #endif  // COMPONENTS_TARK_CAPTIONS_MODEL_MANIFEST_H_
+--- a/components/tark_captions/model_manifest_unittest.cc
++++ b/components/tark_captions/model_manifest_unittest.cc
+@@ -4,6 +4,8 @@
+ 
+ #include "components/tark_captions/model_manifest.h"
+ 
++#include "components/tark_captions/client_language.h"
++
+ #include <set>
+ #include <string>
+ 
+@@ -72,5 +74,36 @@
+             (std::vector<ModelUnit>{ModelUnit::kToEnglish, ModelUnit::kFromEnglish}));
+ }
+ 
++// What a call needs downloaded (D4 Phase 3): detection always; Tark's
++// captions model only for its own languages; translation models only for
++// what Tark translates itself (macOS translates the Apple languages).
++TEST(ModelManifestTest, UnitsForCaptions) {
++  ClientLanguage automatic(/*apple_available=*/true);
++  EXPECT_EQ(UnitsForCaptions(automatic), std::vector<ModelUnit>{ModelUnit::kLanguageId});
++  ClientLanguage tamil(true);
++  tamil.Choose("ta");
++  EXPECT_EQ(UnitsForCaptions(tamil),
++            (std::vector<ModelUnit>{ModelUnit::kLanguageId, ModelUnit::kCaptions}));
++  ClientLanguage spanish(true);
++  spanish.Choose("es");
++  EXPECT_EQ(UnitsForCaptions(spanish), std::vector<ModelUnit>{ModelUnit::kLanguageId});
++  ClientLanguage detected(true);
++  detected.Detected("bn");
++  EXPECT_EQ(UnitsForCaptions(detected),
++            (std::vector<ModelUnit>{ModelUnit::kLanguageId, ModelUnit::kCaptions}));
++}
++
++TEST(ModelManifestTest, UnitsForTranslating) {
++  ClientLanguage spanish(true);
++  spanish.Detected("es");
++  EXPECT_TRUE(UnitsForTranslating(spanish, Target::kEnglish).empty());
++  EXPECT_EQ(UnitsForTranslating(spanish, Target::kTamil),
++            std::vector<ModelUnit>{ModelUnit::kFromEnglish});
++  ClientLanguage hindi(true);
++  hindi.Detected("hi");
++  EXPECT_EQ(UnitsForTranslating(hindi, Target::kEnglish),
++            UnitsForTranslation(Target::kEnglish));
++}
++
+ }  // namespace
+ }  // namespace tark_captions
+--- a/components/tark_captions/model_units.cc
++++ b/components/tark_captions/model_units.cc
+@@ -4,6 +4,8 @@
+ 
+ #include "components/tark_captions/model_manifest.h"
+ 
++#include "components/tark_captions/client_language.h"
++
+ namespace tark_captions {
+ 
+ int64_t UnitSize(const ModelUnitInfo& info) {
+@@ -27,4 +29,24 @@
+   }
+ }
+ 
++std::vector<ModelUnit> UnitsForCaptions(const ClientLanguage& language) {
++  std::vector<ModelUnit> units = {ModelUnit::kLanguageId};
++  const bool own = language.state() == ClientLanguage::State::kCaptioning ||
++                   (!language.automatic() && language.state() == ClientLanguage::State::kDetecting);
++  if (own) {
++    units.push_back(ModelUnit::kCaptions);
++  }
++  return units;
++}
++
++std::vector<ModelUnit> UnitsForTranslating(const ClientLanguage& language, Target target) {
++  if (language.state() != ClientLanguage::State::kApple) {
++    return UnitsForTranslation(target);
++  }
++  if (target == Target::kEnglish || target == Target::kNone) {
++    return {};
++  }
++  return {ModelUnit::kFromEnglish};
++}
++
  }  // namespace tark_captions
 --- a/components/tark_captions/render_queue.cc
 +++ b/components/tark_captions/render_queue.cc

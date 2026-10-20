@@ -34,7 +34,7 @@ LAST_DECISION = 5.0
 
 # What DetectionPolicy (components/tark_captions/detection_policy.cc) knows.
 CAPTIONED = {'hi', 'ta', 'bn'}
-APPLE = {'en', 'es', 'fr', 'de', 'it', 'pt', 'ja', 'ko', 'zh'}
+APPLE = {'en', 'es', 'fr', 'de', 'it', 'pt', 'ja', 'ko', 'zh', 'yue'}
 # IndicConformer covers these too; they are listed once measured.
 PLANNED = {'as', 'gu', 'kn', 'ml', 'mr', 'ne', 'pa', 'sa', 'sd', 'te'}
 MERGED = {'ur': 'hi'}  # spoken Hindustani: one detection

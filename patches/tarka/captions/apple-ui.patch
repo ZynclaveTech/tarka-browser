@@ -1,3 +1,15 @@
+--- a/chrome/app/chromium_strings.grd
++++ b/chrome/app/chromium_strings.grd
+@@ -1979,6 +1979,9 @@
+         <message name="IDS_LOCAL_NETWORK_ACCESS_PERMISSION_DESC" desc="Text shown in the macOS permission dialog, describing why Chrome needs the permission to access local network.">
+           This will allow you to select from available devices and display content on them.
+         </message>
++        <message name="IDS_TARK_SPEECH_RECOGNITION_OS_REASON_TEXT" desc="Tark (D4 Phase 3): text for the macOS speech recognition permission dialog. Tark uses macOS's on-device speech to caption a call in English, Spanish and other languages, only after the user turns live captions on.">
++          Tark uses this Mac's speech recognition to caption your calls when you turn on live captions. What is said stays on this Mac.
++        </message>
+       </if>
+ 
+       <!-- Side panel strings -->
 --- a/chrome/app/settings_strings.grdp
 +++ b/chrome/app/settings_strings.grdp
 @@ -668,6 +668,9 @@
@@ -109,7 +121,32 @@
  std::u16string ScriptName(const std::string& code) {
    if (code.empty()) {
      return l10n_util::GetStringUTF16(IDS_TARK_CAPTIONS_OWN_SCRIPT);
-@@ -298,15 +303,17 @@
+@@ -249,12 +254,8 @@
+     // Detection (and the captions engine) listen through the language_id
+     // unit; Tark's own captions model is needed once the language is one of
+     // its own.
+-    std::vector<tark_captions::ModelUnit> units = {tark_captions::ModelUnit::kLanguageId};
+-    const tark_captions::ClientLanguage& client = shown_->client_language();
+-    if (!client.automatic() ||
+-        client.state() == tark_captions::ClientLanguage::State::kCaptioning) {
+-      units.push_back(tark_captions::ModelUnit::kCaptions);
+-    }
++    const std::vector<tark_captions::ModelUnit> units =
++        tark_captions::UnitsForCaptions(shown_->client_language());
+     for (tark_captions::ModelUnit unit : units) {
+       if (!tark_captions::TarkCaptionModels().ready(unit)) {
+         WaitForModels(/*for_captions=*/true, /*turn_on=*/true, units);
+@@ -270,7 +271,8 @@
+     return;
+   }
+   if (!shown_->translate_on()) {
+-    std::vector<tark_captions::ModelUnit> units = tark_captions::UnitsForTranslation(
++    std::vector<tark_captions::ModelUnit> units = tark_captions::UnitsForTranslating(
++        shown_->client_language(),
+         tark_captions::TargetFromCode(shown_->translate_to())
+             .value_or(tark_captions::Target::kEnglish));
+     for (tark_captions::ModelUnit unit : units) {
+@@ -298,15 +300,17 @@
    menu_model_->AddTitle(l10n_util::GetStringUTF16(IDS_TARK_CAPTIONS_CLIENT_SPEAKS));
    menu_model_->AddRadioItem(kAutoDetect, l10n_util::GetStringUTF16(IDS_TARK_CAPTIONS_AUTO_DETECT),
                              /*group_id=*/0);
@@ -132,7 +169,7 @@
        menu_model_->AddRadioItem(kShowInFirst + i, ScriptName(kShowInCodes[i]), /*group_id=*/1);
      }
    }
-@@ -347,15 +354,16 @@
+@@ -347,15 +351,16 @@
    if (command_id == kAutoDetect) {
      return shown_->client_language().automatic();
    }
@@ -153,7 +190,17 @@
  }
  
  void TarkCaptionPillController::ExecuteCommand(int command_id, int event_flags) {
-@@ -381,10 +389,10 @@
+@@ -366,7 +371,8 @@
+     shown_->SetTranslateTo(kTranslateToCodes[command_id - kTranslateToFirst]);
+     // An Indian target needs the second translation model too.
+     if (shown_->translate_on()) {
+-      std::vector<tark_captions::ModelUnit> units = tark_captions::UnitsForTranslation(
++      std::vector<tark_captions::ModelUnit> units = tark_captions::UnitsForTranslating(
++          shown_->client_language(),
+           tark_captions::TargetFromCode(shown_->translate_to())
+               .value_or(tark_captions::Target::kEnglish));
+       for (tark_captions::ModelUnit unit : units) {
+@@ -381,10 +387,10 @@
    } else if (command_id == kAutoDetect) {
      shown_->ChooseAutoDetect();
    } else {
@@ -168,7 +215,7 @@
      }
    }
    // What is on screen was written with the old choices.
-@@ -495,10 +503,17 @@
+@@ -495,10 +501,17 @@
    view_->SetMode(mode);
    view_->SetCaptionsOn(target->captions_on());
    view_->SetTranslateState(target->captions_on(), target->translate_on());
@@ -189,7 +236,7 @@
    ShowCaption();
    Reposition();
    if (!widget_->IsVisible()) {
-@@ -517,17 +532,21 @@
+@@ -517,17 +530,21 @@
    const tark_captions::CaptionText::Display display = text_.GetDisplay(kCaptionChars);
    tark_captions::CaptionText::Display translation;
    std::u16string translation_status;
@@ -214,7 +261,7 @@
    }
    if (message.empty() && display.committed.empty() && display.draft.empty()) {
      message = l10n_util::GetStringUTF16(IDS_TARK_CAPTIONS_LISTENING);
-@@ -547,8 +566,29 @@
+@@ -547,8 +564,29 @@
    }
  }
  
@@ -244,7 +291,7 @@
      return;
    }
    bool failed = false;
-@@ -655,6 +695,28 @@
+@@ -655,6 +693,28 @@
    view_->SetDownload(download);
  }
  
