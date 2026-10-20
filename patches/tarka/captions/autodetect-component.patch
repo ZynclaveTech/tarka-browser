@@ -1,3 +1,428 @@
+--- /dev/null
++++ b/components/tark_captions/detection_policy.h
+@@ -0,0 +1,45 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef COMPONENTS_TARK_CAPTIONS_DETECTION_POLICY_H_
++#define COMPONENTS_TARK_CAPTIONS_DETECTION_POLICY_H_
++
++#include <string>
++
++#include "base/containers/span.h"
++
++namespace tark_captions {
++
++// When the client's language is decided (D4 Phase 3), in seconds of speech:
++// at the first point when the language detector is sure, else at the last
++// whatever it thinks. Tuned with utils/lid_export.py policy on 549 FLEURS
++// clips; keep in step with its Python twin, `decide`.
++inline constexpr double kFirstDecision = 3.0;
++inline constexpr double kLastDecision = 5.0;
++inline constexpr double kLockProbability = 0.9;
++// An unsure call between neighbouring Indian languages goes to the one Tark
++// captions when that one has at least this much.
++inline constexpr double kNeighbourMass = 0.1;
++
++struct Detection {
++  enum class Kind {
++    kUnsure,       // Not yet: more speech is needed.
++    kCaption,      // Tark's own models caption it (hi, ta, bn).
++    kApple,        // macOS 26's speech captions it (en, es, fr, ...).
++    kPlanned,      // An Indian language not listed yet (te, mr, ...).
++    kUnsupported,  // Anything else (sw, ...).
++  };
++  Kind kind = Kind::kUnsure;
++  std::string code;  // Empty when unsure. Urdu is reported as "hi".
++};
++
++// `logits`: the language detector's scores, one per label, for the first
++// `speech_seconds` of the client's speech.
++Detection DecideLanguage(base::span<const float> logits,
++                         base::span<const std::string> labels,
++                         double speech_seconds);
++
++}  // namespace tark_captions
++
++#endif  // COMPONENTS_TARK_CAPTIONS_DETECTION_POLICY_H_
+--- /dev/null
++++ b/components/tark_captions/detection_policy.cc
+@@ -0,0 +1,88 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/tark_captions/detection_policy.h"
++
++#include <algorithm>
++#include <cmath>
++#include <map>
++#include <string_view>
++
++
++namespace tark_captions {
++namespace {
++
++constexpr std::string_view kCaptioned[] = {"hi", "ta", "bn"};
++constexpr std::string_view kApple[] = {"en", "es", "fr", "de", "it", "pt", "ja", "ko", "zh"};
++// IndicConformer covers these too; they are listed once measured.
++constexpr std::string_view kPlanned[] = {"as", "gu", "kn", "ml", "mr",
++                                         "ne", "pa", "sa", "sd", "te"};
++// Languages the detector confuses; an unsure call inside one goes to the
++// member Tark captions.
++constexpr std::string_view kBengaliFamily[] = {"bn", "as"};
++constexpr std::string_view kHindiFamily[] = {"hi", "mr", "gu", "pa", "ne", "sa", "sd"};
++constexpr std::string_view kTamilFamily[] = {"ta", "ml", "te", "kn"};
++
++bool In(base::span<const std::string_view> set, std::string_view code) {
++  return std::find(set.begin(), set.end(), code) != set.end();
++}
++
++}  // namespace
++
++Detection DecideLanguage(base::span<const float> logits,
++                         base::span<const std::string> labels,
++                         double speech_seconds) {
++  if (speech_seconds < kFirstDecision || logits.empty() || logits.size() != labels.size()) {
++    return {};
++  }
++  // Probabilities, with Urdu counted as Hindi (spoken Hindustani).
++  const float max = *std::max_element(logits.begin(), logits.end());
++  double sum = 0;
++  std::map<std::string, double> p;
++  for (size_t i = 0; i < logits.size(); ++i) {
++    const double e = std::exp(static_cast<double>(logits[i]) - max);
++    sum += e;
++    p[labels[i] == "ur" ? std::string("hi") : labels[i]] += e;
++  }
++  for (auto& [code, value] : p) {
++    value /= sum;
++  }
++  auto top = std::max_element(p.begin(), p.end(),
++                              [](const auto& a, const auto& b) { return a.second < b.second; });
++  const bool sure = top->second >= kLockProbability;
++  if (!sure && speech_seconds < kLastDecision) {
++    return {};
++  }
++  std::string code = top->first;
++  if (!sure && !In(kCaptioned, code)) {
++    for (base::span<const std::string_view> family :
++         {base::span<const std::string_view>(kBengaliFamily),
++          base::span<const std::string_view>(kHindiFamily),
++          base::span<const std::string_view>(kTamilFamily)}) {
++      if (!In(family, code)) {
++        continue;
++      }
++      // The family's captioned member (its first).
++      const std::string captioned(family[0]);
++      auto it = p.find(captioned);
++      if (it != p.end() && it->second >= kNeighbourMass) {
++        code = captioned;
++      }
++    }
++  }
++  Detection out;
++  out.code = code;
++  if (In(kCaptioned, code)) {
++    out.kind = Detection::Kind::kCaption;
++  } else if (In(kApple, code)) {
++    out.kind = Detection::Kind::kApple;
++  } else if (In(kPlanned, code)) {
++    out.kind = Detection::Kind::kPlanned;
++  } else {
++    out.kind = Detection::Kind::kUnsupported;
++  }
++  return out;
++}
++
++}  // namespace tark_captions
+--- /dev/null
++++ b/components/tark_captions/detection_policy_unittest.cc
+@@ -0,0 +1,85 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/tark_captions/detection_policy.h"
++
++#include <cmath>
++#include <map>
++#include <string>
++#include <vector>
++
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace tark_captions {
++namespace {
++
++using Kind = Detection::Kind;
++
++const std::vector<std::string> kLabels = {"ab", "as", "bn", "en", "es", "hi",
++                                          "ml", "sw", "ta", "te", "ur"};
++
++// Log-probabilities, as the model gives them: the named languages get
++// their share, the rest split what is left.
++std::vector<float> Scores(const std::map<std::string, double>& named) {
++  double used = 0;
++  for (const auto& [code, p] : named) {
++    used += p;
++  }
++  const double rest = (1.0 - used) / (kLabels.size() - named.size());
++  std::vector<float> out;
++  for (const std::string& code : kLabels) {
++    auto it = named.find(code);
++    out.push_back(std::log(it == named.end() ? rest : it->second));
++  }
++  return out;
++}
++
++Detection Decide(const std::map<std::string, double>& named, double seconds) {
++  return DecideLanguage(Scores(named), kLabels, seconds);
++}
++
++void ExpectDetection(const Detection& got, Kind kind, const std::string& code) {
++  EXPECT_EQ(got.kind, kind);
++  EXPECT_EQ(got.code, code);
++}
++
++TEST(DetectionPolicyTest, UrduCountsAsHindi) {
++  ExpectDetection(Decide({{"ur", 0.65}, {"hi", 0.3}}, 3.0), Kind::kCaption, "hi");
++}
++
++TEST(DetectionPolicyTest, ConfidentAtThreeSeconds) {
++  ExpectDetection(Decide({{"es", 0.95}}, 3.0), Kind::kApple, "es");
++}
++
++TEST(DetectionPolicyTest, UnsureAtThreeWaitsForFive) {
++  ExpectDetection(Decide({{"ta", 0.4}, {"ml", 0.3}}, 3.0), Kind::kUnsure, "");
++  ExpectDetection(Decide({{"ta", 0.4}, {"ml", 0.3}}, 5.0), Kind::kCaption, "ta");
++}
++
++TEST(DetectionPolicyTest, NeighbourOfSupportedIsSupported) {
++  ExpectDetection(Decide({{"as", 0.5}, {"bn", 0.35}}, 5.0), Kind::kCaption, "bn");
++}
++
++TEST(DetectionPolicyTest, ConfidentNeighbourIsNotPulled) {
++  ExpectDetection(Decide({{"te", 0.95}, {"ta", 0.04}}, 3.0), Kind::kPlanned, "te");
++}
++
++TEST(DetectionPolicyTest, SwahiliIsUnsupported) {
++  ExpectDetection(Decide({{"sw", 0.95}}, 3.0), Kind::kUnsupported, "sw");
++}
++
++TEST(DetectionPolicyTest, TeluguIsPlanned) {
++  ExpectDetection(Decide({{"te", 0.95}}, 3.0), Kind::kPlanned, "te");
++}
++
++TEST(DetectionPolicyTest, NothingBeforeThreeSeconds) {
++  ExpectDetection(Decide({{"es", 0.99}}, 2.9), Kind::kUnsure, "");
++}
++
++TEST(DetectionPolicyTest, ScoresAndLabelsMustMatch) {
++  ExpectDetection(DecideLanguage(std::vector<float>(3, 0.0f), kLabels, 5.0), Kind::kUnsure, "");
++}
++
++}  // namespace
++}  // namespace tark_captions
+--- /dev/null
++++ b/components/tark_captions/language_detector.h
+@@ -0,0 +1,48 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef COMPONENTS_TARK_CAPTIONS_LANGUAGE_DETECTOR_H_
++#define COMPONENTS_TARK_CAPTIONS_LANGUAGE_DETECTOR_H_
++
++#include <memory>
++#include <string>
++#include <vector>
++
++#include "base/containers/span.h"
++#include "base/files/file_path.h"
++
++namespace tark_captions {
++
++class OrtModel;
++class OrtRuntime;
++
++// Which language someone speaks (D4 Phase 3): SpeechBrain's VoxLingua107
++// ECAPA, exported by utils/lid_export.py to lid.onnx (16 kHz audio in, a
++// log-probability per language out) with its labels in lid_labels.txt. Runs
++// in the speech process; DecideLanguage (detection_policy.h) reads the
++// scores. Use on one sequence.
++class LanguageDetector {
++ public:
++  // Null when the models folder has no detector (the language_id unit).
++  static std::unique_ptr<LanguageDetector> Load(OrtRuntime* runtime,
++                                                const base::FilePath& models_dir);
++
++  LanguageDetector(const LanguageDetector&) = delete;
++  LanguageDetector& operator=(const LanguageDetector&) = delete;
++  ~LanguageDetector();
++
++  // One score per label for 16 kHz mono speech; empty if the model fails.
++  std::vector<float> Logits(base::span<const float> pcm16k);
++  const std::vector<std::string>& labels() const { return labels_; }
++
++ private:
++  LanguageDetector(std::unique_ptr<OrtModel> model, std::vector<std::string> labels);
++
++  std::unique_ptr<OrtModel> model_;
++  std::vector<std::string> labels_;
++};
++
++}  // namespace tark_captions
++
++#endif  // COMPONENTS_TARK_CAPTIONS_LANGUAGE_DETECTOR_H_
+--- /dev/null
++++ b/components/tark_captions/language_detector.cc
+@@ -0,0 +1,53 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/tark_captions/language_detector.h"
++
++#include <utility>
++
++#include "base/files/file_util.h"
++#include "base/memory/ptr_util.h"
++#include "base/strings/string_split.h"
++#include "components/tark_captions/ort_runtime.h"
++
++namespace tark_captions {
++
++// static
++std::unique_ptr<LanguageDetector> LanguageDetector::Load(OrtRuntime* runtime,
++                                                         const base::FilePath& models_dir) {
++  std::string text;
++  if (!base::ReadFileToString(models_dir.Append("lid_labels.txt"), &text)) {
++    return nullptr;
++  }
++  std::vector<std::string> labels = base::SplitString(
++      text, "\n", base::TRIM_WHITESPACE, base::SPLIT_WANT_NONEMPTY);
++  std::unique_ptr<OrtModel> model = runtime->LoadModel(models_dir.Append("lid.onnx"), 2);
++  if (labels.empty() || !model) {
++    return nullptr;
++  }
++  return base::WrapUnique(new LanguageDetector(std::move(model), std::move(labels)));
++}
++
++LanguageDetector::LanguageDetector(std::unique_ptr<OrtModel> model,
++                                   std::vector<std::string> labels)
++    : model_(std::move(model)), labels_(std::move(labels)) {}
++
++LanguageDetector::~LanguageDetector() = default;
++
++std::vector<float> LanguageDetector::Logits(base::span<const float> pcm16k) {
++  if (pcm16k.empty()) {
++    return {};
++  }
++  std::vector<Tensor> inputs(1);
++  inputs[0] = {.name = "waveform", .shape = {1, static_cast<int64_t>(pcm16k.size())}};
++  inputs[0].f32.assign(pcm16k.begin(), pcm16k.end());
++  std::vector<Tensor> outputs;
++  if (!model_->Run(inputs, {"logits"}, &outputs) || outputs.empty() ||
++      outputs[0].f32.size() != labels_.size()) {
++    return {};
++  }
++  return std::move(outputs[0].f32);
++}
++
++}  // namespace tark_captions
+--- /dev/null
++++ b/components/tark_captions/language_detector_unittest.cc
+@@ -0,0 +1,63 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/tark_captions/language_detector.h"
++
++#include <algorithm>
++#include <memory>
++#include <string>
++#include <vector>
++
++#include "base/values.h"
++#include "components/tark_captions/ort_runtime.h"
++#include "components/tark_captions/test_util.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace tark_captions {
++namespace {
++
++TEST(LanguageDetectorTest, MatchesGolden) {
++  std::optional<base::FilePath> ort = test::OrtPath();
++  std::optional<base::FilePath> models = test::ModelsDir();
++  std::optional<base::FilePath> testdata = test::TestDataDir();
++  if (!ort || !models || !testdata) {
++    GTEST_SKIP() << "set TARK_CAPTIONS_ORT, TARK_CAPTIONS_MODELS and TARK_CAPTIONS_TESTDATA";
++  }
++  std::unique_ptr<OrtRuntime> runtime = OrtRuntime::Load(*ort);
++  ASSERT_TRUE(runtime);
++  std::unique_ptr<LanguageDetector> detector = LanguageDetector::Load(runtime.get(), *models);
++  ASSERT_TRUE(detector);
++  ASSERT_EQ(detector->labels().size(), 107u);
++  base::ListValue cases = test::LidGoldenCases(*testdata);
++  ASSERT_EQ(cases.size(), 12u);
++  for (const base::Value& value : cases) {
++    const base::DictValue& c = value.GetDict();
++    const std::string& file = *c.FindString("file");
++    int rate = 0;
++    std::vector<float> pcm = test::ReadWav(testdata->AppendASCII(file), &rate);
++    ASSERT_EQ(rate, 16000) << file;
++    pcm.resize(static_cast<size_t>(*c.FindDouble("seconds") * 16000));
++    std::vector<float> got = detector->Logits(pcm);
++    const base::ListValue& want = *c.FindList("logits");
++    ASSERT_EQ(got.size(), want.size()) << file;
++    for (size_t i = 0; i < got.size(); ++i) {
++      EXPECT_NEAR(got[i], want[i].GetDouble(), 1e-3) << file << " " << detector->labels()[i];
++    }
++    const size_t top = std::max_element(got.begin(), got.end()) - got.begin();
++    EXPECT_EQ(detector->labels()[top], *c.FindString("top")) << file;
++  }
++}
++
++TEST(LanguageDetectorTest, MissingModelIsNull) {
++  std::optional<base::FilePath> ort = test::OrtPath();
++  if (!ort) {
++    GTEST_SKIP() << "set TARK_CAPTIONS_ORT";
++  }
++  std::unique_ptr<OrtRuntime> runtime = OrtRuntime::Load(*ort);
++  ASSERT_TRUE(runtime);
++  EXPECT_FALSE(LanguageDetector::Load(runtime.get(), base::FilePath("/nonexistent")));
++}
++
++}  // namespace
++}  // namespace tark_captions
+--- a/components/tark_captions/BUILD.gn
++++ b/components/tark_captions/BUILD.gn
+@@ -23,8 +23,12 @@
+     "caption_model_store.h",
+     "caption_text.cc",
+     "caption_text.h",
++    "detection_policy.cc",
++    "detection_policy.h",
+     "indic_text.cc",
+     "indic_text.h",
++    "language_detector.cc",
++    "language_detector.h",
+     "mel_frontend.cc",
+     "mel_frontend.h",
+     "model_manifest.cc",
+@@ -78,7 +82,9 @@
+     "caption_engine_unittest.cc",
+     "caption_model_store_unittest.cc",
+     "caption_text_unittest.cc",
++    "detection_policy_unittest.cc",
+     "indic_text_unittest.cc",
++    "language_detector_unittest.cc",
+     "mel_frontend_unittest.cc",
+     "model_manifest_unittest.cc",
+     "ort_runtime_unittest.cc",
 --- a/components/tark_captions/model_manifest.h
 +++ b/components/tark_captions/model_manifest.h
 @@ -16,7 +16,7 @@
@@ -39,3 +464,26 @@
    for (const ModelUnitInfo& info : ModelManifest()) {
      for (const ModelFile& file : info.files) {
        EXPECT_EQ(std::string(file.sha256).size(), 64u) << file.path;
+--- a/components/tark_captions/test_util.h
++++ b/components/tark_captions/test_util.h
+@@ -29,6 +29,9 @@
+ // TESTDATA/mt_golden.json's "cases" list (utils/indictrans_export.py
+ // golden): per caption, every stage of the reference translation pipeline.
+ base::ListValue MtGoldenCases(const base::FilePath& testdata);
++// lid_golden.json's cases: a clip, its language and the scores the language
++// detector must give its first seconds (utils/lid_export.py golden).
++base::ListValue LidGoldenCases(const base::FilePath& testdata);
+ 
+ }  // namespace tark_captions::test
+ 
+--- a/components/tark_captions/test_util.cc
++++ b/components/tark_captions/test_util.cc
+@@ -108,4 +108,8 @@
+   return ReadList(testdata.Append("mt_golden.json"), "cases");
+ }
+ 
++base::ListValue LidGoldenCases(const base::FilePath& testdata) {
++  return ReadList(testdata.Append("lid_golden.json"), "cases");
++}
++
+ }  // namespace tark_captions::test
