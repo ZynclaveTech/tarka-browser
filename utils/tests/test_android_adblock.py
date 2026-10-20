@@ -201,3 +201,50 @@ class TestListsInTheBuild(unittest.TestCase):
     def test_job_passes_a_staged_bundle(self):
         j = (ROOT / 'android' / 'aws' / 'jobs' / 'tark-build.sh').read_text()
         self.assertIn('TARK_LISTS_DIR', j)
+
+
+class TestNetworkPatch(unittest.TestCase):
+    """A2 Task 5: requests are checked before they leave."""
+
+    def setUp(self):
+        self.p = patch_text('adblock-network.patch')
+        self.add = added(self.p)
+
+    def test_in_the_series_after_the_engine(self):
+        series = (PATCHES / 'series').read_text().split()
+        self.assertLess(series.index('adblock-engine.patch'), series.index('adblock-network.patch'))
+
+    def test_blocked_like_ublock(self):
+        self.assertIn('network::URLLoaderCompletionStatus status(net::ERR_BLOCKED_BY_CLIENT);', self.add)
+        self.assertIn('status.should_collapse_initiator = true;', self.add)
+
+    def test_redirect_rules_get_their_stub(self):
+        self.assertIn('brave_shields::MakeStubResponse(data_url, request_, &head, &body);', self.add)
+
+    def test_redirects_are_checked_again(self):
+        self.assertIn('redirect_info.new_url, *request_.request_initiator, request_type_,', self.add)
+
+    def test_the_site_switch_is_honoured(self):
+        self.assertIn('settings->GetContentSetting(url, url, ContentSettingsType::ADS) ==', self.add)
+        self.assertIn('CONTENT_SETTING_ALLOW', self.add)
+
+    def test_main_frames_pass(self):
+        self.assertIn('static_cast<int>(blink::mojom::ResourceType::kMainFrame)', self.add)
+
+    def test_hooked_into_chrome(self):
+        self.assertIn('tark_adblock::ProxyingURLLoaderFactory::MaybeProxyRequest(', self.add)
+        self.assertIn('return frame && tark_adblock::AdblockService::Get()->IsReady();', self.add)
+        self.assertIn('tark_adblock::ProxyingURLLoaderFactory::MaybeConnectWebSocket(', self.add)
+
+
+class TestE2E(unittest.TestCase):
+    def test_run_refuses_a_phone(self):
+        r = subprocess.run([sys.executable, str(ROOT / 'android/adblock/e2e/run.py'), '--serial', 'bf678949'],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 2)
+
+    def test_network_cases_named(self):
+        sys.path.insert(0, str(ROOT / 'android/adblock/e2e'))
+        import run
+        self.assertEqual(set(run.CASES['network'][1]),
+                         {'blocked', 'exception', 'redirect', 'chain', 'ws', 'worker', 'frame', 'real'})

@@ -241,7 +241,7 @@
 +#endif  // CHROME_BROWSER_TARK_ADBLOCK_TARK_ADBLOCK_BUNDLE_H_
 --- /dev/null
 +++ b/chrome/browser/tark_adblock/tark_adblock_service.cc
-@@ -0,0 +1,348 @@
+@@ -0,0 +1,316 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -274,7 +274,6 @@
 +#include "content/public/browser/browser_thread.h"
 +#include "crypto/sha2.h"
 +#include "net/base/registry_controlled_domains/registry_controlled_domain.h"
-+#include "third_party/blink/public/mojom/loader/resource_load_info.mojom-shared.h"
 +#include "third_party/brave_adblock/rs/src/lib.rs.h"
 +#include "url/gurl.h"
 +#include "url/origin.h"
@@ -309,37 +308,6 @@
 +    return std::string();
 +  }
 +  return std::string(base::as_string_view(file.bytes()));
-+}
-+
-+// adblock-rust's request types, mapped as brave-core maps them.
-+std::string RequestType(int resource_type) {
-+  switch (static_cast<blink::mojom::ResourceType>(resource_type)) {
-+    case blink::mojom::ResourceType::kMainFrame:
-+      return "main_frame";
-+    case blink::mojom::ResourceType::kSubFrame:
-+      return "sub_frame";
-+    case blink::mojom::ResourceType::kStylesheet:
-+      return "stylesheet";
-+    case blink::mojom::ResourceType::kScript:
-+      return "script";
-+    case blink::mojom::ResourceType::kFavicon:
-+    case blink::mojom::ResourceType::kImage:
-+      return "image";
-+    case blink::mojom::ResourceType::kFontResource:
-+      return "font";
-+    case blink::mojom::ResourceType::kSubResource:
-+      return "other";
-+    case blink::mojom::ResourceType::kObject:
-+      return "object";
-+    case blink::mojom::ResourceType::kMedia:
-+      return "media";
-+    case blink::mojom::ResourceType::kXhr:
-+      return "xhr";
-+    case blink::mojom::ResourceType::kPing:
-+      return "ping";
-+    default:
-+      return std::string();
-+  }
 +}
 +
 +}  // namespace
@@ -443,7 +411,7 @@
 +
 +  BlockResult ShouldBlock(const GURL& url,
 +                          const url::Origin& initiator,
-+                          int resource_type,
++                          const std::string& request_type,
 +                          const std::string& method) {
 +    DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
 +    const bool third_party =
@@ -452,7 +420,7 @@
 +            net::registry_controlled_domains::INCLUDE_PRIVATE_REGISTRIES);
 +    const adblock::BlockerResult matched = engine_->matches(
 +        url.spec(), std::string(url.host()), initiator.host(),
-+        RequestType(resource_type), third_party, method);
++        request_type, third_party, method);
 +    BlockResult result;
 +    result.block = matched.matched;
 +    if (matched.matched && matched.redirect.has_value) {
@@ -502,7 +470,7 @@
 +
 +void AdblockService::ShouldBlock(const GURL& url,
 +                                 const url::Origin& initiator,
-+                                 int resource_type,
++                                 const std::string& request_type,
 +                                 const std::string& method,
 +                                 base::OnceCallback<void(BlockResult)> reply) {
 +  if (!active_) {
@@ -510,7 +478,7 @@
 +    return;
 +  }
 +  active_.AsyncCall(&EngineHolder::ShouldBlock)
-+      .WithArgs(url, initiator, resource_type, method)
++      .WithArgs(url, initiator, request_type, method)
 +      .Then(std::move(reply));
 +}
 +
@@ -592,7 +560,7 @@
 +}  // namespace tark_adblock
 --- /dev/null
 +++ b/chrome/browser/tark_adblock/tark_adblock_service.h
-@@ -0,0 +1,99 @@
+@@ -0,0 +1,100 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -648,11 +616,12 @@
 +  AdblockService(const AdblockService&) = delete;
 +  AdblockService& operator=(const AdblockService&) = delete;
 +
-+  // `resource_type` is a blink::mojom::ResourceType. Replies on the calling
-+  // sequence; at once, with "do not block", while no engine is ready.
++  // `request_type` is adblock-rust's ("script", "image", "websocket", …).
++  // Replies on the calling sequence; at once, with "do not block", while no
++  // engine is ready.
 +  void ShouldBlock(const GURL& url,
 +                   const url::Origin& initiator,
-+                   int resource_type,
++                   const std::string& request_type,
 +                   const std::string& method,
 +                   base::OnceCallback<void(BlockResult)> reply);
 +
