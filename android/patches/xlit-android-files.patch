@@ -1,0 +1,502 @@
+--- a/components/tark_xlit/word_list.h
++++ b/components/tark_xlit/word_list.h
+@@ -46,6 +46,14 @@
+   static std::unique_ptr<WordList> Load(
+       std::unique_ptr<base::MemoryMappedFile> file);
+ 
++  // Tark for Android (A3): several TXLW v1 files read in place, one per
++  // language as android/xlit/files.py splits them (each also holds the
++  // common-English list). A tag found in more than one file is read from the
++  // first. nullptr when `files` is empty or any file is null, not valid or not
++  // a usable TXLW v1 file.
++  static std::unique_ptr<WordList> Load(
++      std::vector<std::unique_ptr<base::MemoryMappedFile>> files);
++
+   WordList(const WordList&) = delete;
+   WordList& operator=(const WordList&) = delete;
+   ~WordList();
+@@ -66,6 +74,8 @@
+     // Absolute file offset of the record-offset table.
+     size_t offset = 0;
+     size_t count = 0;
++    // Which of `parts_` holds the block.
++    size_t part = 0;
+   };
+   struct Record {
+     uint32_t count = 0;
+@@ -74,9 +84,9 @@
+ 
+   using Blocks = std::map<std::string, Block, std::less<>>;
+ 
+-  // Exactly one of `copy` and `file` holds the blob.
++  // Either `copy` holds the one blob, or `files` hold one blob each.
+   WordList(base::HeapArray<uint8_t> copy,
+-           std::unique_ptr<base::MemoryMappedFile> file,
++           std::vector<std::unique_ptr<base::MemoryMappedFile>> files,
+            Blocks blocks);
+ 
+   // The header's blocks, each checked to start after the header and to have
+@@ -91,11 +101,11 @@
+                                std::string_view utf8) const;
+ 
+   base::HeapArray<uint8_t> copy_;
+-  std::unique_ptr<base::MemoryMappedFile> file_;
++  std::vector<std::unique_ptr<base::MemoryMappedFile>> files_;
+   Blocks blocks_;
+-  // The blob, in `copy_` or `file_`. Declared last so that it is destroyed
+-  // before what it points into.
+-  base::raw_span<const uint8_t> data_;
++  // The blobs, in `copy_` or `files_`, in order. Declared last so that they
++  // are destroyed before what they point into.
++  std::vector<base::raw_span<const uint8_t>> parts_;
+ };
+ 
+ // IndicXlit's dictionary rescoring with alpha = 0.9. For each candidate that
+--- a/components/tark_xlit/word_list.cc
++++ b/components/tark_xlit/word_list.cc
+@@ -98,32 +98,58 @@
+   if (!blocks) {
+     return nullptr;
+   }
+-  return base::WrapUnique(new WordList(
+-      base::HeapArray<uint8_t>::CopiedFrom(txlw), nullptr, std::move(*blocks)));
++  return base::WrapUnique(
++      new WordList(base::HeapArray<uint8_t>::CopiedFrom(txlw), {},
++                   std::move(*blocks)));
+ }
+ 
+ // static
+ std::unique_ptr<WordList> WordList::Load(
+     std::unique_ptr<base::MemoryMappedFile> file) {
+-  if (!file || !file->IsValid()) {
++  std::vector<std::unique_ptr<base::MemoryMappedFile>> files;
++  files.push_back(std::move(file));
++  return Load(std::move(files));
++}
++
++// static
++std::unique_ptr<WordList> WordList::Load(
++    std::vector<std::unique_ptr<base::MemoryMappedFile>> files) {
++  if (files.empty()) {
+     return nullptr;
+   }
+-  std::optional<Blocks> blocks = ParseBlocks(file->bytes());
+-  if (!blocks) {
+-    return nullptr;
++  Blocks blocks;
++  for (size_t part = 0; part < files.size(); ++part) {
++    const std::unique_ptr<base::MemoryMappedFile>& file = files[part];
++    if (!file || !file->IsValid()) {
++      return nullptr;
++    }
++    std::optional<Blocks> file_blocks = ParseBlocks(file->bytes());
++    if (!file_blocks) {
++      return nullptr;
++    }
++    for (auto& [tag, block] : *file_blocks) {
++      block.part = part;
++      // emplace keeps the first file's block for a tag (every file has "en").
++      blocks.emplace(tag, block);
++    }
+   }
+   return base::WrapUnique(new WordList(base::HeapArray<uint8_t>(),
+-                                       std::move(file), std::move(*blocks)));
++                                       std::move(files), std::move(blocks)));
+ }
+ 
+ WordList::WordList(base::HeapArray<uint8_t> copy,
+-                   std::unique_ptr<base::MemoryMappedFile> file,
++                   std::vector<std::unique_ptr<base::MemoryMappedFile>> files,
+                    Blocks blocks)
+     : copy_(std::move(copy)),
+-      file_(std::move(file)),
+-      blocks_(std::move(blocks)),
+-      data_(file_ ? file_->bytes()
+-                  : base::span<const uint8_t>(copy_.as_span())) {}
++      files_(std::move(files)),
++      blocks_(std::move(blocks)) {
++  if (files_.empty()) {
++    parts_.emplace_back(copy_.as_span());
++  }
++  for (const std::unique_ptr<base::MemoryMappedFile>& file : files_) {
++    parts_.emplace_back(file->bytes());
++  }
++}
+ 
+ WordList::~WordList() = default;
+ 
+@@ -144,7 +170,7 @@
+                                                    size_t index) const {
+   // ParseBlocks() checked that the block's record-offset table is inside the
+   // blob; the record it points to may not be.
+-  const base::span<const uint8_t> data(data_);
++  const base::span<const uint8_t> data(parts_[block.part]);
+   const base::span<const uint8_t> block_bytes = data.subspan(block.offset);
+   const size_t relative =
+       base::U32FromLittleEndian(block_bytes.subspan(4 * index).first<4>());
+--- a/components/tark_xlit/transliterator.h
++++ b/components/tark_xlit/transliterator.h
+@@ -110,7 +110,9 @@
+ };
+ 
+ // The model and word lists in `directory` (xlit-model.bin and
+-// xlit-words.bin), or nullptr if either is missing or not valid. The word
++// xlit-words.bin; or, on Android, every xlit-words-<tag>.bin there, never a
++// .part file still being written), or nullptr if the model or every word list
++// is missing, or any is not valid. The word
+ // lists are memory-mapped; the model is read and converted, and its file is
+ // closed again. This blocks on file IO and converts the whole model (tens of
+ // milliseconds with a warm disk cache on a development Mac, more on a cold
+@@ -125,6 +127,16 @@
+ // Contents/Resources). Same threading rules.
+ scoped_refptr<Resources> LoadResourcesFromBundle();
+ 
++// Tark for Android (A3): the model and word lists are downloaded into
++// `directory` (the app's data directory) instead of shipping in the APK.
++// Once set (on the UI thread, before any load), LoadResourcesFromBundle()
++// reads `directory`, and only while FilesReady(): the download service sets it
++// when the model and at least one word list have been checked and are in
++// place. An empty path goes back to the bundled files (tests).
++void SetResourceDirectory(const base::FilePath& directory);
++bool FilesReady();
++void SetFilesReady(bool ready);
++
+ // A Transliterator over LoadResourcesFromDirectory(`directory`), or nullptr.
+ // Same threading rules.
+ std::unique_ptr<Transliterator> LoadFromDirectory(
+--- a/components/tark_xlit/transliterator.cc
++++ b/components/tark_xlit/transliterator.cc
+@@ -6,6 +6,7 @@
+ 
+ #include <algorithm>
+ #include <array>
++#include <atomic>
+ #include <cstddef>
+ #include <memory>
+ #include <optional>
+@@ -16,11 +17,14 @@
+ 
+ #include "base/base_paths.h"
+ #include "base/check.h"
++#include "base/files/file_enumerator.h"
+ #include "base/files/file_path.h"
+ #include "base/files/memory_mapped_file.h"
+ #include "base/functional/bind.h"
+ #include "base/memory/scoped_refptr.h"
++#include "base/no_destructor.h"
+ #include "base/path_service.h"
++#include "base/synchronization/lock.h"
+ #include "components/tark_xlit/languages.h"
+ #include "components/tark_xlit/model.h"
+ #include "components/tark_xlit/word_list.h"
+@@ -41,6 +45,22 @@
+ constexpr std::string_view kModelFileName = "xlit-model.bin";
+ constexpr std::string_view kWordsFileName = "xlit-words.bin";
+ constexpr std::string_view kBundleDirectoryName = "indicxlit";
++// A3: one word-list file per language, downloaded (android/xlit/files.py).
++constexpr base::FilePath::CharType kLanguageWordsPattern[] =
++    FILE_PATH_LITERAL("xlit-words-*.bin");
++
++// SetResourceDirectory()'s directory, read on the provider's worker sequence.
++struct ResourceDirectory {
++  base::Lock lock;
++  base::FilePath path;
++};
++
++ResourceDirectory& GetResourceDirectory() {
++  static base::NoDestructor<ResourceDirectory> directory;
++  return *directory;
++}
++
++std::atomic<bool> g_files_ready{false};
+ 
+ // The model's vocabulary has these tokens, and a candidate that spells one out
+ // is not a word.
+@@ -218,19 +238,61 @@
+     return nullptr;
+   }
+ 
+-  // The word lists are read in place, and stay mapped.
+-  auto words_file = std::make_unique<base::MemoryMappedFile>();
+-  if (!words_file->Initialize(directory.AppendASCII(kWordsFileName))) {
+-    return nullptr;
+-  }
+-  std::unique_ptr<WordList> words = WordList::Load(std::move(words_file));
++  // The word lists are read in place, and stay mapped: the Mac's one file,
++  // or (A3) every per-language file. The enumerator's pattern matches whole
++  // names, so a download's "xlit-words-hi.bin.part" is never read.
++  std::vector<base::FilePath> paths;
++  if (base::PathExists(directory.AppendASCII(kWordsFileName))) {
++    paths.push_back(directory.AppendASCII(kWordsFileName));
++  } else {
++    base::FileEnumerator files(directory, /*recursive=*/false,
++                               base::FileEnumerator::FILES,
++                               kLanguageWordsPattern);
++    for (base::FilePath path = files.Next(); !path.empty();
++         path = files.Next()) {
++      paths.push_back(path);
++    }
++    std::ranges::sort(paths);
++  }
++  std::vector<std::unique_ptr<base::MemoryMappedFile>> words_files;
++  for (const base::FilePath& path : paths) {
++    auto words_file = std::make_unique<base::MemoryMappedFile>();
++    if (!words_file->Initialize(path)) {
++      return nullptr;
++    }
++    words_files.push_back(std::move(words_file));
++  }
++  std::unique_ptr<WordList> words = WordList::Load(std::move(words_files));
+   if (!words) {
+     return nullptr;
+   }
+   return base::MakeRefCounted<Resources>(std::move(model), std::move(words));
+ }
+ 
++void SetResourceDirectory(const base::FilePath& directory) {
++  ResourceDirectory& resource_directory = GetResourceDirectory();
++  base::AutoLock lock(resource_directory.lock);
++  resource_directory.path = directory;
++}
++
++bool FilesReady() {
++  return g_files_ready.load(std::memory_order_acquire);
++}
++
++void SetFilesReady(bool ready) {
++  g_files_ready.store(ready, std::memory_order_release);
++}
++
+ scoped_refptr<Resources> LoadResourcesFromBundle() {
++  base::FilePath downloaded;
++  {
++    ResourceDirectory& resource_directory = GetResourceDirectory();
++    base::AutoLock lock(resource_directory.lock);
++    downloaded = resource_directory.path;
++  }
++  if (!downloaded.empty()) {
++    return FilesReady() ? LoadResourcesFromDirectory(downloaded) : nullptr;
++  }
+   base::FilePath assets;
+   if (!base::PathService::Get(base::DIR_ASSETS, &assets)) {
+     return nullptr;
+--- a/components/tark_xlit/BUILD.gn
++++ b/components/tark_xlit/BUILD.gn
+@@ -59,24 +59,38 @@
+   }
+ }
+ 
+-test("tark_xlit_unittests") {
+-  testonly = true
+-  sources = [
+-    "languages_unittest.cc",
+-    "model_unittest.cc",
+-    "transliterator_unittest.cc",
+-  ]
+-  deps = [
+-    ":tark_xlit",
+-    "//base",
+-    "//base/test:run_all_unittests",
+-    "//base/test:test_support",
+-    "//testing/gtest",
+-  ]
++# Tark for Android (A3): built and run on the build machine only, like
++# tark_adblock_unittests: an Android variant would be an APK, and its runner
++# script would collide with this one's.
++if (!is_android) {
++  test("tark_xlit_unittests") {
++    testonly = true
++    sources = [
++      "android_files_unittest.cc",
++      "languages_unittest.cc",
++      "model_unittest.cc",
++      "transliterator_unittest.cc",
++    ]
++    deps = [
++      ":tark_xlit",
++      "//base",
++      "//base/test:run_all_unittests",
++      "//base/test:test_support",
++      "//testing/gtest",
++    ]
+ 
+-  # The xlit setup step (utils/install_xlit.sh) puts the converted model, the
+-  # packed word lists and the goldens (resources/xlit/) here.
+-  data = [ "test/data/" ]
++    # The xlit setup step (utils/install_xlit.sh) puts the converted model, the
++    # packed word lists and the goldens (resources/xlit/) here; android/build.sh
++    # adds two per-language files under android/.
++    data = [ "test/data/" ]
++  }
++}
++
++if (current_toolchain == default_toolchain) {
++  group("host_unittests") {
++    testonly = true
++    deps = [ ":tark_xlit_unittests($host_toolchain)" ]
++  }
+ }
+ 
+ # How long a phrase takes to transliterate: prints p50/p95 for uncached words.
+--- /dev/null
++++ b/components/tark_xlit/android_files_unittest.cc
+@@ -0,0 +1,159 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// Tark for Android (A3): the model and one word-list file per language are
++// downloaded into the app's data directory, not shipped in the APK.
++
++#include <memory>
++#include <string>
++#include <utility>
++#include <vector>
++
++#include "base/files/file_path.h"
++#include "base/files/file_util.h"
++#include "base/files/memory_mapped_file.h"
++#include "base/files/scoped_temp_dir.h"
++#include "base/path_service.h"
++#include "components/tark_xlit/transliterator.h"
++#include "components/tark_xlit/word_list.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace tark_xlit {
++namespace {
++
++// android/build.sh puts two of android/xlit/files.py's per-language files here,
++// next to the Mac's model (test/data/xlit-model.bin).
++base::FilePath TestDataDir() {
++  return base::PathService::CheckedGet(base::DIR_SRC_TEST_DATA_ROOT)
++      .AppendASCII("components/tark_xlit/test/data");
++}
++
++base::FilePath AndroidFile(std::string_view name) {
++  return TestDataDir().AppendASCII("android").AppendASCII(name);
++}
++
++std::unique_ptr<base::MemoryMappedFile> Map(const base::FilePath& path) {
++  auto file = std::make_unique<base::MemoryMappedFile>();
++  EXPECT_TRUE(file->Initialize(path)) << path;
++  return file;
++}
++
++std::unique_ptr<WordList> LoadFiles(std::vector<std::string> names) {
++  std::vector<std::unique_ptr<base::MemoryMappedFile>> files;
++  for (const std::string& name : names) {
++    files.push_back(Map(AndroidFile(name)));
++  }
++  return WordList::Load(std::move(files));
++}
++
++TEST(TarkXlitAndroidFilesTest, CountComesFromTheLanguagesFile) {
++  std::unique_ptr<WordList> words =
++      LoadFiles({"xlit-words-hi.bin", "xlit-words-ta.bin"});
++  ASSERT_TRUE(words);
++  EXPECT_TRUE(words->HasLanguage("hi"));
++  EXPECT_TRUE(words->HasLanguage("ta"));
++  EXPECT_TRUE(words->Count("hi", u"नमस्ते").has_value());
++  EXPECT_TRUE(words->Count("ta", u"வணக்கம்").has_value());
++  EXPECT_FALSE(words->Count("hi", u"வணக்கம்").has_value());
++}
++
++TEST(TarkXlitAndroidFilesTest, MissingLanguageIsNotFound) {
++  std::unique_ptr<WordList> words = LoadFiles({"xlit-words-hi.bin"});
++  ASSERT_TRUE(words);
++  EXPECT_FALSE(words->HasLanguage("ta"));
++  EXPECT_FALSE(words->HasLanguage("bn"));
++  EXPECT_FALSE(words->Count("ta", u"வணக்கம்").has_value());
++}
++
++TEST(TarkXlitAndroidFilesTest, EnglishFromAnyFile) {
++  for (const char* name : {"xlit-words-hi.bin", "xlit-words-ta.bin"}) {
++    std::unique_ptr<WordList> words = LoadFiles({name});
++    ASSERT_TRUE(words) << name;
++    EXPECT_TRUE(words->IsCommonEnglish("the")) << name;
++    EXPECT_FALSE(words->IsCommonEnglish("namaste")) << name;
++  }
++}
++
++TEST(TarkXlitAndroidFilesTest, AnInvalidFileFailsTheLoad) {
++  base::ScopedTempDir dir;
++  ASSERT_TRUE(dir.CreateUniqueTempDir());
++  const base::FilePath bad = dir.GetPath().AppendASCII("xlit-words-ta.bin");
++  ASSERT_TRUE(base::WriteFile(bad, "not a word list"));
++  std::vector<std::unique_ptr<base::MemoryMappedFile>> files;
++  files.push_back(Map(AndroidFile("xlit-words-hi.bin")));
++  files.push_back(Map(bad));
++  EXPECT_FALSE(WordList::Load(std::move(files)));
++  EXPECT_FALSE(
++      WordList::Load(std::vector<std::unique_ptr<base::MemoryMappedFile>>()));
++}
++
++// A directory laid out as the download service leaves it.
++class TarkXlitAndroidDirectoryTest : public testing::Test {
++ protected:
++  void SetUp() override {
++    ASSERT_TRUE(dir_.CreateUniqueTempDir());
++    ASSERT_TRUE(base::CopyFile(TestDataDir().AppendASCII("xlit-model.bin"),
++                               Path("xlit-model.bin")));
++  }
++  void TearDown() override {
++    SetResourceDirectory(base::FilePath());
++    SetFilesReady(false);
++  }
++  base::FilePath Path(std::string_view name) const {
++    return dir_.GetPath().AppendASCII(name);
++  }
++  void Add(std::string_view name, std::string_view as) {
++    ASSERT_TRUE(base::CopyFile(AndroidFile(name), Path(as)));
++  }
++
++  base::ScopedTempDir dir_;
++};
++
++TEST_F(TarkXlitAndroidDirectoryTest, LoadsModelWithOnlyOneLanguage) {
++  Add("xlit-words-hi.bin", "xlit-words-hi.bin");
++  scoped_refptr<Resources> resources =
++      LoadResourcesFromDirectory(dir_.GetPath());
++  ASSERT_TRUE(resources);
++  EXPECT_TRUE(resources->words->HasLanguage("hi"));
++  EXPECT_FALSE(resources->words->HasLanguage("ta"));
++  Transliterator transliterator(resources);
++  EXPECT_EQ(transliterator.Phrase(u"namaste", "hi"), u"नमस्ते");
++}
++
++TEST_F(TarkXlitAndroidDirectoryTest, ModelWithoutAnyWordListLoadsNothing) {
++  EXPECT_FALSE(LoadResourcesFromDirectory(dir_.GetPath()));
++}
++
++TEST_F(TarkXlitAndroidDirectoryTest, IgnoresPartFiles) {
++  Add("xlit-words-hi.bin", "xlit-words-hi.bin.part");
++  EXPECT_FALSE(LoadResourcesFromDirectory(dir_.GetPath()));
++  Add("xlit-words-ta.bin", "xlit-words-ta.bin");
++  scoped_refptr<Resources> resources =
++      LoadResourcesFromDirectory(dir_.GetPath());
++  ASSERT_TRUE(resources);
++  EXPECT_TRUE(resources->words->HasLanguage("ta"));
++  EXPECT_FALSE(resources->words->HasLanguage("hi"));
++}
++
++TEST_F(TarkXlitAndroidDirectoryTest, NotReadyLoadsNothing) {
++  Add("xlit-words-hi.bin", "xlit-words-hi.bin");
++  SetResourceDirectory(dir_.GetPath());
++  SetFilesReady(false);
++  EXPECT_FALSE(FilesReady());
++  EXPECT_FALSE(LoadResourcesFromBundle());
++}
++
++TEST_F(TarkXlitAndroidDirectoryTest, ReloadsAfterFilesBecomeReady) {
++  SetResourceDirectory(dir_.GetPath());
++  EXPECT_FALSE(LoadResourcesFromBundle());
++  Add("xlit-words-hi.bin", "xlit-words-hi.bin");
++  SetFilesReady(true);
++  EXPECT_TRUE(FilesReady());
++  scoped_refptr<Resources> resources = LoadResourcesFromBundle();
++  ASSERT_TRUE(resources);
++  EXPECT_TRUE(resources->words->HasLanguage("hi"));
++}
++
++}  // namespace
++}  // namespace tark_xlit

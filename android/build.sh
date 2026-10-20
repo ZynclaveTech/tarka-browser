@@ -178,6 +178,10 @@ else
   run mkdir -p "$_src_dir/chrome/browser/tark_xlit"
   run python3 "$_root_dir/android/xlit/files.py" header "$_src_dir/third_party/indicxlit/android/files.json" \
     "$_src_dir/chrome/browser/tark_xlit/xlit_files.inc"
+  # Two of them for tark_xlit_unittests (android_files_unittest.cc).
+  run mkdir -p "$_src_dir/components/tark_xlit/test/data/android"
+  run cp "$_src_dir/third_party/indicxlit/android/xlit-words-hi.bin" \
+    "$_src_dir/third_party/indicxlit/android/xlit-words-ta.bin" "$_src_dir/components/tark_xlit/test/data/android/"
   log "every patch applied and Tark's steps done"
   echo "$prep" > "$stamp"
 fi
@@ -231,4 +235,6 @@ run ninja -k 0 -C "$_src_dir/out/Default" chrome_public_apk
 # built for this machine and run here.
 run ninja -C "$_src_dir/out/Default" chrome/browser/tark_adblock:host_unittests
 run "$_src_dir/out/Default/clang_x64/tark_adblock_unittests"
+run ninja -C "$_src_dir/out/Default" components/tark_xlit:host_unittests
+run "$_src_dir/out/Default/clang_x64/tark_xlit_unittests"
 log "built $_src_dir/out/Default/apks/ChromePublic.apk"

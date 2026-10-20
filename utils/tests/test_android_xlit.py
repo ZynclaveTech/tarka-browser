@@ -77,5 +77,45 @@ class TestFiles(unittest.TestCase):
         self.assertIn("'android/xlit/files.py'", (ROOT / 'android' / 'prep_hash.py').read_text())
 
 
+PATCHES = ROOT / 'android' / 'patches'
+
+
+def series():
+    return [l.strip() for l in (PATCHES / 'series').read_text().splitlines()
+            if l.strip() and not l.lstrip().startswith('#')]
+
+
+class TestFilesPatch(unittest.TestCase):
+    """A3 Task 2: tark_xlit reads per-language lists from the app's data."""
+    def setUp(self):
+        self.patch = (PATCHES / 'xlit-android-files.patch').read_text()
+
+    def test_in_the_android_series(self):
+        self.assertIn('xlit-android-files.patch', series())
+
+    def test_word_list_takes_several_files(self):
+        self.assertIn('+      std::vector<std::unique_ptr<base::MemoryMappedFile>> files);', self.patch)
+        self.assertIn('parts_[block.part]', self.patch)
+
+    def test_part_files_are_never_read(self):
+        self.assertIn('FILE_PATH_LITERAL("xlit-words-*.bin")', self.patch)
+
+    def test_downloaded_directory_only_when_ready(self):
+        self.assertIn('return FilesReady() ? LoadResourcesFromDirectory(downloaded) : nullptr;', self.patch)
+
+    def test_unit_tests_built_for_the_machine(self):
+        self.assertIn('tark_xlit_unittests($host_toolchain)', self.patch)
+        self.assertIn('+      "android_files_unittest.cc",', self.patch)
+        sh = (ROOT / 'android' / 'build.sh').read_text()
+        self.assertIn('components/tark_xlit:host_unittests', sh)
+        self.assertIn('clang_x64/tark_xlit_unittests', sh)
+
+    def test_build_sh_gives_the_tests_two_languages(self):
+        sh = (ROOT / 'android' / 'build.sh').read_text()
+        self.assertIn('components/tark_xlit/test/data/android', sh)
+        self.assertIn('xlit-words-hi.bin', sh)
+        self.assertIn('xlit-words-ta.bin', sh)
+
+
 if __name__ == '__main__':
     unittest.main()
