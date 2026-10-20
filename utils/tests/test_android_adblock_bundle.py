@@ -143,3 +143,45 @@ class TestSpecLists(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+WORKFLOW = ADBLOCK.parents[1] / '.github' / 'workflows' / 'android-adblock-lists.yml'
+
+
+class TestWorkflow(unittest.TestCase):
+    """A2 Task 2: the daily job that signs and publishes the bundle on
+    gettarka.com (spec §4: it must not depend on the Mac being on)."""
+
+    def setUp(self):
+        self.y = WORKFLOW.read_text()
+
+    def test_workflow_runs_daily_or_by_hand_only(self):
+        self.assertIn("cron: '30 2 * * *'", self.y)
+        self.assertIn('workflow_dispatch:', self.y)
+        for trigger in ('push:', 'pull_request', 'pull_request_target'):
+            self.assertNotIn(trigger, self.y)
+
+    def test_workflow_signs_with_the_secret_and_checks_first(self):
+        self.assertIn('secrets.TARK_LISTS_SIGNING_KEY', self.y)
+        self.assertLess(self.y.index('listtool/target/release/listtool check'), self.y.index('bundle.py sign'))
+        self.assertIn('bundle.py verify', self.y)
+        self.assertIn('lists_pubkey.txt', self.y)
+
+    def test_workflow_uses_an_oidc_role_never_static_keys(self):
+        self.assertIn('id-token: write', self.y)
+        self.assertIn('role-to-assume: arn:aws:iam::967555169405:role/tark-lists-publisher', self.y)
+        self.assertNotIn('AWS_SECRET_ACCESS_KEY', self.y)
+        self.assertNotIn('aws-secret-access-key', self.y)
+
+    def test_workflow_uploads_zip_before_index_and_invalidates_only_the_index(self):
+        zip_up = self.y.index('lists/android/v1/$(basename "$z")')
+        index_up = self.y.index('lists/android/v1/latest.json --content-type')
+        self.assertLess(zip_up, index_up)
+        self.assertIn('--paths /lists/android/v1/latest.json', self.y)
+        self.assertNotIn("--paths '/*'", self.y)
+
+
+class TestPublicKey(unittest.TestCase):
+    def test_public_key_is_32_bytes_hex(self):
+        key = (ADBLOCK / 'lists_pubkey.txt').read_text().strip()
+        self.assertEqual(len(bytes.fromhex(key)), 32)

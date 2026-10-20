@@ -1,0 +1,55 @@
+# Tark for Android's adblock lists (A2, spec §4): once a day, fetch the lists
+# and uBlock Origin's scriptlets and resources, bundle them as text, check the
+# bundle by compiling it with the browser's adblock-rust, sign it (Ed25519)
+# and publish it on gettarka.com. Phones verify the signature with the public
+# key in android/adblock/lists_pubkey.txt and compile the lists themselves.
+name: Android adblock lists
+
+on:
+  schedule:
+    - cron: '30 2 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: android-adblock-lists
+  cancel-in-progress: false
+
+jobs:
+  lists:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build the list tool
+        run: cargo build --release --locked --manifest-path android/adblock/listtool/Cargo.toml
+      - name: Bundle
+        run: python3 android/adblock/bundle.py build --out out
+      - name: Check
+        run: android/adblock/listtool/target/release/listtool check out/lists-*.zip android/adblock/canaries.txt
+      - name: Sign
+        env:
+          TARK_LISTS_SIGNING_KEY: ${{ secrets.TARK_LISTS_SIGNING_KEY }}
+        run: |
+          umask 077
+          printf '%s\n' "$TARK_LISTS_SIGNING_KEY" > "$RUNNER_TEMP/key"
+          python3 android/adblock/bundle.py sign out/lists-*.zip --key "$RUNNER_TEMP/key"
+          rm -f "$RUNNER_TEMP/key"
+          python3 android/adblock/bundle.py verify out/lists-*.zip out/latest.json --pubkey android/adblock/lists_pubkey.txt
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::967555169405:role/tark-lists-publisher
+          aws-region: ap-south-1
+      - name: Publish
+        run: |
+          z=$(ls out/lists-*.zip)
+          # The zip first, under its own name (never changes once written),
+          # then the index that points at it.
+          aws s3 cp "$z" s3://tark-site-967555169405/lists/android/v1/$(basename "$z") \
+            --content-type application/zip --cache-control 'public, max-age=31536000, immutable'
+          aws s3 cp out/latest.json s3://tark-site-967555169405/lists/android/v1/latest.json --content-type application/json \
+            --cache-control 'public, max-age=300'
+          aws cloudfront create-invalidation --distribution-id E1F37RZV3Y8TAK --paths /lists/android/v1/latest.json
