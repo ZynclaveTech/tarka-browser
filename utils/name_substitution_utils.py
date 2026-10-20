@@ -58,11 +58,18 @@ ENGLISH_ONLY_REGEXES = [
 ]
 
 
+def is_english(lang):
+    """Whether an .xtb language is a variant of English (en-GB): its
+    translations get Tark's English words, as the English source does."""
+    return lang == 'en' or lang.startswith('en-')
+
+
 # Tark (A4, Android): plain words for whole messages, by message name:
 # name -> (English, old id, new id, {language: Tark's wording}). The English
 # text is replaced; translations stay under the old id (other messages can
 # share the old English) and are copied to the new id, Hindi with Tark's
-# wording, unless the new id already has a translation of its own. The ids
+# wording and English variants (en-GB) with the English, unless the new id
+# already has a translation of its own. The ids
 # are grit's fingerprints, pinned so the .xtb pass needs no grit
 # (utils/tests/test_name_substitution.py checks them against grit).
 MESSAGE_RENAMES = {
@@ -120,13 +127,14 @@ def copy_renamed_translations(xml_tree):
     lang = xml_tree.get('lang', '')
     by_id = {t.get('id'): t for t in xml_tree.findall('.//translation')}
     added = False
-    for _, old_id, new_id, by_lang in MESSAGE_RENAMES.values():
+    for english, old_id, new_id, by_lang in MESSAGE_RENAMES.values():
         if new_id in by_id or old_id not in by_id:
             continue
         old = by_id[old_id]
         copy = xml.Element('translation', {'id': new_id})
-        copy.text = by_lang.get(lang, old.text)
-        if lang not in by_lang:
+        tark_words = by_lang.get(lang, english if is_english(lang) else None)
+        copy.text = tark_words or old.text
+        if not tark_words:
             copy.extend(list(old))
         copy.tail = old.tail
         xml_tree.append(copy)
@@ -248,12 +256,13 @@ def replace_grit_message(msg, translation=False):
     return had_any_match
 
 
-def replace_xtb_translation(msg, fp_map):
+def replace_xtb_translation(msg, fp_map, english=False):
     """
     Replaces instances of Chrom(e | ium) with Tark in a
-    .xtb <translation>.
+    .xtb <translation>, and in an English variant's (en-GB) also Incognito
+    with private.
     """
-    had_match = replace_grit_message(msg, translation=True)
+    had_match = replace_grit_message(msg, translation=not english)
 
     # Tark: a translation follows its English message to the new id even when
     # the translation itself had nothing to replace ("Neues Inkognitofenster"
@@ -310,12 +319,13 @@ def replace_xtb_tree(text, fp_map, android=False):
     xml_tree = xml.fromstring(text, get_parser())
     changed = False
     ids_seen = set()
+    english = is_english(xml_tree.get('lang', ''))
 
     if android:
         changed |= copy_renamed_translations(xml_tree)
     for translation in xml_tree.findall('.//translation'):
         assert translation.get('id')
-        changed |= replace_xtb_translation(translation, fp_map)
+        changed |= replace_xtb_translation(translation, fp_map, english)
         dedup_translations_in_place(translation, ids_seen)
 
     if changed:

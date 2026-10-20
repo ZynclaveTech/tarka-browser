@@ -236,3 +236,32 @@ def test_the_ads_category_is_tarks_blocker_in_hindi_too():
     out = util.replace_xtb_tree(_xtb('hi', ('8899807382908246773', 'परेशान करने वाले विज्ञापन')), {}, android=True)
     assert '<translation id="1919345977826869612">विज्ञापन</translation>' in out
     assert '<translation id="8899807382908246773">परेशान करने वाले विज्ञापन</translation>' in out
+
+
+# Found on the user's phone (en-IN, which Android maps to Chromium's en-GB
+# strings): British English showed Chromium's words. en-GB is English, so it
+# gets Tark's English, not a copy of its old translation.
+def test_british_english_gets_tarks_plain_words():
+    out = util.replace_xtb_tree(_xtb('en-GB', ('8899807382908246773', 'Intrusive ads'),
+                                     ('4165986682804962316', 'Site settings')), {}, android=True)
+    assert '<translation id="1919345977826869612">Ads</translation>' in out
+    assert '<translation id="523862956770478816">Site permissions</translation>' in out
+    # The old ids stay for the other messages that share them.
+    assert '<translation id="4165986682804962316">Site settings</translation>' in out
+
+
+def test_british_english_says_private():
+    out = util.replace_xtb_tree(_xtb('en-GB', ('111', 'New Incognito tab'),
+                                     ('333', 'Close Incognito tabs?')), {'111': '222'})
+    assert '<translation id="222">New private tab</translation>' in out
+    assert '<translation id="333">Close private tabs?</translation>' in out
+
+
+def test_other_translations_still_keep_incognito():
+    out = util.replace_xtb_tree(_xtb('it', ('111', 'Navigazione in incognito')), {'111': '222'})
+    assert '<translation id="222">Navigazione in incognito</translation>' in out
+
+
+def test_which_languages_are_english():
+    assert util.is_english('en-GB') and util.is_english('en') and util.is_english('en-US')
+    assert not util.is_english('hi') and not util.is_english('es-419') and not util.is_english('')
