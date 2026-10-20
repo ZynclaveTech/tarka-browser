@@ -34,6 +34,7 @@ HINDI = 'हिन्दी'
 OFFER = f'Type in {HINDI}?'
 
 REQUESTS = []          # paths the browser asked for, in order
+ACCEPT = {'via': 'offer'}  # or 'settings': Settings > Languages' switch
 SERVER = {'tamper': False, 'files': {}}
 
 
@@ -89,6 +90,8 @@ class Device:
         self.start()
 
     def start(self):
+        # Chrome writes Local State a few seconds after a change.
+        time.sleep(12)
         self.shell('am', 'force-stop', PACKAGE)
         self.run('logcat', '-c')
         self.shell('am', 'start', '-n', f'{PACKAGE}/com.google.android.apps.chrome.Main')
@@ -173,7 +176,28 @@ def rows(xml):
     return out
 
 
+def accept_in_settings(dev):
+    """Turns on Settings > Languages > Indian-language suggestions (on Wi-Fi)."""
+    dev.shell('am', 'start', '-n', f'{PACKAGE}/org.chromium.chrome.browser.settings.SettingsActivity')
+    time.sleep(3)
+    for _ in range(4):
+        if tap_text(dev, 'Languages', tries=1):
+            break
+        dev.shell('input', 'swipe', '540', '1800', '540', '700', '300')
+    for _ in range(4):
+        if tap_text(dev, 'Indian-language suggestions', tries=1):
+            return ''
+        dev.shell('input', 'swipe', '540', '1800', '540', '700', '300')
+    return 'no Indian-language suggestions switch'
+
+
 def accept(dev, button):
+    if ACCEPT['via'] == 'settings' and button != 'No thanks':
+        why = accept_in_settings(dev)
+        # Back to the browser without closing the app.
+        dev.shell('am', 'start', '-n', f'{PACKAGE}/com.google.android.apps.chrome.Main')
+        time.sleep(2)
+        return why
     xml = type_in_address_bar(dev, 'namaste')
     if not any(line == OFFER for line, _ in rows(xml)):
         return f'no offer row: {rows(xml)}'
@@ -329,11 +353,14 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument('files_dir', type=pathlib.Path)
     parser.add_argument('--serial', default='emulator-5554')
+    parser.add_argument('--accept', choices=['offer', 'settings'], default='offer',
+                        help='how a case says yes: the offer row, or the Settings switch')
     parser.add_argument('cases', nargs='*', default=list(CASES))
     args = parser.parse_args(argv)
     if not args.serial.startswith('emulator-'):
         print('emulator only', file=sys.stderr)
         return 2
+    ACCEPT['via'] = args.accept
     load_files(args.files_dir)
     socketserver.ThreadingTCPServer.allow_reuse_address = True
     server = socketserver.ThreadingTCPServer(('127.0.0.1', PORT), Handler)

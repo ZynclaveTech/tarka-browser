@@ -228,6 +228,12 @@ class TestDownloadPatch(unittest.TestCase):
         service = self.section('chrome/browser/tark_xlit/xlit_download_service.cc')
         self.assertIn('GetOfferState() != OfferState::kAccepted) {\n+    return;', service)
 
+    def test_the_answer_is_saved_at_once(self):
+        # Found on the emulator: the app killed right after "yes" lost it
+        # (Local State is written a few seconds later), and nothing resumed.
+        service = self.section('chrome/browser/tark_xlit/xlit_download_service.cc')
+        self.assertEqual(service.count('local_state->CommitPendingWrite();'), 2)
+
     def test_started_with_the_browser_and_prefs_registered(self):
         self.assertIn('tark_xlit::XlitDownloadService::Get();', self.section('chrome/browser/chrome_browser_main_android.cc'))
         self.assertIn('tark_xlit::XlitDownloadService::RegisterPrefs(registry);', self.section('chrome/browser/prefs/browser_prefs.cc'))
@@ -286,6 +292,12 @@ class TestSettingsPatch(unittest.TestCase):
         # Both versions of the page get it.
         self.assertIn('+        addTarkXlitSwitch();', java)
         self.assertIn('"//chrome/browser/tark_xlit/android:java"', self.section('chrome/browser/language/android/BUILD.gn'))
+
+    def test_the_switch_shows_the_real_state(self):
+        # Found on the emulator: a persisted switch said "on" while the
+        # download had never been accepted.
+        java = self.section('chrome/browser/language/android/java/src/org/chromium/chrome/browser/language/settings/LanguageSettings.java')
+        self.assertIn('xlitSwitch.setPersistent(false);', java)
 
     def test_summary_names_the_downloaded_languages(self):
         java = self.section('chrome/browser/language/android/java/src/org/chromium/chrome/browser/language/settings/LanguageSettings.java')
