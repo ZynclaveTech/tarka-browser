@@ -837,6 +837,641 @@
 +
 +}  // namespace
 +}  // namespace tark_captions
+--- /dev/null
++++ b/components/tark_captions/english_text.h
+@@ -0,0 +1,36 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef COMPONENTS_TARK_CAPTIONS_ENGLISH_TEXT_H_
++#define COMPONENTS_TARK_CAPTIONS_ENGLISH_TEXT_H_
++
++#include <string>
++#include <string_view>
++
++namespace tark_captions {
++
++// What IndicTransToolkit's IndicProcessor feeds the English-to-Indian model
++// for English text (without the two language tags), for macOS's English
++// captions (D4 Phase 3): its punctuation normaliser, then sacremoses'
++// MosesPunctNormalizer (English, Penn) and MosesTokenizer (English, no XML
++// escaping). Like ModelInput(), it leaves out the processor's placeholders
++// for URLs, emails and numbers, and its digit conversion (macOS writes
++// English digits).
++std::string EnglishModelInput(std::string_view text);
++
++namespace english_text_internal {
++
++// sacremoses' character classes (Perl's Unicode tables) from ICU, and
++// Python's whitespace; exposed for tests.
++bool IsAlpha(char32_t c);
++bool IsNumber(char32_t c);
++bool IsAlnum(char32_t c);
++bool IsLower(char32_t c);
++bool IsSpace(char32_t c);
++
++}  // namespace english_text_internal
++
++}  // namespace tark_captions
++
++#endif  // COMPONENTS_TARK_CAPTIONS_ENGLISH_TEXT_H_
+--- /dev/null
++++ b/components/tark_captions/english_text.cc
+@@ -0,0 +1,504 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/tark_captions/english_text.h"
++
++#include <initializer_list>
++#include <string>
++#include <string_view>
++#include <vector>
++
++#include "base/containers/fixed_flat_set.h"
++#include "base/functional/function_ref.h"
++#include "base/strings/utf_string_conversion_utils.h"
++#include "third_party/icu/source/common/unicode/uchar.h"
++
++namespace tark_captions {
++
++namespace english_text_internal {
++
++bool IsAlpha(char32_t c) {
++  return u_hasBinaryProperty(c, UCHAR_ALPHABETIC);
++}
++
++bool IsNumber(char32_t c) {
++  // sacremoses' table holds a newline too (how the table is stored); text
++  // has none by the time it is used.
++  return c == '\n' || (U_GET_GC_MASK(c) & U_GC_N_MASK) != 0;
++}
++
++bool IsAlnum(char32_t c) {
++  return IsAlpha(c) || u_charType(c) == U_DECIMAL_DIGIT_NUMBER;
++}
++
++bool IsLower(char32_t c) {
++  return u_hasBinaryProperty(c, UCHAR_LOWERCASE);
++}
++
++bool IsSpace(char32_t c) {
++  // Python's str.isspace(): Unicode White_Space plus the ASCII separators.
++  return u_isUWhiteSpace(c) || (c >= 0x1C && c <= 0x1F);
++}
++
++}  // namespace english_text_internal
++
++namespace {
++
++using english_text_internal::IsAlnum;
++using english_text_internal::IsAlpha;
++using english_text_internal::IsLower;
++using english_text_internal::IsNumber;
++using english_text_internal::IsSpace;
++
++using Text = std::u32string;
++using CharTest = bool (*)(char32_t);
++
++constexpr char32_t kNbsp = 0xA0;
++
++bool IsDigit(char32_t c) {  // Python's \d.
++  return u_charType(c) == U_DECIMAL_DIGIT_NUMBER;
++}
++bool IsNotAlpha(char32_t c) {
++  return !IsAlpha(c);
++}
++bool IsNotNumber(char32_t c) {
++  return !IsNumber(c);
++}
++bool IsNotAlphaOrNumber(char32_t c) {
++  return !IsAlpha(c) && !IsNumber(c);
++}
++template <char32_t C>
++bool Is(char32_t c) {
++  return c == C;
++}
++bool IsBracketPunct(char32_t c) {
++  return c == '.' || c == '!' || c == ':' || c == '?' || c == ';' || c == ',';
++}
++
++Text Decode(std::string_view utf8) {
++  Text out;
++  for (size_t i = 0; i < utf8.size(); ++i) {
++    base_icu::UChar32 c;
++    out.push_back(base::ReadUnicodeCharacter(utf8, &i, &c)
++                      ? static_cast<char32_t>(c)
++                      : U'\uFFFD');
++  }
++  return out;
++}
++
++std::string Encode(const Text& text) {
++  std::string out;
++  for (char32_t c : text) {
++    base::WriteUnicodeCharacter(static_cast<base_icu::UChar32>(c), &out);
++  }
++  return out;
++}
++
++// re.sub with a literal pattern.
++void Replace(Text& text, std::u32string_view from, std::u32string_view to) {
++  Text out;
++  size_t at = 0;
++  for (size_t found; (found = text.find(from, at)) != Text::npos; at = found + from.size()) {
++    out.append(text, at, found - at);
++    out.append(to);
++  }
++  out.append(text, at);
++  text = std::move(out);
++}
++
++// re.sub with a pattern of one character class per position: leftmost
++// matches, never overlapping.
++void Replace(Text& text,
++             std::initializer_list<CharTest> pattern,
++             base::FunctionRef<Text(std::u32string_view)> to) {
++  const size_t n = pattern.size();
++  Text out;
++  size_t i = 0;
++  while (i < text.size()) {
++    bool match = i + n <= text.size();
++    for (size_t k = 0; match && k < n; ++k) {
++      match = pattern.begin()[k](text[i + k]);
++    }
++    if (match) {
++      out += to(std::u32string_view(text).substr(i, n));
++      i += n;
++    } else {
++      out.push_back(text[i++]);
++    }
++  }
++  text = std::move(out);
++}
++
++// re.sub(" +", " ") (or "[ ]{2,}", the same).
++void CollapseAsciiSpaces(Text& text) {
++  Text out;
++  for (char32_t c : text) {
++    if (!(c == ' ' && !out.empty() && out.back() == ' ')) {
++      out.push_back(c);
++    }
++  }
++  text = std::move(out);
++}
++
++// re.sub(r"\s+", " ").
++void CollapseSpaces(Text& text) {
++  Text out;
++  bool in_run = false;
++  for (char32_t c : text) {
++    if (!IsSpace(c)) {
++      out.push_back(c);
++    } else if (!in_run) {
++      out.push_back(' ');
++    }
++    in_run = IsSpace(c);
++  }
++  text = std::move(out);
++}
++
++// str.strip().
++void Strip(Text& text) {
++  size_t begin = 0;
++  size_t end = text.size();
++  while (begin < end && IsSpace(text[begin])) {
++    ++begin;
++  }
++  while (end > begin && IsSpace(text[end - 1])) {
++    --end;
++  }
++  text = text.substr(begin, end - begin);
++}
++
++void MapChars(Text& text, std::u32string_view from, char32_t to) {
++  for (char32_t& c : text) {
++    if (from.find(c) != std::u32string_view::npos) {
++      c = to;
++    }
++  }
++}
++
++// `"([,.]+)` -> `\1"`.
++void QuoteAfterCommas(Text& text) {
++  Text out;
++  for (size_t i = 0; i < text.size();) {
++    size_t run = i + 1;
++    while (text[i] == '"' && run < text.size() && (text[run] == ',' || text[run] == '.')) {
++      ++run;
++    }
++    if (text[i] == '"' && run > i + 1) {
++      out.append(text, i + 1, run - i - 1);
++      out.push_back('"');
++      i = run;
++    } else {
++      out.push_back(text[i++]);
++    }
++  }
++  text = std::move(out);
++}
++
++Text Join(std::u32string_view a, std::u32string_view b, std::u32string_view c = U"") {
++  Text out(a);
++  out += b;
++  out += c;
++  return out;
++}
++
++// IndicProcessor._punc_norm.
++void IndicProcessorPunctuation(Text& text) {
++  Replace(text, U"\r", U"");
++  {  // \(\s* -> (
++    Text out;
++    for (size_t i = 0; i < text.size(); ++i) {
++      out.push_back(text[i]);
++      if (text[i] == '(') {
++        while (i + 1 < text.size() && IsSpace(text[i + 1])) {
++          ++i;
++        }
++      }
++    }
++    text = std::move(out);
++  }
++  {  // \s*\) -> )
++    Text out;
++    for (char32_t c : text) {
++      if (c == ')') {
++        while (!out.empty() && IsSpace(out.back())) {
++          out.pop_back();
++        }
++      }
++      out.push_back(c);
++    }
++    text = std::move(out);
++  }
++  for (char32_t mark : {U':', U';'}) {  // \s:\s? -> :
++    Text out;
++    for (size_t i = 0; i < text.size();) {
++      if (IsSpace(text[i]) && i + 1 < text.size() && text[i + 1] == mark) {
++        out.push_back(mark);
++        i += 2;
++        if (i < text.size() && IsSpace(text[i])) {
++          ++i;
++        }
++      } else {
++        out.push_back(text[i++]);
++      }
++    }
++    text = std::move(out);
++  }
++  MapChars(text, U"`\u00B4\u2018\u201A\u2019", '\'');
++  MapChars(text, U"\u201E\u201C\u201D\u00AB\u00BB", '"');
++  MapChars(text, U"\u2013\u2014", '-');
++  Replace(text, U"\u00A0%", U"%");
++  Replace(text, U"n\u00BA\u00A0", U"n\u00BA ");
++  Replace(text, U"\u00A0\u00BAC", U" \u00BAC");
++  Replace(text, {&Is<kNbsp>, [](char32_t c) { return c == '?' || c == '!' || c == ';'; }},
++          [](std::u32string_view m) { return Text(m.substr(1)); });
++  Replace(text, U",\u00A0", U", ");
++  CollapseAsciiSpaces(text);
++  Replace(text, {&Is<')'>, &Is<' '>, &IsBracketPunct},
++          [](std::u32string_view m) { return Join(U")", m.substr(2)); });
++  Replace(text, {&IsDigit, &Is<' '>, &Is<'%'>},
++          [](std::u32string_view m) { return Join(m.substr(0, 1), U"%"); });
++  QuoteAfterCommas(text);
++  Replace(text, {&IsDigit, &Is<kNbsp>, &IsDigit},
++          [](std::u32string_view m) { return Join(m.substr(0, 1), U".", m.substr(2)); });
++  Strip(text);
++}
++
++// sacremoses' MosesPunctNormalizer(lang="en", penn=True).normalize.
++void MosesNormalize(Text& text) {
++  // EXTRA_WHITESPACE.
++  Replace(text, U"\r", U"");
++  Replace(text, U"(", U" (");
++  Replace(text, U")", U") ");
++  CollapseAsciiSpaces(text);
++  Replace(text, {&Is<')'>, &Is<' '>, &IsBracketPunct},
++          [](std::u32string_view m) { return Join(U")", m.substr(2)); });
++  Replace(text, U"( ", U"(");
++  Replace(text, U" )", U")");
++  Replace(text, {&IsDigit, &Is<' '>, &Is<'%'>},
++          [](std::u32string_view m) { return Join(m.substr(0, 1), U"%"); });
++  Replace(text, U" :", U":");
++  Replace(text, U" ;", U";");
++  // NORMALIZE_UNICODE_IF_NOT_PENN (which sacremoses applies when penn).
++  Replace(text, U"`", U"'");
++  Replace(text, U"''", U" \" ");
++  // NORMALIZE_UNICODE. Its ‘ and ’ between ASCII letters become ' like
++  // every other ‘ and ’.
++  Replace(text, U"\u201E", U"\"");
++  Replace(text, U"\u201C", U"\"");
++  Replace(text, U"\u201D", U"\"");
++  Replace(text, U"\u2013", U"-");
++  Replace(text, U"\u2014", U" - ");
++  CollapseAsciiSpaces(text);
++  Replace(text, U"\u00B4", U"'");
++  MapChars(text, U"\u2018\u201A\u2019", '\'');
++  Replace(text, U"''", U"\"");
++  Replace(text, U"\u00B4\u00B4", U"\"");
++  Replace(text, U"\u2026", U"...");
++  // FRENCH_QUOTES.
++  Replace(text, U"\u00A0\u00AB\u00A0", U"\"");
++  Replace(text, U"\u00AB\u00A0", U"\"");
++  Replace(text, U"\u00AB", U"\"");
++  Replace(text, U"\u00A0\u00BB\u00A0", U"\"");
++  Replace(text, U"\u00A0\u00BB", U"\"");
++  Replace(text, U"\u00BB", U"\"");
++  // HANDLE_PSEUDO_SPACES.
++  Replace(text, U"\u00A0%", U"%");
++  Replace(text, U"n\u00BA\u00A0", U"n\u00BA ");
++  Replace(text, U"\u00A0:", U":");
++  Replace(text, U"\u00A0\u00BAC", U" \u00BAC");
++  Replace(text, U"\u00A0cm", U" cm");
++  Replace(text, U"\u00A0?", U"?");
++  Replace(text, U"\u00A0!", U"!");
++  Replace(text, U"\u00A0;", U";");
++  Replace(text, U",\u00A0", U", ");
++  CollapseAsciiSpaces(text);
++  // EN_QUOTATION_FOLLOWED_BY_COMMA, then OTHER (numbers).
++  QuoteAfterCommas(text);
++  Replace(text, {&IsDigit, &Is<kNbsp>, &IsDigit},
++          [](std::u32string_view m) { return Join(m.substr(0, 1), U".", m.substr(2)); });
++  Strip(text);
++}
++
++std::vector<Text> Split(const Text& text) {
++  std::vector<Text> tokens;
++  Text token;
++  for (char32_t c : text) {
++    if (IsSpace(c)) {
++      if (!token.empty()) {
++        tokens.push_back(std::move(token));
++        token.clear();
++      }
++    } else {
++      token.push_back(c);
++    }
++  }
++  if (!token.empty()) {
++    tokens.push_back(std::move(token));
++  }
++  return tokens;
++}
++
++// sacremoses' English nonbreaking prefixes; No, Art and pp only before a
++// number.
++constexpr auto kNonbreaking = base::MakeFixedFlatSet<std::u32string_view>({
++    U"A",     U"B",    U"C",    U"D",     U"E",    U"F",    U"G",    U"H",    U"I",
++    U"J",     U"K",    U"L",    U"M",     U"N",    U"O",    U"P",    U"Q",    U"R",
++    U"S",     U"T",    U"U",    U"V",     U"W",    U"X",    U"Y",    U"Z",    U"Adj",
++    U"Adm",   U"Adv",  U"Asst", U"Bart",  U"Bldg", U"Brig", U"Bros", U"Capt", U"Cmdr",
++    U"Col",   U"Comdr", U"Con", U"Corp",  U"Cpl",  U"DR",   U"Dr",   U"Drs",  U"Ens",
++    U"Gen",   U"Gov",  U"Hon",  U"Hr",    U"Hosp", U"Insp", U"Lt",   U"MM",   U"MR",
++    U"MRS",   U"MS",   U"Maj",  U"Messrs", U"Mlle", U"Mme", U"Mr",   U"Mrs",  U"Ms",
++    U"Msgr",  U"Op",   U"Ord",  U"Pfc",   U"Ph",   U"Prof", U"Pvt",  U"Rep",  U"Reps",
++    U"Res",   U"Rev",  U"Rt",   U"Sen",   U"Sens", U"Sfc",  U"Sgt",  U"Sr",   U"St",
++    U"Supt",  U"Surg", U"v",    U"vs",    U"i.e",  U"rev",  U"e.g",  U"Rs",   U"Nos",
++    U"Nr",    U"Jan",  U"Feb",  U"Mar",   U"Apr",  U"Jun",  U"Jul",  U"Aug",  U"Sep",
++    U"Oct",   U"Nov",  U"Dec",
++});
++constexpr auto kNumericOnly = base::MakeFixedFlatSet<std::u32string_view>({U"No", U"Art", U"pp"});
++
++// MosesTokenizer.handles_nonbreaking_prefixes.
++void NonbreakingPrefixes(Text& text) {
++  std::vector<Text> tokens = Split(text);
++  for (size_t i = 0; i < tokens.size(); ++i) {
++    Text& token = tokens[i];
++    if (token.size() < 2 || token.back() != '.') {
++      continue;
++    }
++    const Text prefix = token.substr(0, token.size() - 1);
++    const bool has_alpha = std::any_of(prefix.begin(), prefix.end(), &IsAlpha);
++    const bool next = i + 1 < tokens.size();
++    if ((prefix.find('.') != Text::npos && has_alpha) || kNonbreaking.contains(prefix) ||
++        (next && IsLower(tokens[i + 1][0]))) {
++      continue;
++    }
++    if (kNumericOnly.contains(prefix) && next && tokens[i + 1][0] >= '0' &&
++        tokens[i + 1][0] <= '9') {
++      continue;
++    }
++    token = prefix + U" .";
++  }
++  Text joined;
++  for (const Text& token : tokens) {
++    if (!joined.empty()) {
++      joined.push_back(' ');
++    }
++    joined += token;
++  }
++  text = std::move(joined);
++}
++
++// MosesTokenizer.replace_multidots: a run of k dots becomes
++// " " + "DOT" * k + "MULTI", with a space after unless it ends the text.
++void ReplaceMultidots(Text& text) {
++  Text out;
++  for (size_t i = 0; i < text.size();) {
++    size_t run = i;
++    while (run < text.size() && text[run] == '.') {
++      ++run;
++    }
++    if (run - i >= 2) {
++      out.push_back(' ');
++      for (size_t k = i; k < run; ++k) {
++        out += U"DOT";
++      }
++      out += U"MULTI";
++      if (run < text.size()) {
++        out.push_back(' ');
++      }
++      i = run;
++    } else {
++      out.push_back(text[i++]);
++    }
++  }
++  text = std::move(out);
++}
++
++// MosesTokenizer.restore_multidots: (?:DOT)+MULTI -> one dot per DOT.
++void RestoreMultidots(Text& text) {
++  Text out;
++  for (size_t i = 0; i < text.size();) {
++    size_t at = i;
++    size_t dots = 0;
++    while (text.compare(at, 3, U"DOT") == 0) {
++      at += 3;
++      ++dots;
++    }
++    if (dots > 0 && text.compare(at, 5, U"MULTI") == 0) {
++      out.append(dots, '.');
++      i = at + 5;
++    } else {
++      out.push_back(text[i++]);
++    }
++  }
++  text = std::move(out);
++}
++
++// sacremoses' MosesTokenizer(lang="en").tokenize(escape=False), joined.
++void MosesTokenize(Text& text) {
++  CollapseSpaces(text);
++  std::erase_if(text, [](char32_t c) { return c <= 0x1F; });
++  Strip(text);
++  {  // PAD_NOT_ISALNUM.
++    Text out;
++    for (char32_t c : text) {
++      if (IsAlnum(c) || IsSpace(c) || c == '.' || c == '\'' || c == '`' || c == ',' ||
++          c == '-') {
++        out.push_back(c);
++      } else {
++        out += Join(U" ", std::u32string_view(&c, 1), U" ");
++      }
++    }
++    text = std::move(out);
++  }
++  ReplaceMultidots(text);
++  // Commas, except within numbers.
++  Replace(text, {&IsNotNumber, &Is<','>},
++          [](std::u32string_view m) { return Join(m.substr(0, 1), U" , "); });
++  Replace(text, {&Is<','>, &IsNotNumber},
++          [](std::u32string_view m) { return Join(U" , ", m.substr(1)); });
++  if (text.size() >= 2 && text.back() == ',' && IsNumber(text[text.size() - 2])) {
++    text.insert(text.size() - 1, U" ");
++    text.push_back(' ');
++  }
++  // English apostrophes.
++  const auto split = [](std::u32string_view m) {
++    return Join(m.substr(0, 1), U" ' ", m.substr(2));
++  };
++  const auto attach = [](std::u32string_view m) {
++    return Join(m.substr(0, 1), U" '", m.substr(2));
++  };
++  Replace(text, {&IsNotAlpha, &Is<'\''>, &IsNotAlpha}, split);
++  Replace(text, {&IsNotAlphaOrNumber, &Is<'\''>, &IsAlpha}, split);
++  Replace(text, {&IsAlpha, &Is<'\''>, &IsNotAlpha}, split);
++  Replace(text, {&IsAlpha, &Is<'\''>, &IsAlpha}, attach);
++  Replace(text, {&IsNumber, &Is<'\''>, &Is<'s'>}, attach);
++  NonbreakingPrefixes(text);
++  CollapseSpaces(text);
++  Strip(text);
++  // A final ".'" (or ".' ") splits.
++  for (std::u32string_view tail : {U".'", U".' "}) {
++    if (text.size() >= tail.size() && text.ends_with(tail)) {
++      text.replace(text.size() - tail.size(), tail.size(), U" . ' ");
++      break;
++    }
++  }
++  RestoreMultidots(text);
++  // The tokens, joined by spaces.
++  CollapseSpaces(text);
++  Strip(text);
++}
++
++}  // namespace
++
++std::string EnglishModelInput(std::string_view input) {
++  Text text = Decode(input);
++  IndicProcessorPunctuation(text);
++  Strip(text);
++  MosesNormalize(text);
++  MosesTokenize(text);
++  return Encode(text);
++}
++
++}  // namespace tark_captions
+--- /dev/null
++++ b/components/tark_captions/english_text_unittest.cc
+@@ -0,0 +1,86 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/tark_captions/english_text.h"
++
++#include <set>
++#include <string>
++
++#include "base/strings/stringprintf.h"
++#include "components/tark_captions/test_util.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace tark_captions {
++namespace {
++
++base::DictValue Golden() {
++  std::optional<base::FilePath> testdata = test::TestDataDir();
++  return testdata ? test::EnMtGolden(*testdata) : base::DictValue();
++}
++
++// English captions (utils/indictrans_export.py en-golden) through
++// IndicProcessor's English steps.
++TEST(EnglishTextTest, ModelInputMatchesReference) {
++  const base::DictValue golden = Golden();
++  const base::ListValue* cases = golden.FindList("cases");
++  if (!cases) {
++    GTEST_SKIP() << "set TARK_CAPTIONS_TESTDATA";
++  }
++  ASSERT_FALSE(cases->empty());
++  for (const base::Value& v : *cases) {
++    const base::DictValue& c = v.GetDict();
++    EXPECT_EQ(EnglishModelInput(*c.FindString("english")), *c.FindString("model_input"))
++        << *c.FindString("id");
++  }
++}
++
++// Over the characters English captions are made of, ICU's classes are
++// sacremoses' (its Perl Unicode tables).
++TEST(EnglishTextTest, CharacterClassesMatchSacremoses) {
++  const base::DictValue golden = Golden();
++  const base::DictValue* classes = golden.FindDict("classes");
++  const base::ListValue* ranges = golden.FindList("ranges");
++  if (!classes || !ranges) {
++    GTEST_SKIP() << "set TARK_CAPTIONS_TESTDATA";
++  }
++  const std::pair<const char*, bool (*)(char32_t)> kClasses[] = {
++      {"IsAlpha", &english_text_internal::IsAlpha},
++      {"IsN", &english_text_internal::IsNumber},
++      {"IsAlnum", &english_text_internal::IsAlnum},
++      {"IsLower", &english_text_internal::IsLower},
++      {"space", &english_text_internal::IsSpace},
++  };
++  for (const auto& [name, predicate] : kClasses) {
++    std::set<int> members;
++    for (const base::Value& c : *classes->FindList(name)) {
++      members.insert(c.GetInt());
++    }
++    for (const base::Value& range : *ranges) {
++      for (int c = range.GetList()[0].GetInt(); c <= range.GetList()[1].GetInt(); ++c) {
++        EXPECT_EQ(predicate(static_cast<char32_t>(c)), members.contains(c)) << name << base::StringPrintf(" U+%04X", c);
++      }
++    }
++  }
++}
++
++TEST(EnglishTextTest, SplitsContractionsAndPunctuation) {
++  EXPECT_EQ(EnglishModelInput("Mr. Smith can't come... sorry!"),
++            "Mr. Smith can 't come ... sorry !");
++}
++
++TEST(EnglishTextTest, EmptyAndBlank) {
++  EXPECT_EQ(EnglishModelInput(""), "");
++  EXPECT_EQ(EnglishModelInput(" \t\n "), "");
++}
++
++// Long runs of dots and spaces (the speech recogniser's output is
++// untrusted) stay linear.
++TEST(EnglishTextTest, LongRunsAreLinear) {
++  const std::string dots(200000, '.');
++  EXPECT_EQ(EnglishModelInput("a" + dots + "b"), "a " + dots + " b");
++  EXPECT_EQ(EnglishModelInput("a" + std::string(200000, ' ') + "b"), "a b");
++}
++
++}  // namespace
++}  // namespace tark_captions
 --- a/chrome/browser/speech/chrome_speech_recognition_service.cc
 +++ b/chrome/browser/speech/chrome_speech_recognition_service.cc
 @@ -94,6 +94,17 @@
@@ -1758,6 +2393,97 @@
 +
  }  // namespace
  }  // namespace speech
+--- a/chrome/services/speech/tark_caption_translator.cc
++++ b/chrome/services/speech/tark_caption_translator.cc
+@@ -41,15 +41,20 @@
+                 const std::string& script,
+                 const std::string& target_code) {
+     Result result;
++    // macOS's English captions (D4 Phase 3) come for an Indian target.
++    const bool english = source_code == "en";
+     const std::optional<tark_captions::Language> source =
+         tark_captions::LanguageFromCode(source_code);
+     const std::optional<tark_captions::Target> target =
+         tark_captions::TargetFromCode(target_code);
+-    if (!source) {
++    if (!english && !source) {
+       return result;
+     }
+     if (script.empty()) {
+       result.shown = text;
++    } else if (english) {
++      // English has no other script to be shown in.
++      return result;
+     } else if (script == "latn") {
+       result.shown =
+           base::UTF16ToUTF8(tark_captions::Romanize(base::UTF8ToUTF16(text), *source));
+@@ -64,13 +69,18 @@
+     if (!target) {
+       return result;
+     }
+-    if (*target != tark_captions::Target::kNone && !engine_) {
++    const bool untranslated = *target == tark_captions::Target::kNone ||
++                              (english && *target == tark_captions::Target::kEnglish);
++    if (!untranslated && !engine_) {
+       engine_ = tark_captions::TranslationEngine::Create(models_dir_, ort_dylib_);
+     }
+-    std::optional<std::string> translation =
+-        *target == tark_captions::Target::kNone
+-            ? std::string()
+-            : (engine_ ? engine_->Translate(text, *source, *target) : std::nullopt);
++    std::optional<std::string> translation;
++    if (untranslated) {
++      translation = std::string();
++    } else if (engine_) {
++      translation = english ? engine_->TranslateEnglish(text, *target)
++                            : engine_->Translate(text, *source, *target);
++    }
+     // Codes and sizes only: call content stays out of logs.
+     VLOG(1) << "Tark translation: " << source_code << " -> " << (script.empty() ? "-" : script)
+             << " / " << (target_code.empty() ? "-" : target_code) << ", " << text.size()
+--- a/chrome/services/speech/tark_caption_translator_unittest.cc
++++ b/chrome/services/speech/tark_caption_translator_unittest.cc
+@@ -86,9 +86,39 @@
+   EXPECT_EQ(r.translation, "");
+ }
+ 
++// macOS's English captions, for an Indian target (D4 Phase 3): shown as
++// they are, translated in the sandbox.
++TEST_F(TarkCaptionTranslatorTest, EnglishTranslatesIntoIndianLanguages) {
++  std::optional<base::FilePath> ort = tark_captions::test::OrtPath();
++  std::optional<base::FilePath> models = tark_captions::test::ModelsDir();
++  std::optional<base::FilePath> testdata = tark_captions::test::TestDataDir();
++  if (!ort || !models || !testdata) {
++    GTEST_SKIP() << "set TARK_CAPTIONS_ORT, TARK_CAPTIONS_MODELS and TARK_CAPTIONS_TESTDATA";
++  }
++  Bind(*ort, *models);
++  const base::DictValue golden = tark_captions::test::EnMtGolden(*testdata);
++  ASSERT_TRUE(golden.FindList("cases") && !golden.FindList("cases")->empty());
++  const base::DictValue& c = (*golden.FindList("cases"))[0].GetDict();
++  Rendered r = Render(*c.FindString("english"), "en", "", "ta");
++  EXPECT_TRUE(r.ok);
++  EXPECT_EQ(r.shown, *c.FindString("english"));
++  EXPECT_EQ(r.translation, *c.FindDict("translations")->FindDict("ta")->FindString("text"));
++}
++
++TEST_F(TarkCaptionTranslatorTest, EnglishNeedsNoModelsWithoutAnIndianTarget) {
++  Bind(base::FilePath("/nonexistent/libonnxruntime.dylib"), base::FilePath("/nonexistent"));
++  Rendered r = Render("hello", "en", "", "en");
++  EXPECT_TRUE(r.ok);
++  EXPECT_EQ(r.shown, "hello");
++  EXPECT_EQ(r.translation, "");
++}
++
+ TEST_F(TarkCaptionTranslatorTest, UnknownCodesAreRejected) {
+   Bind(base::FilePath("/nonexistent/libonnxruntime.dylib"), base::FilePath("/nonexistent"));
+-  EXPECT_FALSE(Render("hello", "en", "", "").ok);
++  EXPECT_FALSE(Render("hello", "xx", "", "").ok);
++  // English has no other script to be shown in.
++  EXPECT_FALSE(Render("hello", "en", "latn", "").ok);
++  EXPECT_FALSE(Render("hello", "en", "hi", "").ok);
+   EXPECT_FALSE(Render("नमस्ते", "hi", "cyrl", "").ok);
+   EXPECT_FALSE(Render("नमस्ते", "hi", "", "fr").ok);
+ }
 --- a/chrome/tools/build/mac/infoplist_strings_util.cc
 +++ b/chrome/tools/build/mac/infoplist_strings_util.cc
 @@ -166,6 +166,11 @@
@@ -1780,6 +2506,25 @@
          {"NSWebBrowserPublicKeyCredentialUsageDescription", permission_reason},
  
          {"\"Chromium Shortcut\"", chromium_shortcut_description},
+--- a/components/tark_captions/BUILD.gn
++++ b/components/tark_captions/BUILD.gn
+@@ -27,6 +27,8 @@
+     "client_language.h",
+     "detection_policy.cc",
+     "detection_policy.h",
++    "english_text.cc",
++    "english_text.h",
+     "indic_text.cc",
+     "indic_text.h",
+     "language_detector.cc",
+@@ -90,6 +92,7 @@
+     "caption_text_unittest.cc",
+     "client_language_unittest.cc",
+     "detection_policy_unittest.cc",
++    "english_text_unittest.cc",
+     "indic_text_unittest.cc",
+     "language_detector_unittest.cc",
+     "language_gate_unittest.cc",
 --- a/components/tark_captions/client_language.cc
 +++ b/components/tark_captions/client_language.cc
 @@ -38,6 +38,10 @@
@@ -2066,6 +2811,184 @@
    EXPECT_EQ(queue.TakeWaitingFinals(), (std::vector<std::string>{"final 1", "final 2"}));
    queue.Done(0);
    EXPECT_FALSE(queue.Next());
+--- a/components/tark_captions/test_util.cc
++++ b/components/tark_captions/test_util.cc
+@@ -6,6 +6,7 @@
+ 
+ #include <cstring>
+ #include <string>
++#include <utility>
+ 
+ #include "base/environment.h"
+ #include "base/files/file_util.h"
+@@ -112,4 +113,16 @@
+   return ReadList(testdata.Append("lid_golden.json"), "cases");
+ }
+ 
++base::DictValue EnMtGolden(const base::FilePath& testdata) {
++  std::string json;
++  if (!base::ReadFileToString(testdata.Append("en_mt_golden.json"), &json)) {
++    return {};
++  }
++  std::optional<base::Value> value = base::JSONReader::Read(json, base::JSON_PARSE_RFC);
++  if (!value || !value->is_dict()) {
++    return {};
++  }
++  return std::move(value->GetDict());
++}
++
+ }  // namespace tark_captions::test
+--- a/components/tark_captions/test_util.h
++++ b/components/tark_captions/test_util.h
+@@ -32,6 +32,10 @@
+ // lid_golden.json's cases: a clip, its language and the scores the language
+ // detector must give its first seconds (utils/lid_export.py golden).
+ base::ListValue LidGoldenCases(const base::FilePath& testdata);
++// en_mt_golden.json (utils/indictrans_export.py en-golden): English captions,
++// their model input and translations ("cases"), and sacremoses' character
++// classes over the code point "ranges" ("classes"). Empty if unreadable.
++base::DictValue EnMtGolden(const base::FilePath& testdata);
+ 
+ }  // namespace tark_captions::test
+ 
+--- a/components/tark_captions/translation_engine.cc
++++ b/components/tark_captions/translation_engine.cc
+@@ -14,6 +14,7 @@
+ #include "base/memory/ptr_util.h"
+ #include "base/strings/string_util.h"
+ #include "base/strings/utf_string_conversions.h"
++#include "components/tark_captions/english_text.h"
+ #include "components/tark_captions/indic_text.h"
+ #include "components/tark_captions/ort_runtime.h"
+ #include "third_party/sentencepiece/src/src/sentencepiece_processor.h"
+@@ -301,28 +302,47 @@
+   }
+   // Indian to Indian: the English model tokens go straight into the second
+   // hop.
++  return IntoIndian(english_tokens, *indian_target,
++                    trace ? &trace->pivot_src_ids : nullptr,
++                    trace ? &trace->pivot_out_ids : nullptr);
++}
++
++int TranslationEngine::LoadedDirectionsForTesting() const {
++  return (to_english_ ? 1 : 0) + (from_english_ ? 1 : 0);
++}
++
++std::optional<std::string> TranslationEngine::TranslateEnglish(std::string_view text,
++                                                               Target target,
++                                                               TranslationTrace* trace) {
++  const std::optional<Language> indian_target = IndianLanguage(target);
++  if (!indian_target) {
++    return std::string();
++  }
++  return IntoIndian(EnglishModelInput(text), *indian_target,
++                    trace ? &trace->src_ids : nullptr, trace ? &trace->out_ids : nullptr);
++}
++
++std::optional<std::string> TranslationEngine::IntoIndian(std::string_view model_input,
++                                                         Language target,
++                                                         std::vector<int64_t>* src_ids,
++                                                         std::vector<int64_t>* out_ids) {
+   Direction* from_english = Get(/*to_english=*/false);
+   if (!from_english) {
+     return std::nullopt;
+   }
+-  const std::vector<int64_t> pivot_src =
+-      from_english->Encode(kEnglishTag, FloresTag(*indian_target), english_tokens);
+-  std::optional<std::vector<int64_t>> pivot_out = from_english->Greedy(pivot_src);
+-  if (!pivot_out) {
++  const std::vector<int64_t> src =
++      from_english->Encode(kEnglishTag, FloresTag(target), model_input);
++  std::optional<std::vector<int64_t>> out = from_english->Greedy(src);
++  if (!out) {
+     return std::nullopt;
+   }
+-  if (trace) {
+-    trace->pivot_src_ids = pivot_src;
+-    trace->pivot_out_ids = *pivot_out;
++  if (src_ids) {
++    *src_ids = src;
++    *out_ids = *out;
+   }
+   // IndicTrans2 writes every Indian language in Devanagari.
+   return base::UTF16ToUTF8(DetokenizeIndic(ConvertScript(
+-      base::UTF8ToUTF16(from_english->Decode(*pivot_out)), Script::kDevanagari,
+-      ScriptOf(*indian_target))));
+-}
+-
+-int TranslationEngine::LoadedDirectionsForTesting() const {
+-  return (to_english_ ? 1 : 0) + (from_english_ ? 1 : 0);
++      base::UTF8ToUTF16(from_english->Decode(*out)), Script::kDevanagari, ScriptOf(target))));
+ }
+ 
+ }  // namespace tark_captions
+--- a/components/tark_captions/translation_engine.h
++++ b/components/tark_captions/translation_engine.h
+@@ -58,6 +58,13 @@
+                                        Target target,
+                                        TranslationTrace* trace = nullptr);
+ 
++  // English `text` (UTF-8, macOS's captions) translated into `target`, in
++  // one hop: "" for kNone or kEnglish (nothing loads), nullopt when the
++  // model is missing or fails. `trace` gets its src_ids and out_ids.
++  std::optional<std::string> TranslateEnglish(std::string_view text,
++                                              Target target,
++                                              TranslationTrace* trace = nullptr);
++
+   int LoadedDirectionsForTesting() const;
+ 
+  private:
+@@ -66,6 +73,12 @@
+   TranslationEngine(std::unique_ptr<OrtRuntime> runtime, const base::FilePath& models_dir);
+   // Loads the direction on first use; null if its files are missing or bad.
+   Direction* Get(bool to_english);
++  // English model input (tokens) into `target`; the ids go to `src_ids` and
++  // `out_ids` when given.
++  std::optional<std::string> IntoIndian(std::string_view model_input,
++                                        Language target,
++                                        std::vector<int64_t>* src_ids,
++                                        std::vector<int64_t>* out_ids);
+ 
+   std::unique_ptr<OrtRuntime> runtime_;
+   const base::FilePath models_dir_;
+--- a/components/tark_captions/translation_engine_unittest.cc
++++ b/components/tark_captions/translation_engine_unittest.cc
+@@ -90,6 +90,35 @@
+   }
+ }
+ 
++// English captions (macOS's) into Indian languages: one hop, with
++// IndicProcessor's English preprocessing.
++TEST_F(TranslationEngineTest, EnglishMatchesReference) {
++  std::optional<base::FilePath> testdata = test::TestDataDir();
++  const base::DictValue golden = test::EnMtGolden(*testdata);
++  const base::ListValue* cases = golden.FindList("cases");
++  ASSERT_TRUE(cases && !cases->empty());
++  for (const base::Value& v : *cases) {
++    const base::DictValue& c = v.GetDict();
++    for (const auto [code, expected] : *c.FindDict("translations")) {
++      TranslationTrace trace;
++      std::optional<std::string> text =
++          engine_->TranslateEnglish(*c.FindString("english"), TargetOf(code), &trace);
++      EXPECT_EQ(trace.src_ids, Ids(expected.GetDict().FindList("src_ids")))
++          << *c.FindString("id") << " -> " << code;
++      EXPECT_EQ(trace.out_ids, Ids(expected.GetDict().FindList("out_ids")))
++          << *c.FindString("id") << " -> " << code;
++      EXPECT_EQ(text, *expected.GetDict().FindString("text")) << *c.FindString("id") << " -> " << code;
++    }
++  }
++}
++
++TEST_F(TranslationEngineTest, EnglishIntoEnglishIsNotTranslated) {
++  std::unique_ptr<TranslationEngine> engine = TranslationEngine::Create(models_, ort_);
++  EXPECT_EQ(engine->TranslateEnglish("hello", Target::kEnglish), "");
++  EXPECT_EQ(engine->TranslateEnglish("hello", Target::kNone), "");
++  EXPECT_EQ(engine->LoadedDirectionsForTesting(), 0);
++}
++
+ TEST_F(TranslationEngineTest, SameLanguageIsNotTranslated) {
+   std::unique_ptr<TranslationEngine> engine = TranslationEngine::Create(models_, ort_);
+   EXPECT_EQ(engine->Translate("नमस्ते", Language::kHindi, Target::kHindi), "");
 --- a/media/mojo/mojom/speech_recognition_service.mojom
 +++ b/media/mojo/mojom/speech_recognition_service.mojom
 @@ -66,10 +66,10 @@

@@ -63,6 +63,24 @@ class TestGolden(unittest.TestCase):
             for target in others:
                 self.assertTrue(case['pivot'][target]['text'].strip(), (case['id'], target))
 
+    def test_en_golden_has_every_target(self):
+        with tempfile.TemporaryDirectory() as out:
+            golden = os.path.join(out, 'en_mt_golden.json')
+            subprocess.run([sys.executable, SCRIPT, 'en-golden', MODELS, TESTDATA, golden],
+                           check=True)
+            with open(golden, encoding='utf-8') as f:
+                data = json.load(f)
+        self.assertEqual(len(data['cases']), 25)
+        for case in data['cases']:
+            # No placeholders: Tark leaves them out.
+            self.assertNotIn('<ID', case['model_input'], case['id'])
+            self.assertEqual(sorted(case['translations']), ['bn', 'hi', 'ta'], case['id'])
+            for target, t in case['translations'].items():
+                self.assertEqual(t['src_ids'][-1], 2, (case['id'], target))
+                self.assertTrue(t['text'].strip(), (case['id'], target))
+        self.assertIn(ord('a'), data['classes']['IsLower'])
+        self.assertIn(0xA0, data['classes']['space'])
+
 
 if __name__ == '__main__':
     unittest.main()

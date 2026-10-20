@@ -6,6 +6,7 @@
 
     indictrans_export.py export INDIC_EN_DIR EN_INDIC_DIR OUT_DIR
     indictrans_export.py golden MODELS_DIR TESTDATA_DIR OUT_JSON
+    indictrans_export.py en-golden MODELS_DIR TESTDATA_DIR OUT_JSON
 
 INDIC_EN_DIR and EN_INDIC_DIR are AI4Bharat's indictrans2-indic-en-dist-200M
 and indictrans2-en-indic-dist-200M checkpoints (MIT). `export` rebuilds the
@@ -23,6 +24,13 @@ TESTDATA_DIR/mt_cases.tsv and writes, per caption, every stage Tark's C++
 engine is tested against: the normalised text, the model input, the token
 ids in and out, the English before and after detokenising, and the
 translation into each other Indian language through English.
+
+`en-golden` does the same for English captions (macOS's, D4 Phase 3) in
+TESTDATA_DIR/en_cases.tsv: the model input after IndicProcessor's English
+steps (its punctuation normaliser, then sacremoses' MosesPunctNormalizer and
+MosesTokenizer) and the translation into Hindi, Tamil and Bengali. It also
+lists which characters of the scripts English captions use are in
+sacremoses' character classes, which Tark's C++ port takes from ICU.
 
 Needs torch, onnxruntime, sentencepiece, safetensors and IndicTransToolkit
 (the D4 spike's environment); none of them is used by Tark itself.
@@ -304,9 +312,10 @@ class Translator:
         return ''.join(t for t in tokens if t not in SPECIAL).replace('\u2581', ' ').strip()
 
 
-def indic_processor():
+def indic_processor(inference=True):
     """IndicTransToolkit's processor without its package __init__ (which
-    imports a collator that needs transformers)."""
+    imports a collator that needs transformers). `inference` wraps URLs,
+    emails, numbers and #/@ words in placeholders, which Tark leaves out."""
     import importlib.util
     import types
     site = next(p for p in sys.path if p.endswith('site-packages'))
@@ -318,7 +327,7 @@ def indic_processor():
     spec = importlib.util.spec_from_file_location('IndicTransToolkit.processor', binary)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    return module.IndicProcessor(inference=True)
+    return module.IndicProcessor(inference=inference)
 
 
 def golden(models, testdata, out_json):
@@ -353,11 +362,54 @@ def golden(models, testdata, out_json):
     out_json.write_text(json.dumps({'cases': cases}, ensure_ascii=False, indent=1) + '\n', encoding='utf-8')
 
 
+# The characters English captions are made of: Latin, general punctuation,
+# currency.
+CLASS_RANGES = [(0x0000, 0x024F), (0x2000, 0x206F), (0x20A0, 0x20CF)]
+
+
+def en_golden(models, testdata, out_json):
+    from sacremoses.corpus import Perluniprops
+    # Without placeholders (as Tark); the inference processor only
+    # postprocesses, after a placeholder-free line gives it an empty map.
+    plain = indic_processor(inference=False)
+    ip = indic_processor()
+    to_indic = Translator(models / FOLDERS['en_indic'])
+    rows = (testdata / 'en_cases.tsv').read_text(encoding='utf-8').splitlines()[1:]
+    cases = []
+    for row in rows:
+        case_id, english = row.split('\t')
+        translations = {}
+        model_input = None
+        for target in ('hi', 'ta', 'bn'):
+            line = plain.preprocess_batch([english], src_lang=FLORES['en'],
+                                          tgt_lang=FLORES[target])[0]
+            ip.preprocess_batch(['x'], src_lang=FLORES['en'], tgt_lang=FLORES[target])
+            model_input = line.split(' ', 2)[2]
+            src_ids = to_indic.encode(line)
+            out_ids = to_indic.greedy(src_ids)
+            text = ip.postprocess_batch([to_indic.decode(out_ids)], lang=FLORES[target])[0]
+            translations[target] = {'src_ids': src_ids, 'out_ids': out_ids, 'text': text}
+        cases.append({'id': case_id, 'english': english, 'model_input': model_input,
+                      'translations': translations})
+    props = Perluniprops()
+    classes = {}
+    for name in ('IsAlpha', 'IsN', 'IsAlnum', 'IsLower'):
+        members = set(props.chars(name))
+        classes[name] = [c for low, high in CLASS_RANGES for c in range(low, high + 1)
+                         if chr(c) in members]
+    classes['space'] = [c for low, high in CLASS_RANGES for c in range(low, high + 1)
+                        if chr(c).isspace()]
+    out_json.write_text(json.dumps({'ranges': CLASS_RANGES, 'classes': classes, 'cases': cases},
+                                   ensure_ascii=False, indent=1) + '\n', encoding='utf-8')
+
+
 def main():
     if len(sys.argv) == 5 and sys.argv[1] == 'export':
         export(*(pathlib.Path(a) for a in sys.argv[2:]))
     elif len(sys.argv) == 5 and sys.argv[1] == 'golden':
         golden(*(pathlib.Path(a) for a in sys.argv[2:]))
+    elif len(sys.argv) == 5 and sys.argv[1] == 'en-golden':
+        en_golden(*(pathlib.Path(a) for a in sys.argv[2:]))
     else:
         sys.exit(__doc__.split('\n\n')[1])
 
