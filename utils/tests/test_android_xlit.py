@@ -322,5 +322,20 @@ class TestE2E(unittest.TestCase):
         self.assertEqual(self.run.load_files(tmp), {digest + '.bin': 'xlit-model.bin'})
 
 
+
+class TestPatchesWellFormed(unittest.TestCase):
+    """Found applying A3 on the build machine: a file without a final newline
+    (the Hindi .xtb) needs "\\ No newline at end of file" in a patch, or GNU
+    patch (unlike macOS's) reads its last line and the next file's header as
+    one line."""
+    def test_a_last_line_without_newline_is_marked(self):
+        for path in sorted(PATCHES.glob('*.patch')):
+            lines = path.read_text().split('\n')
+            for i, line in enumerate(lines):
+                if line[1:].startswith('</translationbundle>') and line[:1] in ' +-':
+                    self.assertEqual(line[1:], '</translationbundle>', f'{path.name}:{i + 1}')
+                    self.assertEqual(lines[i + 1], '\\ No newline at end of file', f'{path.name}:{i + 1}')
+
+
 if __name__ == '__main__':
     unittest.main()
