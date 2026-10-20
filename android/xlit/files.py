@@ -33,7 +33,11 @@ MODEL = 'xlit-model.bin'
 
 def build(words_dir, english, model, out_dir):
     out = pathlib.Path(out_dir)
-    out.mkdir(parents=True, exist_ok=True)
+    # The directory is reused between builds: a file left from an earlier
+    # build must never end up in this build's table.
+    if out.exists():
+        shutil.rmtree(out)
+    out.mkdir(parents=True)
     shutil.copyfile(model, out / MODEL)
     for path in sorted(pathlib.Path(words_dir).iterdir()):
         m = re.fullmatch(r'([a-z]+)\.tsv(\.xz)?', path.name)

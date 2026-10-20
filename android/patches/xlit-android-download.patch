@@ -55,7 +55,7 @@
 +]
 --- /dev/null
 +++ b/chrome/browser/tark_xlit/xlit_files.h
-@@ -0,0 +1,78 @@
+@@ -0,0 +1,99 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -100,9 +100,21 @@
 +// deleted. Blocking.
 +bool VerifyFile(const base::FilePath& path, const XlitFile& file);
 +
-+// What is in `dir`, by name: the table's files of the right size (the hash was
-+// checked when each was downloaded). Deletes what a download left unfinished
-+// (*.part) and table files of the wrong size. Blocking.
++// Beside each checked file, "<name>.sha256" records the hash it was checked
++// against, so that a start trusts it without hashing it again, and a file
++// from an older table (same name and size, other bytes) is not trusted.
++// Blocking.
++bool WriteRecord(const base::FilePath& path, const XlitFile& file);
++
++// A download attempt's own file: "<name>.<generation>.part". A check that is
++// still running for an earlier attempt never touches a newer one's.
++std::string PartFileName(std::string_view name, uint64_t generation);
++
++// What is in `dir`, by name: the table's files of the right size whose record
++// names the table's hash (one without a record is hashed once, and gets one).
++// Deletes what a download left unfinished (*.part), table files of the wrong
++// size or hash, and IndicXlit files the table does not name (a language an
++// older APK listed). Blocking.
 +std::vector<std::string> ScanDirectory(const base::FilePath& dir);
 +
 +// The files to download for the languages `tags`, the model first, leaving out
@@ -121,14 +133,23 @@
 +// the person chose "Download now".
 +bool ShouldStartNow(Network network, bool now);
 +
-+// At most three tries of a failed file per run of the browser.
++// At most three tries of a failed file per run of the browser. Once spent
++// (or after a redirect, Exhaust()), nothing is fetched again until Reset():
++// the person says yes again, or adds a language. A network change alone never
++// resets it.
 +class Attempts {
 + public:
 +  bool TryAgain();
-+  void Reset() { count_ = 0; }
++  void Exhaust() { exhausted_ = true; }
++  bool exhausted() const { return exhausted_; }
++  void Reset() {
++    count_ = 0;
++    exhausted_ = false;
++  }
 +
 + private:
 +  int count_ = 0;
++  bool exhausted_ = false;
 +};
 +
 +}  // namespace tark_xlit
@@ -136,7 +157,7 @@
 +#endif  // CHROME_BROWSER_TARK_XLIT_XLIT_FILES_H_
 --- /dev/null
 +++ b/chrome/browser/tark_xlit/xlit_files.cc
-@@ -0,0 +1,157 @@
+@@ -0,0 +1,185 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -230,12 +251,29 @@
 +      base::DeleteFile(path);
 +      continue;
 +    }
++    if (name.ends_with(".sha256")) {
++      continue;  // Read with its file below.
++    }
 +    const XlitFile* file = FindFile(name);
++    const base::FilePath record = path.AddExtensionASCII("sha256");
 +    if (!file) {
++      // An IndicXlit file this APK's table does not name.
++      if (name.starts_with("xlit-") && name.ends_with(".bin")) {
++        base::DeleteFile(path);
++        base::DeleteFile(record);
++      }
 +      continue;
 +    }
-+    if (files.GetInfo().GetSize() != file->size) {
++    std::string recorded;
++    bool ok = files.GetInfo().GetSize() == file->size;
++    if (ok && !(base::ReadFileToStringWithMaxSize(record, &recorded, 64) &&
++                recorded == file->sha256)) {
++      // No record, or one from another table: check the bytes once.
++      ok = VerifyFile(path, *file) && WriteRecord(path, *file);
++    }
++    if (!ok) {
 +      base::DeleteFile(path);
++      base::DeleteFile(record);
 +      continue;
 +    }
 +    present.push_back(name);
@@ -290,13 +328,24 @@
 +}
 +
 +bool Attempts::TryAgain() {
-+  return ++count_ <= 3;
++  if (++count_ > 3) {
++    exhausted_ = true;
++  }
++  return !exhausted_;
++}
++
++std::string PartFileName(std::string_view name, uint64_t generation) {
++  return base::StrCat({name, ".", base::NumberToString(generation), ".part"});
++}
++
++bool WriteRecord(const base::FilePath& path, const XlitFile& file) {
++  return base::WriteFile(path.AddExtensionASCII("sha256"), file.sha256);
 +}
 +
 +}  // namespace tark_xlit
 --- /dev/null
 +++ b/chrome/browser/tark_xlit/xlit_files_unittest.cc
-@@ -0,0 +1,157 @@
+@@ -0,0 +1,214 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -447,16 +496,73 @@
 +  ASSERT_TRUE(ta);
 +  // ScanDirectory checks sizes only; a list no longer wanted stays.
 +  Write(WordsFileName("ta"), std::string(static_cast<size_t>(ta->size), '\0'));
++  Write(WordsFileName("ta") + ".sha256", ta->sha256);
 +  EXPECT_EQ(ScanDirectory(dir_.GetPath()),
 +            std::vector<std::string>{WordsFileName("ta")});
 +  EXPECT_TRUE(Missing({WordsFileName("ta")}, {"hi"}).size() == 2u);
++}
++
++// Final review (A3): the budget holds across network changes, a stale check
++// never touches a newer attempt's file, a file on the phone is trusted only
++// with a matching record of its hash, and lists the table does not name go.
++TEST_F(TarkXlitFilesTest, AnExhaustedBudgetStaysExhaustedUntilReset) {
++  Attempts attempts;
++  EXPECT_FALSE(attempts.exhausted());
++  for (int i = 0; i < 3; ++i) {
++    EXPECT_TRUE(attempts.TryAgain());
++  }
++  EXPECT_FALSE(attempts.TryAgain());
++  EXPECT_TRUE(attempts.exhausted());
++  attempts.Reset();
++  EXPECT_FALSE(attempts.exhausted());
++  attempts.Exhaust();  // A redirect: no more tries this run.
++  EXPECT_TRUE(attempts.exhausted());
++}
++
++TEST_F(TarkXlitFilesTest, EachAttemptWritesItsOwnPartFile) {
++  EXPECT_NE(PartFileName("xlit-model.bin", 1), PartFileName("xlit-model.bin", 2));
++  EXPECT_TRUE(PartFileName("xlit-words-hi.bin", 7).ends_with(".part"));
++  EXPECT_TRUE(PartFileName("xlit-words-hi.bin", 7).starts_with("xlit-words-hi.bin."));
++}
++
++TEST_F(TarkXlitFilesTest, ScanTrustsAVerifiedRecord) {
++  const XlitFile* hi = FindFile(WordsFileName("hi"));
++  ASSERT_TRUE(hi);
++  // Right size, wrong bytes, but a record says it was checked: trusted
++  // without hashing (the record is written only after a check).
++  Write(hi->name, std::string(static_cast<size_t>(hi->size), 'x'));
++  Write(std::string(hi->name) + ".sha256", hi->sha256);
++  EXPECT_EQ(ScanDirectory(dir_.GetPath()), std::vector<std::string>{std::string(hi->name)});
++}
++
++TEST_F(TarkXlitFilesTest, ScanDeletesASameSizeFileFromAnOlderTable) {
++  const XlitFile* hi = FindFile(WordsFileName("hi"));
++  ASSERT_TRUE(hi);
++  const base::FilePath path = Write(hi->name, std::string(static_cast<size_t>(hi->size), 'x'));
++  Write(std::string(hi->name) + ".sha256", std::string(64, '0'));  // Another table's hash.
++  EXPECT_TRUE(ScanDirectory(dir_.GetPath()).empty());
++  EXPECT_FALSE(base::PathExists(path));
++}
++
++TEST_F(TarkXlitFilesTest, ScanHashesAFileWithoutARecordOnce) {
++  const XlitFile* hi = FindFile(WordsFileName("hi"));
++  ASSERT_TRUE(hi);
++  const base::FilePath path = Write(hi->name, std::string(static_cast<size_t>(hi->size), 'x'));
++  EXPECT_TRUE(ScanDirectory(dir_.GetPath()).empty());  // Wrong bytes: hashed, deleted.
++  EXPECT_FALSE(base::PathExists(path));
++}
++
++TEST_F(TarkXlitFilesTest, ScanDeletesWordListsNotInTheTable) {
++  const base::FilePath stray = Write("xlit-words-xx.bin", "old");
++  EXPECT_TRUE(ScanDirectory(dir_.GetPath()).empty());
++  EXPECT_FALSE(base::PathExists(stray));
 +}
 +
 +}  // namespace
 +}  // namespace tark_xlit
 --- /dev/null
 +++ b/chrome/browser/tark_xlit/xlit_download_service.h
-@@ -0,0 +1,104 @@
+@@ -0,0 +1,109 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -541,8 +647,10 @@
 +  void EnsureObservingLanguages();
 +  // Starts the next missing file if allowed; no-op while one is running.
 +  void MaybeDownloadNext();
-+  void OnDownloaded(const XlitFile* file, base::FilePath part);
-+  void OnVerified(const XlitFile* file, bool ok);
++  void OnDownloaded(uint64_t generation,
++                    const XlitFile* file,
++                    base::FilePath part);
++  void OnVerified(uint64_t generation, const XlitFile* file, bool ok);
 +  void UpdateFilesReady();
 +
 +  SEQUENCE_CHECKER(sequence_checker_);
@@ -552,6 +660,9 @@
 +  std::unique_ptr<network::SimpleURLLoader> loader_;
 +  // The file `loader_` (or the check after it) is working on.
 +  const XlitFile* current_ = nullptr;
++  // Which attempt `current_` belongs to: each download, Accept() and
++  // Decline() start a new one, and a reply for an older one is dropped.
++  uint64_t generation_ = 0;
 +  Attempts attempts_;
 +  base::OneShotTimer retry_timer_;
 +  PrefChangeRegistrar accept_languages_;
@@ -563,7 +674,7 @@
 +#endif  // CHROME_BROWSER_TARK_XLIT_XLIT_DOWNLOAD_SERVICE_H_
 --- /dev/null
 +++ b/chrome/browser/tark_xlit/xlit_download_service.cc
-@@ -0,0 +1,354 @@
+@@ -0,0 +1,372 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -655,11 +766,13 @@
 +  return profile ? profile->GetOriginalProfile()->GetPrefs() : nullptr;
 +}
 +
-+// Checks a finished download and puts it in place. Blocking.
++// Checks a finished download, puts it in place and records its hash.
++// Blocking.
 +bool VerifyAndPlace(const base::FilePath& part,
 +                    const base::FilePath& target,
 +                    XlitFile file) {
-+  return VerifyFile(part, file) && base::ReplaceFile(part, target, nullptr);
++  return VerifyFile(part, file) && base::ReplaceFile(part, target, nullptr) &&
++         WriteRecord(target, file);
 +}
 +
 +}  // namespace
@@ -688,7 +801,7 @@
 +                    : OfferState::kNotAsked);
 +  net::NetworkChangeNotifier::AddNetworkChangeObserver(this);
 +  base::ThreadPool::PostTaskAndReplyWithResult(
-+      FROM_HERE, {base::MayBlock(), base::TaskPriority::BEST_EFFORT},
++      FROM_HERE, {base::MayBlock(), base::TaskPriority::USER_VISIBLE},
 +      base::BindOnce(
 +          [](base::FilePath dir) {
 +            base::CreateDirectory(dir);
@@ -723,6 +836,11 @@
 +  local_state->CommitPendingWrite();
 +  SetOfferState(OfferState::kAccepted);
 +  attempts_.Reset();
++  // A check still running for an earlier attempt is dropped when it replies.
++  ++generation_;
++  loader_.reset();
++  retry_timer_.Stop();
++  current_ = nullptr;
 +  UpdateFilesReady();
 +  EnsureObservingLanguages();
 +  MaybeDownloadNext();
@@ -736,6 +854,7 @@
 +  local_state->CommitPendingWrite();
 +  SetOfferState(OfferState::kDeclined);
 +  // A download in progress stops; its .part file is removed at the next start.
++  ++generation_;
 +  loader_.reset();
 +  retry_timer_.Stop();
 +  current_ = nullptr;
@@ -812,15 +931,17 @@
 +
 +void XlitDownloadService::OnAcceptLanguagesChanged() {
 +  // A language added after saying yes downloads its list; one removed keeps
-+  // its file.
++  // its file. A new list is a new reason to try.
 +  attempts_.Reset();
 +  MaybeDownloadNext();
 +}
 +
 +void XlitDownloadService::MaybeDownloadNext() {
 +  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  // A spent budget holds across network changes (each would otherwise start
++  // the 23 MB model again).
 +  if (!scanned_ || current_ || retry_timer_.IsRunning() ||
-+      GetOfferState() != OfferState::kAccepted) {
++      attempts_.exhausted() || GetOfferState() != OfferState::kAccepted) {
 +    return;
 +  }
 +  PrefService* local_state = g_browser_process->local_state();
@@ -834,6 +955,7 @@
 +    return;
 +  }
 +  current_ = missing.front();
++  const uint64_t generation = ++generation_;
 +  auto request = std::make_unique<network::ResourceRequest>();
 +  const base::CommandLine& command_line =
 +      *base::CommandLine::ForCurrentProcess();
@@ -856,27 +978,32 @@
 +        if (service) {
 +          service->loader_.reset();
 +          service->current_ = nullptr;
++          service->attempts_.Exhaust();
 +        }
 +      },
 +      weak_factory_.GetWeakPtr()));
 +  const base::FilePath part =
-+      dir_.AppendASCII(std::string(current_->name) + ".part");
++      dir_.AppendASCII(PartFileName(current_->name, generation));
 +  loader_->DownloadToFile(
 +      g_browser_process->shared_url_loader_factory().get(),
 +      base::BindOnce(&XlitDownloadService::OnDownloaded,
-+                     weak_factory_.GetWeakPtr(), current_),
++                     weak_factory_.GetWeakPtr(), generation, current_),
 +      part, current_->size);
 +}
 +
-+void XlitDownloadService::OnDownloaded(const XlitFile* file,
++void XlitDownloadService::OnDownloaded(uint64_t generation,
++                                       const XlitFile* file,
 +                                       base::FilePath part) {
 +  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  if (generation != generation_) {
++    return;
++  }
 +  const int error = loader_ ? loader_->NetError() : net::ERR_ABORTED;
 +  loader_.reset();
 +  if (error != net::OK || part.empty()) {
 +    LOG(WARNING) << "tark xlit: " << file->name << " failed: "
 +                 << net::ErrorToString(error);
-+    OnVerified(file, false);
++    OnVerified(generation, file, false);
 +    return;
 +  }
 +  base::ThreadPool::PostTaskAndReplyWithResult(
@@ -884,13 +1011,15 @@
 +      base::BindOnce(&VerifyAndPlace, part,
 +                     dir_.AppendASCII(std::string(file->name)), *file),
 +      base::BindOnce(&XlitDownloadService::OnVerified,
-+                     weak_factory_.GetWeakPtr(), file));
++                     weak_factory_.GetWeakPtr(), generation, file));
 +}
 +
-+void XlitDownloadService::OnVerified(const XlitFile* file, bool ok) {
++void XlitDownloadService::OnVerified(uint64_t generation,
++                                     const XlitFile* file,
++                                     bool ok) {
 +  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
-+  if (current_ != file) {
-+    return;  // Declined meanwhile.
++  if (generation != generation_) {
++    return;  // Declined, or accepted again, meanwhile.
 +  }
 +  current_ = nullptr;
 +  if (ok) {
@@ -1105,7 +1234,7 @@
 +     * @param languageName Its own name, such as "हिन्दी".
 +     */
 +    public static void show(Context context, String tag, String languageName) {
-+        String size = Formatter.formatShortFileSize(context, TarkXlitBridge.getDownloadSize(""));
++        String size = Formatter.formatShortFileSize(context, TarkXlitBridge.getDownloadSize(tag));
 +        new AlertDialog.Builder(context, R.style.ThemeOverlay_BrowserUI_AlertDialog)
 +                .setTitle(context.getString(R.string.tark_xlit_offer, languageName))
 +                .setMessage(context.getString(R.string.tark_xlit_offer_message, languageName, size))

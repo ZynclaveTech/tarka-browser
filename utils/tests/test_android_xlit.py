@@ -68,6 +68,15 @@ class TestFiles(unittest.TestCase):
         for p in a.iterdir():
             self.assertEqual(p.read_bytes(), (b / p.name).read_bytes(), p.name)
 
+    def test_a_leftover_file_is_never_pinned(self):
+        # Final review: the output directory is reused between builds.
+        out = self.tmp / 'out'
+        out.mkdir()
+        (out / 'xlit-words-xx.bin').write_bytes(b'old')
+        files.build(*self.args, out)
+        self.assertFalse((out / 'xlit-words-xx.bin').exists())
+        self.assertNotIn('xlit-words-xx.bin', json.loads((out / 'files.json').read_text()))
+
     def test_build_sh_runs_files_after_install_xlit(self):
         sh = (ROOT / 'android' / 'build.sh').read_text()
         self.assertIn('android/xlit/files.py" build', sh)
@@ -221,12 +230,24 @@ class TestDownloadPatch(unittest.TestCase):
 
     def test_written_to_part_then_checked_then_renamed(self):
         service = self.section('chrome/browser/tark_xlit/xlit_download_service.cc')
-        self.assertIn('".part"', service)
-        self.assertIn('VerifyFile(part, file) && base::ReplaceFile(part, target, nullptr)', service)
+        self.assertIn('dir_.AppendASCII(PartFileName(', service)
+        self.assertIn('".part"', self.section('chrome/browser/tark_xlit/xlit_files.cc'))
+        self.assertIn('VerifyFile(part, file) && base::ReplaceFile(part, target, nullptr) &&', service)
 
     def test_nothing_fetched_until_accepted(self):
         service = self.section('chrome/browser/tark_xlit/xlit_download_service.cc')
         self.assertIn('GetOfferState() != OfferState::kAccepted) {\n+    return;', service)
+
+    def test_review_fixes_are_in_the_service(self):
+        service = self.section('chrome/browser/tark_xlit/xlit_download_service.cc')
+        # A spent budget holds across network changes; a redirect spends it.
+        self.assertIn('attempts_.exhausted() || GetOfferState() != OfferState::kAccepted', service)
+        self.assertIn('service->attempts_.Exhaust();', service)
+        # Each attempt has its own .part file and generation.
+        self.assertIn('PartFileName(current_->name, generation)', service)
+        self.assertIn('if (generation != generation_) {', service)
+        # The record of a checked file's hash.
+        self.assertIn('WriteRecord(target, file)', service)
 
     def test_the_answer_is_saved_at_once(self):
         # Found on the emulator: the app killed right after "yes" lost it
