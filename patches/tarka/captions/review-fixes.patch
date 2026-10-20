@@ -352,6 +352,21 @@
    }
    if (options && !options->language.has_value()) {
      options->language = language_name;
+@@ -236,10 +240,10 @@
+   DCHECK(global_prefs);
+ 
+   // Tark (D4): Tark's caption engine instead of SODA. The "binary" is ONNX
+-  // Runtime and the one "language pack" is the captions models folder; the
+-  // utility process checks both exist before making a recognizer. The
+-  // folder holds every language; each recognizer gets its call's language
+-  // from the pill (through the renderer), not from this default.
++  // Runtime and the one "language pack" is the captions models folder; a
++  // recognizer reports either missing as an error. The folder holds every
++  // language; BindRecognizer() gives each recognizer the captioning call's
++  // language (the pill's), not this default.
+   const std::string language_name = "hi";
+   const base::FilePath binary_path = TarkOnnxRuntimePath();
+   const base::FilePath models_dir = TarkCaptionsModelsDir();
 --- a/chrome/browser/speech/speech_recognition_client_browser_interface.h
 +++ b/chrome/browser/speech/speech_recognition_client_browser_interface.h
 @@ -68,6 +68,11 @@
@@ -675,15 +690,29 @@
      engine_.AsyncCall(&Engine::SetLanguage).WithArgs(*parsed);
    }
  }
+--- a/chrome/services/speech/tark_caption_recognizer.h
++++ b/chrome/services/speech/tark_caption_recognizer.h
+@@ -27,7 +27,8 @@
+ class TarkCaptionRecognizer : public media::mojom::SpeechRecognitionRecognizer {
+  public:
+   // Binds a self-owned recognizer to `receiver`. `language` is a code such
+-  // as "hi" or "hi-IN"; an unsupported one means Hindi.
++  // as "hi" or "hi-IN"; one Tark cannot caption, or a missing ONNX Runtime
++  // or models folder, is reported to the client as an error.
+   static void Create(
+       mojo::PendingReceiver<media::mojom::SpeechRecognitionRecognizer> receiver,
+       mojo::PendingRemote<media::mojom::SpeechRecognitionRecognizerClient> client,
 --- a/chrome/services/speech/tark_caption_recognizer_unittest.cc
 +++ b/chrome/services/speech/tark_caption_recognizer_unittest.cc
-@@ -91,6 +91,18 @@
+@@ -91,6 +91,20 @@
    ASSERT_TRUE(base::test::RunUntil([&] { return client_.error; }));
  }
  
 +// Tark has no English captions: a language it cannot caption is an error the
 +// pill shows, never another language's captions.
 +TEST_F(TarkCaptionRecognizerTest, UnknownLanguageIsAnError) {
++  // With real files: a missing engine also reports an error, so missing
++  // files would hide the behaviour under test.
 +  std::optional<base::FilePath> ort = tark_captions::test::OrtPath();
 +  std::optional<base::FilePath> models = tark_captions::test::ModelsDir();
 +  if (!ort || !models) {
@@ -786,7 +815,7 @@
  #include "base/time/time.h"
  #include "components/tark_captions/ort_runtime.h"
  #include "components/tark_captions/segmenter.h"
-@@ -25,33 +28,115 @@
+@@ -25,33 +28,116 @@
  
  }  // namespace
  
@@ -822,7 +851,8 @@
 +  static void Release(SharedAsr* shared) {
 +    base::AutoLock lock(RegistryLock());
 +    if (--shared->users_ == 0) {
-+      Registry().erase(shared->key_);
++      // Erase by iterator: the key lives in the object being erased.
++      Registry().erase(Registry().find(shared->key_));
 +    }
 +  }
 +
@@ -927,15 +957,16 @@
  #include "components/tark_captions/asr_model.h"
  
  namespace media {
-@@ -22,6 +23,7 @@
+@@ -21,7 +22,7 @@
+ 
  namespace tark_captions {
  
- class OrtRuntime;
+-class OrtRuntime;
 +class SharedAsr;
  class Segmenter;
  class Vad;
  
-@@ -43,9 +45,13 @@
+@@ -43,9 +44,13 @@
      std::vector<double> decode_seconds;  // wall time of each decode
    };
  
@@ -950,7 +981,7 @@
  
    CaptionEngine(const CaptionEngine&) = delete;
    CaptionEngine& operator=(const CaptionEngine&) = delete;
-@@ -64,15 +70,13 @@
+@@ -64,15 +69,13 @@
    const Stats& stats() const { return stats_; }
  
   private:
