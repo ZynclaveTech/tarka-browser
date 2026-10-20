@@ -106,13 +106,15 @@ def has_hairline(img, y_from, y_to, x_from, x_to):
 
 def list_items(xml):
     """The bounds (x1, y1, x2, y2) of the settings list's rows, top to bottom:
-    the children of the screen's RecyclerView."""
+    the children of the screen's RecyclerView. Screens behind the one shown
+    keep their lists in the tree, earlier; the last list is the one shown."""
     bounds = re.compile(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]')
-    for node in ET.fromstring(xml).iter('node'):
-        if node.get('class', '').endswith('RecyclerView'):
-            return [tuple(map(int, bounds.match(child.get('bounds')).groups()))
-                    for child in node.findall('node')]
-    return []
+    lists = [node for node in ET.fromstring(xml).iter('node')
+             if node.get('class', '').endswith('RecyclerView')]
+    if not lists:
+        return []
+    return [tuple(map(int, bounds.match(child.get('bounds')).groups()))
+            for child in lists[-1].findall('node')]
 
 
 def screen_has_dividers(img, items):

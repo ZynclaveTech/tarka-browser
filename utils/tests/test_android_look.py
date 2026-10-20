@@ -305,6 +305,18 @@ class TestDividers(unittest.TestCase):
                '</node></node></hierarchy>')
         self.assertEqual(walk_settings.list_items(xml), [(0, 0, 200, 40), (0, 40, 200, 80)])
 
+    def test_rows_are_the_front_screens_list(self):
+        # Found on the emulator: the screen behind keeps its list in the tree,
+        # first; the one shown is the last.
+        xml = ('<hierarchy>'
+               '<node class="androidx.recyclerview.widget.RecyclerView" bounds="[0,0][200,300]">'
+               '<node class="android.widget.LinearLayout" bounds="[0,0][200,40]"/></node>'
+               '<node class="androidx.recyclerview.widget.RecyclerView" bounds="[0,0][200,300]">'
+               '<node class="android.widget.LinearLayout" bounds="[0,10][200,50]"/>'
+               '<node class="android.widget.LinearLayout" bounds="[0,50][200,90]"/></node>'
+               '</hierarchy>')
+        self.assertEqual(walk_settings.list_items(xml), [(0, 10, 200, 50), (0, 50, 200, 90)])
+
     def test_dividers_forced_where_settings_reads_them(self):
         patch = (ANDROID / 'patches' / 'look-settings-dividers.patch').read_text()
         self.assertIn('+++ b/chrome/android/java/src/org/chromium/chrome/browser/settings/WideDisplayPadding.java', patch)
