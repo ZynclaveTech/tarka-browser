@@ -209,6 +209,8 @@ class TestSettings(unittest.TestCase):
         self.assertIn('row.setBaselineAligned(false);', self.add)
         self.assertIn('0, ViewGroup.LayoutParams.MATCH_PARENT, 1f);', self.add)
         self.assertIn('tile.setMinimumHeight(tarkDp(context, 64));', self.add)
+        # The user: an extra gap under the tiles, before the first section.
+        self.assertIn('column.setPadding(0, tarkDp(context, 8), 0, 0);', self.add)
 
     def test_settings_rows_have_dividers(self):
         # The user: "no divider anywhere". Every settings screen draws the rule
