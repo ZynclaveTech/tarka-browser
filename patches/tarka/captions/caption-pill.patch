@@ -1,0 +1,941 @@
+--- /dev/null
++++ b/chrome/app/tark_captions_strings.grdp
+@@ -0,0 +1,34 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!-- Tark (D4): the call captions pill. -->
++<grit-part>
++  <message name="IDS_TARK_CAPTIONS_CAPTIONS" desc="Button on the call captions pill: show the other person's words as captions.">
++    Captions
++  </message>
++  <message name="IDS_TARK_CAPTIONS_TRANSLATE" desc="Button on the call captions pill: translate the captions. Disabled until translation ships.">
++    Translate
++  </message>
++  <message name="IDS_TARK_CAPTIONS_TRANSLATE_SOON" desc="Tooltip on the disabled Translate button of the call captions pill.">
++    Translation is coming soon
++  </message>
++  <message name="IDS_TARK_CAPTIONS_LANGUAGE" desc="Accessible name of the language button on the call captions pill: the language the other person speaks.">
++    Language they speak
++  </message>
++  <message name="IDS_TARK_CAPTIONS_HINDI" desc="Language name in the call captions language menu.">
++    Hindi
++  </message>
++  <message name="IDS_TARK_CAPTIONS_TAMIL" desc="Language name in the call captions language menu.">
++    Tamil
++  </message>
++  <message name="IDS_TARK_CAPTIONS_BENGALI" desc="Language name in the call captions language menu.">
++    Bengali
++  </message>
++  <message name="IDS_TARK_CAPTIONS_UNAVAILABLE" desc="Shown on the call captions pill when captions cannot run (for example, the caption models are not on this Mac).">
++    Captions unavailable
++  </message>
++  <message name="IDS_TARK_CAPTIONS_HIDE" desc="Tooltip and accessible name of the close button on the call captions pill: hide the pill until the next call.">
++    Hide for this call
++  </message>
++  <message name="IDS_TARK_CAPTIONS_LISTENING" desc="Shown in the caption box after captions are turned on, before the other person's first words arrive.">
++    Listening…
++  </message>
++</grit-part>
+--- /dev/null
++++ b/chrome/browser/ui/views/tark_captions/caption_pill_view.h
+@@ -0,0 +1,71 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_TARK_CAPTIONS_CAPTION_PILL_VIEW_H_
++#define CHROME_BROWSER_UI_VIEWS_TARK_CAPTIONS_CAPTION_PILL_VIEW_H_
++
++#include <string>
++
++#include "base/memory/raw_ptr.h"
++#include "components/tark_captions/caption_text.h"
++#include "ui/base/metadata/metadata_header_macros.h"
++#include "ui/gfx/geometry/point.h"
++#include "ui/views/view.h"
++
++namespace views {
++class MdTextButton;
++class StyledLabel;
++}  // namespace views
++
++// Tark (D4): the call captions pill (mockup pill-states.html, steps 1-3):
++// the caption box (last final line and a faded draft) above a pill with
++// the mark, Captions, the language, Translate (disabled until Phase 2) and
++// ✕. In strip mode (the call's tab is not in front) only a narrower
++// caption box shows.
++class TarkCaptionPillView : public views::View {
++  METADATA_HEADER(TarkCaptionPillView, views::View)
++
++ public:
++  class Delegate {
++   public:
++    virtual void OnCaptionsPressed() = 0;
++    virtual void OnLanguagePressed(views::View* anchor) = 0;
++    virtual void OnHidePressed() = 0;
++    virtual void OnDragged(const gfx::Vector2d& delta) = 0;
++
++   protected:
++    virtual ~Delegate() = default;
++  };
++
++  enum class Mode { kPill, kStrip };
++
++  explicit TarkCaptionPillView(Delegate* delegate);
++  TarkCaptionPillView(const TarkCaptionPillView&) = delete;
++  TarkCaptionPillView& operator=(const TarkCaptionPillView&) = delete;
++  ~TarkCaptionPillView() override;
++
++  void SetMode(Mode mode);
++  void SetCaptionsOn(bool on);
++  void SetLanguageName(const std::u16string& name);
++  // Shows `display` in the caption box, or `message` (Listening…, Captions
++  // unavailable) when it is not empty; hides the box when both are empty.
++  void SetCaption(const tark_captions::CaptionText::Display& display,
++                  const std::u16string& message);
++
++  // views::View:
++  bool OnMousePressed(const ui::MouseEvent& event) override;
++  bool OnMouseDragged(const ui::MouseEvent& event) override;
++
++ private:
++  raw_ptr<Delegate> delegate_;
++  raw_ptr<views::View> caption_box_ = nullptr;
++  raw_ptr<views::StyledLabel> caption_ = nullptr;
++  raw_ptr<views::View> pill_ = nullptr;
++  raw_ptr<views::MdTextButton> captions_button_ = nullptr;
++  raw_ptr<views::MdTextButton> language_button_ = nullptr;
++  int caption_width_ = 420;
++  gfx::Point drag_last_;
++};
++
++#endif  // CHROME_BROWSER_UI_VIEWS_TARK_CAPTIONS_CAPTION_PILL_VIEW_H_
+--- /dev/null
++++ b/chrome/browser/ui/views/tark_captions/caption_pill_view.cc
+@@ -0,0 +1,149 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/ui/views/tark_captions/caption_pill_view.h"
++
++#include <memory>
++
++#include "base/functional/bind.h"
++#include "chrome/grit/generated_resources.h"
++#include "components/vector_icons/vector_icons.h"
++#include "third_party/skia/include/core/SkColor.h"
++#include "ui/base/l10n/l10n_util.h"
++#include "ui/base/metadata/metadata_impl_macros.h"
++#include "ui/base/models/image_model.h"
++#include "ui/color/color_id.h"
++#include "ui/views/accessibility/view_accessibility.h"
++#include "ui/views/background.h"
++#include "ui/views/border.h"
++#include "ui/views/controls/button/image_button.h"
++#include "ui/views/controls/button/image_button_factory.h"
++#include "ui/views/controls/button/md_text_button.h"
++#include "ui/views/controls/image_view.h"
++#include "ui/views/controls/styled_label.h"
++#include "ui/views/layout/box_layout.h"
++
++namespace {
++
++// The caption box's width over the call; in the strip (call tab hidden).
++constexpr int kCaptionWidth = 420;
++constexpr int kStripWidth = 320;
++constexpr SkColor kCaptionBackground = SkColorSetARGB(0xCC, 0x12, 0x12, 0x14);
++constexpr SkColor kCaptionText = SK_ColorWHITE;
++constexpr SkColor kDraftText = SkColorSetARGB(0x99, 0xFF, 0xFF, 0xFF);
++
++}  // namespace
++
++TarkCaptionPillView::TarkCaptionPillView(Delegate* delegate) : delegate_(delegate) {
++  SetLayoutManager(std::make_unique<views::BoxLayout>(
++      views::BoxLayout::Orientation::kVertical, gfx::Insets(), 8))
++      ->set_cross_axis_alignment(views::BoxLayout::CrossAxisAlignment::kCenter);
++
++  caption_box_ = AddChildView(std::make_unique<views::View>());
++  caption_box_->SetLayoutManager(std::make_unique<views::BoxLayout>(
++      views::BoxLayout::Orientation::kVertical));
++  caption_box_->SetBackground(views::CreateRoundedRectBackground(kCaptionBackground, 10));
++  caption_box_->SetBorder(views::CreateEmptyBorder(gfx::Insets::VH(8, 14)));
++  caption_ = caption_box_->AddChildView(std::make_unique<views::StyledLabel>());
++  caption_->SetDisplayedOnBackgroundColor(kCaptionBackground);
++  caption_->SizeToFit(kCaptionWidth);
++  caption_box_->SetVisible(false);
++
++  pill_ = AddChildView(std::make_unique<views::View>());
++  auto* row = pill_->SetLayoutManager(std::make_unique<views::BoxLayout>(
++      views::BoxLayout::Orientation::kHorizontal, gfx::Insets::TLBR(6, 10, 6, 8), 8));
++  row->set_cross_axis_alignment(views::BoxLayout::CrossAxisAlignment::kCenter);
++  pill_->SetBackground(views::CreateRoundedRectBackground(ui::kColorDialogBackground, 22));
++
++  pill_->AddChildView(std::make_unique<views::ImageView>(
++      ui::ImageModel::FromVectorIcon(vector_icons::kProductIcon, ui::kColorIcon, 16)));
++  captions_button_ = pill_->AddChildView(std::make_unique<views::MdTextButton>(
++      base::BindRepeating(&Delegate::OnCaptionsPressed, base::Unretained(delegate_.get())),
++      l10n_util::GetStringUTF16(IDS_TARK_CAPTIONS_CAPTIONS)));
++  language_button_ = pill_->AddChildView(std::make_unique<views::MdTextButton>(
++      views::Button::PressedCallback(),
++      l10n_util::GetStringUTF16(IDS_TARK_CAPTIONS_HINDI)));
++  language_button_->SetCallback(base::BindRepeating(
++      [](TarkCaptionPillView* view) { view->delegate_->OnLanguagePressed(view->language_button_); },
++      base::Unretained(this)));
++  language_button_->GetViewAccessibility().SetName(
++      l10n_util::GetStringUTF16(IDS_TARK_CAPTIONS_LANGUAGE));
++  auto* translate = pill_->AddChildView(std::make_unique<views::MdTextButton>(
++      views::Button::PressedCallback(), l10n_util::GetStringUTF16(IDS_TARK_CAPTIONS_TRANSLATE)));
++  translate->SetEnabled(false);
++  translate->SetTooltipText(l10n_util::GetStringUTF16(IDS_TARK_CAPTIONS_TRANSLATE_SOON));
++  auto* hide = pill_->AddChildView(views::CreateVectorImageButtonWithNativeTheme(
++      base::BindRepeating(&Delegate::OnHidePressed, base::Unretained(delegate_.get())),
++      vector_icons::kCloseIcon, 16));
++  hide->SetTooltipText(l10n_util::GetStringUTF16(IDS_TARK_CAPTIONS_HIDE));
++  hide->GetViewAccessibility().SetName(l10n_util::GetStringUTF16(IDS_TARK_CAPTIONS_HIDE));
++  SetCaptionsOn(false);
++}
++
++TarkCaptionPillView::~TarkCaptionPillView() = default;
++
++void TarkCaptionPillView::SetMode(Mode mode) {
++  pill_->SetVisible(mode == Mode::kPill);
++  caption_width_ = mode == Mode::kPill ? kCaptionWidth : kStripWidth;
++  caption_->SizeToFit(caption_width_);
++  PreferredSizeChanged();
++}
++
++void TarkCaptionPillView::SetCaptionsOn(bool on) {
++  captions_button_->SetStyle(on ? ui::ButtonStyle::kProminent : ui::ButtonStyle::kTonal);
++}
++
++void TarkCaptionPillView::SetLanguageName(const std::u16string& name) {
++  language_button_->SetText(name + u" ▾");
++}
++
++void TarkCaptionPillView::SetCaption(const tark_captions::CaptionText::Display& display,
++                                     const std::u16string& message) {
++  std::u16string text;
++  size_t draft_start = 0;
++  if (!message.empty()) {
++    text = message;
++    draft_start = text.size();
++  } else {
++    text = display.committed;
++    if (!display.draft.empty()) {
++      if (!text.empty()) {
++        text += u" ";
++      }
++      draft_start = text.size();
++      text += display.draft;
++    } else {
++      draft_start = text.size();
++    }
++  }
++  caption_box_->SetVisible(!text.empty());
++  caption_->SetText(text);
++  views::StyledLabel::RangeStyleInfo final_style;
++  final_style.override_color = kCaptionText;
++  views::StyledLabel::RangeStyleInfo draft_style;
++  draft_style.override_color = kDraftText;
++  if (draft_start > 0) {
++    caption_->AddStyleRange(gfx::Range(0, draft_start), final_style);
++  }
++  if (draft_start < text.size()) {
++    caption_->AddStyleRange(gfx::Range(draft_start, text.size()), draft_style);
++  }
++  caption_->SizeToFit(caption_width_);
++  PreferredSizeChanged();
++}
++
++bool TarkCaptionPillView::OnMousePressed(const ui::MouseEvent& event) {
++  drag_last_ = event.root_location();
++  return true;
++}
++
++bool TarkCaptionPillView::OnMouseDragged(const ui::MouseEvent& event) {
++  const gfx::Point now = event.root_location();
++  delegate_->OnDragged(now - drag_last_);
++  drag_last_ = now;
++  return true;
++}
++
++BEGIN_METADATA(TarkCaptionPillView)
++END_METADATA
+--- /dev/null
++++ b/chrome/browser/ui/views/tark_captions/caption_pill_controller.h
+@@ -0,0 +1,105 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_TARK_CAPTIONS_CAPTION_PILL_CONTROLLER_H_
++#define CHROME_BROWSER_UI_VIEWS_TARK_CAPTIONS_CAPTION_PILL_CONTROLLER_H_
++
++#include <memory>
++#include <string>
++
++#include "base/memory/raw_ptr.h"
++#include "base/scoped_multi_source_observation.h"
++#include "base/scoped_observation.h"
++#include "chrome/browser/tark_captions/call_captions_tab_helper.h"
++#include "chrome/browser/ui/tabs/tab_strip_model_observer.h"
++#include "chrome/browser/ui/views/tark_captions/caption_pill_view.h"
++#include "components/tark_captions/caption_text.h"
++#include "ui/menus/simple_menu_model.h"
++#include "ui/gfx/geometry/vector2d.h"
++#include "ui/views/view_observer.h"
++#include "ui/views/widget/widget_observer.h"
++
++class BrowserView;
++
++namespace views {
++class MenuRunner;
++class Widget;
++}  // namespace views
++
++// Tark (D4): shows the call captions pill for one browser window. The pill
++// floats over the call's tab while it is in front (captions off until the
++// user presses Captions); when another tab is in front and the call's
++// captions are on, only the caption box shows (the strip). Captions and the
++// pill go when the call ends or the user hides them for the call. The
++// pill's window is left out of screen shares and screenshots.
++class TarkCaptionPillController : public TabStripModelObserver,
++                                  public CallCaptionsTabHelper::Observer,
++                                  public TarkCaptionPillView::Delegate,
++                                  public ui::SimpleMenuModel::Delegate,
++                                  public views::WidgetObserver,
++                                  public views::ViewObserver {
++ public:
++  explicit TarkCaptionPillController(BrowserView* browser_view);
++  TarkCaptionPillController(const TarkCaptionPillController&) = delete;
++  TarkCaptionPillController& operator=(const TarkCaptionPillController&) = delete;
++  ~TarkCaptionPillController() override;
++
++  // TabStripModelObserver:
++  void OnTabStripModelChanged(TabStripModel* tab_strip_model,
++                              const TabStripModelChange& change,
++                              const TabStripSelectionChange& selection) override;
++
++  // CallCaptionsTabHelper::Observer:
++  void OnCallStateChanged(CallCaptionsTabHelper* tab) override;
++  void OnCaption(CallCaptionsTabHelper* tab, bool is_final, const std::string& text) override;
++  void OnCaptionsUnavailable(CallCaptionsTabHelper* tab) override;
++
++  // TarkCaptionPillView::Delegate:
++  void OnCaptionsPressed() override;
++  void OnLanguagePressed(views::View* anchor) override;
++  void OnHidePressed() override;
++  void OnDragged(const gfx::Vector2d& delta) override;
++
++  // ui::SimpleMenuModel::Delegate:
++  bool IsCommandIdChecked(int command_id) const override;
++  void ExecuteCommand(int command_id, int event_flags) override;
++
++  // views::WidgetObserver:
++  void OnWidgetBoundsChanged(views::Widget* widget, const gfx::Rect& new_bounds) override;
++  void OnWidgetDestroying(views::Widget* widget) override;
++
++  // views::ViewObserver:
++  void OnViewBoundsChanged(views::View* observed_view) override;
++  void OnViewPreferredSizeChanged(views::View* observed_view) override;
++
++ private:
++  void Observe(content::WebContents* contents);
++  void Unobserve(content::WebContents* contents);
++  // Picks the tab the pill is for and shows, updates or closes the pill.
++  void Update();
++  void ShowCaption();
++  void Close();
++  void Reposition();
++
++  raw_ptr<BrowserView> browser_view_;
++  // The tab the pill or strip is showing; null when it is closed.
++  raw_ptr<CallCaptionsTabHelper> shown_ = nullptr;
++  TarkCaptionPillView::Mode mode_ = TarkCaptionPillView::Mode::kPill;
++  tark_captions::CaptionText text_;
++  std::u16string message_;
++  // Where the user dragged the pill, from its resting place.
++  gfx::Vector2d offset_;
++  std::unique_ptr<views::Widget> widget_;
++  raw_ptr<TarkCaptionPillView> view_ = nullptr;
++  std::unique_ptr<ui::SimpleMenuModel> menu_model_;
++  std::unique_ptr<views::MenuRunner> menu_runner_;
++
++  base::ScopedMultiSourceObservation<CallCaptionsTabHelper, CallCaptionsTabHelper::Observer>
++      tabs_observation_{this};
++  base::ScopedObservation<views::Widget, views::WidgetObserver> browser_widget_observation_{this};
++  base::ScopedObservation<views::Widget, views::WidgetObserver> pill_widget_observation_{this};
++  base::ScopedMultiSourceObservation<views::View, views::ViewObserver> view_observation_{this};
++};
++
++#endif  // CHROME_BROWSER_UI_VIEWS_TARK_CAPTIONS_CAPTION_PILL_CONTROLLER_H_
+--- /dev/null
++++ b/chrome/browser/ui/views/tark_captions/caption_pill_controller.cc
+@@ -0,0 +1,326 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/ui/views/tark_captions/caption_pill_controller.h"
++
++#include <utility>
++
++#include "chrome/browser/ui/browser.h"
++#include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "chrome/browser/ui/views/frame/browser_view.h"
++#include "chrome/grit/generated_resources.h"
++#include "components/tark_captions/asr_model.h"
++#include "content/public/browser/web_contents.h"
++#include "ui/base/l10n/l10n_util.h"
++#include "ui/base/mojom/menu_source_type.mojom.h"
++#include "ui/views/controls/menu/menu_runner.h"
++#include "ui/views/controls/webview/webview.h"
++#include "ui/views/widget/widget.h"
++
++namespace {
++
++// The pill rests this far above the bottom of the page, centred; the strip
++// sits at the bottom.
++constexpr int kBottomGap = 72;
++constexpr int kStripGap = 12;
++// About two lines of the 420 px caption box.
++constexpr size_t kCaptionChars = 110;
++
++constexpr tark_captions::Language kLanguages[] = {
++    tark_captions::Language::kHindi,
++    tark_captions::Language::kTamil,
++    tark_captions::Language::kBengali,
++};
++
++std::u16string LanguageName(tark_captions::Language language) {
++  switch (language) {
++    case tark_captions::Language::kHindi:
++      return l10n_util::GetStringUTF16(IDS_TARK_CAPTIONS_HINDI);
++    case tark_captions::Language::kTamil:
++      return l10n_util::GetStringUTF16(IDS_TARK_CAPTIONS_TAMIL);
++    case tark_captions::Language::kBengali:
++      return l10n_util::GetStringUTF16(IDS_TARK_CAPTIONS_BENGALI);
++  }
++}
++
++CallCaptionsTabHelper* HelperFor(content::WebContents* contents) {
++  return contents ? CallCaptionsTabHelper::FromWebContents(contents) : nullptr;
++}
++
++}  // namespace
++
++TarkCaptionPillController::TarkCaptionPillController(BrowserView* browser_view)
++    : browser_view_(browser_view) {
++  TabStripModel* model = browser_view_->browser()->GetTabStripModel();
++  model->AddObserver(this);
++  for (int i = 0; i < model->count(); ++i) {
++    Observe(model->GetWebContentsAt(i));
++  }
++  browser_widget_observation_.Observe(browser_view_->GetWidget());
++  view_observation_.AddObservation(browser_view_->contents_web_view());
++  Update();
++}
++
++TarkCaptionPillController::~TarkCaptionPillController() {
++  menu_runner_.reset();
++  view_observation_.RemoveAllObservations();
++  pill_widget_observation_.Reset();
++  view_ = nullptr;
++  widget_.reset();
++}
++
++void TarkCaptionPillController::OnTabStripModelChanged(
++    TabStripModel* tab_strip_model,
++    const TabStripModelChange& change,
++    const TabStripSelectionChange& selection) {
++  switch (change.type()) {
++    case TabStripModelChange::kInserted:
++      for (const auto& tab : change.GetInsert()->contents) {
++        Observe(tab.contents);
++      }
++      break;
++    case TabStripModelChange::kRemoved:
++      for (const auto& tab : change.GetRemove()->contents) {
++        Unobserve(tab.contents);
++      }
++      break;
++    case TabStripModelChange::kReplaced:
++      Unobserve(change.GetReplace()->old_contents);
++      Observe(change.GetReplace()->new_contents);
++      break;
++    case TabStripModelChange::kMoved:
++    case TabStripModelChange::kSelectionOnly:
++      break;
++  }
++  Update();
++}
++
++void TarkCaptionPillController::OnCallStateChanged(CallCaptionsTabHelper* tab) {
++  Update();
++}
++
++void TarkCaptionPillController::OnCaption(CallCaptionsTabHelper* tab,
++                                          bool is_final,
++                                          const std::string& text) {
++  if (tab != shown_) {
++    return;
++  }
++  if (is_final) {
++    text_.AddFinal(text);
++  } else {
++    text_.SetDraft(text);
++  }
++  message_.clear();
++  ShowCaption();
++}
++
++void TarkCaptionPillController::OnCaptionsUnavailable(CallCaptionsTabHelper* tab) {
++  if (tab != shown_) {
++    return;
++  }
++  message_ = l10n_util::GetStringUTF16(IDS_TARK_CAPTIONS_UNAVAILABLE);
++  ShowCaption();
++}
++
++void TarkCaptionPillController::OnCaptionsPressed() {
++  if (shown_) {
++    shown_->SetCaptionsOn(!shown_->captions_on());
++  }
++}
++
++void TarkCaptionPillController::OnLanguagePressed(views::View* anchor) {
++  if (!shown_) {
++    return;
++  }
++  menu_model_ = std::make_unique<ui::SimpleMenuModel>(this);
++  for (tark_captions::Language language : kLanguages) {
++    menu_model_->AddRadioItem(static_cast<int>(language), LanguageName(language),
++                              /*group_id=*/0);
++  }
++  menu_runner_ = std::make_unique<views::MenuRunner>(menu_model_.get(),
++                                                     views::MenuRunner::NO_FLAGS);
++  menu_runner_->RunMenuAt(anchor->GetWidget(), nullptr, anchor->GetAnchorBoundsInScreen(),
++                          views::MenuAnchorPosition::kBubbleTopLeft,
++                          ui::mojom::MenuSourceType::kMouse);
++}
++
++void TarkCaptionPillController::OnHidePressed() {
++  if (shown_) {
++    shown_->HideForThisCall();
++  }
++}
++
++void TarkCaptionPillController::OnDragged(const gfx::Vector2d& delta) {
++  offset_ += delta;
++  Reposition();
++}
++
++bool TarkCaptionPillController::IsCommandIdChecked(int command_id) const {
++  return shown_ && static_cast<int>(shown_->language()) == command_id;
++}
++
++void TarkCaptionPillController::ExecuteCommand(int command_id, int event_flags) {
++  for (tark_captions::Language language : kLanguages) {
++    if (shown_ && static_cast<int>(language) == command_id) {
++      shown_->SetLanguage(language);
++    }
++  }
++}
++
++void TarkCaptionPillController::OnWidgetBoundsChanged(views::Widget* widget,
++                                                      const gfx::Rect& new_bounds) {
++  Reposition();
++}
++
++void TarkCaptionPillController::OnWidgetDestroying(views::Widget* widget) {
++  if (widget_ && widget == widget_.get()) {
++    // The pill's window went with the browser window's.
++    menu_runner_.reset();
++    if (view_ && view_observation_.IsObservingSource(view_.get())) {
++      view_observation_.RemoveObservation(view_.get());
++    }
++    pill_widget_observation_.Reset();
++    view_ = nullptr;
++    return;
++  }
++  // The browser window is closing: stop following it.
++  Close();
++  browser_widget_observation_.Reset();
++  view_observation_.RemoveAllObservations();
++}
++
++void TarkCaptionPillController::OnViewBoundsChanged(views::View* observed_view) {
++  Reposition();
++}
++
++void TarkCaptionPillController::OnViewPreferredSizeChanged(views::View* observed_view) {
++  Reposition();
++}
++
++void TarkCaptionPillController::Observe(content::WebContents* contents) {
++  CallCaptionsTabHelper* helper = HelperFor(contents);
++  if (helper && !tabs_observation_.IsObservingSource(helper)) {
++    tabs_observation_.AddObservation(helper);
++  }
++}
++
++void TarkCaptionPillController::Unobserve(content::WebContents* contents) {
++  CallCaptionsTabHelper* helper = HelperFor(contents);
++  if (!helper) {
++    return;
++  }
++  if (tabs_observation_.IsObservingSource(helper)) {
++    tabs_observation_.RemoveObservation(helper);
++  }
++  if (helper == shown_) {
++    shown_ = nullptr;
++  }
++}
++
++void TarkCaptionPillController::Update() {
++  TabStripModel* model = browser_view_->browser()->GetTabStripModel();
++  CallCaptionsTabHelper* target = nullptr;
++  TarkCaptionPillView::Mode mode = TarkCaptionPillView::Mode::kPill;
++  CallCaptionsTabHelper* active = HelperFor(model->GetActiveWebContents());
++  if (active && active->in_call() && !active->hidden()) {
++    target = active;
++  } else {
++    // The call is in another tab: its captions (if on) show as the strip.
++    for (int i = 0; i < model->count() && !target; ++i) {
++      CallCaptionsTabHelper* helper = HelperFor(model->GetWebContentsAt(i));
++      if (helper && helper->in_call() && !helper->hidden() && helper->captions_on()) {
++        target = helper;
++        mode = TarkCaptionPillView::Mode::kStrip;
++      }
++    }
++  }
++  if (!target || !browser_view_->GetWidget()) {
++    Close();
++    return;
++  }
++  if (target != shown_ || !target->captions_on()) {
++    text_.Clear();
++    message_.clear();
++  }
++  shown_ = target;
++
++  if (!widget_) {
++    views::Widget::InitParams params(views::Widget::InitParams::CLIENT_OWNS_WIDGET,
++                                     views::Widget::InitParams::TYPE_POPUP);
++    params.parent = browser_view_->GetWidget()->GetNativeView();
++    params.activatable = views::Widget::InitParams::Activatable::kNo;
++    params.opacity = views::Widget::InitParams::WindowOpacity::kTranslucent;
++    params.shadow_type = views::Widget::InitParams::ShadowType::kNone;
++    params.name = "TarkCaptionPill";
++    widget_ = std::make_unique<views::Widget>();
++    widget_->Init(std::move(params));
++    view_ = widget_->SetContentsView(std::make_unique<TarkCaptionPillView>(this));
++    // Captions are private to whoever reads them: keep them out of screen
++    // shares and screenshots.
++    widget_->SetAllowScreenshots(false);
++    pill_widget_observation_.Observe(widget_.get());
++    view_observation_.AddObservation(view_.get());
++  }
++  if (!view_) {
++    return;
++  }
++  mode_ = mode;
++  view_->SetMode(mode);
++  view_->SetCaptionsOn(target->captions_on());
++  view_->SetLanguageName(LanguageName(target->language()));
++  ShowCaption();
++  Reposition();
++  if (!widget_->IsVisible()) {
++    widget_->ShowInactive();
++  }
++}
++
++void TarkCaptionPillController::ShowCaption() {
++  if (!view_ || !shown_) {
++    return;
++  }
++  if (!shown_->captions_on()) {
++    view_->SetCaption({}, std::u16string());
++    return;
++  }
++  const tark_captions::CaptionText::Display display = text_.GetDisplay(kCaptionChars);
++  std::u16string message = message_;
++  if (message.empty() && display.committed.empty() && display.draft.empty()) {
++    message = l10n_util::GetStringUTF16(IDS_TARK_CAPTIONS_LISTENING);
++  }
++  view_->SetCaption(display, message);
++}
++
++void TarkCaptionPillController::Close() {
++  // Hidden, not destroyed: this can run inside one of the pill's own button
++  // presses. The window goes with the controller.
++  menu_runner_.reset();
++  shown_ = nullptr;
++  text_.Clear();
++  message_.clear();
++  if (widget_ && view_) {
++    widget_->Hide();
++  }
++}
++
++void TarkCaptionPillController::Reposition() {
++  if (!widget_ || !view_ || !browser_view_->GetWidget()) {
++    return;
++  }
++  const gfx::Rect area = browser_view_->contents_web_view()->GetBoundsInScreen();
++  gfx::Size size = view_->GetPreferredSize();
++  size.SetToMin(area.size());
++  const bool strip = mode_ == TarkCaptionPillView::Mode::kStrip;
++  const gfx::Point rest(area.x() + (area.width() - size.width()) / 2,
++                        area.bottom() - (strip ? kStripGap : kBottomGap) - size.height());
++  // Only the pill moves where the user dragged it.
++  gfx::Rect bounds(strip ? rest : rest + offset_, size);
++  bounds.AdjustToFit(area);
++  if (!strip) {
++    // Dragging past an edge does not build up: the offset stays where the
++    // pill could go.
++    offset_ = bounds.origin() - rest;
++  }
++  widget_->SetBounds(bounds);
++}
+--- a/chrome/app/generated_resources.grd
++++ b/chrome/app/generated_resources.grd
+@@ -280,6 +280,7 @@
+       <!-- Bookmarks specific strings -->
+       <part file="bookmarks_strings.grdp" />
+       <part file="tark_pages_strings.grdp" />
++      <part file="tark_captions_strings.grdp" />
+ 
+       <!-- Glic specific strings -->
+       <part file="glic_strings.grdp" />
+--- a/chrome/app/generated_resources.grd.gritdeps
++++ b/chrome/app/generated_resources.grd.gritdeps
+@@ -106,6 +106,7 @@
+ chrome/app/shortcut_input_strings.grdp
+ chrome/app/skills_strings.grdp
+ chrome/app/support_tool_strings.grdp
++chrome/app/tark_captions_strings.grdp
+ chrome/app/tark_pages_strings.grdp
+ chrome/app/vr_strings.grdp
+ chrome/app/whats_new_strings.grdp
+--- a/chrome/browser/tark_captions/call_captions_tab_helper.h
++++ b/chrome/browser/tark_captions/call_captions_tab_helper.h
+@@ -31,9 +31,11 @@
+  public:
+   class Observer : public base::CheckedObserver {
+    public:
+-    virtual void OnCallStateChanged() {}
+-    virtual void OnCaption(bool is_final, const std::string& text) {}
+-    virtual void OnCaptionsUnavailable() {}
++    virtual void OnCallStateChanged(CallCaptionsTabHelper* tab) {}
++    virtual void OnCaption(CallCaptionsTabHelper* tab,
++                           bool is_final,
++                           const std::string& text) {}
++    virtual void OnCaptionsUnavailable(CallCaptionsTabHelper* tab) {}
+   };
+ 
+   CallCaptionsTabHelper(const CallCaptionsTabHelper&) = delete;
+--- a/chrome/browser/tark_captions/call_captions_tab_helper.cc
++++ b/chrome/browser/tark_captions/call_captions_tab_helper.cc
+@@ -4,11 +4,9 @@
+ 
+ #include "chrome/browser/tark_captions/call_captions_tab_helper.h"
+ 
+-#include "base/command_line.h"
+ #include "base/logging.h"
+ #include "chrome/browser/media/webrtc/media_capture_devices_dispatcher.h"
+ #include "chrome/browser/profiles/profile.h"
+-#include "chrome/browser/speech/chrome_speech_recognition_service.h"
+ #include "chrome/browser/speech/speech_recognition_client_browser_interface.h"
+ #include "chrome/browser/speech/speech_recognition_client_browser_interface_factory.h"
+ #include "content/public/browser/web_contents.h"
+@@ -33,7 +31,7 @@
+   if (state_.SetCaptionsOn(on) && was_on != on) {
+     CaptionsChanged(was_on);
+   }
+-  observers_.Notify(&Observer::OnCallStateChanged);
++  observers_.Notify(&Observer::OnCallStateChanged, this);
+ }
+ 
+ void CallCaptionsTabHelper::SetLanguage(tark_captions::Language language) {
+@@ -45,7 +43,7 @@
+       speech->OnTarkCaptionsLanguageChanged(tark_captions::LanguageCode(language_));
+     }
+   }
+-  observers_.Notify(&Observer::OnCallStateChanged);
++  observers_.Notify(&Observer::OnCallStateChanged, this);
+ }
+ 
+ void CallCaptionsTabHelper::HideForThisCall() {
+@@ -54,7 +52,7 @@
+   if (was_on) {
+     CaptionsChanged(was_on);
+   }
+-  observers_.Notify(&Observer::OnCallStateChanged);
++  observers_.Notify(&Observer::OnCallStateChanged, this);
+ }
+ 
+ void CallCaptionsTabHelper::OnCaption(const media::SpeechRecognitionResult& result) {
+@@ -64,11 +62,11 @@
+   // Never the text: call content stays out of logs.
+   VLOG(1) << "Tark captions: " << (result.is_final ? "final" : "draft") << ", "
+           << result.transcription.size() << " bytes";
+-  observers_.Notify(&Observer::OnCaption, result.is_final, result.transcription);
++  observers_.Notify(&Observer::OnCaption, this, result.is_final, result.transcription);
+ }
+ 
+ void CallCaptionsTabHelper::OnCaptionsError() {
+-  observers_.Notify(&Observer::OnCaptionsUnavailable);
++  observers_.Notify(&Observer::OnCaptionsUnavailable, this);
+ }
+ 
+ void CallCaptionsTabHelper::AddObserver(Observer* observer) {
+@@ -90,17 +88,7 @@
+   if (was_on && !state_.captions_on()) {
+     CaptionsChanged(was_on);
+   }
+-  // Until the pill (Task 10): --tark-captions-force=LANG turns captions on
+-  // in any tab that is in a call.
+-  const std::string forced =
+-      base::CommandLine::ForCurrentProcess()->GetSwitchValueASCII(
+-          speech::kTarkCaptionsForceSwitch);
+-  if (state_.in_call() && !forced.empty()) {
+-    language_ = tark_captions::LanguageFromCode(forced).value_or(language_);
+-    SetCaptionsOn(true);
+-    return;
+-  }
+-  observers_.Notify(&Observer::OnCallStateChanged);
++  observers_.Notify(&Observer::OnCallStateChanged, this);
+ }
+ 
+ void CallCaptionsTabHelper::CaptionsChanged(bool was_on) {
+--- a/chrome/browser/speech/chrome_speech_recognition_service.h
++++ b/chrome/browser/speech/chrome_speech_recognition_service.h
+@@ -32,10 +32,6 @@
+ // Provides a mojo endpoint in the browser that allows the renderer process to
+ // launch and initialize the sandboxed speech recognition service
+ // process.
+-// Tark (D4), temporary until the caption pill: captions on for every tab,
+-// in the given language ("hi", "ta" or "bn").
+-inline constexpr char kTarkCaptionsForceSwitch[] = "tark-captions-force";
+-
+ class ChromeSpeechRecognitionService
+     : public SpeechRecognitionService,
+       public media::mojom::SpeechRecognitionContext,
+--- a/chrome/browser/speech/chrome_speech_recognition_service.cc
++++ b/chrome/browser/speech/chrome_speech_recognition_service.cc
+@@ -7,7 +7,6 @@
+ #include <string>
+ #include <unordered_set>
+ 
+-#include "base/command_line.h"
+ #include "base/containers/flat_map.h"
+ #include "base/metrics/histogram_functions.h"
+ #include "base/scoped_observation.h"
+@@ -238,11 +237,10 @@
+ 
+   // Tark (D4): Tark's caption engine instead of SODA. The "binary" is ONNX
+   // Runtime and the one "language pack" is the captions models folder; the
+-  // utility process checks both exist before making a recognizer. Until the
+-  // pill chooses the language per call, --tark-captions-force=LANG sets it.
+-  const std::string forced = base::CommandLine::ForCurrentProcess()->GetSwitchValueASCII(
+-      kTarkCaptionsForceSwitch);
+-  const std::string language_name = forced.empty() ? "hi" : forced;
++  // utility process checks both exist before making a recognizer. The
++  // folder holds every language; each recognizer gets its call's language
++  // from the pill (through the renderer), not from this default.
++  const std::string language_name = "hi";
+   const base::FilePath binary_path = TarkOnnxRuntimePath();
+   const base::FilePath models_dir = TarkCaptionsModelsDir();
+   if (binary_path.empty() || models_dir.empty()) {
+--- a/chrome/browser/ui/views/frame/browser_view.h
++++ b/chrome/browser/ui/views/frame/browser_view.h
+@@ -90,6 +90,7 @@
+ class SidePanelAnimationContentView;
+ class TabDragTarget;
+ class TabSearchBubbleHost;
++class TarkCaptionPillController;
+ class TabStrip;
+ class TabStripRegionView;
+ class ToolbarButtonProvider;
+@@ -1211,6 +1212,11 @@
+ 
+   std::unique_ptr<TabSearchBubbleHost> tab_search_bubble_host_;
+ 
++#if BUILDFLAG(IS_MAC)
++  // Tark (D4): the call captions pill.
++  std::unique_ptr<TarkCaptionPillController> tark_caption_pill_;
++#endif
++
+   // Separator between top container and contents.
+   // Note: when `SideBySide` feature is disabled, this separator is also
+   // used when not in `TopContainerOverlayView. Once the feature is fully
+--- a/chrome/browser/ui/views/frame/browser_view.cc
++++ b/chrome/browser/ui/views/frame/browser_view.cc
+@@ -223,6 +223,7 @@
+ #include "chrome/browser/ui/views/tabs/tab/tab_accessibility.h"
+ #include "chrome/browser/ui/views/tabs/tab_strip.h"
+ #include "chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_top_container.h"
++#include "chrome/browser/ui/views/tark_captions/caption_pill_controller.h"
+ #include "chrome/browser/ui/views/theme_copying_widget.h"
+ #include "chrome/browser/ui/views/toolbar/app_menu_control.h"
+ #include "chrome/browser/ui/views/toolbar/avatar_toolbar_button_interface.h"
+@@ -1109,6 +1110,9 @@
+   SetLayoutManager(nullptr);
+ 
+   tab_search_bubble_host_.reset();
++#if BUILDFLAG(IS_MAC)
++  tark_caption_pill_.reset();
++#endif
+ 
+   // Destroy the top controls slide controller first as it depends on the
+   // tabstrip model and the browser frame.
+@@ -5185,6 +5189,13 @@
+   fallback_popup_anchor_ = std::make_unique<views::ViewSubregionAnchor>(
+       kFallbackPopupAnchorElementId, *this);
+ 
++#if BUILDFLAG(IS_MAC)
++  // Tark (D4): the call captions pill.
++  if (GetIsNormalType()) {
++    tark_caption_pill_ = std::make_unique<TarkCaptionPillController>(this);
++  }
++#endif
++
+   initialized_ = true;
+ }
+ 
+--- a/chrome/browser/ui/BUILD.gn
++++ b/chrome/browser/ui/BUILD.gn
+@@ -2751,6 +2751,10 @@
+       "views/frame/vertical_tab_strip_region_view.h",
+       "views/tab_search_bubble_host.cc",
+       "views/tab_search_bubble_host.h",
++      "views/tark_captions/caption_pill_controller.cc",
++      "views/tark_captions/caption_pill_controller.h",
++      "views/tark_captions/caption_pill_view.cc",
++      "views/tark_captions/caption_pill_view.h",
+       "views/web_apps/frame_toolbar/web_app_frame_toolbar_view.cc",
+       "views/web_apps/frame_toolbar/web_app_frame_toolbar_view.h",
+       "views/web_apps/frame_toolbar/web_app_menu_button.cc",
+--- a/chrome/browser/resources/settings/a11y_page/a11y_page.html.ts
++++ b/chrome/browser/resources/settings/a11y_page/a11y_page.html.ts
+@@ -21,9 +21,6 @@
+ </if>
+ 
+ <if expr="is_macosx or is_win">
+-        ${this.enableLiveCaption_ ? html`
+-          <settings-live-caption></settings-live-caption>
+-        ` : ''}
+         <cr-link-row id="captions"
+             class="hr"
+             label="$i18n{captionsPreferencesTitle}"
+--- a/chrome/browser/resources/settings/a11y_page/a11y_page.ts
++++ b/chrome/browser/resources/settings/a11y_page/a11y_page.ts
+@@ -20,7 +20,6 @@
+ import './ax_annotations_section.js';
+ // </if>
+ // <if expr="is_win or is_macosx">
+-import './live_caption.js';
+ 
+ import {CaptionsBrowserProxyImpl} from '/shared/settings/a11y_page/captions_browser_proxy.js';
+ // </if>

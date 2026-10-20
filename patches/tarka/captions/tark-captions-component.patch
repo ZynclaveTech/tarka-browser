@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/components/tark_captions/BUILD.gn
-@@ -0,0 +1,79 @@
+@@ -0,0 +1,82 @@
 +# Copyright 2026 The Tark Authors
 +# Use of this source code is governed by a BSD-style license that can be
 +# found in the LICENSE file.
@@ -20,6 +20,8 @@
 +    "call_state.h",
 +    "caption_engine.cc",
 +    "caption_engine.h",
++    "caption_text.cc",
++    "caption_text.h",
 +    "mel_frontend.cc",
 +    "mel_frontend.h",
 +    "ort_runtime.cc",
@@ -54,6 +56,7 @@
 +    "asr_model_unittest.cc",
 +    "call_state_unittest.cc",
 +    "caption_engine_unittest.cc",
++    "caption_text_unittest.cc",
 +    "mel_frontend_unittest.cc",
 +    "ort_runtime_unittest.cc",
 +    "segmenter_unittest.cc",
@@ -2056,6 +2059,166 @@
 +  state.OnMicCapturing(false);
 +  state.OnMicCapturing(true);
 +  EXPECT_FALSE(state.hidden());
++}
++
++}  // namespace
++}  // namespace tark_captions
+--- /dev/null
++++ b/components/tark_captions/caption_text.h
+@@ -0,0 +1,37 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef COMPONENTS_TARK_CAPTIONS_CAPTION_TEXT_H_
++#define COMPONENTS_TARK_CAPTIONS_CAPTION_TEXT_H_
++
++#include <string>
++
++namespace tark_captions {
++
++// What the caption box shows: the latest final text, followed by the draft
++// of what is being said now (drawn faded; it firms up when its final
++// arrives and replaces it). Only the newest characters that fit are kept,
++// cut at a word boundary, so the box stays at about two lines.
++class CaptionText {
++ public:
++  struct Display {
++    std::u16string committed;
++    std::u16string draft;
++  };
++
++  void AddFinal(const std::string& text);
++  void SetDraft(const std::string& text);
++  void Clear();
++
++  // At most `max_chars` (plus a joining space) of committed + draft.
++  Display GetDisplay(size_t max_chars) const;
++
++ private:
++  std::u16string committed_;
++  std::u16string draft_;
++};
++
++}  // namespace tark_captions
++
++#endif  // COMPONENTS_TARK_CAPTIONS_CAPTION_TEXT_H_
+--- /dev/null
++++ b/components/tark_captions/caption_text.cc
+@@ -0,0 +1,57 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/tark_captions/caption_text.h"
++
++#include "base/strings/string_util.h"
++#include "base/strings/utf_string_conversions.h"
++
++namespace tark_captions {
++namespace {
++
++// Keeps the last `max` characters of `s`, starting at a word.
++std::u16string Tail(const std::u16string& s, size_t max) {
++  if (s.size() <= max) {
++    return s;
++  }
++  std::u16string tail = s.substr(s.size() - max);
++  const size_t space = tail.find(u' ');
++  if (space != std::u16string::npos && space + 1 < tail.size()) {
++    tail = tail.substr(space + 1);
++  }
++  return tail;
++}
++
++}  // namespace
++
++void CaptionText::AddFinal(const std::string& text) {
++  draft_.clear();
++  const std::u16string final_text =
++      std::u16string(base::TrimWhitespace(base::UTF8ToUTF16(text), base::TRIM_ALL));
++  if (final_text.empty()) {
++    return;
++  }
++  committed_ = committed_.empty() ? final_text : committed_ + u" " + final_text;
++  // Bounded memory: no caption box shows more than this.
++  committed_ = Tail(committed_, 1000);
++}
++
++void CaptionText::SetDraft(const std::string& text) {
++  draft_ = std::u16string(base::TrimWhitespace(base::UTF8ToUTF16(text), base::TRIM_ALL));
++}
++
++void CaptionText::Clear() {
++  committed_.clear();
++  draft_.clear();
++}
++
++CaptionText::Display CaptionText::GetDisplay(size_t max_chars) const {
++  Display d;
++  d.draft = Tail(draft_, max_chars);
++  const size_t room = max_chars > d.draft.size() ? max_chars - d.draft.size() : 0;
++  d.committed = room ? Tail(committed_, room) : std::u16string();
++  return d;
++}
++
++}  // namespace tark_captions
+--- /dev/null
++++ b/components/tark_captions/caption_text_unittest.cc
+@@ -0,0 +1,57 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/tark_captions/caption_text.h"
++
++#include "base/strings/string_number_conversions.h"
++#include "base/strings/utf_string_conversions.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace tark_captions {
++namespace {
++
++TEST(CaptionTextTest, DraftFaded) {
++  CaptionText text;
++  text.AddFinal("first sentence");
++  text.SetDraft("second so far");
++  CaptionText::Display d = text.GetDisplay(200);
++  EXPECT_EQ(d.committed, u"first sentence");
++  EXPECT_EQ(d.draft, u"second so far");
++}
++
++TEST(CaptionTextTest, FinalReplacesDraft) {
++  CaptionText text;
++  text.SetDraft("half a sen");
++  text.AddFinal("half a sentence");
++  CaptionText::Display d = text.GetDisplay(200);
++  EXPECT_EQ(d.committed, u"half a sentence");
++  EXPECT_TRUE(d.draft.empty());
++}
++
++TEST(CaptionTextTest, KeepsLastTwoLines) {
++  CaptionText text;
++  for (int i = 0; i < 20; ++i) {
++    text.AddFinal("word" + base::NumberToString(i) + " and more words here");
++  }
++  text.SetDraft("the newest draft");
++  CaptionText::Display d = text.GetDisplay(60);
++  EXPECT_LE(d.committed.size() + d.draft.size(), 60u + 1);
++  EXPECT_EQ(d.draft, u"the newest draft");
++  // The newest final is kept, cut at a word boundary from the front.
++  EXPECT_NE(d.committed.find(u"word19"), std::u16string::npos);
++  EXPECT_NE(d.committed[0], u' ');
++}
++
++TEST(CaptionTextTest, ClearForgetsEverything) {
++  CaptionText text;
++  text.AddFinal("x");
++  text.SetDraft("y");
++  text.Clear();
++  CaptionText::Display d = text.GetDisplay(100);
++  EXPECT_TRUE(d.committed.empty());
++  EXPECT_TRUE(d.draft.empty());
 +}
 +
 +}  // namespace
