@@ -226,10 +226,6 @@ class TestSettings(unittest.TestCase):
         self.assertIn('Google नहीं · सिंक नहीं', self.add)
 
 
-if __name__ == '__main__':
-    unittest.main()
-
-
 class TestConnects(unittest.TestCase):
     """The Mac's "What Tark connects to" on Android (spec §5.3)."""
 
@@ -249,3 +245,58 @@ class TestConnects(unittest.TestCase):
     def test_english_and_hindi(self):
         for fp in ('7144670775258466422', '5542059870322282057', '3441881045024360042', '4695926840610114405'):
             self.assertIn(f'+<translation id="{fp}">', self.p)
+
+
+class TestPrivacyWithoutGoogle(unittest.TestCase):
+    """Privacy and security without the Google rows the Mac never shows."""
+
+    def setUp(self):
+        self.assertIn('android/privacy-no-google-rows.patch', series())
+        self.p = patch('privacy-no-google-rows.patch')
+        self.add = added(self.p)
+
+    def removed(self):
+        return '\n'.join(l[1:] for l in self.p.splitlines() if l.startswith('-') and not l.startswith('---'))
+
+    def test_rows_leave_the_screen(self):
+        # Gone from the XML is gone from the screen and from the search index,
+        # which is built from the same XML.
+        gone = self.removed()
+        for key in ('safe_browsing', 'password_leak_detection', 'sync_and_services_link'):
+            self.assertIn(f'android:key="{key}"', gone, key)
+            self.assertNotIn(f'android:key="{key}"', self.add, key)
+
+    def test_java_no_longer_reaches_for_them(self):
+        gone = self.removed()
+        for name in ('PREF_SAFE_BROWSING', 'PREF_PASSWORD_LEAK_DETECTION', 'PREF_SYNC_AND_SERVICES_LINK',
+                     'SafeBrowsingSettingsFragment', 'GoogleServicesSettings', 'buildFooterString'):
+            self.assertIn(name, gone, name)
+            self.assertNotIn(name, self.add, name)
+
+    def test_search_index_does_not_update_a_missing_row(self):
+        # SettingsIndexData.updateEntrySummaryForKey throws for a key the XML
+        # no longer has: the Safe Browsing summary update must go with the row.
+        self.assertIn('-                            frag, PREF_SAFE_BROWSING, /* summaryId= */ 0);', self.p)
+
+
+class TestPageInfoMark(unittest.TestCase):
+    """about:blank's page info shows Tark's mark, not Chromium's logo."""
+
+    def setUp(self):
+        self.assertIn('android/look-page-info-mark.patch', series())
+        self.p = patch('look-page-info-mark.patch')
+        self.add = added(self.p)
+
+    def test_mark_instead_of_chromium_logo(self):
+        self.assertIn('-                                        mContext, R.drawable.chromelogo16));', self.p)
+        self.assertIn('mContext, R.drawable.tark_mark_24dp));', self.add)
+        self.assertNotIn('chromelogo16', self.add)
+
+    def test_mark_keeps_its_colours(self):
+        # The mark is three coloured dots; a tint would flatten it.
+        self.assertIn('AppCompatResources.getDrawable(', self.add)
+        self.assertNotIn('TintedDrawable', self.add)
+
+
+if __name__ == '__main__':
+    unittest.main()
