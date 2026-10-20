@@ -146,6 +146,11 @@ def type_in_address_bar(dev, text):
     m = None
     for _ in range(5):
         xml = dev.screen()
+        # Tark's notifications sheet can come up a few seconds after start.
+        if 'notification_permission_rationale' in xml:
+            tap_text(dev, 'No thanks', tries=1)
+            tap_text(dev, 'Don’t allow', tries=2)
+            xml = dev.screen()
         m = re.search(r'resource-id="[^"]*(?:url_bar|search_box_text)"[^>]*bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"', xml)
         if m:
             break
@@ -375,6 +380,9 @@ def main(argv=None):
                 why = CASES[name](dev)
             except Exception as e:  # noqa: BLE001 — a case that breaks is a failure
                 why = f'{type(e).__name__}: {e}'
+                # What the screen showed, for the report.
+                shot = subprocess.run(dev.adb + ['exec-out', 'screencap', '-p'], capture_output=True).stdout
+                pathlib.Path(f'/tmp/xlit-e2e-{name}.png').write_bytes(shot)
             failed += bool(why)
             print(f'FAIL {name}: {why}' if why else f'ok {name}', flush=True)
     finally:
