@@ -117,12 +117,13 @@ def list_items(xml):
 
 def screen_has_dividers(img, items):
     """Whether a hairline runs across the middle of any boundary between two
-    adjacent rows (category headers legitimately have none)."""
+    neighbouring rows, at the edge of the rows or in the few pixels between
+    them (category headers legitimately have none)."""
     for a, b in zip(items, items[1:]):
-        if abs(b[1] - a[3]) > 2:
+        if not -2 <= b[1] - a[3] <= 12:
             continue
         inset = (a[2] - a[0]) // 5
-        if has_hairline(img, a[3] - 3, a[3] + 2, a[0] + inset, a[2] - inset):
+        if has_hairline(img, a[3] - 3, b[1] + 2, a[0] + inset, a[2] - inset):
             return True
     return False
 

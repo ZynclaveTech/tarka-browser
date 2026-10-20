@@ -280,6 +280,13 @@ class TestDividers(unittest.TestCase):
         img = walk_settings.parse_screencap(_image(200, 120, [(39, 16, 200)]))
         self.assertTrue(walk_settings.screen_has_dividers(img, self.ITEMS))
 
+    def test_a_divider_in_the_gap_between_rows_is_found(self):
+        # Found on the emulator: the hairline fills a 6 px gap between items.
+        items = [(0, 0, 200, 40), (0, 46, 200, 86)]
+        lines = [(y, 16, 200) for y in range(40, 46)]
+        img = walk_settings.parse_screencap(_image(200, 90, lines))
+        self.assertTrue(walk_settings.screen_has_dividers(img, items))
+
     def test_no_line_is_missing(self):
         img = walk_settings.parse_screencap(_image(200, 120))
         self.assertFalse(walk_settings.screen_has_dividers(img, self.ITEMS))
