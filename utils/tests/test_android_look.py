@@ -187,6 +187,19 @@ class TestSettings(unittest.TestCase):
         self.assertNotIn('performClick', self.add)
         self.assertIn('onPreferenceTreeClick(row)', self.add)
 
+    def test_tiles_even_and_narrow_gutters(self):
+        # The user's phone: tiles had uneven heights and wide side padding.
+        self.assertIn('root.setPaddingRelative(tarkDp(context, 12), 0, tarkDp(context, 12), 0);', self.add)
+        self.assertIn('row.setBaselineAligned(false);', self.add)
+        self.assertIn('0, ViewGroup.LayoutParams.MATCH_PARENT, 1f);', self.add)
+        self.assertIn('tile.setMinimumHeight(tarkDp(context, 64));', self.add)
+
+    def test_settings_rows_have_dividers(self):
+        # The user: "no divider anywhere". Every settings screen draws the rule
+        # hairline between rows, as on the Mac.
+        self.assertIn('+++ b/chrome/browser/settings/android/java/src/org/chromium/chrome/browser/settings/ChromeBaseSettingsFragment.java', self.p)
+        self.assertIn('+        // Tark: hairline dividers between settings rows, as on the Mac.\n+        return true;', self.p)
+
     def test_summary_strings_in_english_and_hindi(self):
         self.assertIn('name="IDS_TARK_SETTINGS_SUMMARY_TITLE"', self.add)
         self.assertIn('Private by default.', self.add)
