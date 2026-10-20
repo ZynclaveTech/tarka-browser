@@ -159,6 +159,9 @@ else
     --tar-path bsdtar "$_src_dir"
   run python3 "$_root_dir/utils/ublock_key.py" "$_src_dir/third_party/ublock/manifest.json" \
     "$_root_dir/resources/ublock/key.txt"
+  # A2: adblock-rust and its new crates into Chromium's vendored crates, each
+  # .crate checked against its pinned sha256 (android/adblock/crates.py).
+  run python3 "$_root_dir/android/adblock/crates.py" "$_src_dir" --cache "$_download_cache/crates"
   echo "tark: run _install_xlit"
   if [[ "$dryrun" != 1 ]]; then
     export _root_dir _src_dir _main_repo _download_cache
