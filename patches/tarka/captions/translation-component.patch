@@ -1,4 +1,211 @@
 --- /dev/null
++++ b/components/tark_captions/caption_choices.h
+@@ -0,0 +1,48 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef COMPONENTS_TARK_CAPTIONS_CAPTION_CHOICES_H_
++#define COMPONENTS_TARK_CAPTIONS_CAPTION_CHOICES_H_
++
++#include <string>
++
++#include "base/memory/raw_ptr.h"
++
++class PrefRegistrySimple;
++class PrefService;
++
++namespace tark_captions {
++
++// The caption choices Tark remembers for every call (D4): the script the
++// user reads their client's words in ("" their own, "latn" English letters,
++// or "hi"/"ta"/"bn" for that language's script) and the language
++// translations go into ("en", "hi", "ta", "bn"). Kept in local state, so
++// for every profile; the client's language is not remembered. Incognito
++// starts from them and keeps its own changes in memory only.
++class CaptionChoices {
++ public:
++  static constexpr char kShowInPref[] = "tark.captions.show_in";
++  static constexpr char kTranslateToPref[] = "tark.captions.translate_to";
++
++  static void RegisterLocalStatePrefs(PrefRegistrySimple* registry);
++  static void ResetIncognitoForTesting();
++
++  explicit CaptionChoices(PrefService* local_state);
++  CaptionChoices(const CaptionChoices&) = delete;
++  CaptionChoices& operator=(const CaptionChoices&) = delete;
++  ~CaptionChoices();
++
++  std::string show_in(bool off_the_record) const;
++  std::string translate_to(bool off_the_record) const;
++  // Unknown codes are ignored.
++  void SetShowIn(const std::string& code, bool off_the_record);
++  void SetTranslateTo(const std::string& code, bool off_the_record);
++
++ private:
++  raw_ptr<PrefService> local_state_;
++};
++
++}  // namespace tark_captions
++
++#endif  // COMPONENTS_TARK_CAPTIONS_CAPTION_CHOICES_H_
+--- /dev/null
++++ b/components/tark_captions/caption_choices.cc
+@@ -0,0 +1,90 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/tark_captions/caption_choices.h"
++
++#include <optional>
++
++#include "base/no_destructor.h"
++#include "components/prefs/pref_registry_simple.h"
++#include "components/prefs/pref_service.h"
++
++namespace tark_captions {
++namespace {
++
++bool IsShowIn(const std::string& code) {
++  return code.empty() || code == "latn" || code == "hi" || code == "ta" || code == "bn";
++}
++
++bool IsTranslateTo(const std::string& code) {
++  return code == "en" || code == "hi" || code == "ta" || code == "bn";
++}
++
++// Incognito's own choices, for this run only.
++struct Incognito {
++  std::optional<std::string> show_in;
++  std::optional<std::string> translate_to;
++};
++
++Incognito& IncognitoChoices() {
++  static base::NoDestructor<Incognito> choices;
++  return *choices;
++}
++
++}  // namespace
++
++// static
++void CaptionChoices::RegisterLocalStatePrefs(PrefRegistrySimple* registry) {
++  registry->RegisterStringPref(kShowInPref, "");
++  registry->RegisterStringPref(kTranslateToPref, "en");
++}
++
++// static
++void CaptionChoices::ResetIncognitoForTesting() {
++  IncognitoChoices() = Incognito();
++}
++
++CaptionChoices::CaptionChoices(PrefService* local_state) : local_state_(local_state) {}
++
++CaptionChoices::~CaptionChoices() = default;
++
++std::string CaptionChoices::show_in(bool off_the_record) const {
++  if (off_the_record && IncognitoChoices().show_in) {
++    return *IncognitoChoices().show_in;
++  }
++  const std::string code = local_state_->GetString(kShowInPref);
++  return IsShowIn(code) ? code : std::string();
++}
++
++std::string CaptionChoices::translate_to(bool off_the_record) const {
++  if (off_the_record && IncognitoChoices().translate_to) {
++    return *IncognitoChoices().translate_to;
++  }
++  const std::string code = local_state_->GetString(kTranslateToPref);
++  return IsTranslateTo(code) ? code : "en";
++}
++
++void CaptionChoices::SetShowIn(const std::string& code, bool off_the_record) {
++  if (!IsShowIn(code)) {
++    return;
++  }
++  if (off_the_record) {
++    IncognitoChoices().show_in = code;
++  } else {
++    local_state_->SetString(kShowInPref, code);
++  }
++}
++
++void CaptionChoices::SetTranslateTo(const std::string& code, bool off_the_record) {
++  if (!IsTranslateTo(code)) {
++    return;
++  }
++  if (off_the_record) {
++    IncognitoChoices().translate_to = code;
++  } else {
++    local_state_->SetString(kTranslateToPref, code);
++  }
++}
++
++}  // namespace tark_captions
+--- /dev/null
++++ b/components/tark_captions/caption_choices_unittest.cc
+@@ -0,0 +1,60 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/tark_captions/caption_choices.h"
++
++#include "components/prefs/testing_pref_service.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace tark_captions {
++namespace {
++
++class CaptionChoicesTest : public testing::Test {
++ protected:
++  void SetUp() override {
++    CaptionChoices::RegisterLocalStatePrefs(local_state_.registry());
++    CaptionChoices::ResetIncognitoForTesting();
++  }
++
++  TestingPrefServiceSimple local_state_;
++};
++
++TEST_F(CaptionChoicesTest, DefaultsAreOwnScriptAndEnglish) {
++  CaptionChoices choices(&local_state_);
++  EXPECT_EQ(choices.show_in(/*off_the_record=*/false), "");
++  EXPECT_EQ(choices.translate_to(/*off_the_record=*/false), "en");
++}
++
++TEST_F(CaptionChoicesTest, RemembersChoices) {
++  CaptionChoices(&local_state_).SetShowIn("latn", false);
++  CaptionChoices(&local_state_).SetTranslateTo("ta", false);
++  CaptionChoices later(&local_state_);
++  EXPECT_EQ(later.show_in(false), "latn");
++  EXPECT_EQ(later.translate_to(false), "ta");
++  // Incognito starts from the remembered choices.
++  EXPECT_EQ(later.translate_to(/*off_the_record=*/true), "ta");
++}
++
++TEST_F(CaptionChoicesTest, IncognitoWritesNothing) {
++  CaptionChoices(&local_state_).SetShowIn("hi", /*off_the_record=*/true);
++  CaptionChoices(&local_state_).SetTranslateTo("bn", /*off_the_record=*/true);
++  EXPECT_FALSE(local_state_.GetUserPref(CaptionChoices::kShowInPref));
++  EXPECT_FALSE(local_state_.GetUserPref(CaptionChoices::kTranslateToPref));
++  CaptionChoices later(&local_state_);
++  EXPECT_EQ(later.show_in(/*off_the_record=*/true), "hi");
++  EXPECT_EQ(later.translate_to(/*off_the_record=*/true), "bn");
++  EXPECT_EQ(later.show_in(/*off_the_record=*/false), "");
++  EXPECT_EQ(later.translate_to(/*off_the_record=*/false), "en");
++}
++
++TEST_F(CaptionChoicesTest, UnknownCodesAreIgnored) {
++  CaptionChoices choices(&local_state_);
++  choices.SetShowIn("klingon", false);
++  choices.SetTranslateTo("", false);
++  EXPECT_EQ(choices.show_in(false), "");
++  EXPECT_EQ(choices.translate_to(false), "en");
++}
++
++}  // namespace
++}  // namespace tark_captions
+--- /dev/null
 +++ b/components/tark_captions/indic_text.h
 @@ -0,0 +1,51 @@
 +// Copyright 2026 The Tark Authors
@@ -607,6 +814,215 @@
 +  EXPECT_EQ(ScriptOf(Language::kHindi), Script::kDevanagari);
 +  EXPECT_EQ(ScriptOf(Language::kTamil), Script::kTamil);
 +  EXPECT_EQ(ScriptOf(Language::kBengali), Script::kBengali);
++}
++
++}  // namespace
++}  // namespace tark_captions
+--- /dev/null
++++ b/components/tark_captions/render_queue.h
+@@ -0,0 +1,53 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef COMPONENTS_TARK_CAPTIONS_RENDER_QUEUE_H_
++#define COMPONENTS_TARK_CAPTIONS_RENDER_QUEUE_H_
++
++#include <cstdint>
++#include <deque>
++#include <optional>
++#include <string>
++
++namespace tark_captions {
++
++struct RenderRequest {
++  bool is_final = false;
++  std::string text;
++  // The choices (script, translation) it was asked with.
++  uint64_t generation = 0;
++};
++
++// Which caption to send to the translator next (D4 Phase 2). Drafts come
++// every 0.8 s while someone speaks and a translation takes ~0.1 s, so:
++// one request at a time; a newer draft replaces a waiting one; finals are
++// all sent, in order, before a draft; a final replaces the draft waiting
++// before it; a result asked with old choices is not shown.
++class RenderQueue {
++ public:
++  RenderQueue();
++  RenderQueue(const RenderQueue&) = delete;
++  RenderQueue& operator=(const RenderQueue&) = delete;
++  ~RenderQueue();
++
++  void Add(bool is_final, std::string text);
++  // The next request, when none is in flight.
++  std::optional<RenderRequest> Next();
++  // The request in flight is done; true if its result is still current.
++  bool Done(uint64_t generation);
++  // The user changed a choice: results asked before are stale, and the
++  // waiting draft goes (the next one comes within a second).
++  void ChoicesChanged();
++  void Clear();
++
++ private:
++  std::deque<std::string> finals_;
++  std::optional<std::string> draft_;
++  bool in_flight_ = false;
++  uint64_t generation_ = 0;
++};
++
++}  // namespace tark_captions
++
++#endif  // COMPONENTS_TARK_CAPTIONS_RENDER_QUEUE_H_
+--- /dev/null
++++ b/components/tark_captions/render_queue.cc
+@@ -0,0 +1,60 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/tark_captions/render_queue.h"
++
++#include <utility>
++
++namespace tark_captions {
++
++RenderQueue::RenderQueue() = default;
++RenderQueue::~RenderQueue() = default;
++
++void RenderQueue::Add(bool is_final, std::string text) {
++  if (is_final) {
++    draft_.reset();
++    finals_.push_back(std::move(text));
++  } else {
++    draft_ = std::move(text);
++  }
++}
++
++std::optional<RenderRequest> RenderQueue::Next() {
++  if (in_flight_) {
++    return std::nullopt;
++  }
++  RenderRequest request;
++  request.generation = generation_;
++  if (!finals_.empty()) {
++    request.is_final = true;
++    request.text = std::move(finals_.front());
++    finals_.pop_front();
++  } else if (draft_) {
++    request.text = std::move(*draft_);
++    draft_.reset();
++  } else {
++    return std::nullopt;
++  }
++  in_flight_ = true;
++  return request;
++}
++
++bool RenderQueue::Done(uint64_t generation) {
++  in_flight_ = false;
++  return generation == generation_;
++}
++
++void RenderQueue::ChoicesChanged() {
++  ++generation_;
++  draft_.reset();
++}
++
++void RenderQueue::Clear() {
++  finals_.clear();
++  draft_.reset();
++  in_flight_ = false;
++  ++generation_;
++}
++
++}  // namespace tark_captions
+--- /dev/null
++++ b/components/tark_captions/render_queue_unittest.cc
+@@ -0,0 +1,87 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/tark_captions/render_queue.h"
++
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace tark_captions {
++namespace {
++
++TEST(RenderQueueTest, OneRequestInFlight) {
++  RenderQueue queue;
++  queue.Add(false, "a");
++  std::optional<RenderRequest> first = queue.Next();
++  ASSERT_TRUE(first);
++  queue.Add(false, "b");
++  EXPECT_FALSE(queue.Next());
++  EXPECT_TRUE(queue.Done(first->generation));
++  EXPECT_EQ(queue.Next()->text, "b");
++}
++
++TEST(RenderQueueTest, DraftsCoalesce) {
++  RenderQueue queue;
++  queue.Add(false, "a");
++  const uint64_t generation = queue.Next()->generation;
++  queue.Add(false, "b");
++  queue.Add(false, "c");
++  queue.Add(false, "d");
++  queue.Done(generation);
++  std::optional<RenderRequest> next = queue.Next();
++  EXPECT_EQ(next->text, "d");
++  queue.Done(next->generation);
++  EXPECT_FALSE(queue.Next());
++}
++
++TEST(RenderQueueTest, FinalsNeverDropped) {
++  RenderQueue queue;
++  queue.Add(false, "draft 1");
++  uint64_t generation = queue.Next()->generation;
++  queue.Add(true, "final 1");
++  queue.Add(true, "final 2");
++  queue.Add(false, "draft 2");
++  queue.Done(generation);
++  std::vector<std::string> order;
++  while (std::optional<RenderRequest> next = queue.Next()) {
++    order.push_back(next->text);
++    queue.Done(next->generation);
++  }
++  EXPECT_EQ(order, (std::vector<std::string>{"final 1", "final 2", "draft 2"}));
++}
++
++// A final replaces the draft of the same words still waiting.
++TEST(RenderQueueTest, FinalSupersedesWaitingDraft) {
++  RenderQueue queue;
++  queue.Add(false, "a");
++  const uint64_t generation = queue.Next()->generation;
++  queue.Add(false, "draft");
++  queue.Add(true, "final");
++  queue.Done(generation);
++  std::optional<RenderRequest> next = queue.Next();
++  EXPECT_TRUE(next->is_final);
++  queue.Done(next->generation);
++  EXPECT_FALSE(queue.Next());
++}
++
++TEST(RenderQueueTest, StaleResultIsDropped) {
++  RenderQueue queue;
++  queue.Add(false, "a");
++  const uint64_t old_generation = queue.Next()->generation;
++  queue.ChoicesChanged();
++  EXPECT_FALSE(queue.Done(old_generation));
++}
++
++TEST(RenderQueueTest, ClearForgetsEverything) {
++  RenderQueue queue;
++  queue.Add(true, "a");
++  queue.Next();
++  queue.Add(true, "b");
++  queue.Clear();
++  EXPECT_FALSE(queue.Next());
++  queue.Add(true, "c");
++  EXPECT_EQ(queue.Next()->text, "c");
 +}
 +
 +}  // namespace
@@ -1556,7 +1972,13 @@
 +}  // namespace tark_captions
 --- a/components/tark_captions/BUILD.gn
 +++ b/components/tark_captions/BUILD.gn
-@@ -19,12 +19,18 @@
+@@ -15,24 +15,37 @@
+     "asr_model.h",
+     "call_state.cc",
+     "call_state.h",
++    "caption_choices.cc",
++    "caption_choices.h",
+     "caption_engine.cc",
      "caption_engine.h",
      "caption_text.cc",
      "caption_text.h",
@@ -1566,6 +1988,8 @@
      "mel_frontend.h",
      "ort_runtime.cc",
      "ort_runtime.h",
++    "render_queue.cc",
++    "render_queue.h",
 +    "romanize.cc",
 +    "romanize.h",
      "segmenter.cc",
@@ -1575,9 +1999,10 @@
      "vad.cc",
      "vad.h",
    ]
-@@ -32,7 +38,9 @@
+   include_dirs = [ "//third_party/tark_onnxruntime/include" ]
    deps = [
      "//base",
++    "//components/prefs",
      "//media",
 +    "//third_party/icu",
      "//third_party/pffft",
@@ -1585,19 +2010,31 @@
    ]
  }
  
-@@ -54,9 +62,12 @@
+@@ -52,11 +65,16 @@
+   sources = [
+     "asr_model_unittest.cc",
      "call_state_unittest.cc",
++    "caption_choices_unittest.cc",
      "caption_engine_unittest.cc",
      "caption_text_unittest.cc",
 +    "indic_text_unittest.cc",
      "mel_frontend_unittest.cc",
      "ort_runtime_unittest.cc",
++    "render_queue_unittest.cc",
 +    "romanize_unittest.cc",
      "segmenter_unittest.cc",
 +    "translation_engine_unittest.cc",
    ]
    deps = [
      ":tark_captions",
+@@ -64,6 +82,7 @@
+     "//base",
+     "//base/test:run_all_unittests",
+     "//base/test:test_support",
++    "//components/prefs:test_support",
+     "//media",
+     "//testing/gtest",
+   ]
 --- a/components/tark_captions/bench.cc
 +++ b/components/tark_captions/bench.cc
 @@ -4,11 +4,25 @@
