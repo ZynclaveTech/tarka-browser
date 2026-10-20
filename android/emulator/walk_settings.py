@@ -46,8 +46,14 @@ class Device:
         time.sleep(1.5)
 
     def open_settings(self):
+        # A fresh start each time: an open Settings task keeps its back stack
+        # and scroll position, and rows above it are never found. Some rows
+        # (Notifications) open Android's own settings app, which would stay
+        # in front: stop it too.
+        self.shell('am', 'force-stop', PACKAGE)
+        self.shell('am', 'force-stop', 'com.android.settings')
         self.shell('am', 'start', '-n', SETTINGS)
-        time.sleep(3)
+        time.sleep(4)
 
     def crashes(self):
         log = self.run('logcat', '-d')
