@@ -17,6 +17,7 @@ only: the test list goes in through root.
 import argparse
 import base64
 import hashlib
+import html
 import http.server
 import json
 import pathlib
@@ -46,17 +47,17 @@ CASES = {
         'ws': 'failed',           # a blocked WebSocket never opens
         'worker': 'failed',       # a worker's fetch is checked too
         'frame': 'failed',        # an ad subframe is blocked
-        'real': 'failed',         # the shipped lists block adsbygoogle.js
-    }),
+        'real': 'failed',         # the shipped lists block pubmatic's pwt.js
+    }, '127.0.0.1'),
     'cosmetic': ('cosmetic.html', {
         'scriptlet': 'ran',       # set-constant ran before the first script
         'trusted': 'ran',         # a trusted-* scriptlet from a mask-1 list
-        'specific': 'hidden',     # 127.0.0.1##.tark-test-ad
-        'generic': 'hidden',      # ##.adsbygoogle, added later by script
-    }),
+        'specific': 'hidden',     # tark.test##.tark-test-ad
+        'generic': 'hidden',      # ##.tark-generic-ad, added later by script
+    }, 'tark.test'),
 }
 # Before the engine is ready nothing is blocked and pages still load.
-FAILOPEN = ('net.html', {'blocked': 'loaded'})
+FAILOPEN = ('net.html', {'blocked': 'loaded'}, '127.0.0.1')
 
 
 class Handler(http.server.SimpleHTTPRequestHandler):
@@ -108,7 +109,9 @@ class Device:
         # SELinux label; then it is handed to the app's user.
         uid = self.shell('stat', '-c', '%u', APP_DIR).strip()
         self.shell(f'cat /data/local/tmp/tark-extra.txt > {EXTRA} && chown {uid}:{uid} {EXTRA} && chmod 600 {EXTRA}')
-        line = ' '.join(['_', f'--tark-adblock-extra-list={EXTRA}'] + flags)
+        # tark.test: the Mac's server under a name that is not local.
+        line = ' '.join(['_', f'--tark-adblock-extra-list={EXTRA}',
+                         '--host-resolver-rules="MAP tark.test 127.0.0.1"'] + flags)
         self.shell(f"echo '{line}' > /data/local/tmp/chrome-command-line")
         self.run('logcat', '-c')
 
@@ -135,7 +138,8 @@ class Device:
                 with urllib.request.urlopen(f'http://127.0.0.1:{DEVTOOLS_PORT}/json', timeout=5) as r:
                     for tab in json.load(r):
                         if tab.get('url') == url and tab.get('title', '').startswith('done:'):
-                            return json.loads(tab['title'][5:])
+                            # DevTools' tab list escapes titles as HTML.
+                            return json.loads(html.unescape(tab['title'])[5:])
             except OSError:
                 pass
             time.sleep(1)
@@ -161,6 +165,15 @@ def switch(dev):
     """'Block ads on this site' off for 127.0.0.1: its test ad loads; localhost
     (another site) stays blocked; after a restart 127.0.0.1 is still off.
     Turned back on at the end."""
+    # From a clean profile: no site switched off yet.
+    dev.shell('pm', 'clear', PACKAGE)
+    dev.open('about:blank')          # creates the app's folders again
+    time.sleep(10)
+    dev.setup([])
+    dev.open('about:blank')
+    dev.wait_ready()
+    time.sleep(3)
+    tap_text(dev, 'No thanks', tries=2)    # a fresh profile's notifications prompt
     failed = check(dev, 'net.html', {'blocked': 'failed'})
     dev.shell('input', 'tap', '60', '136')          # the page's status icon
     time.sleep(2)
@@ -170,9 +183,15 @@ def switch(dev):
     time.sleep(4)                                     # the page reloads
     failed += check(dev, 'net.html', {'blocked': 'loaded'})
     failed += check(dev, 'net.html', {'blocked': 'failed'}, host='localhost')
+    # Leave the app first, as a person would: Chrome writes its settings when
+    # it goes to the background (a force-stop alone can beat the write).
+    dev.shell('input', 'keyevent', 'KEYCODE_HOME')
+    time.sleep(5)
     dev.shell('am', 'force-stop', PACKAGE)
+    dev.run('logcat', '-c')
     dev.open('about:blank')
     dev.wait_ready()
+    time.sleep(3)
     failed += check(dev, 'net.html', {'blocked': 'loaded'})
     dev.shell('input', 'tap', '60', '136')
     time.sleep(2)
@@ -202,6 +221,7 @@ def main(argv=None):
     if not args.serial.startswith('emulator-'):
         print(f'{args.serial} is not an emulator: the test list needs root', file=sys.stderr)
         return 2
+    socketserver.ThreadingTCPServer.allow_reuse_address = True
     server = socketserver.ThreadingTCPServer(('127.0.0.1', PORT), Handler)
     server.daemon_threads = True
     threading.Thread(target=server.serve_forever, daemon=True).start()

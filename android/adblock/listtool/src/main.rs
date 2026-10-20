@@ -98,11 +98,50 @@ fn check(bundle: &Path, canaries: &Path) -> ExitCode {
     if failed > 0 { ExitCode::FAILURE } else { ExitCode::SUCCESS }
 }
 
+// listtool explain BUNDLE.zip EXTRA_LIST|- ITEM...  (ITEM: req:URL,SOURCE,TYPE
+// | page:URL | class:NAME): what the engine decides, for debugging.
+fn explain(bundle: &Path, extra: &str, items: &[&str]) -> ExitCode {
+    let mut zip = zip::ZipArchive::new(std::fs::File::open(bundle).unwrap()).unwrap();
+    let manifest: serde_json::Value = serde_json::from_str(&read_entry(&mut zip, "manifest.json")).unwrap();
+    let mut set = FilterSet::new(false);
+    for list in manifest["lists"].as_array().unwrap() {
+        let name = list["name"].as_str().unwrap();
+        let mask = list["permission"].as_u64().unwrap_or(0) as u8;
+        let opts = ParseOptions { permissions: PermissionMask::from_bits(mask), ..Default::default() };
+        set.add_filter_list(read_entry(&mut zip, &format!("lists/{name}.txt")), opts);
+    }
+    if extra != "-" {
+        let opts = ParseOptions { permissions: PermissionMask::from_bits(1), ..Default::default() };
+        set.add_filter_list(std::fs::read_to_string(extra).unwrap(), opts);
+    }
+    let resources: Vec<Resource> = serde_json::from_str(&read_entry(&mut zip, "resources.json")).unwrap();
+    let mut engine = Engine::new_with_filter_set(set);
+    engine.use_resources(resources);
+    let mut last_exceptions = std::collections::HashSet::new();
+    for item in items {
+        if let Some(rest) = item.strip_prefix("req:") {
+            let f: Vec<&str> = rest.split(',').collect();
+            let r = engine.check_network_request(&Request::new(f[0], f[1], f[2], "GET").unwrap());
+            println!("{item}: block={} redirect={} exception={}", r.should_block(),
+                     r.redirect.as_deref().map(|s| &s[..s.len().min(40)]).unwrap_or("-"), r.exception.is_some());
+        } else if let Some(url) = item.strip_prefix("page:") {
+            let res = engine.url_cosmetic_resources(url);
+            println!("{item}: hide={:?} generichide={} script_len={} script_head={:?}", res.hide_selectors,
+                     res.generichide, res.injected_script.len(), &res.injected_script[res.injected_script.len().saturating_sub(400)..]);
+            last_exceptions = res.exceptions;
+        } else if let Some(class) = item.strip_prefix("class:") {
+            println!("{item}: {:?}", engine.hidden_class_id_selectors([class], std::iter::empty::<&str>(), &last_exceptions));
+        }
+    }
+    ExitCode::SUCCESS
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     match args.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
         [_, "resources", "--ubo", ubo, "--out", out] => resources(Path::new(ubo), Path::new(out)),
         [_, "check", bundle, canaries] => check(Path::new(bundle), Path::new(canaries)),
+        [_, "explain", bundle, extra, items @ ..] => explain(Path::new(bundle), extra, items),
         _ => {
             eprintln!("usage: listtool resources --ubo DIR --out FILE | listtool check BUNDLE.zip CANARIES.txt");
             ExitCode::from(2)
