@@ -155,8 +155,9 @@ def type_in_address_bar(dev, text):
     x1, y1, x2, y2 = map(int, m.groups())
     dev.shell('input', 'tap', str((x1 + x2) // 2), str((y1 + y2) // 2))
     time.sleep(1)
-    dev.shell('input', 'keyevent', 'KEYCODE_MOVE_END')
-    dev.shell('input', 'keyevent', '--longpress', 'KEYCODE_DEL')
+    # Select all, then delete: whatever was typed before goes.
+    dev.shell('input', 'keycombination', 'KEYCODE_CTRL_LEFT', 'KEYCODE_A')
+    dev.shell('input', 'keyevent', 'KEYCODE_DEL')
     for word in text.split(' '):
         if word:
             dev.shell('input', 'text', word)
@@ -334,7 +335,8 @@ def case_languages(dev):
     dev.shell('am', 'force-stop', PACKAGE)
     prefs = f'/data/user/0/{PACKAGE}/app_chrome/Default/Preferences'
     data = json.loads(dev.shell('cat', prefs) or '{}')
-    data.setdefault('intl', {})['accept_languages'] = 'ta,en-US,en'
+    # Android rebuilds accept_languages from selected_languages: set both.
+    data.setdefault('intl', {}).update(accept_languages='ta,en-US,en', selected_languages='ta,en-US,en')
     dev.shell(f"cat > {prefs} <<'JSON'\n{json.dumps(data)}\nJSON")
     dev.start()
     end = time.time() + 120
