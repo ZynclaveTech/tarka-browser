@@ -366,3 +366,16 @@ class TestDividers(unittest.TestCase):
         self.assertIn('+        listView.setDivider(divider);', patch)
         self.assertEqual(patch.count('divider_color'), 3)
         self.assertIn('-        private static final int[] ATTRS = new int[] {android.R.attr.listDivider};', patch)
+
+
+class TestSettingsPadding(unittest.TestCase):
+    """A3 (the user: "extra horizontal padding make sure it aligns with back
+    button and question mark from header"): settings rows had Chromium's
+    containment margin (16 dp) on top of their own 16 dp padding."""
+
+    def test_rows_have_no_extra_side_margin(self):
+        patch = (ANDROID / 'patches' / 'look-settings-padding.patch').read_text()
+        self.assertIn('+++ b/components/browser_ui/widget/android/java/src/org/chromium/components/browser_ui/widget/containment/ContainmentItemController.java', patch)
+        self.assertIn('-        mHorizontalMargin = mDefaultMargin;', patch)
+        self.assertIn('+        mHorizontalMargin = 0;', patch)
+        self.assertIn('\nlook-settings-padding.patch\n', (ANDROID / 'patches' / 'series').read_text())
