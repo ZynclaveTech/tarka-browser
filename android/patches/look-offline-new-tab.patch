@@ -1,0 +1,338 @@
+--- a/chrome/android/chrome_java_resources.gni
++++ b/chrome/android/chrome_java_resources.gni
+@@ -408,6 +408,7 @@
+   "java/res/drawable/tab_indicator.xml",
+   "java/res/drawable/tablet_black_24dp.xml",
+   "java/res/drawable/tablet_recent_tab_empty_state_illustration.xml",
++  "java/res/drawable/tark_ntp_mark.xml",
+   "java/res/drawable/task_spark_24dp.xml",
+   "java/res/drawable/text_cursor_lowend.xml",
+   "java/res/drawable/tips_opt_in_logo.xml",
+--- /dev/null
++++ b/chrome/android/java/res/drawable/tark_ntp_mark.xml
+@@ -0,0 +1,21 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!-- Copyright 2026 The Tark Authors
++     Use of this source code is governed by a BSD-style license that can be
++     found in the LICENSE file. -->
++<!-- Tark's mark on the offline new tab page, as on the Mac's: amber, coral
++     and indigo dots in the Paper palette (light and dark). -->
++<vector xmlns:android="http://schemas.android.com/apk/res/android"
++    android:width="64dp"
++    android:height="52dp"
++    android:viewportWidth="44"
++    android:viewportHeight="36">
++    <path
++        android:fillColor="@color/tark_ntp_amber"
++        android:pathData="M15,9a7,7 0,1 0,14 0a7,7 0,1 0,-14 0z" />
++    <path
++        android:fillColor="@color/tark_ntp_coral"
++        android:pathData="M2,27a7,7 0,1 0,14 0a7,7 0,1 0,-14 0z" />
++    <path
++        android:fillColor="@color/tark_ntp_indigo"
++        android:pathData="M28,27a7,7 0,1 0,14 0a7,7 0,1 0,-14 0z" />
++</vector>
+--- a/chrome/android/java/res/layout/new_tab_page_layout.xml
++++ b/chrome/android/java/res/layout/new_tab_page_layout.xml
+@@ -26,12 +26,35 @@
+         android:layout_height="wrap_content"
+         android:layout="@layout/logo_view_layout" />
+ 
++    <!-- Tark: the mark, as on the Mac's offline new tab (spec §13). Its top
++         margin is set by NewTabPageLayout. -->
++    <ImageView
++        android:id="@+id/tark_ntp_mark"
++        android:layout_width="64dp"
++        android:layout_height="52dp"
++        android:layout_marginBottom="28dp"
++        android:importantForAccessibility="no"
++        android:src="@drawable/tark_ntp_mark" />
++
+     <!-- Search box -->
+     <ViewStub
+         android:id="@+id/search_box_stub"
+         android:layout_width="match_parent"
+         android:layout_height="wrap_content" />
+ 
++    <!-- Tark: the Mac's offline line, shown while there is no connection. -->
++    <TextView
++        android:id="@+id/tark_ntp_offline_line"
++        android:layout_width="wrap_content"
++        android:layout_height="wrap_content"
++        android:layout_marginTop="28dp"
++        android:layout_marginHorizontal="24dp"
++        android:gravity="center"
++        android:text="@string/tark_ntp_offline"
++        android:textColor="@color/tark_ntp_soft"
++        android:textSize="14sp"
++        android:visibility="gone" />
++
+     <!-- Composeplate / "AI Mode" -->
+     <ViewStub
+         android:id="@+id/composeplate_view_stub"
+--- a/chrome/android/java/res/values-night/colors.xml
++++ b/chrome/android/java/res/values-night/colors.xml
+@@ -25,4 +25,12 @@
+     <color name="tab_recording_alert_color">@color/google_red_300</color>
+     <color name="tab_sharing_alert_color">@color/baseline_primary_80</color>
+     <color name="tab_pip_alert_color">@color/baseline_primary_80</color>
++
++    <!-- Tark: the offline new tab page's Paper colours (the Mac's offline page). -->
++    <color name="tark_ntp_raised">@color/tark_raised_dark</color>
++    <color name="tark_ntp_rule">@color/tark_rule_dark</color>
++    <color name="tark_ntp_soft">@color/tark_soft_dark</color>
++    <color name="tark_ntp_amber">@color/tark_amber_dark</color>
++    <color name="tark_ntp_coral">@color/tark_coral_dark</color>
++    <color name="tark_ntp_indigo">@color/tark_indigo_dark</color>
+ </resources>
+--- a/chrome/android/java/res/values/colors.xml
++++ b/chrome/android/java/res/values/colors.xml
+@@ -96,4 +96,12 @@
+     <color name="tab_recording_alert_color">@color/google_red_600</color>
+     <color name="tab_sharing_alert_color">@color/tab_group_color_picker_blue_dark</color>
+     <color name="tab_pip_alert_color">@color/tab_group_color_picker_blue_dark</color>
++
++    <!-- Tark: the offline new tab page's Paper colours (the Mac's offline page). -->
++    <color name="tark_ntp_raised">@color/tark_raised_light</color>
++    <color name="tark_ntp_rule">@color/tark_rule_light</color>
++    <color name="tark_ntp_soft">@color/tark_soft_light</color>
++    <color name="tark_ntp_amber">@color/tark_amber_light</color>
++    <color name="tark_ntp_coral">@color/tark_coral_light</color>
++    <color name="tark_ntp_indigo">@color/tark_indigo_light</color>
+ </resources>
+--- a/chrome/android/java/src/org/chromium/chrome/browser/ntp/NewTabPageCoordinator.java
++++ b/chrome/android/java/src/org/chromium/chrome/browser/ntp/NewTabPageCoordinator.java
+@@ -125,6 +125,7 @@
+ @NullMarked
+ public class NewTabPageCoordinator implements ModuleDelegateHost {
+     private static final String TAG = "NewTabPageLayout";
++    private static final boolean TARK_OFFLINE_NTP = true;
+     // Counts of the number of NTPs have been visible to users.
+     private static int sCount;
+ 
+@@ -1021,7 +1022,11 @@
+                 getNtpSearchBoxTransitionStartOffset(showFakeSearchBoxWithoutLogo);
+ 
+         if (mNtpSearchBox != null) {
+-            int topMargin = showFakeSearchBoxWithoutLogo ? mNtpSearchBoxTopMarginWithoutLogo : 0;
++            // Tark: the mark sits above the pill and sets the gap itself.
++            int topMargin =
++                    showFakeSearchBoxWithoutLogo && !TARK_OFFLINE_NTP
++                            ? mNtpSearchBoxTopMarginWithoutLogo
++                            : 0;
+             mNtpSearchBox.setTopMargin(topMargin);
+         }
+ 
+@@ -1210,7 +1215,9 @@
+      * @param mostRecentTab The last shown Tab if exists. It is non null for NTP home surface only.
+      */
+     public void showHomeSurfaceUiOnNtp(@Nullable Tab mostRecentTab) {
+-        if (mModuleRegistrySupplier.get() == null) {
++        // Tark: no magic stack (Chromium's tips, which point at Google
++        // features, and cards); the page is the Mac's offline new tab.
++        if (TARK_OFFLINE_NTP || mModuleRegistrySupplier.get() == null) {
+             return;
+         }
+ 
+--- a/chrome/android/java/src/org/chromium/chrome/browser/ntp/NewTabPageLayout.java
++++ b/chrome/android/java/src/org/chromium/chrome/browser/ntp/NewTabPageLayout.java
+@@ -16,6 +16,7 @@
+ import org.chromium.build.annotations.Nullable;
+ import org.chromium.chrome.R;
+ import org.chromium.chrome.browser.ui.theme.ChromeSemanticColorUtils;
++import org.chromium.net.NetworkChangeNotifier;
+ 
+ /**
+  * Layout for the new tab page. This positions the page elements in the correct vertical positions.
+@@ -41,8 +42,16 @@
+ 
+     private static final String TAG = "NewTabPageLayout";
+ 
++    // Tark: the share of the window's height above the mark, so the mark, the
++    // search pill and the offline line sit a little above the middle, as on
++    // the Mac's offline new tab.
++    private static final float TARK_MARK_TOP_FRACTION = 0.2f;
++
+     private @Nullable Delegate mDelegate;
+     private @Nullable View mSearchBoxView;
++    private @Nullable View mTarkOfflineLine;
++    private final NetworkChangeNotifier.ConnectionTypeObserver mTarkConnectionObserver =
++            _ -> updateTarkOfflineLine();
+ 
+     /** Constructor for inflating from XML. */
+     public NewTabPageLayout(Context context, AttributeSet attrs) {
+@@ -61,6 +70,25 @@
+         initializeSiteSectionView();
+ 
+         Log.i(TAG, "NewTabPageLayout.onFinishInflate after insertSiteSectionView");
++
++        // Tark: Android's new tab page only shows offline (online, a new tab
++        // opens Shodhya Today), so it is the Mac's offline new tab: the mark,
++        // the search pill and one line.
++        View mark = findViewById(R.id.tark_ntp_mark);
++        LinearLayout.LayoutParams markParams = (LinearLayout.LayoutParams) mark.getLayoutParams();
++        int windowHeight = getResources().getDisplayMetrics().heightPixels;
++        markParams.topMargin = Math.round(windowHeight * TARK_MARK_TOP_FRACTION);
++        mark.setLayoutParams(markParams);
++        mTarkOfflineLine = findViewById(R.id.tark_ntp_offline_line);
++        updateTarkOfflineLine();
++    }
++
++    /** Tark: the offline line shows only while there is no connection. */
++    private void updateTarkOfflineLine() {
++        if (mTarkOfflineLine == null) return;
++        boolean offline =
++                NetworkChangeNotifier.isInitialized() && !NetworkChangeNotifier.isOnline();
++        mTarkOfflineLine.setVisibility(offline ? View.VISIBLE : View.GONE);
+     }
+ 
+     @Override
+@@ -79,6 +107,18 @@
+         if (mDelegate != null) {
+             mDelegate.onAttachedToWindow();
+         }
++        if (NetworkChangeNotifier.isInitialized()) {
++            NetworkChangeNotifier.addConnectionTypeObserver(mTarkConnectionObserver);
++        }
++        updateTarkOfflineLine();
++    }
++
++    @Override
++    protected void onDetachedFromWindow() {
++        if (NetworkChangeNotifier.isInitialized()) {
++            NetworkChangeNotifier.removeConnectionTypeObserver(mTarkConnectionObserver);
++        }
++        super.onDetachedFromWindow();
+     }
+ 
+     @Override
+--- a/chrome/android/java/src/org/chromium/chrome/browser/ntp/search/SearchBoxContainerView.java
++++ b/chrome/android/java/src/org/chromium/chrome/browser/ntp/search/SearchBoxContainerView.java
+@@ -10,6 +10,7 @@
+ import android.graphics.Rect;
+ import android.graphics.Typeface;
+ import android.graphics.drawable.Drawable;
++import android.graphics.drawable.GradientDrawable;
+ import android.graphics.drawable.LayerDrawable;
+ import android.graphics.drawable.RippleDrawable;
+ import android.util.AttributeSet;
+@@ -36,6 +37,8 @@
+ /** Provides the additional capabilities needed for the SearchBox container layout. */
+ @NullMarked
+ public class SearchBoxContainerView extends LinearLayout {
++    private static final boolean TARK_FLAT_PILL = true;
++
+     TextView mHintTextView;
+     ImageView mDseIconView;
+     View mSearchBoxView;
+@@ -93,6 +96,25 @@
+         if (!mIsNtpAuroraEnabled) {
+             revertToLegacyLayoutConfiguration(res);
+         }
++        applyTarkPill();
++    }
++
++    /**
++     * Tark: the search pill of the Mac's offline new tab: raised paper, a rule hairline, fully
++     * round, no shadow. Chromium's background code runs first; this replaces what it set.
++     */
++    private void applyTarkPill() {
++        Context context = getContext();
++        float density = getResources().getDisplayMetrics().density;
++        GradientDrawable pill = new GradientDrawable();
++        pill.setColor(context.getColor(R.color.tark_ntp_raised));
++        pill.setCornerRadius(999 * density);
++        pill.setStroke(Math.max(1, Math.round(density)), context.getColor(R.color.tark_ntp_rule));
++        ColorStateList ripple = ColorStateList.valueOf(context.getColor(R.color.tark_ntp_rule));
++        mSearchBoxView.setBackground(new RippleDrawable(ripple, pill, null));
++        mSearchBoxView.setElevation(0);
++        setClipToPadding(true);
++        setClipChildren(true);
+     }
+ 
+     @Override
+@@ -135,6 +157,7 @@
+ 
+         NtpCustomizationUtils.applyWhiteBackgroundAndShadow(
+                 getContext(), this, searchBoxShadowContainerView, applyWhiteBackground);
++        applyTarkPill();
+     }
+ 
+     /**
+@@ -143,7 +166,8 @@
+      * @param apply Whether to apply elevation to the search box.
+      */
+     void applyElevation(boolean apply) {
+-        if (!apply) {
++        // Tark: the pill is flat; its hairline marks it.
++        if (!apply || TARK_FLAT_PILL) {
+             mSearchBoxView.setElevation(0);
+             // Reset clipping to default to avoid unexpected behavior.
+             setClipToPadding(true);
+--- a/chrome/android/java/src/org/chromium/chrome/browser/ntp/search/SearchBoxMediator.java
++++ b/chrome/android/java/src/org/chromium/chrome/browser/ntp/search/SearchBoxMediator.java
+@@ -47,6 +47,8 @@
+ 
+ @NullMarked
+ class SearchBoxMediator implements DestroyObserver {
++    private static final boolean TARK_LOUPE = true;
++
+     private final Context mContext;
+     private final PropertyModel mModel;
+     private final SearchBoxContainerView mView;
+@@ -154,7 +156,9 @@
+     void setSearchEngineIcon(@Nullable StatusIconResource newIcon) {
+         // AL desktop environments with Google as DSE uses the search loop icon instead of the
+         // engine specific icon.
+-        mSearchEngineIcon = isGoogleDseOnDesktop() ? null : newIcon;
++        // Tark: the new tab page shows the mark above the pill, so the pill
++        // has the search loupe, not the engine's icon (the mark again).
++        mSearchEngineIcon = (TARK_LOUPE || isGoogleDseOnDesktop()) ? null : newIcon;
+         updateDseIconTint();
+ 
+         if (mSearchEngineIcon == null) {
+--- a/chrome/android/java/src/org/chromium/chrome/browser/suggestions/tile/MostVisitedTilesMediator.java
++++ b/chrome/android/java/src/org/chromium/chrome/browser/suggestions/tile/MostVisitedTilesMediator.java
+@@ -41,6 +41,7 @@
+ /** Mediator for handling {@link MostVisitedTilesLayout} related logic. */
+ @NullMarked
+ public class MostVisitedTilesMediator implements TileGroup.Observer {
++    private static final boolean TARK_TILES = false;
+ 
+     /**
+      * Score threshold for the first Top Sites Tiles to trigger IPH for MVT Customization. For
+@@ -177,7 +178,11 @@
+      * visible if and only if the user has the toggle turned on.
+      */
+     void updateMvtVisibility() {
+-        mModel.set(IS_VISIBLE, NtpCustomizationConfigManager.getInstance().getPrefIsMvtToggleOn());
++        // Tark: no tiles on the new tab page, as on the Mac's offline new tab
++        // (it only shows offline, where the tiles' sites cannot load).
++        mModel.set(
++                IS_VISIBLE,
++                TARK_TILES && NtpCustomizationConfigManager.getInstance().getPrefIsMvtToggleOn());
+     }
+ 
+     @Override
+--- a/chrome/browser/ui/android/strings/android_chrome_strings.grd
++++ b/chrome/browser/ui/android/strings/android_chrome_strings.grd
+@@ -4920,6 +4920,9 @@
+       <message name="IDS_OFFLINE_INDICATOR_V2_BACK_ONLINE_TEXT" desc="Text to be displayed in the status indicator above the toolbar when the device goes back online.">
+         Back online
+       </message>
++      <message name="IDS_TARK_NTP_OFFLINE" desc="Tark: the line under the search box on the new tab page while the device has no connection; typed searches load when the connection returns.">
++        You’re offline. Searches will run when you’re back.
++      </message>
+ 
+       <!-- Find in page -->
+       <message name="IDS_HINT_FIND_IN_PAGE" desc="Hint text to show for the find in page search field when the search field is empty.">
+--- a/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb
++++ b/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb
+@@ -2112,6 +2112,7 @@
+ <translation id="916607977885256133">पिक्चर में पिक्चर</translation>
+ <translation id="9168847423516963845">पता बार को सबसे नीचे ले जाएं</translation>
+ <translation id="9169507124922466868">नेविगेशन का इतिहास आधी स्क्रीन में खुला हुआ है</translation>
++<translation id="9170813372755092227">आप ऑफ़लाइन हैं। इंटरनेट वापस आते ही खोज चलेगी।</translation>
+ <translation id="9183563643084679152">आपने क्यूआर कोड स्कैन करके Chrome में साइन इन किया है. आपको इस खाते से पासवर्ड, बुकमार्क वगैरह मिलेंगे.</translation>
+ <translation id="9189607089796819144">क्या आपको फिर भी "<ph name="FILE_NAME" />" (<ph name="FILE_SIZE" />) को डाउनलोड करना है?</translation>
+ <translation id="9190276265094487094">सिंक किए हुए सभी डिवाइसों पर आपकी खोज का इतिहास सेव रहेगा, ताकि आप अपने पिछले काम को जारी रख सकें</translation>
