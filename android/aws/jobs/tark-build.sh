@@ -48,6 +48,12 @@ echo "submodule $SUB" >> $log
 (( fresh )) && rm -rf /tark/work/src /tark/work/prepared.stamp
 # An earlier build's APK must never be uploaded as this job's.
 rm -f /tark/work/src/out/Default/apks/ChromePublic.apk
+# A2: a list bundle staged in s3://BUCKET/lists/ (latest.json and its zip)
+# stands in for gettarka.com's; build.sh checks its signature either way.
+rm -rf /tark/lists && mkdir -p /tark/lists
+if aws s3 cp --quiet --recursive "s3://$B/lists/" /tark/lists/ && [[ -f /tark/lists/latest.json ]]; then
+  export TARK_LISTS_DIR=/tark/lists
+fi
 # A hung step (a stalled sync, a stuck link) ends here instead of billing on.
 timeout 8h bash $repo/android/build.sh $stop /tark/work >> $log 2>&1
 code=$?

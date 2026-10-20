@@ -3,6 +3,7 @@ and its new dependencies, placed into Chromium's vendored crates by
 android/adblock/crates.py (each .crate checked against a pinned sha256) and
 wired up by android/patches/adblock-crates.patch."""
 import hashlib
+import re
 import io
 import json
 import pathlib
@@ -131,3 +132,72 @@ class TestBuildSh(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TestEnginePatch(unittest.TestCase):
+    """A2 Task 4: the engine (Brave's bridge, trimmed) and Tark's service."""
+
+    def setUp(self):
+        self.p = patch_text('adblock-engine.patch')
+        self.add = added(self.p)
+
+    def test_in_the_series_after_the_crates(self):
+        series = (PATCHES / 'series').read_text().split()
+        self.assertLess(series.index('adblock-crates.patch'), series.index('adblock-engine.patch'))
+
+    def test_borrowed_files_keep_mpl_and_say_what_changed(self):
+        for f in re.findall(r'^\+\+\+ b/(third_party/brave_adblock/\S+\.(?:rs|h|cc))$', self.p, re.M):
+            body = self.p.split(f'+++ b/{f}\n', 1)[1].split('\n--- ', 1)[0]
+            self.assertIn('Mozilla Public', body, f)
+            self.assertIn('Modifications Copyright 2026 The Tark Authors', body, f)
+
+    def test_licence_and_readme(self):
+        self.assertIn('+++ b/third_party/brave_adblock/LICENSE', self.p)
+        self.assertIn('+License: MPL-2.0', self.p)
+
+    def test_the_asset_is_stored_uncompressed(self):
+        self.assertIn('renaming_destinations = [ "tark_adblock/lists.zip" ]', self.add)
+        self.assertIn('disable_compression = true', self.add)
+        self.assertIn('"//chrome/browser/tark_adblock:lists_assets",', self.add)
+
+    def test_each_engine_on_its_own_sequence(self):
+        self.assertIn('base::SequenceBound<EngineHolder> active_;', self.add)
+        self.assertIn('base::SequenceBound<EngineHolder> pending_;', self.add)
+        self.assertIn('{base::MayBlock(), base::TaskPriority::USER_BLOCKING,', self.add)
+        self.assertIn('base::TaskShutdownBehavior::SKIP_ON_SHUTDOWN}', self.add)
+
+    def test_fails_open_until_ready(self):
+        self.assertIn('  if (!active_) {\n    std::move(reply).Run(BlockResult());', self.add)
+
+    def test_the_cache_is_keyed_by_bundle_and_crate(self):
+        self.assertIn('constexpr char kCrateVersion[] = "adblock 0.13.3";', self.add)
+        self.assertIn('bundle->sha256 + " " + kCrateVersion', self.add)
+
+    def test_the_public_key_is_the_lists_key(self):
+        key = bytes.fromhex((ROOT / 'android/adblock/lists_pubkey.txt').read_text().strip())
+        literal = ', '.join('0x%02x' % b for b in key[:8])
+        self.assertIn(literal, self.add)
+
+    def test_started_after_browser_start(self):
+        self.assertIn('  tark_adblock::AdblockService::Get();', self.add)
+
+
+class TestNoUblockPak(unittest.TestCase):
+    def test_android_ships_no_ublock_pak(self):
+        p = patch_text('adblock-no-ublock-pak.patch')
+        self.assertIn('-      "$root_gen_dir/third_party/ublock/resources/ublock_resources.pak",', p)
+        self.assertIn('-      "//third_party/ublock",', p)
+        self.assertIn('adblock-no-ublock-pak.patch', (PATCHES / 'series').read_text().split())
+
+
+class TestListsInTheBuild(unittest.TestCase):
+    def test_build_verifies_the_bundle_before_the_apk_gets_it(self):
+        s = (ROOT / 'android' / 'build.sh').read_text()
+        verify = s.index('android/adblock/bundle.py" verify')
+        self.assertLess(verify, s.index('chrome/browser/tark_adblock/lists.zip"'))
+        self.assertGreater(verify, s.index('# --- end prepare ---'))
+        self.assertIn('https://gettarka.com/lists/android/v1', s)
+
+    def test_job_passes_a_staged_bundle(self):
+        j = (ROOT / 'android' / 'aws' / 'jobs' / 'tark-build.sh').read_text()
+        self.assertIn('TARK_LISTS_DIR', j)

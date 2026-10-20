@@ -174,6 +174,31 @@ else
 fi
 # --- end prepare ---
 
+# A2: the newest signed list bundle goes into the APK as an asset, checked
+# against Tark's list-signing key first (android/adblock/bundle.py verify).
+# TARK_LISTS_DIR (latest.json beside its zip) stands in for gettarka.com.
+lists_base="https://gettarka.com/lists/android/v1"
+rm -rf "$work/lists" && mkdir -p "$work/lists"
+if [[ -n "${TARK_LISTS_DIR:-}" ]]; then
+  run cp "$TARK_LISTS_DIR"/latest.json "$work/lists/latest.json"
+else
+  run curl -fsSL -o "$work/lists/latest.json" "$lists_base/latest.json"
+fi
+if [[ "$dryrun" != 1 ]]; then
+  lists_file=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["file"])' "$work/lists/latest.json")
+  [[ $lists_file =~ ^lists-[0-9]{8}\.zip$ ]] || { echo "bad list bundle name '$lists_file'" >&2; exit 1; }
+else
+  lists_file=lists-00000000.zip
+fi
+if [[ -n "${TARK_LISTS_DIR:-}" ]]; then
+  run cp "$TARK_LISTS_DIR/$lists_file" "$work/lists/$lists_file"
+else
+  run curl -fsSL -o "$work/lists/$lists_file" "$lists_base/$lists_file"
+fi
+run python3 "$_root_dir/android/adblock/bundle.py" verify "$work/lists/$lists_file" "$work/lists/latest.json" \
+  --pubkey "$_root_dir/android/adblock/lists_pubkey.txt"
+run cp "$work/lists/$lists_file" "$_src_dir/chrome/browser/tark_adblock/lists.zip"
+
 if (( stop_before_gn )); then
   log "stopping before gn gen (--stop-before-gn)"
   exit 3
