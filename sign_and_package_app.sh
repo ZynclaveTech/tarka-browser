@@ -150,8 +150,12 @@ if (( _dev )); then
   cp "$_profile" "$_app/Contents/embedded.provisionprofile"
   sign --identifier "$_bundle_id" --options restrict,library,runtime,kill --entitlements "$_dev_entitlements" "$_app"
 elif (( _ad_hoc )); then
+  # A development profile left by an earlier dev signing doesn't belong in
+  # any other build.
+  rm -f "$_app/Contents/embedded.provisionprofile"
   sign --identifier "$_bundle_id" --options restrict,library,runtime,kill --entitlements "$_root_dir/entitlements/app-entitlements.plist" "$_app"
 else
+  rm -f "$_app/Contents/embedded.provisionprofile"
   sign --identifier "$_bundle_id" --options restrict,library,runtime,kill --entitlements "$_root_dir/entitlements/app-entitlements.plist" --requirements "=designated => identifier \"$_bundle_id\" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */" "$_app"
 fi
 
