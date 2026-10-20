@@ -185,3 +185,24 @@ class TestPublicKey(unittest.TestCase):
     def test_public_key_is_32_bytes_hex(self):
         key = (ADBLOCK / 'lists_pubkey.txt').read_text().strip()
         self.assertEqual(len(bytes.fromhex(key)), 32)
+
+
+class TestWorkflowHardening(unittest.TestCase):
+    """The workflow holds the list-signing key in a public repo."""
+
+    def setUp(self):
+        self.y = WORKFLOW.read_text()
+
+    def test_every_action_is_pinned_to_a_commit(self):
+        import re
+        uses = re.findall(r'uses:\s*(\S+)', self.y)
+        self.assertTrue(uses)
+        for u in uses:
+            self.assertRegex(u, r'^[\w.-]+/[\w.-]+@[0-9a-f]{40}$', u)
+
+    def test_checkout_leaves_no_token_behind(self):
+        self.assertIn('persist-credentials: false', self.y)
+
+    def test_the_key_is_never_echoed(self):
+        self.assertNotIn('set -x', self.y)
+        self.assertNotIn('echo "$TARK_LISTS_SIGNING_KEY"', self.y)
