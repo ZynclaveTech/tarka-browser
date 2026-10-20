@@ -922,7 +922,36 @@
    client_language_.Choose(tark_captions::LanguageCode(language));
    // Results asked in the old language are not shown; captions waiting keep
    // the language they were heard in.
-@@ -112,6 +132,7 @@
+@@ -91,6 +111,28 @@
+   observers_.Notify(&Observer::OnCallStateChanged, this);
+ }
+ 
++void CallCaptionsTabHelper::ChooseLanguage(const std::string& code) {
++  if (std::optional<tark_captions::Language> language = tark_captions::LanguageFromCode(code)) {
++    SetLanguage(*language);
++    return;
++  }
++  const bool was_other_script = !effective_show_in().empty();
++  client_language_.set_apple_available(AppleAvailable());
++  client_language_.Choose(code);
++  render_queue_.ChoicesChanged();
++  StopRenderingIfUnneeded(/*show_waiting_finals=*/was_other_script);
++  if (state_.captions_on()) {
++    Profile* profile = Profile::FromBrowserContext(GetWebContents().GetBrowserContext());
++    if (auto* speech =
++            SpeechRecognitionClientBrowserInterfaceFactory::GetForProfile(profile)) {
++      speech->OnTarkCaptionsLanguageChanged(client_language_.recognizer_code());
++    }
++  }
++  UpdateModelsInUse();
++  observers_.Notify(&Observer::OnClientLanguageChanged, this);
++  observers_.Notify(&Observer::OnCallStateChanged, this);
++}
++
+ void CallCaptionsTabHelper::ChooseAutoDetect() {
+   client_language_.ChooseAuto();
+   render_queue_.ChoicesChanged();
+@@ -112,6 +154,7 @@
    }
    VLOG(1) << "Tark captions: the client speaks \"" << code << "\"";
    const std::string before = client_language_.code();
@@ -930,7 +959,7 @@
    // Every recognizer in the tab (one per audio player on the call page)
    // hears the lock, or is told it when it heard otherwise.
    if (std::optional<std::string> tell = client_language_.Detected(code)) {
-@@ -154,7 +175,12 @@
+@@ -154,7 +197,12 @@
            << result.transcription.size() << " bytes";
    observers_.Notify(&Observer::OnCaption, this, result.is_final, result.transcription);
    if (renders()) {
@@ -944,7 +973,7 @@
      Pump();
    }
  }
-@@ -200,6 +226,10 @@
+@@ -200,6 +248,10 @@
  }
  
  std::string CallCaptionsTabHelper::effective_show_in() const {
@@ -955,7 +984,7 @@
    const std::string code = show_in();
    return code == tark_captions::LanguageCode(language_) ? std::string() : code;
  }
-@@ -234,7 +264,26 @@
+@@ -234,7 +286,26 @@
    if (next->is_final) {
      in_flight_final_ = text;
    }
@@ -983,7 +1012,7 @@
                        translate_on_ ? translate_to() : std::string(),
                        base::BindOnce(&CallCaptionsTabHelper::OnRendered,
                                       weak_factory_.GetWeakPtr(), next->is_final,
-@@ -260,6 +309,136 @@
+@@ -260,6 +331,136 @@
    Pump();
  }
  
@@ -1120,7 +1149,7 @@
  void CallCaptionsTabHelper::StopRendering() {
    translate_on_ = false;
    render_queue_.Clear();
-@@ -309,6 +488,7 @@
+@@ -309,6 +510,7 @@
    if (!state_.in_call()) {
      // The client's language is never remembered past the call.
      client_language_.ChooseAuto();
@@ -1128,7 +1157,7 @@
    }
    if (was_on && !state_.captions_on()) {
      CaptionsChanged(was_on);
-@@ -352,6 +532,8 @@
+@@ -352,6 +554,8 @@
    if (was_on) {
      StopRendering();
    }
@@ -1185,7 +1214,17 @@
   public:
    class Observer : public base::CheckedObserver {
     public:
-@@ -96,6 +109,24 @@
+@@ -72,6 +85,9 @@
+   void SetLanguage(tark_captions::Language language);
+   // The user picked "Auto-detect" again: listen afresh.
+   void ChooseAutoDetect();
++  // The user picked the client's language for this call: one of Tark's
++  // own (SetLanguage) or one macOS captions ("es").
++  void ChooseLanguage(const std::string& code);
+   void HideForThisCall();
+ 
+   // Translate is per call: off when a call starts and when captions go off.
+@@ -96,6 +112,26 @@
    // it couldn't tell).
    void OnLanguageDetected(const std::string& code);
  
@@ -1198,6 +1237,8 @@
 +    double fraction = 0;
 +  };
 +  AppleDownload apple_download() const;
++  // macOS 26's speech is here to caption the Apple languages.
++  bool apple_languages_available() const { return AppleAvailable(); }
 +  void RetryAppleDownload();
 +  // Translate is on and macOS has the pair but the user hasn't added it
 +  // (System Settings > Translation Languages).
@@ -1210,7 +1251,7 @@
    void AddObserver(Observer* observer);
    void RemoveObserver(Observer* observer);
  
-@@ -131,6 +162,24 @@
+@@ -131,6 +167,24 @@
    // Tells the model store which units this call is using (Settings can't
    // remove them meanwhile).
    void UpdateModelsInUse();
@@ -1235,7 +1276,7 @@
  
    tark_captions::CallState state_;
    tark_captions::Language language_ = tark_captions::Language::kHindi;
-@@ -152,6 +201,12 @@
+@@ -152,6 +206,12 @@
    // The final being rendered, to show as it is if rendering stops.
    std::optional<std::string> in_flight_final_;
    mojo::Remote<media::mojom::TarkCaptionTranslator> translator_;

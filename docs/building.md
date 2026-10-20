@@ -474,3 +474,22 @@ unpacked to `build/src/third_party/sparkle` by `dev.sh setup` and
   detection never needs the 679 MB captions unit. The pill's chip reads
   "Auto-detect", then "Tamil · detected"; a language Tark can't caption
   gets a line and "Choose a language".
+- **Apple languages (Phase 3 Part B):** English, Spanish, French, German,
+  Italian, Portuguese, Japanese, Korean, Chinese and Cantonese caption
+  through macOS 26's own speech (SpeechAnalyzer/SpeechTranscriber) and
+  translate through its Translation framework, in the browser process.
+  Chromium's Mac toolchain builds no Swift, so
+  `chrome/browser/tark_captions/apple/` holds a small Swift library with C
+  entry points (`tark_apple_speech.h`) that a GN action builds with
+  Xcode's swiftc against Chromium's SDK (arm64, macOS 26);
+  `sign_and_package_app.sh` installs it into `Contents/Frameworks`
+  (`utils/install_apple_speech.sh`) and signs it, and the browser loads it
+  on macOS 26 only (`AppleSpeechLibrary`). Each recognizer opens its own
+  tap (`TarkAudioTapSource.OpenTap`) for an Apple language; the call's tab
+  runs one `AppleCaptioner` per tap. macOS downloads a language's speech
+  from Apple the first time (the pill shows "Getting Spanish ready · 40%");
+  a translation language the user hasn't added shows "Open Settings".
+  Apple's Translation answers only while the calling thread's run loop
+  runs (the browser's UI thread does). Tests:
+  `tark_apple_speech_unittests` (the real library, macOS 26, Spanish
+  installed) and `tark_apple_captions_unittests` (a fake of it).

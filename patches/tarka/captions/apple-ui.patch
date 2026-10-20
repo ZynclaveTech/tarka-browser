@@ -1,0 +1,524 @@
+--- a/chrome/app/settings_strings.grdp
++++ b/chrome/app/settings_strings.grdp
+@@ -668,6 +668,9 @@
+     <message name="IDS_SETTINGS_TARK_LIVE_CAPTIONS_LANGUAGE_ID_DETAIL" desc="Live captions settings: what the language detection download does.">
+       Works out which language your client speaks
+     </message>
++    <message name="IDS_SETTINGS_TARK_LIVE_CAPTIONS_APPLE" desc="Live captions settings (D4 Phase 3): the languages macOS's own speech captions, under the downloads Tark makes itself.">
++      English, Spanish, French, German, Italian, Portuguese, Japanese, Korean and Chinese caption through macOS (macOS 26 and later).
++    </message>
+     <message name="IDS_SETTINGS_TARK_LIVE_CAPTIONS_DOWNLOAD" desc="Live captions settings: button to download a model.">
+       Download
+     </message>
+@@ -716,6 +719,9 @@
+     <message name="IDS_SETTINGS_TARK_CONNECTS_CAPTIONS" desc="Item in the list of services Tark connects to: Tark's own server, which hosts the on-device caption and translation models. $1 is a list of host names.">
+       Tark's live caption and translation models, downloaded once when you first use a language or from Settings › Live captions; your calls are never sent (<ph name="HOSTS">$1<ex>models.example.com</ex></ph>)
+     </message>
++    <message name="IDS_SETTINGS_TARK_CONNECTS_APPLE_LANGUAGES" desc="Privacy settings, 'What Tark connects to' (D4 Phase 3): macOS itself downloads speech and translation languages from Apple for the Apple languages in live captions; Tark sends Apple nothing.">
++      macOS downloads its own speech and translation languages from Apple when you first use English, Spanish and the others in captions. Tark sends Apple nothing.
++    </message>
+     <message name="IDS_SETTINGS_TARK_WIDEVINE" desc="Label of the Privacy settings toggle that lets sites play DRM-protected video by downloading Google's Widevine module.">
+       Protected video (Netflix, Prime and others)
+     </message>
+--- a/chrome/app/tark_captions_strings.grdp
++++ b/chrome/app/tark_captions_strings.grdp
+@@ -100,4 +100,13 @@
+   <message name="IDS_TARK_CAPTIONS_DETECTION_DOWNLOAD_FAILED" desc="Call captions pill: that download failed; shown with Retry.">
+     Couldn't get captions ready. Check your connection.
+   </message>
++  <message name="IDS_TARK_CAPTIONS_GETTING_APPLE_READY" desc="Call captions pill (D4 Phase 3): macOS is downloading its own speech for a language from Apple. $1 is the language, e.g. Spanish; $2 a percentage.">
++    Getting <ph name="LANGUAGE">$1<ex>Spanish</ex></ph> ready · <ph name="PERCENT">$2<ex>40</ex></ph>%
++  </message>
++  <message name="IDS_TARK_CAPTIONS_TRANSLATION_LANGUAGE_MISSING" desc="Call captions pill: Translate is on, and macOS can translate the other person's language only after the user adds it in System Settings. $1 is the language, e.g. Spanish.">
++    To translate <ph name="LANGUAGE">$1<ex>Spanish</ex></ph>, add it in System Settings › General › Language &amp; Region › Translation Languages.
++  </message>
++  <message name="IDS_TARK_CAPTIONS_OPEN_SETTINGS" desc="Call captions pill: button that opens macOS System Settings where translation languages are added.">
++    Open Settings
++  </message>
+ </grit-part>
+--- a/chrome/browser/resources/settings/a11y_page/tark_live_captions_page.html.ts
++++ b/chrome/browser/resources/settings/a11y_page/tark_live_captions_page.html.ts
+@@ -44,6 +44,9 @@
+     </div>
+   `)}
+   <div class="cr-row">
++    <div class="secondary" id="apple">$i18n{tarkLiveCaptionsApple}</div>
++  </div>
++  <div class="cr-row">
+     <div class="flex">$i18n{tarkLiveCaptionsShowIn}</div>
+     <select id="showIn" class="md-select" @change="${this.onShowInChange_}">
+       ${this.showInOptions_.map(option => html`
+--- a/chrome/browser/resources/settings/privacy_page/privacy_page.html
++++ b/chrome/browser/resources/settings/privacy_page/privacy_page.html
+@@ -59,6 +59,9 @@
+       <div class="cr-row continuation">$i18n{tarkConnectsUblock}</div>
+       <div class="cr-row continuation">$i18n{tarkConnectsWidevine}</div>
+       <div class="cr-row continuation">$i18n{tarkConnectsCaptions}</div>
++<if expr="is_macosx">
++      <div class="cr-row continuation">$i18n{tarkConnectsAppleLanguages}</div>
++</if>
+     </cr-collapse>
+     <cr-toast id="deleteBrowsingDataToast" duration="5000">
+       <div>[[dbdDeletionConfirmationToastLabel_]]</div>
+--- a/chrome/browser/ui/views/tark_captions/caption_pill_controller.cc
++++ b/chrome/browser/ui/views/tark_captions/caption_pill_controller.cc
+@@ -8,6 +8,7 @@
+ 
+ #include "base/strings/string_number_conversions.h"
+ #include "chrome/browser/browser_process.h"
++#include "chrome/browser/platform_util.h"
+ #include "chrome/browser/tark_captions/caption_models.h"
+ #include "chrome/browser/ui/browser.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+@@ -35,18 +36,14 @@
+ // Menu command ids: the client's language is the Language value, or
+ // Auto-detect; the others start at these.
+ constexpr int kAutoDetect = 50;
++// The client's language: kLanguageFirst + its place in ClientLanguageChoices.
++constexpr int kLanguageFirst = 60;
+ constexpr int kShowInFirst = 100;
+ constexpr int kTranslateToFirst = 200;
+ // CaptionChoices codes, in menu order.
+ constexpr const char* kShowInCodes[] = {"", "latn", "hi", "ta", "bn"};
+ constexpr const char* kTranslateToCodes[] = {"en", "hi", "ta", "bn"};
+ 
+-constexpr tark_captions::Language kLanguages[] = {
+-    tark_captions::Language::kHindi,
+-    tark_captions::Language::kTamil,
+-    tark_captions::Language::kBengali,
+-};
+-
+ std::u16string LanguageName(tark_captions::Language language) {
+   switch (language) {
+     case tark_captions::Language::kHindi:
+@@ -88,9 +85,17 @@
+       return l10n_util::GetStringFUTF16(IDS_TARK_CAPTIONS_UNSUPPORTED, NameOf(pill.code));
+     case PillLanguage::Notice::kNeedsMacOS26:
+       return l10n_util::GetStringFUTF16(IDS_TARK_CAPTIONS_NEEDS_MACOS_26, NameOf(pill.code));
++    case PillLanguage::Notice::kTranslationLanguageMissing:
++      return l10n_util::GetStringFUTF16(IDS_TARK_CAPTIONS_TRANSLATION_LANGUAGE_MISSING,
++                                        NameOf(pill.code));
+   }
+ }
+ 
++PillLanguage Describe(CallCaptionsTabHelper* tab) {
++  return DescribeLanguage(tab->client_language(),
++                          tab->translate_on() && tab->translation_language_missing());
++}
++
+ std::u16string ScriptName(const std::string& code) {
+   if (code.empty()) {
+     return l10n_util::GetStringUTF16(IDS_TARK_CAPTIONS_OWN_SCRIPT);
+@@ -298,15 +303,17 @@
+   menu_model_->AddTitle(l10n_util::GetStringUTF16(IDS_TARK_CAPTIONS_CLIENT_SPEAKS));
+   menu_model_->AddRadioItem(kAutoDetect, l10n_util::GetStringUTF16(IDS_TARK_CAPTIONS_AUTO_DETECT),
+                             /*group_id=*/0);
+-  for (tark_captions::Language language : kLanguages) {
+-    menu_model_->AddRadioItem(static_cast<int>(language), LanguageName(language),
+-                              /*group_id=*/0);
++  // Ids follow the full list, so they mean the same with or without macOS's.
++  const std::vector<std::string> all = ClientLanguageChoices(/*apple_available=*/true);
++  for (const std::string& code : ClientLanguageChoices(shown_->apple_languages_available())) {
++    const int index = std::ranges::find(all, code) - all.begin();
++    menu_model_->AddRadioItem(kLanguageFirst + index, NameOf(code), /*group_id=*/0);
+   }
+   menu_model_->AddSeparator(ui::NORMAL_SEPARATOR);
+   menu_model_->AddTitle(l10n_util::GetStringUTF16(IDS_TARK_CAPTIONS_SHOW_IN));
+-  const std::string own = tark_captions::LanguageCode(shown_->language());
++  const std::vector<std::string> scripts = ShowInChoices(shown_->client_language());
+   for (size_t i = 0; i < std::size(kShowInCodes); ++i) {
+-    if (kShowInCodes[i] != own) {
++    if (std::ranges::find(scripts, kShowInCodes[i]) != scripts.end()) {
+       menu_model_->AddRadioItem(kShowInFirst + i, ScriptName(kShowInCodes[i]), /*group_id=*/1);
+     }
+   }
+@@ -347,15 +354,16 @@
+   if (command_id == kAutoDetect) {
+     return shown_->client_language().automatic();
+   }
+-  return !shown_->client_language().automatic() &&
+-         static_cast<int>(shown_->language()) == command_id;
++  const std::vector<std::string> all = ClientLanguageChoices(/*apple_available=*/true);
++  const size_t index = command_id - kLanguageFirst;
++  return !shown_->client_language().automatic() && index < all.size() &&
++         shown_->client_language().code() == all[index];
+ }
+ 
+ bool TarkCaptionPillController::IsCommandIdEnabled(int command_id) const {
+   // Translating into the client's own language means nothing.
+   return !shown_ || command_id < kTranslateToFirst ||
+-         kTranslateToCodes[command_id - kTranslateToFirst] !=
+-             std::string(tark_captions::LanguageCode(shown_->language()));
++         kTranslateToCodes[command_id - kTranslateToFirst] != shown_->client_language().code();
+ }
+ 
+ void TarkCaptionPillController::ExecuteCommand(int command_id, int event_flags) {
+@@ -381,10 +389,10 @@
+   } else if (command_id == kAutoDetect) {
+     shown_->ChooseAutoDetect();
+   } else {
+-    for (tark_captions::Language language : kLanguages) {
+-      if (static_cast<int>(language) == command_id) {
+-        shown_->SetLanguage(language);
+-      }
++    const std::vector<std::string> all = ClientLanguageChoices(/*apple_available=*/true);
++    const size_t index = command_id - kLanguageFirst;
++    if (index < all.size()) {
++      shown_->ChooseLanguage(all[index]);
+     }
+   }
+   // What is on screen was written with the old choices.
+@@ -495,10 +503,17 @@
+   view_->SetMode(mode);
+   view_->SetCaptionsOn(target->captions_on());
+   view_->SetTranslateState(target->captions_on(), target->translate_on());
+-  const PillLanguage pill = DescribeLanguage(target->client_language());
++  const PillLanguage pill = Describe(target);
+   view_->SetLanguageName(ChipText(pill));
+-  view_->SetChooseLanguageVisible(target->captions_on() &&
+-                                  pill.notice != PillLanguage::Notice::kNone);
++  std::u16string notice_button;
++  if (target->captions_on() && pill.notice != PillLanguage::Notice::kNone) {
++    notice_button = l10n_util::GetStringUTF16(
++        pill.notice == PillLanguage::Notice::kTranslationLanguageMissing
++            ? IDS_TARK_CAPTIONS_OPEN_SETTINGS
++            : IDS_TARK_CAPTIONS_CHOOSE_LANGUAGE);
++  }
++  view_->SetNoticeButton(notice_button);
++  ShowAppleDownload();
+   ShowCaption();
+   Reposition();
+   if (!widget_->IsVisible()) {
+@@ -517,17 +532,21 @@
+   const tark_captions::CaptionText::Display display = text_.GetDisplay(kCaptionChars);
+   tark_captions::CaptionText::Display translation;
+   std::u16string translation_status;
++  const PillLanguage pill = Describe(shown_);
+   if (shown_->translate_on()) {
+-    if (translation_failed_) {
++    if (pill.notice == PillLanguage::Notice::kTranslationLanguageMissing) {
++      // The captions keep coming; the translation waits for System Settings.
++      translation_status = NoticeText(pill);
++    } else if (translation_failed_) {
+       translation_status = l10n_util::GetStringUTF16(IDS_TARK_CAPTIONS_TRANSLATION_UNAVAILABLE);
+     } else {
+       translation = translation_.GetDisplay(kCaptionChars);
+     }
+   }
+   std::u16string message = message_;
+-  if (message.empty()) {
++  if (message.empty() && pill.notice != PillLanguage::Notice::kTranslationLanguageMissing) {
+     // A language Tark can't caption: said plainly, never wrong captions.
+-    message = NoticeText(DescribeLanguage(shown_->client_language()));
++    message = NoticeText(pill);
+   }
+   if (message.empty() && display.committed.empty() && display.draft.empty()) {
+     message = l10n_util::GetStringUTF16(IDS_TARK_CAPTIONS_LISTENING);
+@@ -547,8 +566,29 @@
+   }
+ }
+ 
++void TarkCaptionPillController::OnNoticeButtonPressed(views::View* anchor) {
++  if (!shown_) {
++    return;
++  }
++  if (Describe(shown_).notice == PillLanguage::Notice::kTranslationLanguageMissing) {
++    platform_util::OpenExternal(GURL(kTranslationSettingsUrl));
++    return;
++  }
++  OnLanguagePressed(anchor);
++}
++
+ void TarkCaptionPillController::OnDownloadButtonPressed() {
+   if (!waiting_) {
++    if (!shown_ || !shown_->apple_download().active) {
++      return;
++    }
++    // macOS's download: Retry after it failed, Cancel turns captions off
++    // (macOS finishes it by itself).
++    if (shown_->apple_download().failed) {
++      shown_->RetryAppleDownload();
++    } else {
++      shown_->SetCaptionsOn(false);
++    }
+     return;
+   }
+   bool failed = false;
+@@ -655,6 +695,28 @@
+   view_->SetDownload(download);
+ }
+ 
++void TarkCaptionPillController::ShowAppleDownload() {
++  if (!view_ || !shown_ || waiting_) {
++    return;
++  }
++  const CallCaptionsTabHelper::AppleDownload apple = shown_->apple_download();
++  if (!apple.active || !shown_->captions_on()) {
++    view_->SetDownload(std::nullopt);
++    return;
++  }
++  const std::u16string language = NameOf(shown_->client_language().code());
++  TarkCaptionPillView::Download download;
++  download.failed = apple.failed;
++  download.fraction = apple.fraction;
++  download.text =
++      apple.failed
++          ? l10n_util::GetStringFUTF16(IDS_TARK_CAPTIONS_DOWNLOAD_FAILED, language)
++          : l10n_util::GetStringFUTF16(IDS_TARK_CAPTIONS_GETTING_APPLE_READY, language,
++                                       base::NumberToString16(
++                                           static_cast<int>(apple.fraction * 100)));
++  view_->SetDownload(download);
++}
++
+ void TarkCaptionPillController::ClearText() {
+   text_.Clear();
+   translation_.Clear();
+--- a/chrome/browser/ui/views/tark_captions/caption_pill_controller.h
++++ b/chrome/browser/ui/views/tark_captions/caption_pill_controller.h
+@@ -71,6 +71,7 @@
+   void OnHidePressed() override;
+   void OnDragged(const gfx::Vector2d& delta) override;
+   void OnDownloadButtonPressed() override;
++  void OnNoticeButtonPressed(views::View* anchor) override;
+ 
+   // tark_captions::CaptionModelStore::Observer:
+   void OnModelStatusChanged(tark_captions::ModelUnit unit) override;
+@@ -102,6 +103,8 @@
+   void WaitForModels(bool for_captions, bool turn_on, std::vector<tark_captions::ModelUnit> units);
+   void StopWaiting();
+   void ShowDownload();
++  // macOS downloading an Apple language's speech (no Tark model waited on).
++  void ShowAppleDownload();
+   void Reposition();
+ 
+   raw_ptr<BrowserView> browser_view_;
+--- a/chrome/browser/ui/views/tark_captions/caption_pill_view.cc
++++ b/chrome/browser/ui/views/tark_captions/caption_pill_view.cc
+@@ -69,7 +69,9 @@
+       views::Button::PressedCallback(),
+       l10n_util::GetStringUTF16(IDS_TARK_CAPTIONS_CHOOSE_LANGUAGE)));
+   choose_button_->SetCallback(base::BindRepeating(
+-      [](TarkCaptionPillView* view) { view->delegate_->OnLanguagePressed(view->choose_button_); },
++      [](TarkCaptionPillView* view) {
++        view->delegate_->OnNoticeButtonPressed(view->choose_button_);
++      },
+       base::Unretained(this)));
+   choose_button_->SetStyle(ui::ButtonStyle::kProminent);
+   translate_button_ = pill_->AddChildView(std::make_unique<views::MdTextButton>(
+@@ -83,7 +85,7 @@
+   SetCaptionsOn(false);
+   SetTranslateState(/*enabled=*/false, /*on=*/false);
+   SetDownload(std::nullopt);
+-  SetChooseLanguageVisible(false);
++  SetNoticeButton(std::u16string());
+ }
+ 
+ TarkCaptionPillView::~TarkCaptionPillView() = default;
+@@ -129,8 +131,11 @@
+   language_button_->SetText(name + u" ▾");
+ }
+ 
+-void TarkCaptionPillView::SetChooseLanguageVisible(bool visible) {
+-  choose_button_->SetVisible(visible && language_button_->GetVisible());
++void TarkCaptionPillView::SetNoticeButton(const std::u16string& label) {
++  if (!label.empty()) {
++    choose_button_->SetText(label);
++  }
++  choose_button_->SetVisible(!label.empty() && language_button_->GetVisible());
+   PreferredSizeChanged();
+ }
+ 
+--- a/chrome/browser/ui/views/tark_captions/caption_pill_view.h
++++ b/chrome/browser/ui/views/tark_captions/caption_pill_view.h
+@@ -40,6 +40,8 @@
+     virtual void OnDragged(const gfx::Vector2d& delta) = 0;
+     // Cancel while a model downloads, Retry after it failed.
+     virtual void OnDownloadButtonPressed() = 0;
++    // The button beside a notice: Choose a language, or Open Settings.
++    virtual void OnNoticeButtonPressed(views::View* anchor) = 0;
+ 
+    protected:
+     virtual ~Delegate() = default;
+@@ -66,9 +68,10 @@
+   // Translate's button: usable while captions are on, prominent when on.
+   void SetTranslateState(bool enabled, bool on);
+   void SetLanguageName(const std::u16string& name);
+-  // "Choose a language", beside a language Tark can't caption (D4 Phase 3,
+-  // pill-states.html 5); it opens the language menu.
+-  void SetChooseLanguageVisible(bool visible);
++  // The button beside a notice (D4 Phase 3, pill-states.html 5): "Choose a
++  // language", or "Open Settings" for a translation language to add; empty
++  // hides it.
++  void SetNoticeButton(const std::u16string& label);
+   // Replaces the pill's buttons (not ✕) with the download row, or puts them
+   // back.
+   void SetDownload(const std::optional<Download>& download);
+--- a/chrome/browser/ui/views/tark_captions/pill_language.cc
++++ b/chrome/browser/ui/views/tark_captions/pill_language.cc
+@@ -7,7 +7,8 @@
+ #include "components/tark_captions/client_language.h"
+ #include "ui/base/l10n/l10n_util.h"
+ 
+-PillLanguage DescribeLanguage(const tark_captions::ClientLanguage& language) {
++PillLanguage DescribeLanguage(const tark_captions::ClientLanguage& language,
++                              bool translation_missing) {
+   using State = tark_captions::ClientLanguage::State;
+   PillLanguage out;
+   out.code = language.code();
+@@ -25,14 +26,41 @@
+     case State::kAppleUnavailable:
+       out.notice = PillLanguage::Notice::kNeedsMacOS26;
+       break;
++    case State::kApple:
++      if (translation_missing) {
++        out.notice = PillLanguage::Notice::kTranslationLanguageMissing;
++      }
++      break;
+     case State::kDetecting:
+     case State::kCaptioning:
+-    case State::kApple:
+       break;
+   }
+   return out;
+ }
+ 
++std::vector<std::string> ClientLanguageChoices(bool apple_available) {
++  std::vector<std::string> codes = {"hi", "ta", "bn"};
++  if (apple_available) {
++    for (const char* code : {"en", "es", "fr", "de", "it", "pt", "ja", "ko", "zh", "yue"}) {
++      codes.push_back(code);
++    }
++  }
++  return codes;
++}
++
++std::vector<std::string> ShowInChoices(const tark_captions::ClientLanguage& language) {
++  if (language.state() == tark_captions::ClientLanguage::State::kApple) {
++    return {""};
++  }
++  std::vector<std::string> codes;
++  for (const char* code : {"", "latn", "hi", "ta", "bn"}) {
++    if (code != language.code()) {
++      codes.push_back(code);
++    }
++  }
++  return codes;
++}
++
+ std::u16string LanguageDisplayName(const std::string& code, const std::string& ui_locale) {
+   return l10n_util::GetDisplayNameForLocale(code, ui_locale, /*is_for_ui=*/true);
+ }
+--- a/chrome/browser/ui/views/tark_captions/pill_language.h
++++ b/chrome/browser/ui/views/tark_captions/pill_language.h
+@@ -6,6 +6,7 @@
+ #define CHROME_BROWSER_UI_VIEWS_TARK_CAPTIONS_PILL_LANGUAGE_H_
+ 
+ #include <string>
++#include <vector>
+ 
+ namespace tark_captions {
+ class ClientLanguage;
+@@ -25,13 +26,28 @@
+     kPlanned,       // An Indian language Tark will caption once tested.
+     kUnsupported,   // A language Tark can't caption.
+     kNeedsMacOS26,  // A language macOS 26 captions, on an older Mac.
++    // Translate is on, and the user must add the language in System
++    // Settings for macOS to translate it.
++    kTranslationLanguageMissing,
+   };
+   Chip chip = Chip::kAutoDetect;
+   Notice notice = Notice::kNone;
+   std::string code;  // The language, when there is one.
+ };
+ 
+-PillLanguage DescribeLanguage(const tark_captions::ClientLanguage& language);
++PillLanguage DescribeLanguage(const tark_captions::ClientLanguage& language,
++                              bool translation_missing = false);
++
++// Client speaks, after Auto-detect: Tark's own languages, then macOS 26's.
++std::vector<std::string> ClientLanguageChoices(bool apple_available);
++
++// Show their words in: CaptionChoices codes ("" is the language's own
++// script). macOS's languages are shown in their own script only.
++std::vector<std::string> ShowInChoices(const tark_captions::ClientLanguage& language);
++
++// System Settings › General › Language & Region (Translation Languages).
++inline constexpr char kTranslationSettingsUrl[] =
++    "x-apple.systempreferences:com.apple.Localization-Settings.extension";
+ 
+ // "Swahili" for "sw" in `ui_locale`'s words (ICU), for languages Tark has
+ // no string of its own for.
+--- a/chrome/browser/ui/views/tark_captions/pill_language_unittest.cc
++++ b/chrome/browser/ui/views/tark_captions/pill_language_unittest.cc
+@@ -4,6 +4,9 @@
+ 
+ #include "chrome/browser/ui/views/tark_captions/pill_language.h"
+ 
++#include <string>
++#include <vector>
++
+ #include "components/tark_captions/client_language.h"
+ #include "testing/gtest/include/gtest/gtest.h"
+ 
+@@ -57,4 +60,39 @@
+   EXPECT_EQ(LanguageDisplayName(pill.code, "en"), u"Spanish");
+ }
+ 
++// Client speaks: Auto-detect first, Tark's own languages, then macOS's on
++// macOS 26 (D4 Phase 3).
++TEST(PillLanguageTest, AppleLanguagesListedOnMacOS26) {
++  EXPECT_EQ(ClientLanguageChoices(/*apple_available=*/false),
++            (std::vector<std::string>{"hi", "ta", "bn"}));
++  EXPECT_EQ(ClientLanguageChoices(true),
++            (std::vector<std::string>{"hi", "ta", "bn", "en", "es", "fr", "de", "it", "pt", "ja",
++                                      "ko", "zh", "yue"}));
++}
++
++TEST(PillLanguageTest, ShowInOffersOwnScriptOnlyForApple) {
++  ClientLanguage spanish(/*apple_available=*/true);
++  spanish.Detected("es");
++  EXPECT_EQ(ShowInChoices(spanish), std::vector<std::string>{""});
++  ClientLanguage tamil(true);
++  tamil.Detected("ta");
++  EXPECT_EQ(ShowInChoices(tamil), (std::vector<std::string>{"", "latn", "hi", "bn"}));
++}
++
++TEST(PillLanguageTest, TranslationLanguageMissingOffersSettings) {
++  ClientLanguage spanish(true);
++  spanish.Detected("es");
++  const PillLanguage pill = DescribeLanguage(spanish, /*translation_missing=*/true);
++  EXPECT_EQ(pill.notice, PillLanguage::Notice::kTranslationLanguageMissing);
++  EXPECT_EQ(pill.code, "es");
++  EXPECT_STREQ(kTranslationSettingsUrl,
++               "x-apple.systempreferences:com.apple.Localization-Settings.extension");
++}
++
++TEST(PillLanguageTest, AppleLanguageWithAppleSpeechHasNoNotice) {
++  ClientLanguage spanish(true);
++  spanish.Detected("es");
++  EXPECT_EQ(DescribeLanguage(spanish).notice, PillLanguage::Notice::kNone);
++}
++
+ }  // namespace
+--- a/chrome/browser/ui/webui/settings/tark_contacted_hosts.cc
++++ b/chrome/browser/ui/webui/settings/tark_contacted_hosts.cc
+@@ -40,6 +40,9 @@
+                                   IDS_SETTINGS_TARK_CONNECTS_TITLE);
+   html_source->AddLocalizedString("tarkConnectsIntro",
+                                   IDS_SETTINGS_TARK_CONNECTS_INTRO);
++  // Not a host Tark contacts: macOS itself fetches these (D4 Phase 3).
++  html_source->AddLocalizedString("tarkConnectsAppleLanguages",
++                                  IDS_SETTINGS_TARK_CONNECTS_APPLE_LANGUAGES);
+ }
+ 
+ }  // namespace tark
+--- a/chrome/browser/ui/webui/settings/tark_settings_strings.cc
++++ b/chrome/browser/ui/webui/settings/tark_settings_strings.cc
+@@ -59,6 +59,7 @@
+       {"tarkLiveCaptionsFromEnglishDetail",
+        IDS_SETTINGS_TARK_LIVE_CAPTIONS_FROM_ENGLISH_DETAIL},
+       {"tarkLiveCaptionsLanguageId", IDS_SETTINGS_TARK_LIVE_CAPTIONS_LANGUAGE_ID},
++      {"tarkLiveCaptionsApple", IDS_SETTINGS_TARK_LIVE_CAPTIONS_APPLE},
+       {"tarkLiveCaptionsLanguageIdDetail",
+        IDS_SETTINGS_TARK_LIVE_CAPTIONS_LANGUAGE_ID_DETAIL},
+       {"tarkLiveCaptionsDownload", IDS_SETTINGS_TARK_LIVE_CAPTIONS_DOWNLOAD},
