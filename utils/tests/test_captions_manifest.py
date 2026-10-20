@@ -14,7 +14,7 @@ SCRIPT = os.path.join(REPO, 'utils', 'captions_manifest.py')
 CAPTIONS = ('encoder.int8.onnx', 'ctc_decoder.onnx', 'vocab.json', 'language_masks.json',
             'window.f32', 'mel_fb.f32', 'silero_vad.onnx')
 TRANSLATION = ('encoder.int8.onnx', 'decoder_step.int8.onnx', 'model.SRC', 'dict.SRC.json',
-               'dict.TGT.json', 'config.json', 'LICENSE')
+               'dict.TGT.json', 'config.json', 'LICENSE.txt')
 
 
 def make_models(root):
@@ -32,6 +32,15 @@ def make_models(root):
 
 
 class TestCaptionsManifest(unittest.TestCase):
+    def test_every_published_name_has_an_extension(self):
+        # gettarka.com's CloudFront function serves a path with no extension as
+        # <path>/index.html, so a model file named LICENSE would 404.
+        sys.path.insert(0, os.path.join(REPO, 'utils'))
+        import captions_manifest
+        for _, _, _, paths in captions_manifest.UNITS:
+            for path in paths:
+                self.assertIn('.', os.path.basename(path), path)
+
     def test_manifest_lists_every_file_once(self):
         with tempfile.TemporaryDirectory() as tmp:
             files = make_models(tmp)

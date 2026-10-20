@@ -23,7 +23,7 @@ import sys
 CAPTIONS = ('encoder.int8.onnx', 'ctc_decoder.onnx', 'vocab.json', 'language_masks.json',
             'window.f32', 'mel_fb.f32', 'silero_vad.onnx')
 TRANSLATION = ('encoder.int8.onnx', 'decoder_step.int8.onnx', 'model.SRC', 'dict.SRC.json',
-               'dict.TGT.json', 'config.json', 'LICENSE')
+               'dict.TGT.json', 'config.json', 'LICENSE.txt')
 UNITS = (
     ('kCaptions', 'captions', 'kCaptionsFiles', [p for p in CAPTIONS]),
     ('kToEnglish', 'to_english', 'kToEnglishFiles', [f'it2_indic_en/{n}' for n in TRANSLATION]),

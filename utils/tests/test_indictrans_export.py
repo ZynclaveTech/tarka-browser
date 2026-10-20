@@ -28,7 +28,7 @@ MODELS = os.environ.get('TARK_CAPTIONS_MODELS')
 HAVE_DEPS = all(importlib.util.find_spec(m) for m in
                 ('torch', 'onnxruntime', 'sentencepiece', 'safetensors', 'IndicTransToolkit'))
 FILES = ('encoder.int8.onnx', 'decoder_step.int8.onnx', 'model.SRC', 'dict.SRC.json',
-         'dict.TGT.json', 'config.json', 'LICENSE')
+         'dict.TGT.json', 'config.json', 'LICENSE.txt')
 STAGES = ('id', 'lang', 'caption', 'normalized', 'model_input', 'src_ids', 'out_ids',
           'english_tokens', 'english', 'pivot')
 

@@ -41,7 +41,11 @@ from torch import nn
 
 FLORES = {'hi': 'hin_Deva', 'ta': 'tam_Taml', 'bn': 'ben_Beng', 'en': 'eng_Latn'}
 FOLDERS = {'indic_en': 'it2_indic_en', 'en_indic': 'it2_en_indic'}
-SHIPPED = ('model.SRC', 'dict.SRC.json', 'dict.TGT.json', 'config.json', 'LICENSE')
+# Checkpoint file -> shipped name. Every shipped name has an extension:
+# gettarka.com serves a path without one as <path>/index.html.
+SHIPPED = {'model.SRC': 'model.SRC', 'dict.SRC.json': 'dict.SRC.json',
+           'dict.TGT.json': 'dict.TGT.json', 'config.json': 'config.json',
+           'LICENSE': 'LICENSE.txt'}
 SPECIAL = {'<s>', '<pad>', '</s>', '<unk>'}
 
 
@@ -248,8 +252,8 @@ def export_one(src, out):
     for part in ('encoder', 'decoder_step'):
         quantize_dynamic(str(fp32 / f'{part}.onnx'), str(out / f'{part}.int8.onnx'), weight_type=QuantType.QInt8)
     shutil.rmtree(fp32)
-    for name in SHIPPED:
-        shutil.copy2(src / name, out / name)
+    for name, shipped in SHIPPED.items():
+        shutil.copy2(src / name, out / shipped)
 
 
 def export(indic_en, en_indic, out):

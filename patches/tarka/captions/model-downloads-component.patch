@@ -73,7 +73,7 @@
 +};
 +
 +constexpr ModelFile kToEnglishFiles[] = {
-+    {"it2_indic_en/LICENSE", 1128, "383258420065a19d9fef0daf00d10792d3f8a5ccf783d94a91f5d6755386615b"},
++    {"it2_indic_en/LICENSE.txt", 1128, "383258420065a19d9fef0daf00d10792d3f8a5ccf783d94a91f5d6755386615b"},
 +    {"it2_indic_en/config.json", 1370, "7268e8cc0fb12d2791d5380595eb44039d03a2066c995f99a1bcc9da8d1100a6"},
 +    {"it2_indic_en/decoder_step.int8.onnx", 101029313, "ba982d2e9eff12b7b827f9405c02e1a4f181ae005948a3cafd055c1339265b92"},
 +    {"it2_indic_en/dict.SRC.json", 3391208, "3d3b180702520742dec423a5a7f7b4e3dad399d69e40ca7df294a1567884bed5"},
@@ -83,7 +83,7 @@
 +};
 +
 +constexpr ModelFile kFromEnglishFiles[] = {
-+    {"it2_en_indic/LICENSE", 1128, "383258420065a19d9fef0daf00d10792d3f8a5ccf783d94a91f5d6755386615b"},
++    {"it2_en_indic/LICENSE.txt", 1128, "383258420065a19d9fef0daf00d10792d3f8a5ccf783d94a91f5d6755386615b"},
 +    {"it2_en_indic/config.json", 1371, "1429519f3b36f8bab631ed632b328a3422c19c4225c825dcde27c545746f475e"},
 +    {"it2_en_indic/decoder_step.int8.onnx", 193574336, "6e42edf623acdd332cdfcb86a9ee17dee8da0a8a59e7f4ae6babfc27a599529f"},
 +    {"it2_en_indic/dict.SRC.json", 645314, "c6f65113581422c8777991d3770123c63447fe63dc5f3e8f4187eeff7553a689"},
@@ -181,7 +181,7 @@
 +  EXPECT_EQ(PathsOf(ModelUnit::kCaptions),
 +            (std::set<std::string>{"ctc_decoder.onnx", "encoder.int8.onnx", "language_masks.json",
 +                                   "mel_fb.f32", "silero_vad.onnx", "vocab.json", "window.f32"}));
-+  const std::set<std::string> kTranslation = {"LICENSE", "config.json", "decoder_step.int8.onnx",
++  const std::set<std::string> kTranslation = {"LICENSE.txt", "config.json", "decoder_step.int8.onnx",
 +                                              "dict.SRC.json", "dict.TGT.json",
 +                                              "encoder.int8.onnx", "model.SRC"};
 +  for (const auto& [unit, folder] : {std::pair(ModelUnit::kToEnglish, "it2_indic_en/"),
@@ -332,7 +332,7 @@
 +#endif  // COMPONENTS_TARK_CAPTIONS_CAPTION_MODEL_STORE_H_
 --- /dev/null
 +++ b/components/tark_captions/caption_model_store.cc
-@@ -0,0 +1,357 @@
+@@ -0,0 +1,368 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -362,6 +362,14 @@
 +
 +base::FilePath PathOf(const base::FilePath& dir, const ModelFile& file) {
 +  return dir.AppendASCII(file.path);
++}
++
++// Where a file downloads before its hash is checked: one flat folder that
++// units downloading at the same time share.
++base::FilePath PartialOf(const base::FilePath& dir, const ModelFile& file) {
++  std::string name(file.path);
++  base::ReplaceChars(name, "/", "_", &name);
++  return dir.AppendASCII(kDownloadDir).AppendASCII(name);
 +}
 +
 +base::FilePath MarkerOf(const base::FilePath& dir, const ModelUnitInfo& info) {
@@ -447,6 +455,15 @@
 +      base::DeleteFile(PathOf(dir, file).DirName());
 +    }
 +  }
++}
++
++// Blocking: what a cancelled or failed download leaves, its partial file and
++// the files already in place, goes; other units' downloads are untouched.
++void DiscardUnit(const base::FilePath& dir, const ModelUnitInfo& info) {
++  for (const ModelFile& file : info.files) {
++    base::DeleteFile(PartialOf(dir, file));
++  }
++  DeleteUnit(dir, info);
 +}
 +
 +}  // namespace
@@ -554,12 +571,10 @@
 +  u.loader = network::SimpleURLLoader::Create(std::move(request), annotation_);
 +  u.loader->SetOnDownloadProgressCallback(base::BindRepeating(
 +      &CaptionModelStore::OnProgress, weak_factory_.GetWeakPtr(), unit));
-+  std::string partial(file.path);
-+  base::ReplaceChars(partial, "/", "_", &partial);
 +  u.loader->DownloadToFile(
 +      factory_.get(),
 +      base::BindOnce(&CaptionModelStore::OnFileDownloaded, weak_factory_.GetWeakPtr(), unit),
-+      models_dir_.AppendASCII(kDownloadDir).AppendASCII(partial), file.size);
++      PartialOf(models_dir_, file), file.size);
 +}
 +
 +void CaptionModelStore::OnProgress(ModelUnit unit, uint64_t current) {
@@ -621,11 +636,9 @@
 +  u.loader.reset();
 +  u.status.state = State::kFailed;
 +  u.status.done = 0;
-+  // Observers hear once the partial files are gone.
++  // Observers hear once the unit's files are gone.
 +  files_->PostTaskAndReply(
-+      FROM_HERE,
-+      base::BindOnce(base::IgnoreResult(&base::DeletePathRecursively),
-+                     models_dir_.AppendASCII(kDownloadDir)),
++      FROM_HERE, base::BindOnce(&DiscardUnit, models_dir_, *Info(unit)),
 +      base::BindOnce(&CaptionModelStore::Notify, weak_factory_.GetWeakPtr(), unit));
 +}
 +
@@ -638,11 +651,9 @@
 +  u.loader.reset();
 +  u.status.state = State::kMissing;
 +  u.status.done = 0;
-+  // Observers hear once the partial files are gone.
++  // Observers hear once the unit's files are gone.
 +  files_->PostTaskAndReply(
-+      FROM_HERE,
-+      base::BindOnce(base::IgnoreResult(&base::DeletePathRecursively),
-+                     models_dir_.AppendASCII(kDownloadDir)),
++      FROM_HERE, base::BindOnce(&DiscardUnit, models_dir_, *Info(unit)),
 +      base::BindOnce(&CaptionModelStore::Notify, weak_factory_.GetWeakPtr(), unit));
 +}
 +
@@ -692,7 +703,7 @@
 +}  // namespace tark_captions
 --- /dev/null
 +++ b/components/tark_captions/caption_model_store_unittest.cc
-@@ -0,0 +1,276 @@
+@@ -0,0 +1,321 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -893,6 +904,51 @@
 +  store->Cancel(ModelUnit::kCaptions);
 +  EXPECT_EQ(store->status(ModelUnit::kCaptions).state, State::kMissing);
 +  ASSERT_TRUE(base::test::RunUntil([&] { return DownloadFolderEmpty(); }));
++}
++
++// A cancel after some files are in place leaves none of the unit behind:
++// nothing else could remove them (Remove needs a ready unit).
++TEST_F(CaptionModelStoreTest, CancelRemovesFilesAlreadyInPlace) {
++  auto store = MakeStore();
++  WaitChecked(store.get());
++  factory_.AddResponse(std::string(kBase) + "a.bin", "alpha");
++  store->Download(ModelUnit::kCaptions);
++  ASSERT_TRUE(base::test::RunUntil([&] {
++    return store->status(ModelUnit::kCaptions).done == 5 && factory_.NumPending() == 1;
++  }));
++  EXPECT_EQ(Read("a.bin"), "alpha");
++  store->Cancel(ModelUnit::kCaptions);
++  ASSERT_TRUE(base::test::RunUntil(
++      [&] { return !base::PathExists(dir_.GetPath().AppendASCII("a.bin")); }));
++  EXPECT_FALSE(base::PathExists(dir_.GetPath().AppendASCII("sub")));
++}
++
++// Captions and a translation unit download together when the pill waits for
++// both; cancelling one must not break the other.
++TEST_F(CaptionModelStoreTest, CancellingOneUnitKeepsAnothersDownload) {
++  auto store = MakeStore();
++  WaitChecked(store.get());
++  store->Download(ModelUnit::kCaptions);
++  store->Download(ModelUnit::kToEnglish);
++  ASSERT_TRUE(base::test::RunUntil([&] { return factory_.NumPending() == 2; }));
++  store->Cancel(ModelUnit::kCaptions);
++  env_.RunUntilIdle();
++  Serve(to_english_);
++  ASSERT_TRUE(WaitFor(store.get(), ModelUnit::kToEnglish, State::kReady));
++  EXPECT_EQ(Read("it/c.bin"), "charlie");
++}
++
++TEST_F(CaptionModelStoreTest, OneUnitFailingKeepsAnothersDownload) {
++  auto store = MakeStore();
++  WaitChecked(store.get());
++  store->Download(ModelUnit::kToEnglish);
++  ASSERT_TRUE(base::test::RunUntil([&] { return factory_.NumPending() == 1; }));
++  factory_.AddResponse(std::string(kBase) + "a.bin", "alphz");
++  store->Download(ModelUnit::kCaptions);
++  ASSERT_TRUE(WaitFor(store.get(), ModelUnit::kCaptions, State::kFailed));
++  env_.RunUntilIdle();
++  Serve(to_english_);
++  ASSERT_TRUE(WaitFor(store.get(), ModelUnit::kToEnglish, State::kReady));
 +}
 +
 +TEST_F(CaptionModelStoreTest, LeftoverPartialsIgnored) {
