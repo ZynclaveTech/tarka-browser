@@ -8,7 +8,7 @@
 #
 # about:credits lists what live captions run on: tools/licenses finds a
 # README.chromium (and its LICENSE) in each third_party folder. ONNX Runtime
-# keeps its release's LICENSE; the two models bring theirs.
+# keeps its release's LICENSE; the models and the ported code bring theirs.
 
 _install_captions_credits() {
   local credits="$_root_dir/resources/captions/credits"
@@ -20,4 +20,11 @@ _install_captions_credits() {
     "$third_party/tark_indicconformer/"
   cp "$credits/silero_vad/README.chromium" "$credits/silero_vad/LICENSE" \
     "$third_party/tark_silero_vad/"
+  # Phase 2: the translation model and the MIT code the text steps are
+  # ported from.
+  local name
+  for name in indictrans2 indicnlp indictranstoolkit sacremoses; do
+    mkdir -p "$third_party/tark_$name"
+    cp "$credits/$name/README.chromium" "$credits/$name/LICENSE" "$third_party/tark_$name/"
+  done
 }

@@ -16,6 +16,12 @@ DIRS = {
     'onnxruntime': 'tark_onnxruntime',
     'indicconformer': 'tark_indicconformer',
     'silero_vad': 'tark_silero_vad',
+    # Phase 2: the translation model, and the MIT code Tark's C++ text steps
+    # are ported from.
+    'indictrans2': 'tark_indictrans2',
+    'indicnlp': 'tark_indicnlp',
+    'indictranstoolkit': 'tark_indictranstoolkit',
+    'sacremoses': 'tark_sacremoses',
 }
 FIELDS = ('Name', 'URL', 'Version', 'License', 'License File', 'Shipped')
 
@@ -36,7 +42,7 @@ class TestCaptionsCredits(unittest.TestCase):
             self.assertEqual(fields['Shipped'], 'yes', name)
 
     def test_models_bring_their_licence(self):
-        for name in ('indicconformer', 'silero_vad'):
+        for name in set(DIRS) - {'onnxruntime'}:
             self.assertIn('MIT License', read(os.path.join(CREDITS, name, 'LICENSE')), name)
 
     def test_install_copies_into_third_party(self):

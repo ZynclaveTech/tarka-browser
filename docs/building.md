@@ -412,3 +412,30 @@ unpacked to `build/src/third_party/sparkle` by `dev.sh setup` and
   `build.sh`) puts `README.chromium` and `LICENSE` for ONNX Runtime,
   IndicConformer and Silero VAD under `third_party/`, from
   `resources/captions/credits/`, for about:credits.
+- **Translation (Phase 2):** `utils/indictrans_export.py export INDIC_EN_DIR
+  EN_INDIC_DIR OUT_DIR` turns AI4Bharat's IndicTrans2 distilled 200M
+  checkpoints (MIT) into `it2_indic_en/` and `it2_en_indic/` in the models
+  folder: an int8 ONNX encoder and cached decoder step, the SentencePiece
+  model and vocabularies. It rebuilds the model in plain PyTorch, because
+  AI4Bharat's code needs a transformers release with known vulnerabilities.
+  `golden` writes `resources/captions/testdata/mt_golden.json`: every stage
+  of the Python reference pipeline on 16 real captions. The C++ engine
+  (`components/tark_captions/translation_engine.cc`, with the text steps
+  ported from IndicNLP, IndicTransToolkit and sacremoses in `indic_text.cc`)
+  must match it token for token, pivots included. Indian→Indian goes
+  through English, feeding the English model tokens straight into the
+  second hop.
+- **Where translation runs:** `media.mojom.TarkCaptionTranslator` in the
+  speech utility process (`chrome/services/speech/tark_caption_translator.cc`),
+  bound through `SpeechRecognitionService.BindTarkCaptionTranslator`. Text
+  from call audio is changed (English letters, another script) and
+  translated in the sandbox, never in the browser. The tab helper sends one
+  caption at a time (`RenderQueue`: the newest draft replaces a waiting one;
+  finals all go; results asked with old choices are dropped). "Show their
+  words in" and "Translate to" are remembered in local state
+  (`CaptionChoices`); incognito keeps its changes in memory.
+- **Bench:** `out/Default/tark_captions_bench --translate` (M3 Pro: 0.08 s
+  per caption to English, 0.05 s per draft, 0.18 s Indian→Indian; peak
+  1.12 GB with captions and one direction, 1.47 GB with both).
+  `--romanize` prints the test captions in English letters to review the
+  spellings.
