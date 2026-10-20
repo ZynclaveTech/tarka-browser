@@ -30,7 +30,7 @@ INPUTS = [
     'utils/domain_substitution_skip.txt', 'utils/filter_substitution_list.py',
     'utils/install_branding.py', 'utils/install_xlit.sh', 'downloads-xlit.ini',
     'downloads-tark.ini', 'utils/ublock_key.py', 'resources/ublock/key.txt',
-    'android/adblock/crates.py',
+    'android/adblock/crates.py', 'android/xlit/files.py',
 ]
 GLOBS = ['resources/branding/mark/*', 'resources/fonts/inter-latin*.woff2', 'resources/xlit/**/*',
          'ungoogled-chromium/patches/**/*.patch']

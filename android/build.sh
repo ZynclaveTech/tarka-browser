@@ -169,6 +169,15 @@ else
     source "$_root_dir/utils/install_xlit.sh"
     _install_xlit
   fi
+  # A3: the model and word lists are not in the APK; phones download them
+  # (spec §5). One word-list file per language, and every file's size and
+  # sha256, compiled in, for the download to check against.
+  run python3 "$_root_dir/android/xlit/files.py" build "$_root_dir/resources/xlit/words" \
+    "$_root_dir/resources/xlit/english-common.txt.xz" "$_src_dir/third_party/indicxlit/xlit-model.bin" \
+    "$_src_dir/third_party/indicxlit/android"
+  run mkdir -p "$_src_dir/chrome/browser/tark_xlit"
+  run python3 "$_root_dir/android/xlit/files.py" header "$_src_dir/third_party/indicxlit/android/files.json" \
+    "$_src_dir/chrome/browser/tark_xlit/xlit_files.inc"
   log "every patch applied and Tark's steps done"
   echo "$prep" > "$stamp"
 fi
