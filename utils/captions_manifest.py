@@ -21,7 +21,7 @@ import re
 import sys
 
 CAPTIONS = ('encoder.int8.onnx', 'ctc_decoder.onnx', 'vocab.json', 'language_masks.json',
-            'window.f32', 'mel_fb.f32', 'silero_vad.onnx')
+            'window.f32', 'mel_fb.f32')
 TRANSLATION = ('encoder.int8.onnx', 'decoder_step.int8.onnx', 'model.SRC', 'dict.SRC.json',
                'dict.TGT.json', 'config.json', 'LICENSE.txt')
 UNITS = (
@@ -29,8 +29,11 @@ UNITS = (
     ('kToEnglish', 'to_english', 'kToEnglishFiles', [f'it2_indic_en/{n}' for n in TRANSLATION]),
     ('kFromEnglish', 'from_english', 'kFromEnglishFiles',
      [f'it2_en_indic/{n}' for n in TRANSLATION]),
-    # The spoken-language-ID model (utils/lid_export.py), D4 Phase 3.
-    ('kLanguageId', 'language_id', 'kLanguageIdFiles', ['lid.onnx', 'lid_labels.txt']),
+    # The spoken-language-ID model (utils/lid_export.py), D4 Phase 3, and
+    # Silero VAD, which finds the speech it listens to (and the captions
+    # engine decodes): detection runs before any captions unit is needed.
+    ('kLanguageId', 'language_id', 'kLanguageIdFiles',
+     ['lid.onnx', 'lid_labels.txt', 'silero_vad.onnx']),
 )
 
 

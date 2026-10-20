@@ -398,9 +398,448 @@
 +
 +}  // namespace
 +}  // namespace tark_captions
+--- /dev/null
++++ b/components/tark_captions/language_gate.h
+@@ -0,0 +1,64 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef COMPONENTS_TARK_CAPTIONS_LANGUAGE_GATE_H_
++#define COMPONENTS_TARK_CAPTIONS_LANGUAGE_GATE_H_
++
++#include <memory>
++#include <optional>
++#include <vector>
++
++#include "base/containers/span.h"
++#include "base/files/file_path.h"
++#include "components/tark_captions/detection_policy.h"
++
++namespace tark_captions {
++
++class LanguageDetector;
++class OrtRuntime;
++class Vad;
++
++// The first seconds of a call (D4 Phase 3): listens until the client has
++// spoken for kFirstDecision seconds (kLastDecision when unsure), then says
++// which language it is. Only speech counts (Silero VAD): silence, hold music
++// and noise never decide. What it heard since the speech began is kept so
++// the captions, or the browser's Apple captioner, start from the first word.
++// Use on one sequence.
++class LanguageGate {
++ public:
++  // Null without the language_id unit (lid.onnx, lid_labels.txt,
++  // silero_vad.onnx) or ONNX Runtime.
++  static std::unique_ptr<LanguageGate> Create(const base::FilePath& models_dir,
++                                              const base::FilePath& ort_dylib);
++
++  LanguageGate(const LanguageGate&) = delete;
++  LanguageGate& operator=(const LanguageGate&) = delete;
++  ~LanguageGate();
++
++  // 16 kHz mono call audio. The decision, the one time it is made.
++  std::optional<Detection> AddMono16k(base::span<const float> pcm);
++
++  // The audio since just before the speech began (at most the last 30 s);
++  // empty after it is taken.
++  std::vector<float> TakeHeard();
++  double speech_seconds() const;
++
++ private:
++  LanguageGate(std::unique_ptr<OrtRuntime> runtime,
++               std::unique_ptr<Vad> vad,
++               std::unique_ptr<LanguageDetector> detector);
++
++  std::unique_ptr<OrtRuntime> runtime_;
++  std::unique_ptr<Vad> vad_;
++  std::unique_ptr<LanguageDetector> detector_;
++  std::vector<float> chunk_;    // The next VAD chunk, being filled.
++  std::vector<float> speech_;   // Speech only: what the detector hears.
++  std::vector<float> heard_;    // Everything since the speech began.
++  std::vector<float> preroll_;  // The half second before it began.
++  bool decided_ = false;
++};
++
++}  // namespace tark_captions
++
++#endif  // COMPONENTS_TARK_CAPTIONS_LANGUAGE_GATE_H_
+--- /dev/null
++++ b/components/tark_captions/language_gate.cc
+@@ -0,0 +1,106 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/tark_captions/language_gate.h"
++
++#include <utility>
++
++#include "base/memory/ptr_util.h"
++#include "components/tark_captions/language_detector.h"
++#include "components/tark_captions/mono_resampler.h"
++#include "components/tark_captions/ort_runtime.h"
++#include "components/tark_captions/vad.h"
++
++namespace tark_captions {
++namespace {
++
++constexpr float kSpeechProbability = 0.5f;
++constexpr size_t kPreroll = MonoResampler::kRate / 2;
++constexpr size_t kMaxHeard = 30 * MonoResampler::kRate;
++
++}  // namespace
++
++// static
++std::unique_ptr<LanguageGate> LanguageGate::Create(const base::FilePath& models_dir,
++                                                   const base::FilePath& ort_dylib) {
++  std::unique_ptr<OrtRuntime> runtime = OrtRuntime::Load(ort_dylib);
++  if (!runtime) {
++    return nullptr;
++  }
++  std::unique_ptr<Vad> vad = Vad::Load(runtime.get(), models_dir);
++  std::unique_ptr<LanguageDetector> detector = LanguageDetector::Load(runtime.get(), models_dir);
++  if (!vad || !detector) {
++    return nullptr;
++  }
++  return base::WrapUnique(
++      new LanguageGate(std::move(runtime), std::move(vad), std::move(detector)));
++}
++
++LanguageGate::LanguageGate(std::unique_ptr<OrtRuntime> runtime,
++                           std::unique_ptr<Vad> vad,
++                           std::unique_ptr<LanguageDetector> detector)
++    : runtime_(std::move(runtime)), vad_(std::move(vad)), detector_(std::move(detector)) {}
++
++// The models go before the runtime that made them.
++LanguageGate::~LanguageGate() {
++  detector_.reset();
++  vad_.reset();
++}
++
++std::optional<Detection> LanguageGate::AddMono16k(base::span<const float> pcm) {
++  if (decided_) {
++    return std::nullopt;
++  }
++  std::optional<Detection> decision;
++  for (float sample : pcm) {
++    chunk_.push_back(sample);
++    if (chunk_.size() < Vad::kChunk) {
++      continue;
++    }
++    const bool speech = vad_->Process(base::span(chunk_).first<Vad::kChunk>()) >= kSpeechProbability;
++    if (heard_.empty() && !speech) {
++      preroll_.insert(preroll_.end(), chunk_.begin(), chunk_.end());
++      if (preroll_.size() > kPreroll) {
++        preroll_.erase(preroll_.begin(), preroll_.end() - kPreroll);
++      }
++    } else {
++      if (heard_.empty()) {
++        heard_ = std::move(preroll_);
++        preroll_.clear();
++      }
++      heard_.insert(heard_.end(), chunk_.begin(), chunk_.end());
++      if (heard_.size() > kMaxHeard) {
++        heard_.erase(heard_.begin(), heard_.end() - kMaxHeard);
++      }
++    }
++    chunk_.clear();
++    if (!speech || decision) {
++      continue;
++    }
++    const double before = speech_seconds();
++    speech_.insert(speech_.end(), heard_.end() - Vad::kChunk, heard_.end());
++    const double now = speech_seconds();
++    // Decide when the speech crosses 3 s, and again at 5 s if unsure.
++    for (double at : {kFirstDecision, kLastDecision}) {
++      if (before < at && now >= at) {
++        Detection d = DecideLanguage(detector_->Logits(speech_), detector_->labels(), now);
++        if (d.kind != Detection::Kind::kUnsure) {
++          decision = std::move(d);
++          decided_ = true;
++        }
++      }
++    }
++  }
++  return decision;
++}
++
++std::vector<float> LanguageGate::TakeHeard() {
++  return std::exchange(heard_, {});
++}
++
++double LanguageGate::speech_seconds() const {
++  return static_cast<double>(speech_.size()) / MonoResampler::kRate;
++}
++
++}  // namespace tark_captions
+--- /dev/null
++++ b/components/tark_captions/language_gate_unittest.cc
+@@ -0,0 +1,88 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/tark_captions/language_gate.h"
++
++#include <memory>
++#include <optional>
++#include <string>
++#include <vector>
++
++#include "base/rand_util.h"
++#include "components/tark_captions/test_util.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace tark_captions {
++namespace {
++
++class LanguageGateTest : public testing::Test {
++ protected:
++  void SetUp() override {
++    ort_ = test::OrtPath();
++    models_ = test::ModelsDir();
++    testdata_ = test::TestDataDir();
++    if (!ort_ || !models_ || !testdata_) {
++      GTEST_SKIP() << "set TARK_CAPTIONS_ORT, TARK_CAPTIONS_MODELS and TARK_CAPTIONS_TESTDATA";
++    }
++    gate_ = LanguageGate::Create(*models_, *ort_);
++    ASSERT_TRUE(gate_);
++  }
++
++  // Feeds `pcm` in 10 ms blocks; the first decision, if any.
++  std::optional<Detection> Feed(const std::vector<float>& pcm) {
++    std::optional<Detection> first;
++    for (size_t i = 0; i < pcm.size(); i += 160) {
++      std::optional<Detection> d =
++          gate_->AddMono16k(base::span(pcm).subspan(i, std::min<size_t>(160, pcm.size() - i)));
++      if (d && !first) {
++        first = d;
++      }
++    }
++    return first;
++  }
++
++  std::vector<float> Clip(const std::string& name) {
++    int rate = 0;
++    std::vector<float> pcm = test::ReadWav(testdata_->AppendASCII(name), &rate);
++    EXPECT_EQ(rate, 16000);
++    return pcm;
++  }
++
++  std::optional<base::FilePath> ort_, models_, testdata_;
++  std::unique_ptr<LanguageGate> gate_;
++};
++
++TEST_F(LanguageGateTest, DecidesSpanishAndKeepsWhatItHeard) {
++  std::optional<Detection> d = Feed(Clip("lid/es_1.wav"));
++  ASSERT_TRUE(d);
++  EXPECT_EQ(d->kind, Detection::Kind::kApple);
++  EXPECT_EQ(d->code, "es");
++  EXPECT_GE(gate_->TakeHeard().size(), 3u * 16000);
++  EXPECT_TRUE(gate_->TakeHeard().empty());
++}
++
++TEST_F(LanguageGateTest, DecidesOnce) {
++  std::vector<float> pcm = Clip("lid/hi_1.wav");
++  ASSERT_TRUE(Feed(pcm));
++  EXPECT_FALSE(Feed(pcm));
++}
++
++TEST_F(LanguageGateTest, SilenceAndNoiseNeverDecide) {
++  std::vector<float> pcm(10 * 16000, 0.0f);
++  float last = 0;
++  for (int i = 0; i < 10 * 16000; ++i) {
++    // Low-passed white noise, roughly pink.
++    last = 0.95f * last + 0.05f * static_cast<float>(base::RandDouble() * 2 - 1);
++    pcm.push_back(last * 2);
++  }
++  EXPECT_FALSE(Feed(pcm));
++  EXPECT_LT(gate_->speech_seconds(), kFirstDecision);
++}
++
++TEST_F(LanguageGateTest, MissingDetectorIsNull) {
++  EXPECT_FALSE(LanguageGate::Create(base::FilePath("/nonexistent"), *ort_));
++}
++
++}  // namespace
++}  // namespace tark_captions
+--- /dev/null
++++ b/components/tark_captions/mono_resampler.h
+@@ -0,0 +1,45 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef COMPONENTS_TARK_CAPTIONS_MONO_RESAMPLER_H_
++#define COMPONENTS_TARK_CAPTIONS_MONO_RESAMPLER_H_
++
++#include <memory>
++#include <vector>
++
++#include "base/containers/span.h"
++
++namespace media {
++class SincResampler;
++}
++
++namespace tark_captions {
++
++// Call audio as the models want it: channels averaged to mono, resampled to
++// 16 kHz. Keeps the resampler's state between calls, so feed one stream.
++class MonoResampler {
++ public:
++  static constexpr int kRate = 16000;
++
++  MonoResampler();
++  MonoResampler(const MonoResampler&) = delete;
++  MonoResampler& operator=(const MonoResampler&) = delete;
++  ~MonoResampler();
++
++  // Appends `interleaved` (`channels` >= 1, `sample_rate` >= 8 kHz) to `out`
++  // as 16 kHz mono; anything else is ignored.
++  void Add(base::span<const float> interleaved,
++           int channels,
++           int sample_rate,
++           std::vector<float>* out);
++
++ private:
++  int input_rate_ = kRate;
++  std::unique_ptr<media::SincResampler> resampler_;
++  std::vector<float> fifo_;  // Mono input waiting for the resampler.
++};
++
++}  // namespace tark_captions
++
++#endif  // COMPONENTS_TARK_CAPTIONS_MONO_RESAMPLER_H_
+--- /dev/null
++++ b/components/tark_captions/mono_resampler.cc
+@@ -0,0 +1,59 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/tark_captions/mono_resampler.h"
++
++#include <algorithm>
++
++#include "base/functional/bind.h"
++#include "media/base/sinc_resampler.h"
++
++namespace tark_captions {
++
++MonoResampler::MonoResampler() = default;
++MonoResampler::~MonoResampler() = default;
++
++void MonoResampler::Add(base::span<const float> interleaved,
++                        int channels,
++                        int sample_rate,
++                        std::vector<float>* out) {
++  if (channels < 1 || sample_rate < 8000) {
++    return;
++  }
++  std::vector<float> mono(interleaved.size() / channels);
++  for (size_t i = 0; i < mono.size(); ++i) {
++    float sum = 0;
++    for (int c = 0; c < channels; ++c) {
++      sum += interleaved[i * channels + c];
++    }
++    mono[i] = sum / channels;
++  }
++  if (sample_rate == kRate) {
++    out->insert(out->end(), mono.begin(), mono.end());
++    return;
++  }
++  if (!resampler_ || sample_rate != input_rate_) {
++    input_rate_ = sample_rate;
++    fifo_.clear();
++    resampler_ = std::make_unique<media::SincResampler>(
++        static_cast<double>(sample_rate) / kRate, media::SincResampler::kDefaultRequestSize,
++        base::BindRepeating(
++            [](std::vector<float>* fifo, base::span<float> dest) {
++              const size_t n = std::min(dest.size(), fifo->size());
++              std::copy_n(fifo->begin(), n, dest.begin());
++              std::fill(dest.begin() + n, dest.end(), 0.0f);
++              fifo->erase(fifo->begin(), fifo->begin() + n);
++            },
++            base::Unretained(&fifo_)));
++    resampler_->PrimeWithSilence();
++  }
++  fifo_.insert(fifo_.end(), mono.begin(), mono.end());
++  std::vector<float> chunk(resampler_->ChunkSize());
++  while (fifo_.size() >= static_cast<size_t>(media::SincResampler::kDefaultRequestSize)) {
++    resampler_->Resample(chunk);
++    out->insert(out->end(), chunk.begin(), chunk.end());
++  }
++}
++
++}  // namespace tark_captions
+--- /dev/null
++++ b/components/tark_captions/mono_resampler_unittest.cc
+@@ -0,0 +1,59 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/tark_captions/mono_resampler.h"
++
++#include <cmath>
++#include <vector>
++
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace tark_captions {
++namespace {
++
++TEST(MonoResamplerTest, SixteenKilohertzMonoPassesThrough) {
++  MonoResampler resampler;
++  std::vector<float> in = {0.1f, -0.2f, 0.3f};
++  std::vector<float> out;
++  resampler.Add(in, 1, 16000, &out);
++  EXPECT_EQ(out, in);
++}
++
++TEST(MonoResamplerTest, StereoIsAveraged) {
++  MonoResampler resampler;
++  std::vector<float> out;
++  resampler.Add(std::vector<float>{0.2f, 0.4f, -1.0f, 1.0f}, 2, 16000, &out);
++  ASSERT_EQ(out.size(), 2u);
++  EXPECT_FLOAT_EQ(out[0], 0.3f);
++  EXPECT_FLOAT_EQ(out[1], 0.0f);
++}
++
++// One second of a 440 Hz tone at 48 kHz stereo comes out as about one second
++// at 16 kHz (less what the resampler holds back).
++TEST(MonoResamplerTest, FortyEightKilohertzStereoBecomesSixteen) {
++  MonoResampler resampler;
++  std::vector<float> in;
++  for (int i = 0; i < 48000; ++i) {
++    const float s = 0.5f * std::sin(2 * M_PI * 440 * i / 48000.0);
++    in.push_back(s);
++    in.push_back(s);
++  }
++  std::vector<float> out;
++  for (size_t i = 0; i < in.size(); i += 960) {
++    resampler.Add(base::span(in).subspan(i, 960u), 2, 48000, &out);
++  }
++  EXPECT_GT(out.size(), 15000u);
++  EXPECT_LE(out.size(), 16000u);
++}
++
++TEST(MonoResamplerTest, BadInputIsIgnored) {
++  MonoResampler resampler;
++  std::vector<float> out;
++  resampler.Add(std::vector<float>{0.1f}, 0, 16000, &out);
++  resampler.Add(std::vector<float>{0.1f}, 1, 4000, &out);
++  EXPECT_TRUE(out.empty());
++}
++
++}  // namespace
++}  // namespace tark_captions
 --- a/components/tark_captions/BUILD.gn
 +++ b/components/tark_captions/BUILD.gn
-@@ -23,8 +23,12 @@
+@@ -23,13 +23,21 @@
      "caption_model_store.h",
      "caption_text.cc",
      "caption_text.h",
@@ -410,19 +849,141 @@
      "indic_text.h",
 +    "language_detector.cc",
 +    "language_detector.h",
++    "language_gate.cc",
++    "language_gate.h",
      "mel_frontend.cc",
      "mel_frontend.h",
      "model_manifest.cc",
-@@ -78,7 +82,9 @@
+     "model_manifest.h",
+     "model_units.cc",
++    "mono_resampler.cc",
++    "mono_resampler.h",
+     "ort_runtime.cc",
+     "ort_runtime.h",
+     "render_queue.cc",
+@@ -78,9 +86,13 @@
      "caption_engine_unittest.cc",
      "caption_model_store_unittest.cc",
      "caption_text_unittest.cc",
 +    "detection_policy_unittest.cc",
      "indic_text_unittest.cc",
 +    "language_detector_unittest.cc",
++    "language_gate_unittest.cc",
      "mel_frontend_unittest.cc",
      "model_manifest_unittest.cc",
++    "mono_resampler_unittest.cc",
      "ort_runtime_unittest.cc",
+     "render_queue_unittest.cc",
+     "romanize_unittest.cc",
+--- a/components/tark_captions/caption_engine.cc
++++ b/components/tark_captions/caption_engine.cc
+@@ -16,7 +16,6 @@
+ #include "components/tark_captions/ort_runtime.h"
+ #include "components/tark_captions/segmenter.h"
+ #include "components/tark_captions/vad.h"
+-#include "media/base/sinc_resampler.h"
+ 
+ namespace tark_captions {
+ namespace {
+@@ -146,41 +145,10 @@
+ 
+ void CaptionEngine::AddAudio(base::span<const float> interleaved, int channels, int sample_rate,
+                              const EventCallback& on_event) {
+-  if (channels < 1 || sample_rate < 8000) {
+-    return;
+-  }
+-  std::vector<float> mono(interleaved.size() / channels);
+-  for (size_t i = 0; i < mono.size(); ++i) {
+-    float sum = 0;
+-    for (int c = 0; c < channels; ++c) {
+-      sum += interleaved[i * channels + c];
+-    }
+-    mono[i] = sum / channels;
+-  }
+-  if (sample_rate == kRate) {
+-    AddMono16k(mono, on_event);
+-    return;
+-  }
+-  if (!resampler_ || sample_rate != input_rate_) {
+-    input_rate_ = sample_rate;
+-    fifo_.clear();
+-    resampler_ = std::make_unique<media::SincResampler>(
+-        static_cast<double>(sample_rate) / kRate, media::SincResampler::kDefaultRequestSize,
+-        base::BindRepeating(
+-            [](std::vector<float>* fifo, base::span<float> dest) {
+-              const size_t n = std::min(dest.size(), fifo->size());
+-              std::copy_n(fifo->begin(), n, dest.begin());
+-              std::fill(dest.begin() + n, dest.end(), 0.0f);
+-              fifo->erase(fifo->begin(), fifo->begin() + n);
+-            },
+-            base::Unretained(&fifo_)));
+-    resampler_->PrimeWithSilence();
+-  }
+-  fifo_.insert(fifo_.end(), mono.begin(), mono.end());
+-  std::vector<float> out(resampler_->ChunkSize());
+-  while (fifo_.size() >= static_cast<size_t>(media::SincResampler::kDefaultRequestSize)) {
+-    resampler_->Resample(out);
+-    AddMono16k(out, on_event);
++  std::vector<float> mono16k;
++  resampler_.Add(interleaved, channels, sample_rate, &mono16k);
++  if (!mono16k.empty()) {
++    AddMono16k(mono16k, on_event);
+   }
+ }
+ 
+--- a/components/tark_captions/caption_engine.h
++++ b/components/tark_captions/caption_engine.h
+@@ -15,10 +15,7 @@
+ #include "base/functional/callback.h"
+ #include "base/memory/raw_ptr.h"
+ #include "components/tark_captions/asr_model.h"
+-
+-namespace media {
+-class SincResampler;
+-}
++#include "components/tark_captions/mono_resampler.h"
+ 
+ namespace tark_captions {
+ 
+@@ -86,9 +83,7 @@
+   int64_t total_ = 0;
+   std::vector<float> chunk_;  // the next VAD chunk, being filled
+ 
+-  int input_rate_ = 16000;
+-  std::unique_ptr<media::SincResampler> resampler_;
+-  std::vector<float> fifo_;  // mono input waiting for the resampler
++  MonoResampler resampler_;
+ 
+   Stats stats_;
+ };
+--- a/components/tark_captions/model_manifest.cc
++++ b/components/tark_captions/model_manifest.cc
+@@ -15,7 +15,6 @@
+     {"encoder.int8.onnx", 652623111, "2c6804fa6bc7c8b7326f0aefa78fd26699412032d882a898542f95a51b52dfa0"},
+     {"language_masks.json", 862011, "de02a9384ef897b7f97cd416d7f27238e0cb9bf252c56e4a34db562eccf75a63"},
+     {"mel_fb.f32", 82240, "9d90b10b095f8eeddbd9366a4b341867bc04cecbb8486637e653fdabe86e0598"},
+-    {"silero_vad.onnx", 2327524, "1a153a22f4509e292a94e67d6f9b85e8deb25b4988682b7e174c65279d8788e3"},
+     {"vocab.json", 96743, "eda380b3ba4507cb0850b6d0666298babe07eaf3f299b2d08f91db4b491a59bf"},
+     {"window.f32", 1600, "744788a137aa808ccc97d9d3c185c649b2e9c2b99c3262887c3ac9bb3b7e1c4c"},
+ };
+@@ -40,10 +39,17 @@
+     {"it2_en_indic/model.SRC", 759425, "3cedc5cbcc740369b76201942a0f096fec7287fee039b55bdb956f301235b914"},
+ };
+ 
++constexpr ModelFile kLanguageIdFiles[] = {
++    {"lid.onnx", 86063323, "7cfabee2653ac9d6e80f9f766514dedb0983fc6cd6e078b499fc6d644164f0a4"},
++    {"lid_labels.txt", 325, "ce47fc9a94ffb272516546e879f9c132cc95863a1d26864fbed05ef95980773a"},
++    {"silero_vad.onnx", 2327524, "1a153a22f4509e292a94e67d6f9b85e8deb25b4988682b7e174c65279d8788e3"},
++};
++
+ constexpr ModelUnitInfo kUnits[] = {
+     {ModelUnit::kCaptions, "captions", kCaptionsFiles},
+     {ModelUnit::kToEnglish, "to_english", kToEnglishFiles},
+     {ModelUnit::kFromEnglish, "from_english", kFromEnglishFiles},
++    {ModelUnit::kLanguageId, "language_id", kLanguageIdFiles},
+ };
+ 
+ }  // namespace
 --- a/components/tark_captions/model_manifest.h
 +++ b/components/tark_captions/model_manifest.h
 @@ -16,7 +16,7 @@
@@ -434,36 +995,37 @@
  
  // One file of a unit: its path in the models folder, size and SHA-256
  // (lowercase hex). Tark uses a file only when both match.
---- a/components/tark_captions/model_manifest.cc
-+++ b/components/tark_captions/model_manifest.cc
-@@ -40,10 +40,16 @@
-     {"it2_en_indic/model.SRC", 759425, "3cedc5cbcc740369b76201942a0f096fec7287fee039b55bdb956f301235b914"},
- };
- 
-+constexpr ModelFile kLanguageIdFiles[] = {
-+    {"lid.onnx", 86063323, "7cfabee2653ac9d6e80f9f766514dedb0983fc6cd6e078b499fc6d644164f0a4"},
-+    {"lid_labels.txt", 325, "ce47fc9a94ffb272516546e879f9c132cc95863a1d26864fbed05ef95980773a"},
-+};
-+
- constexpr ModelUnitInfo kUnits[] = {
-     {ModelUnit::kCaptions, "captions", kCaptionsFiles},
-     {ModelUnit::kToEnglish, "to_english", kToEnglishFiles},
-     {ModelUnit::kFromEnglish, "from_english", kFromEnglishFiles},
-+    {ModelUnit::kLanguageId, "language_id", kLanguageIdFiles},
- };
- 
- }  // namespace
 --- a/components/tark_captions/model_manifest_unittest.cc
 +++ b/components/tark_captions/model_manifest_unittest.cc
+@@ -37,7 +37,7 @@
+ TEST(ModelManifestTest, UnitsCoverTheEngineFiles) {
+   EXPECT_EQ(PathsOf(ModelUnit::kCaptions),
+             (std::set<std::string>{"ctc_decoder.onnx", "encoder.int8.onnx", "language_masks.json",
+-                                   "mel_fb.f32", "silero_vad.onnx", "vocab.json", "window.f32"}));
++                                   "mel_fb.f32", "vocab.json", "window.f32"}));
+   const std::set<std::string> kTranslation = {"LICENSE.txt", "config.json", "decoder_step.int8.onnx",
+                                               "dict.SRC.json", "dict.TGT.json",
+                                               "encoder.int8.onnx", "model.SRC"};
 @@ -49,6 +49,8 @@
      }
      EXPECT_EQ(PathsOf(unit), expected);
    }
 +  EXPECT_EQ(PathsOf(ModelUnit::kLanguageId),
-+            (std::set<std::string>{"lid.onnx", "lid_labels.txt"}));
++            (std::set<std::string>{"lid.onnx", "lid_labels.txt", "silero_vad.onnx"}));
    for (const ModelUnitInfo& info : ModelManifest()) {
      for (const ModelFile& file : info.files) {
        EXPECT_EQ(std::string(file.sha256).size(), 64u) << file.path;
+--- a/components/tark_captions/test_util.cc
++++ b/components/tark_captions/test_util.cc
+@@ -108,4 +108,8 @@
+   return ReadList(testdata.Append("mt_golden.json"), "cases");
+ }
+ 
++base::ListValue LidGoldenCases(const base::FilePath& testdata) {
++  return ReadList(testdata.Append("lid_golden.json"), "cases");
++}
++
+ }  // namespace tark_captions::test
 --- a/components/tark_captions/test_util.h
 +++ b/components/tark_captions/test_util.h
 @@ -29,6 +29,9 @@
@@ -476,14 +1038,3 @@
  
  }  // namespace tark_captions::test
  
---- a/components/tark_captions/test_util.cc
-+++ b/components/tark_captions/test_util.cc
-@@ -108,4 +108,8 @@
-   return ReadList(testdata.Append("mt_golden.json"), "cases");
- }
- 
-+base::ListValue LidGoldenCases(const base::FilePath& testdata) {
-+  return ReadList(testdata.Append("lid_golden.json"), "cases");
-+}
-+
- }  // namespace tark_captions::test

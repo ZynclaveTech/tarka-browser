@@ -12,12 +12,12 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
 SCRIPT = os.path.join(REPO, 'utils', 'captions_manifest.py')
 CAPTIONS = ('encoder.int8.onnx', 'ctc_decoder.onnx', 'vocab.json', 'language_masks.json',
-            'window.f32', 'mel_fb.f32', 'silero_vad.onnx')
+            'window.f32', 'mel_fb.f32')
 TRANSLATION = ('encoder.int8.onnx', 'decoder_step.int8.onnx', 'model.SRC', 'dict.SRC.json',
                'dict.TGT.json', 'config.json', 'LICENSE.txt')
 
 
-LANGUAGE_ID = ('lid.onnx', 'lid_labels.txt')
+LANGUAGE_ID = ('lid.onnx', 'lid_labels.txt', 'silero_vad.onnx')
 
 
 def make_models(root):
@@ -63,7 +63,7 @@ class TestCaptionsManifest(unittest.TestCase):
         sys.path.insert(0, os.path.join(REPO, 'utils'))
         import captions_manifest
         units = {unit_id: paths for _, unit_id, _, paths in captions_manifest.UNITS}
-        self.assertEqual(units['language_id'], ['lid.onnx', 'lid_labels.txt'])
+        self.assertEqual(units['language_id'], ['lid.onnx', 'lid_labels.txt', 'silero_vad.onnx'])
 
     def test_check_finds_a_changed_file(self):
         with tempfile.TemporaryDirectory() as tmp:
