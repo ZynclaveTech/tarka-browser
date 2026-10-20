@@ -317,6 +317,25 @@ class TestDividers(unittest.TestCase):
                '</hierarchy>')
         self.assertEqual(walk_settings.list_items(xml), [(0, 10, 200, 50), (0, 50, 200, 90)])
 
+    def test_radio_options_are_rows_too(self):
+        # A choice (Address bar: Top, Bottom) is one list row holding a
+        # RadioGroup; its options are what a person sees as rows.
+        xml = ('<hierarchy><node class="androidx.recyclerview.widget.RecyclerView" bounds="[0,0][200,300]">'
+               '<node class="android.widget.LinearLayout" bounds="[0,0][200,40]"/>'
+               '<node class="android.widget.FrameLayout" bounds="[0,40][200,140]">'
+               '<node class="android.widget.RadioGroup" bounds="[0,40][200,140]">'
+               '<node class="android.widget.RelativeLayout" bounds="[0,40][200,90]"/>'
+               '<node class="android.widget.RelativeLayout" bounds="[0,91][200,140]"/>'
+               '</node></node></node></hierarchy>')
+        self.assertEqual(walk_settings.list_items(xml),
+                         [(0, 0, 200, 40), (0, 40, 200, 90), (0, 91, 200, 140)])
+
+    def test_a_divider_across_a_wider_gap_is_found(self):
+        # Secure DNS: a 24 px gap between the switch and the choice below it.
+        items = [(0, 0, 200, 40), (0, 64, 200, 104)]
+        img = walk_settings.parse_screencap(_image(200, 110, [(40, 16, 200), (41, 16, 200), (42, 16, 200)]))
+        self.assertTrue(walk_settings.screen_has_dividers(img, items))
+
     def test_dividers_forced_where_settings_reads_them(self):
         patch = (ANDROID / 'patches' / 'look-settings-dividers.patch').read_text()
         self.assertIn('+++ b/chrome/android/java/src/org/chromium/chrome/browser/settings/WideDisplayPadding.java', patch)
@@ -326,6 +345,16 @@ class TestDividers(unittest.TestCase):
         self.assertIn('\nlook-settings-dividers.patch\n', series)
 
     def test_no_fragment_override_patched(self):
-        # One place decides; the screens' own hasDivider() stay as they are.
+        # One place decides for the lists; the screens' own hasDivider() stay
+        # as they are. Radio options and the search engines' own list are the
+        # other two places.
         patch = (ANDROID / 'patches' / 'look-settings-dividers.patch').read_text()
-        self.assertEqual(patch.count('+++ b/'), 1)
+        files = sorted(l[6:] for l in patch.splitlines() if l.startswith('+++ b/'))
+        self.assertEqual(sorted(f.rsplit('/', 1)[1] for f in files),
+                         ['PreferenceListRecyclerView.java', 'RadioButtonWithDescriptionLayout.java', 'WideDisplayPadding.java'])
+
+    def test_radio_options_and_engines_get_the_hairline(self):
+        patch = (ANDROID / 'patches' / 'look-settings-dividers.patch').read_text()
+        self.assertIn('+        setShowDividers(SHOW_DIVIDER_MIDDLE);', patch)
+        self.assertEqual(patch.count('R.color.divider_color'), 2)
+        self.assertIn('-        private static final int[] ATTRS = new int[] {android.R.attr.listDivider};', patch)

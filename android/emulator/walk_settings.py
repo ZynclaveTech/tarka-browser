@@ -106,15 +106,21 @@ def has_hairline(img, y_from, y_to, x_from, x_to):
 
 def list_items(xml):
     """The bounds (x1, y1, x2, y2) of the settings list's rows, top to bottom:
-    the children of the screen's RecyclerView. Screens behind the one shown
+    the children of the screen's list (RecyclerView or ListView), with a
+    choice's radio options as rows of their own. Screens behind the one shown
     keep their lists in the tree, earlier; the last list is the one shown."""
     bounds = re.compile(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]')
+    box = lambda node: tuple(map(int, bounds.match(node.get('bounds')).groups()))
     lists = [node for node in ET.fromstring(xml).iter('node')
-             if node.get('class', '').endswith('RecyclerView')]
+             if node.get('class', '').endswith(('RecyclerView', 'ListView'))]
     if not lists:
         return []
-    return [tuple(map(int, bounds.match(child.get('bounds')).groups()))
-            for child in lists[-1].findall('node')]
+    rows = []
+    for child in lists[-1].findall('node'):
+        group = next((n for n in child.iter('node') if n.get('class', '').endswith('RadioGroup')), None)
+        options = group.findall('node') if group is not None else []
+        rows += [box(o) for o in options] if len(options) >= 2 else [box(child)]
+    return rows
 
 
 def screen_has_dividers(img, items):
@@ -122,7 +128,7 @@ def screen_has_dividers(img, items):
     neighbouring rows, at the edge of the rows or in the few pixels between
     them (category headers legitimately have none)."""
     for a, b in zip(items, items[1:]):
-        if not -2 <= b[1] - a[3] <= 12:
+        if not -2 <= b[1] - a[3] <= 32:
             continue
         inset = (a[2] - a[0]) // 5
         if has_hairline(img, a[3] - 3, b[1] + 2, a[0] + inset, a[2] - inset):
