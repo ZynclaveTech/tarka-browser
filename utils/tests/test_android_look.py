@@ -228,3 +228,24 @@ class TestSettings(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TestConnects(unittest.TestCase):
+    """The Mac's "What Tark connects to" on Android (spec §5.3)."""
+
+    def setUp(self):
+        self.p = (REPO / 'android' / 'patches' / 'look-connects.patch').read_text()
+
+    def test_in_the_series(self):
+        self.assertIn('look-connects.patch', (REPO / 'android' / 'patches' / 'series').read_text().split())
+
+    def test_every_host_android_contacts_is_named(self):
+        hosts = [l.strip() for l in (REPO / 'android' / 'allowed_hosts.txt').read_text().splitlines()
+                 if l.strip() and not l.startswith('#')]
+        english = ''.join(l for l in self.p.splitlines() if l.startswith('+        '))
+        for host in hosts:
+            self.assertIn(host, english, host)
+
+    def test_english_and_hindi(self):
+        for fp in ('7144670775258466422', '5542059870322282057', '3441881045024360042', '4695926840610114405'):
+            self.assertIn(f'+<translation id="{fp}">', self.p)
