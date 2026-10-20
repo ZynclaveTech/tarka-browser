@@ -23,7 +23,8 @@ _install_captions_credits() {
   # Phase 2: the translation model and the MIT code the text steps are
   # ported from.
   local name
-  for name in indictrans2 indicnlp indictranstoolkit sacremoses; do
+  # Phase 3: the spoken-language-ID model.
+  for name in indictrans2 indicnlp indictranstoolkit sacremoses voxlingua_ecapa; do
     mkdir -p "$third_party/tark_$name"
     cp "$credits/$name/README.chromium" "$credits/$name/LICENSE" "$third_party/tark_$name/"
   done

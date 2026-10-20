@@ -22,7 +22,12 @@ DIRS = {
     'indicnlp': 'tark_indicnlp',
     'indictranstoolkit': 'tark_indictranstoolkit',
     'sacremoses': 'tark_sacremoses',
+    # Phase 3: the spoken-language-ID model.
+    'voxlingua_ecapa': 'tark_voxlingua_ecapa',
 }
+# Licence of each, when not MIT, and the words its LICENSE text starts with.
+LICENCES = {'voxlingua_ecapa': 'Apache-2.0'}
+LICENCE_TEXT = {'MIT': 'MIT License', 'Apache-2.0': 'Apache License'}
 FIELDS = ('Name', 'URL', 'Version', 'License', 'License File', 'Shipped')
 
 
@@ -38,12 +43,13 @@ class TestCaptionsCredits(unittest.TestCase):
             fields = dict(re.findall(r'^([A-Za-z ]+): (.+)$', readme, re.M))
             for field in FIELDS:
                 self.assertIn(field, fields, (name, field))
-            self.assertEqual(fields['License'], 'MIT', name)
+            self.assertEqual(fields['License'], LICENCES.get(name, 'MIT'), name)
             self.assertEqual(fields['Shipped'], 'yes', name)
 
     def test_models_bring_their_licence(self):
         for name in set(DIRS) - {'onnxruntime'}:
-            self.assertIn('MIT License', read(os.path.join(CREDITS, name, 'LICENSE')), name)
+            self.assertIn(LICENCE_TEXT[LICENCES.get(name, 'MIT')],
+                          read(os.path.join(CREDITS, name, 'LICENSE')), name)
 
     def test_install_copies_into_third_party(self):
         with tempfile.TemporaryDirectory() as tmp:

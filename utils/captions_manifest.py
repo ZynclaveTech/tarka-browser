@@ -29,6 +29,8 @@ UNITS = (
     ('kToEnglish', 'to_english', 'kToEnglishFiles', [f'it2_indic_en/{n}' for n in TRANSLATION]),
     ('kFromEnglish', 'from_english', 'kFromEnglishFiles',
      [f'it2_en_indic/{n}' for n in TRANSLATION]),
+    # The spoken-language-ID model (utils/lid_export.py), D4 Phase 3.
+    ('kLanguageId', 'language_id', 'kLanguageIdFiles', ['lid.onnx', 'lid_labels.txt']),
 )
 
 
