@@ -1,0 +1,666 @@
+--- /dev/null
++++ b/chrome/browser/tark_captions/caption_models.h
+@@ -0,0 +1,22 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_TARK_CAPTIONS_CAPTION_MODELS_H_
++#define CHROME_BROWSER_TARK_CAPTIONS_CAPTION_MODELS_H_
++
++#include "components/tark_captions/caption_model_store.h"
++
++namespace tark_captions {
++
++// Tark (D4 Phase 4): the live captions models on this Mac, for every
++// profile (the browser UI thread only). Downloads come from
++// https://gettarka.com/models/captions/v1/ through the system network
++// context (no cookies); --tark-captions-models-url points elsewhere for
++// tests, which changes nothing Tark runs because every file is checked
++// against the manifest compiled into Tark.
++CaptionModelStore& TarkCaptionModels();
++
++}  // namespace tark_captions
++
++#endif  // CHROME_BROWSER_TARK_CAPTIONS_CAPTION_MODELS_H_
+--- /dev/null
++++ b/chrome/browser/tark_captions/caption_models.cc
+@@ -0,0 +1,61 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/tark_captions/caption_models.h"
++
++#include <memory>
++
++#include "base/command_line.h"
++#include "base/no_destructor.h"
++#include "chrome/browser/browser_process.h"
++#include "chrome/browser/speech/chrome_speech_recognition_service.h"
++#include "components/tark_captions/model_manifest.h"
++#include "net/traffic_annotation/network_traffic_annotation.h"
++#include "services/network/public/cpp/shared_url_loader_factory.h"
++
++namespace tark_captions {
++namespace {
++
++constexpr char kModelsUrlSwitch[] = "tark-captions-models-url";
++constexpr char kModelsUrl[] = "https://gettarka.com/models/captions/v1/";
++
++constexpr net::NetworkTrafficAnnotationTag kAnnotation =
++    net::DefineNetworkTrafficAnnotation("tark_captions_models", R"(
++        semantics {
++          sender: "Tark live captions"
++          description:
++            "Downloads the on-device speech recognition and translation "
++            "models Tark's call captions run on, once per model, from "
++            "gettarka.com. Every file is checked against hashes built into "
++            "Tark."
++          trigger:
++            "The user turns on Captions or Translate in a call and the "
++            "model is not on this Mac yet, or downloads it in Settings > "
++            "Live captions."
++          data: "None. The request carries no cookies and no user data."
++          destination: OTHER
++          destination_other: "gettarka.com, Tark's own site."
++        }
++        policy {
++          cookies_allowed: NO
++          setting:
++            "Nothing is downloaded until the user turns on Captions or "
++            "Translate, or downloads a model in Settings > Live captions."
++          policy_exception_justification: "Not implemented."
++        })");
++
++}  // namespace
++
++CaptionModelStore& TarkCaptionModels() {
++  static base::NoDestructor<CaptionModelStore> store(
++      speech::ChromeSpeechRecognitionService::TarkCaptionsModelsDir(),
++      g_browser_process->shared_url_loader_factory(),
++      GURL(base::CommandLine::ForCurrentProcess()->HasSwitch(kModelsUrlSwitch)
++               ? base::CommandLine::ForCurrentProcess()->GetSwitchValueASCII(kModelsUrlSwitch)
++               : kModelsUrl),
++      ModelManifest(), kAnnotation);
++  return *store;
++}
++
++}  // namespace tark_captions
+--- a/chrome/app/tark_captions_strings.grdp
++++ b/chrome/app/tark_captions_strings.grdp
+@@ -55,6 +55,24 @@
+   <message name="IDS_TARK_CAPTIONS_TRANSLATION_UNAVAILABLE" desc="Shown under the captions when the translation cannot run (for example, the translation models are not on this Mac).">
+     Translation unavailable
+   </message>
++  <message name="IDS_TARK_CAPTIONS_GETTING_READY" desc="Shown on the call captions pill while a language's caption model downloads. $1 is a language name, $2 and $3 megabytes.">
++    Getting <ph name="LANGUAGE">$1<ex>Tamil</ex></ph> ready · <ph name="DONE">$2<ex>412</ex></ph> of <ph name="TOTAL">$3<ex>680</ex></ph> MB
++  </message>
++  <message name="IDS_TARK_CAPTIONS_GETTING_TRANSLATION_READY" desc="Shown on the call captions pill while a translation model downloads. $1 and $2 are megabytes.">
++    Getting translation ready · <ph name="DONE">$1<ex>120</ex></ph> of <ph name="TOTAL">$2<ex>228</ex></ph> MB
++  </message>
++  <message name="IDS_TARK_CAPTIONS_DOWNLOAD_FAILED" desc="Shown on the call captions pill when a language's caption model could not be downloaded. $1 is a language name.">
++    Couldn't get <ph name="LANGUAGE">$1<ex>Tamil</ex></ph> ready. Check your connection.
++  </message>
++  <message name="IDS_TARK_CAPTIONS_TRANSLATION_DOWNLOAD_FAILED" desc="Shown on the call captions pill when a translation model could not be downloaded.">
++    Couldn't get translation ready. Check your connection.
++  </message>
++  <message name="IDS_TARK_CAPTIONS_CANCEL" desc="Button on the call captions pill: stop downloading a model.">
++    Cancel
++  </message>
++  <message name="IDS_TARK_CAPTIONS_RETRY" desc="Button on the call captions pill: try downloading a model again.">
++    Retry
++  </message>
+   <message name="IDS_TARK_CAPTIONS_LISTENING" desc="Shown in the caption box after captions are turned on, before the other person's first words arrive.">
+     Listening…
+   </message>
+--- a/chrome/browser/tark_captions/BUILD.gn
++++ b/chrome/browser/tark_captions/BUILD.gn
+@@ -9,6 +9,8 @@
+   sources = [
+     "call_captions_tab_helper.cc",
+     "call_captions_tab_helper.h",
++    "caption_models.cc",
++    "caption_models.h",
+   ]
+   public_deps = [
+     "//base",
+@@ -24,5 +26,7 @@
+     "//chrome/browser/speech",
+     "//components/prefs",
+     "//mojo/public/cpp/bindings",
++    "//net",
++    "//services/network/public/cpp",
+   ]
+ }
+--- a/chrome/browser/tark_captions/call_captions_tab_helper.h
++++ b/chrome/browser/tark_captions/call_captions_tab_helper.h
+@@ -115,6 +115,9 @@
+   // they are shown as they are.
+   void StopRenderingIfUnneeded(bool show_waiting_finals);
+   bool off_the_record() const { return off_the_record_; }
++  // Tells the model store which units this call is using (Settings can't
++  // remove them meanwhile).
++  void UpdateModelsInUse();
+ 
+   tark_captions::CallState state_;
+   tark_captions::Language language_ = tark_captions::Language::kHindi;
+@@ -127,6 +130,8 @@
+   // changes.
+   const bool off_the_record_;
+   bool translate_on_ = false;
++  // This tab marked models in use.
++  bool holds_models_ = false;
+   tark_captions::RenderQueue render_queue_;
+   // The final being rendered, to show as it is if rendering stops.
+   std::optional<std::string> in_flight_final_;
+--- a/chrome/browser/tark_captions/call_captions_tab_helper.cc
++++ b/chrome/browser/tark_captions/call_captions_tab_helper.cc
+@@ -4,16 +4,21 @@
+ 
+ #include "chrome/browser/tark_captions/call_captions_tab_helper.h"
+ 
++#include <algorithm>
++#include <vector>
++
+ #include "base/logging.h"
+ #include "base/no_destructor.h"
+ #include "chrome/browser/media/webrtc/media_capture_devices_dispatcher.h"
+ #include "chrome/browser/browser_process.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/speech/speech_recognition_service.h"
++#include "chrome/browser/tark_captions/caption_models.h"
+ #include "chrome/browser/speech/speech_recognition_service_factory.h"
+ #include "chrome/browser/speech/speech_recognition_client_browser_interface.h"
+ #include "chrome/browser/speech/speech_recognition_client_browser_interface_factory.h"
+ #include "components/tark_captions/caption_choices.h"
++#include "components/tark_captions/model_manifest.h"
+ #include "content/public/browser/browser_context.h"
+ #include "content/public/browser/web_contents.h"
+ #include "media/mojo/mojom/speech_recognition_result.h"
+@@ -37,6 +42,13 @@
+ 
+ CallCaptionsTabHelper::~CallCaptionsTabHelper() {
+   Captioning().Release(this);
++  if (holds_models_) {
++    for (tark_captions::ModelUnit unit :
++         {tark_captions::ModelUnit::kCaptions, tark_captions::ModelUnit::kToEnglish,
++          tark_captions::ModelUnit::kFromEnglish}) {
++      tark_captions::TarkCaptionModels().SetInUse(unit, false);
++    }
++  }
+   if (state_.captions_on()) {
+     state_.SetCaptionsOn(false);
+     CaptionsChanged(/*was_on=*/true);
+@@ -55,6 +67,7 @@
+     CaptionsChanged(was_on);
+   }
+   ReleaseIfOff();
++  UpdateModelsInUse();
+   observers_.Notify(&Observer::OnCallStateChanged, this);
+ }
+ 
+@@ -72,6 +85,7 @@
+       speech->OnTarkCaptionsLanguageChanged(tark_captions::LanguageCode(language_));
+     }
+   }
++  UpdateModelsInUse();
+   observers_.Notify(&Observer::OnCallStateChanged, this);
+ }
+ 
+@@ -82,6 +96,7 @@
+     CaptionsChanged(was_on);
+   }
+   ReleaseIfOff();
++  UpdateModelsInUse();
+   observers_.Notify(&Observer::OnCallStateChanged, this);
+ }
+ 
+@@ -107,6 +122,7 @@
+   render_queue_.ChoicesChanged();
+   // Captions in their own script were shown as they came.
+   StopRenderingIfUnneeded(/*show_waiting_finals=*/false);
++  UpdateModelsInUse();
+   observers_.Notify(&Observer::OnCallStateChanged, this);
+ }
+ 
+@@ -126,6 +142,7 @@
+       .SetShowIn(code, off_the_record());
+   render_queue_.ChoicesChanged();
+   StopRenderingIfUnneeded(/*show_waiting_finals=*/was_other_script);
++  UpdateModelsInUse();
+   observers_.Notify(&Observer::OnCallStateChanged, this);
+ }
+ 
+@@ -133,6 +150,7 @@
+   tark_captions::CaptionChoices(g_browser_process->local_state())
+       .SetTranslateTo(code, off_the_record());
+   render_queue_.ChoicesChanged();
++  UpdateModelsInUse();
+   observers_.Notify(&Observer::OnCallStateChanged, this);
+ }
+ 
+@@ -247,9 +265,29 @@
+     CaptionsChanged(was_on);
+   }
+   ReleaseIfOff();
++  UpdateModelsInUse();
+   observers_.Notify(&Observer::OnCallStateChanged, this);
+ }
+ 
++void CallCaptionsTabHelper::UpdateModelsInUse() {
++  const bool on = state_.captions_on();
++  if (!on && !holds_models_) {
++    return;
++  }
++  holds_models_ = on;
++  std::vector<tark_captions::ModelUnit> translation;
++  if (on && translate_on_) {
++    translation = tark_captions::UnitsForTranslation(
++        tark_captions::TargetFromCode(translate_to()).value_or(tark_captions::Target::kEnglish));
++  }
++  tark_captions::CaptionModelStore& models = tark_captions::TarkCaptionModels();
++  models.SetInUse(tark_captions::ModelUnit::kCaptions, on);
++  for (tark_captions::ModelUnit unit :
++       {tark_captions::ModelUnit::kToEnglish, tark_captions::ModelUnit::kFromEnglish}) {
++    models.SetInUse(unit, std::ranges::find(translation, unit) != translation.end());
++  }
++}
++
+ void CallCaptionsTabHelper::ReleaseIfOff() {
+   if (!state_.captions_on()) {
+     Captioning().Release(this);
+--- a/chrome/browser/ui/views/tark_captions/caption_pill_view.h
++++ b/chrome/browser/ui/views/tark_captions/caption_pill_view.h
+@@ -5,6 +5,7 @@
+ #ifndef CHROME_BROWSER_UI_VIEWS_TARK_CAPTIONS_CAPTION_PILL_VIEW_H_
+ #define CHROME_BROWSER_UI_VIEWS_TARK_CAPTIONS_CAPTION_PILL_VIEW_H_
+ 
++#include <optional>
+ #include <string>
+ 
+ #include "base/memory/raw_ptr.h"
+@@ -16,7 +17,9 @@
+ class TarkCaptionBoxView;
+ 
+ namespace views {
++class Label;
+ class MdTextButton;
++class ProgressBar;
+ }  // namespace views
+ 
+ // Tark (D4): the call captions pill (mockup pill-states.html, steps 1-3):
+@@ -35,6 +38,8 @@
+     virtual void OnLanguagePressed(views::View* anchor) = 0;
+     virtual void OnHidePressed() = 0;
+     virtual void OnDragged(const gfx::Vector2d& delta) = 0;
++    // Cancel while a model downloads, Retry after it failed.
++    virtual void OnDownloadButtonPressed() = 0;
+ 
+    protected:
+     virtual ~Delegate() = default;
+@@ -42,6 +47,15 @@
+ 
+   enum class Mode { kPill, kStrip };
+ 
++  // A model being downloaded for Captions or Translate (D4 Phase 4):
++  // "Getting Tamil ready · 412 of 680 MB" with progress and Cancel, or the
++  // failure with Retry.
++  struct Download {
++    std::u16string text;
++    double fraction = 0;
++    bool failed = false;
++  };
++
+   explicit TarkCaptionPillView(Delegate* delegate);
+   TarkCaptionPillView(const TarkCaptionPillView&) = delete;
+   TarkCaptionPillView& operator=(const TarkCaptionPillView&) = delete;
+@@ -52,8 +66,9 @@
+   // Translate's button: usable while captions are on, prominent when on.
+   void SetTranslateState(bool enabled, bool on);
+   void SetLanguageName(const std::u16string& name);
+-  // Shows `display` in the caption box, or `message` (Listening…, Captions
+-  // unavailable) when it is not empty; hides the box when both are empty.
++  // Replaces the pill's buttons (not ✕) with the download row, or puts them
++  // back.
++  void SetDownload(const std::optional<Download>& download);
+   // Shows `original` (in the script the user reads) and, when it is not
+   // empty, `translation` below it; or `message` (Listening…, Captions
+   // unavailable) alone. Hides the box when all are empty.
+@@ -75,6 +90,9 @@
+   raw_ptr<views::MdTextButton> captions_button_ = nullptr;
+   raw_ptr<views::MdTextButton> language_button_ = nullptr;
+   raw_ptr<views::MdTextButton> translate_button_ = nullptr;
++  raw_ptr<views::Label> download_label_ = nullptr;
++  raw_ptr<views::ProgressBar> download_progress_ = nullptr;
++  raw_ptr<views::MdTextButton> download_button_ = nullptr;
+   gfx::Point drag_last_;
+ };
+ 
+--- a/chrome/browser/ui/views/tark_captions/caption_pill_view.cc
++++ b/chrome/browser/ui/views/tark_captions/caption_pill_view.cc
+@@ -21,6 +21,8 @@
+ #include "ui/views/controls/button/image_button_factory.h"
+ #include "ui/views/controls/button/md_text_button.h"
+ #include "ui/views/controls/image_view.h"
++#include "ui/views/controls/label.h"
++#include "ui/views/controls/progress_bar.h"
+ #include "ui/views/layout/box_layout.h"
+ 
+ namespace {
+@@ -46,6 +48,12 @@
+ 
+   pill_->AddChildView(std::make_unique<views::ImageView>(
+       ui::ImageModel::FromVectorIcon(vector_icons::kProductIcon, ui::kColorIcon, 16)));
++  download_label_ = pill_->AddChildView(std::make_unique<views::Label>());
++  download_progress_ = pill_->AddChildView(std::make_unique<views::ProgressBar>());
++  download_progress_->SetPreferredSize(gfx::Size(90, 4));
++  download_button_ = pill_->AddChildView(std::make_unique<views::MdTextButton>(
++      base::BindRepeating(&Delegate::OnDownloadButtonPressed, base::Unretained(delegate_.get())),
++      l10n_util::GetStringUTF16(IDS_TARK_CAPTIONS_CANCEL)));
+   captions_button_ = pill_->AddChildView(std::make_unique<views::MdTextButton>(
+       base::BindRepeating(&Delegate::OnCaptionsPressed, base::Unretained(delegate_.get())),
+       l10n_util::GetStringUTF16(IDS_TARK_CAPTIONS_CAPTIONS)));
+@@ -67,6 +75,7 @@
+   hide->GetViewAccessibility().SetName(l10n_util::GetStringUTF16(IDS_TARK_CAPTIONS_HIDE));
+   SetCaptionsOn(false);
+   SetTranslateState(/*enabled=*/false, /*on=*/false);
++  SetDownload(std::nullopt);
+ }
+ 
+ TarkCaptionPillView::~TarkCaptionPillView() = default;
+@@ -87,6 +96,24 @@
+   translate_button_->SetStyle(on ? ui::ButtonStyle::kProminent : ui::ButtonStyle::kDefault);
+ }
+ 
++void TarkCaptionPillView::SetDownload(const std::optional<Download>& download) {
++  captions_button_->SetVisible(!download);
++  language_button_->SetVisible(!download);
++  translate_button_->SetVisible(!download);
++  download_label_->SetVisible(!!download);
++  download_progress_->SetVisible(download && !download->failed);
++  download_button_->SetVisible(!!download);
++  if (download) {
++    download_label_->SetText(download->text);
++    download_label_->SetEnabledColor(download->failed ? ui::kColorAlertHighSeverity
++                                                      : ui::kColorLabelForegroundSecondary);
++    download_progress_->SetValue(download->fraction);
++    download_button_->SetText(l10n_util::GetStringUTF16(
++        download->failed ? IDS_TARK_CAPTIONS_RETRY : IDS_TARK_CAPTIONS_CANCEL));
++  }
++  PreferredSizeChanged();
++}
++
+ void TarkCaptionPillView::SetLanguageName(const std::u16string& name) {
+   language_button_->SetText(name + u" ▾");
+ }
+--- a/chrome/browser/ui/views/tark_captions/caption_pill_controller.h
++++ b/chrome/browser/ui/views/tark_captions/caption_pill_controller.h
+@@ -7,6 +7,7 @@
+ 
+ #include <memory>
+ #include <string>
++#include <vector>
+ 
+ #include "base/memory/raw_ptr.h"
+ #include "base/scoped_multi_source_observation.h"
+@@ -14,6 +15,7 @@
+ #include "chrome/browser/tark_captions/call_captions_tab_helper.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model_observer.h"
+ #include "chrome/browser/ui/views/tark_captions/caption_pill_view.h"
++#include "components/tark_captions/caption_model_store.h"
+ #include "components/tark_captions/caption_text.h"
+ #include "ui/menus/simple_menu_model.h"
+ #include "ui/gfx/geometry/vector2d.h"
+@@ -38,7 +40,8 @@
+                                   public TarkCaptionPillView::Delegate,
+                                   public ui::SimpleMenuModel::Delegate,
+                                   public views::WidgetObserver,
+-                                  public views::ViewObserver {
++                                  public views::ViewObserver,
++                                  public tark_captions::CaptionModelStore::Observer {
+  public:
+   explicit TarkCaptionPillController(BrowserView* browser_view);
+   TarkCaptionPillController(const TarkCaptionPillController&) = delete;
+@@ -66,6 +69,10 @@
+   void OnLanguagePressed(views::View* anchor) override;
+   void OnHidePressed() override;
+   void OnDragged(const gfx::Vector2d& delta) override;
++  void OnDownloadButtonPressed() override;
++
++  // tark_captions::CaptionModelStore::Observer:
++  void OnModelStatusChanged(tark_captions::ModelUnit unit) override;
+ 
+   // ui::SimpleMenuModel::Delegate:
+   bool IsCommandIdChecked(int command_id) const override;
+@@ -89,6 +96,11 @@
+   void Close();
+   // Captions start afresh (another call, a new choice).
+   void ClearText();
++  // Waits for `units` (downloading the missing ones), then turns on what
++  // the user pressed.
++  void WaitForModels(bool for_captions, bool turn_on, std::vector<tark_captions::ModelUnit> units);
++  void StopWaiting();
++  void ShowDownload();
+   void Reposition();
+ 
+   raw_ptr<BrowserView> browser_view_;
+@@ -101,6 +113,14 @@
+   tark_captions::CaptionText translation_;
+   bool translation_failed_ = false;
+   std::u16string message_;
++  // Captions or Translate waiting for its models (D4 Phase 4).
++  bool waiting_ = false;
++  bool waiting_for_captions_ = false;
++  bool turn_on_when_ready_ = false;
++  std::vector<tark_captions::ModelUnit> waiting_units_;
++  base::ScopedObservation<tark_captions::CaptionModelStore,
++                          tark_captions::CaptionModelStore::Observer>
++      models_observation_{this};
+   // Where the user dragged the pill, from its resting place.
+   gfx::Vector2d offset_;
+   std::unique_ptr<views::Widget> widget_;
+--- a/chrome/browser/ui/views/tark_captions/caption_pill_controller.cc
++++ b/chrome/browser/ui/views/tark_captions/caption_pill_controller.cc
+@@ -6,11 +6,14 @@
+ 
+ #include <utility>
+ 
++#include "base/strings/string_number_conversions.h"
++#include "chrome/browser/tark_captions/caption_models.h"
+ #include "chrome/browser/ui/browser.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
+ #include "chrome/grit/generated_resources.h"
+ #include "components/tark_captions/asr_model.h"
++#include "components/tark_captions/model_manifest.h"
+ #include "content/public/browser/web_contents.h"
+ #include "ui/base/l10n/l10n_util.h"
+ #include "ui/base/mojom/menu_source_type.mojom.h"
+@@ -85,6 +88,7 @@
+     : browser_view_(browser_view) {
+   TabStripModel* model = browser_view_->browser()->GetTabStripModel();
+   model->AddObserver(this);
++  models_observation_.Observe(&tark_captions::TarkCaptionModels());
+   for (int i = 0; i < model->count(); ++i) {
+     Observe(model->GetWebContentsAt(i));
+   }
+@@ -185,12 +189,32 @@
+ }
+ 
+ void TarkCaptionPillController::OnCaptionsPressed() {
+-  if (shown_) {
+-    shown_->SetCaptionsOn(!shown_->captions_on());
++  if (!shown_) {
++    return;
++  }
++  if (!shown_->captions_on() &&
++      !tark_captions::TarkCaptionModels().ready(tark_captions::ModelUnit::kCaptions)) {
++    WaitForModels(/*for_captions=*/true, /*turn_on=*/true, {tark_captions::ModelUnit::kCaptions});
++    return;
+   }
++  shown_->SetCaptionsOn(!shown_->captions_on());
+ }
+ 
+ void TarkCaptionPillController::OnTranslatePressed() {
++  if (!shown_) {
++    return;
++  }
++  if (!shown_->translate_on()) {
++    std::vector<tark_captions::ModelUnit> units = tark_captions::UnitsForTranslation(
++        tark_captions::TargetFromCode(shown_->translate_to())
++            .value_or(tark_captions::Target::kEnglish));
++    for (tark_captions::ModelUnit unit : units) {
++      if (!tark_captions::TarkCaptionModels().ready(unit)) {
++        WaitForModels(/*for_captions=*/false, /*turn_on=*/true, units);
++        return;
++      }
++    }
++  }
+   if (shown_) {
+     shown_->SetTranslateOn(!shown_->translate_on());
+     translation_.Clear();
+@@ -269,6 +293,18 @@
+   }
+   if (command_id >= kTranslateToFirst) {
+     shown_->SetTranslateTo(kTranslateToCodes[command_id - kTranslateToFirst]);
++    // An Indian target needs the second translation model too.
++    if (shown_->translate_on()) {
++      std::vector<tark_captions::ModelUnit> units = tark_captions::UnitsForTranslation(
++          tark_captions::TargetFromCode(shown_->translate_to())
++              .value_or(tark_captions::Target::kEnglish));
++      for (tark_captions::ModelUnit unit : units) {
++        if (!tark_captions::TarkCaptionModels().ready(unit)) {
++          WaitForModels(/*for_captions=*/false, /*turn_on=*/false, units);
++          break;
++        }
++      }
++    }
+   } else if (command_id >= kShowInFirst) {
+     shown_->SetShowIn(kShowInCodes[command_id - kShowInFirst]);
+   } else {
+@@ -357,6 +393,9 @@
+   if (target != shown_ || !target->captions_on()) {
+     ClearText();
+   }
++  if (target != shown_) {
++    StopWaiting();
++  }
+   shown_ = target;
+ 
+   if (!widget_) {
+@@ -422,11 +461,114 @@
+   menu_runner_.reset();
+   shown_ = nullptr;
+   ClearText();
++  StopWaiting();
+   if (widget_ && view_) {
+     widget_->Hide();
+   }
+ }
+ 
++void TarkCaptionPillController::OnDownloadButtonPressed() {
++  if (!waiting_) {
++    return;
++  }
++  bool failed = false;
++  for (tark_captions::ModelUnit unit : waiting_units_) {
++    failed |= tark_captions::TarkCaptionModels().status(unit).state ==
++              tark_captions::CaptionModelStore::State::kFailed;
++  }
++  if (failed) {
++    // Retry.
++    for (tark_captions::ModelUnit unit : waiting_units_) {
++      tark_captions::TarkCaptionModels().Download(unit);
++    }
++    ShowDownload();
++    return;
++  }
++  for (tark_captions::ModelUnit unit : waiting_units_) {
++    tark_captions::TarkCaptionModels().Cancel(unit);
++  }
++  StopWaiting();
++}
++
++void TarkCaptionPillController::OnModelStatusChanged(tark_captions::ModelUnit unit) {
++  if (!waiting_ || !shown_) {
++    return;
++  }
++  for (tark_captions::ModelUnit needed : waiting_units_) {
++    if (!tark_captions::TarkCaptionModels().ready(needed)) {
++      ShowDownload();
++      return;
++    }
++  }
++  const bool for_captions = waiting_for_captions_;
++  const bool turn_on = turn_on_when_ready_;
++  StopWaiting();
++  if (!turn_on) {
++    return;
++  }
++  if (for_captions) {
++    shown_->SetCaptionsOn(true);
++  } else {
++    shown_->SetTranslateOn(true);
++  }
++}
++
++void TarkCaptionPillController::WaitForModels(bool for_captions,
++                                              bool turn_on,
++                                              std::vector<tark_captions::ModelUnit> units) {
++  waiting_ = true;
++  waiting_for_captions_ = for_captions;
++  turn_on_when_ready_ = turn_on;
++  waiting_units_ = std::move(units);
++  for (tark_captions::ModelUnit unit : waiting_units_) {
++    tark_captions::TarkCaptionModels().Download(unit);
++  }
++  ShowDownload();
++}
++
++void TarkCaptionPillController::StopWaiting() {
++  waiting_ = false;
++  waiting_units_.clear();
++  if (view_) {
++    view_->SetDownload(std::nullopt);
++  }
++}
++
++void TarkCaptionPillController::ShowDownload() {
++  if (!view_ || !shown_ || !waiting_) {
++    return;
++  }
++  int64_t done = 0;
++  int64_t total = 0;
++  bool failed = false;
++  for (tark_captions::ModelUnit unit : waiting_units_) {
++    const tark_captions::CaptionModelStore::Status status =
++        tark_captions::TarkCaptionModels().status(unit);
++    done += status.state == tark_captions::CaptionModelStore::State::kReady ? status.total
++                                                                           : status.done;
++    total += status.total;
++    failed |= status.state == tark_captions::CaptionModelStore::State::kFailed;
++  }
++  const std::u16string language = LanguageName(shown_->language());
++  const std::u16string done_mb = base::NumberToString16(done / 1000000);
++  const std::u16string total_mb = base::NumberToString16(total / 1000000);
++  TarkCaptionPillView::Download download;
++  download.failed = failed;
++  download.fraction = total > 0 ? static_cast<double>(done) / total : 0;
++  if (waiting_for_captions_) {
++    download.text =
++        failed ? l10n_util::GetStringFUTF16(IDS_TARK_CAPTIONS_DOWNLOAD_FAILED, language)
++               : l10n_util::GetStringFUTF16(IDS_TARK_CAPTIONS_GETTING_READY, language, done_mb,
++                                            total_mb);
++  } else {
++    download.text =
++        failed ? l10n_util::GetStringUTF16(IDS_TARK_CAPTIONS_TRANSLATION_DOWNLOAD_FAILED)
++               : l10n_util::GetStringFUTF16(IDS_TARK_CAPTIONS_GETTING_TRANSLATION_READY,
++                                            done_mb, total_mb);
++  }
++  view_->SetDownload(download);
++}
++
+ void TarkCaptionPillController::ClearText() {
+   text_.Clear();
+   translation_.Clear();
