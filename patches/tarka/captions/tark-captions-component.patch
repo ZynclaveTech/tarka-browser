@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/components/tark_captions/BUILD.gn
-@@ -0,0 +1,76 @@
+@@ -0,0 +1,79 @@
 +# Copyright 2026 The Tark Authors
 +# Use of this source code is governed by a BSD-style license that can be
 +# found in the LICENSE file.
@@ -16,6 +16,8 @@
 +  sources = [
 +    "asr_model.cc",
 +    "asr_model.h",
++    "call_state.cc",
++    "call_state.h",
 +    "caption_engine.cc",
 +    "caption_engine.h",
 +    "mel_frontend.cc",
@@ -50,6 +52,7 @@
 +test("tark_captions_unittests") {
 +  sources = [
 +    "asr_model_unittest.cc",
++    "call_state_unittest.cc",
 +    "caption_engine_unittest.cc",
 +    "mel_frontend_unittest.cc",
 +    "ort_runtime_unittest.cc",
@@ -1913,6 +1916,150 @@
 +         times[times.size() * 9 / 10], Segmenter::kDraftEvery / 2 + times[times.size() / 2]);
 +  return 0;
 +}
+--- /dev/null
++++ b/components/tark_captions/call_state.h
+@@ -0,0 +1,37 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef COMPONENTS_TARK_CAPTIONS_CALL_STATE_H_
++#define COMPONENTS_TARK_CAPTIONS_CALL_STATE_H_
++
++namespace tark_captions {
++
++// One tab's call and captions state. A tab is in a call while it captures
++// the microphone. Captions start off in every call and only the user turns
++// them on (nothing listens before that); the call ending turns them off and
++// forgets "hide for this call".
++class CallState {
++ public:
++  enum class Phase { kIdle, kInCall, kCaptioning };
++
++  void OnMicCapturing(bool capturing);
++  // False (and no change) outside a call or after HideForThisCall().
++  bool SetCaptionsOn(bool on);
++  // The pill's ✕: captions off and no pill until the next call.
++  void HideForThisCall();
++
++  Phase phase() const;
++  bool in_call() const { return in_call_; }
++  bool captions_on() const { return captions_on_; }
++  bool hidden() const { return hidden_; }
++
++ private:
++  bool in_call_ = false;
++  bool captions_on_ = false;
++  bool hidden_ = false;
++};
++
++}  // namespace tark_captions
++
++#endif  // COMPONENTS_TARK_CAPTIONS_CALL_STATE_H_
+--- /dev/null
++++ b/components/tark_captions/call_state.cc
+@@ -0,0 +1,38 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/tark_captions/call_state.h"
++
++namespace tark_captions {
++
++void CallState::OnMicCapturing(bool capturing) {
++  if (capturing == in_call_) {
++    return;
++  }
++  in_call_ = capturing;
++  captions_on_ = false;
++  hidden_ = false;
++}
++
++bool CallState::SetCaptionsOn(bool on) {
++  if (on && (!in_call_ || hidden_)) {
++    return false;
++  }
++  captions_on_ = on;
++  return true;
++}
++
++void CallState::HideForThisCall() {
++  captions_on_ = false;
++  hidden_ = in_call_;
++}
++
++CallState::Phase CallState::phase() const {
++  if (!in_call_) {
++    return Phase::kIdle;
++  }
++  return captions_on_ ? Phase::kCaptioning : Phase::kInCall;
++}
++
++}  // namespace tark_captions
+--- /dev/null
++++ b/components/tark_captions/call_state_unittest.cc
+@@ -0,0 +1,60 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/tark_captions/call_state.h"
++
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace tark_captions {
++namespace {
++
++TEST(CallStateTest, MicCaptureStartsCall) {
++  CallState state;
++  EXPECT_EQ(state.phase(), CallState::Phase::kIdle);
++  state.OnMicCapturing(true);
++  EXPECT_EQ(state.phase(), CallState::Phase::kInCall);
++  EXPECT_TRUE(state.in_call());
++}
++
++TEST(CallStateTest, CaptionsOffByDefault) {
++  CallState state;
++  state.OnMicCapturing(true);
++  EXPECT_FALSE(state.captions_on());
++  EXPECT_TRUE(state.SetCaptionsOn(true));
++  EXPECT_EQ(state.phase(), CallState::Phase::kCaptioning);
++}
++
++TEST(CallStateTest, CaptionsNeedACall) {
++  CallState state;
++  EXPECT_FALSE(state.SetCaptionsOn(true));
++  EXPECT_FALSE(state.captions_on());
++}
++
++TEST(CallStateTest, CallEndStopsEngine) {
++  CallState state;
++  state.OnMicCapturing(true);
++  state.SetCaptionsOn(true);
++  state.OnMicCapturing(false);
++  EXPECT_EQ(state.phase(), CallState::Phase::kIdle);
++  EXPECT_FALSE(state.captions_on());
++  // The next call starts with captions off again.
++  state.OnMicCapturing(true);
++  EXPECT_FALSE(state.captions_on());
++}
++
++TEST(CallStateTest, HiddenForThisCall) {
++  CallState state;
++  state.OnMicCapturing(true);
++  state.SetCaptionsOn(true);
++  state.HideForThisCall();
++  EXPECT_FALSE(state.captions_on());
++  EXPECT_TRUE(state.hidden());
++  EXPECT_FALSE(state.SetCaptionsOn(true));
++  state.OnMicCapturing(false);
++  state.OnMicCapturing(true);
++  EXPECT_FALSE(state.hidden());
++}
++
++}  // namespace
++}  // namespace tark_captions
 --- a/chrome/services/speech/BUILD.gn
 +++ b/chrome/services/speech/BUILD.gn
 @@ -36,6 +36,7 @@
