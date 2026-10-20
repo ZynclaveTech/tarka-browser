@@ -222,3 +222,37 @@ class TestKeyOnlyOnMain(unittest.TestCase):
         rules = {l.split()[0]: l.split()[1:] for l in owners if l.strip() and not l.startswith('#')}
         for path in ('/.github/', '/android/adblock/'):
             self.assertEqual(rules.get(path), ['@soorajpandey'], path)
+
+
+class TestBundleNames(unittest.TestCase):
+    """A bundle's file name is never reused (found 2026-10-21: two runs on one
+    day wrote two different lists-YYYYMMDD.zip, and the CDN, which keeps a
+    zip for a year, served the first beside the second's index). Names stay
+    lists-<8 digits>.zip: every installed Tark accepts only that shape
+    (ValidBundleFileName in tark_adblock_bundle.cc)."""
+
+    def at(self, text):
+        import datetime
+        return datetime.datetime.fromisoformat(text.replace('Z', '+00:00'))
+
+    def test_names_count_minutes_since_2026(self):
+        self.assertEqual(bundle.bundle_file_name(self.at('2026-01-01T00:00:00Z')), 'lists-00000000.zip')
+        self.assertEqual(bundle.bundle_file_name(self.at('2026-10-21T02:30:59Z')), 'lists-00422070.zip')
+
+    def test_runs_a_minute_apart_get_different_names(self):
+        self.assertNotEqual(bundle.bundle_file_name(self.at('2026-10-20T21:07:00Z')),
+                            bundle.bundle_file_name(self.at('2026-10-20T21:08:00Z')))
+
+    def test_names_fit_what_installed_phones_accept(self):
+        import re
+        for when in ('2026-10-21T02:30:00Z', '2099-12-31T23:59:00Z', '2216-01-01T00:00:00Z'):
+            self.assertRegex(bundle.bundle_file_name(self.at(when)), r'^lists-[0-9]{8}\.zip$', when)
+
+    def test_build_names_its_zip_so(self):
+        import inspect
+        self.assertIn('bundle_file_name(now)', inspect.getsource(bundle.build))
+
+    def test_the_zip_is_never_written_over(self):
+        y = WORKFLOW.read_text()
+        self.assertIn("--if-none-match '*'", y)
+        self.assertLess(y.index("--if-none-match '*'"), y.index('lists/android/v1/latest.json --content-type'))
