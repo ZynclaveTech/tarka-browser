@@ -336,3 +336,12 @@ class TestSiteSwitchPatch(unittest.TestCase):
         self.assertIn('<message name="IDS_TARK_PAGE_INFO_BLOCK_ADS"', self.add)
         self.assertIn('Block ads on this site', self.add)
         self.assertIn('<translation id="502232591958917855">', self.add)
+
+
+class TestJavaSourceList(unittest.TestCase):
+    def test_the_source_list_only_gains_the_switch(self):
+        p = patch_text('adblock-site-switch.patch')
+        gni = p.split('+++ b/chrome/android/chrome_java_sources.gni\n', 1)[1].split('\n--- ', 1)[0]
+        self.assertEqual([l for l in gni.splitlines() if l.startswith('-')], [])
+        self.assertEqual([l for l in gni.splitlines() if l.startswith('+')],
+                         ['+  "java/src/org/chromium/chrome/browser/page_info/TarkAdblockSiteSwitch.java",'])
