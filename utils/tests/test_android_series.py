@@ -132,7 +132,8 @@ class TestAndroidSeries(unittest.TestCase):
                       'password_reuse_detection_manager_client.h"', patch)
 
     def test_direct_apk_size(self):
-        # Spec: direct APK ≤ 180 MB (the user's decision, 2026-10-20), native
+        # Spec: direct APK ≤ 182 MB (the user's decision, 2026-10-20: 130, then
+        # 180, then 182 MB for A2's ad blocker), native
         # library compressed, no XR module.
         self.assertIn('android/direct-apk-size.patch', self.series)
         patch = (ANDROID / 'patches' / 'direct-apk-size.patch').read_text()
