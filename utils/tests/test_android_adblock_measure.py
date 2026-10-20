@@ -42,6 +42,20 @@ class TestLoadTime(unittest.TestCase):
         *_, ok = report.loadtime_report({'a': runs(0, load=1100)}, {'a': runs(0, load=1000)})
         self.assertFalse(ok)
 
+    def test_a_page_that_never_loaded_has_no_time(self):
+        # loadEventEnd is 0 when the load never fired: the old tool wrote
+        # 0 - navigationStart, a large negative number.
+        on = {'a': [{'blocked': 0, 'requests': 1, 'load_ms': v} for v in (1000, -1792490828900, None)]}
+        off = {'a': runs(0, load=1000)}
+        rows, ratio, ok = report.loadtime_report(on, off)
+        self.assertEqual(rows, [('a', 1000, 1000)])
+
+    def test_measure_script_times_out_and_resumes(self):
+        src = (MEASURE / 'measure.mjs').read_text()
+        self.assertIn('timed out', src)
+        self.assertIn("'--from'", src)
+        self.assertIn('writeFileSync(outFile', src)
+
 
 class TestSites(unittest.TestCase):
     def test_twenty_sites_with_youtube(self):

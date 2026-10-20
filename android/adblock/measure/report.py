@@ -29,8 +29,9 @@ def blocked_report(tark, ubo):
 def loadtime_report(on, off):
     rows = []
     for site in off:
-        a = [r['load_ms'] for r in on.get(site, []) if r['load_ms']]
-        b = [r['load_ms'] for r in off[site] if r['load_ms']]
+        # No time, or not a positive one: the page never finished loading.
+        a = [r['load_ms'] for r in on.get(site, []) if (r['load_ms'] or 0) > 0]
+        b = [r['load_ms'] for r in off[site] if (r['load_ms'] or 0) > 0]
         if a and b:
             rows.append((site, statistics.median(a), statistics.median(b)))
     ratio = statistics.median(a / b for _, a, b in rows) if rows else 1.0
