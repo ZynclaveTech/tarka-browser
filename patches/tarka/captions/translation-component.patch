@@ -612,6 +612,386 @@
 +}  // namespace
 +}  // namespace tark_captions
 --- /dev/null
++++ b/components/tark_captions/romanize.h
+@@ -0,0 +1,25 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef COMPONENTS_TARK_CAPTIONS_ROMANIZE_H_
++#define COMPONENTS_TARK_CAPTIONS_ROMANIZE_H_
++
++#include <string>
++#include <string_view>
++
++#include "components/tark_captions/asr_model.h"
++
++namespace tark_captions {
++
++// "Show their words in English letters" (D4): everyday Latin spelling
++// without diacritics, lowercase ASCII, e.g. नमस्ते "namaste", தமிழ்
++// "tamizh", বাংলা "bangla". Readable, not phonetically exact: the inherent
++// vowel is "a" (Hindi, Tamil) or "o" (Bengali), and Hindi and Bengali drop
++// it at the end of a word and in the middle where it is silent. Anything
++// outside the language's script is left as it is.
++std::u16string Romanize(std::u16string_view text, Language language);
++
++}  // namespace tark_captions
++
++#endif  // COMPONENTS_TARK_CAPTIONS_ROMANIZE_H_
+--- /dev/null
++++ b/components/tark_captions/romanize.cc
+@@ -0,0 +1,294 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/tark_captions/romanize.h"
++
++#include <string>
++#include <vector>
++
++#include "base/containers/fixed_flat_map.h"
++#include "base/strings/utf_string_conversions.h"
++
++namespace tark_captions {
++namespace {
++
++// One script's letters. Keys are code points; values are Latin spellings.
++struct Table {
++  char16_t first;  // The script's Unicode block.
++  char16_t last;
++  const char* inherent;
++  bool drops_inherent;  // Hindi and Bengali.
++  char16_t virama;
++  char16_t nukta;  // 0 if none.
++  base::span<const std::pair<char16_t, const char*>> consonants;
++  base::span<const std::pair<char16_t, const char*>> nukta_consonants;
++  base::span<const std::pair<char16_t, const char*>> vowels;
++  base::span<const std::pair<char16_t, const char*>> signs;  // Dependent vowels.
++  base::span<const std::pair<char16_t, const char*>> codas;  // Anusvara etc.
++};
++
++constexpr std::pair<char16_t, const char*> kHindiConsonants[] = {
++    {u'क', "k"},  {u'ख', "kh"}, {u'ग', "g"},  {u'घ', "gh"}, {u'ङ', "n"},  {u'च', "ch"},
++    {u'छ', "chh"}, {u'ज', "j"},  {u'झ', "jh"}, {u'ञ', "n"},  {u'ट', "t"},  {u'ठ', "th"},
++    {u'ड', "d"},  {u'ढ', "dh"}, {u'ण', "n"},  {u'त', "t"},  {u'थ', "th"}, {u'द', "d"},
++    {u'ध', "dh"}, {u'न', "n"},  {u'प', "p"},  {u'फ', "ph"}, {u'ब', "b"},  {u'भ', "bh"},
++    {u'म', "m"},  {u'य', "y"},  {u'र', "r"},  {u'ल', "l"},  {u'व', "v"},  {u'श', "sh"},
++    {u'ष', "sh"}, {u'स', "s"},  {u'ह', "h"},  {u'ळ', "l"},
++};
++// With the nukta, written as one code point or as consonant + nukta.
++constexpr std::pair<char16_t, const char*> kHindiNuktaConsonants[] = {
++    {u'क', "q"}, {u'ख', "kh"}, {u'ग', "g"}, {u'ज', "z"},
++    {u'ड', "r"}, {u'ढ', "rh"}, {u'फ', "f"}, {u'य', "y"},
++};
++constexpr std::pair<char16_t, const char*> kHindiVowels[] = {
++    {u'अ', "a"}, {u'आ', "aa"}, {u'इ', "i"}, {u'ई', "i"}, {u'उ', "u"},  {u'ऊ', "u"},
++    {u'ऋ', "ri"}, {u'ए', "e"}, {u'ऐ', "ai"}, {u'ओ', "o"}, {u'औ', "au"},
++};
++constexpr std::pair<char16_t, const char*> kHindiSigns[] = {
++    {u'ा', "a"}, {u'ि', "i"}, {u'ी', "i"}, {u'ु', "u"},  {u'ू', "u"},
++    {u'ृ', "ri"}, {u'े', "e"}, {u'ै', "ai"}, {u'ो', "o"}, {u'ौ', "au"},
++};
++constexpr std::pair<char16_t, const char*> kHindiCodas[] = {
++    {u'ं', "n"}, {u'ँ', "n"}, {u'ः', "h"},
++};
++
++constexpr std::pair<char16_t, const char*> kTamilConsonants[] = {
++    {u'க', "k"}, {u'ங', "ng"}, {u'ச', "ch"}, {u'ஞ', "nj"}, {u'ட', "t"},  {u'ண', "n"},
++    {u'த', "t"}, {u'ந', "n"},  {u'ப', "p"},  {u'ம', "m"},  {u'ய', "y"},  {u'ர', "r"},
++    {u'ல', "l"}, {u'வ', "v"},  {u'ழ', "zh"}, {u'ள', "l"},  {u'ற', "r"},  {u'ன', "n"},
++    {u'ஜ', "j"}, {u'ஷ', "sh"}, {u'ஸ', "s"},  {u'ஹ', "h"},
++};
++constexpr std::pair<char16_t, const char*> kTamilVowels[] = {
++    {u'அ', "a"}, {u'ஆ', "aa"}, {u'இ', "i"}, {u'ஈ', "i"},  {u'உ', "u"}, {u'ஊ', "u"},
++    {u'எ', "e"}, {u'ஏ', "e"},  {u'ஐ', "ai"}, {u'ஒ', "o"}, {u'ஓ', "o"}, {u'ஔ', "au"},
++};
++constexpr std::pair<char16_t, const char*> kTamilSigns[] = {
++    {u'ா', "a"}, {u'ி', "i"}, {u'ீ', "i"},  {u'ு', "u"}, {u'ூ', "u"},
++    {u'ெ', "e"}, {u'ே', "e"}, {u'ை', "ai"}, {u'ொ', "o"}, {u'ோ', "o"}, {u'ௌ', "au"},
++};
++constexpr std::pair<char16_t, const char*> kTamilCodas[] = {
++    {u'ஃ', "h"},
++};
++
++constexpr std::pair<char16_t, const char*> kBengaliConsonants[] = {
++    {u'ক', "k"},  {u'খ', "kh"}, {u'গ', "g"},  {u'ঘ', "gh"}, {u'ঙ', "ng"}, {u'চ', "ch"},
++    {u'ছ', "chh"}, {u'জ', "j"},  {u'ঝ', "jh"}, {u'ঞ', "n"},  {u'ট', "t"},  {u'ঠ', "th"},
++    {u'ড', "d"},  {u'ঢ', "dh"}, {u'ণ', "n"},  {u'ত', "t"},  {u'থ', "th"}, {u'দ', "d"},
++    {u'ধ', "dh"}, {u'ন', "n"},  {u'প', "p"},  {u'ফ', "ph"}, {u'ব', "b"},  {u'ভ', "bh"},
++    {u'ম', "m"},  {u'য', "j"},  {u'র', "r"},  {u'ল', "l"},  {u'শ', "sh"}, {u'ষ', "sh"},
++    {u'স', "s"},  {u'হ', "h"},  {u'\u09DC', "r"}, {u'\u09DD', "rh"}, {u'\u09DF', "y"}, {u'ৎ', "t"},
++};
++constexpr std::pair<char16_t, const char*> kBengaliNuktaConsonants[] = {
++    {u'ড', "r"}, {u'ঢ', "rh"}, {u'য', "y"},
++};
++constexpr std::pair<char16_t, const char*> kBengaliVowels[] = {
++    {u'অ', "o"}, {u'আ', "a"}, {u'ই', "i"},  {u'ঈ', "i"}, {u'উ', "u"}, {u'ঊ', "u"},
++    {u'ঋ', "ri"}, {u'এ', "e"}, {u'ঐ', "oi"}, {u'ও', "o"}, {u'ঔ', "ou"},
++};
++constexpr std::pair<char16_t, const char*> kBengaliSigns[] = {
++    {u'া', "a"}, {u'ি', "i"}, {u'ী', "i"},  {u'ু', "u"}, {u'ূ', "u"},
++    {u'ৃ', "ri"}, {u'ে', "e"}, {u'ৈ', "oi"}, {u'ো', "o"}, {u'ৌ', "ou"},
++};
++constexpr std::pair<char16_t, const char*> kBengaliCodas[] = {
++    {u'ং', "ng"}, {u'ঁ', "n"}, {u'ঃ', "h"},
++};
++
++const Table& TableFor(Language language) {
++  static const Table kHindi = {0x0900, 0x097F, "a", true, 0x094D, 0x093C,
++                               kHindiConsonants, kHindiNuktaConsonants, kHindiVowels,
++                               kHindiSigns, kHindiCodas};
++  static const Table kTamil = {0x0B80, 0x0BFF, "a", false, 0x0BCD, 0,
++                               kTamilConsonants, {}, kTamilVowels, kTamilSigns, kTamilCodas};
++  static const Table kBengali = {0x0980, 0x09FF, "o", true, 0x09CD, 0x09BC,
++                                 kBengaliConsonants, kBengaliNuktaConsonants, kBengaliVowels,
++                                 kBengaliSigns, kBengaliCodas};
++  switch (language) {
++    case Language::kHindi:
++      return kHindi;
++    case Language::kTamil:
++      return kTamil;
++    case Language::kBengali:
++      return kBengali;
++  }
++}
++
++const char* Find(base::span<const std::pair<char16_t, const char*>> list, char16_t c) {
++  for (const auto& [key, value] : list) {
++    if (key == c) {
++      return value;
++    }
++  }
++  return nullptr;
++}
++
++// Composite nukta letters (क़ U+0958 ... य़ U+095F) as consonant + nukta.
++std::u16string DecomposeNuktas(std::u16string_view text) {
++  static constexpr std::pair<char16_t, char16_t> kComposites[] = {
++      {0x0958, u'क'}, {0x0959, u'ख'}, {0x095A, u'ग'}, {0x095B, u'ज'},
++      {0x095C, u'ड'}, {0x095D, u'ढ'}, {0x095E, u'फ'}, {0x095F, u'य'},
++  };
++  std::u16string out;
++  for (char16_t c : text) {
++    bool done = false;
++    for (const auto& [composite, base] : kComposites) {
++      if (c == composite) {
++        out += base;
++        out += u'़';
++        done = true;
++        break;
++      }
++    }
++    if (!done) {
++      out += c;
++    }
++  }
++  return out;
++}
++
++// A written syllable: consonants (or none, for an independent vowel), its
++// vowel, and a nasal or visarga after it.
++struct Syllable {
++  std::string onset;
++  int consonants = 0;
++  std::string vowel;
++  bool inherent = false;  // `vowel` is the script's inherent vowel.
++  bool dropped = false;   // ... and it is silent.
++  std::string coda;
++};
++
++std::string RomanizeWord(std::u16string_view word, const Table& t) {
++  std::vector<Syllable> syllables;
++  size_t i = 0;
++  auto consonant_at = [&](size_t k, std::string* latin, size_t* used) {
++    const char16_t c = word[k];
++    if (t.nukta && k + 1 < word.size() && word[k + 1] == t.nukta) {
++      if (const char* n = Find(t.nukta_consonants, c)) {
++        *latin = n;
++        *used = 2;
++        return true;
++      }
++    }
++    if (const char* plain = Find(t.consonants, c)) {
++      *latin = plain;
++      *used = (t.nukta && k + 1 < word.size() && word[k + 1] == t.nukta) ? 2 : 1;
++      return true;
++    }
++    return false;
++  };
++  while (i < word.size()) {
++    Syllable s;
++    std::string latin;
++    size_t used = 0;
++    if (const char* v = Find(t.vowels, word[i])) {
++      s.vowel = v;
++      ++i;
++    } else if (consonant_at(i, &latin, &used)) {
++      std::vector<char16_t> cluster = {word[i]};
++      s.onset = latin;
++      s.consonants = 1;
++      i += used;
++      while (i + 1 < word.size() && word[i] == t.virama &&
++             consonant_at(i + 1, &latin, &used)) {
++        // Bengali য after a virama is the "y" sound (য-ফলা).
++        if (t.first == 0x0980 && word[i + 1] == u'য') {
++          latin = "y";
++        }
++        cluster.push_back(word[i + 1]);
++        s.onset += latin;
++        ++s.consonants;
++        i += 1 + used;
++      }
++      // Tamil clusters as they are said: ன்ற "ndr" (நன்றி "nandri"),
++      // ற்ற "tr" (மற்றும் "matrum"), ங்க "ng" (விளங்கும் "vilangum").
++      if (t.first == 0x0B80) {
++        if (cluster == std::vector<char16_t>{u'ன', u'ற'}) {
++          s.onset = "ndr";
++        } else if (cluster == std::vector<char16_t>{u'ற', u'ற'}) {
++          s.onset = "tr";
++        } else if (cluster == std::vector<char16_t>{u'ங', u'க'}) {
++          s.onset = "ng";
++        }
++      }
++      if (i < word.size() && Find(t.signs, word[i])) {
++        s.vowel = Find(t.signs, word[i]);
++        ++i;
++      } else if (i < word.size() && word[i] == t.virama) {
++        ++i;  // No vowel.
++      } else {
++        s.vowel = t.inherent;
++        s.inherent = true;
++      }
++    } else {
++      // Not a letter Tark knows (a sign or mark): kept as it is.
++      return base::UTF16ToUTF8(word);
++    }
++    while (i < word.size() && Find(t.codas, word[i])) {
++      s.coda += Find(t.codas, word[i]);
++      ++i;
++    }
++    syllables.push_back(std::move(s));
++  }
++  if (t.drops_inherent && syllables.size() > 1) {
++    // The last inherent vowel is silent (भारत "bharat").
++    Syllable& last = syllables.back();
++    if (last.inherent && last.coda.empty()) {
++      last.dropped = true;
++    }
++    // In the middle, a single consonant's inherent vowel is silent between
++    // an open syllable and a single consonant that has a vowel
++    // (कमला "kamla"; but ज़िंदगी "zindagi", नमस्ते "namaste").
++    for (size_t k = syllables.size() - 2; k >= 1; --k) {
++      Syllable& s = syllables[k];
++      const Syllable& before = syllables[k - 1];
++      const Syllable& after = syllables[k + 1];
++      const bool before_open = !before.vowel.empty() && !before.dropped && before.coda.empty();
++      const bool after_voiced = after.consonants == 1 && !after.vowel.empty() && !after.dropped;
++      if (s.inherent && s.consonants == 1 && s.coda.empty() && before_open && after_voiced) {
++        s.dropped = true;
++      }
++    }
++  }
++  std::string out;
++  for (size_t k = 0; k < syllables.size(); ++k) {
++    const Syllable& s = syllables[k];
++    out += s.onset;
++    if (!s.dropped) {
++      out += s.vowel;
++    }
++    // A nasal before p, b or m is said "m" (लंबी "lambi").
++    const bool before_labial = k + 1 < syllables.size() && !syllables[k + 1].onset.empty() &&
++                               (syllables[k + 1].onset[0] == 'p' ||
++                                syllables[k + 1].onset[0] == 'b' ||
++                                syllables[k + 1].onset[0] == 'm');
++    out += (before_labial && s.coda == "n") ? "m" : s.coda;
++  }
++  return out;
++}
++
++}  // namespace
++
++std::u16string Romanize(std::u16string_view input, Language language) {
++  const Table& t = TableFor(language);
++  const std::u16string text = DecomposeNuktas(input);
++  std::u16string out;
++  std::u16string word;
++  auto flush = [&] {
++    if (!word.empty()) {
++      out += base::UTF8ToUTF16(RomanizeWord(word, t));
++      word.clear();
++    }
++  };
++  for (char16_t c : text) {
++    if (c >= t.first && c <= t.last && c != 0x0964 && c != 0x0965) {
++      word += c;
++    } else {
++      flush();
++      out += c;
++    }
++  }
++  flush();
++  return out;
++}
++
++}  // namespace tark_captions
+--- /dev/null
++++ b/components/tark_captions/romanize_unittest.cc
+@@ -0,0 +1,52 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/tark_captions/romanize.h"
++
++#include "base/strings/utf_string_conversions.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace tark_captions {
++namespace {
++
++struct Example {
++  Language language;
++  const char* text;
++  const char* latin;
++};
++
++// Everyday spellings without diacritics ("show their words in English
++// letters", spec D4).
++TEST(RomanizeTest, RomanizesEverydaySpellings) {
++  const Example kExamples[] = {
++      {Language::kHindi, "नमस्ते", "namaste"},
++      {Language::kHindi, "भारत", "bharat"},
++      {Language::kHindi, "कमला", "kamla"},
++      {Language::kHindi, "ज़िंदगी", "zindagi"},
++      {Language::kHindi, "क्या", "kya"},
++      {Language::kHindi, "लंबी", "lambi"},
++      {Language::kHindi, "आप कैसे हैं", "aap kaise hain"},
++      {Language::kTamil, "தமிழ்", "tamizh"},
++      {Language::kTamil, "வணக்கம்", "vanakkam"},
++      {Language::kTamil, "நன்றி", "nandri"},
++      {Language::kTamil, "சென்னை", "chennai"},
++      {Language::kTamil, "மற்றும்", "matrum"},
++      {Language::kTamil, "விளங்கும்", "vilangum"},
++      {Language::kBengali, "বাংলা", "bangla"},
++      {Language::kBengali, "আমি", "ami"},
++      {Language::kBengali, "কলকাতা", "kolkata"},
++      {Language::kBengali, "ধন্যবাদ", "dhonyobad"},
++  };
++  for (const Example& e : kExamples) {
++    EXPECT_EQ(base::UTF16ToUTF8(Romanize(base::UTF8ToUTF16(e.text), e.language)), e.latin)
++        << e.text;
++  }
++}
++
++TEST(RomanizeTest, LeavesOtherTextAlone) {
++  EXPECT_EQ(Romanize(u"OK 42", Language::kHindi), u"OK 42");
++}
++
++}  // namespace
++}  // namespace tark_captions
+--- /dev/null
 +++ b/components/tark_captions/translation_engine.h
 @@ -0,0 +1,78 @@
 +// Copyright 2026 The Tark Authors
@@ -1176,7 +1556,7 @@
 +}  // namespace tark_captions
 --- a/components/tark_captions/BUILD.gn
 +++ b/components/tark_captions/BUILD.gn
-@@ -19,12 +19,16 @@
+@@ -19,12 +19,18 @@
      "caption_engine.h",
      "caption_text.cc",
      "caption_text.h",
@@ -1186,6 +1566,8 @@
      "mel_frontend.h",
      "ort_runtime.cc",
      "ort_runtime.h",
++    "romanize.cc",
++    "romanize.h",
      "segmenter.cc",
      "segmenter.h",
 +    "translation_engine.cc",
@@ -1193,7 +1575,7 @@
      "vad.cc",
      "vad.h",
    ]
-@@ -32,7 +36,9 @@
+@@ -32,7 +38,9 @@
    deps = [
      "//base",
      "//media",
@@ -1203,13 +1585,14 @@
    ]
  }
  
-@@ -54,9 +60,11 @@
+@@ -54,9 +62,12 @@
      "call_state_unittest.cc",
      "caption_engine_unittest.cc",
      "caption_text_unittest.cc",
 +    "indic_text_unittest.cc",
      "mel_frontend_unittest.cc",
      "ort_runtime_unittest.cc",
++    "romanize_unittest.cc",
      "segmenter_unittest.cc",
 +    "translation_engine_unittest.cc",
    ]
@@ -1217,13 +1600,15 @@
      ":tark_captions",
 --- a/components/tark_captions/bench.cc
 +++ b/components/tark_captions/bench.cc
-@@ -4,11 +4,21 @@
+@@ -4,11 +4,25 @@
  
  // tark_captions_bench: cores used and draft lag of the caption engine on a
  // 5-minute Hindi track (the test clips repeated, with 0.8-2 s pauses).
 +// tark_captions_bench --translate: translation time per caption (whole and
 +// half captions, as finals and drafts) and peak memory with captions and
 +// translation loaded.
++// tark_captions_bench --romanize: the test captions in English letters, to
++// review the spellings.
  
  #include <sys/resource.h>
  
@@ -1234,12 +1619,14 @@
 +
 +#include "base/strings/string_split.h"
 +#include "base/strings/string_util.h"
++#include "base/strings/utf_string_conversions.h"
 +#include "base/time/time.h"
++#include "components/tark_captions/romanize.h"
 +#include "components/tark_captions/translation_engine.h"
  
  #include "base/functional/callback_helpers.h"
  #include "components/tark_captions/caption_engine.h"
-@@ -23,9 +33,57 @@
+@@ -23,9 +37,57 @@
    return u.ru_utime.tv_sec + u.ru_utime.tv_usec / 1e6 + u.ru_stime.tv_sec + u.ru_stime.tv_usec / 1e6;
  }
  
@@ -1298,10 +1685,20 @@
    using namespace tark_captions;
    std::optional<base::FilePath> ort = test::OrtPath();
    std::optional<base::FilePath> models = test::ModelsDir();
-@@ -34,6 +92,9 @@
+@@ -34,6 +96,19 @@
      fprintf(stderr, "set TARK_CAPTIONS_ORT, TARK_CAPTIONS_MODELS and TARK_CAPTIONS_TESTDATA\n");
      return 2;
    }
++  if (argc > 1 && strcmp(argv[1], "--romanize") == 0) {
++    for (const base::Value& v : test::MtGoldenCases(*testdata)) {
++      const std::string caption = *v.GetDict().FindString("caption");
++      printf("%s\n  %s\n", caption.c_str(),
++             base::UTF16ToUTF8(Romanize(base::UTF8ToUTF16(caption),
++                                        *LanguageFromCode(*v.GetDict().FindString("lang"))))
++                 .c_str());
++    }
++    return 0;
++  }
 +  if (argc > 1 && strcmp(argv[1], "--translate") == 0) {
 +    return Translate(*ort, *models, *testdata);
 +  }
