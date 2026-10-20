@@ -1,0 +1,129 @@
+--- a/chrome/browser/language/android/java/src/org/chromium/chrome/browser/language/settings/LanguageSettings.java
++++ b/chrome/browser/language/android/java/src/org/chromium/chrome/browser/language/settings/LanguageSettings.java
+@@ -35,6 +35,7 @@
+ import org.chromium.chrome.browser.settings.ChromeManagedPreferenceDelegate;
+ import org.chromium.chrome.browser.settings.SettingsNavigationFactory;
+ import org.chromium.chrome.browser.settings.search.ChromeBaseSearchIndexProvider;
++import org.chromium.chrome.browser.tark_xlit.TarkXlitBridge;
+ import org.chromium.chrome.browser.translate.TranslateBridge;
+ import org.chromium.components.browser_ui.settings.ChromeSwitchPreference;
+ import org.chromium.components.browser_ui.settings.SettingsUtils;
+@@ -61,6 +62,8 @@
+     static final String PREFERRED_LANGUAGES_KEY = "preferred_languages";
+     static final String CONTENT_LANGUAGES_KEY = "content_languages_preference";
+     static final String TRANSLATE_SWITCH_KEY = "translate_switch";
++    // Tark (A3): the address bar's Indian-language suggestions.
++    static final String TARK_XLIT_SWITCH_KEY = "tark_xlit_switch";
+ 
+     static final String TRANSLATION_ADVANCED_SECTION = "translation_advanced_settings_section";
+     static final String TARGET_LANGUAGE_KEY = "translate_settings_target_language";
+@@ -86,6 +89,7 @@
+         } else {
+             createBasicPreferences();
+         }
++        addTarkXlitSwitch();
+ 
+         LanguagesManager.recordImpression(LanguagesManager.LanguageSettingsPageType.PAGE_MAIN);
+     }
+@@ -105,6 +109,56 @@
+     private static boolean shouldShowDetailedPreferences() {
+         return ChromeFeatureList.isEnabled(ChromeFeatureList.DETAILED_LANGUAGE_SETTINGS)
+                 || GlobalAppLocaleController.getInstance().isOverridden();
++    }
++
++    private @Nullable ChromeSwitchPreference mTarkXlitSwitch;
++
++    /**
++     * Tark (A3, spec §5): turns the address bar's Indian-language suggestions on (downloading the
++     * model and the word lists of the person's languages, on Wi-Fi) or off (the files stay). Its
++     * summary says where the download is.
++     */
++    private void addTarkXlitSwitch() {
++        ChromeSwitchPreference xlitSwitch =
++                new ChromeSwitchPreference(getPreferenceManager().getContext());
++        xlitSwitch.setKey(TARK_XLIT_SWITCH_KEY);
++        xlitSwitch.setTitle(R.string.tark_xlit_switch_title);
++        xlitSwitch.setChecked(TarkXlitBridge.getOfferState() == TarkXlitBridge.ACCEPTED);
++        xlitSwitch.setOnPreferenceChangeListener(
++                (preference, newValue) -> {
++                    if ((boolean) newValue) {
++                        TarkXlitBridge.accept(/* now= */ false);
++                    } else {
++                        TarkXlitBridge.decline();
++                    }
++                    updateTarkXlitSummary();
++                    return true;
++                });
++        getPreferenceScreen().addPreference(xlitSwitch);
++        mTarkXlitSwitch = xlitSwitch;
++        updateTarkXlitSummary();
++    }
++
++    private void updateTarkXlitSummary() {
++        if (mTarkXlitSwitch == null) return;
++        String summary;
++        String[] names = TarkXlitBridge.getDownloadedLanguageNames();
++        if (TarkXlitBridge.getOfferState() != TarkXlitBridge.ACCEPTED) {
++            summary = getString(R.string.tark_xlit_switch_off);
++        } else if (TarkXlitBridge.isWaitingForWifi()) {
++            summary = getString(R.string.tark_xlit_switch_waiting);
++        } else if (names.length == 0) {
++            summary = getString(R.string.tark_xlit_switch_downloading);
++        } else {
++            summary = getString(R.string.tark_xlit_switch_downloaded, TextUtils.join(", ", names));
++        }
++        mTarkXlitSwitch.setSummary(summary);
++    }
++
++    @Override
++    public void onResume() {
++        super.onResume();
++        updateTarkXlitSummary();
+     }
+ 
+     /** Create the old language and translate settings page. Delete once no longer used. */
+--- a/chrome/browser/language/android/BUILD.gn
++++ b/chrome/browser/language/android/BUILD.gn
+@@ -58,6 +58,8 @@
+     "//chrome/browser/flags:java",
+     "//chrome/browser/preferences:java",
+     "//chrome/browser/preferences:pref_service_java",
++    # Tark (A3): Indian-language suggestions' switch.
++    "//chrome/browser/tark_xlit/android:java",
+     "//chrome/browser/profiles/android:java",
+     "//chrome/browser/settings:java",
+     "//chrome/browser/tab:java",
+--- a/chrome/browser/ui/android/strings/android_chrome_strings.grd
++++ b/chrome/browser/ui/android/strings/android_chrome_strings.grd
+@@ -879,6 +879,21 @@
+       <message name="IDS_TARK_CONNECTS_XLIT" desc="Tark: item in the list of services Tark connects to: the Indian-language suggestions' download from Tark's site, only when the person asks, with its host name.">
+         Indian-language suggestions, downloaded once when you ask (gettarka.com)
+       </message>
++      <message name="IDS_TARK_XLIT_SWITCH_TITLE" desc="Tark: switch in Settings > Languages: suggestions in the person's Indian languages while typing English letters in the address bar.">
++        Indian-language suggestions
++      </message>
++      <message name="IDS_TARK_XLIT_SWITCH_OFF" desc="Tark: summary of the Indian-language suggestions switch when it is off.">
++        Off
++      </message>
++      <message name="IDS_TARK_XLIT_SWITCH_WAITING" desc="Tark: summary of the Indian-language suggestions switch: turned on, the download waits until the phone is on Wi-Fi.">
++        Waiting for Wi-Fi
++      </message>
++      <message name="IDS_TARK_XLIT_SWITCH_DOWNLOADING" desc="Tark: summary of the Indian-language suggestions switch: turned on, downloading.">
++        Downloading…
++      </message>
++      <message name="IDS_TARK_XLIT_SWITCH_DOWNLOADED" desc="Tark: summary of the Indian-language suggestions switch: on, with the languages whose suggestions are downloaded, in their own names.">
++        Downloaded: <ph name="LANGUAGES">%1$s<ex>हिन्दी, தமிழ்</ex></ph>
++      </message>
+       <message name="IDS_TARK_CONNECTS_LISTS" desc="Tark: item in the list of services Tark connects to: the ad blocker's daily lists from Tark's site, with its host name.">
+         Tark's ad-blocking lists, once a day on Wi-Fi or every three days on mobile data (gettarka.com)
+       </message>
+--- a/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb
++++ b/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb
+@@ -2166,4 +2166,7 @@
+ <translation id="854019961256078494">Wi-Fi पर डाउनलोड करें</translation>
+ <translation id="8273905181216423293">अभी डाउनलोड करें</translation>
+ <translation id="8533623660476485480">भारतीय भाषाओं के सुझाव, आपके मांगने पर एक बार डाउनलोड (gettarka.com)</translation>
++<translation id="6612875707773743625">भारतीय भाषाओं में सुझाव</translation>
++<translation id="8304126055697421220">Wi-Fi का इंतज़ार है</translation>
++<translation id="9054517922063697959">डाउनलोड हो गए: <ph name="LANGUAGES"/></translation>
+ </translationbundle>

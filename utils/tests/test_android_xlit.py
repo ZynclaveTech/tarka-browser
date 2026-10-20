@@ -239,5 +239,45 @@ class TestDownloadPatch(unittest.TestCase):
         self.assertIn('clang_x64/tark_xlit_files_unittests', sh)
 
 
+
+class TestSettingsPatch(unittest.TestCase):
+    """A3 Task 5: Settings > Languages > Indian-language suggestions."""
+    def setUp(self):
+        self.patch = (PATCHES / 'xlit-android-settings.patch').read_text()
+
+    def section(self, path):
+        return ''.join(p for p in self.patch.split('--- ') if f'+++ b/{path}' in p)
+
+    def test_in_the_android_series_after_the_download(self):
+        s = series()
+        self.assertLess(s.index('xlit-android-download.patch'), s.index('xlit-android-settings.patch'))
+
+    def test_switch_in_languages_page(self):
+        java = self.section('chrome/browser/language/android/java/src/org/chromium/chrome/browser/language/settings/LanguageSettings.java')
+        self.assertIn('TARK_XLIT_SWITCH_KEY = "tark_xlit_switch"', java)
+        self.assertIn('TarkXlitBridge.accept(/* now= */ false)', java)
+        self.assertIn('TarkXlitBridge.decline()', java)
+        # Both versions of the page get it.
+        self.assertIn('+        addTarkXlitSwitch();', java)
+        self.assertIn('"//chrome/browser/tark_xlit/android:java"', self.section('chrome/browser/language/android/BUILD.gn'))
+
+    def test_summary_names_the_downloaded_languages(self):
+        java = self.section('chrome/browser/language/android/java/src/org/chromium/chrome/browser/language/settings/LanguageSettings.java')
+        self.assertIn('TarkXlitBridge.getDownloadedLanguageNames()', java)
+        self.assertIn('TarkXlitBridge.isWaitingForWifi()', java)
+
+    def test_settings_strings_in_english_and_hindi(self):
+        grd = self.section('chrome/browser/ui/android/strings/android_chrome_strings.grd')
+        for name in ('IDS_TARK_XLIT_SWITCH_TITLE', 'IDS_TARK_XLIT_SWITCH_OFF', 'IDS_TARK_XLIT_SWITCH_WAITING',
+                     'IDS_TARK_XLIT_SWITCH_DOWNLOADING', 'IDS_TARK_XLIT_SWITCH_DOWNLOADED'):
+            self.assertIn(f'name="{name}"', grd)
+        xtb = self.section('chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb')
+        for i in ('6612875707773743625', '8304126055697421220', '9054517922063697959'):
+            self.assertIn(f'<translation id="{i}">', xtb)
+        # "Off" and "Downloading…" are already translated.
+        for i in ('5860033963881614850', '6738867403308150051'):
+            self.assertNotIn(f'id="{i}"', xtb)
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -296,7 +296,7 @@
 +}  // namespace tark_xlit
 --- /dev/null
 +++ b/chrome/browser/tark_xlit/xlit_files_unittest.cc
-@@ -0,0 +1,137 @@
+@@ -0,0 +1,157 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -432,11 +432,31 @@
 +                ".bin");
 +}
 +
++// Settings > Languages: a language added after saying yes downloads its list;
++// one removed keeps its file.
++TEST_F(TarkXlitFilesTest, AddedLanguageDownloadsItsList) {
++  const std::vector<std::string> present = {std::string(kModelFileName),
++                                            WordsFileName("hi")};
++  std::vector<const XlitFile*> missing = Missing(present, {"hi", "ta"});
++  ASSERT_EQ(missing.size(), 1u);
++  EXPECT_EQ(missing[0]->name, WordsFileName("ta"));
++}
++
++TEST_F(TarkXlitFilesTest, RemovedLanguageKeepsItsFile) {
++  const XlitFile* ta = FindFile(WordsFileName("ta"));
++  ASSERT_TRUE(ta);
++  // ScanDirectory checks sizes only; a list no longer wanted stays.
++  Write(WordsFileName("ta"), std::string(static_cast<size_t>(ta->size), '\0'));
++  EXPECT_EQ(ScanDirectory(dir_.GetPath()),
++            std::vector<std::string>{WordsFileName("ta")});
++  EXPECT_TRUE(Missing({WordsFileName("ta")}, {"hi"}).size() == 2u);
++}
++
 +}  // namespace
 +}  // namespace tark_xlit
 --- /dev/null
 +++ b/chrome/browser/tark_xlit/xlit_download_service.h
-@@ -0,0 +1,102 @@
+@@ -0,0 +1,104 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -496,6 +516,8 @@
 +  OfferState offer_state() const;
 +  // The languages whose word list is in place, by tag.
 +  std::vector<std::string> DownloadedLanguages() const;
++  // The same, by their own names ("हिन्दी"), in UTF-8, for Settings.
++  std::vector<std::string> DownloadedLanguageNames() const;
 +  // Accepted, something left to download, and waiting for Wi-Fi.
 +  bool IsWaitingForWifi() const;
 +  // Bytes still to download for the row languages, or for `tag` if given.
@@ -541,19 +563,21 @@
 +#endif  // CHROME_BROWSER_TARK_XLIT_XLIT_DOWNLOAD_SERVICE_H_
 --- /dev/null
 +++ b/chrome/browser/tark_xlit/xlit_download_service.cc
-@@ -0,0 +1,315 @@
+@@ -0,0 +1,330 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
 +
 +#include "chrome/browser/tark_xlit/xlit_download_service.h"
 +
++#include <algorithm>
 +#include <utility>
 +
 +#include "base/files/file_util.h"
 +#include "base/functional/bind.h"
 +#include "base/logging.h"
 +#include "base/path_service.h"
++#include "base/strings/utf_string_conversions.h"
 +#include "base/task/thread_pool.h"
 +#include "chrome/browser/browser_process.h"
 +#include "chrome/browser/profiles/profile.h"
@@ -718,6 +742,19 @@
 +    }
 +  }
 +  return tags;
++}
++
++std::vector<std::string> XlitDownloadService::DownloadedLanguageNames() const {
++  std::vector<std::string> names;
++  const base::span<const Language> languages = AllLanguages();
++  for (const std::string& tag : DownloadedLanguages()) {
++    // Konkani has two accept codes and one tag; its first entry names it.
++    const auto language = std::ranges::find(languages, tag, &Language::tag);
++    if (language != languages.end()) {
++      names.push_back(base::UTF16ToUTF8(language->native_name));
++    }
++  }
++  return names;
 +}
 +
 +bool XlitDownloadService::IsWaitingForWifi() const {
@@ -893,7 +930,7 @@
 +}
 --- /dev/null
 +++ b/chrome/browser/tark_xlit/android/tark_xlit_bridge.cc
-@@ -0,0 +1,42 @@
+@@ -0,0 +1,43 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -921,8 +958,9 @@
 +  return static_cast<int32_t>(XlitDownloadService::Get().offer_state());
 +}
 +
-+static std::vector<std::string> JNI_TarkXlitBridge_GetDownloadedLanguages() {
-+  return XlitDownloadService::Get().DownloadedLanguages();
++static std::vector<std::string>
++JNI_TarkXlitBridge_GetDownloadedLanguageNames() {
++  return XlitDownloadService::Get().DownloadedLanguageNames();
 +}
 +
 +static bool JNI_TarkXlitBridge_IsWaitingForWifi() {
@@ -980,9 +1018,9 @@
 +        return TarkXlitBridgeJni.get().getOfferState();
 +    }
 +
-+    /** The languages whose word list is in place, by tag. */
-+    public static String[] getDownloadedLanguages() {
-+        return TarkXlitBridgeJni.get().getDownloadedLanguages();
++    /** The languages whose word list is in place, by their own names ("हिन्दी"). */
++    public static String[] getDownloadedLanguageNames() {
++        return TarkXlitBridgeJni.get().getDownloadedLanguageNames();
 +    }
 +
 +    public static boolean isWaitingForWifi() {
@@ -1003,7 +1041,7 @@
 +        int getOfferState();
 +
 +        @JniType("std::vector<std::string>")
-+        String[] getDownloadedLanguages();
++        String[] getDownloadedLanguageNames();
 +
 +        boolean isWaitingForWifi();
 +
