@@ -351,10 +351,18 @@ class TestDividers(unittest.TestCase):
         patch = (ANDROID / 'patches' / 'look-settings-dividers.patch').read_text()
         files = sorted(l[6:] for l in patch.splitlines() if l.startswith('+++ b/'))
         self.assertEqual(sorted(f.rsplit('/', 1)[1] for f in files),
-                         ['PreferenceListRecyclerView.java', 'RadioButtonWithDescriptionLayout.java', 'WideDisplayPadding.java'])
+                         ['PreferenceListRecyclerView.java', 'RadioButtonWithDescriptionLayout.java',
+                          'SearchEngineSettings.java', 'WideDisplayPadding.java'])
 
     def test_radio_options_and_engines_get_the_hairline(self):
         patch = (ANDROID / 'patches' / 'look-settings-dividers.patch').read_text()
-        self.assertIn('+        setShowDividers(SHOW_DIVIDER_MIDDLE);', patch)
-        self.assertEqual(patch.count('R.color.divider_color'), 2)
+        # Final review: never SHOW_DIVIDER_MIDDLE (it also cuts the controls
+        # attached under an option, and dialogs); lines only between
+        # RadioButtonWithDescription children, only inside a Settings list.
+        self.assertNotIn('SHOW_DIVIDER_MIDDLE', patch)
+        self.assertIn('if (!(child instanceof RadioButtonWithDescription)', patch)
+        self.assertIn('if (parent instanceof RecyclerView) {', patch)
+        # And the search engines' ListView.
+        self.assertIn('+        listView.setDivider(divider);', patch)
+        self.assertEqual(patch.count('divider_color'), 3)
         self.assertIn('-        private static final int[] ATTRS = new int[] {android.R.attr.listDivider};', patch)

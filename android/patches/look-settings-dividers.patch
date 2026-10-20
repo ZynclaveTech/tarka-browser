@@ -17,29 +17,109 @@
          }
 --- a/components/browser_ui/widget/android/java/src/org/chromium/components/browser_ui/widget/RadioButtonWithDescriptionLayout.java
 +++ b/components/browser_ui/widget/android/java/src/org/chromium/components/browser_ui/widget/RadioButtonWithDescriptionLayout.java
-@@ -5,6 +5,7 @@
+@@ -5,13 +5,18 @@
  package org.chromium.components.browser_ui.widget;
  
  import android.content.Context;
-+import android.graphics.drawable.GradientDrawable;
++import android.graphics.Canvas;
++import android.graphics.Paint;
  import android.util.AttributeSet;
  import android.view.View;
  import android.view.ViewGroup;
-@@ -63,6 +64,14 @@
++import android.view.ViewParent;
+ import android.widget.RadioGroup;
+ 
+ import org.chromium.build.annotations.NullMarked;
+ import org.chromium.build.annotations.Nullable;
++import androidx.recyclerview.widget.RecyclerView;
++
+ import org.chromium.ui.base.ViewUtils;
+ 
+ import java.util.ArrayList;
+@@ -54,6 +59,8 @@
+ public final class RadioButtonWithDescriptionLayout extends RadioGroup
+         implements RadioButtonWithDescription.ButtonCheckedStateChangedListener {
+     private final List<RadioButtonWithDescription> mRadioButtonsWithDescriptions;
++    // Tark (A3): set while the group sits in a Settings list.
++    private @Nullable Paint mTarkDividerPaint;
+     private @Nullable OnCheckedChangeListener mOnCheckedChangeListener;
+ 
+     public RadioButtonWithDescriptionLayout(Context context) {
+@@ -63,6 +70,48 @@
      public RadioButtonWithDescriptionLayout(Context context, @Nullable AttributeSet attrs) {
          super(context, attrs);
          mRadioButtonsWithDescriptions = new ArrayList<>();
-+        // Tark (A3): a hairline between the options, as between every Settings row.
-+        GradientDrawable divider = new GradientDrawable();
-+        divider.setColor(
-+                context.getColor(org.chromium.components.browser_ui.styles.R.color.divider_color));
-+        divider.setSize(
-+                0, Math.max(1, Math.round(context.getResources().getDisplayMetrics().density)));
-+        setDividerDrawable(divider);
-+        setShowDividers(SHOW_DIVIDER_MIDDLE);
++    }
++
++    /**
++     * Tark (A3): in a Settings list (a RecyclerView above), a hairline between the options, as
++     * between every Settings row. Never above a control attached under an option (Secure DNS's
++     * provider picker, Theme's checkbox), and not in dialogs.
++     */
++    @Override
++    protected void onAttachedToWindow() {
++        super.onAttachedToWindow();
++        mTarkDividerPaint = null;
++        for (ViewParent parent = getParent(); parent != null; parent = parent.getParent()) {
++            if (parent instanceof RecyclerView) {
++                mTarkDividerPaint = new Paint();
++                mTarkDividerPaint.setColor(
++                        getContext()
++                                .getColor(
++                                        org.chromium.components.browser_ui.styles.R.color
++                                                .divider_color));
++                break;
++            }
++        }
++    }
++
++    @Override
++    protected void dispatchDraw(Canvas canvas) {
++        super.dispatchDraw(canvas);
++        if (mTarkDividerPaint == null) return;
++        float height = Math.max(1, Math.round(getResources().getDisplayMetrics().density));
++        boolean first = true;
++        for (int i = 0; i < getChildCount(); i++) {
++            View child = getChildAt(i);
++            if (!(child instanceof RadioButtonWithDescription)
++                    || child.getVisibility() != View.VISIBLE) {
++                continue;
++            }
++            if (!first) {
++                canvas.drawRect(0, child.getTop(), getWidth(), child.getTop() + height,
++                        mTarkDividerPaint);
++            }
++            first = false;
++        }
      }
  
      @Override
+--- a/chrome/browser/search_engines/android/java/src/org/chromium/chrome/browser/search_engines/settings/SearchEngineSettings.java
++++ b/chrome/browser/search_engines/android/java/src/org/chromium/chrome/browser/search_engines/settings/SearchEngineSettings.java
+@@ -5,6 +5,7 @@
+ package org.chromium.chrome.browser.search_engines.settings;
+ 
+ import android.content.Context;
++import android.graphics.drawable.GradientDrawable;
+ import android.os.Bundle;
+ import android.view.View;
+ import android.widget.ListView;
+@@ -75,7 +76,14 @@
+     public void onViewCreated(View view, @Nullable Bundle savedInstanceState) {
+         super.onViewCreated(view, savedInstanceState);
+         ListView listView = getListView();
+-        listView.setDivider(null);
++        // Tark (A3): the Settings hairline between engines, as between every Settings row.
++        GradientDrawable divider = new GradientDrawable();
++        divider.setColor(
++                requireContext()
++                        .getColor(org.chromium.components.browser_ui.styles.R.color.divider_color));
++        listView.setDivider(divider);
++        listView.setDividerHeight(
++                Math.max(1, Math.round(getResources().getDisplayMetrics().density)));
+         listView.setItemsCanFocus(true);
+ 
+         assert mProfile != null;
 --- a/chrome/browser/search_engines/android/java/src/org/chromium/chrome/browser/search_engines/settings/common/PreferenceListRecyclerView.java
 +++ b/chrome/browser/search_engines/android/java/src/org/chromium/chrome/browser/search_engines/settings/common/PreferenceListRecyclerView.java
 @@ -4,13 +4,11 @@
