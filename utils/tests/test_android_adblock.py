@@ -248,3 +248,91 @@ class TestE2E(unittest.TestCase):
         import run
         self.assertEqual(set(run.CASES['network'][1]),
                          {'blocked', 'exception', 'redirect', 'chain', 'ws', 'worker', 'frame', 'real'})
+
+
+class TestCosmeticPatch(unittest.TestCase):
+    """A2 Task 6: hiding rules and scriptlets."""
+
+    def setUp(self):
+        self.p = patch_text('adblock-cosmetic.patch')
+        self.add = added(self.p)
+
+    def test_in_the_series_after_the_network(self):
+        series = (PATCHES / 'series').read_text().split()
+        self.assertLess(series.index('adblock-network.patch'), series.index('adblock-cosmetic.patch'))
+
+    def test_resources_arrive_before_the_page_scripts(self):
+        # Sync at commit, applied first at document start: YouTube's ads
+        # come through when scriptlets run after the page's scripts.
+        self.assertIn('  [Sync]\n+  UrlCosmeticResources(string url)', self.p.replace('+  [Sync]', '  [Sync]'))
+        self.assertIn('  if (auto* adblock = tark_adblock::FrameObserver::Get(render_frame)) {', self.add)
+        self.assertIn('    adblock->RunScriptsAtDocumentStart();', self.add)
+
+    def test_scriptlets_in_the_page_world_hide_rules_as_user_styles(self):
+        self.assertIn('frame->ExecuteScript(blink::WebScriptSource(', self.add)
+        self.assertIn('const scriptletGlobals = ', self.add)
+        self.assertIn('blink::WebCssOrigin::kUser', self.add)
+
+    def test_one_rule_per_selector(self):
+        self.assertIn('{selector, "{display:none !important}\\n"}', self.add)
+
+    def test_the_site_switch_is_honoured(self):
+        self.assertIn('if (!gurl.SchemeIsHTTPOrHTTPS() || AdsAllowedFor(gurl)) {', self.add)
+
+    def test_bound_for_every_frame(self):
+        self.assertIn('map->Add<tark_adblock::mojom::CosmeticResources>(', self.add)
+        self.assertIn('new tark_adblock::FrameObserver(render_frame);', self.add)
+
+
+class TestUpdater(unittest.TestCase):
+    """A2 Task 7: daily updates (in the engine patch)."""
+
+    def setUp(self):
+        self.add = added(patch_text('adblock-engine.patch'))
+
+    def test_only_gettarka_without_cookies_or_query(self):
+        self.assertIn('constexpr char kListsBase[] = "https://gettarka.com/lists/android/v1/";', self.add)
+        self.assertIn('request->credentials_mode = network::mojom::CredentialsMode::kOmit;', self.add)
+        self.assertIn('std::string(kListsBase) + "latest.json"', self.add)
+
+    def test_schedule(self):
+        self.assertIn('return now - last_success >= base::Hours(24);', self.add)
+        self.assertIn('return now - last_success >= base::Hours(72);', self.add)
+        self.assertIn('timer_.Start(FROM_HERE, base::Hours(6),', self.add)
+
+    def test_never_an_older_bundle(self):
+        self.assertIn('if (!bundle || bundle->created <= current_created) {', self.add)
+
+    def test_unit_tests_built_and_run(self):
+        self.assertIn('test("tark_adblock_unittests") {', self.add)
+        s = (ROOT / 'android' / 'build.sh').read_text()
+        self.assertIn('run "$_src_dir/out/Default/clang_x64/tark_adblock_unittests"', s)
+
+    def test_only_gettarka_is_new(self):
+        hosts = (ROOT / 'android' / 'allowed_hosts.txt').read_text().split()
+        self.assertIn('gettarka.com', hosts)
+
+
+class TestSiteSwitchPatch(unittest.TestCase):
+    """A2 Task 8: "Block ads on this site"."""
+
+    def setUp(self):
+        self.p = patch_text('adblock-site-switch.patch')
+        self.add = added(self.p)
+
+    def test_in_the_series(self):
+        self.assertIn('adblock-site-switch.patch', (PATCHES / 'series').read_text().split())
+
+    def test_the_row_in_page_info(self):
+        self.assertIn('TarkAdblockSiteSwitch.create(', self.add)
+        self.assertIn('"java/src/org/chromium/chrome/browser/page_info/TarkAdblockSiteSwitch.java",', self.add)
+
+    def test_stored_as_the_ads_setting_and_reloads(self):
+        self.assertIn('ContentSettingsType.ADS', self.add)
+        self.assertIn('checked ? ContentSetting.DEFAULT : ContentSetting.ALLOW', self.add)
+        self.assertIn('webContents.getNavigationController().reload(true);', self.add)
+
+    def test_english_and_hindi(self):
+        self.assertIn('<message name="IDS_TARK_PAGE_INFO_BLOCK_ADS"', self.add)
+        self.assertIn('Block ads on this site', self.add)
+        self.assertIn('<translation id="502232591958917855">', self.add)

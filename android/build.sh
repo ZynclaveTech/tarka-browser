@@ -218,4 +218,8 @@ run sed -i "s|^script_executable = .*|script_executable = \"python3\"|" "$_src_d
 run "$_src_dir/out/Default/gn" gen "$_src_dir/out/Default" --root="$_src_dir" --fail-on-unused-args
 # -k 0: one run reports every failing step, not only the first.
 run ninja -k 0 -C "$_src_dir/out/Default" chrome_public_apk
+# A2: the ad blocker's unit tests (list bundle, signature, update schedule),
+# built for this machine and run here.
+run ninja -C "$_src_dir/out/Default" chrome/browser/tark_adblock:host_unittests
+run "$_src_dir/out/Default/clang_x64/tark_adblock_unittests"
 log "built $_src_dir/out/Default/apks/ChromePublic.apk"

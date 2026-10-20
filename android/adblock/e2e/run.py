@@ -4,7 +4,7 @@
 # found in the LICENSE file.
 """End-to-end checks of Tark's ad blocker on the emulator (A2).
 
-    run.py [--serial emulator-5554] [CASES...]     cases: failopen network
+    run.py [--serial emulator-5554] [CASES...]     cases: failopen network cosmetic switch
 
 Serves android/adblock/e2e/site/ from this Mac (adb reverse, port 8000),
 gives the browser the test list extra.txt (--tark-adblock-extra-list, which
@@ -47,6 +47,12 @@ CASES = {
         'worker': 'failed',       # a worker's fetch is checked too
         'frame': 'failed',        # an ad subframe is blocked
         'real': 'failed',         # the shipped lists block adsbygoogle.js
+    }),
+    'cosmetic': ('cosmetic.html', {
+        'scriptlet': 'ran',       # set-constant ran before the first script
+        'trusted': 'ran',         # a trusted-* scriptlet from a mask-1 list
+        'specific': 'hidden',     # 127.0.0.1##.tark-test-ad
+        'generic': 'hidden',      # ##.adsbygoogle, added later by script
     }),
 }
 # Before the engine is ready nothing is blocked and pages still load.
@@ -136,8 +142,47 @@ class Device:
         return None
 
 
-def check(dev, page, expected):
-    url = f'http://127.0.0.1:{PORT}/{page}?{time.time_ns()}'
+def tap_text(dev, text, tries=5):
+    """Taps the on-screen element whose text is `text` (uiautomator)."""
+    import re
+    for _ in range(tries):
+        dev.shell('uiautomator', 'dump', '/sdcard/ui.xml')
+        xml = dev.shell('cat', '/sdcard/ui.xml')
+        m = re.search(r'text="' + re.escape(text) + r'"[^>]*bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"', xml)
+        if m:
+            x1, y1, x2, y2 = map(int, m.groups())
+            dev.shell('input', 'tap', str((x1 + x2) // 2), str((y1 + y2) // 2))
+            return True
+        time.sleep(1)
+    return False
+
+
+def switch(dev):
+    """'Block ads on this site' off for 127.0.0.1: its test ad loads; localhost
+    (another site) stays blocked; after a restart 127.0.0.1 is still off.
+    Turned back on at the end."""
+    failed = check(dev, 'net.html', {'blocked': 'failed'})
+    dev.shell('input', 'tap', '60', '136')          # the page's status icon
+    time.sleep(2)
+    ok = tap_text(dev, 'Block ads on this site')
+    print(f'{"ok  " if ok else "FAIL"}  switch row in page info')
+    failed += not ok
+    time.sleep(4)                                     # the page reloads
+    failed += check(dev, 'net.html', {'blocked': 'loaded'})
+    failed += check(dev, 'net.html', {'blocked': 'failed'}, host='localhost')
+    dev.shell('am', 'force-stop', PACKAGE)
+    dev.open('about:blank')
+    dev.wait_ready()
+    failed += check(dev, 'net.html', {'blocked': 'loaded'})
+    dev.shell('input', 'tap', '60', '136')
+    time.sleep(2)
+    tap_text(dev, 'Block ads on this site')
+    time.sleep(4)
+    return failed
+
+
+def check(dev, page, expected, host='127.0.0.1'):
+    url = f'http://{host}:{PORT}/{page}?{time.time_ns()}'
     dev.open(url)
     results = dev.wait_results(url)
     failed = 0
@@ -152,7 +197,7 @@ def check(dev, page, expected):
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument('--serial', default='emulator-5554')
-    ap.add_argument('cases', nargs='*', default=['failopen'] + list(CASES))
+    ap.add_argument('cases', nargs='*', default=['failopen'] + list(CASES) + ['switch'])
     args = ap.parse_args(argv)
     if not args.serial.startswith('emulator-'):
         print(f'{args.serial} is not an emulator: the test list needs root', file=sys.stderr)
@@ -178,7 +223,7 @@ def main(argv=None):
                 print('FAIL  the engine never reported ready')
                 return 1
             for case in rest:
-                failed += check(dev, *CASES[case])
+                failed += switch(dev) if case == 'switch' else check(dev, *CASES[case])
     finally:
         dev.teardown()
         server.shutdown()

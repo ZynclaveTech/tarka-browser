@@ -46,7 +46,10 @@ class TestAllowedHosts(unittest.TestCase):
     def test_mac_list_without_ublock_and_web_store(self):
         android = load_allowed(REPO / 'android' / 'allowed_hosts.txt')
         mac = load_allowed(REPO / 'utils' / 'allowed_hosts.txt')
-        self.assertLessEqual(android, mac)
+        # A2: the ad blocker's daily lists come from gettarka.com, a host only
+        # Tark for Android contacts.
+        self.assertLessEqual(android - {'gettarka.com'}, mac)
+        self.assertIn('gettarka.com', android)
         self.assertIn('shodhya.com', android)
         self.assertIn('api.shodhya.com', android)
         # Widevine on Android comes from the OS (MediaDrm), not the component

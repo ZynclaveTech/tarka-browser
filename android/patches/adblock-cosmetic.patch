@@ -1,0 +1,541 @@
+--- /dev/null
++++ b/chrome/common/tark_adblock/BUILD.gn
+@@ -0,0 +1,10 @@
++# Copyright 2026 The Tark Authors
++# Use of this source code is governed by a BSD-style license that can be
++# found in the LICENSE file.
++
++import("//mojo/public/tools/bindings/mojom.gni")
++
++mojom("mojom") {
++  sources = [ "tark_adblock.mojom" ]
++  public_deps = [ "//mojo/public/mojom/base" ]
++}
+--- /dev/null
++++ b/chrome/common/tark_adblock/tark_adblock.mojom
+@@ -0,0 +1,22 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++module tark_adblock.mojom;
++
++import "mojo/public/mojom/base/values.mojom";
++
++// A frame asks Tark's ad blocker (browser process) what to hide and which
++// scriptlets to run on its page (spec §4).
++interface CosmeticResources {
++  // adblock-rust's UrlSpecificResources for the page about to commit:
++  // hide_selectors, exceptions, injected_script, generichide (empty when
++  // blocking is off for the site). Sync: the scriptlets must run before the
++  // page's own scripts (YouTube's ads need that).
++  [Sync]
++  UrlCosmeticResources(string url) => (mojo_base.mojom.DictionaryValue resources);
++
++  // The generic hide selectors for class and id names seen on the page.
++  HiddenClassIdSelectors(array<string> classes, array<string> ids,
++                         array<string> exceptions) => (array<string> selectors);
++};
+--- /dev/null
++++ b/chrome/browser/tark_adblock/tark_adblock_cosmetic_resources.cc
+@@ -0,0 +1,99 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/tark_adblock/tark_adblock_cosmetic_resources.h"
++
++#include <memory>
++#include <optional>
++#include <string>
++#include <utility>
++#include <vector>
++
++#include "base/functional/bind.h"
++#include "base/values.h"
++#include "chrome/browser/content_settings/host_content_settings_map_factory.h"
++#include "chrome/browser/tark_adblock/tark_adblock_proxying_url_loader_factory.h"
++#include "chrome/browser/tark_adblock/tark_adblock_service.h"
++#include "content/public/browser/global_routing_id.h"
++#include "content/public/browser/render_frame_host.h"
++#include "mojo/public/cpp/bindings/self_owned_receiver.h"
++#include "url/gurl.h"
++#include "url/origin.h"
++
++namespace tark_adblock {
++
++namespace {
++
++class CosmeticResourcesImpl : public mojom::CosmeticResources {
++ public:
++  explicit CosmeticResourcesImpl(content::GlobalRenderFrameHostId frame_id)
++      : frame_id_(frame_id) {}
++  CosmeticResourcesImpl(const CosmeticResourcesImpl&) = delete;
++  CosmeticResourcesImpl& operator=(const CosmeticResourcesImpl&) = delete;
++  ~CosmeticResourcesImpl() override = default;
++
++  // mojom::CosmeticResources:
++  void UrlCosmeticResources(const std::string& url,
++                            UrlCosmeticResourcesCallback callback) override {
++    const GURL gurl(url);
++    if (!gurl.SchemeIsHTTPOrHTTPS() || AdsAllowedFor(gurl)) {
++      std::move(callback).Run(base::DictValue());
++      return;
++    }
++    AdblockService::Get()->UrlCosmeticResources(gurl, std::move(callback));
++  }
++
++  void HiddenClassIdSelectors(
++      const std::vector<std::string>& classes,
++      const std::vector<std::string>& ids,
++      const std::vector<std::string>& exceptions,
++      HiddenClassIdSelectorsCallback callback) override {
++    AdblockService::Get()->HiddenClassIdSelectors(
++        classes, ids, exceptions,
++        base::BindOnce(
++            [](HiddenClassIdSelectorsCallback callback,
++               base::ListValue selectors) {
++              std::vector<std::string> out;
++              for (const base::Value& selector : selectors) {
++                if (selector.is_string()) {
++                  out.push_back(selector.GetString());
++                }
++              }
++              std::move(callback).Run(std::move(out));
++            },
++            std::move(callback)));
++  }
++
++ private:
++  // Whether "Block ads on this site" is off for the page's top frame. For a
++  // main frame the page is the one about to commit, `url`.
++  bool AdsAllowedFor(const GURL& url) const {
++    content::RenderFrameHost* frame =
++        content::RenderFrameHost::FromID(frame_id_);
++    if (!frame) {
++      return false;
++    }
++    const std::optional<url::Origin> top =
++        frame->GetParentOrOuterDocument()
++            ? frame->GetOutermostMainFrame()->GetLastCommittedOrigin()
++            : url::Origin::Create(url);
++    return AdsAllowed(
++        HostContentSettingsMapFactory::GetForProfile(frame->GetBrowserContext()),
++        top);
++  }
++
++  const content::GlobalRenderFrameHostId frame_id_;
++};
++
++}  // namespace
++
++void BindCosmeticResources(
++    content::RenderFrameHost* frame,
++    mojo::PendingReceiver<mojom::CosmeticResources> receiver) {
++  mojo::MakeSelfOwnedReceiver(
++      std::make_unique<CosmeticResourcesImpl>(frame->GetGlobalId()),
++      std::move(receiver));
++}
++
++}  // namespace tark_adblock
+--- /dev/null
++++ b/chrome/browser/tark_adblock/tark_adblock_cosmetic_resources.h
+@@ -0,0 +1,24 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_TARK_ADBLOCK_TARK_ADBLOCK_COSMETIC_RESOURCES_H_
++#define CHROME_BROWSER_TARK_ADBLOCK_TARK_ADBLOCK_COSMETIC_RESOURCES_H_
++
++#include "chrome/common/tark_adblock/tark_adblock.mojom.h"
++#include "mojo/public/cpp/bindings/pending_receiver.h"
++
++namespace content {
++class RenderFrameHost;
++}  // namespace content
++
++namespace tark_adblock {
++
++// Binds a frame's CosmeticResources (chrome_browser_interface_binders.cc).
++void BindCosmeticResources(
++    content::RenderFrameHost* frame,
++    mojo::PendingReceiver<mojom::CosmeticResources> receiver);
++
++}  // namespace tark_adblock
++
++#endif  // CHROME_BROWSER_TARK_ADBLOCK_TARK_ADBLOCK_COSMETIC_RESOURCES_H_
+--- /dev/null
++++ b/chrome/renderer/tark_adblock/tark_adblock_frame_observer.cc
+@@ -0,0 +1,216 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/renderer/tark_adblock/tark_adblock_frame_observer.h"
++
++#include <memory>
++#include <utility>
++
++#include "base/functional/bind.h"
++#include "base/strings/strcat.h"
++#include "base/time/time.h"
++#include "chrome/common/chrome_isolated_world_ids.h"
++#include "content/public/renderer/render_frame.h"
++#include "content/public/renderer/v8_value_converter.h"
++#include "third_party/blink/public/common/browser_interface_broker_proxy.h"
++#include "third_party/blink/public/platform/scheduler/web_agent_group_scheduler.h"
++#include "third_party/blink/public/platform/web_string.h"
++#include "third_party/blink/public/platform/web_url.h"
++#include "third_party/blink/public/web/web_document.h"
++#include "third_party/blink/public/web/web_document_loader.h"
++#include "third_party/blink/public/web/web_local_frame.h"
++#include "third_party/blink/public/web/web_script_source.h"
++#include "url/gurl.h"
++#include "v8/include/v8-context.h"
++#include "v8/include/v8-isolate.h"
++#include "v8/include/v8-local-handle.h"
++
++namespace tark_adblock {
++
++namespace {
++
++// Chromium's world for internal features; the collector keeps to one
++// global, so nothing else that runs there is disturbed.
++constexpr int kWorldId = ISOLATED_WORLD_ID_CHROME_INTERNAL;
++
++// uBlock Origin's scriptlets expect `scriptletGlobals` (as brave-core
++// provides it: a Map that also answers property reads).
++constexpr char kScriptletPrelude[] = R"js(
++const scriptletGlobals = (() => {
++  const methods = ['has', 'get', 'set'];
++  return new Proxy(new Map(), {
++    get(target, prop) {
++      return methods.includes(prop) ? Map.prototype[prop].bind(target)
++                                    : target.get(prop);
++    },
++    set(target, prop, value) {
++      if (!methods.includes(prop)) target.set(prop, value);
++      return true;
++    },
++  });
++})();
++)js";
++
++// Runs in the isolated world: gathers class and id names as elements appear
++// or change; __tarkAdblockCollect() hands over the new ones.
++constexpr char kCollectorScript[] = R"js((() => {
++  if (window.__tarkAdblockCollect) return;
++  const seen = new Set();
++  let classes = [], ids = [];
++  const add = (el) => {
++    if (el.id && !seen.has('#' + el.id)) { seen.add('#' + el.id); ids.push(el.id); }
++    if (el.classList) {
++      for (const c of el.classList) {
++        if (!seen.has('.' + c)) { seen.add('.' + c); classes.push(c); }
++      }
++    }
++  };
++  const scan = (node) => {
++    if (node.nodeType !== Node.ELEMENT_NODE) return;
++    add(node);
++    for (const el of node.querySelectorAll('[id],[class]')) add(el);
++  };
++  new MutationObserver((records) => {
++    for (const r of records) {
++      if (r.type === 'attributes') add(r.target);
++      else for (const n of r.addedNodes) scan(n);
++    }
++  }).observe(document, {subtree: true, childList: true, attributes: true,
++                        attributeFilter: ['id', 'class']});
++  if (document.documentElement) scan(document.documentElement);
++  window.__tarkAdblockCollect = () => {
++    const out = [classes, ids];
++    classes = [];
++    ids = [];
++    return out;
++  };
++})();)js";
++
++std::vector<std::string> Strings(const base::ListValue* list) {
++  std::vector<std::string> out;
++  if (list) {
++    for (const base::Value& value : *list) {
++      if (value.is_string()) {
++        out.push_back(value.GetString());
++      }
++    }
++  }
++  return out;
++}
++
++}  // namespace
++
++FrameObserver::FrameObserver(content::RenderFrame* render_frame)
++    : content::RenderFrameObserver(render_frame),
++      content::RenderFrameObserverTracker<FrameObserver>(render_frame) {}
++
++FrameObserver::~FrameObserver() = default;
++
++void FrameObserver::OnDestruct() {
++  delete this;
++}
++
++mojom::CosmeticResources* FrameObserver::Resources() {
++  if (!remote_.is_bound()) {
++    render_frame()->GetBrowserInterfaceBroker().GetInterface(
++        remote_.BindNewPipeAndPassReceiver());
++    remote_.reset_on_disconnect();
++  }
++  return remote_.get();
++}
++
++void FrameObserver::ReadyToCommitNavigation(
++    blink::WebDocumentLoader* document_loader) {
++  resources_.reset();
++  exceptions_.clear();
++  collect_timer_.Stop();
++  collect_count_ = 0;
++  weak_factory_.InvalidateWeakPtrs();
++  const GURL url(document_loader->GetUrl());
++  if (!url.SchemeIsHTTPOrHTTPS()) {
++    return;
++  }
++  // Synchronous: the page's scriptlets must be ready before its scripts run.
++  base::DictValue resources;
++  if (Resources()->UrlCosmeticResources(url.spec(), &resources) &&
++      !resources.empty()) {
++    resources_ = std::move(resources);
++  }
++}
++
++void FrameObserver::RunScriptsAtDocumentStart() {
++  if (!resources_) {
++    return;
++  }
++  blink::WebLocalFrame* frame = render_frame()->GetWebFrame();
++  const std::string* script = resources_->FindString("injected_script");
++  if (script && !script->empty()) {
++    frame->ExecuteScript(blink::WebScriptSource(blink::WebString::FromUTF8(
++        base::StrCat({"(function() {\n", kScriptletPrelude, *script,
++                      "\n})();"}))));
++  }
++  InsertHideRules(Strings(resources_->FindList("hide_selectors")));
++  exceptions_ = Strings(resources_->FindList("exceptions"));
++  if (!resources_->FindBool("generichide").value_or(false)) {
++    frame->ExecuteScriptInIsolatedWorld(
++        kWorldId, blink::WebScriptSource(blink::WebString::FromUTF8(
++                      kCollectorScript)),
++        blink::BackForwardCacheAware::kAllow);
++    ScheduleCollect();
++  }
++}
++
++void FrameObserver::InsertHideRules(const std::vector<std::string>& selectors) {
++  if (selectors.empty()) {
++    return;
++  }
++  // One rule per selector: one the browser cannot parse drops only itself.
++  std::string css;
++  for (const std::string& selector : selectors) {
++    base::StrAppend(&css, {selector, "{display:none !important}\n"});
++  }
++  render_frame()->GetWebFrame()->GetDocument().InsertStyleSheet(
++      blink::WebString::FromUTF8(css), nullptr, blink::WebCssOrigin::kUser);
++}
++
++void FrameObserver::ScheduleCollect() {
++  // Often while the page builds itself, then every two seconds.
++  const base::TimeDelta delay = collect_count_ < 20 ? base::Milliseconds(500)
++                                                    : base::Seconds(2);
++  collect_timer_.Start(FROM_HERE, delay,
++                       base::BindOnce(&FrameObserver::Collect,
++                                      base::Unretained(this)));
++}
++
++void FrameObserver::Collect() {
++  ++collect_count_;
++  blink::WebLocalFrame* frame = render_frame()->GetWebFrame();
++  v8::Isolate* isolate = frame->GetAgentGroupScheduler()->Isolate();
++  v8::HandleScope handle_scope(isolate);
++  v8::Local<v8::Value> result = frame->ExecuteScriptInIsolatedWorldAndReturnValue(
++      kWorldId,
++      blink::WebScriptSource(blink::WebString::FromUTF8(
++          "window.__tarkAdblockCollect ? __tarkAdblockCollect() : null")),
++      blink::BackForwardCacheAware::kAllow);
++  v8::Local<v8::Context> context =
++      frame->GetScriptContextFromWorldId(isolate, kWorldId);
++  std::unique_ptr<base::Value> value =
++      result.IsEmpty() || context.IsEmpty()
++          ? nullptr
++          : content::V8ValueConverter::Create()->FromV8Value(result, context);
++  if (value && value->is_list() && value->GetList().size() == 2 &&
++      value->GetList()[0].is_list() && value->GetList()[1].is_list()) {
++    std::vector<std::string> classes = Strings(&value->GetList()[0].GetList());
++    std::vector<std::string> ids = Strings(&value->GetList()[1].GetList());
++    if (!classes.empty() || !ids.empty()) {
++      Resources()->HiddenClassIdSelectors(
++          classes, ids, exceptions_,
++          base::BindOnce(&FrameObserver::InsertHideRules,
++                         weak_factory_.GetWeakPtr()));
++    }
++  }
++  ScheduleCollect();
++}
++
++}  // namespace tark_adblock
+--- /dev/null
++++ b/chrome/renderer/tark_adblock/tark_adblock_frame_observer.h
+@@ -0,0 +1,61 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_RENDERER_TARK_ADBLOCK_TARK_ADBLOCK_FRAME_OBSERVER_H_
++#define CHROME_RENDERER_TARK_ADBLOCK_TARK_ADBLOCK_FRAME_OBSERVER_H_
++
++#include <optional>
++#include <string>
++#include <vector>
++
++#include "base/memory/weak_ptr.h"
++#include "base/timer/timer.h"
++#include "base/values.h"
++#include "chrome/common/tark_adblock/tark_adblock.mojom.h"
++#include "content/public/renderer/render_frame_observer.h"
++#include "content/public/renderer/render_frame_observer_tracker.h"
++#include "mojo/public/cpp/bindings/remote.h"
++
++namespace tark_adblock {
++
++// Tark's ad blocker in a frame (spec §4), as brave-core's cosmetic filters
++// do it: at commit the frame asks the browser (synchronously) for its page's
++// resources; at document start, before the page's own scripts, it runs the
++// scriptlets in the page's world and hides the page's selectors with a user
++// stylesheet; then a small script in an isolated world collects class and id
++// names as they appear, and the generic rules for them are hidden too.
++// uBlock Origin's behaviour: no first-party exemptions.
++class FrameObserver : public content::RenderFrameObserver,
++                      public content::RenderFrameObserverTracker<FrameObserver> {
++ public:
++  explicit FrameObserver(content::RenderFrame* render_frame);
++  FrameObserver(const FrameObserver&) = delete;
++  FrameObserver& operator=(const FrameObserver&) = delete;
++  ~FrameObserver() override;
++
++  // From ChromeContentRendererClient::RunScriptsAtDocumentStart, first.
++  void RunScriptsAtDocumentStart();
++
++ private:
++  // content::RenderFrameObserver:
++  void ReadyToCommitNavigation(
++      blink::WebDocumentLoader* document_loader) override;
++  void OnDestruct() override;
++
++  mojom::CosmeticResources* Resources();
++  void InsertHideRules(const std::vector<std::string>& selectors);
++  void ScheduleCollect();
++  void Collect();
++
++  mojo::Remote<mojom::CosmeticResources> remote_;
++  std::optional<base::DictValue> resources_;
++  std::vector<std::string> exceptions_;
++  base::OneShotTimer collect_timer_;
++  int collect_count_ = 0;
++  base::WeakPtrFactory<FrameObserver> weak_factory_{this};
++};
++
++}  // namespace tark_adblock
++
++#endif  // CHROME_RENDERER_TARK_ADBLOCK_TARK_ADBLOCK_FRAME_OBSERVER_H_
+--- a/chrome/browser/BUILD.gn
++++ b/chrome/browser/BUILD.gn
+@@ -1639,6 +1639,8 @@
+   if (is_android) {
+     # Tark's ad blocker (A2, spec §4).
+     sources += [
++      "tark_adblock/tark_adblock_cosmetic_resources.cc",
++      "tark_adblock/tark_adblock_cosmetic_resources.h",
+       "tark_adblock/tark_adblock_proxying_url_loader_factory.cc",
+       "tark_adblock/tark_adblock_proxying_url_loader_factory.h",
+       "tark_adblock/tark_adblock_service.cc",
+@@ -1648,6 +1650,7 @@
+     ]
+     deps += [
+       "//chrome/browser/tark_adblock:bundle",
++      "//chrome/common/tark_adblock:mojom",
+       "//third_party/brave_adblock",
+     ]
+   }
+--- a/chrome/browser/chrome_browser_interface_binders.cc
++++ b/chrome/browser/chrome_browser_interface_binders.cc
+@@ -33,6 +33,7 @@
+ #include "chrome/browser/signin/identity_manager_factory.h"
+ #include "chrome/browser/speech/on_device_speech_recognition_impl.h"
+ #include "chrome/browser/ssl/chrome_security_state_util.h"
++#include "chrome/browser/tark_adblock/tark_adblock_cosmetic_resources.h"
+ #include "chrome/browser/translate/translate_frame_binder.h"
+ #include "chrome/browser/ui/search_engines/search_engine_tab_helper.h"
+ #include "chrome/common/buildflags.h"
+@@ -435,6 +436,10 @@
+   }
+   map->Add<image_annotation::mojom::Annotator>(&BindImageAnnotator);
+ 
++  // Tark (A2): the ad blocker's page resources (spec §4).
++  map->Add<tark_adblock::mojom::CosmeticResources>(
++      &tark_adblock::BindCosmeticResources);
++
+   map->Add<blink::mojom::ScriptToolHost>(
+       &actor::ActorScriptToolReceiver::Create);
+ 
+--- a/chrome/renderer/BUILD.gn
++++ b/chrome/renderer/BUILD.gn
+@@ -338,10 +338,15 @@
+       "net/page_auto_fetcher_helper_android.h",
+       "sandbox_status_extension_android.cc",
+       "sandbox_status_extension_android.h",
++      "tark_adblock/tark_adblock_frame_observer.cc",
++      "tark_adblock/tark_adblock_frame_observer.h",
+       "wallet/boarding_pass_extractor.cc",
+       "wallet/boarding_pass_extractor.h",
+     ]
+-    deps += [ "//chrome/common/wallet:mojo_bindings" ]
++    deps += [
++      "//chrome/common/tark_adblock:mojom",
++      "//chrome/common/wallet:mojo_bindings",
++    ]
+   } else {
+     sources += [
+       "accessibility/phrase_segmentation/base_phrase_segmenter.cc",
+--- a/chrome/renderer/chrome_content_renderer_client.cc
++++ b/chrome/renderer/chrome_content_renderer_client.cc
+@@ -74,6 +74,7 @@
+ #include "chrome/renderer/v8_unwinder.h"
+ #include "chrome/renderer/websocket_handshake_throttle_provider_impl.h"
+ #include "chrome/renderer/webui_browser/webui_browser_renderer_extension.h"
++#include "chrome/renderer/tark_adblock/tark_adblock_frame_observer.h"
+ #include "chrome/renderer/worker_content_settings_client.h"
+ #include "chrome/services/speech/buildflags/buildflags.h"
+ #include "components/autofill/content/renderer/autofill_agent.h"
+@@ -653,6 +654,9 @@
+ 
+   new prerender::NoStatePrefetchRenderFrameObserver(render_frame);
+ 
++  // Tark (A2): the ad blocker's scriptlets and hide rules (spec §4).
++  new tark_adblock::FrameObserver(render_frame);
++
+   auto content_settings_delegate =
+       std::make_unique<ChromeContentSettingsAgentDelegate>(render_frame);
+ #if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
+@@ -1457,6 +1461,11 @@
+ 
+ void ChromeContentRendererClient::RunScriptsAtDocumentStart(
+     content::RenderFrame* render_frame) {
++  // Tark (A2): the ad blocker first, so its scriptlets run before any other
++  // script on the page.
++  if (auto* adblock = tark_adblock::FrameObserver::Get(render_frame)) {
++    adblock->RunScriptsAtDocumentStart();
++  }
+ #if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
+   extensions::ExtensionsRendererClient::Get()->RunScriptsAtDocumentStart(
+       render_frame);
