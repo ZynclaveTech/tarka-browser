@@ -215,9 +215,771 @@
 +
 +}  // namespace
 +}  // namespace tark_captions
+--- /dev/null
++++ b/components/tark_captions/caption_model_store.h
+@@ -0,0 +1,112 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef COMPONENTS_TARK_CAPTIONS_CAPTION_MODEL_STORE_H_
++#define COMPONENTS_TARK_CAPTIONS_CAPTION_MODEL_STORE_H_
++
++#include <cstdint>
++#include <map>
++#include <memory>
++
++#include "base/containers/span.h"
++#include "base/files/file_path.h"
++#include "base/memory/scoped_refptr.h"
++#include "base/memory/weak_ptr.h"
++#include "base/observer_list.h"
++#include "base/observer_list_types.h"
++#include "base/sequence_checker.h"
++#include "base/task/sequenced_task_runner.h"
++#include "components/tark_captions/model_manifest.h"
++#include "net/traffic_annotation/network_traffic_annotation.h"
++#include "url/gurl.h"
++
++namespace network {
++class SharedURLLoaderFactory;
++class SimpleURLLoader;
++}  // namespace network
++
++namespace tark_captions {
++
++// The live captions models on this Mac (D4 Phase 4): which download units
++// are ready, and getting the rest from gettarka.com. Each file is
++// downloaded to `models_dir/.download/`, checked against the manifest's size
++// and SHA-256, then moved into place; a unit is ready once a marker for the
++// manifest's files is written. Models a developer copied by hand are
++// checked once and then trusted the same way. Use on one sequence.
++class CaptionModelStore {
++ public:
++  enum class State { kChecking, kMissing, kDownloading, kReady, kFailed };
++  struct Status {
++    State state = State::kChecking;
++    int64_t done = 0;   // Bytes downloaded so far.
++    int64_t total = 0;  // The unit's size.
++  };
++
++  class Observer : public base::CheckedObserver {
++   public:
++    virtual void OnModelStatusChanged(ModelUnit unit) = 0;
++  };
++
++  CaptionModelStore(const base::FilePath& models_dir,
++                    scoped_refptr<network::SharedURLLoaderFactory> factory,
++                    const GURL& base_url,
++                    base::span<const ModelUnitInfo> manifest,
++                    const net::NetworkTrafficAnnotationTag& annotation);
++  CaptionModelStore(const CaptionModelStore&) = delete;
++  CaptionModelStore& operator=(const CaptionModelStore&) = delete;
++  ~CaptionModelStore();
++
++  Status status(ModelUnit unit) const;
++  bool ready(ModelUnit unit) const { return status(unit).state == State::kReady; }
++
++  // Starts getting `unit` (also a retry after kFailed); nothing if it is
++  // ready, downloading or still being checked.
++  void Download(ModelUnit unit);
++  void Cancel(ModelUnit unit);
++  // Deletes a ready unit's files. False while it is in use or downloading.
++  bool Remove(ModelUnit unit);
++  // A call is using the unit: it can't be removed.
++  void SetInUse(ModelUnit unit, bool in_use);
++  bool in_use(ModelUnit unit) const;
++  // The size of the units that are ready.
++  int64_t BytesOnDisk() const;
++
++  void AddObserver(Observer* observer);
++  void RemoveObserver(Observer* observer);
++
++ private:
++  struct Unit {
++    Status status;
++    bool in_use = false;
++    size_t next_file = 0;
++    int64_t done_before_file = 0;
++    std::unique_ptr<network::SimpleURLLoader> loader;
++  };
++
++  const ModelUnitInfo* Info(ModelUnit unit) const;
++  void OnChecked(ModelUnit unit, bool ready);
++  void StartNextFile(ModelUnit unit);
++  void OnProgress(ModelUnit unit, uint64_t current);
++  void OnFileDownloaded(ModelUnit unit, base::FilePath path);
++  void OnFileVerified(ModelUnit unit, bool ok);
++  void OnMarkerWritten(ModelUnit unit, bool ok);
++  void Fail(ModelUnit unit);
++  void Notify(ModelUnit unit);
++
++  const base::FilePath models_dir_;
++  scoped_refptr<network::SharedURLLoaderFactory> factory_;
++  const GURL base_url_;
++  const base::span<const ModelUnitInfo> manifest_;
++  const net::NetworkTrafficAnnotationTag annotation_;
++  // File work (checking, hashing, moving) runs here, in order.
++  scoped_refptr<base::SequencedTaskRunner> files_;
++  std::map<ModelUnit, Unit> units_;
++  base::ObserverList<Observer> observers_;
++  SEQUENCE_CHECKER(sequence_checker_);
++  base::WeakPtrFactory<CaptionModelStore> weak_factory_{this};
++};
++
++}  // namespace tark_captions
++
++#endif  // COMPONENTS_TARK_CAPTIONS_CAPTION_MODEL_STORE_H_
+--- /dev/null
++++ b/components/tark_captions/caption_model_store.cc
+@@ -0,0 +1,357 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/tark_captions/caption_model_store.h"
++
++#include <string>
++#include <utility>
++
++#include "base/files/file.h"
++#include "base/files/file_util.h"
++#include "base/functional/bind.h"
++#include "base/logging.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/strings/string_util.h"
++#include "base/task/thread_pool.h"
++#include "crypto/hash.h"
++#include "services/network/public/cpp/resource_request.h"
++#include "services/network/public/cpp/shared_url_loader_factory.h"
++#include "services/network/public/cpp/simple_url_loader.h"
++#include "services/network/public/mojom/fetch_api.mojom-shared.h"
++
++namespace tark_captions {
++namespace {
++
++constexpr char kDownloadDir[] = ".download";
++
++base::FilePath PathOf(const base::FilePath& dir, const ModelFile& file) {
++  return dir.AppendASCII(file.path);
++}
++
++base::FilePath MarkerOf(const base::FilePath& dir, const ModelUnitInfo& info) {
++  return dir.AppendASCII(std::string(".ready-") + info.id);
++}
++
++// What the marker holds: the manifest's hashes, so a new manifest (new
++// models) is not mistaken for the old one.
++std::string Fingerprint(const ModelUnitInfo& info) {
++  std::string out;
++  for (const ModelFile& file : info.files) {
++    out += std::string(file.path) + " " + file.sha256 + "\n";
++  }
++  return out;
++}
++
++bool HashMatches(const base::FilePath& path, const ModelFile& file) {
++  base::File in(path, base::File::FLAG_OPEN | base::File::FLAG_READ);
++  if (!in.IsValid() || in.GetLength() != file.size) {
++    return false;
++  }
++  crypto::hash::Hasher hasher(crypto::hash::HashKind::kSha256);
++  std::vector<uint8_t> buffer(1 << 20);
++  while (true) {
++    std::optional<size_t> read = in.ReadAtCurrentPos(buffer);
++    if (!read) {
++      return false;
++    }
++    if (*read == 0) {
++      break;
++    }
++    hasher.Update(base::span(buffer).first(*read));
++  }
++  std::array<uint8_t, crypto::hash::kSha256Size> digest;
++  hasher.Finish(digest);
++  return base::HexEncodeLower(digest) == file.sha256;
++}
++
++bool SizesMatch(const base::FilePath& dir, const ModelUnitInfo& info) {
++  for (const ModelFile& file : info.files) {
++    std::optional<int64_t> size = base::GetFileSize(PathOf(dir, file));
++    if (!size || *size != file.size) {
++      return false;
++    }
++  }
++  return true;
++}
++
++// Blocking: whether `info` is on disk. A marker for this manifest and the
++// right sizes are enough; without a marker every file is hashed once.
++bool CheckUnit(const base::FilePath& dir, const ModelUnitInfo& info) {
++  if (!SizesMatch(dir, info)) {
++    return false;
++  }
++  std::string marker;
++  if (base::ReadFileToString(MarkerOf(dir, info), &marker) && marker == Fingerprint(info)) {
++    return true;
++  }
++  for (const ModelFile& file : info.files) {
++    if (!HashMatches(PathOf(dir, file), file)) {
++      return false;
++    }
++  }
++  return base::WriteFile(MarkerOf(dir, info), Fingerprint(info));
++}
++
++// Blocking: checks a downloaded file and moves it into place, or deletes it.
++bool VerifyAndPlace(const base::FilePath& dir, const ModelFile& file, const base::FilePath& path) {
++  const bool ok = HashMatches(path, file) && base::CreateDirectory(PathOf(dir, file).DirName()) &&
++                  base::Move(path, PathOf(dir, file));
++  if (!ok) {
++    base::DeleteFile(path);
++  }
++  return ok;
++}
++
++void DeleteUnit(const base::FilePath& dir, const ModelUnitInfo& info) {
++  base::DeleteFile(MarkerOf(dir, info));
++  for (const ModelFile& file : info.files) {
++    base::DeleteFile(PathOf(dir, file));
++    // Empty folders it leaves (it2_indic_en/) go too; full ones stay.
++    if (PathOf(dir, file).DirName() != dir) {
++      base::DeleteFile(PathOf(dir, file).DirName());
++    }
++  }
++}
++
++}  // namespace
++
++CaptionModelStore::CaptionModelStore(const base::FilePath& models_dir,
++                                     scoped_refptr<network::SharedURLLoaderFactory> factory,
++                                     const GURL& base_url,
++                                     base::span<const ModelUnitInfo> manifest,
++                                     const net::NetworkTrafficAnnotationTag& annotation)
++    : models_dir_(models_dir),
++      factory_(std::move(factory)),
++      base_url_(base_url),
++      manifest_(manifest),
++      annotation_(annotation),
++      files_(base::ThreadPool::CreateSequencedTaskRunner(
++          {base::MayBlock(), base::TaskPriority::USER_VISIBLE,
++           base::TaskShutdownBehavior::SKIP_ON_SHUTDOWN})) {
++  // Partial files from a download that never finished are never models.
++  files_->PostTask(FROM_HERE, base::BindOnce(
++                                  [](const base::FilePath& dir) {
++                                    base::DeletePathRecursively(dir.AppendASCII(kDownloadDir));
++                                  },
++                                  models_dir_));
++  for (const ModelUnitInfo& info : manifest_) {
++    Unit& unit = units_[info.unit];
++    unit.status.total = UnitSize(info);
++    files_->PostTaskAndReplyWithResult(
++        FROM_HERE, base::BindOnce(&CheckUnit, models_dir_, info),
++        base::BindOnce(&CaptionModelStore::OnChecked, weak_factory_.GetWeakPtr(), info.unit));
++  }
++}
++
++CaptionModelStore::~CaptionModelStore() = default;
++
++const ModelUnitInfo* CaptionModelStore::Info(ModelUnit unit) const {
++  for (const ModelUnitInfo& info : manifest_) {
++    if (info.unit == unit) {
++      return &info;
++    }
++  }
++  return nullptr;
++}
++
++CaptionModelStore::Status CaptionModelStore::status(ModelUnit unit) const {
++  auto it = units_.find(unit);
++  return it == units_.end() ? Status() : it->second.status;
++}
++
++bool CaptionModelStore::in_use(ModelUnit unit) const {
++  auto it = units_.find(unit);
++  return it != units_.end() && it->second.in_use;
++}
++
++void CaptionModelStore::OnChecked(ModelUnit unit, bool ready) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  Unit& u = units_[unit];
++  if (u.status.state != State::kChecking) {
++    return;
++  }
++  u.status.state = ready ? State::kReady : State::kMissing;
++  Notify(unit);
++}
++
++void CaptionModelStore::Download(ModelUnit unit) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  Unit& u = units_[unit];
++  if (!Info(unit) || u.status.state == State::kReady || u.status.state == State::kDownloading ||
++      u.status.state == State::kChecking) {
++    return;
++  }
++  u.status.state = State::kDownloading;
++  u.status.done = 0;
++  u.next_file = 0;
++  u.done_before_file = 0;
++  Notify(unit);
++  files_->PostTaskAndReply(
++      FROM_HERE,
++      base::BindOnce(base::IgnoreResult(&base::CreateDirectory),
++                     models_dir_.AppendASCII(kDownloadDir)),
++      base::BindOnce(&CaptionModelStore::StartNextFile, weak_factory_.GetWeakPtr(), unit));
++}
++
++void CaptionModelStore::StartNextFile(ModelUnit unit) {
++  Unit& u = units_[unit];
++  if (u.status.state != State::kDownloading) {
++    return;
++  }
++  const ModelUnitInfo& info = *Info(unit);
++  if (u.next_file == info.files.size()) {
++    files_->PostTaskAndReplyWithResult(
++        FROM_HERE,
++        base::BindOnce(
++            [](const base::FilePath& path, std::string fingerprint) {
++              return base::WriteFile(path, fingerprint);
++            },
++            MarkerOf(models_dir_, info), Fingerprint(info)),
++        base::BindOnce(&CaptionModelStore::OnMarkerWritten, weak_factory_.GetWeakPtr(), unit));
++    return;
++  }
++  const ModelFile& file = info.files[u.next_file];
++  auto request = std::make_unique<network::ResourceRequest>();
++  request->url = base_url_.Resolve(file.path);
++  request->method = "GET";
++  request->credentials_mode = network::mojom::CredentialsMode::kOmit;
++  u.loader = network::SimpleURLLoader::Create(std::move(request), annotation_);
++  u.loader->SetOnDownloadProgressCallback(base::BindRepeating(
++      &CaptionModelStore::OnProgress, weak_factory_.GetWeakPtr(), unit));
++  std::string partial(file.path);
++  base::ReplaceChars(partial, "/", "_", &partial);
++  u.loader->DownloadToFile(
++      factory_.get(),
++      base::BindOnce(&CaptionModelStore::OnFileDownloaded, weak_factory_.GetWeakPtr(), unit),
++      models_dir_.AppendASCII(kDownloadDir).AppendASCII(partial), file.size);
++}
++
++void CaptionModelStore::OnProgress(ModelUnit unit, uint64_t current) {
++  Unit& u = units_[unit];
++  u.status.done = u.done_before_file + static_cast<int64_t>(current);
++  Notify(unit);
++}
++
++void CaptionModelStore::OnFileDownloaded(ModelUnit unit, base::FilePath path) {
++  Unit& u = units_[unit];
++  const int net_error = u.loader ? u.loader->NetError() : 0;
++  u.loader.reset();
++  if (path.empty()) {
++    // The error code and size only.
++    LOG(WARNING) << "Tark captions: download of " << Info(unit)->id << " failed, net error "
++                 << net_error;
++    Fail(unit);
++    return;
++  }
++  const ModelFile& file = Info(unit)->files[u.next_file];
++  files_->PostTaskAndReplyWithResult(
++      FROM_HERE, base::BindOnce(&VerifyAndPlace, models_dir_, file, path),
++      base::BindOnce(&CaptionModelStore::OnFileVerified, weak_factory_.GetWeakPtr(), unit));
++}
++
++void CaptionModelStore::OnFileVerified(ModelUnit unit, bool ok) {
++  Unit& u = units_[unit];
++  if (u.status.state != State::kDownloading) {
++    return;
++  }
++  if (!ok) {
++    LOG(WARNING) << "Tark captions: a file of " << Info(unit)->id
++                 << " did not match its hash";
++    Fail(unit);
++    return;
++  }
++  u.done_before_file += Info(unit)->files[u.next_file].size;
++  u.status.done = u.done_before_file;
++  ++u.next_file;
++  StartNextFile(unit);
++}
++
++void CaptionModelStore::OnMarkerWritten(ModelUnit unit, bool ok) {
++  Unit& u = units_[unit];
++  if (u.status.state != State::kDownloading) {
++    return;
++  }
++  if (!ok) {
++    Fail(unit);
++    return;
++  }
++  u.status.state = State::kReady;
++  u.status.done = u.status.total;
++  Notify(unit);
++}
++
++void CaptionModelStore::Fail(ModelUnit unit) {
++  Unit& u = units_[unit];
++  u.loader.reset();
++  u.status.state = State::kFailed;
++  u.status.done = 0;
++  // Observers hear once the partial files are gone.
++  files_->PostTaskAndReply(
++      FROM_HERE,
++      base::BindOnce(base::IgnoreResult(&base::DeletePathRecursively),
++                     models_dir_.AppendASCII(kDownloadDir)),
++      base::BindOnce(&CaptionModelStore::Notify, weak_factory_.GetWeakPtr(), unit));
++}
++
++void CaptionModelStore::Cancel(ModelUnit unit) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  Unit& u = units_[unit];
++  if (u.status.state != State::kDownloading) {
++    return;
++  }
++  u.loader.reset();
++  u.status.state = State::kMissing;
++  u.status.done = 0;
++  // Observers hear once the partial files are gone.
++  files_->PostTaskAndReply(
++      FROM_HERE,
++      base::BindOnce(base::IgnoreResult(&base::DeletePathRecursively),
++                     models_dir_.AppendASCII(kDownloadDir)),
++      base::BindOnce(&CaptionModelStore::Notify, weak_factory_.GetWeakPtr(), unit));
++}
++
++bool CaptionModelStore::Remove(ModelUnit unit) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  Unit& u = units_[unit];
++  if (u.in_use || u.status.state == State::kDownloading ||
++      u.status.state == State::kChecking || !Info(unit)) {
++    return false;
++  }
++  u.status.state = State::kMissing;
++  u.status.done = 0;
++  // Observers hear once the files are gone.
++  files_->PostTaskAndReply(
++      FROM_HERE, base::BindOnce(&DeleteUnit, models_dir_, *Info(unit)),
++      base::BindOnce(&CaptionModelStore::Notify, weak_factory_.GetWeakPtr(), unit));
++  return true;
++}
++
++void CaptionModelStore::SetInUse(ModelUnit unit, bool in_use) {
++  units_[unit].in_use = in_use;
++  Notify(unit);
++}
++
++int64_t CaptionModelStore::BytesOnDisk() const {
++  int64_t bytes = 0;
++  for (const ModelUnitInfo& info : manifest_) {
++    if (status(info.unit).state == State::kReady) {
++      bytes += UnitSize(info);
++    }
++  }
++  return bytes;
++}
++
++void CaptionModelStore::AddObserver(Observer* observer) {
++  observers_.AddObserver(observer);
++}
++
++void CaptionModelStore::RemoveObserver(Observer* observer) {
++  observers_.RemoveObserver(observer);
++}
++
++void CaptionModelStore::Notify(ModelUnit unit) {
++  observers_.Notify(&Observer::OnModelStatusChanged, unit);
++}
++
++}  // namespace tark_captions
+--- /dev/null
++++ b/components/tark_captions/caption_model_store_unittest.cc
+@@ -0,0 +1,276 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/tark_captions/caption_model_store.h"
++
++#include <memory>
++#include <string>
++#include <vector>
++
++#include "base/files/file_util.h"
++#include "base/files/scoped_temp_dir.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/test/run_until.h"
++#include "base/test/task_environment.h"
++#include "crypto/hash.h"
++#include "net/traffic_annotation/network_traffic_annotation_test_helper.h"
++#include "services/network/public/cpp/weak_wrapper_shared_url_loader_factory.h"
++#include "services/network/public/mojom/url_response_head.mojom.h"
++#include "services/network/test/test_url_loader_factory.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace tark_captions {
++namespace {
++
++using State = CaptionModelStore::State;
++
++constexpr char kBase[] = "https://models.test/v1/";
++
++struct TestFile {
++  std::string path;
++  std::string content;
++  std::string sha256;
++};
++
++class Recorder : public CaptionModelStore::Observer {
++ public:
++  explicit Recorder(CaptionModelStore* store) : store_(store) {}
++  void OnModelStatusChanged(ModelUnit unit) override {
++    statuses.push_back(store_->status(unit));
++  }
++  std::vector<CaptionModelStore::Status> statuses;
++
++ private:
++  raw_ptr<CaptionModelStore> store_;
++};
++
++class CaptionModelStoreTest : public testing::Test {
++ protected:
++  void SetUp() override {
++    ASSERT_TRUE(dir_.CreateUniqueTempDir());
++    AddFile(&captions_, "a.bin", "alpha");
++    AddFile(&captions_, "sub/b.bin", "bravo bravo");
++    AddFile(&to_english_, "it/c.bin", "charlie");
++    AddFile(&from_english_, "it2/d.bin", "delta");
++    for (auto [list, files] :
++         {std::pair(&captions_, &captions_files_), std::pair(&to_english_, &to_english_files_),
++          std::pair(&from_english_, &from_english_files_)}) {
++      for (const TestFile& f : *list) {
++        files->push_back(
++            {f.path.c_str(), static_cast<int64_t>(f.content.size()), f.sha256.c_str()});
++      }
++    }
++    manifest_ = {{ModelUnit::kCaptions, "captions", captions_files_},
++                 {ModelUnit::kToEnglish, "to_english", to_english_files_},
++                 {ModelUnit::kFromEnglish, "from_english", from_english_files_}};
++  }
++
++  // File work posted by a store can outlive it; it reads the test manifest,
++  // which must outlive that work.
++  void TearDown() override { env_.RunUntilIdle(); }
++
++  void AddFile(std::vector<TestFile>* list, std::string path, std::string content) {
++    list->push_back({path, content, base::HexEncodeLower(crypto::hash::Sha256(content))});
++  }
++
++  std::unique_ptr<CaptionModelStore> MakeStore() {
++    return std::make_unique<CaptionModelStore>(
++        dir_.GetPath(),
++        base::MakeRefCounted<network::WeakWrapperSharedURLLoaderFactory>(&factory_),
++        GURL(kBase), manifest_, TRAFFIC_ANNOTATION_FOR_TESTS);
++  }
++
++  // Waits until `store` is done checking what is on disk.
++  void WaitChecked(CaptionModelStore* store) {
++    ASSERT_TRUE(base::test::RunUntil([&] {
++      for (const ModelUnitInfo& info : manifest_) {
++        if (store->status(info.unit).state == State::kChecking) {
++          return false;
++        }
++      }
++      return true;
++    }));
++  }
++
++  void Serve(const std::vector<TestFile>& files) {
++    for (const TestFile& f : files) {
++      factory_.AddResponse(std::string(kBase) + f.path, f.content);
++    }
++  }
++
++  bool WaitFor(CaptionModelStore* store, ModelUnit unit, State state) {
++    return base::test::RunUntil([&] { return store->status(unit).state == state; });
++  }
++
++  std::string Read(const std::string& path) {
++    std::string content;
++    base::ReadFileToString(dir_.GetPath().AppendASCII(path), &content);
++    return content;
++  }
++
++  bool DownloadFolderEmpty() {
++    const base::FilePath download = dir_.GetPath().AppendASCII(".download");
++    return !base::PathExists(download) || base::IsDirectoryEmpty(download);
++  }
++
++  base::test::TaskEnvironment env_;
++  base::ScopedTempDir dir_;
++  network::TestURLLoaderFactory factory_;
++  std::vector<TestFile> captions_, to_english_, from_english_;
++  std::vector<ModelFile> captions_files_, to_english_files_, from_english_files_;
++  std::vector<ModelUnitInfo> manifest_;
++};
++
++TEST_F(CaptionModelStoreTest, DownloadsVerifiesAndMarksReady) {
++  auto store = MakeStore();
++  WaitChecked(store.get());
++  EXPECT_EQ(store->status(ModelUnit::kCaptions).state, State::kMissing);
++  Serve(captions_);
++  store->Download(ModelUnit::kCaptions);
++  ASSERT_TRUE(WaitFor(store.get(), ModelUnit::kCaptions, State::kReady));
++  EXPECT_EQ(Read("a.bin"), "alpha");
++  EXPECT_EQ(Read("sub/b.bin"), "bravo bravo");
++  EXPECT_TRUE(DownloadFolderEmpty());
++  store.reset();
++  auto again = MakeStore();
++  WaitChecked(again.get());
++  EXPECT_EQ(again->status(ModelUnit::kCaptions).state, State::kReady);
++  EXPECT_EQ(again->status(ModelUnit::kToEnglish).state, State::kMissing);
++}
++
++TEST_F(CaptionModelStoreTest, ProgressReported) {
++  auto store = MakeStore();
++  WaitChecked(store.get());
++  Recorder recorder(store.get());
++  store->AddObserver(&recorder);
++  Serve(captions_);
++  store->Download(ModelUnit::kCaptions);
++  ASSERT_TRUE(WaitFor(store.get(), ModelUnit::kCaptions, State::kReady));
++  store->RemoveObserver(&recorder);
++  bool saw_downloading = false;
++  for (const auto& s : recorder.statuses) {
++    if (s.state == State::kDownloading) {
++      saw_downloading = true;
++      EXPECT_EQ(s.total, 16);
++      EXPECT_LE(s.done, s.total);
++    }
++  }
++  EXPECT_TRUE(saw_downloading);
++  EXPECT_EQ(recorder.statuses.back().state, State::kReady);
++}
++
++TEST_F(CaptionModelStoreTest, BadHashFailsAndCleansUp) {
++  auto store = MakeStore();
++  WaitChecked(store.get());
++  factory_.AddResponse(std::string(kBase) + "a.bin", "alphz");
++  store->Download(ModelUnit::kCaptions);
++  ASSERT_TRUE(WaitFor(store.get(), ModelUnit::kCaptions, State::kFailed));
++  EXPECT_FALSE(base::PathExists(dir_.GetPath().AppendASCII("a.bin")));
++  ASSERT_TRUE(base::test::RunUntil([&] { return DownloadFolderEmpty(); }));
++}
++
++TEST_F(CaptionModelStoreTest, WrongSizeFails) {
++  auto store = MakeStore();
++  WaitChecked(store.get());
++  factory_.AddResponse(std::string(kBase) + "a.bin", "alpha and more");
++  store->Download(ModelUnit::kCaptions);
++  ASSERT_TRUE(WaitFor(store.get(), ModelUnit::kCaptions, State::kFailed));
++  EXPECT_FALSE(base::PathExists(dir_.GetPath().AppendASCII("a.bin")));
++}
++
++TEST_F(CaptionModelStoreTest, NetworkErrorFailsAndCleansUp) {
++  auto store = MakeStore();
++  WaitChecked(store.get());
++  factory_.AddResponse(GURL(std::string(kBase) + "a.bin"), network::mojom::URLResponseHead::New(),
++                       "", network::URLLoaderCompletionStatus(net::ERR_INTERNET_DISCONNECTED));
++  store->Download(ModelUnit::kCaptions);
++  ASSERT_TRUE(WaitFor(store.get(), ModelUnit::kCaptions, State::kFailed));
++  EXPECT_EQ(store->status(ModelUnit::kCaptions).done, 0);
++  ASSERT_TRUE(base::test::RunUntil([&] { return DownloadFolderEmpty(); }));
++}
++
++TEST_F(CaptionModelStoreTest, CancelStopsAndCleansUp) {
++  auto store = MakeStore();
++  WaitChecked(store.get());
++  store->Download(ModelUnit::kCaptions);
++  ASSERT_TRUE(base::test::RunUntil([&] { return factory_.NumPending() == 1; }));
++  store->Cancel(ModelUnit::kCaptions);
++  EXPECT_EQ(store->status(ModelUnit::kCaptions).state, State::kMissing);
++  ASSERT_TRUE(base::test::RunUntil([&] { return DownloadFolderEmpty(); }));
++}
++
++TEST_F(CaptionModelStoreTest, LeftoverPartialsIgnored) {
++  ASSERT_TRUE(base::CreateDirectory(dir_.GetPath().AppendASCII(".download")));
++  ASSERT_TRUE(base::WriteFile(dir_.GetPath().AppendASCII(".download/a.bin"), "alp"));
++  auto store = MakeStore();
++  WaitChecked(store.get());
++  EXPECT_EQ(store->status(ModelUnit::kCaptions).state, State::kMissing);
++  EXPECT_FALSE(base::PathExists(dir_.GetPath().AppendASCII(".download")));
++}
++
++// The models a developer copied by hand (no marker): checked once, then
++// ready without a download.
++TEST_F(CaptionModelStoreTest, ExistingFolderVerifiedOnce) {
++  for (const TestFile& f : to_english_) {
++    const base::FilePath path = dir_.GetPath().AppendASCII(f.path);
++    ASSERT_TRUE(base::CreateDirectory(path.DirName()));
++    ASSERT_TRUE(base::WriteFile(path, f.content));
++  }
++  auto store = MakeStore();
++  ASSERT_TRUE(WaitFor(store.get(), ModelUnit::kToEnglish, State::kReady));
++  EXPECT_EQ(factory_.NumPending(), 0);
++  EXPECT_EQ(store->status(ModelUnit::kCaptions).state, State::kMissing);
++}
++
++TEST_F(CaptionModelStoreTest, RemoveDeletesFiles) {
++  auto store = MakeStore();
++  WaitChecked(store.get());
++  Serve(captions_);
++  store->Download(ModelUnit::kCaptions);
++  ASSERT_TRUE(WaitFor(store.get(), ModelUnit::kCaptions, State::kReady));
++  EXPECT_TRUE(store->Remove(ModelUnit::kCaptions));
++  EXPECT_EQ(store->status(ModelUnit::kCaptions).state, State::kMissing);
++  ASSERT_TRUE(base::test::RunUntil(
++      [&] { return !base::PathExists(dir_.GetPath().AppendASCII("a.bin")); }));
++  auto again = MakeStore();
++  WaitChecked(again.get());
++  EXPECT_EQ(again->status(ModelUnit::kCaptions).state, State::kMissing);
++}
++
++TEST_F(CaptionModelStoreTest, RemoveRefusedWhileInUse) {
++  auto store = MakeStore();
++  WaitChecked(store.get());
++  Serve(captions_);
++  store->Download(ModelUnit::kCaptions);
++  ASSERT_TRUE(WaitFor(store.get(), ModelUnit::kCaptions, State::kReady));
++  store->SetInUse(ModelUnit::kCaptions, true);
++  EXPECT_FALSE(store->Remove(ModelUnit::kCaptions));
++  EXPECT_EQ(Read("a.bin"), "alpha");
++  store->SetInUse(ModelUnit::kCaptions, false);
++  EXPECT_TRUE(store->Remove(ModelUnit::kCaptions));
++}
++
++TEST_F(CaptionModelStoreTest, RequestsOnlyTheBaseUrl) {
++  auto store = MakeStore();
++  WaitChecked(store.get());
++  store->Download(ModelUnit::kCaptions);
++  ASSERT_TRUE(base::test::RunUntil([&] { return factory_.NumPending() == 1; }));
++  for (const network::TestURLLoaderFactory::PendingRequest& p : *factory_.pending_requests()) {
++    EXPECT_TRUE(p.request.url.spec().starts_with(kBase)) << p.request.url;
++    EXPECT_EQ(p.request.credentials_mode, network::mojom::CredentialsMode::kOmit);
++  }
++}
++
++TEST_F(CaptionModelStoreTest, BytesOnDisk) {
++  auto store = MakeStore();
++  WaitChecked(store.get());
++  EXPECT_EQ(store->BytesOnDisk(), 0);
++  Serve(captions_);
++  store->Download(ModelUnit::kCaptions);
++  ASSERT_TRUE(WaitFor(store.get(), ModelUnit::kCaptions, State::kReady));
++  EXPECT_EQ(store->BytesOnDisk(), 16);
++}
++
++}  // namespace
++}  // namespace tark_captions
 --- a/components/tark_captions/BUILD.gn
 +++ b/components/tark_captions/BUILD.gn
-@@ -25,6 +25,9 @@
+@@ -19,12 +19,17 @@
+     "caption_choices.h",
+     "caption_engine.cc",
+     "caption_engine.h",
++    "caption_model_store.cc",
++    "caption_model_store.h",
+     "caption_text.cc",
+     "caption_text.h",
+     "indic_text.cc",
      "indic_text.h",
      "mel_frontend.cc",
      "mel_frontend.h",
@@ -227,7 +989,23 @@
      "ort_runtime.cc",
      "ort_runtime.h",
      "render_queue.cc",
-@@ -70,6 +73,7 @@
+@@ -42,7 +47,11 @@
+   deps = [
+     "//base",
+     "//components/prefs",
++    "//crypto",
+     "//media",
++    "//net",
++    "//services/network/public/cpp",
++    "//url",
+     "//third_party/icu",
+     "//third_party/pffft",
+     "//third_party/sentencepiece",
+@@ -67,9 +76,11 @@
+     "call_state_unittest.cc",
+     "caption_choices_unittest.cc",
+     "caption_engine_unittest.cc",
++    "caption_model_store_unittest.cc",
      "caption_text_unittest.cc",
      "indic_text_unittest.cc",
      "mel_frontend_unittest.cc",
@@ -235,3 +1013,20 @@
      "ort_runtime_unittest.cc",
      "render_queue_unittest.cc",
      "romanize_unittest.cc",
+@@ -80,10 +91,15 @@
+     ":tark_captions",
+     ":test_support",
+     "//base",
+-    "//base/test:run_all_unittests",
++    "//mojo/core/test:run_all_unittests",
+     "//base/test:test_support",
+     "//components/prefs:test_support",
++    "//crypto",
+     "//media",
++    "//net",
++    "//net:test_support",
++    "//services/network:test_support",
++    "//services/network/public/cpp",
+     "//testing/gtest",
+     "//third_party/icu",
+   ]
