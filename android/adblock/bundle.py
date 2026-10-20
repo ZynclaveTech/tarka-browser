@@ -243,6 +243,19 @@ def fetch_lists(assets):
     return lists
 
 
+# A bundle's name counts minutes from here: never reused (a published zip is
+# cached for a year), and still lists-<8 digits>.zip, the only shape installed
+# Tarks accept (ValidBundleFileName), for about 190 years.
+NAME_EPOCH = datetime.datetime(2026, 1, 1, tzinfo=datetime.timezone.utc)
+
+
+def bundle_file_name(now):
+    minutes = int((now - NAME_EPOCH).total_seconds() // 60)
+    if not 0 <= minutes < 10 ** 8:
+        raise ValueError(f'{now} is outside the bundle names\' range')
+    return f'lists-{minutes:08d}.zip'
+
+
 def build(out_dir, ubo_tag=None, listtool=None):
     ubo_tag = ubo_tag or _latest_ubo_tag()
     listtool = listtool or str(HERE / 'listtool' / 'target' / 'release' / 'listtool')
@@ -258,7 +271,7 @@ def build(out_dir, ubo_tag=None, listtool=None):
     now = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)
     created = now.strftime('%Y-%m-%dT%H:%M:%SZ')
     data = make_zip(lists, resources, created, ubo_tag)
-    path = pathlib.Path(out_dir) / f'lists-{now:%Y%m%d}.zip'
+    path = pathlib.Path(out_dir) / bundle_file_name(now)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(data)
     return path
