@@ -845,7 +845,7 @@
 +}  // namespace tark_captions
 --- /dev/null
 +++ b/components/tark_captions/client_language.h
-@@ -0,0 +1,64 @@
+@@ -0,0 +1,68 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -854,6 +854,7 @@
 +#define COMPONENTS_TARK_CAPTIONS_CLIENT_LANGUAGE_H_
 +
 +#include <cstdint>
++#include <optional>
 +#include <string>
 +
 +namespace tark_captions {
@@ -883,8 +884,10 @@
 +  // The user picked `code` for this call.
 +  void Choose(const std::string& code);
 +  // The speech process heard `code` ("und": it couldn't tell). Ignored once
-+  // a language is locked or picked.
-+  void Detected(const std::string& code);
++  // a language is locked or picked. Returns what every recognizer in the
++  // call's tab must now be told (the lock, or the language they heard
++  // otherwise), or nothing.
++  std::optional<std::string> Detected(const std::string& code);
 +
 +  State state() const { return state_; }
 +  // "" while detecting.
@@ -894,8 +897,9 @@
 +  bool detected() const { return automatic_ && !code_.empty(); }
 +  // Bumped by every choice, so answers about an older one can be dropped.
 +  uint64_t generation() const { return generation_; }
-+  // What the recognizer is told: "auto" until a language is known.
-+  std::string recognizer_code() const { return code_.empty() ? "auto" : code_; }
++  // What the recognizers are told: "auto" until a language is known, then
++  // that language, or "none" when nothing on this Mac can caption it.
++  std::string recognizer_code() const;
 +
 + private:
 +  void Set(const std::string& code);
@@ -912,7 +916,7 @@
 +#endif  // COMPONENTS_TARK_CAPTIONS_CLIENT_LANGUAGE_H_
 --- /dev/null
 +++ b/components/tark_captions/client_language.cc
-@@ -0,0 +1,54 @@
+@@ -0,0 +1,74 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -940,11 +944,31 @@
 +  Set(code);
 +}
 +
-+void ClientLanguage::Detected(const std::string& code) {
-+  if (!automatic_ || !code_.empty() || code == "und" || code.empty()) {
-+    return;
++std::optional<std::string> ClientLanguage::Detected(const std::string& code) {
++  if (code == "und" || code.empty()) {
++    return std::nullopt;
 +  }
-+  Set(code);
++  if (automatic_ && code_.empty()) {
++    Set(code);
++    return recognizer_code();
++  }
++  // Locked or picked already: a recognizer that heard otherwise is told.
++  const std::string heard = code == "ur" ? "hi" : code;
++  return heard == code_ ? std::nullopt : std::optional<std::string>(recognizer_code());
++}
++
++std::string ClientLanguage::recognizer_code() const {
++  switch (state_) {
++    case State::kDetecting:
++      return "auto";
++    case State::kCaptioning:
++    case State::kApple:
++      return code_;
++    case State::kAppleUnavailable:
++    case State::kPlanned:
++    case State::kUnsupported:
++      return "none";
++  }
 +}
 +
 +void ClientLanguage::Set(const std::string& code) {
@@ -969,12 +993,15 @@
 +}  // namespace tark_captions
 --- /dev/null
 +++ b/components/tark_captions/client_language_unittest.cc
-@@ -0,0 +1,99 @@
+@@ -0,0 +1,131 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
 +
 +#include "components/tark_captions/client_language.h"
++
++#include <optional>
++#include <string>
 +
 +#include "testing/gtest/include/gtest/gtest.h"
 +
@@ -1065,6 +1092,35 @@
 +  swahili.Detected("sw");
 +  EXPECT_EQ(swahili.state(), State::kUnsupported);
 +  EXPECT_EQ(swahili.code(), "sw");
++}
++
++// Every recognizer in the call's tab hears the lock: the first to decide
++// sets the language, and one that decides otherwise is told it.
++TEST(ClientLanguageTest, LockTellsEveryRecognizer) {
++  ClientLanguage language(true);
++  EXPECT_EQ(language.Detected("ta"), std::optional<std::string>("ta"));
++  EXPECT_EQ(language.Detected("hi"), std::optional<std::string>("ta"));
++  EXPECT_EQ(language.Detected("ta"), std::nullopt);
++  EXPECT_EQ(language.Detected("und"), std::nullopt);
++  language.Choose("bn");
++  EXPECT_EQ(language.Detected("ta"), std::optional<std::string>("bn"));
++}
++
++// Nothing to decode for a language Tark can't caption: recognizers idle
++// ("none"), never an error that would hide the notice.
++TEST(ClientLanguageTest, CantCaptionTellsRecognizersNone) {
++  ClientLanguage swahili(true);
++  EXPECT_EQ(swahili.Detected("sw"), std::optional<std::string>("none"));
++  EXPECT_EQ(swahili.recognizer_code(), "none");
++  ClientLanguage telugu(true);
++  telugu.Detected("te");
++  EXPECT_EQ(telugu.recognizer_code(), "none");
++  ClientLanguage spanish(/*apple_available=*/false);
++  spanish.Detected("es");
++  EXPECT_EQ(spanish.recognizer_code(), "none");
++  ClientLanguage apple(/*apple_available=*/true);
++  apple.Detected("es");
++  EXPECT_EQ(apple.recognizer_code(), "es");
 +}
 +
 +}  // namespace

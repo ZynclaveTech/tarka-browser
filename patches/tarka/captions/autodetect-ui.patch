@@ -270,7 +270,7 @@
    // Results asked in the old language are not shown; captions waiting keep
    // the language they were heard in.
    render_queue_.ChoicesChanged();
-@@ -86,6 +87,42 @@
+@@ -86,6 +87,50 @@
      }
    }
    UpdateModelsInUse();
@@ -299,7 +299,15 @@
 +  }
 +  VLOG(1) << "Tark captions: the client speaks \"" << code << "\"";
 +  const std::string before = client_language_.code();
-+  client_language_.Detected(code);
++  // Every recognizer in the tab (one per audio player on the call page)
++  // hears the lock, or is told it when it heard otherwise.
++  if (std::optional<std::string> tell = client_language_.Detected(code)) {
++    Profile* profile = Profile::FromBrowserContext(GetWebContents().GetBrowserContext());
++    if (auto* speech =
++            SpeechRecognitionClientBrowserInterfaceFactory::GetForProfile(profile)) {
++      speech->OnTarkCaptionsLanguageChanged(*tell);
++    }
++  }
 +  if (client_language_.code() == before) {
 +    return;  // Picked by the user, already locked, or "und".
 +  }
@@ -313,7 +321,7 @@
    observers_.Notify(&Observer::OnCallStateChanged, this);
  }
  
-@@ -261,6 +298,10 @@
+@@ -261,6 +306,10 @@
    const bool was_on = state_.captions_on();
    state_.OnMicCapturing(is_capturing_audio);
    VLOG(1) << "Tark captions: in_call=" << state_.in_call();
@@ -324,7 +332,7 @@
    if (was_on && !state_.captions_on()) {
      CaptionsChanged(was_on);
    }
-@@ -281,7 +322,12 @@
+@@ -281,7 +330,12 @@
          tark_captions::TargetFromCode(translate_to()).value_or(tark_captions::Target::kEnglish));
    }
    tark_captions::CaptionModelStore& models = tark_captions::TarkCaptionModels();
@@ -338,7 +346,7 @@
    for (tark_captions::ModelUnit unit :
         {tark_captions::ModelUnit::kToEnglish, tark_captions::ModelUnit::kFromEnglish}) {
      models.SetInUse(unit, std::ranges::find(translation, unit) != translation.end());
-@@ -302,7 +348,7 @@
+@@ -302,7 +356,7 @@
    speech::SpeechRecognitionClientBrowserInterface* speech =
        SpeechRecognitionClientBrowserInterfaceFactory::GetForProfile(profile);
    if (speech) {

@@ -51,6 +51,13 @@ class TestCaptionsCredits(unittest.TestCase):
             self.assertIn(LICENCE_TEXT[LICENCES.get(name, 'MIT')],
                           read(os.path.join(CREDITS, name, 'LICENSE')), name)
 
+    def test_voxlingua_dataset_is_attributed(self):
+        # CC-BY-4.0 asks for the work, its authors, its licence and a link.
+        readme = read(os.path.join(CREDITS, 'voxlingua_ecapa', 'README.chromium'))
+        for needed in ('VoxLingua107', 'Valk', 'Alum', 'https://bark.phon.ioc.ee/voxlingua107/',
+                       'CC BY 4.0', 'https://creativecommons.org/licenses/by/4.0/'):
+            self.assertIn(needed, readme)
+
     def test_install_copies_into_third_party(self):
         with tempfile.TemporaryDirectory() as tmp:
             src = os.path.join(tmp, 'src')
