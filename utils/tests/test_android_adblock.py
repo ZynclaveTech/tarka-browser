@@ -329,7 +329,6 @@ class TestSiteSwitchPatch(unittest.TestCase):
 
     def test_stored_as_the_ads_setting_and_reloads(self):
         self.assertIn('ContentSettingsType.ADS', self.add)
-        self.assertIn('checked ? ContentSetting.DEFAULT : ContentSetting.ALLOW', self.add)
         self.assertIn('webContents.getNavigationController().reload(true);', self.add)
 
     def test_english_and_hindi(self):
@@ -345,3 +344,26 @@ class TestJavaSourceList(unittest.TestCase):
         self.assertEqual([l for l in gni.splitlines() if l.startswith('-')], [])
         self.assertEqual([l for l in gni.splitlines() if l.startswith('+')],
                          ['+  "java/src/org/chromium/chrome/browser/page_info/TarkAdblockSiteSwitch.java",'])
+
+
+class TestReviewFixes(unittest.TestCase):
+    """A2 final review: the Important findings."""
+
+    def test_a_request_ends_when_the_network_side_goes_away(self):
+        add = added(patch_text('adblock-network.patch'))
+        self.assertIn('client_receiver_.set_disconnect_handler(', add)
+        self.assertIn('network::URLLoaderCompletionStatus(net::ERR_FAILED)', add)
+
+    def test_prerendered_pages_get_their_resources(self):
+        add = added(patch_text('adblock-cosmetic.patch'))
+        self.assertIn('policy_map.SetNonAssociatedPolicy<tark_adblock::mojom::CosmeticResources>(', add)
+        self.assertIn('content::MojoBinderNonAssociatedPolicy::kGrant', add)
+
+    def test_the_collector_pauses_with_its_page_and_backs_off(self):
+        add = added(patch_text('adblock-cosmetic.patch'))
+        self.assertIn('GetTaskRunner(blink::TaskType::kInternalDefault)', add)
+        self.assertIn('base::Seconds(30)', add)
+
+    def test_the_switch_writes_block_explicitly(self):
+        add = added(patch_text('adblock-site-switch.patch'))
+        self.assertIn('checked ? ContentSetting.BLOCK : ContentSetting.ALLOW', add)

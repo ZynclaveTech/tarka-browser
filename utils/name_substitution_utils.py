@@ -74,6 +74,25 @@ MESSAGE_RENAMES = {
     'IDS_PREFS_SITE_SETTINGS':
         ('Site permissions', '4165986682804962316', '523862956770478816',
          {'hi': 'साइट की अनुमतियां'}),
+    # A2: Site permissions' "Intrusive ads" (Chromium's filter for abusive
+    # sites) is Tark's ad blocker on Android: "Ads", allowed or blocked.
+    'IDS_SITE_SETTINGS_PAGE_INTRUSIVE_ADS_LABEL':
+        ('Ads', '8899807382908246773', '1919345977826869612', {'hi': 'विज्ञापन'}),
+    'IDS_SITE_SETTINGS_PAGE_INTRUSIVE_ALLOWED_SUB_LABEL':
+        ('Sites can show ads; Tark does not block them', '8077120325605624147',
+         '6776312556175280371', {'hi': 'साइटें विज्ञापन दिखा सकती हैं; Tark उन्हें ब्लॉक नहीं करता'}),
+    'IDS_SITE_SETTINGS_PAGE_INTRUSIVE_BLOCKED_SUB_LABEL':
+        ('Tark blocks ads and trackers on every site', '8681886425883659911',
+         '7919551752479614882', {'hi': 'Tark हर साइट पर विज्ञापन और ट्रैकर ब्लॉक करता है'}),
+    'IDS_SITE_SETTINGS_PAGE_INTRUSIVE_ADS_A11Y':
+        ('When on, sites can show ads. When off, Tark blocks ads and trackers.',
+         '4755971844837804407', '4963902051023881364',
+         {'hi': 'चालू होने पर, साइटें विज्ञापन दिखा सकती हैं। बंद होने पर, Tark विज्ञापन और ट्रैकर ब्लॉक करता है।'}),
+    'IDS_WEBSITE_SETTINGS_ADS_PAGE_DESCRIPTION':
+        ('Tark blocks ads and trackers on every site. Turn ads on here to allow them everywhere, '
+         'or for one site from its page info.', '3981465354637804599', '8813220890469783504',
+         {'hi': 'Tark हर साइट पर विज्ञापन और ट्रैकर ब्लॉक करता है। सभी साइटों पर विज्ञापन दिखाने के लिए '
+                'इसे चालू करें, या किसी एक साइट के लिए उसकी पेज जानकारी से।'}),
 }
 
 

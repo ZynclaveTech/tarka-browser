@@ -158,7 +158,13 @@ def test_default_workers_fit_windows_limit():
 # A4 Task 6: Android's plain words for whole messages, by message name.
 def test_plain_word_renames_have_hindi():
     assert set(util.MESSAGE_RENAMES) == {'IDS_PASSWORD_MANAGER_SETTINGS_TITLE',
-                                         'IDS_CLEAR_BROWSING_DATA_TITLE', 'IDS_PREFS_SITE_SETTINGS'}
+                                         'IDS_CLEAR_BROWSING_DATA_TITLE', 'IDS_PREFS_SITE_SETTINGS',
+                                         # A2: Site permissions' "Intrusive ads" is Tark's blocker.
+                                         'IDS_SITE_SETTINGS_PAGE_INTRUSIVE_ADS_LABEL',
+                                         'IDS_SITE_SETTINGS_PAGE_INTRUSIVE_ALLOWED_SUB_LABEL',
+                                         'IDS_SITE_SETTINGS_PAGE_INTRUSIVE_BLOCKED_SUB_LABEL',
+                                         'IDS_SITE_SETTINGS_PAGE_INTRUSIVE_ADS_A11Y',
+                                         'IDS_WEBSITE_SETTINGS_ADS_PAGE_DESCRIPTION'}
     for english, old_id, new_id, by_lang in util.MESSAGE_RENAMES.values():
         assert english and old_id != new_id and 'hi' in by_lang
 
@@ -222,3 +228,11 @@ def test_renames_only_in_android_strings():
     assert not util.is_android_strings('chrome/app/resources/generated_resources_hi.xtb')
     out = util.replace_xtb_tree(_xtb('hi', ('961856697154696964', 'ब्राउज़िंग डेटा मिटाएं')), {}, android=False)
     assert out is None
+
+
+def test_the_ads_category_is_tarks_blocker_in_hindi_too():
+    # A2 final review: "Intrusive ads" (Chromium's) becomes "Ads" (Tark's
+    # blocker); its old Hindi stays under the old id.
+    out = util.replace_xtb_tree(_xtb('hi', ('8899807382908246773', 'परेशान करने वाले विज्ञापन')), {}, android=True)
+    assert '<translation id="1919345977826869612">विज्ञापन</translation>' in out
+    assert '<translation id="8899807382908246773">परेशान करने वाले विज्ञापन</translation>' in out

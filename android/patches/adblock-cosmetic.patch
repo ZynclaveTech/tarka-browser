@@ -167,13 +167,14 @@
 +#endif  // CHROME_BROWSER_TARK_ADBLOCK_TARK_ADBLOCK_COSMETIC_RESOURCES_H_
 --- /dev/null
 +++ b/chrome/renderer/tark_adblock/tark_adblock_frame_observer.cc
-@@ -0,0 +1,216 @@
+@@ -0,0 +1,226 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
 +
 +#include "chrome/renderer/tark_adblock/tark_adblock_frame_observer.h"
 +
++#include <algorithm>
 +#include <memory>
 +#include <utility>
 +
@@ -185,6 +186,7 @@
 +#include "content/public/renderer/v8_value_converter.h"
 +#include "third_party/blink/public/platform/browser_interface_broker_proxy.h"
 +#include "third_party/blink/public/platform/scheduler/web_agent_group_scheduler.h"
++#include "third_party/blink/public/platform/task_type.h"
 +#include "third_party/blink/public/platform/web_string.h"
 +#include "third_party/blink/public/platform/web_url.h"
 +#include "third_party/blink/public/web/web_document.h"
@@ -203,6 +205,7 @@
 +// Chromium's world for internal features; the collector keeps to one
 +// global, so nothing else that runs there is disturbed.
 +constexpr int kWorldId = ISOLATED_WORLD_ID_CHROME_INTERNAL;
++constexpr base::TimeDelta kFirstCollectDelay = base::Milliseconds(500);
 +
 +// uBlock Origin's scriptlets expect `scriptletGlobals` (as brave-core
 +// provides it: a Map that also answers property reads).
@@ -273,7 +276,12 @@
 +
 +FrameObserver::FrameObserver(content::RenderFrame* render_frame)
 +    : content::RenderFrameObserver(render_frame),
-+      content::RenderFrameObserverTracker<FrameObserver>(render_frame) {}
++      content::RenderFrameObserverTracker<FrameObserver>(render_frame) {
++  // The frame's own scheduler: throttled in the background, frozen with the
++  // page (back/forward cache), like the page's own timers.
++  collect_timer_.SetTaskRunner(
++      render_frame->GetTaskRunner(blink::TaskType::kInternalDefault));
++}
 +
 +FrameObserver::~FrameObserver() = default;
 +
@@ -295,7 +303,7 @@
 +  resources_.reset();
 +  exceptions_.clear();
 +  collect_timer_.Stop();
-+  collect_count_ = 0;
++  collect_delay_ = kFirstCollectDelay;
 +  weak_factory_.InvalidateWeakPtrs();
 +  const GURL url(document_loader->GetUrl());
 +  if (!url.SchemeIsHTTPOrHTTPS()) {
@@ -345,16 +353,12 @@
 +}
 +
 +void FrameObserver::ScheduleCollect() {
-+  // Often while the page builds itself, then every two seconds.
-+  const base::TimeDelta delay = collect_count_ < 20 ? base::Milliseconds(500)
-+                                                    : base::Seconds(2);
-+  collect_timer_.Start(FROM_HERE, delay,
++  collect_timer_.Start(FROM_HERE, collect_delay_,
 +                       base::BindOnce(&FrameObserver::Collect,
 +                                      base::Unretained(this)));
 +}
 +
 +void FrameObserver::Collect() {
-+  ++collect_count_;
 +  blink::WebLocalFrame* frame = render_frame()->GetWebFrame();
 +  v8::Isolate* isolate = frame->GetAgentGroupScheduler()->Isolate();
 +  v8::HandleScope handle_scope(isolate);
@@ -365,6 +369,7 @@
 +      blink::BackForwardCacheAware::kAllow);
 +  v8::Local<v8::Context> context =
 +      frame->GetScriptContextFromWorldId(isolate, kWorldId);
++  bool found = false;
 +  std::unique_ptr<base::Value> value =
 +      result.IsEmpty() || context.IsEmpty()
 +          ? nullptr
@@ -373,20 +378,25 @@
 +      value->GetList()[0].is_list() && value->GetList()[1].is_list()) {
 +    std::vector<std::string> classes = Strings(&value->GetList()[0].GetList());
 +    std::vector<std::string> ids = Strings(&value->GetList()[1].GetList());
-+    if (!classes.empty() || !ids.empty()) {
++    found = !classes.empty() || !ids.empty();
++    if (found) {
 +      Resources()->HiddenClassIdSelectors(
 +          classes, ids, exceptions_,
 +          base::BindOnce(&FrameObserver::InsertHideRules,
 +                         weak_factory_.GetWeakPtr()));
 +    }
 +  }
++  // Every half second while the page adds elements; when it stops, less
++  // and less often, up to every 30 seconds.
++  collect_delay_ = found ? kFirstCollectDelay
++                         : std::min(collect_delay_ * 2, base::Seconds(30));
 +  ScheduleCollect();
 +}
 +
 +}  // namespace tark_adblock
 --- /dev/null
 +++ b/chrome/renderer/tark_adblock/tark_adblock_frame_observer.h
-@@ -0,0 +1,61 @@
+@@ -0,0 +1,62 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -399,6 +409,7 @@
 +#include <vector>
 +
 +#include "base/memory/weak_ptr.h"
++#include "base/time/time.h"
 +#include "base/timer/timer.h"
 +#include "base/values.h"
 +#include "chrome/common/tark_adblock/tark_adblock.mojom.h"
@@ -441,7 +452,7 @@
 +  std::optional<base::DictValue> resources_;
 +  std::vector<std::string> exceptions_;
 +  base::OneShotTimer collect_timer_;
-+  int collect_count_ = 0;
++  base::TimeDelta collect_delay_ = base::Milliseconds(500);
 +  base::WeakPtrFactory<FrameObserver> weak_factory_{this};
 +};
 +
@@ -539,3 +550,26 @@
  #if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
    extensions::ExtensionsRendererClient::Get()->RunScriptsAtDocumentStart(
        render_frame);
+--- a/chrome/browser/chrome_content_browser_client_binder_policies.cc
++++ b/chrome/browser/chrome_content_browser_client_binder_policies.cc
+@@ -5,6 +5,7 @@
+ #include "chrome/browser/chrome_content_browser_client_binder_policies.h"
+ 
+ #include "chrome/browser/ui/webui/bluetooth_internals/bluetooth_internals.mojom.h"
++#include "chrome/common/tark_adblock/tark_adblock.mojom.h"
+ #include "components/autofill/content/common/mojom/autofill_driver.mojom.h"
+ #include "components/page_load_metrics/common/page_load_metrics.mojom.h"
+ #include "components/subresource_filter/content/mojom/subresource_filter.mojom.h"
+@@ -27,6 +28,12 @@
+   // policy for interfaces registered by WebUI.
+   policy_map.SetNonAssociatedPolicy<::mojom::BluetoothInternalsHandler>(
+       content::MojoBinderNonAssociatedPolicy::kUnexpected);
++
++  // Tark (A2): the ad blocker's page resources. Read-only, and asked for
++  // synchronously at commit, so a prerendered page must get them at once
++  // rather than wait for activation.
++  policy_map.SetNonAssociatedPolicy<tark_adblock::mojom::CosmeticResources>(
++      content::MojoBinderNonAssociatedPolicy::kGrant);
+ }
+ 
+ // Registers policies for channel-associated interfaces registered in
