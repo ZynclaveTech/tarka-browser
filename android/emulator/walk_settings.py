@@ -5,15 +5,22 @@
 """Open every Settings screen of Tark for Android (the top level and the
 Privacy and security screens) and report any that crashes.
 
-usage: walk_settings.py [--serial SERIAL] [--allow-device]
+usage: walk_settings.py [--serial SERIAL] [--allow-device] [--dividers]
 Defaults to the emulator (emulator-5554); a real phone only with
 --allow-device. Exits 1 if any screen crashed or could not be found.
+
+--dividers (A3): also checks that every screen with a list of two or more
+rows draws a hairline between rows somewhere, from a screenshot; prints
+"divider ok", "divider MISSING" or "divider n/a" per screen, and exits 1 on
+any missing.
 """
 import argparse
 import re
+import struct
 import subprocess
 import sys
 import time
+import xml.etree.ElementTree as ET
 
 PACKAGE = 'com.gettarka.tarka'
 SETTINGS = PACKAGE + '/org.chromium.chrome.browser.settings.SettingsActivity'
@@ -63,6 +70,73 @@ class Device:
         return self.shell('pidof', PACKAGE).strip() != ''
 
 
+def parse_screencap(data):
+    """(width, height, RGBA bytes) of `adb exec-out screencap` output, whose
+    header is 12 bytes, or 16 from Android 10 (a colour space)."""
+    width, height = struct.unpack('<II', data[:8])
+    header = len(data) - width * height * 4
+    if header not in (12, 16):
+        raise ValueError(f'not a raw screencap of {width}x{height}')
+    return width, height, data[header:]
+
+
+def _pixel(img, x, y):
+    width, _, px = img
+    i = (y * width + x) * 4
+    return px[i:i + 3]
+
+
+def _close(a, b, tolerance):
+    return all(abs(p - q) <= tolerance for p, q in zip(a, b))
+
+
+def has_hairline(img, y_from, y_to, x_from, x_to):
+    """Whether one colour, unlike the background just above, runs across
+    [x_from, x_to) at some y in [y_from, y_to]."""
+    _, height, _ = img
+    background = _pixel(img, (x_from + x_to) // 2, max(0, y_from - 6))
+    xs = range(x_from, x_to, max(1, (x_to - x_from) // 40))
+    for y in range(max(0, y_from), min(height, y_to + 1)):
+        colours = [_pixel(img, x, y) for x in xs]
+        same = sum(1 for c in colours if _close(c, colours[0], 6))
+        if same >= 0.9 * len(colours) and not _close(colours[0], background, 8):
+            return True
+    return False
+
+
+def list_items(xml):
+    """The bounds (x1, y1, x2, y2) of the settings list's rows, top to bottom:
+    the children of the screen's RecyclerView."""
+    bounds = re.compile(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]')
+    for node in ET.fromstring(xml).iter('node'):
+        if node.get('class', '').endswith('RecyclerView'):
+            return [tuple(map(int, bounds.match(child.get('bounds')).groups()))
+                    for child in node.findall('node')]
+    return []
+
+
+def screen_has_dividers(img, items):
+    """Whether a hairline runs across the middle of any boundary between two
+    adjacent rows (category headers legitimately have none)."""
+    for a, b in zip(items, items[1:]):
+        if abs(b[1] - a[3]) > 2:
+            continue
+        inset = (a[2] - a[0]) // 5
+        if has_hairline(img, a[3] - 3, a[3] + 2, a[0] + inset, a[2] - inset):
+            return True
+    return False
+
+
+def check_dividers(dev):
+    """'ok', 'MISSING' or 'n/a' (fewer than two rows) for the screen shown."""
+    dev.shell('uiautomator', 'dump', '/sdcard/ui.xml')
+    items = list_items(dev.shell('cat', '/sdcard/ui.xml'))
+    if len(items) < 2:
+        return 'n/a'
+    data = subprocess.run(dev.adb + ['exec-out', 'screencap'], capture_output=True).stdout
+    return 'ok' if screen_has_dividers(parse_screencap(data), items) else 'MISSING'
+
+
 def collect(dev, pages=4):
     titles = []
     for _ in range(pages):
@@ -84,12 +158,15 @@ def tap(dev, title):
     return False
 
 
-def visit(dev, path):
-    """Opens Settings, taps each title in path; returns 'ok', 'missing' or 'crash'."""
+def visit(dev, path, on_screen=None):
+    """Opens Settings, taps each title in path; returns 'ok', 'missing' or
+    'crash'. on_screen(dev) runs on the screen reached."""
     dev.open_settings()
     for title in path:
         if not tap(dev, title):
             return 'missing'
+    if on_screen:
+        on_screen(dev)
     bad = dev.crashes() or not dev.alive()
     dev.run('logcat', '-c')
     if not dev.alive():
@@ -102,6 +179,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument('--serial', default='emulator-5554')
     parser.add_argument('--allow-device', action='store_true')
+    parser.add_argument('--dividers', action='store_true')
     args = parser.parse_args(argv)
     if not args.serial.startswith('emulator-') and not args.allow_device:
         print(f'{args.serial} is not an emulator; pass --allow-device to walk a phone', file=sys.stderr)
@@ -114,10 +192,16 @@ def main(argv=None):
     tap(dev, PRIVACY)
     privacy = [t for t in collect(dev) if t not in top]
     failed = 0
-    for path in [[t] for t in top] + [[PRIVACY, t] for t in privacy]:
-        result = visit(dev, path)
+    for path in [[]] + [[t] for t in top] + [[PRIVACY, t] for t in privacy]:
+        divider = []
+        if not path and not args.dividers:
+            continue
+        result = visit(dev, path, (lambda d: divider.append(check_dividers(d))) if args.dividers else None)
         failed += result != 'ok'
-        print(f'{result:8} ' + ' > '.join(path))
+        print(f'{result:8} ' + (' > '.join(path) or 'Settings'))
+        if divider:
+            failed += divider[0] == 'MISSING'
+            print(f'divider {divider[0]} ' + (' > '.join(path) or 'Settings'))
     return 1 if failed else 0
 
 

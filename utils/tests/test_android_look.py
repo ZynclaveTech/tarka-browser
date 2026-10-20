@@ -249,3 +249,64 @@ class TestConnects(unittest.TestCase):
     def test_english_and_hindi(self):
         for fp in ('7144670775258466422', '5542059870322282057', '3441881045024360042', '4695926840610114405'):
             self.assertIn(f'+<translation id="{fp}">', self.p)
+
+
+sys.path.insert(0, str(ANDROID / 'emulator'))
+import walk_settings  # noqa: E402
+
+
+def _image(width, height, lines=(), background=(255, 253, 248)):
+    """A raw screencap (16-byte header, RGBA) with grey lines: (y, x_from, x_to)."""
+    import struct
+    px = bytearray(bytes(background) + b'\xff') * (width * height)
+    for y, x_from, x_to in lines:
+        for x in range(x_from, x_to):
+            i = (y * width + x) * 4
+            px[i:i + 3] = bytes((200, 196, 188))
+    return struct.pack('<IIII', width, height, 1, 0) + bytes(px)
+
+
+class TestDividers(unittest.TestCase):
+    """A3 Task 7 (the user: "add divider in all screens in settings")."""
+    ITEMS = [(0, 0, 200, 40), (0, 40, 200, 80), (0, 80, 200, 120)]
+
+    def test_screencap_with_either_header(self):
+        img = walk_settings.parse_screencap(_image(4, 3))
+        self.assertEqual(img[:2], (4, 3))
+        legacy = _image(4, 3)[:12] + _image(4, 3)[16:]
+        self.assertEqual(walk_settings.parse_screencap(legacy)[:2], (4, 3))
+
+    def test_a_hairline_between_rows_is_found(self):
+        img = walk_settings.parse_screencap(_image(200, 120, [(39, 16, 200)]))
+        self.assertTrue(walk_settings.screen_has_dividers(img, self.ITEMS))
+
+    def test_no_line_is_missing(self):
+        img = walk_settings.parse_screencap(_image(200, 120))
+        self.assertFalse(walk_settings.screen_has_dividers(img, self.ITEMS))
+
+    def test_text_near_the_boundary_is_not_a_divider(self):
+        # A short run of ink (a word) is not a line across the row.
+        img = walk_settings.parse_screencap(_image(200, 120, [(39, 60, 100)]))
+        self.assertFalse(walk_settings.screen_has_dividers(img, self.ITEMS))
+
+    def test_rows_are_the_list_children(self):
+        xml = ('<hierarchy><node class="android.widget.FrameLayout" bounds="[0,0][200,300]">'
+               '<node class="androidx.recyclerview.widget.RecyclerView" bounds="[0,0][200,300]">'
+               '<node class="android.widget.LinearLayout" bounds="[0,0][200,40]">'
+               '<node class="android.widget.TextView" bounds="[16,8][180,30]"/></node>'
+               '<node class="android.widget.LinearLayout" bounds="[0,40][200,80]"/>'
+               '</node></node></hierarchy>')
+        self.assertEqual(walk_settings.list_items(xml), [(0, 0, 200, 40), (0, 40, 200, 80)])
+
+    def test_dividers_forced_where_settings_reads_them(self):
+        patch = (ANDROID / 'patches' / 'look-settings-dividers.patch').read_text()
+        self.assertIn('+++ b/chrome/android/java/src/org/chromium/chrome/browser/settings/WideDisplayPadding.java', patch)
+        self.assertIn('-        if ((customDividerFragment != null && !customDividerFragment.hasDivider())', patch)
+        self.assertIn('+        if (dividerDrawable == null) {', patch)
+        series = (ANDROID / 'patches' / 'series').read_text()
+        self.assertIn('\nlook-settings-dividers.patch\n', series)
+
+    def test_no_fragment_override_patched(self):
+        # One place decides; the screens' own hasDivider() stay as they are.
+        patch = (ANDROID / 'patches' / 'look-settings-dividers.patch').read_text()
+        self.assertEqual(patch.count('+++ b/'), 1)
