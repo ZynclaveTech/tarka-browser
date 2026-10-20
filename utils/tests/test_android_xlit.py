@@ -110,6 +110,12 @@ class TestFilesPatch(unittest.TestCase):
         self.assertIn('components/tark_xlit:host_unittests', sh)
         self.assertIn('clang_x64/tark_xlit_unittests', sh)
 
+    def test_tests_find_their_data_from_the_host_build(self):
+        # Found on the build machine: run from out/Default/clang_x64, base
+        # takes out/ for the source root; CR_SOURCE_ROOT names it.
+        sh = (ROOT / 'android' / 'build.sh').read_text()
+        self.assertIn('run env CR_SOURCE_ROOT="$_src_dir" "$_src_dir/out/Default/clang_x64/tark_xlit_unittests"', sh)
+
     def test_build_sh_gives_the_tests_two_languages(self):
         sh = (ROOT / 'android' / 'build.sh').read_text()
         self.assertIn('components/tark_xlit/test/data/android', sh)
