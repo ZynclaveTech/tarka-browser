@@ -279,5 +279,15 @@ class TestSettingsPatch(unittest.TestCase):
             self.assertNotIn(f'id="{i}"', xtb)
 
 
+
+class TestSiteSearch(unittest.TestCase):
+    """A3 Task 6: @ sources open a chip on Android (Chromium's site search)."""
+    def test_site_search_enabled_on_android(self):
+        patch = (PATCHES / 'omnibox-site-search-on.patch').read_text()
+        self.assertIn('-BASE_FEATURE(kOmniboxSiteSearch, DISABLED);', patch)
+        self.assertIn('+BASE_FEATURE(kOmniboxSiteSearch, ENABLED);', patch)
+        self.assertIn('omnibox-site-search-on.patch', series())
+
+
 if __name__ == '__main__':
     unittest.main()
