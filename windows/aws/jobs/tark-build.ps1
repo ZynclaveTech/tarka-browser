@@ -10,6 +10,8 @@ param([string]$Bucket, [string]$Prefix, [string]$Ref = 'main', [switch]$Fresh, [
 $ErrorActionPreference = 'Continue'
 # Windows PowerShell 5.1 redirects (*>>) as UTF-16; logs are read on the Mac.
 $PSDefaultParameterValues['Out-File:Encoding'] = 'utf8'
+# A job that just finished may have scheduled a shutdown; this one needs the machine.
+cmd.exe /c "shutdown /a >nul 2>&1"
 $repo = 'C:\tarka-browser'
 $work = 'C:\tw'
 $log = 'C:\tark-logs\tark-build.log'
@@ -34,8 +36,16 @@ try {
   git -C $repo submodule update --init --depth 1 ungoogled-chromium *>> $log
   "commit $(git -C $repo rev-parse HEAD)" | Add-Content $log
 
-  if ($Fresh -and (Test-Path "$work\build\src")) { Remove-Item -Recurse -Force "$work\build\src" }
+  if ($Fresh) {
+    # A fresh tree: the source and name substitution's backup of the old one
+    # (name_substitution.py refuses to overwrite an existing backup).
+    if (Test-Path "$work\build\src") { Remove-Item -Recurse -Force "$work\build\src" }
+    Remove-Item -Force "$work\build\namesubs.tar" -ErrorAction SilentlyContinue
+  }
   python3 "$repo\windows\prepare_workdir.py" $repo $work *>> $log
+  # The last build's packages, so only this build's are uploaded.
+  Get-ChildItem "$work\build" -File -ErrorAction SilentlyContinue |
+    Where-Object { $_.Extension -in '.zip', '.exe' } | Remove-Item -Force
   Set-Location $work
   $vcvars = "$env:vs2022_install\VC\Auxiliary\Build\vcvars64.bat"
   if ($PatchOnly) {
@@ -45,7 +55,10 @@ try {
   }
   cmd.exe /c "call `"$vcvars`" && python3 build.py --tarball -j 64 && python3 package.py" *>> $log
   "exit $LASTEXITCODE" | Add-Content $log
-  Get-ChildItem "$work\build" -File -Include *.zip, *.exe -Recurse -Depth 0 | ForEach-Object { Upload $_.FullName $_.Name }
+  # Only package.py's installer and zip, which sit directly in build\ (a
+  # recursive search also picked up hundreds of tool files).
+  Get-ChildItem "$work\build" -File -Filter 'Tark-*' | Where-Object { $_.Extension -in '.zip', '.exe' } |
+    ForEach-Object { Upload $_.FullName $_.Name }
 } finally {
   Upload $log 'tark-build.log'
   # Stop the machine unless another job is still building on it; the idle

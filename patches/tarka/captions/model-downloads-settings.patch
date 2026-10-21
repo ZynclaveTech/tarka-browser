@@ -1,0 +1,796 @@
+--- /dev/null
++++ b/chrome/browser/ui/webui/settings/tark_live_captions_handler.h
+@@ -0,0 +1,53 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_WEBUI_SETTINGS_TARK_LIVE_CAPTIONS_HANDLER_H_
++#define CHROME_BROWSER_UI_WEBUI_SETTINGS_TARK_LIVE_CAPTIONS_HANDLER_H_
++
++#include "base/scoped_observation.h"
++#include "base/values.h"
++#include "chrome/browser/ui/webui/settings/settings_page_ui_handler.h"
++#include "components/tark_captions/caption_model_store.h"
++
++namespace settings {
++
++// Tark (D4 Phase 4): Settings > Accessibility > Live captions. The caption
++// and translation models on this Mac (download, cancel, remove) and the two
++// remembered choices (show their words in, translate to).
++class TarkLiveCaptionsHandler : public SettingsPageUIHandler,
++                                public tark_captions::CaptionModelStore::Observer {
++ public:
++  TarkLiveCaptionsHandler();
++  TarkLiveCaptionsHandler(const TarkLiveCaptionsHandler&) = delete;
++  TarkLiveCaptionsHandler& operator=(const TarkLiveCaptionsHandler&) = delete;
++  ~TarkLiveCaptionsHandler() override;
++
++  // SettingsPageUIHandler:
++  void RegisterMessages() override;
++  void OnJavascriptAllowed() override;
++  void OnJavascriptDisallowed() override;
++
++  // tark_captions::CaptionModelStore::Observer:
++  void OnModelStatusChanged(tark_captions::ModelUnit unit) override;
++
++ private:
++  void HandleGetModels(const base::ListValue& args);
++  void HandleDownload(const base::ListValue& args);
++  void HandleCancel(const base::ListValue& args);
++  void HandleRemove(const base::ListValue& args);
++  void HandleGetChoices(const base::ListValue& args);
++  void HandleSetShowIn(const base::ListValue& args);
++  void HandleSetTranslateTo(const base::ListValue& args);
++
++  // {models: [{id, sizeMb, doneMb, state}], usedMb}.
++  base::DictValue Models() const;
++
++  base::ScopedObservation<tark_captions::CaptionModelStore,
++                          tark_captions::CaptionModelStore::Observer>
++      models_observation_{this};
++};
++
++}  // namespace settings
++
++#endif  // CHROME_BROWSER_UI_WEBUI_SETTINGS_TARK_LIVE_CAPTIONS_HANDLER_H_
+--- /dev/null
++++ b/chrome/browser/ui/webui/settings/tark_live_captions_handler.cc
+@@ -0,0 +1,147 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/ui/webui/settings/tark_live_captions_handler.h"
++
++#include <optional>
++#include <string>
++
++#include "base/functional/bind.h"
++#include "chrome/browser/browser_process.h"
++#include "chrome/browser/tark_captions/caption_models.h"
++#include "components/tark_captions/caption_choices.h"
++#include "components/tark_captions/model_manifest.h"
++#include "content/public/browser/web_ui.h"
++
++namespace settings {
++namespace {
++
++using State = tark_captions::CaptionModelStore::State;
++
++std::optional<tark_captions::ModelUnit> UnitFromId(const base::ListValue& args, size_t index) {
++  if (args.size() <= index || !args[index].is_string()) {
++    return std::nullopt;
++  }
++  for (const tark_captions::ModelUnitInfo& info : tark_captions::ModelManifest()) {
++    if (args[index].GetString() == info.id) {
++      return info.unit;
++    }
++  }
++  return std::nullopt;
++}
++
++const char* StateName(const tark_captions::CaptionModelStore& store,
++                      tark_captions::ModelUnit unit) {
++  switch (store.status(unit).state) {
++    case State::kChecking:
++      return "checking";
++    case State::kMissing:
++      return "missing";
++    case State::kDownloading:
++      return "downloading";
++    case State::kReady:
++      return store.in_use(unit) ? "inUse" : "ready";
++    case State::kFailed:
++      return "failed";
++  }
++}
++
++int Megabytes(int64_t bytes) {
++  return static_cast<int>(bytes / 1000000);
++}
++
++}  // namespace
++
++TarkLiveCaptionsHandler::TarkLiveCaptionsHandler() = default;
++TarkLiveCaptionsHandler::~TarkLiveCaptionsHandler() = default;
++
++void TarkLiveCaptionsHandler::RegisterMessages() {
++  auto add = [this](const char* name, void (TarkLiveCaptionsHandler::*method)(
++                                          const base::ListValue&)) {
++    web_ui()->RegisterMessageCallback(name, base::BindRepeating(method, base::Unretained(this)));
++  };
++  add("getTarkCaptionModels", &TarkLiveCaptionsHandler::HandleGetModels);
++  add("downloadTarkCaptionModel", &TarkLiveCaptionsHandler::HandleDownload);
++  add("cancelTarkCaptionModel", &TarkLiveCaptionsHandler::HandleCancel);
++  add("removeTarkCaptionModel", &TarkLiveCaptionsHandler::HandleRemove);
++  add("getTarkCaptionChoices", &TarkLiveCaptionsHandler::HandleGetChoices);
++  add("setTarkCaptionShowIn", &TarkLiveCaptionsHandler::HandleSetShowIn);
++  add("setTarkCaptionTranslateTo", &TarkLiveCaptionsHandler::HandleSetTranslateTo);
++}
++
++void TarkLiveCaptionsHandler::OnJavascriptAllowed() {
++  models_observation_.Observe(&tark_captions::TarkCaptionModels());
++}
++
++void TarkLiveCaptionsHandler::OnJavascriptDisallowed() {
++  models_observation_.Reset();
++}
++
++void TarkLiveCaptionsHandler::OnModelStatusChanged(tark_captions::ModelUnit unit) {
++  FireWebUIListener("tark-caption-models-changed", Models());
++}
++
++base::DictValue TarkLiveCaptionsHandler::Models() const {
++  const tark_captions::CaptionModelStore& store = tark_captions::TarkCaptionModels();
++  base::ListValue models;
++  for (const tark_captions::ModelUnitInfo& info : tark_captions::ModelManifest()) {
++    models.Append(base::DictValue()
++                      .Set("id", info.id)
++                      .Set("sizeMb", Megabytes(tark_captions::UnitSize(info)))
++                      .Set("doneMb", Megabytes(store.status(info.unit).done))
++                      .Set("state", StateName(store, info.unit)));
++  }
++  return base::DictValue()
++      .Set("models", std::move(models))
++      .Set("usedMb", Megabytes(store.BytesOnDisk()));
++}
++
++void TarkLiveCaptionsHandler::HandleGetModels(const base::ListValue& args) {
++  AllowJavascript();
++  ResolveJavascriptCallback(args[0], Models());
++}
++
++void TarkLiveCaptionsHandler::HandleDownload(const base::ListValue& args) {
++  if (std::optional<tark_captions::ModelUnit> unit = UnitFromId(args, 0)) {
++    tark_captions::TarkCaptionModels().Download(*unit);
++  }
++}
++
++void TarkLiveCaptionsHandler::HandleCancel(const base::ListValue& args) {
++  if (std::optional<tark_captions::ModelUnit> unit = UnitFromId(args, 0)) {
++    tark_captions::TarkCaptionModels().Cancel(*unit);
++  }
++}
++
++void TarkLiveCaptionsHandler::HandleRemove(const base::ListValue& args) {
++  if (std::optional<tark_captions::ModelUnit> unit = UnitFromId(args, 0)) {
++    tark_captions::TarkCaptionModels().Remove(*unit);
++  }
++}
++
++void TarkLiveCaptionsHandler::HandleGetChoices(const base::ListValue& args) {
++  AllowJavascript();
++  // Settings never runs off the record, so these are the remembered ones.
++  tark_captions::CaptionChoices choices(g_browser_process->local_state());
++  ResolveJavascriptCallback(args[0],
++                            base::DictValue()
++                                .Set("showIn", choices.show_in(/*off_the_record=*/false))
++                                .Set("translateTo", choices.translate_to(/*off_the_record=*/false)));
++}
++
++void TarkLiveCaptionsHandler::HandleSetShowIn(const base::ListValue& args) {
++  if (!args.empty() && args[0].is_string()) {
++    tark_captions::CaptionChoices(g_browser_process->local_state())
++        .SetShowIn(args[0].GetString(), /*off_the_record=*/false);
++  }
++}
++
++void TarkLiveCaptionsHandler::HandleSetTranslateTo(const base::ListValue& args) {
++  if (!args.empty() && args[0].is_string()) {
++    tark_captions::CaptionChoices(g_browser_process->local_state())
++        .SetTranslateTo(args[0].GetString(), /*off_the_record=*/false);
++  }
++}
++
++}  // namespace settings
+--- /dev/null
++++ b/chrome/browser/resources/settings/a11y_page/tark_live_captions_page.ts
+@@ -0,0 +1,173 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++/**
++ * @fileoverview 'settings-tark-live-captions-page' (Tark, D4 Phase 4):
++ * chrome://settings/liveCaptions. The caption and translation models on
++ * this Mac (download, cancel, remove) and the remembered caption choices.
++ */
++
++import '//resources/cr_elements/cr_button/cr_button.js';
++import '//resources/cr_elements/cr_icon/cr_icon.js';
++import '//resources/cr_elements/icons.html.js';
++import '../settings_page/settings_subpage.js';
++
++import {I18nMixinLit} from '//resources/cr_elements/i18n_mixin_lit.js';
++import {WebUiListenerMixinLit} from '//resources/cr_elements/web_ui_listener_mixin_lit.js';
++import {sendWithPromise} from '//resources/js/cr.js';
++import {CrLitElement} from '//resources/lit/v3_0/lit.rollup.js';
++
++import {loadTimeData} from '../i18n_setup.js';
++import {SettingsViewMixinLit} from '../settings_page/settings_view_mixin_lit.js';
++
++import {getCss} from './tark_live_captions_page.css.js';
++import {getHtml} from './tark_live_captions_page.html.js';
++
++export interface TarkCaptionModel {
++  id: string;
++  sizeMb: number;
++  doneMb: number;
++  state: 'checking'|'missing'|'downloading'|'ready'|'inUse'|'failed';
++}
++
++interface TarkCaptionModels {
++  models: TarkCaptionModel[];
++  usedMb: number;
++}
++
++interface Option {
++  value: string;
++  name: string;
++}
++
++const SettingsTarkLiveCaptionsPageElementBase =
++    SettingsViewMixinLit(WebUiListenerMixinLit(I18nMixinLit(CrLitElement)));
++
++export class SettingsTarkLiveCaptionsPageElement extends
++    SettingsTarkLiveCaptionsPageElementBase {
++  static get is() {
++    return 'settings-tark-live-captions-page';
++  }
++
++  static override get styles() {
++    return getCss();
++  }
++
++  override render() {
++    return getHtml.bind(this)();
++  }
++
++  static override get properties() {
++    return {
++      models_: {type: Array},
++      usedMb_: {type: Number},
++      showIn_: {type: String},
++      translateTo_: {type: String},
++    };
++  }
++
++  protected accessor models_: TarkCaptionModel[] = [];
++  protected accessor usedMb_: number = 0;
++  protected accessor showIn_: string = '';
++  protected accessor translateTo_: string = 'en';
++
++  protected showInOptions_: Option[] = [
++    {value: '', name: loadTimeData.getString('tarkCaptionsOwnScript')},
++    {value: 'latn', name: loadTimeData.getString('tarkCaptionsEnglishLetters')},
++    {value: 'hi', name: loadTimeData.getString('tarkCaptionsDevanagari')},
++    {value: 'ta', name: loadTimeData.getString('tarkCaptionsTamilScript')},
++    {value: 'bn', name: loadTimeData.getString('tarkCaptionsBengaliScript')},
++  ];
++  protected translateToOptions_: Option[] = [
++    {value: 'en', name: loadTimeData.getString('tarkCaptionsEnglish')},
++    {value: 'hi', name: loadTimeData.getString('tarkCaptionsHindi')},
++    {value: 'ta', name: loadTimeData.getString('tarkCaptionsTamil')},
++    {value: 'bn', name: loadTimeData.getString('tarkCaptionsBengali')},
++  ];
++
++  override connectedCallback() {
++    super.connectedCallback();
++    this.addWebUiListener(
++        'tark-caption-models-changed',
++        (models: TarkCaptionModels) => this.setModels_(models));
++    sendWithPromise<TarkCaptionModels>('getTarkCaptionModels')
++        .then(models => this.setModels_(models));
++    sendWithPromise<{showIn: string, translateTo: string}>('getTarkCaptionChoices')
++        .then(choices => {
++          this.showIn_ = choices.showIn;
++          this.translateTo_ = choices.translateTo;
++        });
++  }
++
++  private setModels_(models: TarkCaptionModels) {
++    this.models_ = models.models;
++    this.usedMb_ = models.usedMb;
++  }
++
++  protected titleOf_(id: string): string {
++    switch (id) {
++      case 'captions':
++        return this.i18n('tarkLiveCaptionsCaptions');
++      case 'to_english':
++        return this.i18n('tarkLiveCaptionsToEnglish');
++      default:
++        return this.i18n('tarkLiveCaptionsFromEnglish');
++    }
++  }
++
++  protected detailOf_(model: TarkCaptionModel): string {
++    if (model.state === 'failed') {
++      return this.i18n('tarkLiveCaptionsFailed');
++    }
++    if (model.state === 'downloading') {
++      return this.i18n(
++          'tarkLiveCaptionsProgress', String(model.doneMb), String(model.sizeMb));
++    }
++    const detail = model.id === 'captions' ?
++        this.i18n('tarkLiveCaptionsCaptionsDetail') :
++        model.id === 'to_english' ? this.i18n('tarkLiveCaptionsToEnglishDetail') :
++                                    this.i18n('tarkLiveCaptionsFromEnglishDetail');
++    return `${detail} · ${model.sizeMb} MB`;
++  }
++
++  private modelIdOf_(e: Event): string {
++    return (e.currentTarget as HTMLElement).dataset['modelId']!;
++  }
++
++  protected onDownloadClick_(e: Event) {
++    chrome.send('downloadTarkCaptionModel', [this.modelIdOf_(e)]);
++  }
++
++  protected onCancelClick_(e: Event) {
++    chrome.send('cancelTarkCaptionModel', [this.modelIdOf_(e)]);
++  }
++
++  protected onRemoveClick_(e: Event) {
++    chrome.send('removeTarkCaptionModel', [this.modelIdOf_(e)]);
++  }
++
++  protected onShowInChange_(e: Event) {
++    this.showIn_ = (e.target as HTMLSelectElement).value;
++    chrome.send('setTarkCaptionShowIn', [this.showIn_]);
++  }
++
++  protected onTranslateToChange_(e: Event) {
++    this.translateTo_ = (e.target as HTMLSelectElement).value;
++    chrome.send('setTarkCaptionTranslateTo', [this.translateTo_]);
++  }
++
++  // SettingsViewMixin implementation.
++  override focusBackButton() {
++    this.shadowRoot.querySelector('settings-subpage')!.focusBackButton();
++  }
++}
++
++declare global {
++  interface HTMLElementTagNameMap {
++    'settings-tark-live-captions-page': SettingsTarkLiveCaptionsPageElement;
++  }
++}
++
++customElements.define(
++    SettingsTarkLiveCaptionsPageElement.is, SettingsTarkLiveCaptionsPageElement);
+--- /dev/null
++++ b/chrome/browser/resources/settings/a11y_page/tark_live_captions_page.html.ts
+@@ -0,0 +1,72 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++import {html} from '//resources/lit/v3_0/lit.rollup.js';
++
++import type {SettingsTarkLiveCaptionsPageElement} from './tark_live_captions_page.js';
++
++export function getHtml(this: SettingsTarkLiveCaptionsPageElement) {
++  // clang-format off
++  return html`<!--_html_template_start_-->
++<settings-subpage page-title="$i18n{tarkLiveCaptionsTitle}"
++    route-path="${this.routePath}">
++  <div class="cr-row first">
++    <div class="secondary">$i18n{tarkLiveCaptionsIntro}</div>
++  </div>
++  ${this.models_.map(model => html`
++    <div class="cr-row" id="${model.id}">
++      <cr-icon class="model-icon"
++          icon="${model.state === 'ready' || model.state === 'inUse' ?
++              'cr:check' : 'cr:file-download'}">
++      </cr-icon>
++      <div class="flex cr-padded-text">
++        <div>${this.titleOf_(model.id)}</div>
++        <div class="secondary ${model.state === 'failed' ? 'failed' : ''}">
++          ${this.detailOf_(model)}
++        </div>
++      </div>
++      ${model.state === 'ready' ? html`
++        <cr-button id="remove-${model.id}" data-model-id="${model.id}"
++            @click="${this.onRemoveClick_}">$i18n{tarkLiveCaptionsRemove}</cr-button>
++      ` : ''}
++      ${model.state === 'inUse' ? html`
++        <div class="secondary">$i18n{tarkLiveCaptionsInUse}</div>
++      ` : ''}
++      ${model.state === 'downloading' ? html`
++        <cr-button id="cancel-${model.id}" data-model-id="${model.id}"
++            @click="${this.onCancelClick_}">$i18n{tarkLiveCaptionsCancel}</cr-button>
++      ` : ''}
++      ${model.state === 'missing' || model.state === 'failed' ? html`
++        <cr-button id="download-${model.id}" data-model-id="${model.id}"
++            @click="${this.onDownloadClick_}">$i18n{tarkLiveCaptionsDownload}</cr-button>
++      ` : ''}
++    </div>
++  `)}
++  <div class="cr-row">
++    <div class="flex">$i18n{tarkLiveCaptionsShowIn}</div>
++    <select id="showIn" class="md-select" @change="${this.onShowInChange_}">
++      ${this.showInOptions_.map(option => html`
++        <option value="${option.value}" ?selected="${option.value === this.showIn_}">
++          ${option.name}
++        </option>`)}
++    </select>
++  </div>
++  <div class="cr-row">
++    <div class="flex">$i18n{tarkLiveCaptionsTranslateTo}</div>
++    <select id="translateTo" class="md-select" @change="${this.onTranslateToChange_}">
++      ${this.translateToOptions_.map(option => html`
++        <option value="${option.value}" ?selected="${option.value === this.translateTo_}">
++          ${option.name}
++        </option>`)}
++    </select>
++  </div>
++  <div class="cr-row">
++    <div class="secondary" id="used">
++      ${this.i18n('tarkLiveCaptionsUsed', String(this.usedMb_))}
++    </div>
++  </div>
++</settings-subpage>
++<!--_html_template_end_-->`;
++  // clang-format on
++}
+--- /dev/null
++++ b/chrome/browser/resources/settings/a11y_page/tark_live_captions_page.css
+@@ -0,0 +1,19 @@
++/* Copyright 2026 The Tark Authors
++ * Use of this source code is governed by a BSD-style license that can be
++ * found in the LICENSE file. */
++
++/* #css_wrapper_metadata_start
++ * #type=style-lit
++ * #import=//resources/cr_elements/cr_shared_style_lit.css.js
++ * #import=//resources/cr_elements/md_select_lit.css.js
++ * #import=../settings_shared_lit.css.js
++ * #include=cr-shared-style-lit md-select-lit settings-shared-lit
++ * #css_wrapper_metadata_end */
++
++.model-icon {
++  margin-inline-end: 16px;
++}
++
++.failed {
++  color: var(--cr-fallback-color-error, var(--google-red-600));
++}
+--- a/chrome/app/settings_strings.grdp
++++ b/chrome/app/settings_strings.grdp
+@@ -635,6 +635,60 @@
+     <message name="IDS_SETTINGS_TARK_HEADER_ADVANCED" desc="Sentence under the Advanced section label, which groups the less used settings.">
+       For when you need them
+     </message>
++    <message name="IDS_SETTINGS_TARK_LIVE_CAPTIONS_TITLE" desc="Title of the Settings page and row for Tark's live captions for calls.">
++      Live captions
++    </message>
++    <message name="IDS_SETTINGS_TARK_LIVE_CAPTIONS_ROW_SUBLABEL" desc="Sub-label of the Live captions row in Accessibility settings.">
++      Captions and translation for calls, on this Mac
++    </message>
++    <message name="IDS_SETTINGS_TARK_LIVE_CAPTIONS_INTRO" desc="Introduction on the Live captions settings page.">
++      Captions and translation run on this Mac. Each language's model downloads once from gettarka.com, then works offline.
++    </message>
++    <message name="IDS_SETTINGS_TARK_LIVE_CAPTIONS_CAPTIONS" desc="Live captions settings: the download for Indian-language captions.">
++      Indian languages · captions
++    </message>
++    <message name="IDS_SETTINGS_TARK_LIVE_CAPTIONS_CAPTIONS_DETAIL" desc="Live captions settings: the languages the captions download covers.">
++      Hindi, Tamil, Bengali
++    </message>
++    <message name="IDS_SETTINGS_TARK_LIVE_CAPTIONS_TO_ENGLISH" desc="Live captions settings: the download for translating into English.">
++      Translate into English
++    </message>
++    <message name="IDS_SETTINGS_TARK_LIVE_CAPTIONS_TO_ENGLISH_DETAIL" desc="Live captions settings: what the translate-into-English download covers.">
++      From Hindi, Tamil, Bengali
++    </message>
++    <message name="IDS_SETTINGS_TARK_LIVE_CAPTIONS_FROM_ENGLISH" desc="Live captions settings: the download for translating into Indian languages.">
++      Translate into Hindi, Tamil, Bengali
++    </message>
++    <message name="IDS_SETTINGS_TARK_LIVE_CAPTIONS_FROM_ENGLISH_DETAIL" desc="Live captions settings: when the translate-into-Indian-languages download is needed.">
++      Needed only for Indian targets
++    </message>
++    <message name="IDS_SETTINGS_TARK_LIVE_CAPTIONS_DOWNLOAD" desc="Live captions settings: button to download a model.">
++      Download
++    </message>
++    <message name="IDS_SETTINGS_TARK_LIVE_CAPTIONS_REMOVE" desc="Live captions settings: button to delete a downloaded model.">
++      Remove
++    </message>
++    <message name="IDS_SETTINGS_TARK_LIVE_CAPTIONS_CANCEL" desc="Live captions settings: button to stop a model download.">
++      Cancel
++    </message>
++    <message name="IDS_SETTINGS_TARK_LIVE_CAPTIONS_IN_USE" desc="Live captions settings: shown instead of Remove while a call is using the model.">
++      In use
++    </message>
++    <message name="IDS_SETTINGS_TARK_LIVE_CAPTIONS_FAILED" desc="Live captions settings: shown when a model download failed.">
++      Couldn't download. Check your connection.
++    </message>
++    <message name="IDS_SETTINGS_TARK_LIVE_CAPTIONS_SHOW_IN" desc="Live captions settings: the script the other person's words are shown in.">
++      Show their words in
++    </message>
++    <message name="IDS_SETTINGS_TARK_LIVE_CAPTIONS_TRANSLATE_TO" desc="Live captions settings: the language translations are shown in.">
++      Translate to
++    </message>
++    <message name="IDS_SETTINGS_TARK_LIVE_CAPTIONS_PROGRESS" desc="Live captions settings: progress of a model download. $1 and $2 are megabytes.">
++      <ph name="DONE">$1<ex>412</ex></ph> of <ph name="TOTAL">$2<ex>680</ex></ph> MB
++    </message>
++    <message name="IDS_SETTINGS_TARK_LIVE_CAPTIONS_USED" desc="Live captions settings: space the downloaded models use. $1 is megabytes.">
++      Using <ph name="SIZE">$1<ex>680</ex></ph> MB on this Mac
++    </message>
+     <message name="IDS_SETTINGS_TARK_CONNECTS_TITLE" desc="Title of the Privacy settings row that lists every service Tark itself connects to.">
+       What Tark connects to
+     </message>
+@@ -653,6 +707,9 @@
+     <message name="IDS_SETTINGS_TARK_CONNECTS_WIDEVINE" desc="Item in the list of services Tark connects to: Google's DRM module server, used only if the user turns on protected video. $1 is a list of host names.">
+       Google's Widevine servers, only if you turn on protected video above (<ph name="HOSTS">$1<ex>update.example.com</ex></ph>)
+     </message>
++    <message name="IDS_SETTINGS_TARK_CONNECTS_CAPTIONS" desc="Item in the list of services Tark connects to: Tark's own server, which hosts the on-device caption and translation models. $1 is a list of host names.">
++      Tark's live caption and translation models, downloaded once when you first use a language or from Settings › Live captions; your calls are never sent (<ph name="HOSTS">$1<ex>models.example.com</ex></ph>)
++    </message>
+     <message name="IDS_SETTINGS_TARK_WIDEVINE" desc="Label of the Privacy settings toggle that lets sites play DRM-protected video by downloading Google's Widevine module.">
+       Protected video (Netflix, Prime and others)
+     </message>
+--- a/chrome/browser/resources/settings/BUILD.gn
++++ b/chrome/browser/resources/settings/BUILD.gn
+@@ -490,6 +490,13 @@
+     ]
+   }
+ 
++  if (is_mac) {
++    ts_files += [
++      "a11y_page/tark_live_captions_page.html.ts",
++      "a11y_page/tark_live_captions_page.ts",
++    ]
++  }
++
+   if (is_win || is_mac || is_linux) {
+     ts_files += [
+       "a11y_page/ax_annotations_section.html.ts",
+@@ -521,6 +528,7 @@
+     "a11y_page/captions_page.css",
+     "a11y_page/live_caption.css",
+     "a11y_page/live_translate.css",
++    "a11y_page/tark_live_captions_page.css",
+     "about_page/about_page.css",
+     "appearance_page/appearance_fonts_page.css",
+     "appearance_page/appearance_page.css",
+--- a/chrome/browser/resources/settings/a11y_page/a11y_page.html.ts
++++ b/chrome/browser/resources/settings/a11y_page/a11y_page.html.ts
+@@ -20,6 +20,13 @@
+         </cr-link-row>
+ </if>
+ 
++<if expr="is_macosx">
++        <cr-link-row id="tarkLiveCaptions" class="hr"
++            label="$i18n{tarkLiveCaptionsTitle}"
++            sub-label="$i18n{tarkLiveCaptionsRowSublabel}"
++            @click="${this.onTarkLiveCaptionsClick_}">
++        </cr-link-row>
++</if>
+ <if expr="is_macosx or is_win">
+         <cr-link-row id="captions"
+             class="hr"
+--- a/chrome/browser/resources/settings/a11y_page/a11y_page.ts
++++ b/chrome/browser/resources/settings/a11y_page/a11y_page.ts
+@@ -177,6 +177,12 @@
+     return anyAxAnnotationsFeatureEnabled && this.hasScreenReader_;
+   }
+ 
++  // <if expr="is_macosx">
++  protected onTarkLiveCaptionsClick_() {
++    Router.getInstance().navigateTo(routes.TARK_LIVE_CAPTIONS);
++  }
++  // </if>
++
+   protected onCaptionsClick_() {
+     // <if expr="is_win or is_macosx">
+     CaptionsBrowserProxyImpl.getInstance().openSystemCaptionsDialog();
+@@ -231,21 +237,24 @@
+   }
+   // </if>
+ 
+-  // <if expr="is_linux">
++  // <if expr="is_linux or is_macosx">
+   // SettingsViewMixin implementation.
+   override getFocusConfig() {
+     const map = new Map();
+     if (routes.CAPTIONS) {
+       map.set(routes.CAPTIONS.path, '#captions');
+     }
++    if (routes.TARK_LIVE_CAPTIONS) {
++      map.set(routes.TARK_LIVE_CAPTIONS.path, '#tarkLiveCaptions');
++    }
+     return map;
+   }
+   // </if>
+ 
+   // SettingsViewMixin implementation.
+   override getAssociatedControlFor(childViewId: string): HTMLElement {
+-    assert(childViewId === 'captions');
+-    const control = this.shadowRoot.querySelector<HTMLElement>('#captions');
++    assert(childViewId === 'captions' || childViewId === 'tarkLiveCaptions');
++    const control = this.shadowRoot.querySelector<HTMLElement>(`#${childViewId}`);
+     assert(
+         control,
+         `Failed to find associated control for child '${childViewId}'`);
+--- a/chrome/browser/resources/settings/a11y_page/a11y_page_index.html.ts
++++ b/chrome/browser/resources/settings/a11y_page/a11y_page_index.html.ts
+@@ -20,6 +20,12 @@
+       route-path="${this.routes_.CAPTIONS.path}">
+   </settings-captions-page>
+ </if>
++<if expr="is_macosx">
++  <settings-tark-live-captions-page slot="view" id="tarkLiveCaptions"
++      data-parent-view-id="parent"
++      route-path="${this.routes_.TARK_LIVE_CAPTIONS.path}">
++  </settings-tark-live-captions-page>
++</if>
+ </cr-view-manager>
+ <!--_html_template_end_-->`;
+   // clang-format on
+--- a/chrome/browser/resources/settings/a11y_page/a11y_page_index.ts
++++ b/chrome/browser/resources/settings/a11y_page/a11y_page_index.ts
+@@ -8,6 +8,9 @@
+ import './captions_page.js';
+ 
+ // </if>
++// <if expr="is_macosx">
++import './tark_live_captions_page.js';
++// </if>
+ 
+ import type {CrViewManagerElement} from 'chrome://resources/cr_elements/cr_view_manager/cr_view_manager.js';
+ import {CrLitElement} from 'chrome://resources/lit/v3_0/lit.rollup.js';
+@@ -64,6 +67,12 @@
+           this.$.viewManager.switchView(
+               'parent', 'no-animation', 'no-animation');
+           break;
++        // <if expr="is_macosx">
++        case routes.TARK_LIVE_CAPTIONS:
++          this.$.viewManager.switchView(
++              'tarkLiveCaptions', 'no-animation', 'no-animation');
++          break;
++        // </if>
+         // <if expr="is_linux">
+         case routes.CAPTIONS:
+           this.$.viewManager.switchView(
+--- a/chrome/browser/resources/settings/privacy_page/privacy_page.html
++++ b/chrome/browser/resources/settings/privacy_page/privacy_page.html
+@@ -58,6 +58,7 @@
+       <div class="cr-row continuation">$i18n{tarkConnectsStore}</div>
+       <div class="cr-row continuation">$i18n{tarkConnectsUblock}</div>
+       <div class="cr-row continuation">$i18n{tarkConnectsWidevine}</div>
++      <div class="cr-row continuation">$i18n{tarkConnectsCaptions}</div>
+     </cr-collapse>
+     <cr-toast id="deleteBrowsingDataToast" duration="5000">
+       <div>[[dbdDeletionConfirmationToastLabel_]]</div>
+--- a/chrome/browser/resources/settings/route.ts
++++ b/chrome/browser/resources/settings/route.ts
+@@ -281,6 +281,10 @@
+     // <if expr="is_linux">
+     r.CAPTIONS = r.ACCESSIBILITY.createChild('/captions');
+     // </if>
++    // <if expr="is_macosx">
++    // Tark (D4): live captions for calls.
++    r.TARK_LIVE_CAPTIONS = r.ACCESSIBILITY.createChild('/liveCaptions');
++    // </if>
+   }
+ 
+   // <if expr="not is_chromeos">
+--- a/chrome/browser/resources/settings/router.ts
++++ b/chrome/browser/resources/settings/router.ts
+@@ -26,6 +26,7 @@
+   AUTOFILL: Route;
+   BASIC: Route;
+   CAPTIONS: Route;
++  TARK_LIVE_CAPTIONS: Route;
+   CLEAR_BROWSER_DATA: Route;
+   COMPARE: Route;
+   CONTACT_INFO: Route;
+--- a/chrome/browser/ui/webui/settings/BUILD.gn
++++ b/chrome/browser/ui/webui/settings/BUILD.gn
+@@ -180,11 +180,15 @@
+     "site_settings_helper.cc",
+     "tark_contacted_hosts.cc",
+     "tark_contacted_hosts.h",
++    "tark_live_captions_handler.cc",
++    "tark_live_captions_handler.h",
+     "tark_settings_strings.cc",
+     "tark_settings_strings.h",
+   ]
+ 
+   deps = [
++    "//chrome/browser/tark_captions",
++    "//components/tark_captions",
+     ":settings",
+     "//chrome/app:command_ids",
+     "//chrome/app:generated_resources",
+--- a/chrome/browser/ui/webui/settings/settings_ui.cc
++++ b/chrome/browser/ui/webui/settings/settings_ui.cc
+@@ -4,6 +4,10 @@
+ 
+ #include "chrome/browser/ui/webui/settings/settings_ui.h"
+ 
++#if BUILDFLAG(IS_MAC)
++#include "chrome/browser/ui/webui/settings/tark_live_captions_handler.h"
++#endif
++
+ #include <stddef.h>
+ 
+ #include <memory>
+@@ -310,6 +314,7 @@
+ 
+ #if BUILDFLAG(IS_MAC)
+   AddSettingsPageUIHandler(std::make_unique<MacSystemSettingsHandler>());
++  AddSettingsPageUIHandler(std::make_unique<TarkLiveCaptionsHandler>());
+ #endif
+ 
+   html_source->AddBoolean("signinAllowed", false);
+--- a/chrome/browser/ui/webui/settings/tark_contacted_hosts.cc
++++ b/chrome/browser/ui/webui/settings/tark_contacted_hosts.cc
+@@ -29,6 +29,8 @@
+        u"pgl.yoyo.org"},
+       {"tarkConnectsWidevine", IDS_SETTINGS_TARK_CONNECTS_WIDEVINE,
+        u"update.googleapis.com, edgedl.me.gvt1.com"},
++      {"tarkConnectsCaptions", IDS_SETTINGS_TARK_CONNECTS_CAPTIONS,
++       u"gettarka.com"},
+   };
+   for (const Row& row : kRows) {
+     html_source->AddString(
+--- a/chrome/browser/ui/webui/settings/tark_settings_strings.cc
++++ b/chrome/browser/ui/webui/settings/tark_settings_strings.cc
+@@ -47,6 +47,35 @@
+       {"tarkHeaderPasswords", IDS_SETTINGS_TARK_HEADER_PASSWORDS},
+       {"tarkHeaderDownloads", IDS_SETTINGS_TARK_HEADER_DOWNLOADS},
+       {"tarkHeaderAdvanced", IDS_SETTINGS_TARK_HEADER_ADVANCED},
++      // D4: Settings > Accessibility > Live captions.
++      {"tarkLiveCaptionsTitle", IDS_SETTINGS_TARK_LIVE_CAPTIONS_TITLE},
++      {"tarkLiveCaptionsRowSublabel", IDS_SETTINGS_TARK_LIVE_CAPTIONS_ROW_SUBLABEL},
++      {"tarkLiveCaptionsIntro", IDS_SETTINGS_TARK_LIVE_CAPTIONS_INTRO},
++      {"tarkLiveCaptionsCaptions", IDS_SETTINGS_TARK_LIVE_CAPTIONS_CAPTIONS},
++      {"tarkLiveCaptionsCaptionsDetail", IDS_SETTINGS_TARK_LIVE_CAPTIONS_CAPTIONS_DETAIL},
++      {"tarkLiveCaptionsToEnglish", IDS_SETTINGS_TARK_LIVE_CAPTIONS_TO_ENGLISH},
++      {"tarkLiveCaptionsToEnglishDetail", IDS_SETTINGS_TARK_LIVE_CAPTIONS_TO_ENGLISH_DETAIL},
++      {"tarkLiveCaptionsFromEnglish", IDS_SETTINGS_TARK_LIVE_CAPTIONS_FROM_ENGLISH},
++      {"tarkLiveCaptionsFromEnglishDetail",
++       IDS_SETTINGS_TARK_LIVE_CAPTIONS_FROM_ENGLISH_DETAIL},
++      {"tarkLiveCaptionsDownload", IDS_SETTINGS_TARK_LIVE_CAPTIONS_DOWNLOAD},
++      {"tarkLiveCaptionsRemove", IDS_SETTINGS_TARK_LIVE_CAPTIONS_REMOVE},
++      {"tarkLiveCaptionsCancel", IDS_SETTINGS_TARK_LIVE_CAPTIONS_CANCEL},
++      {"tarkLiveCaptionsInUse", IDS_SETTINGS_TARK_LIVE_CAPTIONS_IN_USE},
++      {"tarkLiveCaptionsFailed", IDS_SETTINGS_TARK_LIVE_CAPTIONS_FAILED},
++      {"tarkLiveCaptionsShowIn", IDS_SETTINGS_TARK_LIVE_CAPTIONS_SHOW_IN},
++      {"tarkLiveCaptionsTranslateTo", IDS_SETTINGS_TARK_LIVE_CAPTIONS_TRANSLATE_TO},
++      {"tarkLiveCaptionsProgress", IDS_SETTINGS_TARK_LIVE_CAPTIONS_PROGRESS},
++      {"tarkLiveCaptionsUsed", IDS_SETTINGS_TARK_LIVE_CAPTIONS_USED},
++      {"tarkCaptionsOwnScript", IDS_TARK_CAPTIONS_OWN_SCRIPT},
++      {"tarkCaptionsEnglishLetters", IDS_TARK_CAPTIONS_ENGLISH_LETTERS},
++      {"tarkCaptionsDevanagari", IDS_TARK_CAPTIONS_DEVANAGARI},
++      {"tarkCaptionsTamilScript", IDS_TARK_CAPTIONS_TAMIL_SCRIPT},
++      {"tarkCaptionsBengaliScript", IDS_TARK_CAPTIONS_BENGALI_SCRIPT},
++      {"tarkCaptionsEnglish", IDS_TARK_CAPTIONS_ENGLISH},
++      {"tarkCaptionsHindi", IDS_TARK_CAPTIONS_HINDI},
++      {"tarkCaptionsTamil", IDS_TARK_CAPTIONS_TAMIL},
++      {"tarkCaptionsBengali", IDS_TARK_CAPTIONS_BENGALI},
+   };
+   html_source->AddLocalizedStrings(kStrings);
+ }

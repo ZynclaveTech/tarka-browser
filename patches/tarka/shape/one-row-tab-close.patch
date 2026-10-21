@@ -1,0 +1,116 @@
+--- a/chrome/browser/ui/views/tabs/tab_strip.h
++++ b/chrome/browser/ui/views/tabs/tab_strip.h
+@@ -91,6 +91,12 @@
+   void SetAvailableWidthCallback(
+       base::RepeatingCallback<int()> available_width_callback);
+ 
++  // Tark: whether closing tabs with the mouse has frozen the tabs' widths
++  // (tab closing mode, see TabContainer::EnterTabClosingMode()).
++  bool InTabClosingMode() {
++    return tab_container_ && tab_container_->InTabClose();
++  }
++
+   void NewTabButtonPressed(const ui::Event& event);
+ 
+   // Returns the size needed for the specified views. This is invoked during
+--- a/chrome/browser/ui/views/toolbar/toolbar_view.cc
++++ b/chrome/browser/ui/views/toolbar/toolbar_view.cc
+@@ -6,6 +6,7 @@
+ 
+ #include <algorithm>
+ #include <memory>
++#include <optional>
+ #include <utility>
+ 
+ #include "ui/views/view_observer.h"
+@@ -233,7 +234,8 @@
+   gfx::Size CalculatePreferredSize(
+       const views::SizeBounds& available_size) const override {
+     const views::View* tab_strip = GetHorizontalTabStrip();
+-    return gfx::Size(tab_strip ? tab_strip->GetPreferredSize().width() : 0, 0);
++    const int width = tab_strip ? tab_strip->GetPreferredSize().width() : 0;
++    return gfx::Size(std::max(width, held_preferred_.value_or(0)), 0);
+   }
+   gfx::Size GetMinimumSize() const override {
+     const views::View* tab_strip = GetHorizontalTabStrip();
+@@ -260,17 +262,25 @@
+   }
+ 
+   void AddedToWidget() override {
+-    if (views::View* tab_strip =
++    if (TabStripRegionView* region =
+             browser_view_->tark_horizontal_tab_strip_region_view();
+-        tab_strip && !observation_.IsObserving()) {
+-      observation_.Observe(tab_strip);
++        region && !observation_.IsObserving()) {
++      observation_.Observe(region);
++      tab_strip_ = views::AsViewClass<TabStrip>(region->GetTabStripView());
+     }
+   }
+ 
+   // views::ViewObserver:
+   void OnViewPreferredSizeChanged(views::View* observed_view) override {
++    UpdateHeldWidth();
+     PreferredSizeChanged();
+   }
++  // A window resize can squeeze the tabs or give them room.
++  void OnBoundsChanged(const gfx::Rect& previous_bounds) override {
++    if (UpdateHeldWidth()) {
++      PreferredSizeChanged();
++    }
++  }
+   // Switching vertical tabs on or off shows or hides the horizontal strip.
+   void OnViewVisibilityChanged(views::View* observed_view,
+                                views::View* starting_view,
+@@ -278,10 +288,38 @@
+     PreferredSizeChanged();
+   }
+   void OnViewIsDeleting(views::View* observed_view) override {
++    tab_strip_ = nullptr;
+     observation_.Reset();
+   }
+ 
+  private:
++  // Closing squeezed tabs with the mouse freezes their widths (tab closing
++  // mode) so the next close button lands under the pointer, while the tab
++  // strip's preferred width shrinks by a tab with every close. A well that
++  // followed it would slide the buttons and the address pill under the
++  // pointer, then reflow the whole row as the tabs widen back once the
++  // pointer leaves. So from the first close until the tabs have finished
++  // widening, the well keeps asking for what the tabs asked for at rest:
++  // FlexLayout's offer to the well depends on what the well asks for, so
++  // holding the well's width instead would still let the row shrink it.
++  // Tabs at full width leave closing mode at once; the well follows those
++  // as before. Returns whether the held preferred width changed.
++  bool UpdateHeldWidth() {
++    const std::optional<int> before = held_preferred_;
++    const views::View* region = GetHorizontalTabStrip();
++    if (!region || !tab_strip_) {
++      held_preferred_.reset();
++    } else if (!tab_strip_->InTabClosingMode() &&
++               !tab_strip_->IsAnimatingInTabStrip()) {
++      held_preferred_.reset();
++      resting_preferred_ = region->GetPreferredSize().width();
++    } else if (tab_strip_->InTabClosingMode() && !held_preferred_ &&
++               resting_preferred_ > width()) {
++      held_preferred_ = resting_preferred_;
++    }
++    return held_preferred_ != before;
++  }
++
+   const views::View* GetHorizontalTabStrip() const {
+     if (!browser_view_->ShouldDrawTabStrip() ||
+         browser_view_->ShouldDrawVerticalTabStrip()) {
+@@ -291,6 +329,12 @@
+   }
+ 
+   raw_ptr<BrowserView> browser_view_;
++  raw_ptr<TabStrip> tab_strip_ = nullptr;
++  // What the tab strip asked for when last at rest.
++  int resting_preferred_ = 0;
++  // Held through tab closing mode while the tabs are squeezed (see
++  // UpdateHeldWidth()).
++  std::optional<int> held_preferred_;
+   base::ScopedObservation<views::View, views::ViewObserver> observation_{this};
+ };
+ 

@@ -26,6 +26,18 @@ if [[ -z "$_target_dmg" ]]; then
   _target_dmg="$_root_dir/build/${_product_name}_${_chromium_version}-${_ungoogled_revision}.${_package_revision}_macos.dmg"
 fi
 
+# A release for other people must be an official build: non-official builds
+# keep Chromium's DCHECKs on, so an internal check that is harmless in an
+# official build kills the tab ("Aw, Snap!", error code 6). Revisions 1 and 2
+# shipped that way. Ad-hoc and development signing stay allowed for testing.
+if (( ! _ad_hoc && ! _dev )); then
+  _official="$(grep -E '^[[:space:]]*is_official_build[[:space:]]*=' "$_src_dir/out/Default/args.gn" | tail -1 | tr -d ' ')"
+  if [[ "$_official" != "is_official_build=true" ]]; then
+    printf '::error::refusing to sign a non-official build for release (%s in out/Default/args.gn)\n' "${_official:-no is_official_build}" >&2
+    exit 1
+  fi
+fi
+
 sign() {
   if (( _ad_hoc )); then
     # Library validation compares Team IDs, and an ad-hoc signature has
@@ -66,6 +78,29 @@ else
   rm -rf "$_sparkle"
 fi
 
+# Tark (D4): ONNX Runtime for live captions. Signed below with Tark's identity
+# (the speech helper runs with library validation).
+_ort_src="${TARKA_ONNXRUNTIME_DIR:-$_src_dir/third_party/tark_onnxruntime}"
+_ort="$_app/Contents/Frameworks/libonnxruntime.1.31.0.dylib"
+if [[ -d "$_ort_src" ]]; then
+  "$_root_dir/utils/install_onnxruntime.sh" "$_app" "$_ort_src"
+else
+  warning "No ONNX Runtime at $_ort_src: this build has no live captions"
+  rm -f "$_ort"
+fi
+
+# Tark (D4 Phase 3): the Swift library over macOS 26's speech and translation
+# (the Apple languages in live captions), built by GN next to Tark.app.
+# Signed below with Tark's identity; the browser loads it on macOS 26 only.
+_apple_src="${TARKA_APPLE_SPEECH_DYLIB:-$(dirname "$_app")/libtark_apple_speech.dylib}"
+_apple="$_app/Contents/Frameworks/libtark_apple_speech.dylib"
+if [[ -f "$_apple_src" ]]; then
+  "$_root_dir/utils/install_apple_speech.sh" "$_app" "$_apple_src"
+else
+  warning "No $_apple_src: this build has no Apple languages in live captions"
+  rm -f "$_apple"
+fi
+
 # Fix issue where macOS requests permission for incoming network connections
 # See https://github.com/ungoogled-software/ungoogled-chromium-macos/issues/17
 xattr -cs "$_app"
@@ -101,6 +136,12 @@ if [[ -d "$_sparkle" ]]; then
   sign --options runtime "$_sparkle/Versions/B/Updater.app"
   sign --options runtime "$_sparkle"
 fi
+if [[ -f "$_ort" ]]; then
+  sign --identifier "libonnxruntime" --options runtime "$_ort"
+fi
+if [[ -f "$_apple" ]]; then
+  sign --identifier "libtark_apple_speech" --options runtime "$_apple"
+fi
 if (( _dev )); then
   _profile="${TARKA_PROVISIONING_PROFILE:?set TARKA_PROVISIONING_PROFILE to the development profile}"
   _dev_entitlements="$(mktemp -t tark-entitlements).plist"
@@ -109,8 +150,12 @@ if (( _dev )); then
   cp "$_profile" "$_app/Contents/embedded.provisionprofile"
   sign --identifier "$_bundle_id" --options restrict,library,runtime,kill --entitlements "$_dev_entitlements" "$_app"
 elif (( _ad_hoc )); then
+  # A development profile left by an earlier dev signing doesn't belong in
+  # any other build.
+  rm -f "$_app/Contents/embedded.provisionprofile"
   sign --identifier "$_bundle_id" --options restrict,library,runtime,kill --entitlements "$_root_dir/entitlements/app-entitlements.plist" "$_app"
 else
+  rm -f "$_app/Contents/embedded.provisionprofile"
   sign --identifier "$_bundle_id" --options restrict,library,runtime,kill --entitlements "$_root_dir/entitlements/app-entitlements.plist" --requirements "=designated => identifier \"$_bundle_id\" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */" "$_app"
 fi
 

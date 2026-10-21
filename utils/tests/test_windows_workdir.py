@@ -62,6 +62,21 @@ class TestWindowsWorkdir(unittest.TestCase):
         self.assertEqual((self.work / 'domain_substitution.list').read_text(),
                          (self.work / 'ungoogled-chromium' / 'domain_substitution.list').read_text())
 
+    def test_package_names_are_tarks(self):
+        # Tark-<chromium>-<revision>-<cpu>, as the DMG is named; the zip's
+        # top folder takes the same name.
+        sys.path.insert(0, str(self.work))
+        try:
+            import package
+        finally:
+            sys.path.pop(0)
+        outputs = pathlib.Path(self.tmp.name) / 'out'
+        outputs.mkdir(exist_ok=True)
+        (outputs / 'args.gn').write_text('target_cpu="x64"\n')
+        chromium = (REPO / 'ungoogled-chromium' / 'chromium_version.txt').read_text().strip()
+        revision = (REPO / 'revision.txt').read_text().strip()
+        self.assertEqual(package.tark_stem(outputs), 'Tark-%s-%s-x64' % (chromium, revision))
+
     def test_rerun_keeps_build_dir(self):
         marker = self.work / 'build' / 'keep.txt'
         marker.parent.mkdir(parents=True, exist_ok=True)

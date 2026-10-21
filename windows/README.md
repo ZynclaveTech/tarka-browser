@@ -7,10 +7,12 @@ plus Tark's patches and build steps. It builds natively on a Windows machine
 the Mac.
 
 - `upstream/` — upstream's build files and Windows platform patches at the
-  tag in `upstream/UPSTREAM_COMMIT` (BSD-3-Clause, `upstream/LICENSE`). One
-  local change: a hook in `upstream/build.py`, after patching and domain
-  substitution, that runs `tark_post_patch.py`. When bumping upstream, copy
-  the new files over and re-add the hook.
+  tag in `upstream/UPSTREAM_COMMIT` (BSD-3-Clause, `upstream/LICENSE`). Two
+  local changes: a hook in `upstream/build.py`, after patching and domain
+  substitution, that runs `tark_post_patch.py`; and Tark's names in
+  `upstream/package.py` (`tark_stem`: `Tark-<chromium>-<revision>-x64.zip`
+  and `-setup.exe`, as the DMG is named). When bumping upstream, copy the
+  new files over and re-add both.
 - `prepare_workdir.py REPO WORKDIR` — assembles the folder `build.py` runs in:
   upstream's files, this repo's `ungoogled-chromium` core, Tark's patches
   after the Windows ones (minus `mac-only-patches.txt`), Tark's filtered

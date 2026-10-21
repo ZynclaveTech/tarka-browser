@@ -1,0 +1,650 @@
+--- /dev/null
++++ b/chrome/browser/tark_captions/apple/BUILD.gn
+@@ -0,0 +1,40 @@
++# Copyright 2026 The Tark Authors
++# Use of this source code is governed by a BSD-style license that can be
++# found in the LICENSE file.
++
++import("//build/config/mac/mac_sdk.gni")
++import("//testing/test.gni")
++
++# Tark (D4 Phase 3): the Swift library over macOS 26's speech and
++# translation, built by Xcode's swiftc (Chromium's Mac toolchain builds no
++# Swift). sign_and_package_app.sh installs it into Tark.app's Frameworks.
++action("tark_apple_speech") {
++  script = "build_swift_dylib.py"
++  sources = [ "tark_apple_speech.swift" ]
++  outputs = [ "$root_out_dir/libtark_apple_speech.dylib" ]
++  args = [
++    "--sdk",
++    rebase_path(mac_sdk_path, root_build_dir),
++    "--target",
++    "arm64-apple-macos26.0",
++    "--module",
++    "TarkAppleSpeech",
++    "--output",
++    rebase_path(outputs[0], root_build_dir),
++  ] + rebase_path(sources, root_build_dir)
++}
++
++# Runs on macOS 26 with the Spanish speech and translation installed; the
++# tests that need them are skipped otherwise. TARK_CAPTIONS_TESTDATA as for
++# the other captions tests.
++test("tark_apple_speech_unittests") {
++  sources = [ "tark_apple_speech_unittest.cc" ]
++  deps = [
++    "//base",
++    "//base/test:run_all_unittests",
++    "//base/test:test_support",
++    "//components/tark_captions:test_support",
++    "//testing/gtest",
++  ]
++  data_deps = [ ":tark_apple_speech" ]
++}
+--- /dev/null
++++ b/chrome/browser/tark_captions/apple/build_swift_dylib.py
+@@ -0,0 +1,36 @@
++#!/usr/bin/env python3
++# Copyright 2026 The Tark Authors
++# Use of this source code is governed by a BSD-style license that can be
++# found in the LICENSE file.
++"""Builds a Swift dynamic library with Xcode's swiftc, for the GN action in
++this folder (Chromium's Mac toolchain builds no Swift).
++
++  build_swift_dylib.py --sdk SDK --target TRIPLE --module NAME --output DYLIB
++                       SOURCE.swift...
++"""
++import argparse
++import os
++import subprocess
++import sys
++
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument('--sdk', required=True)
++    parser.add_argument('--target', required=True)
++    parser.add_argument('--module', required=True)
++    parser.add_argument('--output', required=True)
++    parser.add_argument('sources', nargs='+')
++    args = parser.parse_args()
++    name = os.path.basename(args.output)
++    command = [
++        'xcrun', 'swiftc', '-emit-library', '-module-name', args.module,
++        '-target', args.target, '-sdk', args.sdk, '-O', '-swift-version', '5',
++        '-Xlinker', '-install_name', '-Xlinker', '@rpath/' + name,
++        '-o', args.output,
++    ] + args.sources
++    return subprocess.run(command).returncode
++
++
++if __name__ == '__main__':
++    sys.exit(main())
+--- /dev/null
++++ b/chrome/browser/tark_captions/apple/tark_apple_speech.h
+@@ -0,0 +1,71 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_TARK_CAPTIONS_APPLE_TARK_APPLE_SPEECH_H_
++#define CHROME_BROWSER_TARK_CAPTIONS_APPLE_TARK_APPLE_SPEECH_H_
++
++// Tark (D4 Phase 3): the C entry points of libtark_apple_speech.dylib, a
++// small Swift library over macOS 26's on-device speech (SpeechAnalyzer,
++// SpeechTranscriber, AssetInventory) and Translation (TranslationSession).
++// Chromium's Mac toolchain builds no Swift, so Xcode's swiftc builds it
++// (build_swift_dylib.py) and the browser dlopens it on macOS 26 and later.
++//
++// Callbacks come on any thread; callers hop to their own. Strings are UTF-8.
++// Locales are identifiers such as "es_US"; languages are codes such as "es".
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++typedef void (*tark_apple_status_fn)(void* ctx, int status);
++typedef void (*tark_apple_progress_fn)(void* ctx, double fraction);
++typedef void (*tark_apple_done_fn)(void* ctx, int ok);
++typedef void (*tark_apple_result_fn)(void* ctx, int is_final, const char* text);
++typedef void (*tark_apple_failed_fn)(void* ctx, int code);
++typedef void (*tark_apple_stopped_fn)(void* ctx);
++typedef void (*tark_apple_text_fn)(void* ctx, int ok, const char* text);
++
++// 1 when this Mac's speech can transcribe (macOS 26 and later).
++int tark_apple_available(void);
++
++// The locale's speech: 0 unsupported, 1 supported (needs installing),
++// 2 installed.
++void tark_apple_locale_status(const char* locale, void* ctx, tark_apple_status_fn done);
++
++// Has macOS download and install the locale's speech; `progress` from 0 to
++// 1 meanwhile, then `done` once.
++void tark_apple_install(const char* locale,
++                        void* ctx,
++                        tark_apple_progress_fn progress,
++                        tark_apple_done_fn done);
++
++// Starts transcribing: `result` for each draft (is_final 0) and final, or
++// `failed` once. The handle takes audio until stopped.
++void* tark_apple_transcriber_start(const char* locale,
++                                   void* ctx,
++                                   tark_apple_result_fn result,
++                                   tark_apple_failed_fn failed);
++// 16 kHz mono audio.
++void tark_apple_transcriber_append(void* transcriber, const float* pcm16k, int count);
++// Flushes the last words, frees the handle, then calls `stopped`: the last
++// call with this transcriber's ctx.
++void tark_apple_transcriber_stop(void* transcriber, tark_apple_stopped_fn stopped);
++
++// Translation between two languages: 0 unsupported, 1 supported (the user
++// adds it in System Settings), 2 installed.
++void tark_apple_translation_status(const char* from,
++                                   const char* to,
++                                   void* ctx,
++                                   tark_apple_status_fn done);
++void tark_apple_translate(const char* from,
++                          const char* to,
++                          const char* text,
++                          void* ctx,
++                          tark_apple_text_fn done);
++
++#ifdef __cplusplus
++}  // extern "C"
++#endif
++
++#endif  // CHROME_BROWSER_TARK_CAPTIONS_APPLE_TARK_APPLE_SPEECH_H_
+--- /dev/null
++++ b/chrome/browser/tark_captions/apple/tark_apple_speech.swift
+@@ -0,0 +1,289 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// Tark (D4 Phase 3): macOS 26's on-device speech and translation behind the C
++// entry points in tark_apple_speech.h. Built by Xcode's swiftc (see
++// build_swift_dylib.py); never logs what was said.
++
++import AVFoundation
++import Foundation
++import Speech
++import Translation
++
++public typealias StatusFn = @convention(c) (UnsafeMutableRawPointer?, Int32) -> Void
++public typealias ProgressFn = @convention(c) (UnsafeMutableRawPointer?, Double) -> Void
++public typealias DoneFn = @convention(c) (UnsafeMutableRawPointer?, Int32) -> Void
++public typealias ResultFn = @convention(c) (UnsafeMutableRawPointer?, Int32, UnsafePointer<CChar>?) -> Void
++public typealias FailedFn = @convention(c) (UnsafeMutableRawPointer?, Int32) -> Void
++public typealias StoppedFn = @convention(c) (UnsafeMutableRawPointer?) -> Void
++public typealias TextFn = @convention(c) (UnsafeMutableRawPointer?, Int32, UnsafePointer<CChar>?) -> Void
++
++// A caller's context crosses into tasks as bits: the library never reads it.
++private func bits(_ ctx: UnsafeMutableRawPointer?) -> UInt { UInt(bitPattern: ctx) }
++private func ptr(_ bits: UInt) -> UnsafeMutableRawPointer? { UnsafeMutableRawPointer(bitPattern: bits) }
++
++private func makeTranscriber(_ locale: String) -> SpeechTranscriber {
++  // Drafts (volatile) and quick finals: without .fastResults nothing streams.
++  SpeechTranscriber(
++    locale: Locale(identifier: locale), transcriptionOptions: [],
++    reportingOptions: [.volatileResults, .fastResults], attributeOptions: [])
++}
++
++private func contains(_ locales: [Locale], _ identifier: String) -> Bool {
++  let wanted = Locale(identifier: identifier).identifier(.bcp47)
++  return locales.contains { $0.identifier(.bcp47) == wanted }
++}
++
++@_cdecl("tark_apple_available")
++public func tark_apple_available() -> Int32 {
++  SpeechTranscriber.isAvailable ? 1 : 0
++}
++
++@_cdecl("tark_apple_locale_status")
++public func tark_apple_locale_status(
++  _ locale: UnsafePointer<CChar>, _ ctx: UnsafeMutableRawPointer?, _ done: StatusFn
++) {
++  let identifier = String(cString: locale)
++  let context = bits(ctx)
++  Task {
++    let status: Int32
++    if contains(await SpeechTranscriber.installedLocales, identifier) {
++      status = 2
++    } else if contains(await SpeechTranscriber.supportedLocales, identifier) {
++      status = 1
++    } else {
++      status = 0
++    }
++    done(ptr(context), status)
++  }
++}
++
++@_cdecl("tark_apple_install")
++public func tark_apple_install(
++  _ locale: UnsafePointer<CChar>, _ ctx: UnsafeMutableRawPointer?, _ progress: ProgressFn,
++  _ done: DoneFn
++) {
++  let identifier = String(cString: locale)
++  let context = bits(ctx)
++  Task {
++    var ok: Int32 = 1
++    var watch: Task<Void, Never>? = nil
++    do {
++      if let request = try await AssetInventory.assetInstallationRequest(
++        supporting: [makeTranscriber(identifier)])
++      {
++        watch = Task {
++          while !Task.isCancelled {
++            progress(ptr(context), request.progress.fractionCompleted)
++            try? await Task.sleep(for: .milliseconds(500))
++          }
++        }
++        try await request.downloadAndInstall()
++      }
++    } catch {
++      ok = 0
++    }
++    // No progress after `done`: done is the caller's last use of ctx.
++    watch?.cancel()
++    await watch?.value
++    if ok == 1 {
++      progress(ptr(context), 1)
++    }
++    done(ptr(context), ok)
++  }
++}
++
++// One call's transcription: audio in through `append`, drafts and finals
++// out through `result`. State lives on `queue`.
++final class Transcriber: @unchecked Sendable {
++  private let context: UInt
++  private let result: ResultFn
++  private let failed: FailedFn
++  private let queue = DispatchQueue(label: "tark.apple.transcriber")
++  private let stream: AsyncStream<AnalyzerInput>
++  private let input: AsyncStream<AnalyzerInput>.Continuation
++  private let module: SpeechTranscriber
++  private let analyzer: SpeechAnalyzer
++  private let source = AVAudioFormat(
++    commonFormat: .pcmFormatFloat32, sampleRate: 16000, channels: 1, interleaved: false)!
++  private var converter: AVAudioConverter?
++  private var target: AVAudioFormat?
++  private var pending: [Float] = []  // Audio that came before the analyzer was ready.
++  private var setup: Task<Void, Never>?
++  private var reader: Task<Void, Never>?
++  private var reportedFailure = false
++  private var stopping = false
++
++  init(locale: String, ctx: UnsafeMutableRawPointer?, result: ResultFn, failed: FailedFn) {
++    context = bits(ctx)
++    self.result = result
++    self.failed = failed
++    (stream, input) = AsyncStream<AnalyzerInput>.makeStream()
++    module = makeTranscriber(locale)
++    analyzer = SpeechAnalyzer(modules: [module])
++    setup = Task { await self.prepare() }
++  }
++
++  private func fail(_ code: Int32) {
++    queue.sync {
++      if reportedFailure { return }
++      reportedFailure = true
++      failed(ptr(context), code)
++    }
++  }
++
++  private func prepare() async {
++    guard let format = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [module]),
++      let converter = AVAudioConverter(from: source, to: format)
++    else {
++      fail(1)
++      return
++    }
++    do {
++      try await analyzer.prepareToAnalyze(in: format)
++      reader = Task {
++        do {
++          for try await r in module.results {
++            String(r.text.characters).withCString { result(ptr(context), r.isFinal ? 1 : 0, $0) }
++          }
++        } catch {
++          fail(2)
++        }
++      }
++      try await analyzer.start(inputSequence: stream)
++    } catch {
++      fail(1)
++      return
++    }
++    queue.sync {
++      self.target = format
++      self.converter = converter
++      let waiting = pending
++      pending = []
++      feed(waiting)
++    }
++  }
++
++  func append(_ samples: [Float]) {
++    queue.async {
++      // Stopped, or failed: nothing will read it, so nothing is kept.
++      if self.stopping || self.reportedFailure {
++        self.pending.removeAll()
++        return
++      }
++      if self.converter == nil {
++        self.pending += samples
++      } else {
++        self.feed(samples)
++      }
++    }
++  }
++
++  // On `queue`.
++  private func feed(_ samples: [Float]) {
++    guard !samples.isEmpty, let converter, let target,
++      let buffer = AVAudioPCMBuffer(pcmFormat: source, frameCapacity: AVAudioFrameCount(samples.count))
++    else { return }
++    buffer.frameLength = AVAudioFrameCount(samples.count)
++    samples.withUnsafeBufferPointer { buffer.floatChannelData![0].update(from: $0.baseAddress!, count: samples.count) }
++    let ratio = target.sampleRate / source.sampleRate
++    guard
++      let out = AVAudioPCMBuffer(
++        pcmFormat: target, frameCapacity: AVAudioFrameCount(Double(samples.count) * ratio) + 32)
++    else { return }
++    var consumed = false
++    var error: NSError?
++    converter.convert(to: out, error: &error) { _, status in
++      if consumed {
++        status.pointee = .noDataNow
++        return nil
++      }
++      consumed = true
++      status.pointee = .haveData
++      return buffer
++    }
++    if error == nil && out.frameLength > 0 {
++      input.yield(AnalyzerInput(buffer: out))
++    }
++  }
++
++  func stop(_ stopped: StoppedFn) {
++    Task {
++      // Audio that came before the analyzer was ready is fed when it is: the
++      // input ends only after that.
++      await self.setup?.value
++      self.queue.sync {
++        self.stopping = true
++        self.input.finish()
++      }
++      try? await self.analyzer.finalizeAndFinishThroughEndOfInput()
++      await self.reader?.value
++      stopped(ptr(self.context))
++    }
++  }
++}
++
++@_cdecl("tark_apple_transcriber_start")
++public func tark_apple_transcriber_start(
++  _ locale: UnsafePointer<CChar>, _ ctx: UnsafeMutableRawPointer?, _ result: ResultFn,
++  _ failed: FailedFn
++) -> UnsafeMutableRawPointer {
++  let transcriber = Transcriber(
++    locale: String(cString: locale), ctx: ctx, result: result, failed: failed)
++  return Unmanaged.passRetained(transcriber).toOpaque()
++}
++
++@_cdecl("tark_apple_transcriber_append")
++public func tark_apple_transcriber_append(
++  _ handle: UnsafeMutableRawPointer, _ pcm16k: UnsafePointer<Float>, _ count: Int32
++) {
++  let transcriber = Unmanaged<Transcriber>.fromOpaque(handle).takeUnretainedValue()
++  transcriber.append(Array(UnsafeBufferPointer(start: pcm16k, count: Int(count))))
++}
++
++@_cdecl("tark_apple_transcriber_stop")
++public func tark_apple_transcriber_stop(_ handle: UnsafeMutableRawPointer, _ stopped: StoppedFn) {
++  // The library's reference goes once it has stopped.
++  let transcriber = Unmanaged<Transcriber>.fromOpaque(handle).takeRetainedValue()
++  transcriber.stop(stopped)
++}
++
++@_cdecl("tark_apple_translation_status")
++public func tark_apple_translation_status(
++  _ from: UnsafePointer<CChar>, _ to: UnsafePointer<CChar>, _ ctx: UnsafeMutableRawPointer?,
++  _ done: StatusFn
++) {
++  let source = Locale.Language(identifier: String(cString: from))
++  let target = Locale.Language(identifier: String(cString: to))
++  let context = bits(ctx)
++  Task {
++    let status: Int32
++    switch await LanguageAvailability().status(from: source, to: target) {
++    case .installed: status = 2
++    case .supported: status = 1
++    default: status = 0
++    }
++    done(ptr(context), status)
++  }
++}
++
++@_cdecl("tark_apple_translate")
++public func tark_apple_translate(
++  _ from: UnsafePointer<CChar>, _ to: UnsafePointer<CChar>, _ text: UnsafePointer<CChar>,
++  _ ctx: UnsafeMutableRawPointer?, _ done: TextFn
++) {
++  let source = Locale.Language(identifier: String(cString: from))
++  let target = Locale.Language(identifier: String(cString: to))
++  let words = String(cString: text)
++  let context = bits(ctx)
++  Task {
++    do {
++      let session = TranslationSession(installedSource: source, target: target)
++      let translated = try await session.translate(words).targetText
++      translated.withCString { done(ptr(context), 1, $0) }
++    } catch {
++      done(ptr(context), 0, nil)
++    }
++  }
++}
+--- /dev/null
++++ b/chrome/browser/tark_captions/apple/tark_apple_speech_unittest.cc
+@@ -0,0 +1,199 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// libtark_apple_speech.dylib through its C entry points, as the browser loads
++// it (dlopen). macOS 26 only; the Spanish tests need es_US speech and the
++// Spanish→English translation installed.
++
++#include "chrome/browser/tark_captions/apple/tark_apple_speech.h"
++
++#include <dlfcn.h>
++
++#include <atomic>
++#include <string>
++#include <vector>
++
++#include "base/files/file_path.h"
++#include "base/functional/callback_helpers.h"
++#include "base/task/sequenced_task_runner.h"
++#include "base/mac/mac_util.h"
++#include "base/path_service.h"
++#include "base/synchronization/lock.h"
++#include "base/test/run_until.h"
++#include "base/test/task_environment.h"
++#include "components/tark_captions/test_util.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace {
++
++// What the library calls back with, from any thread. Each callback wakes
++// the test's thread (as the browser posts each one to its own).
++struct Calls {
++  void Wake() { runner->PostTask(FROM_HERE, base::DoNothing()); }
++
++  scoped_refptr<base::SequencedTaskRunner> runner =
++      base::SequencedTaskRunner::GetCurrentDefault();
++  base::Lock lock;
++  std::vector<std::string> finals;
++  int drafts = 0;
++  std::atomic<int> failed{0};
++  std::atomic<bool> stopped{false};
++  std::atomic<int> status{-1};
++  std::atomic<bool> translated{false};
++  std::string translation;
++};
++
++Calls* CallsOf(void* ctx) {
++  return static_cast<Calls*>(ctx);
++}
++
++class TarkAppleSpeechTest : public testing::Test {
++ protected:
++  void SetUp() override {
++    if (base::mac::MacOSMajorVersion() < 26) {
++      GTEST_SKIP() << "macOS 26 or later";
++    }
++    base::FilePath dir;
++    ASSERT_TRUE(base::PathService::Get(base::DIR_EXE, &dir));
++    library_ = dlopen(dir.Append("libtark_apple_speech.dylib").value().c_str(),
++                      RTLD_NOW | RTLD_LOCAL);
++    ASSERT_TRUE(library_) << dlerror();
++  }
++
++  void TearDown() override {
++    // The library's tasks may outlive a test; it stays loaded.
++  }
++
++  template <typename F>
++  F Symbol(const char* name) {
++    return reinterpret_cast<F>(dlsym(library_, name));
++  }
++
++  // es_US speech installed (2), or the test is skipped.
++  bool SpanishInstalled() {
++    Calls calls;
++    Symbol<decltype(&tark_apple_locale_status)>("tark_apple_locale_status")(
++        "es_US", &calls, [](void* ctx, int status) {
++          CallsOf(ctx)->status = status;
++          CallsOf(ctx)->Wake();
++        });
++    EXPECT_TRUE(base::test::RunUntil([&] { return calls.status >= 0; }));
++    return calls.status == 2;
++  }
++
++  // Feeds the Spanish test clip, then stops.
++  void TranscribeSpanish(Calls* calls) {
++    std::optional<base::FilePath> testdata = tark_captions::test::TestDataDir();
++    ASSERT_TRUE(testdata) << "set TARK_CAPTIONS_TESTDATA";
++    int rate = 0;
++    std::vector<float> pcm =
++        tark_captions::test::ReadWav(testdata->AppendASCII("lid/es_1.wav"), &rate);
++    ASSERT_EQ(rate, 16000);
++    void* t = Symbol<decltype(&tark_apple_transcriber_start)>("tark_apple_transcriber_start")(
++        "es_US", calls,
++        [](void* ctx, int is_final, const char* text) {
++          base::AutoLock lock(CallsOf(ctx)->lock);
++          if (is_final) {
++            CallsOf(ctx)->finals.push_back(text);
++          } else {
++            ++CallsOf(ctx)->drafts;
++          }
++        },
++        [](void* ctx, int code) {
++          CallsOf(ctx)->failed = code;
++          CallsOf(ctx)->Wake();
++        });
++    auto append =
++        Symbol<decltype(&tark_apple_transcriber_append)>("tark_apple_transcriber_append");
++    for (size_t i = 0; i < pcm.size(); i += 1600) {
++      append(t, pcm.data() + i, static_cast<int>(std::min<size_t>(1600, pcm.size() - i)));
++    }
++    // Stopped straight after the last audio: the last words still come.
++    Symbol<decltype(&tark_apple_transcriber_stop)>("tark_apple_transcriber_stop")(
++        t, [](void* ctx) {
++          CallsOf(ctx)->stopped = true;
++          CallsOf(ctx)->Wake();
++        });
++    ASSERT_TRUE(base::test::RunUntil([&] { return calls->stopped.load(); }));
++  }
++
++  // The UI thread runs a CFRunLoop, as the browser's does: Apple's
++  // translation answers only then.
++  base::test::TaskEnvironment env_{base::test::TaskEnvironment::MainThreadType::UI,
++                                   base::test::TaskEnvironment::TimeSource::SYSTEM_TIME};
++  void* library_ = nullptr;
++};
++
++TEST_F(TarkAppleSpeechTest, ExportsTheEntryPoints) {
++  for (const char* name :
++       {"tark_apple_available", "tark_apple_locale_status", "tark_apple_install",
++        "tark_apple_transcriber_start", "tark_apple_transcriber_append",
++        "tark_apple_transcriber_stop", "tark_apple_translation_status", "tark_apple_translate"}) {
++    EXPECT_TRUE(dlsym(library_, name)) << name;
++  }
++  EXPECT_EQ(Symbol<decltype(&tark_apple_available)>("tark_apple_available")(), 1);
++}
++
++TEST_F(TarkAppleSpeechTest, UnknownLocaleIsUnsupported) {
++  Calls calls;
++  Symbol<decltype(&tark_apple_locale_status)>("tark_apple_locale_status")(
++      "xx_XX", &calls, [](void* ctx, int status) {
++          CallsOf(ctx)->status = status;
++          CallsOf(ctx)->Wake();
++        });
++  ASSERT_TRUE(base::test::RunUntil([&] { return calls.status >= 0; }));
++  EXPECT_EQ(calls.status, 0);
++}
++
++TEST_F(TarkAppleSpeechTest, TranscribesSpanish) {
++  if (!SpanishInstalled()) {
++    GTEST_SKIP() << "es_US speech is not installed";
++  }
++  Calls calls;
++  TranscribeSpanish(&calls);
++  base::AutoLock lock(calls.lock);
++  EXPECT_EQ(calls.failed, 0);
++  EXPECT_GT(calls.drafts, 0);
++  std::string all;
++  for (const std::string& f : calls.finals) {
++    all += f + " ";
++  }
++  EXPECT_NE(all.find("civilizaci"), std::string::npos) << all;
++}
++
++TEST_F(TarkAppleSpeechTest, StopFlushesFinal) {
++  if (!SpanishInstalled()) {
++    GTEST_SKIP() << "es_US speech is not installed";
++  }
++  Calls calls;
++  TranscribeSpanish(&calls);
++  base::AutoLock lock(calls.lock);
++  EXPECT_FALSE(calls.finals.empty());
++}
++
++TEST_F(TarkAppleSpeechTest, TranslatesSpanishToEnglish) {
++  Calls calls;
++  Symbol<decltype(&tark_apple_translation_status)>("tark_apple_translation_status")(
++      "es", "en", &calls, [](void* ctx, int status) {
++          CallsOf(ctx)->status = status;
++          CallsOf(ctx)->Wake();
++        });
++  ASSERT_TRUE(base::test::RunUntil([&] { return calls.status >= 0; }));
++  if (calls.status != 2) {
++    GTEST_SKIP() << "Spanish→English translation is not installed";
++  }
++  Symbol<decltype(&tark_apple_translate)>("tark_apple_translate")(
++      "es", "en", "El clima de hoy es soleado y agradable.", &calls,
++      [](void* ctx, int ok, const char* text) {
++        base::AutoLock lock(CallsOf(ctx)->lock);
++        CallsOf(ctx)->translation = ok && text ? text : "";
++        CallsOf(ctx)->translated = true;
++        CallsOf(ctx)->Wake();
++      });
++  ASSERT_TRUE(base::test::RunUntil([&] { return calls.translated.load(); }));
++  base::AutoLock lock(calls.lock);
++  EXPECT_NE(calls.translation.find("sunny"), std::string::npos) << calls.translation;
++}
++
++}  // namespace

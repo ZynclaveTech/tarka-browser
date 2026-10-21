@@ -11,6 +11,12 @@ Tark for Android blocks ads with Brave's adblock-rust inside the browser
   reference code). `keygen` makes a signing key (never printed, mode 600).
 - `scriptlets.mjs` turns uBO's scriptlet module into Resources (as Brave's
   crx packager does); `requiresTrust` scriptlets get permission 1.
+- `ubo.json` pins the uBlock Origin release bundling uses, with its
+  tarball's sha256: bundling runs uBO's scriptlet module, so a new release
+  is read first and then pinned in a reviewed change:
+  `python3 android/adblock/bundle.py pin-ubo TAG > android/adblock/ubo.json`.
+  The daily workflow bundles in a job with no secrets and signs in another
+  that runs no third-party code.
 - `listtool/` (Rust, the browser's adblock-rust 0.13.3): `resources`
   assembles uBO's redirect resources; `check` compiles a bundle and checks
   `canaries.txt` — a bundle that fails is never published.

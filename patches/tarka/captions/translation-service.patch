@@ -1,0 +1,434 @@
+--- /dev/null
++++ b/media/mojo/mojom/tark_caption_translator.mojom
+@@ -0,0 +1,18 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++module media.mojom;
++
++// Tark (D4 Phase 2): shows a call's caption in the script the user reads
++// and translates it, in the speech recognition utility process. Bound by
++// the browser through SpeechRecognitionService.BindTarkCaptionTranslator.
++interface TarkCaptionTranslator {
++  // `text`: a caption in `source` ("hi", "ta", "bn"). `script`: "" (its own
++  // script), "latn" (English letters), or "hi"/"ta"/"bn" (that language's
++  // script). `target`: "" (no translation), "en", "hi", "ta", "bn".
++  // `ok` is false when a code is unknown or a model the request needs is
++  // missing; `shown` is still filled when only the translation failed.
++  Render(string text, string source, string script, string target)
++      => (bool ok, string shown, string translation);
++};
+--- /dev/null
++++ b/chrome/services/speech/tark_caption_translator.h
+@@ -0,0 +1,48 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_SERVICES_SPEECH_TARK_CAPTION_TRANSLATOR_H_
++#define CHROME_SERVICES_SPEECH_TARK_CAPTION_TRANSLATOR_H_
++
++#include <string>
++
++#include "base/files/file_path.h"
++#include "base/threading/sequence_bound.h"
++#include "media/mojo/mojom/tark_caption_translator.mojom.h"
++#include "mojo/public/cpp/bindings/pending_receiver.h"
++
++namespace speech {
++
++// Tark (D4 Phase 2): media::mojom::TarkCaptionTranslator in the speech
++// recognition utility process. Captions are text from call audio, so they
++// are changed (script, English letters) and translated here, in the
++// sandbox, not in the browser. The work runs on its own sequence; the
++// translation models load on the first request that needs them.
++class TarkCaptionTranslator : public media::mojom::TarkCaptionTranslator {
++ public:
++  // Binds a self-owned translator to `receiver`.
++  static void Create(mojo::PendingReceiver<media::mojom::TarkCaptionTranslator> receiver,
++                     const base::FilePath& ort_dylib,
++                     const base::FilePath& models_dir);
++
++  TarkCaptionTranslator(const base::FilePath& ort_dylib, const base::FilePath& models_dir);
++  TarkCaptionTranslator(const TarkCaptionTranslator&) = delete;
++  TarkCaptionTranslator& operator=(const TarkCaptionTranslator&) = delete;
++  ~TarkCaptionTranslator() override;
++
++  // media::mojom::TarkCaptionTranslator:
++  void Render(const std::string& text,
++              const std::string& source,
++              const std::string& script,
++              const std::string& target,
++              RenderCallback callback) override;
++
++ private:
++  class Worker;
++  base::SequenceBound<Worker> worker_;
++};
++
++}  // namespace speech
++
++#endif  // CHROME_SERVICES_SPEECH_TARK_CAPTION_TRANSLATOR_H_
+--- /dev/null
++++ b/chrome/services/speech/tark_caption_translator.cc
+@@ -0,0 +1,124 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/services/speech/tark_caption_translator.h"
++
++#include <memory>
++#include <optional>
++#include <utility>
++
++#include "base/functional/bind.h"
++#include "base/logging.h"
++#include "base/strings/utf_string_conversions.h"
++#include "base/task/thread_pool.h"
++#include "components/tark_captions/asr_model.h"
++#include "components/tark_captions/indic_text.h"
++#include "components/tark_captions/romanize.h"
++#include "components/tark_captions/translation_engine.h"
++#include "mojo/public/cpp/bindings/self_owned_receiver.h"
++
++namespace speech {
++
++namespace {
++
++struct Result {
++  bool ok = false;
++  std::string shown;
++  std::string translation;
++};
++
++}  // namespace
++
++// Lives on a thread-pool sequence that may block (model loads, decoding).
++class TarkCaptionTranslator::Worker {
++ public:
++  Worker(const base::FilePath& ort_dylib, const base::FilePath& models_dir)
++      : ort_dylib_(ort_dylib), models_dir_(models_dir) {}
++
++  Result Render(const std::string& text,
++                const std::string& source_code,
++                const std::string& script,
++                const std::string& target_code) {
++    Result result;
++    const std::optional<tark_captions::Language> source =
++        tark_captions::LanguageFromCode(source_code);
++    const std::optional<tark_captions::Target> target =
++        tark_captions::TargetFromCode(target_code);
++    if (!source) {
++      return result;
++    }
++    if (script.empty()) {
++      result.shown = text;
++    } else if (script == "latn") {
++      result.shown =
++          base::UTF16ToUTF8(tark_captions::Romanize(base::UTF8ToUTF16(text), *source));
++    } else if (const std::optional<tark_captions::Language> other =
++                   tark_captions::LanguageFromCode(script)) {
++      result.shown = base::UTF16ToUTF8(tark_captions::ConvertScript(
++          base::UTF8ToUTF16(text), tark_captions::ScriptOf(*source),
++          tark_captions::ScriptOf(*other)));
++    } else {
++      return result;
++    }
++    if (!target) {
++      return result;
++    }
++    if (*target != tark_captions::Target::kNone && !engine_) {
++      engine_ = tark_captions::TranslationEngine::Create(models_dir_, ort_dylib_);
++    }
++    std::optional<std::string> translation =
++        *target == tark_captions::Target::kNone
++            ? std::string()
++            : (engine_ ? engine_->Translate(text, *source, *target) : std::nullopt);
++    // Codes and sizes only: call content stays out of logs.
++    VLOG(1) << "Tark translation: " << source_code << " -> " << (script.empty() ? "-" : script)
++            << " / " << (target_code.empty() ? "-" : target_code) << ", " << text.size()
++            << " bytes in, " << (translation ? translation->size() : 0) << " bytes out";
++    if (!translation) {
++      return result;
++    }
++    result.ok = true;
++    result.translation = std::move(*translation);
++    return result;
++  }
++
++ private:
++  const base::FilePath ort_dylib_;
++  const base::FilePath models_dir_;
++  std::unique_ptr<tark_captions::TranslationEngine> engine_;
++};
++
++// static
++void TarkCaptionTranslator::Create(
++    mojo::PendingReceiver<media::mojom::TarkCaptionTranslator> receiver,
++    const base::FilePath& ort_dylib,
++    const base::FilePath& models_dir) {
++  mojo::MakeSelfOwnedReceiver(std::make_unique<TarkCaptionTranslator>(ort_dylib, models_dir),
++                              std::move(receiver));
++}
++
++TarkCaptionTranslator::TarkCaptionTranslator(const base::FilePath& ort_dylib,
++                                             const base::FilePath& models_dir)
++    : worker_(base::ThreadPool::CreateSequencedTaskRunner(
++                  {base::MayBlock(), base::TaskPriority::USER_VISIBLE}),
++              ort_dylib,
++              models_dir) {}
++
++TarkCaptionTranslator::~TarkCaptionTranslator() = default;
++
++void TarkCaptionTranslator::Render(const std::string& text,
++                                   const std::string& source,
++                                   const std::string& script,
++                                   const std::string& target,
++                                   RenderCallback callback) {
++  worker_.AsyncCall(&Worker::Render)
++      .WithArgs(text, source, script, target)
++      .Then(base::BindOnce(
++          [](RenderCallback callback, Result result) {
++            std::move(callback).Run(result.ok, result.shown, result.translation);
++          },
++          std::move(callback)));
++}
++
++}  // namespace speech
+--- /dev/null
++++ b/chrome/services/speech/tark_caption_translator_unittest.cc
+@@ -0,0 +1,97 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/services/speech/tark_caption_translator.h"
++
++#include <string>
++
++#include "base/files/scoped_temp_dir.h"
++#include "base/strings/utf_string_conversions.h"
++#include "base/test/task_environment.h"
++#include "base/test/test_future.h"
++#include "components/tark_captions/romanize.h"
++#include "components/tark_captions/test_util.h"
++#include "mojo/public/cpp/bindings/remote.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace speech {
++namespace {
++
++struct Rendered {
++  bool ok;
++  std::string shown;
++  std::string translation;
++};
++
++class TarkCaptionTranslatorTest : public testing::Test {
++ protected:
++  void Bind(const base::FilePath& ort, const base::FilePath& models) {
++    TarkCaptionTranslator::Create(translator_.BindNewPipeAndPassReceiver(), ort, models);
++  }
++  Rendered Render(const std::string& text,
++                  const std::string& source,
++                  const std::string& script,
++                  const std::string& target) {
++    base::test::TestFuture<bool, const std::string&, const std::string&> done;
++    translator_->Render(text, source, script, target, done.GetCallback());
++    return {done.Get<0>(), done.Get<1>(), done.Get<2>()};
++  }
++
++  base::test::TaskEnvironment env_;
++  mojo::Remote<media::mojom::TarkCaptionTranslator> translator_;
++};
++
++TEST_F(TarkCaptionTranslatorTest, ScriptOnlyNeedsNoModels) {
++  Bind(base::FilePath("/nonexistent/libonnxruntime.dylib"), base::FilePath("/nonexistent"));
++  Rendered latin = Render("தமிழ்", "ta", "latn", "");
++  EXPECT_TRUE(latin.ok);
++  EXPECT_EQ(latin.shown, "tamizh");
++  EXPECT_EQ(latin.translation, "");
++  Rendered bengali = Render("नमस्ते", "hi", "bn", "");
++  EXPECT_TRUE(bengali.ok);
++  EXPECT_EQ(bengali.shown, "নমস্তে");
++}
++
++TEST_F(TarkCaptionTranslatorTest, TranslatorRendersAndTranslates) {
++  std::optional<base::FilePath> ort = tark_captions::test::OrtPath();
++  std::optional<base::FilePath> models = tark_captions::test::ModelsDir();
++  std::optional<base::FilePath> testdata = tark_captions::test::TestDataDir();
++  if (!ort || !models || !testdata) {
++    GTEST_SKIP() << "set TARK_CAPTIONS_ORT, TARK_CAPTIONS_MODELS and TARK_CAPTIONS_TESTDATA";
++  }
++  Bind(*ort, *models);
++  const base::ListValue cases = tark_captions::test::MtGoldenCases(*testdata);
++  ASSERT_FALSE(cases.empty());
++  const base::DictValue& c = cases[0].GetDict();
++  ASSERT_EQ(*c.FindString("lang"), "hi");
++  Rendered r = Render(*c.FindString("caption"), "hi", "latn", "en");
++  EXPECT_TRUE(r.ok);
++  EXPECT_EQ(r.shown, base::UTF16ToUTF8(tark_captions::Romanize(
++                         base::UTF8ToUTF16(*c.FindString("caption")), tark_captions::Language::kHindi)));
++  EXPECT_EQ(r.translation, *c.FindString("english"));
++}
++
++TEST_F(TarkCaptionTranslatorTest, TranslatorReportsMissingModels) {
++  std::optional<base::FilePath> ort = tark_captions::test::OrtPath();
++  if (!ort) {
++    GTEST_SKIP() << "set TARK_CAPTIONS_ORT";
++  }
++  base::ScopedTempDir empty;
++  ASSERT_TRUE(empty.CreateUniqueTempDir());
++  Bind(*ort, empty.GetPath());
++  Rendered r = Render("नमस्ते", "hi", "", "en");
++  EXPECT_FALSE(r.ok);
++  EXPECT_EQ(r.shown, "नमस्ते");
++  EXPECT_EQ(r.translation, "");
++}
++
++TEST_F(TarkCaptionTranslatorTest, UnknownCodesAreRejected) {
++  Bind(base::FilePath("/nonexistent/libonnxruntime.dylib"), base::FilePath("/nonexistent"));
++  EXPECT_FALSE(Render("hello", "en", "", "").ok);
++  EXPECT_FALSE(Render("नमस्ते", "hi", "cyrl", "").ok);
++  EXPECT_FALSE(Render("नमस्ते", "hi", "", "fr").ok);
++}
++
++}  // namespace
++}  // namespace speech
+--- a/media/mojo/mojom/BUILD.gn
++++ b/media/mojo/mojom/BUILD.gn
+@@ -57,7 +57,10 @@
+       "mediadrm_support.mojom",
+     ]
+   } else {
+-    sources += [ "speech_recognition_service.mojom" ]
++    sources += [
++      "speech_recognition_service.mojom",
++      "tark_caption_translator.mojom",
++    ]
+   }
+ 
+   # TODO(crbug.com/1293520): Revisit this after the cast renderer has been
+--- a/media/mojo/mojom/speech_recognition_service.mojom
++++ b/media/mojo/mojom/speech_recognition_service.mojom
+@@ -9,6 +9,7 @@
+ import "media/mojo/mojom/audio_stream_factory.mojom";
+ import "media/mojo/mojom/media_types.mojom";
+ import "media/mojo/mojom/speech_recognition.mojom";
++import "media/mojo/mojom/tark_caption_translator.mojom";
+ import "mojo/public/mojom/base/file_path.mojom";
+ import "sandbox/policy/mojom/context.mojom";
+ import "sandbox/policy/mojom/sandbox.mojom";
+@@ -59,6 +60,10 @@
+   // Sets the config file paths for the language packs. Used to notify the
+   // service when new language packs are installed.
+   SetSodaConfigPaths(map<string, mojo_base.mojom.FilePath> config_paths);
++
++  // Tark (D4 Phase 2): a translator for call captions, using the ONNX
++  // Runtime and models folder given to SetSodaPaths.
++  BindTarkCaptionTranslator(pending_receiver<TarkCaptionTranslator> receiver);
+ };
+ 
+ // The interface used to start and stop fetching audio from the microphone
+--- a/chrome/services/speech/BUILD.gn
++++ b/chrome/services/speech/BUILD.gn
+@@ -22,6 +22,8 @@
+     "speech_timestamp_estimator.h",
+     "tark_caption_recognizer.cc",
+     "tark_caption_recognizer.h",
++    "tark_caption_translator.cc",
++    "tark_caption_translator.h",
+   ]
+ 
+   configs += [ "//build/config/compiler:wexit_time_destructors" ]
+@@ -115,6 +117,7 @@
+ test("tark_speech_unittests") {
+   sources = [
+     "tark_caption_recognizer_unittest.cc",
++    "tark_caption_translator_unittest.cc",
+     "tark_speech_service_unittest.cc",
+   ]
+   deps = [
+--- a/chrome/services/speech/speech_recognition_service_impl.h
++++ b/chrome/services/speech/speech_recognition_service_impl.h
+@@ -59,6 +59,8 @@
+   void SetSodaParams(const bool mask_offensive_words) override;
+   void SetSodaConfigPaths(
+       const base::flat_map<std::string, base::FilePath>& config_paths) override;
++  void BindTarkCaptionTranslator(
++      mojo::PendingReceiver<media::mojom::TarkCaptionTranslator> receiver) override;
+ 
+   // media::mojom::SpeechRecognitionContext:
+   void BindRecognizer(
+--- a/chrome/services/speech/speech_recognition_service_impl.cc
++++ b/chrome/services/speech/speech_recognition_service_impl.cc
+@@ -14,6 +14,7 @@
+ #include "chrome/services/speech/soda_speech_recognizer_impl.h"
+ #include "chrome/services/speech/speech_recognition_recognizer_impl.h"
+ #include "chrome/services/speech/tark_caption_recognizer.h"
++#include "chrome/services/speech/tark_caption_translator.h"
+ #include "media/mojo/mojom/speech_recognition.mojom.h"
+ #include "media/mojo/mojom/speech_recognition_service.mojom.h"
+ #include "mojo/public/cpp/bindings/pending_receiver.h"
+@@ -71,6 +72,15 @@
+   }
+ }
+ 
++void SpeechRecognitionServiceImpl::BindTarkCaptionTranslator(
++    mojo::PendingReceiver<media::mojom::TarkCaptionTranslator> receiver) {
++  // Tark (D4 Phase 2): the same ONNX Runtime and models folder as the
++  // recognizers (see CreateRecognizer()).
++  const base::FilePath models_dir =
++      config_paths_.empty() ? base::FilePath() : config_paths_.begin()->second;
++  TarkCaptionTranslator::Create(std::move(receiver), binary_path_, models_dir);
++}
++
+ void SpeechRecognitionServiceImpl::BindRecognizer(
+     mojo::PendingReceiver<media::mojom::SpeechRecognitionRecognizer> receiver,
+     mojo::PendingRemote<media::mojom::SpeechRecognitionRecognizerClient> client,
+--- a/chrome/browser/speech/speech_recognition_service.h
++++ b/chrome/browser/speech/speech_recognition_service.h
+@@ -19,6 +19,11 @@
+   virtual void BindAudioSourceSpeechRecognitionContext(
+       mojo::PendingReceiver<media::mojom::AudioSourceSpeechRecognitionContext>
+           receiver) = 0;
++
++  // Tark (D4 Phase 2): a caption translator in the speech process. Only
++  // the Chrome (utility process) service has one.
++  virtual void BindTarkCaptionTranslator(
++      mojo::PendingReceiver<media::mojom::TarkCaptionTranslator> receiver) {}
+ };
+ 
+ }  // namespace speech
+--- a/chrome/browser/speech/chrome_speech_recognition_service.h
++++ b/chrome/browser/speech/chrome_speech_recognition_service.h
+@@ -59,6 +59,9 @@
+   void BindAudioSourceSpeechRecognitionContext(
+       mojo::PendingReceiver<media::mojom::AudioSourceSpeechRecognitionContext>
+           receiver) override;
++  void BindTarkCaptionTranslator(
++      mojo::PendingReceiver<media::mojom::TarkCaptionTranslator> receiver)
++      override;
+ 
+   // media::mojom::SpeechRecognitionContext:
+   void BindRecognizer(
+--- a/chrome/browser/speech/chrome_speech_recognition_service.cc
++++ b/chrome/browser/speech/chrome_speech_recognition_service.cc
+@@ -211,6 +211,15 @@
+   }
+ }
+ 
++void ChromeSpeechRecognitionService::BindTarkCaptionTranslator(
++    mojo::PendingReceiver<media::mojom::TarkCaptionTranslator> receiver) {
++  LaunchIfNotRunning();
++
++  if (speech_recognition_service_.is_bound()) {
++    speech_recognition_service_->BindTarkCaptionTranslator(std::move(receiver));
++  }
++}
++
+ void ChromeSpeechRecognitionService::OnSodaInstalled(
+     speech::LanguageCode /*language_code*/) {
+   if (speech_recognition_service_.is_bound()) {

@@ -4,7 +4,8 @@
 # found in the LICENSE file.
 """Tark's adblock list bundle (A2, spec §4).
 
-    bundle.py build --out DIR [--ubo-tag TAG] [--listtool PATH]
+    bundle.py build --out DIR [--listtool PATH]
+    bundle.py pin-ubo TAG                           prints ubo.json for TAG
     bundle.py sign ZIP --key SECRET_HEX_FILE        writes DIR/latest.json
     bundle.py verify ZIP INDEX.json --pubkey HEX_OR_FILE
     bundle.py keygen --out SECRET_HEX_FILE          prints the public key
@@ -14,6 +15,10 @@ resources and scriptlets as adblock-rust Resources (resources.json), and
 manifest.json. latest.json carries the zip's size, sha256 and an Ed25519
 signature over its bytes. Phones verify the signature and compile the lists
 themselves; the same zip ships in the APK.
+
+uBlock Origin's code runs while bundling (scriptlets.mjs imports its scriptlet
+module), so build uses only the version pinned in ubo.json, whose tarball must
+have the pinned sha256. A new uBO is a reviewed change to ubo.json (pin-ubo).
 """
 
 import argparse
@@ -211,19 +216,38 @@ def check(data, index, public):
 
 # --- building from the publishers ------------------------------------------
 
-def _ubo_source(tag, dest):
-    url = f'https://codeload.github.com/gorhill/uBlock/tar.gz/refs/tags/{tag}'
+UBO_PIN = HERE / 'ubo.json'
+
+
+def _fetch_bytes(url):
     req = urllib.request.Request(url, headers={'User-Agent': USER_AGENT})
     with urllib.request.urlopen(req, timeout=300) as r:
-        tarfile.open(fileobj=io.BytesIO(r.read()), mode='r:gz').extractall(dest, filter='data')
+        return r.read()
+
+
+def _ubo_url(tag):
+    return f'https://codeload.github.com/gorhill/uBlock/tar.gz/refs/tags/{tag}'
+
+
+def ubo_pin():
+    """The uBlock Origin release bundling uses: {'tag', 'sha256'}."""
+    return json.loads(UBO_PIN.read_text())
+
+
+def pin_ubo(tag, fetch=_fetch_bytes):
+    """ubo.json for a new release, after reading its code."""
+    return {'tag': tag, 'sha256': hashlib.sha256(fetch(_ubo_url(tag))).hexdigest()}
+
+
+def _ubo_source(pin, dest, fetch=_fetch_bytes):
+    """The pinned release unpacked in dest; a tarball with any other sha256 is
+    refused before anything is unpacked."""
+    data = fetch(_ubo_url(pin['tag']))
+    got = hashlib.sha256(data).hexdigest()
+    if got != pin['sha256']:
+        raise ValueError(f"uBlock Origin {pin['tag']}: sha256 {got} is not the pinned {pin['sha256']}")
+    tarfile.open(fileobj=io.BytesIO(data), mode='r:gz').extractall(dest, filter='data')
     return next(pathlib.Path(dest).glob('uBlock-*'))
-
-
-def _latest_ubo_tag():
-    req = urllib.request.Request('https://api.github.com/repos/gorhill/uBlock/releases/latest',
-                                 headers={'User-Agent': USER_AGENT})
-    with urllib.request.urlopen(req, timeout=60) as r:
-        return json.load(r)['tag_name']
 
 
 def fetch_lists(assets):
@@ -243,11 +267,24 @@ def fetch_lists(assets):
     return lists
 
 
-def build(out_dir, ubo_tag=None, listtool=None):
-    ubo_tag = ubo_tag or _latest_ubo_tag()
+# A bundle's name counts minutes from here: never reused (a published zip is
+# cached for a year), and still lists-<8 digits>.zip, the only shape installed
+# Tarks accept (ValidBundleFileName), for about 190 years.
+NAME_EPOCH = datetime.datetime(2026, 1, 1, tzinfo=datetime.timezone.utc)
+
+
+def bundle_file_name(now):
+    minutes = int((now - NAME_EPOCH).total_seconds() // 60)
+    if not 0 <= minutes < 10 ** 8:
+        raise ValueError(f'{now} is outside the bundle names\' range')
+    return f'lists-{minutes:08d}.zip'
+
+
+def build(out_dir, listtool=None):
+    pin = ubo_pin()
     listtool = listtool or str(HERE / 'listtool' / 'target' / 'release' / 'listtool')
     with tempfile.TemporaryDirectory() as tmp:
-        ubo = _ubo_source(ubo_tag, tmp)
+        ubo = _ubo_source(pin, tmp)
         assets = json.loads((ubo / 'assets' / 'assets.json').read_text())
         lists = fetch_lists(assets)
         redirects = pathlib.Path(tmp) / 'redirects.json'
@@ -257,8 +294,8 @@ def build(out_dir, ubo_tag=None, listtool=None):
         resources = json.loads(redirects.read_text()) + json.loads(scriptlets)
     now = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)
     created = now.strftime('%Y-%m-%dT%H:%M:%SZ')
-    data = make_zip(lists, resources, created, ubo_tag)
-    path = pathlib.Path(out_dir) / f'lists-{now:%Y%m%d}.zip'
+    data = make_zip(lists, resources, created, pin['tag'])
+    path = pathlib.Path(out_dir) / bundle_file_name(now)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(data)
     return path
@@ -275,7 +312,6 @@ def main(argv=None):
     sub = ap.add_subparsers(dest='cmd', required=True)
     b = sub.add_parser('build')
     b.add_argument('--out', required=True)
-    b.add_argument('--ubo-tag')
     b.add_argument('--listtool')
     s = sub.add_parser('sign')
     s.add_argument('zip')
@@ -284,12 +320,16 @@ def main(argv=None):
     v.add_argument('zip')
     v.add_argument('index')
     v.add_argument('--pubkey', required=True)
+    u = sub.add_parser('pin-ubo')
+    u.add_argument('tag')
     k = sub.add_parser('keygen')
     k.add_argument('--out', required=True)
     args = ap.parse_args(argv)
 
     if args.cmd == 'build':
-        print(build(args.out, args.ubo_tag, args.listtool))
+        print(build(args.out, args.listtool))
+    elif args.cmd == 'pin-ubo':
+        print(json.dumps(pin_ubo(args.tag), indent=1))
     elif args.cmd == 'sign':
         z = pathlib.Path(args.zip)
         index = make_index(z.read_bytes(), z.name, _read_key(args.key))

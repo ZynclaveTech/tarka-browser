@@ -1,0 +1,2192 @@
+--- /dev/null
++++ b/components/tark_captions/caption_choices.h
+@@ -0,0 +1,48 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef COMPONENTS_TARK_CAPTIONS_CAPTION_CHOICES_H_
++#define COMPONENTS_TARK_CAPTIONS_CAPTION_CHOICES_H_
++
++#include <string>
++
++#include "base/memory/raw_ptr.h"
++
++class PrefRegistrySimple;
++class PrefService;
++
++namespace tark_captions {
++
++// The caption choices Tark remembers for every call (D4): the script the
++// user reads their client's words in ("" their own, "latn" English letters,
++// or "hi"/"ta"/"bn" for that language's script) and the language
++// translations go into ("en", "hi", "ta", "bn"). Kept in local state, so
++// for every profile; the client's language is not remembered. Incognito
++// starts from them and keeps its own changes in memory only.
++class CaptionChoices {
++ public:
++  static constexpr char kShowInPref[] = "tark.captions.show_in";
++  static constexpr char kTranslateToPref[] = "tark.captions.translate_to";
++
++  static void RegisterLocalStatePrefs(PrefRegistrySimple* registry);
++  static void ResetIncognitoForTesting();
++
++  explicit CaptionChoices(PrefService* local_state);
++  CaptionChoices(const CaptionChoices&) = delete;
++  CaptionChoices& operator=(const CaptionChoices&) = delete;
++  ~CaptionChoices();
++
++  std::string show_in(bool off_the_record) const;
++  std::string translate_to(bool off_the_record) const;
++  // Unknown codes are ignored.
++  void SetShowIn(const std::string& code, bool off_the_record);
++  void SetTranslateTo(const std::string& code, bool off_the_record);
++
++ private:
++  raw_ptr<PrefService> local_state_;
++};
++
++}  // namespace tark_captions
++
++#endif  // COMPONENTS_TARK_CAPTIONS_CAPTION_CHOICES_H_
+--- /dev/null
++++ b/components/tark_captions/caption_choices.cc
+@@ -0,0 +1,90 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/tark_captions/caption_choices.h"
++
++#include <optional>
++
++#include "base/no_destructor.h"
++#include "components/prefs/pref_registry_simple.h"
++#include "components/prefs/pref_service.h"
++
++namespace tark_captions {
++namespace {
++
++bool IsShowIn(const std::string& code) {
++  return code.empty() || code == "latn" || code == "hi" || code == "ta" || code == "bn";
++}
++
++bool IsTranslateTo(const std::string& code) {
++  return code == "en" || code == "hi" || code == "ta" || code == "bn";
++}
++
++// Incognito's own choices, for this run only.
++struct Incognito {
++  std::optional<std::string> show_in;
++  std::optional<std::string> translate_to;
++};
++
++Incognito& IncognitoChoices() {
++  static base::NoDestructor<Incognito> choices;
++  return *choices;
++}
++
++}  // namespace
++
++// static
++void CaptionChoices::RegisterLocalStatePrefs(PrefRegistrySimple* registry) {
++  registry->RegisterStringPref(kShowInPref, "");
++  registry->RegisterStringPref(kTranslateToPref, "en");
++}
++
++// static
++void CaptionChoices::ResetIncognitoForTesting() {
++  IncognitoChoices() = Incognito();
++}
++
++CaptionChoices::CaptionChoices(PrefService* local_state) : local_state_(local_state) {}
++
++CaptionChoices::~CaptionChoices() = default;
++
++std::string CaptionChoices::show_in(bool off_the_record) const {
++  if (off_the_record && IncognitoChoices().show_in) {
++    return *IncognitoChoices().show_in;
++  }
++  const std::string code = local_state_->GetString(kShowInPref);
++  return IsShowIn(code) ? code : std::string();
++}
++
++std::string CaptionChoices::translate_to(bool off_the_record) const {
++  if (off_the_record && IncognitoChoices().translate_to) {
++    return *IncognitoChoices().translate_to;
++  }
++  const std::string code = local_state_->GetString(kTranslateToPref);
++  return IsTranslateTo(code) ? code : "en";
++}
++
++void CaptionChoices::SetShowIn(const std::string& code, bool off_the_record) {
++  if (!IsShowIn(code)) {
++    return;
++  }
++  if (off_the_record) {
++    IncognitoChoices().show_in = code;
++  } else {
++    local_state_->SetString(kShowInPref, code);
++  }
++}
++
++void CaptionChoices::SetTranslateTo(const std::string& code, bool off_the_record) {
++  if (!IsTranslateTo(code)) {
++    return;
++  }
++  if (off_the_record) {
++    IncognitoChoices().translate_to = code;
++  } else {
++    local_state_->SetString(kTranslateToPref, code);
++  }
++}
++
++}  // namespace tark_captions
+--- /dev/null
++++ b/components/tark_captions/caption_choices_unittest.cc
+@@ -0,0 +1,60 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/tark_captions/caption_choices.h"
++
++#include "components/prefs/testing_pref_service.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace tark_captions {
++namespace {
++
++class CaptionChoicesTest : public testing::Test {
++ protected:
++  void SetUp() override {
++    CaptionChoices::RegisterLocalStatePrefs(local_state_.registry());
++    CaptionChoices::ResetIncognitoForTesting();
++  }
++
++  TestingPrefServiceSimple local_state_;
++};
++
++TEST_F(CaptionChoicesTest, DefaultsAreOwnScriptAndEnglish) {
++  CaptionChoices choices(&local_state_);
++  EXPECT_EQ(choices.show_in(/*off_the_record=*/false), "");
++  EXPECT_EQ(choices.translate_to(/*off_the_record=*/false), "en");
++}
++
++TEST_F(CaptionChoicesTest, RemembersChoices) {
++  CaptionChoices(&local_state_).SetShowIn("latn", false);
++  CaptionChoices(&local_state_).SetTranslateTo("ta", false);
++  CaptionChoices later(&local_state_);
++  EXPECT_EQ(later.show_in(false), "latn");
++  EXPECT_EQ(later.translate_to(false), "ta");
++  // Incognito starts from the remembered choices.
++  EXPECT_EQ(later.translate_to(/*off_the_record=*/true), "ta");
++}
++
++TEST_F(CaptionChoicesTest, IncognitoWritesNothing) {
++  CaptionChoices(&local_state_).SetShowIn("hi", /*off_the_record=*/true);
++  CaptionChoices(&local_state_).SetTranslateTo("bn", /*off_the_record=*/true);
++  EXPECT_FALSE(local_state_.GetUserPref(CaptionChoices::kShowInPref));
++  EXPECT_FALSE(local_state_.GetUserPref(CaptionChoices::kTranslateToPref));
++  CaptionChoices later(&local_state_);
++  EXPECT_EQ(later.show_in(/*off_the_record=*/true), "hi");
++  EXPECT_EQ(later.translate_to(/*off_the_record=*/true), "bn");
++  EXPECT_EQ(later.show_in(/*off_the_record=*/false), "");
++  EXPECT_EQ(later.translate_to(/*off_the_record=*/false), "en");
++}
++
++TEST_F(CaptionChoicesTest, UnknownCodesAreIgnored) {
++  CaptionChoices choices(&local_state_);
++  choices.SetShowIn("klingon", false);
++  choices.SetTranslateTo("", false);
++  EXPECT_EQ(choices.show_in(false), "");
++  EXPECT_EQ(choices.translate_to(false), "en");
++}
++
++}  // namespace
++}  // namespace tark_captions
+--- /dev/null
++++ b/components/tark_captions/indic_text.h
+@@ -0,0 +1,51 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef COMPONENTS_TARK_CAPTIONS_INDIC_TEXT_H_
++#define COMPONENTS_TARK_CAPTIONS_INDIC_TEXT_H_
++
++#include <string>
++#include <string_view>
++
++#include "components/tark_captions/asr_model.h"
++
++namespace tark_captions {
++
++// The text steps around the translation model (D4 Phase 2): ports of the
++// parts of IndicTransToolkit's IndicProcessor (IndicNLP's normaliser,
++// tokeniser and script converter; sacremoses' English detokeniser) that
++// caption text reaches. Captions are Indian letters and spaces, so the
++// processor's URL, number and punctuation handling is not ported.
++
++enum class Script { kDevanagari, kTamil, kBengali, kLatin };
++
++Script ScriptOf(Language language);
++
++// IndicNLP's BaseNormalizer and the Devanagari, Tamil or Bengali normaliser
++// with IndicTransToolkit's settings (nuktas kept, nasals and chandras
++// untouched). Its colon-to-visarga step never matches (its pattern is
++// double-escaped upstream) and is left out.
++std::u16string NormalizeIndic(std::u16string_view text, Language language);
++
++// IndicNLP's UnicodeIndicTransliterator between Indian scripts: the letter
++// at the same offset in the other script's Unicode block (dandas kept;
++// Tamil, which lacks voiced and aspirated plosives, gets the unvoiced one).
++// Text is returned unchanged when either script is Latin.
++std::u16string ConvertScript(std::u16string_view text, Script from, Script to);
++
++// IndicNLP's trivial_tokenize / trivial_detokenize for Brahmi scripts.
++std::u16string TokenizeIndic(std::u16string_view text);
++std::u16string DetokenizeIndic(std::u16string_view text);
++
++// sacremoses' MosesDetokenizer(lang="en") on space-separated tokens.
++std::string DetokenizeEnglish(std::string_view tokens);
++
++// What IndicTransToolkit feeds the model for a caption in `language`
++// (without the two language tags): normalised, tokenised and written in
++// Devanagari (IndicTrans2's script unification).
++std::string ModelInput(std::string_view caption, Language language);
++
++}  // namespace tark_captions
++
++#endif  // COMPONENTS_TARK_CAPTIONS_INDIC_TEXT_H_
+--- /dev/null
++++ b/components/tark_captions/indic_text.cc
+@@ -0,0 +1,472 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/tark_captions/indic_text.h"
++
++#include <map>
++#include <vector>
++
++#include "base/strings/string_split.h"
++#include "base/strings/string_util.h"
++#include "base/strings/utf_string_conversions.h"
++#include "third_party/icu/source/common/unicode/uchar.h"
++#include "third_party/icu/source/common/unicode/utf16.h"
++
++namespace tark_captions {
++namespace {
++
++constexpr char16_t kNukta = u'़';
++constexpr char16_t kBengaliNukta = u'়';
++constexpr char16_t kDanda = u'।';
++constexpr char16_t kDoubleDanda = u'॥';
++// IndicNLP's coordinated range: offsets 0x00-0x6f line up across scripts.
++constexpr int kCoordinatedEnd = 0x6F;
++
++char16_t BlockStart(Script script) {
++  switch (script) {
++    case Script::kDevanagari:
++      return 0x0900;
++    case Script::kTamil:
++      return 0x0B80;
++    case Script::kBengali:
++      return 0x0980;
++    case Script::kLatin:
++      return 0;
++  }
++}
++
++void ReplaceAll(std::u16string& text, std::u16string_view from, std::u16string_view to) {
++  base::ReplaceSubstringsAfterOffset(&text, 0, from, to);
++}
++
++// Collapses runs of spaces to one and trims spaces at both ends.
++std::u16string CollapseSpaces(std::u16string_view text) {
++  std::u16string out;
++  for (char16_t c : text) {
++    if (c == u' ' && (out.empty() || out.back() == u' ')) {
++      continue;
++    }
++    out.push_back(c);
++  }
++  if (!out.empty() && out.back() == u' ') {
++    out.pop_back();
++  }
++  return out;
++}
++
++// IndicNLP's _correct_tamil_mapping.
++int CorrectTamilOffset(int offset) {
++  if (offset >= 0x15 && offset <= 0x28 && offset != 0x1C &&
++      !((offset - 0x15) % 5 == 0 || (offset - 0x15) % 5 == 4)) {
++    offset = 0x15 + 5 * ((offset - 0x15) / 5);
++  }
++  if (offset == 0x2B || offset == 0x2C || offset == 0x2D) {
++    offset = 0x2A;
++  }
++  if (offset == 0x36) {
++    offset = 0x37;
++  }
++  return offset;
++}
++
++bool IsTokenPunctuation(char16_t c) {
++  // Python's string.punctuation and IndicNLP's Indian punctuation.
++  static constexpr std::u16string_view kAscii = u"!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~";
++  static constexpr std::u16string_view kIndic =
++      u"।॥꫱꫰꯫꯬꯭꯮꯯᱾᱿";
++  return kAscii.find(c) != std::u16string_view::npos ||
++         kIndic.find(c) != std::u16string_view::npos;
++}
++
++bool IsAsciiDigit(char16_t c) {
++  return c >= u'0' && c <= u'9';
++}
++
++// IndicNLP's pat_num_seq, ([0-9]+ [,.:/] )+[0-9]+: the length of a match
++// starting at `i`, or 0.
++size_t NumberSequenceAt(std::u16string_view s, size_t i) {
++  size_t end = 0;
++  size_t p = i;
++  while (true) {
++    size_t q = p;
++    while (q < s.size() && IsAsciiDigit(s[q])) {
++      ++q;
++    }
++    if (q == p) {
++      break;
++    }
++    // A complete "[0-9]+" here ends a match if at least one group came first.
++    if (end != 0 || p != i) {
++      end = q;
++    }
++    if (q + 2 < s.size() && s[q] == u' ' &&
++        std::u16string_view(u",.:/").find(s[q + 1]) != std::u16string_view::npos &&
++        s[q + 2] == u' ') {
++      p = q + 3;
++      continue;
++    }
++    break;
++  }
++  return end == 0 ? 0 : end - i;
++}
++
++std::u16string JoinNumberSequences(std::u16string_view s) {
++  std::u16string out;
++  size_t i = 0;
++  while (i < s.size()) {
++    const bool at_start = i == 0 || !IsAsciiDigit(s[i - 1]);
++    const size_t length = at_start ? NumberSequenceAt(s, i) : 0;
++    if (length == 0) {
++      out.push_back(s[i++]);
++      continue;
++    }
++    for (char16_t c : s.substr(i, length)) {
++      if (c != u' ') {
++        out.push_back(c);
++      }
++    }
++    i += length;
++  }
++  return out;
++}
++
++std::u16string AsciiDigits(std::u16string_view text) {
++  std::u16string out(text);
++  for (char16_t& c : out) {
++    // IndicTransToolkit's digit table: Devanagari and Bengali here (it has
++    // no Tamil digits).
++    if (c >= 0x0966 && c <= 0x096F) {
++      c = u'0' + (c - 0x0966);
++    } else if (c >= 0x09E6 && c <= 0x09EF) {
++      c = u'0' + (c - 0x09E6);
++    }
++  }
++  return out;
++}
++
++// sacremoses' character classes, via ICU.
++bool IsCjk(UChar32 c) {
++  static constexpr std::pair<UChar32, UChar32> kRanges[] = {
++      {4352, 4607},     {11904, 42191},   {43072, 43135},   {44032, 55215},
++      {63744, 64255},   {65072, 65103},   {65381, 65500},   {94208, 101119},
++      {110592, 110895}, {110960, 111359}, {131072, 196607},
++  };
++  for (const auto& [low, high] : kRanges) {
++    if (c >= low && c <= high) {
++      return true;
++    }
++  }
++  return false;
++}
++
++std::vector<UChar32> CodePoints(const std::u16string& s) {
++  std::vector<UChar32> out;
++  for (size_t i = 0; i < s.size();) {
++    UChar32 c;
++    U16_NEXT(s.data(), i, s.size(), c);
++    out.push_back(c);
++  }
++  return out;
++}
++
++bool AllOf(const std::u16string& token, bool (*pred)(UChar32)) {
++  const std::vector<UChar32> cps = CodePoints(token);
++  if (cps.empty()) {
++    return false;
++  }
++  for (UChar32 c : cps) {
++    if (!pred(c)) {
++      return false;
++    }
++  }
++  return true;
++}
++
++bool IsCurrencyOrOpener(UChar32 c) {
++  return u_charType(c) == U_CURRENCY_SYMBOL || c == '(' || c == '[' || c == '{' || c == 0xBF ||
++         c == 0xA1;
++}
++
++bool IsPunct(UChar32 c) {
++  return c == ',' || c == '.' || c == '?' || c == '!' || c == ':' || c == ';' || c == '\\' ||
++         c == '%' || c == '}' || c == ']' || c == ')';
++}
++
++bool IsOpenQuote(UChar32 c) {
++  return c == '\'' || c == '"' || c == 0x201E || c == 0x201C || c == '`';
++}
++
++bool IsCurlyDoubleQuote(UChar32 c) {
++  return c == 0x201E || c == 0x201C || c == 0x201D;
++}
++
++}  // namespace
++
++Script ScriptOf(Language language) {
++  switch (language) {
++    case Language::kHindi:
++      return Script::kDevanagari;
++    case Language::kTamil:
++      return Script::kTamil;
++    case Language::kBengali:
++      return Script::kBengali;
++  }
++}
++
++std::u16string NormalizeIndic(std::u16string_view input, Language language) {
++  std::u16string text(input);
++  // BaseNormalizer.
++  for (std::u16string_view gone : {u"﻿", u"￾", u"⁠", u"­"}) {
++    ReplaceAll(text, gone, u"");
++  }
++  ReplaceAll(text, u"​", u" ");
++  ReplaceAll(text, u" ", u" ");
++  ReplaceAll(text, u"‌", u"");
++  ReplaceAll(text, u"‍", u"");
++  // NormalizerI._normalize_punctuations, in its order.
++  static constexpr std::pair<std::u16string_view, std::u16string_view> kPunctuation[] = {
++      {u"﻿", u""},   {u"„", u"\""}, {u"“", u"\""}, {u"”", u"\""},
++      {u"–", u"-"},  {u"—", u" - "}, {u"´", u"'"},  {u"‘", u"'"},
++      {u"‚", u"'"},  {u"’", u"'"},  {u"''", u"\""},     {u"´´", u"\""},
++      {u"…", u"..."},
++  };
++  for (const auto& [from, to] : kPunctuation) {
++    ReplaceAll(text, from, to);
++  }
++  switch (language) {
++    case Language::kHindi: {
++      ReplaceAll(text, u"ॲ", u"ए");
++      static constexpr std::pair<char16_t, char16_t> kNuktaForms[] = {
++          {0x0929, 0x0928}, {0x0931, 0x0930}, {0x0934, 0x0933}, {0x0958, 0x0915},
++          {0x0959, 0x0916}, {0x095A, 0x0917}, {0x095B, 0x091C}, {0x095C, 0x0921},
++          {0x095D, 0x0922}, {0x095E, 0x092B}, {0x095F, 0x092F},
++      };
++      for (const auto& [composite, base] : kNuktaForms) {
++        ReplaceAll(text, std::u16string(1, composite), std::u16string{base, kNukta});
++      }
++      ReplaceAll(text, u"|", u"।");
++      break;
++    }
++    case Language::kBengali: {
++      ReplaceAll(text, u"ড়", std::u16string{0x09A1, kBengaliNukta});
++      ReplaceAll(text, u"ঢ়", std::u16string{0x09A2, kBengaliNukta});
++      ReplaceAll(text, u"য়", std::u16string{0x09AF, kBengaliNukta});
++      ReplaceAll(text, u"৤", u"।");
++      ReplaceAll(text, u"৥", u"॥");
++      ReplaceAll(text, u"|", u"।");
++      ReplaceAll(text, u"৷", u"।");
++      ReplaceAll(text, u"ো", u"ো");
++      ReplaceAll(text, u"ৌ", u"ৌ");
++      break;
++    }
++    case Language::kTamil: {
++      ReplaceAll(text, u"௤", u"।");
++      ReplaceAll(text, u"௥", u"॥");
++      ReplaceAll(text, u"ஔ", u"ஔ");
++      ReplaceAll(text, u"ொ", u"ொ");
++      ReplaceAll(text, u"ோ", u"ோ");
++      ReplaceAll(text, u"ௌ", u"ௌ");
++      break;
++    }
++  }
++  return text;
++}
++
++std::u16string ConvertScript(std::u16string_view text, Script from, Script to) {
++  if (from == Script::kLatin || to == Script::kLatin || from == to) {
++    return std::u16string(text);
++  }
++  const int from_start = BlockStart(from);
++  const int to_start = BlockStart(to);
++  std::u16string out;
++  out.reserve(text.size());
++  for (char16_t c : text) {
++    int offset = static_cast<int>(c) - from_start;
++    if (offset >= 0 && offset <= kCoordinatedEnd && c != kDanda && c != kDoubleDanda) {
++      if (to == Script::kTamil) {
++        offset = CorrectTamilOffset(offset);
++      }
++      out.push_back(static_cast<char16_t>(to_start + offset));
++    } else {
++      out.push_back(c);
++    }
++  }
++  return out;
++}
++
++std::u16string TokenizeIndic(std::u16string_view text) {
++  std::u16string spaced;
++  for (char16_t c : text) {
++    if (c == u'\t') {
++      c = u' ';
++    }
++    if (IsTokenPunctuation(c)) {
++      spaced += u' ';
++      spaced += c;
++      spaced += u' ';
++    } else {
++      spaced += c;
++    }
++  }
++  return JoinNumberSequences(CollapseSpaces(CollapseSpaces(spaced)));
++}
++
++std::u16string DetokenizeIndic(std::u16string_view text) {
++  // Number sequences, as IndicNLP does it: a match at the very start of the
++  // remaining text is skipped (its loop only appends when start > prev).
++  std::u16string s;
++  {
++    size_t prev = 0;
++    size_t i = 0;
++    std::u16string_view in(text);
++    while (i < in.size()) {
++      const bool at_start = i == 0 || !IsAsciiDigit(in[i - 1]);
++      const size_t length = at_start ? NumberSequenceAt(in, i) : 0;
++      if (length == 0) {
++        ++i;
++        continue;
++      }
++      if (i > prev) {
++        s += in.substr(prev, i - prev);
++        for (char16_t c : in.substr(i, length)) {
++          if (c != u' ') {
++            s.push_back(c);
++          }
++        }
++        prev = i + length;
++      }
++      i += length;
++    }
++    s += in.substr(prev);
++  }
++  auto drop_space = [](std::u16string& str, std::u16string_view set, bool before, bool after) {
++    std::u16string out;
++    for (size_t i = 0; i < str.size(); ++i) {
++      const bool in_set = set.find(str[i]) != std::u16string_view::npos;
++      if (in_set && before && after) {
++        if (!out.empty() && out.back() == u' ' && i + 1 < str.size() && str[i + 1] == u' ') {
++          out.back() = str[i];
++          ++i;
++          continue;
++        }
++      } else if (in_set && before) {
++        if (!out.empty() && out.back() == u' ') {
++          out.back() = str[i];
++          continue;
++        }
++      } else if (in_set && after) {
++        if (i + 1 < str.size() && str[i + 1] == u' ') {
++          out.push_back(str[i]);
++          ++i;
++          continue;
++        }
++      }
++      out.push_back(str[i]);
++    }
++    str = out;
++  };
++  drop_space(s, u"-/\\", true, true);
++  drop_space(s, u"!%)]},.:;>?।॥", true, false);
++  drop_space(s, u"#$([{<@", false, true);
++  // Quotes alternate between attaching right and left.
++  for (char16_t quote : std::u16string_view(u"'\"`")) {
++    std::u16string marked;
++    int count = 0;
++    for (char16_t c : s) {
++      if (c == quote) {
++        marked += count % 2 == 0 ? u"@RA" : u"@LA";
++        ++count;
++      } else {
++        marked.push_back(c);
++      }
++    }
++    const std::u16string q(1, quote);
++    ReplaceAll(marked, u"@RA ", q);
++    ReplaceAll(marked, u" @LA", q);
++    ReplaceAll(marked, u"@RA", q);
++    ReplaceAll(marked, u"@LA", q);
++    s = marked;
++  }
++  return s;
++}
++
++std::string DetokenizeEnglish(std::string_view input) {
++  std::u16string text = u" " + base::UTF8ToUTF16(input) + u" ";
++  ReplaceAll(text, u" @-@ ", u"-");
++  static constexpr std::pair<std::u16string_view, std::u16string_view> kUnescape[] = {
++      {u"&bar;", u"|"}, {u"&#124;", u"|"}, {u"&lt;", u"<"},  {u"&gt;", u">"},
++      {u"&bra;", u"["}, {u"&ket;", u"]"},  {u"&quot;", u"\""}, {u"&apos;", u"'"},
++      {u"&#91;", u"["}, {u"&#93;", u"]"},  {u"&amp;", u"&"},
++  };
++  for (const auto& [from, to] : kUnescape) {
++    ReplaceAll(text, from, to);
++  }
++  std::vector<std::u16string> tokens;
++  for (const std::u16string& t : base::SplitString(text, base::kWhitespaceUTF16,
++                                                   base::KEEP_WHITESPACE,
++                                                   base::SPLIT_WANT_NONEMPTY)) {
++    tokens.push_back(t);
++  }
++  std::map<std::u16string, int> quote_counts;
++  std::u16string prepend = u" ";
++  std::u16string out;
++  for (size_t i = 0; i < tokens.size(); ++i) {
++    const std::u16string& token = tokens[i];
++    const std::vector<UChar32> cps = CodePoints(token);
++    if (IsCjk(cps.front())) {
++      const std::vector<UChar32> prev = i > 0 ? CodePoints(tokens[i - 1]) : std::vector<UChar32>();
++      out += (i > 0 && IsCjk(prev.back())) ? token : prepend + token;
++      prepend = u" ";
++    } else if (AllOf(token, &IsCurrencyOrOpener)) {
++      out += prepend + token;
++      prepend = u"";
++    } else if (AllOf(token, &IsPunct)) {
++      out += token;
++      prepend = u" ";
++    } else if (i > 0 && cps.size() >= 2 && cps[0] == '\'' && u_isalpha(cps[1])) {
++      out += token;
++      prepend = u" ";
++    } else if (AllOf(token, &IsOpenQuote)) {
++      const std::u16string key = AllOf(token, &IsCurlyDoubleQuote) ? u"\"" : token;
++      int& count = quote_counts[key];
++      if (count % 2 == 0) {
++        if (token == u"'" && i > 0 && !tokens[i - 1].empty() && tokens[i - 1].back() == u's') {
++          out += token;
++          prepend = u" ";
++        } else {
++          out += prepend + token;
++          prepend = u"";
++          ++count;
++        }
++      } else {
++        out += token;
++        prepend = u" ";
++        ++count;
++      }
++    } else {
++      out += prepend + token;
++      prepend = u" ";
++    }
++  }
++  std::u16string collapsed;
++  for (char16_t c : out) {
++    if (c == u' ' && !collapsed.empty() && collapsed.back() == u' ') {
++      continue;
++    }
++    collapsed.push_back(c);
++  }
++  return base::UTF16ToUTF8(base::TrimWhitespace(collapsed, base::TRIM_ALL));
++}
++
++std::string ModelInput(std::string_view caption, Language language) {
++  std::u16string text = CollapseSpaces(base::UTF8ToUTF16(caption));
++  text = AsciiDigits(text);
++  text = NormalizeIndic(base::TrimWhitespace(text, base::TRIM_ALL), language);
++  text = TokenizeIndic(text);
++  text = ConvertScript(text, ScriptOf(language), Script::kDevanagari);
++  ReplaceAll(text, u" ् ", u"्");
++  return base::UTF16ToUTF8(base::TrimWhitespace(text, base::TRIM_ALL));
++}
++
++}  // namespace tark_captions
+--- /dev/null
++++ b/components/tark_captions/indic_text_unittest.cc
+@@ -0,0 +1,81 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/tark_captions/indic_text.h"
++
++#include <string>
++
++#include "base/strings/utf_string_conversions.h"
++#include "components/tark_captions/test_util.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace tark_captions {
++namespace {
++
++// The golden cases (utils/indictrans_export.py golden): real caption
++// hypotheses through IndicTransToolkit's IndicProcessor.
++base::ListValue Cases() {
++  std::optional<base::FilePath> testdata = test::TestDataDir();
++  return testdata ? test::MtGoldenCases(*testdata) : base::ListValue();
++}
++
++Language LanguageOf(const base::DictValue& c) {
++  return *LanguageFromCode(*c.FindString("lang"));
++}
++
++TEST(IndicTextTest, NormalizeMatchesReference) {
++  base::ListValue cases = Cases();
++  if (cases.empty()) {
++    GTEST_SKIP() << "set TARK_CAPTIONS_TESTDATA";
++  }
++  for (const base::Value& v : cases) {
++    const base::DictValue& c = v.GetDict();
++    EXPECT_EQ(base::UTF16ToUTF8(NormalizeIndic(base::UTF8ToUTF16(*c.FindString("caption")),
++                                               LanguageOf(c))),
++              *c.FindString("normalized"))
++        << *c.FindString("id");
++  }
++}
++
++TEST(IndicTextTest, ModelInputMatchesReference) {
++  base::ListValue cases = Cases();
++  if (cases.empty()) {
++    GTEST_SKIP() << "set TARK_CAPTIONS_TESTDATA";
++  }
++  for (const base::Value& v : cases) {
++    const base::DictValue& c = v.GetDict();
++    EXPECT_EQ(ModelInput(*c.FindString("caption"), LanguageOf(c)), *c.FindString("model_input"))
++        << *c.FindString("id");
++  }
++}
++
++TEST(IndicTextTest, EnglishDetokenizeMatchesReference) {
++  base::ListValue cases = Cases();
++  if (cases.empty()) {
++    GTEST_SKIP() << "set TARK_CAPTIONS_TESTDATA";
++  }
++  for (const base::Value& v : cases) {
++    const base::DictValue& c = v.GetDict();
++    EXPECT_EQ(DetokenizeEnglish(*c.FindString("english_tokens")), *c.FindString("english"))
++        << *c.FindString("id");
++  }
++}
++
++// Tamil has no voiced or aspirated plosives: ग and ड become க and ட.
++TEST(IndicTextTest, TamilTargetUsesUnvoicedPlosives) {
++  EXPECT_EQ(ConvertScript(u"गड", Script::kDevanagari, Script::kTamil), u"கட");
++}
++
++TEST(IndicTextTest, DandasUnchanged) {
++  EXPECT_EQ(ConvertScript(u"क।", Script::kDevanagari, Script::kBengali), u"ক।");
++}
++
++TEST(IndicTextTest, ScriptsOfLanguages) {
++  EXPECT_EQ(ScriptOf(Language::kHindi), Script::kDevanagari);
++  EXPECT_EQ(ScriptOf(Language::kTamil), Script::kTamil);
++  EXPECT_EQ(ScriptOf(Language::kBengali), Script::kBengali);
++}
++
++}  // namespace
++}  // namespace tark_captions
+--- /dev/null
++++ b/components/tark_captions/render_queue.h
+@@ -0,0 +1,53 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef COMPONENTS_TARK_CAPTIONS_RENDER_QUEUE_H_
++#define COMPONENTS_TARK_CAPTIONS_RENDER_QUEUE_H_
++
++#include <cstdint>
++#include <deque>
++#include <optional>
++#include <string>
++
++namespace tark_captions {
++
++struct RenderRequest {
++  bool is_final = false;
++  std::string text;
++  // The choices (script, translation) it was asked with.
++  uint64_t generation = 0;
++};
++
++// Which caption to send to the translator next (D4 Phase 2). Drafts come
++// every 0.8 s while someone speaks and a translation takes ~0.1 s, so:
++// one request at a time; a newer draft replaces a waiting one; finals are
++// all sent, in order, before a draft; a final replaces the draft waiting
++// before it; a result asked with old choices is not shown.
++class RenderQueue {
++ public:
++  RenderQueue();
++  RenderQueue(const RenderQueue&) = delete;
++  RenderQueue& operator=(const RenderQueue&) = delete;
++  ~RenderQueue();
++
++  void Add(bool is_final, std::string text);
++  // The next request, when none is in flight.
++  std::optional<RenderRequest> Next();
++  // The request in flight is done; true if its result is still current.
++  bool Done(uint64_t generation);
++  // The user changed a choice: results asked before are stale, and the
++  // waiting draft goes (the next one comes within a second).
++  void ChoicesChanged();
++  void Clear();
++
++ private:
++  std::deque<std::string> finals_;
++  std::optional<std::string> draft_;
++  bool in_flight_ = false;
++  uint64_t generation_ = 0;
++};
++
++}  // namespace tark_captions
++
++#endif  // COMPONENTS_TARK_CAPTIONS_RENDER_QUEUE_H_
+--- /dev/null
++++ b/components/tark_captions/render_queue.cc
+@@ -0,0 +1,60 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/tark_captions/render_queue.h"
++
++#include <utility>
++
++namespace tark_captions {
++
++RenderQueue::RenderQueue() = default;
++RenderQueue::~RenderQueue() = default;
++
++void RenderQueue::Add(bool is_final, std::string text) {
++  if (is_final) {
++    draft_.reset();
++    finals_.push_back(std::move(text));
++  } else {
++    draft_ = std::move(text);
++  }
++}
++
++std::optional<RenderRequest> RenderQueue::Next() {
++  if (in_flight_) {
++    return std::nullopt;
++  }
++  RenderRequest request;
++  request.generation = generation_;
++  if (!finals_.empty()) {
++    request.is_final = true;
++    request.text = std::move(finals_.front());
++    finals_.pop_front();
++  } else if (draft_) {
++    request.text = std::move(*draft_);
++    draft_.reset();
++  } else {
++    return std::nullopt;
++  }
++  in_flight_ = true;
++  return request;
++}
++
++bool RenderQueue::Done(uint64_t generation) {
++  in_flight_ = false;
++  return generation == generation_;
++}
++
++void RenderQueue::ChoicesChanged() {
++  ++generation_;
++  draft_.reset();
++}
++
++void RenderQueue::Clear() {
++  finals_.clear();
++  draft_.reset();
++  in_flight_ = false;
++  ++generation_;
++}
++
++}  // namespace tark_captions
+--- /dev/null
++++ b/components/tark_captions/render_queue_unittest.cc
+@@ -0,0 +1,87 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/tark_captions/render_queue.h"
++
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace tark_captions {
++namespace {
++
++TEST(RenderQueueTest, OneRequestInFlight) {
++  RenderQueue queue;
++  queue.Add(false, "a");
++  std::optional<RenderRequest> first = queue.Next();
++  ASSERT_TRUE(first);
++  queue.Add(false, "b");
++  EXPECT_FALSE(queue.Next());
++  EXPECT_TRUE(queue.Done(first->generation));
++  EXPECT_EQ(queue.Next()->text, "b");
++}
++
++TEST(RenderQueueTest, DraftsCoalesce) {
++  RenderQueue queue;
++  queue.Add(false, "a");
++  const uint64_t generation = queue.Next()->generation;
++  queue.Add(false, "b");
++  queue.Add(false, "c");
++  queue.Add(false, "d");
++  queue.Done(generation);
++  std::optional<RenderRequest> next = queue.Next();
++  EXPECT_EQ(next->text, "d");
++  queue.Done(next->generation);
++  EXPECT_FALSE(queue.Next());
++}
++
++TEST(RenderQueueTest, FinalsNeverDropped) {
++  RenderQueue queue;
++  queue.Add(false, "draft 1");
++  uint64_t generation = queue.Next()->generation;
++  queue.Add(true, "final 1");
++  queue.Add(true, "final 2");
++  queue.Add(false, "draft 2");
++  queue.Done(generation);
++  std::vector<std::string> order;
++  while (std::optional<RenderRequest> next = queue.Next()) {
++    order.push_back(next->text);
++    queue.Done(next->generation);
++  }
++  EXPECT_EQ(order, (std::vector<std::string>{"final 1", "final 2", "draft 2"}));
++}
++
++// A final replaces the draft of the same words still waiting.
++TEST(RenderQueueTest, FinalSupersedesWaitingDraft) {
++  RenderQueue queue;
++  queue.Add(false, "a");
++  const uint64_t generation = queue.Next()->generation;
++  queue.Add(false, "draft");
++  queue.Add(true, "final");
++  queue.Done(generation);
++  std::optional<RenderRequest> next = queue.Next();
++  EXPECT_TRUE(next->is_final);
++  queue.Done(next->generation);
++  EXPECT_FALSE(queue.Next());
++}
++
++TEST(RenderQueueTest, StaleResultIsDropped) {
++  RenderQueue queue;
++  queue.Add(false, "a");
++  const uint64_t old_generation = queue.Next()->generation;
++  queue.ChoicesChanged();
++  EXPECT_FALSE(queue.Done(old_generation));
++}
++
++TEST(RenderQueueTest, ClearForgetsEverything) {
++  RenderQueue queue;
++  queue.Add(true, "a");
++  queue.Next();
++  queue.Add(true, "b");
++  queue.Clear();
++  EXPECT_FALSE(queue.Next());
++  queue.Add(true, "c");
++  EXPECT_EQ(queue.Next()->text, "c");
++}
++
++}  // namespace
++}  // namespace tark_captions
+--- /dev/null
++++ b/components/tark_captions/romanize.h
+@@ -0,0 +1,25 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef COMPONENTS_TARK_CAPTIONS_ROMANIZE_H_
++#define COMPONENTS_TARK_CAPTIONS_ROMANIZE_H_
++
++#include <string>
++#include <string_view>
++
++#include "components/tark_captions/asr_model.h"
++
++namespace tark_captions {
++
++// "Show their words in English letters" (D4): everyday Latin spelling
++// without diacritics, lowercase ASCII, e.g. नमस्ते "namaste", தமிழ்
++// "tamizh", বাংলা "bangla". Readable, not phonetically exact: the inherent
++// vowel is "a" (Hindi, Tamil) or "o" (Bengali), and Hindi and Bengali drop
++// it at the end of a word and in the middle where it is silent. Anything
++// outside the language's script is left as it is.
++std::u16string Romanize(std::u16string_view text, Language language);
++
++}  // namespace tark_captions
++
++#endif  // COMPONENTS_TARK_CAPTIONS_ROMANIZE_H_
+--- /dev/null
++++ b/components/tark_captions/romanize.cc
+@@ -0,0 +1,294 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/tark_captions/romanize.h"
++
++#include <string>
++#include <vector>
++
++#include "base/containers/fixed_flat_map.h"
++#include "base/strings/utf_string_conversions.h"
++
++namespace tark_captions {
++namespace {
++
++// One script's letters. Keys are code points; values are Latin spellings.
++struct Table {
++  char16_t first;  // The script's Unicode block.
++  char16_t last;
++  const char* inherent;
++  bool drops_inherent;  // Hindi and Bengali.
++  char16_t virama;
++  char16_t nukta;  // 0 if none.
++  base::span<const std::pair<char16_t, const char*>> consonants;
++  base::span<const std::pair<char16_t, const char*>> nukta_consonants;
++  base::span<const std::pair<char16_t, const char*>> vowels;
++  base::span<const std::pair<char16_t, const char*>> signs;  // Dependent vowels.
++  base::span<const std::pair<char16_t, const char*>> codas;  // Anusvara etc.
++};
++
++constexpr std::pair<char16_t, const char*> kHindiConsonants[] = {
++    {u'क', "k"},  {u'ख', "kh"}, {u'ग', "g"},  {u'घ', "gh"}, {u'ङ', "n"},  {u'च', "ch"},
++    {u'छ', "chh"}, {u'ज', "j"},  {u'झ', "jh"}, {u'ञ', "n"},  {u'ट', "t"},  {u'ठ', "th"},
++    {u'ड', "d"},  {u'ढ', "dh"}, {u'ण', "n"},  {u'त', "t"},  {u'थ', "th"}, {u'द', "d"},
++    {u'ध', "dh"}, {u'न', "n"},  {u'प', "p"},  {u'फ', "ph"}, {u'ब', "b"},  {u'भ', "bh"},
++    {u'म', "m"},  {u'य', "y"},  {u'र', "r"},  {u'ल', "l"},  {u'व', "v"},  {u'श', "sh"},
++    {u'ष', "sh"}, {u'स', "s"},  {u'ह', "h"},  {u'ळ', "l"},
++};
++// With the nukta, written as one code point or as consonant + nukta.
++constexpr std::pair<char16_t, const char*> kHindiNuktaConsonants[] = {
++    {u'क', "q"}, {u'ख', "kh"}, {u'ग', "g"}, {u'ज', "z"},
++    {u'ड', "r"}, {u'ढ', "rh"}, {u'फ', "f"}, {u'य', "y"},
++};
++constexpr std::pair<char16_t, const char*> kHindiVowels[] = {
++    {u'अ', "a"}, {u'आ', "aa"}, {u'इ', "i"}, {u'ई', "i"}, {u'उ', "u"},  {u'ऊ', "u"},
++    {u'ऋ', "ri"}, {u'ए', "e"}, {u'ऐ', "ai"}, {u'ओ', "o"}, {u'औ', "au"},
++};
++constexpr std::pair<char16_t, const char*> kHindiSigns[] = {
++    {u'ा', "a"}, {u'ि', "i"}, {u'ी', "i"}, {u'ु', "u"},  {u'ू', "u"},
++    {u'ृ', "ri"}, {u'े', "e"}, {u'ै', "ai"}, {u'ो', "o"}, {u'ौ', "au"},
++};
++constexpr std::pair<char16_t, const char*> kHindiCodas[] = {
++    {u'ं', "n"}, {u'ँ', "n"}, {u'ः', "h"},
++};
++
++constexpr std::pair<char16_t, const char*> kTamilConsonants[] = {
++    {u'க', "k"}, {u'ங', "ng"}, {u'ச', "ch"}, {u'ஞ', "nj"}, {u'ட', "t"},  {u'ண', "n"},
++    {u'த', "t"}, {u'ந', "n"},  {u'ப', "p"},  {u'ம', "m"},  {u'ய', "y"},  {u'ர', "r"},
++    {u'ல', "l"}, {u'வ', "v"},  {u'ழ', "zh"}, {u'ள', "l"},  {u'ற', "r"},  {u'ன', "n"},
++    {u'ஜ', "j"}, {u'ஷ', "sh"}, {u'ஸ', "s"},  {u'ஹ', "h"},
++};
++constexpr std::pair<char16_t, const char*> kTamilVowels[] = {
++    {u'அ', "a"}, {u'ஆ', "aa"}, {u'இ', "i"}, {u'ஈ', "i"},  {u'உ', "u"}, {u'ஊ', "u"},
++    {u'எ', "e"}, {u'ஏ', "e"},  {u'ஐ', "ai"}, {u'ஒ', "o"}, {u'ஓ', "o"}, {u'ஔ', "au"},
++};
++constexpr std::pair<char16_t, const char*> kTamilSigns[] = {
++    {u'ா', "a"}, {u'ி', "i"}, {u'ீ', "i"},  {u'ு', "u"}, {u'ூ', "u"},
++    {u'ெ', "e"}, {u'ே', "e"}, {u'ை', "ai"}, {u'ொ', "o"}, {u'ோ', "o"}, {u'ௌ', "au"},
++};
++constexpr std::pair<char16_t, const char*> kTamilCodas[] = {
++    {u'ஃ', "h"},
++};
++
++constexpr std::pair<char16_t, const char*> kBengaliConsonants[] = {
++    {u'ক', "k"},  {u'খ', "kh"}, {u'গ', "g"},  {u'ঘ', "gh"}, {u'ঙ', "ng"}, {u'চ', "ch"},
++    {u'ছ', "chh"}, {u'জ', "j"},  {u'ঝ', "jh"}, {u'ঞ', "n"},  {u'ট', "t"},  {u'ঠ', "th"},
++    {u'ড', "d"},  {u'ঢ', "dh"}, {u'ণ', "n"},  {u'ত', "t"},  {u'থ', "th"}, {u'দ', "d"},
++    {u'ধ', "dh"}, {u'ন', "n"},  {u'প', "p"},  {u'ফ', "ph"}, {u'ব', "b"},  {u'ভ', "bh"},
++    {u'ম', "m"},  {u'য', "j"},  {u'র', "r"},  {u'ল', "l"},  {u'শ', "sh"}, {u'ষ', "sh"},
++    {u'স', "s"},  {u'হ', "h"},  {u'\u09DC', "r"}, {u'\u09DD', "rh"}, {u'\u09DF', "y"}, {u'ৎ', "t"},
++};
++constexpr std::pair<char16_t, const char*> kBengaliNuktaConsonants[] = {
++    {u'ড', "r"}, {u'ঢ', "rh"}, {u'য', "y"},
++};
++constexpr std::pair<char16_t, const char*> kBengaliVowels[] = {
++    {u'অ', "o"}, {u'আ', "a"}, {u'ই', "i"},  {u'ঈ', "i"}, {u'উ', "u"}, {u'ঊ', "u"},
++    {u'ঋ', "ri"}, {u'এ', "e"}, {u'ঐ', "oi"}, {u'ও', "o"}, {u'ঔ', "ou"},
++};
++constexpr std::pair<char16_t, const char*> kBengaliSigns[] = {
++    {u'া', "a"}, {u'ি', "i"}, {u'ী', "i"},  {u'ু', "u"}, {u'ূ', "u"},
++    {u'ৃ', "ri"}, {u'ে', "e"}, {u'ৈ', "oi"}, {u'ো', "o"}, {u'ৌ', "ou"},
++};
++constexpr std::pair<char16_t, const char*> kBengaliCodas[] = {
++    {u'ং', "ng"}, {u'ঁ', "n"}, {u'ঃ', "h"},
++};
++
++const Table& TableFor(Language language) {
++  static const Table kHindi = {0x0900, 0x097F, "a", true, 0x094D, 0x093C,
++                               kHindiConsonants, kHindiNuktaConsonants, kHindiVowels,
++                               kHindiSigns, kHindiCodas};
++  static const Table kTamil = {0x0B80, 0x0BFF, "a", false, 0x0BCD, 0,
++                               kTamilConsonants, {}, kTamilVowels, kTamilSigns, kTamilCodas};
++  static const Table kBengali = {0x0980, 0x09FF, "o", true, 0x09CD, 0x09BC,
++                                 kBengaliConsonants, kBengaliNuktaConsonants, kBengaliVowels,
++                                 kBengaliSigns, kBengaliCodas};
++  switch (language) {
++    case Language::kHindi:
++      return kHindi;
++    case Language::kTamil:
++      return kTamil;
++    case Language::kBengali:
++      return kBengali;
++  }
++}
++
++const char* Find(base::span<const std::pair<char16_t, const char*>> list, char16_t c) {
++  for (const auto& [key, value] : list) {
++    if (key == c) {
++      return value;
++    }
++  }
++  return nullptr;
++}
++
++// Composite nukta letters (क़ U+0958 ... य़ U+095F) as consonant + nukta.
++std::u16string DecomposeNuktas(std::u16string_view text) {
++  static constexpr std::pair<char16_t, char16_t> kComposites[] = {
++      {0x0958, u'क'}, {0x0959, u'ख'}, {0x095A, u'ग'}, {0x095B, u'ज'},
++      {0x095C, u'ड'}, {0x095D, u'ढ'}, {0x095E, u'फ'}, {0x095F, u'य'},
++  };
++  std::u16string out;
++  for (char16_t c : text) {
++    bool done = false;
++    for (const auto& [composite, base] : kComposites) {
++      if (c == composite) {
++        out += base;
++        out += u'़';
++        done = true;
++        break;
++      }
++    }
++    if (!done) {
++      out += c;
++    }
++  }
++  return out;
++}
++
++// A written syllable: consonants (or none, for an independent vowel), its
++// vowel, and a nasal or visarga after it.
++struct Syllable {
++  std::string onset;
++  int consonants = 0;
++  std::string vowel;
++  bool inherent = false;  // `vowel` is the script's inherent vowel.
++  bool dropped = false;   // ... and it is silent.
++  std::string coda;
++};
++
++std::string RomanizeWord(std::u16string_view word, const Table& t) {
++  std::vector<Syllable> syllables;
++  size_t i = 0;
++  auto consonant_at = [&](size_t k, std::string* latin, size_t* used) {
++    const char16_t c = word[k];
++    if (t.nukta && k + 1 < word.size() && word[k + 1] == t.nukta) {
++      if (const char* n = Find(t.nukta_consonants, c)) {
++        *latin = n;
++        *used = 2;
++        return true;
++      }
++    }
++    if (const char* plain = Find(t.consonants, c)) {
++      *latin = plain;
++      *used = (t.nukta && k + 1 < word.size() && word[k + 1] == t.nukta) ? 2 : 1;
++      return true;
++    }
++    return false;
++  };
++  while (i < word.size()) {
++    Syllable s;
++    std::string latin;
++    size_t used = 0;
++    if (const char* v = Find(t.vowels, word[i])) {
++      s.vowel = v;
++      ++i;
++    } else if (consonant_at(i, &latin, &used)) {
++      std::vector<char16_t> cluster = {word[i]};
++      s.onset = latin;
++      s.consonants = 1;
++      i += used;
++      while (i + 1 < word.size() && word[i] == t.virama &&
++             consonant_at(i + 1, &latin, &used)) {
++        // Bengali য after a virama is the "y" sound (য-ফলা).
++        if (t.first == 0x0980 && word[i + 1] == u'য') {
++          latin = "y";
++        }
++        cluster.push_back(word[i + 1]);
++        s.onset += latin;
++        ++s.consonants;
++        i += 1 + used;
++      }
++      // Tamil clusters as they are said: ன்ற "ndr" (நன்றி "nandri"),
++      // ற்ற "tr" (மற்றும் "matrum"), ங்க "ng" (விளங்கும் "vilangum").
++      if (t.first == 0x0B80) {
++        if (cluster == std::vector<char16_t>{u'ன', u'ற'}) {
++          s.onset = "ndr";
++        } else if (cluster == std::vector<char16_t>{u'ற', u'ற'}) {
++          s.onset = "tr";
++        } else if (cluster == std::vector<char16_t>{u'ங', u'க'}) {
++          s.onset = "ng";
++        }
++      }
++      if (i < word.size() && Find(t.signs, word[i])) {
++        s.vowel = Find(t.signs, word[i]);
++        ++i;
++      } else if (i < word.size() && word[i] == t.virama) {
++        ++i;  // No vowel.
++      } else {
++        s.vowel = t.inherent;
++        s.inherent = true;
++      }
++    } else {
++      // Not a letter Tark knows (a sign or mark): kept as it is.
++      return base::UTF16ToUTF8(word);
++    }
++    while (i < word.size() && Find(t.codas, word[i])) {
++      s.coda += Find(t.codas, word[i]);
++      ++i;
++    }
++    syllables.push_back(std::move(s));
++  }
++  if (t.drops_inherent && syllables.size() > 1) {
++    // The last inherent vowel is silent (भारत "bharat").
++    Syllable& last = syllables.back();
++    if (last.inherent && last.coda.empty()) {
++      last.dropped = true;
++    }
++    // In the middle, a single consonant's inherent vowel is silent between
++    // an open syllable and a single consonant that has a vowel
++    // (कमला "kamla"; but ज़िंदगी "zindagi", नमस्ते "namaste").
++    for (size_t k = syllables.size() - 2; k >= 1; --k) {
++      Syllable& s = syllables[k];
++      const Syllable& before = syllables[k - 1];
++      const Syllable& after = syllables[k + 1];
++      const bool before_open = !before.vowel.empty() && !before.dropped && before.coda.empty();
++      const bool after_voiced = after.consonants == 1 && !after.vowel.empty() && !after.dropped;
++      if (s.inherent && s.consonants == 1 && s.coda.empty() && before_open && after_voiced) {
++        s.dropped = true;
++      }
++    }
++  }
++  std::string out;
++  for (size_t k = 0; k < syllables.size(); ++k) {
++    const Syllable& s = syllables[k];
++    out += s.onset;
++    if (!s.dropped) {
++      out += s.vowel;
++    }
++    // A nasal before p, b or m is said "m" (लंबी "lambi").
++    const bool before_labial = k + 1 < syllables.size() && !syllables[k + 1].onset.empty() &&
++                               (syllables[k + 1].onset[0] == 'p' ||
++                                syllables[k + 1].onset[0] == 'b' ||
++                                syllables[k + 1].onset[0] == 'm');
++    out += (before_labial && s.coda == "n") ? "m" : s.coda;
++  }
++  return out;
++}
++
++}  // namespace
++
++std::u16string Romanize(std::u16string_view input, Language language) {
++  const Table& t = TableFor(language);
++  const std::u16string text = DecomposeNuktas(input);
++  std::u16string out;
++  std::u16string word;
++  auto flush = [&] {
++    if (!word.empty()) {
++      out += base::UTF8ToUTF16(RomanizeWord(word, t));
++      word.clear();
++    }
++  };
++  for (char16_t c : text) {
++    if (c >= t.first && c <= t.last && c != 0x0964 && c != 0x0965) {
++      word += c;
++    } else {
++      flush();
++      out += c;
++    }
++  }
++  flush();
++  return out;
++}
++
++}  // namespace tark_captions
+--- /dev/null
++++ b/components/tark_captions/romanize_unittest.cc
+@@ -0,0 +1,52 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/tark_captions/romanize.h"
++
++#include "base/strings/utf_string_conversions.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace tark_captions {
++namespace {
++
++struct Example {
++  Language language;
++  const char* text;
++  const char* latin;
++};
++
++// Everyday spellings without diacritics ("show their words in English
++// letters", spec D4).
++TEST(RomanizeTest, RomanizesEverydaySpellings) {
++  const Example kExamples[] = {
++      {Language::kHindi, "नमस्ते", "namaste"},
++      {Language::kHindi, "भारत", "bharat"},
++      {Language::kHindi, "कमला", "kamla"},
++      {Language::kHindi, "ज़िंदगी", "zindagi"},
++      {Language::kHindi, "क्या", "kya"},
++      {Language::kHindi, "लंबी", "lambi"},
++      {Language::kHindi, "आप कैसे हैं", "aap kaise hain"},
++      {Language::kTamil, "தமிழ்", "tamizh"},
++      {Language::kTamil, "வணக்கம்", "vanakkam"},
++      {Language::kTamil, "நன்றி", "nandri"},
++      {Language::kTamil, "சென்னை", "chennai"},
++      {Language::kTamil, "மற்றும்", "matrum"},
++      {Language::kTamil, "விளங்கும்", "vilangum"},
++      {Language::kBengali, "বাংলা", "bangla"},
++      {Language::kBengali, "আমি", "ami"},
++      {Language::kBengali, "কলকাতা", "kolkata"},
++      {Language::kBengali, "ধন্যবাদ", "dhonyobad"},
++  };
++  for (const Example& e : kExamples) {
++    EXPECT_EQ(base::UTF16ToUTF8(Romanize(base::UTF8ToUTF16(e.text), e.language)), e.latin)
++        << e.text;
++  }
++}
++
++TEST(RomanizeTest, LeavesOtherTextAlone) {
++  EXPECT_EQ(Romanize(u"OK 42", Language::kHindi), u"OK 42");
++}
++
++}  // namespace
++}  // namespace tark_captions
+--- /dev/null
++++ b/components/tark_captions/translation_engine.h
+@@ -0,0 +1,78 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef COMPONENTS_TARK_CAPTIONS_TRANSLATION_ENGINE_H_
++#define COMPONENTS_TARK_CAPTIONS_TRANSLATION_ENGINE_H_
++
++#include <cstdint>
++#include <memory>
++#include <optional>
++#include <string>
++#include <string_view>
++#include <vector>
++
++#include "base/files/file_path.h"
++#include "components/tark_captions/asr_model.h"
++
++namespace tark_captions {
++
++class OrtRuntime;
++
++// What a caption is translated into (D4 Phase 2). English is the default;
++// Indian targets go through English.
++enum class Target { kNone, kEnglish, kHindi, kTamil, kBengali };
++
++// "" (none), "en", "hi", "ta" or "bn".
++std::optional<Target> TargetFromCode(std::string_view code);
++
++// The model's token ids, for tests: the first hop (to English) and, for an
++// Indian target, the second.
++struct TranslationTrace {
++  std::vector<int64_t> src_ids;
++  std::vector<int64_t> out_ids;
++  std::vector<int64_t> pivot_src_ids;
++  std::vector<int64_t> pivot_out_ids;
++};
++
++// AI4Bharat's IndicTrans2 distilled 200M (MIT), int8 ONNX encoder and
++// cached decoder step (utils/indictrans_export.py), greedy, one caption at
++// a time. Each direction loads from the models folder (it2_indic_en/,
++// it2_en_indic/) the first time it is needed. Use on one sequence; it
++// blocks while it loads or decodes.
++class TranslationEngine {
++ public:
++  // Null if ONNX Runtime is missing; a missing model shows up in Translate().
++  static std::unique_ptr<TranslationEngine> Create(const base::FilePath& models_dir,
++                                                   const base::FilePath& ort_dylib);
++
++  TranslationEngine(const TranslationEngine&) = delete;
++  TranslationEngine& operator=(const TranslationEngine&) = delete;
++  ~TranslationEngine();
++
++  // `caption` (UTF-8) in `source`, translated into `target`: "" for
++  // kNone or the source's own language (nothing loads), nullopt when a model
++  // it needs is missing or fails.
++  std::optional<std::string> Translate(std::string_view caption,
++                                       Language source,
++                                       Target target,
++                                       TranslationTrace* trace = nullptr);
++
++  int LoadedDirectionsForTesting() const;
++
++ private:
++  class Direction;
++
++  TranslationEngine(std::unique_ptr<OrtRuntime> runtime, const base::FilePath& models_dir);
++  // Loads the direction on first use; null if its files are missing or bad.
++  Direction* Get(bool to_english);
++
++  std::unique_ptr<OrtRuntime> runtime_;
++  const base::FilePath models_dir_;
++  std::unique_ptr<Direction> to_english_;
++  std::unique_ptr<Direction> from_english_;
++};
++
++}  // namespace tark_captions
++
++#endif  // COMPONENTS_TARK_CAPTIONS_TRANSLATION_ENGINE_H_
+--- /dev/null
++++ b/components/tark_captions/translation_engine.cc
+@@ -0,0 +1,328 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/tark_captions/translation_engine.h"
++
++#include <algorithm>
++#include <utility>
++
++#include "base/containers/flat_map.h"
++#include "base/files/file_util.h"
++#include "base/json/json_reader.h"
++#include "base/logging.h"
++#include "base/memory/ptr_util.h"
++#include "base/strings/string_util.h"
++#include "base/strings/utf_string_conversions.h"
++#include "components/tark_captions/indic_text.h"
++#include "components/tark_captions/ort_runtime.h"
++#include "third_party/sentencepiece/src/src/sentencepiece_processor.h"
++
++namespace tark_captions {
++namespace {
++
++constexpr int kThreads = 2;
++// IndicTrans2's model_max_length: 255 tokens and </s>.
++constexpr size_t kMaxSourceTokens = 255;
++constexpr int kMaxSteps = 256;
++constexpr char kEnglishTag[] = "eng_Latn";
++
++const char* FloresTag(Language language) {
++  switch (language) {
++    case Language::kHindi:
++      return "hin_Deva";
++    case Language::kTamil:
++      return "tam_Taml";
++    case Language::kBengali:
++      return "ben_Beng";
++  }
++}
++
++std::optional<Language> IndianLanguage(Target target) {
++  switch (target) {
++    case Target::kHindi:
++      return Language::kHindi;
++    case Target::kTamil:
++      return Language::kTamil;
++    case Target::kBengali:
++      return Language::kBengali;
++    case Target::kNone:
++    case Target::kEnglish:
++      return std::nullopt;
++  }
++}
++
++std::optional<base::DictValue> ReadJsonDict(const base::FilePath& file) {
++  std::string json;
++  if (!base::ReadFileToString(file, &json)) {
++    return std::nullopt;
++  }
++  std::optional<base::Value> value = base::JSONReader::Read(json, base::JSON_PARSE_RFC);
++  if (!value || !value->is_dict()) {
++    return std::nullopt;
++  }
++  return std::move(*value).TakeDict();
++}
++
++}  // namespace
++
++std::optional<Target> TargetFromCode(std::string_view code) {
++  if (code.empty()) {
++    return Target::kNone;
++  }
++  if (code == "en") {
++    return Target::kEnglish;
++  }
++  if (code == "hi") {
++    return Target::kHindi;
++  }
++  if (code == "ta") {
++    return Target::kTamil;
++  }
++  if (code == "bn") {
++    return Target::kBengali;
++  }
++  return std::nullopt;
++}
++
++// One translation direction: tokenizer, vocabularies and the two models.
++class TranslationEngine::Direction {
++ public:
++  static std::unique_ptr<Direction> Load(OrtRuntime* runtime, const base::FilePath& dir) {
++    auto d = base::WrapUnique(new Direction());
++    std::optional<base::DictValue> config = ReadJsonDict(dir.Append("config.json"));
++    std::optional<base::DictValue> src = ReadJsonDict(dir.Append("dict.SRC.json"));
++    std::optional<base::DictValue> tgt = ReadJsonDict(dir.Append("dict.TGT.json"));
++    std::string spm;
++    if (!config || !src || !tgt || !base::ReadFileToString(dir.Append("model.SRC"), &spm) ||
++        !d->spm_.LoadFromSerializedProto(spm).ok()) {
++      LOG(ERROR) << "Tark translation: model files missing in " << dir;
++      return nullptr;
++    }
++    std::optional<int> layers = config->FindInt("decoder_layers");
++    std::optional<int> heads = config->FindInt("decoder_attention_heads");
++    std::optional<int> dim = config->FindInt("decoder_embed_dim");
++    std::optional<int> start = config->FindInt("decoder_start_token_id");
++    std::optional<int> eos = config->FindInt("eos_token_id");
++    if (!layers || !heads || !dim || !start || !eos || *heads <= 0) {
++      return nullptr;
++    }
++    d->layers_ = *layers;
++    d->heads_ = *heads;
++    d->head_dim_ = *dim / *heads;
++    d->start_ = *start;
++    d->eos_ = *eos;
++    std::vector<std::pair<std::string, int64_t>> src_entries;
++    for (const auto [piece, id] : *src) {
++      if (!id.is_int()) {
++        return nullptr;
++      }
++      src_entries.emplace_back(piece, id.GetInt());
++    }
++    d->src_vocab_ = base::flat_map<std::string, int64_t>(std::move(src_entries));
++    for (const auto [token, id] : *tgt) {
++      if (!id.is_int() || id.GetInt() < 0) {
++        return nullptr;
++      }
++      if (static_cast<size_t>(id.GetInt()) >= d->tgt_vocab_.size()) {
++        d->tgt_vocab_.resize(id.GetInt() + 1);
++      }
++      d->tgt_vocab_[id.GetInt()] = token;
++    }
++    auto unk = d->src_vocab_.find("<unk>");
++    auto end = d->src_vocab_.find("</s>");
++    if (unk == d->src_vocab_.end() || end == d->src_vocab_.end()) {
++      return nullptr;
++    }
++    d->unk_ = unk->second;
++    d->end_ = end->second;
++    d->encoder_ = runtime->LoadModel(dir.Append("encoder.int8.onnx"), kThreads);
++    d->decoder_ = runtime->LoadModel(dir.Append("decoder_step.int8.onnx"), kThreads);
++    if (!d->encoder_ || !d->decoder_) {
++      LOG(ERROR) << "Tark translation: models not loaded from " << dir;
++      return nullptr;
++    }
++    return d;
++  }
++
++  // The language tags, then the SentencePiece pieces of `body`; at most
++  // 255 ids, then </s>.
++  std::vector<int64_t> Encode(std::string_view src_tag,
++                              std::string_view tgt_tag,
++                              std::string_view body) const {
++    std::vector<std::string> pieces = {std::string(src_tag), std::string(tgt_tag)};
++    std::vector<std::string> body_pieces;
++    if (spm_.Encode(body, &body_pieces).ok()) {
++      pieces.insert(pieces.end(), body_pieces.begin(), body_pieces.end());
++    }
++    std::vector<int64_t> ids;
++    for (const std::string& piece : pieces) {
++      if (ids.size() == kMaxSourceTokens) {
++        break;
++      }
++      auto it = src_vocab_.find(piece);
++      ids.push_back(it == src_vocab_.end() ? unk_ : it->second);
++    }
++    ids.push_back(end_);
++    return ids;
++  }
++
++  std::optional<std::vector<int64_t>> Greedy(const std::vector<int64_t>& ids) {
++    std::vector<Tensor> encoded;
++    if (!encoder_->Run({Tensor{.name = "ids",
++                               .shape = {1, static_cast<int64_t>(ids.size())},
++                               .i64 = ids}},
++                       {"cross_mask", "cross_k", "cross_v"}, &encoded)) {
++      return std::nullopt;
++    }
++    const std::vector<int64_t> empty_cache = {layers_, 1, heads_, 0, head_dim_};
++    std::vector<Tensor> inputs = {
++        Tensor{.name = "token", .shape = {1, 1}, .i64 = {start_}},
++        Tensor{.name = "step", .shape = {}, .i64 = {0}},
++        Tensor{.name = "past_k", .shape = empty_cache},
++        Tensor{.name = "past_v", .shape = empty_cache},
++        std::move(encoded[1]),
++        std::move(encoded[2]),
++        std::move(encoded[0]),
++    };
++    std::vector<int64_t> out;
++    std::vector<Tensor> step_out;
++    for (int step = 0; step < kMaxSteps; ++step) {
++      inputs[1].i64[0] = step;
++      if (!decoder_->Run(inputs, {"logits", "new_k", "new_v"}, &step_out) ||
++          step_out[0].f32.empty()) {
++        return std::nullopt;
++      }
++      const std::vector<float>& logits = step_out[0].f32;
++      const int64_t token = std::max_element(logits.begin(), logits.end()) - logits.begin();
++      if (token == eos_) {
++        break;
++      }
++      out.push_back(token);
++      inputs[0].i64[0] = token;
++      inputs[2] = std::move(step_out[1]);
++      inputs[2].name = "past_k";
++      inputs[3] = std::move(step_out[2]);
++      inputs[3].name = "past_v";
++    }
++    return out;
++  }
++
++  // Target tokens joined, without <s>, <pad>, </s>, <unk>; ▁ is a space.
++  std::string Decode(const std::vector<int64_t>& ids) const {
++    std::string text;
++    for (int64_t id : ids) {
++      if (id < 0 || static_cast<size_t>(id) >= tgt_vocab_.size()) {
++        continue;
++      }
++      const std::string& token = tgt_vocab_[id];
++      if (token.empty() || token == "<s>" || token == "<pad>" || token == "</s>" ||
++          token == "<unk>") {
++        continue;
++      }
++      text += token;
++    }
++    base::ReplaceSubstringsAfterOffset(&text, 0, "\xE2\x96\x81", " ");
++    return std::string(base::TrimWhitespaceASCII(text, base::TRIM_ALL));
++  }
++
++ private:
++  Direction() = default;
++
++  std::unique_ptr<OrtModel> encoder_;
++  std::unique_ptr<OrtModel> decoder_;
++  sentencepiece::SentencePieceProcessor spm_;
++  base::flat_map<std::string, int64_t> src_vocab_;
++  std::vector<std::string> tgt_vocab_;
++  int64_t layers_ = 0;
++  int64_t heads_ = 0;
++  int64_t head_dim_ = 0;
++  int64_t start_ = 0;
++  int64_t eos_ = 0;
++  int64_t unk_ = 0;
++  int64_t end_ = 0;
++};
++
++// static
++std::unique_ptr<TranslationEngine> TranslationEngine::Create(const base::FilePath& models_dir,
++                                                             const base::FilePath& ort_dylib) {
++  std::unique_ptr<OrtRuntime> runtime = OrtRuntime::Load(ort_dylib);
++  if (!runtime) {
++    return nullptr;
++  }
++  return base::WrapUnique(new TranslationEngine(std::move(runtime), models_dir));
++}
++
++TranslationEngine::TranslationEngine(std::unique_ptr<OrtRuntime> runtime,
++                                     const base::FilePath& models_dir)
++    : runtime_(std::move(runtime)), models_dir_(models_dir) {}
++
++TranslationEngine::~TranslationEngine() {
++  // The models before the runtime that loaded them.
++  to_english_.reset();
++  from_english_.reset();
++}
++
++TranslationEngine::Direction* TranslationEngine::Get(bool to_english) {
++  std::unique_ptr<Direction>& direction = to_english ? to_english_ : from_english_;
++  if (!direction) {
++    // Not remembered when missing: the models may arrive later.
++    direction = Direction::Load(runtime_.get(),
++                                models_dir_.Append(to_english ? "it2_indic_en" : "it2_en_indic"));
++  }
++  return direction.get();
++}
++
++std::optional<std::string> TranslationEngine::Translate(std::string_view caption,
++                                                        Language source,
++                                                        Target target,
++                                                        TranslationTrace* trace) {
++  const std::optional<Language> indian_target = IndianLanguage(target);
++  if (target == Target::kNone || indian_target == source) {
++    return std::string();
++  }
++  Direction* to_english = Get(/*to_english=*/true);
++  if (!to_english) {
++    return std::nullopt;
++  }
++  const std::vector<int64_t> src_ids =
++      to_english->Encode(FloresTag(source), kEnglishTag, ModelInput(caption, source));
++  std::optional<std::vector<int64_t>> out_ids = to_english->Greedy(src_ids);
++  if (!out_ids) {
++    return std::nullopt;
++  }
++  if (trace) {
++    trace->src_ids = src_ids;
++    trace->out_ids = *out_ids;
++  }
++  const std::string english_tokens = to_english->Decode(*out_ids);
++  if (!indian_target) {
++    return DetokenizeEnglish(english_tokens);
++  }
++  // Indian to Indian: the English model tokens go straight into the second
++  // hop.
++  Direction* from_english = Get(/*to_english=*/false);
++  if (!from_english) {
++    return std::nullopt;
++  }
++  const std::vector<int64_t> pivot_src =
++      from_english->Encode(kEnglishTag, FloresTag(*indian_target), english_tokens);
++  std::optional<std::vector<int64_t>> pivot_out = from_english->Greedy(pivot_src);
++  if (!pivot_out) {
++    return std::nullopt;
++  }
++  if (trace) {
++    trace->pivot_src_ids = pivot_src;
++    trace->pivot_out_ids = *pivot_out;
++  }
++  // IndicTrans2 writes every Indian language in Devanagari.
++  return base::UTF16ToUTF8(DetokenizeIndic(ConvertScript(
++      base::UTF8ToUTF16(from_english->Decode(*pivot_out)), Script::kDevanagari,
++      ScriptOf(*indian_target))));
++}
++
++int TranslationEngine::LoadedDirectionsForTesting() const {
++  return (to_english_ ? 1 : 0) + (from_english_ ? 1 : 0);
++}
++
++}  // namespace tark_captions
+--- /dev/null
++++ b/components/tark_captions/translation_engine_unittest.cc
+@@ -0,0 +1,148 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/tark_captions/translation_engine.h"
++
++#include <string>
++#include <vector>
++
++#include "base/files/file_util.h"
++#include "base/files/scoped_temp_dir.h"
++#include "components/tark_captions/test_util.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace tark_captions {
++namespace {
++
++std::vector<int64_t> Ids(const base::ListValue* list) {
++  std::vector<int64_t> ids;
++  for (const base::Value& v : *list) {
++    ids.push_back(v.GetInt());
++  }
++  return ids;
++}
++
++Target TargetOf(const std::string& code) {
++  return *TargetFromCode(code);
++}
++
++class TranslationEngineTest : public testing::Test {
++ protected:
++  void SetUp() override {
++    std::optional<base::FilePath> ort = test::OrtPath();
++    std::optional<base::FilePath> models = test::ModelsDir();
++    std::optional<base::FilePath> testdata = test::TestDataDir();
++    if (!ort || !models || !testdata) {
++      GTEST_SKIP() << "set TARK_CAPTIONS_ORT, TARK_CAPTIONS_MODELS and TARK_CAPTIONS_TESTDATA";
++    }
++    ort_ = *ort;
++    models_ = *models;
++    cases_ = test::MtGoldenCases(*testdata);
++    ASSERT_FALSE(cases_.empty());
++    engine_ = TranslationEngine::Create(models_, ort_);
++    ASSERT_TRUE(engine_);
++  }
++
++  base::FilePath ort_;
++  base::FilePath models_;
++  base::ListValue cases_;
++  std::unique_ptr<TranslationEngine> engine_;
++};
++
++TEST_F(TranslationEngineTest, TokenIdsMatchReference) {
++  for (const base::Value& v : cases_) {
++    const base::DictValue& c = v.GetDict();
++    TranslationTrace trace;
++    engine_->Translate(*c.FindString("caption"), *LanguageFromCode(*c.FindString("lang")),
++                       Target::kEnglish, &trace);
++    EXPECT_EQ(trace.src_ids, Ids(c.FindList("src_ids"))) << *c.FindString("id");
++  }
++}
++
++// Same ONNX Runtime (1.31.0) and int8 files as the reference: exact.
++TEST_F(TranslationEngineTest, TranslatesLikeReference) {
++  for (const base::Value& v : cases_) {
++    const base::DictValue& c = v.GetDict();
++    TranslationTrace trace;
++    std::optional<std::string> english = engine_->Translate(
++        *c.FindString("caption"), *LanguageFromCode(*c.FindString("lang")), Target::kEnglish,
++        &trace);
++    EXPECT_EQ(trace.out_ids, Ids(c.FindList("out_ids"))) << *c.FindString("id");
++    EXPECT_EQ(english, *c.FindString("english")) << *c.FindString("id");
++  }
++}
++
++// Indian to Indian goes through English; the second hop takes the English
++// model tokens as they are (the reference detokenises and re-tokenises).
++TEST_F(TranslationEngineTest, PivotMatchesReference) {
++  for (const base::Value& v : cases_) {
++    const base::DictValue& c = v.GetDict();
++    for (const auto [code, pivot] : *c.FindDict("pivot")) {
++      TranslationTrace trace;
++      std::optional<std::string> text = engine_->Translate(
++          *c.FindString("caption"), *LanguageFromCode(*c.FindString("lang")), TargetOf(code),
++          &trace);
++      EXPECT_EQ(trace.pivot_src_ids, Ids(pivot.GetDict().FindList("src_ids")))
++          << *c.FindString("id") << " -> " << code;
++      EXPECT_EQ(text, *pivot.GetDict().FindString("text")) << *c.FindString("id") << " -> " << code;
++    }
++  }
++}
++
++TEST_F(TranslationEngineTest, SameLanguageIsNotTranslated) {
++  std::unique_ptr<TranslationEngine> engine = TranslationEngine::Create(models_, ort_);
++  EXPECT_EQ(engine->Translate("नमस्ते", Language::kHindi, Target::kHindi), "");
++  EXPECT_EQ(engine->Translate("नमस्ते", Language::kHindi, Target::kNone), "");
++  EXPECT_EQ(engine->LoadedDirectionsForTesting(), 0);
++}
++
++TEST_F(TranslationEngineTest, LongInputIsTruncated) {
++  std::string caption;
++  for (int i = 0; i < 400; ++i) {
++    caption += "नमस्ते ";
++  }
++  TranslationTrace trace;
++  EXPECT_TRUE(engine_->Translate(caption, Language::kHindi, Target::kEnglish, &trace));
++  EXPECT_LE(trace.src_ids.size(), 256u);
++  EXPECT_LE(trace.out_ids.size(), 256u);
++}
++
++TEST_F(TranslationEngineTest, MissingModelsFail) {
++  base::ScopedTempDir empty;
++  ASSERT_TRUE(empty.CreateUniqueTempDir());
++  std::unique_ptr<TranslationEngine> engine = TranslationEngine::Create(empty.GetPath(), ort_);
++  ASSERT_TRUE(engine);
++  EXPECT_EQ(engine->Translate("नमस्ते", Language::kHindi, Target::kEnglish), std::nullopt);
++}
++
++TEST_F(TranslationEngineTest, TruncatedModelFails) {
++  base::ScopedTempDir dir;
++  ASSERT_TRUE(dir.CreateUniqueTempDir());
++  const base::FilePath from = models_.Append("it2_indic_en");
++  const base::FilePath to = dir.GetPath().Append("it2_indic_en");
++  ASSERT_TRUE(base::CopyDirectory(from, dir.GetPath(), /*recursive=*/true));
++  std::string encoder;
++  ASSERT_TRUE(base::ReadFileToStringWithMaxSize(from.Append("encoder.int8.onnx"), &encoder,
++                                                1 << 20) ||
++              encoder.size() == (1u << 20));
++  ASSERT_TRUE(base::WriteFile(to.Append("encoder.int8.onnx"), encoder.substr(0, 1 << 20)));
++  std::unique_ptr<TranslationEngine> engine = TranslationEngine::Create(dir.GetPath(), ort_);
++  ASSERT_TRUE(engine);
++  EXPECT_EQ(engine->Translate("नमस्ते", Language::kHindi, Target::kEnglish), std::nullopt);
++}
++
++TEST(TranslationEngineNoRuntimeTest, CreateFailsWithoutRuntime) {
++  EXPECT_FALSE(TranslationEngine::Create(base::FilePath("/nonexistent"),
++                                         base::FilePath("/nonexistent/libonnxruntime.dylib")));
++}
++
++TEST(TranslationEngineNoRuntimeTest, TargetCodes) {
++  EXPECT_EQ(TargetFromCode(""), Target::kNone);
++  EXPECT_EQ(TargetFromCode("en"), Target::kEnglish);
++  EXPECT_EQ(TargetFromCode("ta"), Target::kTamil);
++  EXPECT_EQ(TargetFromCode("fr"), std::nullopt);
++}
++
++}  // namespace
++}  // namespace tark_captions
+--- a/components/tark_captions/BUILD.gn
++++ b/components/tark_captions/BUILD.gn
+@@ -15,24 +15,37 @@
+     "asr_model.h",
+     "call_state.cc",
+     "call_state.h",
++    "caption_choices.cc",
++    "caption_choices.h",
+     "caption_engine.cc",
+     "caption_engine.h",
+     "caption_text.cc",
+     "caption_text.h",
++    "indic_text.cc",
++    "indic_text.h",
+     "mel_frontend.cc",
+     "mel_frontend.h",
+     "ort_runtime.cc",
+     "ort_runtime.h",
++    "render_queue.cc",
++    "render_queue.h",
++    "romanize.cc",
++    "romanize.h",
+     "segmenter.cc",
+     "segmenter.h",
++    "translation_engine.cc",
++    "translation_engine.h",
+     "vad.cc",
+     "vad.h",
+   ]
+   include_dirs = [ "//third_party/tark_onnxruntime/include" ]
+   deps = [
+     "//base",
++    "//components/prefs",
+     "//media",
++    "//third_party/icu",
+     "//third_party/pffft",
++    "//third_party/sentencepiece",
+   ]
+ }
+ 
+@@ -52,11 +65,16 @@
+   sources = [
+     "asr_model_unittest.cc",
+     "call_state_unittest.cc",
++    "caption_choices_unittest.cc",
+     "caption_engine_unittest.cc",
+     "caption_text_unittest.cc",
++    "indic_text_unittest.cc",
+     "mel_frontend_unittest.cc",
+     "ort_runtime_unittest.cc",
++    "render_queue_unittest.cc",
++    "romanize_unittest.cc",
+     "segmenter_unittest.cc",
++    "translation_engine_unittest.cc",
+   ]
+   deps = [
+     ":tark_captions",
+@@ -64,6 +82,7 @@
+     "//base",
+     "//base/test:run_all_unittests",
+     "//base/test:test_support",
++    "//components/prefs:test_support",
+     "//media",
+     "//testing/gtest",
+   ]
+--- a/components/tark_captions/bench.cc
++++ b/components/tark_captions/bench.cc
+@@ -4,11 +4,25 @@
+ 
+ // tark_captions_bench: cores used and draft lag of the caption engine on a
+ // 5-minute Hindi track (the test clips repeated, with 0.8-2 s pauses).
++// tark_captions_bench --translate: translation time per caption (whole and
++// half captions, as finals and drafts) and peak memory with captions and
++// translation loaded.
++// tark_captions_bench --romanize: the test captions in English letters, to
++// review the spellings.
+ 
+ #include <sys/resource.h>
+ 
+ #include <algorithm>
+ #include <cstdio>
++#include <cstring>
++#include <string>
++
++#include "base/strings/string_split.h"
++#include "base/strings/string_util.h"
++#include "base/strings/utf_string_conversions.h"
++#include "base/time/time.h"
++#include "components/tark_captions/romanize.h"
++#include "components/tark_captions/translation_engine.h"
+ 
+ #include "base/functional/callback_helpers.h"
+ #include "components/tark_captions/caption_engine.h"
+@@ -23,9 +37,57 @@
+   return u.ru_utime.tv_sec + u.ru_utime.tv_usec / 1e6 + u.ru_stime.tv_sec + u.ru_stime.tv_usec / 1e6;
+ }
+ 
++double PeakMegabytes() {
++  rusage u;
++  getrusage(RUSAGE_SELF, &u);
++  return u.ru_maxrss / 1048576.0;  // Bytes on macOS.
++}
++
++double Median(std::vector<double> v) {
++  std::sort(v.begin(), v.end());
++  return v[v.size() / 2];
++}
++
++int Translate(const base::FilePath& ort, const base::FilePath& models,
++              const base::FilePath& testdata) {
++  using namespace tark_captions;
++  std::unique_ptr<CaptionEngine> captions = CaptionEngine::Create(models, ort);
++  std::unique_ptr<TranslationEngine> engine = TranslationEngine::Create(models, ort);
++  if (!captions || !engine) {
++    fprintf(stderr, "engines not created\n");
++    return 1;
++  }
++  std::vector<double> full, draft, pivot;
++  for (const base::Value& v : test::MtGoldenCases(testdata)) {
++    const std::string caption = *v.GetDict().FindString("caption");
++    const Language language = *LanguageFromCode(*v.GetDict().FindString("lang"));
++    std::vector<std::string> words = base::SplitString(caption, " ", base::TRIM_WHITESPACE,
++                                                       base::SPLIT_WANT_NONEMPTY);
++    words.resize(std::max<size_t>(1, words.size() / 2));
++    base::TimeTicks t = base::TimeTicks::Now();
++    engine->Translate(caption, language, Target::kEnglish);
++    full.push_back((base::TimeTicks::Now() - t).InSecondsF());
++    t = base::TimeTicks::Now();
++    engine->Translate(base::JoinString(words, " "), language, Target::kEnglish);
++    draft.push_back((base::TimeTicks::Now() - t).InSecondsF());
++  }
++  const double peak_one = PeakMegabytes();
++  for (const base::Value& v : test::MtGoldenCases(testdata)) {
++    const Language language = *LanguageFromCode(*v.GetDict().FindString("lang"));
++    const Target target = language == Language::kHindi ? Target::kTamil : Target::kHindi;
++    base::TimeTicks t = base::TimeTicks::Now();
++    engine->Translate(*v.GetDict().FindString("caption"), language, target);
++    pivot.push_back((base::TimeTicks::Now() - t).InSecondsF());
++  }
++  printf("to English: whole %.3f s, half (draft) %.3f s; Indian to Indian %.3f s; "
++         "peak RSS captions + to-English %.0f MB, + both directions %.0f MB\n",
++         Median(full), Median(draft), Median(pivot), peak_one, PeakMegabytes());
++  return 0;
++}
++
+ }  // namespace
+ 
+-int main() {
++int main(int argc, char** argv) {
+   using namespace tark_captions;
+   std::optional<base::FilePath> ort = test::OrtPath();
+   std::optional<base::FilePath> models = test::ModelsDir();
+@@ -34,6 +96,19 @@
+     fprintf(stderr, "set TARK_CAPTIONS_ORT, TARK_CAPTIONS_MODELS and TARK_CAPTIONS_TESTDATA\n");
+     return 2;
+   }
++  if (argc > 1 && strcmp(argv[1], "--romanize") == 0) {
++    for (const base::Value& v : test::MtGoldenCases(*testdata)) {
++      const std::string caption = *v.GetDict().FindString("caption");
++      printf("%s\n  %s\n", caption.c_str(),
++             base::UTF16ToUTF8(Romanize(base::UTF8ToUTF16(caption),
++                                        *LanguageFromCode(*v.GetDict().FindString("lang"))))
++                 .c_str());
++    }
++    return 0;
++  }
++  if (argc > 1 && strcmp(argv[1], "--translate") == 0) {
++    return Translate(*ort, *models, *testdata);
++  }
+   std::vector<std::vector<float>> clips;
+   for (const base::Value& clip : test::GoldenClips(*testdata)) {
+     if (*clip.GetDict().FindString("lang") == "hi") {
+--- a/components/tark_captions/test_util.h
++++ b/components/tark_captions/test_util.h
+@@ -26,6 +26,10 @@
+ // TESTDATA/golden.json's "clips" list (utils/captions_export.py golden).
+ base::ListValue GoldenClips(const base::FilePath& testdata);
+ 
++// TESTDATA/mt_golden.json's "cases" list (utils/indictrans_export.py
++// golden): per caption, every stage of the reference translation pipeline.
++base::ListValue MtGoldenCases(const base::FilePath& testdata);
++
+ }  // namespace tark_captions::test
+ 
+ #endif  // COMPONENTS_TARK_CAPTIONS_TEST_UTIL_H_
+--- a/components/tark_captions/test_util.cc
++++ b/components/tark_captions/test_util.cc
+@@ -84,16 +84,28 @@
+   return {};
+ }
+ 
+-base::ListValue GoldenClips(const base::FilePath& testdata) {
++namespace {
++
++base::ListValue ReadList(const base::FilePath& file, std::string_view key) {
+   std::string json;
+-  if (!base::ReadFileToString(testdata.Append("golden.json"), &json)) {
++  if (!base::ReadFileToString(file, &json)) {
+     return {};
+   }
+   std::optional<base::Value> value = base::JSONReader::Read(json, base::JSON_PARSE_RFC);
+-  if (!value || !value->is_dict() || !value->GetDict().FindList("clips")) {
++  if (!value || !value->is_dict() || !value->GetDict().FindList(key)) {
+     return {};
+   }
+-  return value->GetDict().FindList("clips")->Clone();
++  return value->GetDict().FindList(key)->Clone();
++}
++
++}  // namespace
++
++base::ListValue GoldenClips(const base::FilePath& testdata) {
++  return ReadList(testdata.Append("golden.json"), "clips");
++}
++
++base::ListValue MtGoldenCases(const base::FilePath& testdata) {
++  return ReadList(testdata.Append("mt_golden.json"), "cases");
+ }
+ 
+ }  // namespace tark_captions::test

@@ -100,6 +100,48 @@ class PngTest(unittest.TestCase):
         self.assertEqual(mark.icon_text([24]), mark.icon_text([24]))
 
 
+def decode_ico(data):
+    """Returns [(size, image bytes)] for each entry of a Windows .ico."""
+    reserved, kind, count = struct.unpack('<HHH', data[:6])
+    assert (reserved, kind) == (0, 1)
+    entries = []
+    for i in range(count):
+        width, height, _, _, planes, bits, length, offset = struct.unpack(
+            '<BBBBHHII', data[6 + 16 * i:22 + 16 * i])
+        assert width == height and (planes, bits) == (1, 32)
+        entries.append((width or 256, data[offset:offset + length]))
+    return entries
+
+
+class IcoTest(unittest.TestCase):
+
+    def test_one_entry_per_size(self):
+        sizes = [size for size, _ in decode_ico(mark.ico([16, 32, 48, 256]))]
+        self.assertEqual(sizes, [16, 32, 48, 256])
+
+    def test_small_sizes_are_32_bit_bitmaps_of_the_mark(self):
+        # A bottom-up BGRA bitmap (height doubled for the AND mask), the
+        # pixels the PNG of that size has.
+        _, image = decode_ico(mark.ico([32]))[0]
+        header, width, height, planes, bits = struct.unpack('<IiiHH', image[:16])
+        self.assertEqual((header, width, height, planes, bits), (40, 32, 64, 1, 32))
+        _, _, rows = decode_png(mark.png(32, 32))
+        pixels = image[40:40 + 32 * 32 * 4]
+        for y in range(32):
+            for x in range(32):
+                b, g, r, a = pixels[((31 - y) * 32 + x) * 4:((31 - y) * 32 + x) * 4 + 4]
+                self.assertEqual((r, g, b, a), rows[y][x], (x, y))
+        self.assertEqual(len(image), 40 + 32 * 32 * 4 + 32 * 4)
+
+    def test_256_is_the_png(self):
+        _, image = decode_ico(mark.ico([256]))[0]
+        self.assertEqual(image, mark.png(256, 256))
+
+    def test_manifest_kind(self):
+        entry = mark.Entry('ico', ('16,256', 'mid'), 'x.ico')
+        self.assertEqual(mark.render(entry), mark.ico([16, 256]))
+
+
 class SvgTest(unittest.TestCase):
 
     def test_three_circles_in_mid_palette(self):

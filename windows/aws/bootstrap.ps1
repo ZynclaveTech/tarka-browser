@@ -64,6 +64,8 @@ if (-not (Test-Path 'C:\Program Files (x86)\Windows Kits\10\Include\10.0.28000.0
 $watch = @'
 $busy = Get-Process -Name ninja, clang-cl, lld-link, python, python3, 7z, vs_installer, setup, winsdksetup -ErrorAction SilentlyContinue
 $flag = 'C:\tark-setup\idle-count.txt'
+$job = Join-Path $env:ProgramData 'TarkSetup\job.running'
+if (-not $busy -and (Test-Path $job) -and ((Get-Date) - (Get-Item $job).LastWriteTime).TotalHours -lt 24) { $busy = $true }
 if ($busy) { Set-Content $flag 0; exit }
 $n = 0; if (Test-Path $flag) { $n = [int](Get-Content $flag) }
 $n++; Set-Content $flag $n

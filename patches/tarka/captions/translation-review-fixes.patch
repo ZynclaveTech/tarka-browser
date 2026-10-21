@@ -1,0 +1,645 @@
+--- a/components/tark_captions/BUILD.gn
++++ b/components/tark_captions/BUILD.gn
+@@ -85,6 +85,7 @@
+     "//components/prefs:test_support",
+     "//media",
+     "//testing/gtest",
++    "//third_party/icu",
+   ]
+ }
+ 
+--- a/components/tark_captions/indic_text_unittest.cc
++++ b/components/tark_captions/indic_text_unittest.cc
+@@ -9,6 +9,7 @@
+ #include "base/strings/utf_string_conversions.h"
+ #include "components/tark_captions/test_util.h"
+ #include "testing/gtest/include/gtest/gtest.h"
++#include "third_party/icu/source/common/unicode/uchar.h"
+ 
+ namespace tark_captions {
+ namespace {
+@@ -77,5 +78,44 @@
+   EXPECT_EQ(ScriptOf(Language::kBengali), Script::kBengali);
+ }
+ 
++// "Show their words in" another Indian script: offsets that land on empty
++// code points (Tamil has no voiced plosives, Bengali no ன ற ழ வ...) are
++// replaced by the nearest letter, never shown as empty boxes.
++TEST(IndicTextTest, DisplayConversionHasNoEmptyLetters) {
++  const Script kScripts[] = {Script::kDevanagari, Script::kTamil, Script::kBengali};
++  const char16_t kStart[] = {0x0900, 0x0B80, 0x0980};
++  for (int from = 0; from < 3; ++from) {
++    std::u16string every;
++    for (char16_t c = kStart[from]; c <= kStart[from] + 0x6F; ++c) {
++      if (u_isdefined(c)) {
++        every += c;
++      }
++    }
++    std::vector<std::u16string> inputs = {every};
++    base::ListValue cases = Cases();
++    for (const base::Value& v : cases) {
++      if (ScriptOf(LanguageOf(v.GetDict())) == kScripts[from]) {
++        inputs.push_back(base::UTF8ToUTF16(*v.GetDict().FindString("caption")));
++      }
++    }
++    for (int to = 0; to < 3; ++to) {
++      if (to == from) {
++        continue;
++      }
++      for (const std::u16string& input : inputs) {
++        for (char16_t c : ConvertScriptForDisplay(input, kScripts[from], kScripts[to])) {
++          EXPECT_TRUE(u_isdefined(c)) << "U+" << std::hex << static_cast<int>(c) << " from "
++                                      << from << " to " << to;
++        }
++      }
++    }
++  }
++}
++
++TEST(IndicTextTest, DisplayConversionKeepsCommonLetters) {
++  EXPECT_EQ(ConvertScriptForDisplay(u"நன்றி", Script::kTamil, Script::kBengali), u"নন্রি");
++  EXPECT_EQ(ConvertScriptForDisplay(u"विकास", Script::kDevanagari, Script::kBengali), u"বিকাস");
++}
++
+ }  // namespace
+ }  // namespace tark_captions
+--- a/components/tark_captions/render_queue.h
++++ b/components/tark_captions/render_queue.h
+@@ -9,12 +9,18 @@
+ #include <deque>
+ #include <optional>
+ #include <string>
++#include <utility>
++#include <vector>
++
++#include "components/tark_captions/asr_model.h"
+ 
+ namespace tark_captions {
+ 
+ struct RenderRequest {
+   bool is_final = false;
+   std::string text;
++  // The language it was heard in.
++  Language source = Language::kHindi;
+   // The choices (script, translation) it was asked with.
+   uint64_t generation = 0;
+ };
+@@ -31,7 +37,7 @@
+   RenderQueue& operator=(const RenderQueue&) = delete;
+   ~RenderQueue();
+ 
+-  void Add(bool is_final, std::string text);
++  void Add(bool is_final, std::string text, Language source = Language::kHindi);
+   // The next request, when none is in flight.
+   std::optional<RenderRequest> Next();
+   // The request in flight is done; true if its result is still current.
+@@ -39,11 +45,14 @@
+   // The user changed a choice: results asked before are stale, and the
+   // waiting draft goes (the next one comes within a second).
+   void ChoicesChanged();
++  // The finals still waiting (not the one in flight), taken out; the
++  // waiting draft goes too.
++  std::vector<std::string> TakeWaitingFinals();
+   void Clear();
+ 
+  private:
+-  std::deque<std::string> finals_;
+-  std::optional<std::string> draft_;
++  std::deque<std::pair<std::string, Language>> finals_;
++  std::optional<std::pair<std::string, Language>> draft_;
+   bool in_flight_ = false;
+   uint64_t generation_ = 0;
+ };
+--- a/components/tark_captions/romanize_unittest.cc
++++ b/components/tark_captions/romanize_unittest.cc
+@@ -26,6 +26,8 @@
+       {Language::kHindi, "ज़िंदगी", "zindagi"},
+       {Language::kHindi, "क्या", "kya"},
+       {Language::kHindi, "लंबी", "lambi"},
++      {Language::kHindi, "कल ऑफिस में कॉल है", "kal ofis men kol hai"},
++      {Language::kHindi, "डॉक्टर", "doktar"},
+       {Language::kHindi, "आप कैसे हैं", "aap kaise hain"},
+       {Language::kTamil, "தமிழ்", "tamizh"},
+       {Language::kTamil, "வணக்கம்", "vanakkam"},
+--- a/components/tark_captions/render_queue_unittest.cc
++++ b/components/tark_captions/render_queue_unittest.cc
+@@ -83,5 +83,26 @@
+   EXPECT_EQ(queue.Next()->text, "c");
+ }
+ 
++// A caption is translated from the language it was heard in, even if the
++// user changes the client's language while it waits.
++TEST(RenderQueueTest, RequestKeepsItsLanguage) {
++  RenderQueue queue;
++  queue.Add(true, "a", Language::kTamil);
++  EXPECT_EQ(queue.Next()->source, Language::kTamil);
++}
++
++// Translate turned off: the finals still waiting are shown as they are.
++TEST(RenderQueueTest, TakeWaitingFinals) {
++  RenderQueue queue;
++  queue.Add(false, "draft 1", Language::kHindi);
++  queue.Next();
++  queue.Add(true, "final 1", Language::kHindi);
++  queue.Add(true, "final 2", Language::kHindi);
++  queue.Add(false, "draft 2", Language::kHindi);
++  EXPECT_EQ(queue.TakeWaitingFinals(), (std::vector<std::string>{"final 1", "final 2"}));
++  queue.Done(0);
++  EXPECT_FALSE(queue.Next());
++}
++
+ }  // namespace
+ }  // namespace tark_captions
+--- a/components/tark_captions/indic_text.h
++++ b/components/tark_captions/indic_text.h
+@@ -34,6 +34,13 @@
+ // Text is returned unchanged when either script is Latin.
+ std::u16string ConvertScript(std::u16string_view text, Script from, Script to);
+ 
++// ConvertScript for showing a caption in another Indian script ("show
++// their words in", D4 Phase 2): letters the target script lacks (Bengali
++// has no ன ற ழ வ, Tamil no ृ or nukta forms...) become the nearest letter
++// it has, and anything still without a counterpart stays as it was, so
++// nothing turns into an empty box.
++std::u16string ConvertScriptForDisplay(std::u16string_view text, Script from, Script to);
++
+ // IndicNLP's trivial_tokenize / trivial_detokenize for Brahmi scripts.
+ std::u16string TokenizeIndic(std::u16string_view text);
+ std::u16string DetokenizeIndic(std::u16string_view text);
+--- a/components/tark_captions/romanize.cc
++++ b/components/tark_captions/romanize.cc
+@@ -32,7 +32,7 @@
+     {u'क', "k"},  {u'ख', "kh"}, {u'ग', "g"},  {u'घ', "gh"}, {u'ङ', "n"},  {u'च', "ch"},
+     {u'छ', "chh"}, {u'ज', "j"},  {u'झ', "jh"}, {u'ञ', "n"},  {u'ट', "t"},  {u'ठ', "th"},
+     {u'ड', "d"},  {u'ढ', "dh"}, {u'ण', "n"},  {u'त', "t"},  {u'थ', "th"}, {u'द', "d"},
+-    {u'ध', "dh"}, {u'न', "n"},  {u'प', "p"},  {u'फ', "ph"}, {u'ब', "b"},  {u'भ', "bh"},
++    {u'ध', "dh"}, {u'न', "n"},  {u'प', "p"},  {u'फ', "f"}, {u'ब', "b"},  {u'भ', "bh"},
+     {u'म', "m"},  {u'य', "y"},  {u'र', "r"},  {u'ल', "l"},  {u'व', "v"},  {u'श', "sh"},
+     {u'ष', "sh"}, {u'स', "s"},  {u'ह', "h"},  {u'ळ', "l"},
+ };
+@@ -44,10 +44,13 @@
+ constexpr std::pair<char16_t, const char*> kHindiVowels[] = {
+     {u'अ', "a"}, {u'आ', "aa"}, {u'इ', "i"}, {u'ई', "i"}, {u'उ', "u"},  {u'ऊ', "u"},
+     {u'ऋ', "ri"}, {u'ए', "e"}, {u'ऐ', "ai"}, {u'ओ', "o"}, {u'औ', "au"},
++    // English loanwords: ऑफिस "ofis".
++    {u'ऑ', "o"},  {u'ऍ', "e"},
+ };
+ constexpr std::pair<char16_t, const char*> kHindiSigns[] = {
+     {u'ा', "a"}, {u'ि', "i"}, {u'ी', "i"}, {u'ु', "u"},  {u'ू', "u"},
+     {u'ृ', "ri"}, {u'े', "e"}, {u'ै', "ai"}, {u'ो', "o"}, {u'ौ', "au"},
++    {u'ॉ', "o"},  {u'ॅ', "e"},
+ };
+ constexpr std::pair<char16_t, const char*> kHindiCodas[] = {
+     {u'ं', "n"}, {u'ँ', "n"}, {u'ः', "h"},
+@@ -75,7 +78,7 @@
+     {u'ক', "k"},  {u'খ', "kh"}, {u'গ', "g"},  {u'ঘ', "gh"}, {u'ঙ', "ng"}, {u'চ', "ch"},
+     {u'ছ', "chh"}, {u'জ', "j"},  {u'ঝ', "jh"}, {u'ঞ', "n"},  {u'ট', "t"},  {u'ঠ', "th"},
+     {u'ড', "d"},  {u'ঢ', "dh"}, {u'ণ', "n"},  {u'ত', "t"},  {u'থ', "th"}, {u'দ', "d"},
+-    {u'ধ', "dh"}, {u'ন', "n"},  {u'প', "p"},  {u'ফ', "ph"}, {u'ব', "b"},  {u'ভ', "bh"},
++    {u'ধ', "dh"}, {u'ন', "n"},  {u'প', "p"},  {u'ফ', "f"}, {u'ব', "b"},  {u'ভ', "bh"},
+     {u'ম', "m"},  {u'য', "j"},  {u'র', "r"},  {u'ল', "l"},  {u'শ', "sh"}, {u'ষ', "sh"},
+     {u'স', "s"},  {u'হ', "h"},  {u'\u09DC', "r"}, {u'\u09DD', "rh"}, {u'\u09DF', "y"}, {u'ৎ', "t"},
+ };
+--- a/components/tark_captions/indic_text.cc
++++ b/components/tark_captions/indic_text.cc
+@@ -295,6 +295,78 @@
+   return out;
+ }
+ 
++std::u16string ConvertScriptForDisplay(std::u16string_view text, Script from, Script to) {
++  if (from == Script::kLatin || to == Script::kLatin || from == to) {
++    return std::u16string(text);
++  }
++  // Letters with no counterpart at the same offset: the nearest one.
++  static constexpr struct {
++    char16_t from;
++    Script to;
++    std::u16string_view letters;
++  } kNearest[] = {
++      // Into Bengali.
++      {u'ன', Script::kBengali, u"ন"},  {u'ற', Script::kBengali, u"র"},
++      {u'ள', Script::kBengali, u"ল"},  {u'ழ', Script::kBengali, u"ল"},
++      {u'வ', Script::kBengali, u"ব"},  {u'எ', Script::kBengali, u"এ"},
++      {u'ஒ', Script::kBengali, u"ও"},  {u'ெ', Script::kBengali, u"ে"},
++      {u'ொ', Script::kBengali, u"ো"},  {u'व', Script::kBengali, u"ব"},
++      {u'ळ', Script::kBengali, u"ল"},  {u'ऑ', Script::kBengali, u"ও"},
++      {u'ॉ', Script::kBengali, u"ো"},  {u'ॅ', Script::kBengali, u"ে"},
++      {u'ऎ', Script::kBengali, u"এ"},  {u'ॆ', Script::kBengali, u"ে"},
++      {u'\u0929', Script::kBengali, u"ন"}, {u'\u0931', Script::kBengali, u"র"},
++      {u'\u0934', Script::kBengali, u"ল"},
++      // Into Tamil.
++      {u'ँ', Script::kTamil, u"ம்"},    {u'ृ', Script::kTamil, u"ு"},
++      {u'ऋ', Script::kTamil, u"ரு"},   {u'\u093C', Script::kTamil, u""},
++      {u'ॉ', Script::kTamil, u"ொ"},    {u'ॅ', Script::kTamil, u"ெ"},
++      {u'ऑ', Script::kTamil, u"ஒ"},    {u'ঁ', Script::kTamil, u"ம்"},
++      {u'\u09BC', Script::kTamil, u""}, {u'ৃ', Script::kTamil, u"ு"},
++      {u'ঋ', Script::kTamil, u"ரு"},   {u'ৎ', Script::kTamil, u"த்"},
++      {u'\u09DC', Script::kTamil, u"ட"}, {u'\u09DD', Script::kTamil, u"ட"},
++      {u'\u09DF', Script::kTamil, u"ய"}, {u'\u095C', Script::kTamil, u"ட"},
++      {u'\u095D', Script::kTamil, u"ட"},
++      // Into Devanagari.
++      {u'ৎ', Script::kDevanagari, u"त्"},
++  };
++  // Composite nukta letters: their base letter first (the nukta follows).
++  static constexpr std::pair<char16_t, std::u16string_view> kComposites[] = {
++      {0x0958, u"क\u093C"}, {0x0959, u"ख\u093C"}, {0x095A, u"ग\u093C"},
++      {0x095B, u"ज\u093C"}, {0x095E, u"फ\u093C"}, {0x095F, u"य\u093C"},
++  };
++  std::u16string source;
++  for (char16_t c : text) {
++    bool decomposed = false;
++    for (const auto& [composite, letters] : kComposites) {
++      if (c == composite) {
++        source += letters;
++        decomposed = true;
++      }
++    }
++    if (!decomposed) {
++      source += c;
++    }
++  }
++  std::u16string out;
++  for (char16_t c : source) {
++    bool done = false;
++    for (const auto& n : kNearest) {
++      if (n.from == c && n.to == to) {
++        out += n.letters;
++        done = true;
++        break;
++      }
++    }
++    if (done) {
++      continue;
++    }
++    const std::u16string converted = ConvertScript(std::u16string(1, c), from, to);
++    // Still no letter there: keep the original rather than an empty box.
++    out += u_isdefined(converted[0]) ? converted : std::u16string(1, c);
++  }
++  return out;
++}
++
+ std::u16string TokenizeIndic(std::u16string_view text) {
+   std::u16string spaced;
+   for (char16_t c : text) {
+--- a/components/tark_captions/render_queue.cc
++++ b/components/tark_captions/render_queue.cc
+@@ -11,12 +11,12 @@
+ RenderQueue::RenderQueue() = default;
+ RenderQueue::~RenderQueue() = default;
+ 
+-void RenderQueue::Add(bool is_final, std::string text) {
++void RenderQueue::Add(bool is_final, std::string text, Language source) {
+   if (is_final) {
+     draft_.reset();
+-    finals_.push_back(std::move(text));
++    finals_.emplace_back(std::move(text), source);
+   } else {
+-    draft_ = std::move(text);
++    draft_.emplace(std::move(text), source);
+   }
+ }
+ 
+@@ -28,10 +28,12 @@
+   request.generation = generation_;
+   if (!finals_.empty()) {
+     request.is_final = true;
+-    request.text = std::move(finals_.front());
++    request.text = std::move(finals_.front().first);
++    request.source = finals_.front().second;
+     finals_.pop_front();
+   } else if (draft_) {
+-    request.text = std::move(*draft_);
++    request.text = std::move(draft_->first);
++    request.source = draft_->second;
+     draft_.reset();
+   } else {
+     return std::nullopt;
+@@ -50,6 +52,16 @@
+   draft_.reset();
+ }
+ 
++std::vector<std::string> RenderQueue::TakeWaitingFinals() {
++  std::vector<std::string> finals;
++  for (auto& [text, source] : finals_) {
++    finals.push_back(std::move(text));
++  }
++  finals_.clear();
++  draft_.reset();
++  return finals;
++}
++
+ void RenderQueue::Clear() {
+   finals_.clear();
+   draft_.reset();
+--- a/chrome/browser/ui/views/tark_captions/caption_pill_view.h
++++ b/chrome/browser/ui/views/tark_captions/caption_pill_view.h
+@@ -59,7 +59,8 @@
+   // unavailable) alone. Hides the box when all are empty.
+   void SetCaption(const tark_captions::CaptionText::Display& original,
+                   const tark_captions::CaptionText::Display& translation,
+-                  const std::u16string& message);
++                  const std::u16string& message,
++                  const std::u16string& translation_status = std::u16string());
+ 
+   // views::View:
+   bool OnMousePressed(const ui::MouseEvent& event) override;
+--- a/chrome/browser/ui/views/tark_captions/caption_box_view.cc
++++ b/chrome/browser/ui/views/tark_captions/caption_box_view.cc
+@@ -106,7 +106,8 @@
+ 
+ void TarkCaptionBoxView::SetCaption(const tark_captions::CaptionText::Display& original,
+                                     const tark_captions::CaptionText::Display& translation,
+-                                    const std::u16string& message) {
++                                    const std::u16string& message,
++                                    const std::u16string& translation_status) {
+   const bool translated =
+       message.empty() && !(translation.committed.empty() && translation.draft.empty());
+   bool any = false;
+@@ -119,8 +120,12 @@
+                   SkColorSetA(kFinalColor, kOriginalAlpha), text_width_);
+     }
+   } else {
+-    translation_->SetVisible(false);
+     any = Fill(label_, original, message, 0, kFinalColor, text_width_);
++    if (message.empty() && !translation_status.empty() && !strip_) {
++      Fill(translation_, {translation_status, u""}, u"", 0, kDraftColor, text_width_);
++    } else {
++      translation_->SetVisible(false);
++    }
+   }
+   SetVisible(any);
+   PreferredSizeChanged();
+--- a/chrome/browser/ui/views/tark_captions/caption_pill_controller.cc
++++ b/chrome/browser/ui/views/tark_captions/caption_pill_controller.cc
+@@ -134,9 +134,9 @@
+ void TarkCaptionPillController::OnCaption(CallCaptionsTabHelper* tab,
+                                           bool is_final,
+                                           const std::string& text) {
+-  // When the caption goes through the translator, OnCaptionRendered brings
+-  // it.
+-  if (tab != shown_ || tab->renders()) {
++  // Shown at once unless it is shown in another script, which
++  // OnCaptionRendered brings.
++  if (tab != shown_ || !tab->effective_show_in().empty()) {
+     return;
+   }
+   if (is_final) {
+@@ -156,10 +156,13 @@
+   if (tab != shown_) {
+     return;
+   }
+-  if (is_final) {
+-    text_.AddFinal(shown);
+-  } else {
+-    text_.SetDraft(shown);
++  // In its own script the caption was shown already, from OnCaption.
++  if (!tab->effective_show_in().empty()) {
++    if (is_final) {
++      text_.AddFinal(shown);
++    } else {
++      text_.SetDraft(shown);
++    }
+   }
+   translation_failed_ = translation_failed;
+   if (tab->translate_on() && !translation_failed) {
+@@ -248,7 +251,7 @@
+     return shown_->translate_to() == kTranslateToCodes[command_id - kTranslateToFirst];
+   }
+   if (command_id >= kShowInFirst) {
+-    return shown_->show_in() == kShowInCodes[command_id - kShowInFirst];
++    return shown_->effective_show_in() == kShowInCodes[command_id - kShowInFirst];
+   }
+   return static_cast<int>(shown_->language()) == command_id;
+ }
+@@ -398,18 +401,19 @@
+   }
+   const tark_captions::CaptionText::Display display = text_.GetDisplay(kCaptionChars);
+   tark_captions::CaptionText::Display translation;
++  std::u16string translation_status;
+   if (shown_->translate_on()) {
+-    translation = translation_failed_
+-                      ? tark_captions::CaptionText::Display{
+-                            l10n_util::GetStringUTF16(IDS_TARK_CAPTIONS_TRANSLATION_UNAVAILABLE),
+-                            u""}
+-                      : translation_.GetDisplay(kCaptionChars);
++    if (translation_failed_) {
++      translation_status = l10n_util::GetStringUTF16(IDS_TARK_CAPTIONS_TRANSLATION_UNAVAILABLE);
++    } else {
++      translation = translation_.GetDisplay(kCaptionChars);
++    }
+   }
+   std::u16string message = message_;
+   if (message.empty() && display.committed.empty() && display.draft.empty()) {
+     message = l10n_util::GetStringUTF16(IDS_TARK_CAPTIONS_LISTENING);
+   }
+-  view_->SetCaption(display, translation, message);
++  view_->SetCaption(display, translation, message, translation_status);
+ }
+ 
+ void TarkCaptionPillController::Close() {
+--- a/chrome/browser/ui/views/tark_captions/caption_pill_view.cc
++++ b/chrome/browser/ui/views/tark_captions/caption_pill_view.cc
+@@ -93,8 +93,9 @@
+ 
+ void TarkCaptionPillView::SetCaption(const tark_captions::CaptionText::Display& original,
+                                      const tark_captions::CaptionText::Display& translation,
+-                                     const std::u16string& message) {
+-  caption_box_->SetCaption(original, translation, message);
++                                     const std::u16string& message,
++                                     const std::u16string& translation_status) {
++  caption_box_->SetCaption(original, translation, message, translation_status);
+   PreferredSizeChanged();
+ }
+ 
+--- a/chrome/browser/ui/views/tark_captions/caption_box_view_unittest.cc
++++ b/chrome/browser/ui/views/tark_captions/caption_box_view_unittest.cc
+@@ -109,6 +109,22 @@
+   EXPECT_TRUE(box_->translation_for_testing()->GetVisible());
+ }
+ 
++// Translation unavailable: the captions keep showing (in the strip too);
++// the failure is a quiet status line, not a translation.
++TEST_F(TarkCaptionBoxViewTest, StripShowsOriginalWhenTranslationFails) {
++  box_->SetStrip(true);
++  box_->SetCaption({u"namaste", u""}, {}, u"", u"Translation unavailable");
++  EXPECT_TRUE(box_->label_for_testing()->GetVisible());
++  EXPECT_EQ(Colors(), (std::vector<SkColor>{TarkCaptionBoxView::kFinalColor}));
++}
++
++TEST_F(TarkCaptionBoxViewTest, TranslationFailureIsAStatus) {
++  box_->SetCaption({u"namaste", u""}, {}, u"", u"Translation unavailable");
++  EXPECT_TRUE(box_->label_for_testing()->GetVisible());
++  EXPECT_EQ(ColorsOf(box_->translation_for_testing()),
++            (std::vector<SkColor>{TarkCaptionBoxView::kDraftColor}));
++}
++
+ TEST_F(TarkCaptionBoxViewTest, HiddenWhenEmpty) {
+   box_->SetCaption({u"one", u""}, u"");
+   EXPECT_TRUE(box_->GetVisible());
+--- a/chrome/browser/ui/views/tark_captions/caption_box_view.h
++++ b/chrome/browser/ui/views/tark_captions/caption_box_view.h
+@@ -44,9 +44,12 @@
+   // With Translate on (D4 Phase 2): the original small on top and the
+   // translation larger below; each has its draft faded. An empty
+   // `translation` looks as above.
++  // `translation_status` (Translation unavailable) shows quietly below the
++  // original when there is no translation; the strip keeps the original.
+   void SetCaption(const tark_captions::CaptionText::Display& original,
+                   const tark_captions::CaptionText::Display& translation,
+-                  const std::u16string& message);
++                  const std::u16string& message,
++                  const std::u16string& translation_status = std::u16string());
+ 
+   views::StyledLabel* label_for_testing() { return label_; }
+   views::StyledLabel* translation_for_testing() { return translation_; }
+--- a/chrome/browser/tark_captions/call_captions_tab_helper.cc
++++ b/chrome/browser/tark_captions/call_captions_tab_helper.cc
+@@ -59,7 +59,12 @@
+ }
+ 
+ void CallCaptionsTabHelper::SetLanguage(tark_captions::Language language) {
++  const bool was_other_script = !effective_show_in().empty();
+   language_ = language;
++  // Results asked in the old language are not shown; captions waiting keep
++  // the language they were heard in.
++  render_queue_.ChoicesChanged();
++  StopRenderingIfUnneeded(/*show_waiting_finals=*/was_other_script);
+   if (state_.captions_on()) {
+     Profile* profile = Profile::FromBrowserContext(GetWebContents().GetBrowserContext());
+     if (auto* speech =
+@@ -89,7 +94,7 @@
+           << result.transcription.size() << " bytes";
+   observers_.Notify(&Observer::OnCaption, this, result.is_final, result.transcription);
+   if (renders()) {
+-    render_queue_.Add(result.is_final, result.transcription);
++    render_queue_.Add(result.is_final, result.transcription, language_);
+     Pump();
+   }
+ }
+@@ -100,6 +105,8 @@
+   }
+   translate_on_ = on;
+   render_queue_.ChoicesChanged();
++  // Captions in their own script were shown as they came.
++  StopRenderingIfUnneeded(/*show_waiting_finals=*/false);
+   observers_.Notify(&Observer::OnCallStateChanged, this);
+ }
+ 
+@@ -114,9 +121,11 @@
+ }
+ 
+ void CallCaptionsTabHelper::SetShowIn(const std::string& code) {
++  const bool was_other_script = !effective_show_in().empty();
+   tark_captions::CaptionChoices(g_browser_process->local_state())
+       .SetShowIn(code, off_the_record());
+   render_queue_.ChoicesChanged();
++  StopRenderingIfUnneeded(/*show_waiting_finals=*/was_other_script);
+   observers_.Notify(&Observer::OnCallStateChanged, this);
+ }
+ 
+@@ -127,8 +136,13 @@
+   observers_.Notify(&Observer::OnCallStateChanged, this);
+ }
+ 
++std::string CallCaptionsTabHelper::effective_show_in() const {
++  const std::string code = show_in();
++  return code == tark_captions::LanguageCode(language_) ? std::string() : code;
++}
++
+ bool CallCaptionsTabHelper::renders() const {
+-  return state_.captions_on() && (translate_on_ || !show_in().empty());
++  return state_.captions_on() && (translate_on_ || !effective_show_in().empty());
+ }
+ 
+ void CallCaptionsTabHelper::Pump() {
+@@ -154,7 +168,10 @@
+     return;
+   }
+   const std::string text = next->text;
+-  translator_->Render(text, tark_captions::LanguageCode(language_), show_in(),
++  if (next->is_final) {
++    in_flight_final_ = text;
++  }
++  translator_->Render(text, tark_captions::LanguageCode(next->source), effective_show_in(),
+                       translate_on_ ? translate_to() : std::string(),
+                       base::BindOnce(&CallCaptionsTabHelper::OnRendered,
+                                      weak_factory_.GetWeakPtr(), next->is_final,
+@@ -168,6 +185,7 @@
+                                        const std::string& shown,
+                                        const std::string& translation) {
+   const bool current = render_queue_.Done(generation);
++  in_flight_final_.reset();
+   // Sizes only: call content stays out of logs.
+   VLOG(1) << "Tark captions: rendered " << (is_final ? "final" : "draft") << ", "
+           << shown.size() << " bytes shown, " << translation.size() << " bytes translated"
+@@ -182,7 +200,27 @@
+ void CallCaptionsTabHelper::StopRendering() {
+   translate_on_ = false;
+   render_queue_.Clear();
++  in_flight_final_.reset();
++  translator_.reset();
++}
++
++void CallCaptionsTabHelper::StopRenderingIfUnneeded(bool show_waiting_finals) {
++  if (renders() || !translator_.is_bound()) {
++    return;
++  }
++  std::vector<std::string> finals = render_queue_.TakeWaitingFinals();
++  if (in_flight_final_) {
++    finals.insert(finals.begin(), *in_flight_final_);
++  }
++  render_queue_.Clear();
++  in_flight_final_.reset();
+   translator_.reset();
++  if (!show_waiting_finals) {
++    return;
++  }
++  for (const std::string& text : finals) {
++    observers_.Notify(&Observer::OnCaption, this, /*is_final=*/true, text);
++  }
+ }
+ 
+ void CallCaptionsTabHelper::OnCaptionsError() {
+--- a/chrome/browser/tark_captions/call_captions_tab_helper.h
++++ b/chrome/browser/tark_captions/call_captions_tab_helper.h
+@@ -70,6 +70,8 @@
+   // The remembered choices (tark_captions::CaptionChoices codes); incognito
+   // tabs keep their changes in memory.
+   std::string show_in() const;
++  // show_in(), or "" when it is the client's own script.
++  std::string effective_show_in() const;
+   std::string translate_to() const;
+   void SetShowIn(const std::string& code);
+   void SetTranslateTo(const std::string& code);
+@@ -107,6 +109,11 @@
+                   const std::string& translation);
+   // Captions went off: nothing waits, the translator goes, Translate is off.
+   void StopRendering();
++  // Nothing needs the translator any more (Translate off, own script): the
++  // translator (and its models) goes. `show_waiting_finals`: the finals
++  // still waiting were never shown (they waited for another script), so
++  // they are shown as they are.
++  void StopRenderingIfUnneeded(bool show_waiting_finals);
+   bool off_the_record() const { return off_the_record_; }
+ 
+   tark_captions::CallState state_;
+@@ -121,6 +128,8 @@
+   const bool off_the_record_;
+   bool translate_on_ = false;
+   tark_captions::RenderQueue render_queue_;
++  // The final being rendered, to show as it is if rendering stops.
++  std::optional<std::string> in_flight_final_;
+   mojo::Remote<media::mojom::TarkCaptionTranslator> translator_;
+   base::WeakPtrFactory<CallCaptionsTabHelper> weak_factory_{this};
+ 
+--- a/chrome/services/speech/tark_caption_translator.cc
++++ b/chrome/services/speech/tark_caption_translator.cc
+@@ -55,7 +55,7 @@
+           base::UTF16ToUTF8(tark_captions::Romanize(base::UTF8ToUTF16(text), *source));
+     } else if (const std::optional<tark_captions::Language> other =
+                    tark_captions::LanguageFromCode(script)) {
+-      result.shown = base::UTF16ToUTF8(tark_captions::ConvertScript(
++      result.shown = base::UTF16ToUTF8(tark_captions::ConvertScriptForDisplay(
+           base::UTF8ToUTF16(text), tark_captions::ScriptOf(*source),
+           tark_captions::ScriptOf(*other)));
+     } else {

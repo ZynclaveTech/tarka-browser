@@ -1,0 +1,514 @@
+--- /dev/null
++++ b/chrome/browser/tark_captions/BUILD.gn
+@@ -0,0 +1,24 @@
++# Copyright 2026 The Tark Authors
++# Use of this source code is governed by a BSD-style license that can be
++# found in the LICENSE file.
++
++# Tark's call captions (D4), per tab: call detection (the tab captures the
++# microphone), captions on/off and language, and the captions themselves
++# for the pill.
++source_set("tark_captions") {
++  sources = [
++    "call_captions_tab_helper.cc",
++    "call_captions_tab_helper.h",
++  ]
++  public_deps = [
++    "//base",
++    "//chrome/browser/media/webrtc",
++    "//components/tark_captions",
++    "//content/public/browser",
++    "//media/mojo/mojom:speech_recognition",
++  ]
++  deps = [
++    "//chrome/browser/profiles:profile",
++    "//chrome/browser/speech",
++  ]
++}
+--- /dev/null
++++ b/chrome/browser/tark_captions/call_captions_tab_helper.h
+@@ -0,0 +1,82 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_TARK_CAPTIONS_CALL_CAPTIONS_TAB_HELPER_H_
++#define CHROME_BROWSER_TARK_CAPTIONS_CALL_CAPTIONS_TAB_HELPER_H_
++
++#include <string>
++
++#include "base/memory/scoped_refptr.h"
++#include "base/observer_list.h"
++#include "base/observer_list_types.h"
++#include "base/scoped_observation.h"
++#include "chrome/browser/media/webrtc/media_stream_capture_indicator.h"
++#include "components/tark_captions/asr_model.h"
++#include "components/tark_captions/call_state.h"
++#include "content/public/browser/web_contents_user_data.h"
++
++namespace media {
++struct SpeechRecognitionResult;
++}
++
++// Tark (D4): one tab's call captions. The tab is in a call while it
++// captures the microphone; the user turns captions on (nothing listens
++// before), which lets the tab's renderer send its incoming call audio to
++// the speech service; the captions come back here for the pill. The call
++// ending turns captions off.
++class CallCaptionsTabHelper
++    : public content::WebContentsUserData<CallCaptionsTabHelper>,
++      public MediaStreamCaptureIndicator::Observer {
++ public:
++  class Observer : public base::CheckedObserver {
++   public:
++    virtual void OnCallStateChanged() {}
++    virtual void OnCaption(bool is_final, const std::string& text) {}
++    virtual void OnCaptionsUnavailable() {}
++  };
++
++  CallCaptionsTabHelper(const CallCaptionsTabHelper&) = delete;
++  CallCaptionsTabHelper& operator=(const CallCaptionsTabHelper&) = delete;
++  ~CallCaptionsTabHelper() override;
++
++  bool in_call() const { return state_.in_call(); }
++  bool captions_on() const { return state_.captions_on(); }
++  bool hidden() const { return state_.hidden(); }
++  tark_captions::Language language() const { return language_; }
++
++  void SetCaptionsOn(bool on);
++  void SetLanguage(tark_captions::Language language);
++  void HideForThisCall();
++
++  // From the speech recognition host of one of this tab's frames.
++  void OnCaption(const media::SpeechRecognitionResult& result);
++  void OnCaptionsError();
++
++  void AddObserver(Observer* observer);
++  void RemoveObserver(Observer* observer);
++
++  // MediaStreamCaptureIndicator::Observer:
++  void OnIsCapturingAudioChanged(content::WebContents* web_contents,
++                                 bool is_capturing_audio) override;
++
++ private:
++  friend class content::WebContentsUserData<CallCaptionsTabHelper>;
++  explicit CallCaptionsTabHelper(content::WebContents* web_contents);
++
++  // Tells the profile's renderers (through the speech client interface)
++  // whether this tab's captions turned on or off.
++  void CaptionsChanged(bool was_on);
++
++  tark_captions::CallState state_;
++  tark_captions::Language language_ = tark_captions::Language::kHindi;
++  scoped_refptr<MediaStreamCaptureIndicator> indicator_;
++  base::ScopedObservation<MediaStreamCaptureIndicator,
++                          MediaStreamCaptureIndicator::Observer>
++      capture_observation_{this};
++  base::ObserverList<Observer> observers_;
++
++  WEB_CONTENTS_USER_DATA_KEY_DECL();
++};
++
++#endif  // CHROME_BROWSER_TARK_CAPTIONS_CALL_CAPTIONS_TAB_HELPER_H_
+--- /dev/null
++++ b/chrome/browser/tark_captions/call_captions_tab_helper.cc
+@@ -0,0 +1,115 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/tark_captions/call_captions_tab_helper.h"
++
++#include "base/command_line.h"
++#include "base/logging.h"
++#include "chrome/browser/media/webrtc/media_capture_devices_dispatcher.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/speech/chrome_speech_recognition_service.h"
++#include "chrome/browser/speech/speech_recognition_client_browser_interface.h"
++#include "chrome/browser/speech/speech_recognition_client_browser_interface_factory.h"
++#include "content/public/browser/web_contents.h"
++#include "media/mojo/mojom/speech_recognition_result.h"
++
++CallCaptionsTabHelper::CallCaptionsTabHelper(content::WebContents* web_contents)
++    : content::WebContentsUserData<CallCaptionsTabHelper>(*web_contents),
++      indicator_(MediaCaptureDevicesDispatcher::GetInstance()->GetMediaStreamCaptureIndicator()) {
++  capture_observation_.Observe(indicator_.get());
++  state_.OnMicCapturing(indicator_->IsCapturingAudio(web_contents));
++}
++
++CallCaptionsTabHelper::~CallCaptionsTabHelper() {
++  if (state_.captions_on()) {
++    state_.SetCaptionsOn(false);
++    CaptionsChanged(/*was_on=*/true);
++  }
++}
++
++void CallCaptionsTabHelper::SetCaptionsOn(bool on) {
++  const bool was_on = state_.captions_on();
++  if (state_.SetCaptionsOn(on) && was_on != on) {
++    CaptionsChanged(was_on);
++  }
++  observers_.Notify(&Observer::OnCallStateChanged);
++}
++
++void CallCaptionsTabHelper::SetLanguage(tark_captions::Language language) {
++  language_ = language;
++  if (state_.captions_on()) {
++    Profile* profile = Profile::FromBrowserContext(GetWebContents().GetBrowserContext());
++    if (auto* speech =
++            SpeechRecognitionClientBrowserInterfaceFactory::GetForProfile(profile)) {
++      speech->OnTarkCaptionsLanguageChanged(tark_captions::LanguageCode(language_));
++    }
++  }
++  observers_.Notify(&Observer::OnCallStateChanged);
++}
++
++void CallCaptionsTabHelper::HideForThisCall() {
++  const bool was_on = state_.captions_on();
++  state_.HideForThisCall();
++  if (was_on) {
++    CaptionsChanged(was_on);
++  }
++  observers_.Notify(&Observer::OnCallStateChanged);
++}
++
++void CallCaptionsTabHelper::OnCaption(const media::SpeechRecognitionResult& result) {
++  if (!state_.captions_on()) {
++    return;
++  }
++  // Never the text: call content stays out of logs.
++  VLOG(1) << "Tark captions: " << (result.is_final ? "final" : "draft") << ", "
++          << result.transcription.size() << " bytes";
++  observers_.Notify(&Observer::OnCaption, result.is_final, result.transcription);
++}
++
++void CallCaptionsTabHelper::OnCaptionsError() {
++  observers_.Notify(&Observer::OnCaptionsUnavailable);
++}
++
++void CallCaptionsTabHelper::AddObserver(Observer* observer) {
++  observers_.AddObserver(observer);
++}
++
++void CallCaptionsTabHelper::RemoveObserver(Observer* observer) {
++  observers_.RemoveObserver(observer);
++}
++
++void CallCaptionsTabHelper::OnIsCapturingAudioChanged(content::WebContents* web_contents,
++                                                      bool is_capturing_audio) {
++  if (web_contents != &GetWebContents()) {
++    return;
++  }
++  const bool was_on = state_.captions_on();
++  state_.OnMicCapturing(is_capturing_audio);
++  VLOG(1) << "Tark captions: in_call=" << state_.in_call();
++  if (was_on && !state_.captions_on()) {
++    CaptionsChanged(was_on);
++  }
++  // Until the pill (Task 10): --tark-captions-force=LANG turns captions on
++  // in any tab that is in a call.
++  const std::string forced =
++      base::CommandLine::ForCurrentProcess()->GetSwitchValueASCII(
++          speech::kTarkCaptionsForceSwitch);
++  if (state_.in_call() && !forced.empty()) {
++    language_ = tark_captions::LanguageFromCode(forced).value_or(language_);
++    SetCaptionsOn(true);
++    return;
++  }
++  observers_.Notify(&Observer::OnCallStateChanged);
++}
++
++void CallCaptionsTabHelper::CaptionsChanged(bool was_on) {
++  Profile* profile = Profile::FromBrowserContext(GetWebContents().GetBrowserContext());
++  speech::SpeechRecognitionClientBrowserInterface* speech =
++      SpeechRecognitionClientBrowserInterfaceFactory::GetForProfile(profile);
++  if (speech) {
++    speech->OnTarkCaptionsChanged(/*on=*/!was_on, tark_captions::LanguageCode(language_));
++  }
++}
++
++WEB_CONTENTS_USER_DATA_KEY_IMPL(CallCaptionsTabHelper);
+--- a/chrome/browser/speech/speech_recognition_client_browser_interface.h
++++ b/chrome/browser/speech/speech_recognition_client_browser_interface.h
+@@ -61,6 +61,14 @@
+           pending_remote) override;
+ #endif
+ 
++  // Tark (D4): a tab turned its call captions on or off, in `language`
++  // ("hi", "ta", "bn"). Renderers are told captions are unavailable, then,
++  // while any tab captions, available again (so a renderer whose earlier
++  // bind was refused binds now) and the language.
++  void OnTarkCaptionsChanged(bool on, const std::string& language);
++  // Tark (D4): the captioning tab's language changed.
++  void OnTarkCaptionsLanguageChanged(const std::string& language);
++
+   // SodaInstaller::Observer:
+   void OnSodaInstalled(speech::LanguageCode language_code) override;
+   void OnSodaProgress(speech::LanguageCode language_code,
+@@ -89,6 +97,10 @@
+   mojo::RemoteSet<media::mojom::SpeechRecognitionBrowserObserver>
+       live_caption_availability_observers_;
+ 
++  // Tark (D4): tabs with call captions on, and their language.
++  int tark_captions_tabs_ = 0;
++  std::string tark_captions_language_ = "hi";
++
+   mojo::ReceiverSet<media::mojom::SpeechRecognitionClientBrowserInterface>
+       speech_recognition_client_browser_interface_;
+ 
+--- a/chrome/browser/speech/speech_recognition_client_browser_interface.cc
++++ b/chrome/browser/speech/speech_recognition_client_browser_interface.cc
+@@ -4,9 +4,9 @@
+ 
+ #include "chrome/browser/speech/speech_recognition_client_browser_interface.h"
+ 
++#include <algorithm>
+ #include <memory>
+ 
+-#include "base/command_line.h"
+ #include "base/feature_list.h"
+ #include "base/functional/bind.h"
+ #include "base/logging.h"
+@@ -15,7 +15,6 @@
+ #include "build/build_config.h"
+ #include "chrome/browser/browser_process.h"
+ #include "chrome/browser/profiles/profile.h"
+-#include "chrome/browser/speech/chrome_speech_recognition_service.h"
+ #include "components/live_caption/caption_util.h"
+ #include "components/live_caption/pref_names.h"
+ #include "components/prefs/pref_change_registrar.h"
+@@ -173,16 +172,36 @@
+   }
+ }
+ 
++void SpeechRecognitionClientBrowserInterface::OnTarkCaptionsChanged(
++    bool on,
++    const std::string& language) {
++  tark_captions_tabs_ = std::max(0, tark_captions_tabs_ + (on ? 1 : -1));
++  tark_captions_language_ = language;
++  for (auto& observer : live_caption_availability_observers_) {
++    observer->SpeechRecognitionAvailabilityChanged(false);
++  }
++  NotifyLiveCaptionObserversIfNeeded();
++}
++
++void SpeechRecognitionClientBrowserInterface::OnTarkCaptionsLanguageChanged(
++    const std::string& language) {
++  tark_captions_language_ = language;
++  for (auto& observer : live_caption_availability_observers_) {
++    observer->SpeechRecognitionLanguageChanged(language);
++  }
++}
++
+ void SpeechRecognitionClientBrowserInterface::
+     NotifyLiveCaptionObserversIfNeeded() {
+   if (live_caption_availability_observers_.empty()) {
+     return;
+   }
+-  // Tark (D4): --tark-captions-force makes captions available everywhere
+-  // until the pill decides per call.
+-  if (base::CommandLine::ForCurrentProcess()->HasSwitch(kTarkCaptionsForceSwitch)) {
++  // Tark (D4): captions are Tark's call captions, available while a tab has
++  // them on. Chromium's own Live Caption is not used.
++  if (tark_captions_tabs_ > 0) {
+     for (auto& observer : live_caption_availability_observers_) {
+       observer->SpeechRecognitionAvailabilityChanged(true);
++      observer->SpeechRecognitionLanguageChanged(tark_captions_language_);
+     }
+     return;
+   }
+--- a/chrome/browser/chrome_browser_interface_binders.cc
++++ b/chrome/browser/chrome_browser_interface_binders.cc
+@@ -6,7 +6,6 @@
+ 
+ #include <utility>
+ 
+-#include "base/command_line.h"
+ #include "base/feature_list.h"
+ #include "base/functional/bind.h"
+ #include "build/build_config.h"
+@@ -130,7 +129,7 @@
+ #if BUILDFLAG(ENABLE_SPEECH_SERVICE)
+ #include "chrome/browser/accessibility/live_caption/live_caption_speech_recognition_host.h"
+ #include "chrome/browser/accessibility/live_caption/live_caption_unavailability_notifier.h"
+-#include "chrome/browser/speech/chrome_speech_recognition_service.h"
++#include "chrome/browser/tark_captions/call_captions_tab_helper.h"
+ #include "chrome/browser/speech/speech_recognition_client_browser_interface.h"
+ #include "chrome/browser/speech/speech_recognition_client_browser_interface_factory.h"
+ #include "chrome/browser/speech/speech_recognition_service.h"
+@@ -301,14 +300,13 @@
+   if (!profile) {
+     return;
+   }
+-  PrefService* profile_prefs = profile->GetPrefs();
+-  // Tark (D4): --tark-captions-force admits every frame until the pill.
+-  const bool tark_forced = base::CommandLine::ForCurrentProcess()->HasSwitch(
+-      speech::kTarkCaptionsForceSwitch);
+-  if (!tark_forced &&
+-      (!(profile_prefs->GetBoolean(prefs::kLiveCaptionEnabled) ||
+-         profile_prefs->GetBoolean(prefs::kHeadlessCaptionEnabled)) ||
+-       !captions::IsLiveCaptionFeatureSupported())) {
++  // Tark (D4): only a tab whose call captions are on may send audio to the
++  // speech service. Chromium's own Live Caption is not used.
++  content::WebContents* web_contents =
++      content::WebContents::FromRenderFrameHost(frame_host);
++  CallCaptionsTabHelper* tark_tab =
++      web_contents ? CallCaptionsTabHelper::FromWebContents(web_contents) : nullptr;
++  if (!tark_tab || !tark_tab->captions_on()) {
+     return;
+   }
+ 
+@@ -340,12 +338,13 @@
+     content::RenderFrameHost* frame_host,
+     mojo::PendingReceiver<media::mojom::SpeechRecognitionRecognizerClient>
+         client_receiver) {
+-  Profile* profile = Profile::FromBrowserContext(
+-      frame_host->GetProcess()->GetBrowserContext());
+-  PrefService* profile_prefs = profile->GetPrefs();
+-  if ((profile_prefs->GetBoolean(prefs::kLiveCaptionEnabled) ||
+-       profile_prefs->GetBoolean(prefs::kHeadlessCaptionEnabled)) &&
+-      captions::IsLiveCaptionFeatureSupported()) {
++  // Tark (D4): results come back only to a tab whose call captions are on
++  // (they go on to the pill). Chromium's own Live Caption is not used.
++  content::WebContents* web_contents =
++      content::WebContents::FromRenderFrameHost(frame_host);
++  CallCaptionsTabHelper* tark_tab =
++      web_contents ? CallCaptionsTabHelper::FromWebContents(web_contents) : nullptr;
++  if (tark_tab && tark_tab->captions_on()) {
+     captions::LiveCaptionSpeechRecognitionHost::Create(
+         frame_host, std::move(client_receiver));
+   }
+--- a/chrome/browser/accessibility/live_caption/live_caption_speech_recognition_host.h
++++ b/chrome/browser/accessibility/live_caption/live_caption_speech_recognition_host.h
+@@ -24,6 +24,8 @@
+ class RenderFrameHost;
+ }
+ 
++class CallCaptionsTabHelper;
++
+ namespace captions {
+ 
+ class CaptionBubbleContextBrowser;
+@@ -91,6 +93,8 @@
+   // Returns the LiveCaptionController for frame_host_. Returns nullptr if it
+   // does not exist. Lifetime is tied to the BrowserContext.
+   LiveCaptionController* GetLiveCaptionController();
++  // Tark (D4): this frame's tab's call captions, if any.
++  CallCaptionsTabHelper* GetTarkCallCaptions();
+ 
+   // Returns the LiveTranslateController for frame_host_. Returns nullptr if it
+   // does not exist. Lifetime is tied to the BrowserContext.
+--- a/chrome/browser/accessibility/live_caption/live_caption_speech_recognition_host.cc
++++ b/chrome/browser/accessibility/live_caption/live_caption_speech_recognition_host.cc
+@@ -11,10 +11,8 @@
+ #include <utility>
+ #include <vector>
+ 
+-#include "base/command_line.h"
+ #include "base/feature_list.h"
+ #include "base/i18n/legacy_language_tag_helpers.h"
+-#include "base/logging.h"
+ #include "base/metrics/histogram_functions.h"
+ #include "base/strings/strcat.h"
+ #include "base/strings/string_util.h"
+@@ -25,7 +23,7 @@
+ #include "chrome/browser/accessibility/live_caption/live_translate_controller_factory.h"
+ #include "chrome/browser/browser_process.h"
+ #include "chrome/browser/profiles/profile.h"
+-#include "chrome/browser/speech/chrome_speech_recognition_service.h"
++#include "chrome/browser/tark_captions/call_captions_tab_helper.h"
+ #include "components/live_caption/greedy_text_stabilizer.h"
+ #include "components/live_caption/live_caption_controller.h"
+ #include "components/live_caption/live_translate_controller.h"
+@@ -159,17 +157,19 @@
+   }
+ }
+ 
++CallCaptionsTabHelper* LiveCaptionSpeechRecognitionHost::GetTarkCallCaptions() {
++  content::WebContents* web_contents =
++      content::WebContents::FromRenderFrameHost(&render_frame_host());
++  return web_contents ? CallCaptionsTabHelper::FromWebContents(web_contents) : nullptr;
++}
++
+ void LiveCaptionSpeechRecognitionHost::OnSpeechRecognitionRecognitionEvent(
+     const media::SpeechRecognitionResult& result,
+     OnSpeechRecognitionRecognitionEventCallback reply) {
+-  // Tark (D4), until the caption pill: --tark-captions-force keeps
+-  // recognition going and logs each result's kind and size (never the
+-  // text, so call content stays out of logs).
+-  if (base::CommandLine::ForCurrentProcess()->HasSwitch(
+-          speech::kTarkCaptionsForceSwitch)) {
+-    VLOG(1) << "Tark captions: " << (result.is_final ? "final" : "draft") << ", "
+-            << result.transcription.size() << " bytes";
+-    std::move(reply).Run(true);
++  // Tark (D4): the call's captions go to its tab (and the pill).
++  if (CallCaptionsTabHelper* tab = GetTarkCallCaptions()) {
++    tab->OnCaption(result);
++    std::move(reply).Run(tab->captions_on());
+     return;
+   }
+   LiveCaptionController* live_caption_controller = GetLiveCaptionController();
+@@ -274,6 +274,10 @@
+ }
+ 
+ void LiveCaptionSpeechRecognitionHost::OnSpeechRecognitionError() {
++  if (CallCaptionsTabHelper* tab = GetTarkCallCaptions()) {
++    tab->OnCaptionsError();
++    return;
++  }
+   LiveCaptionController* live_caption_controller = GetLiveCaptionController();
+   if (live_caption_controller)
+     live_caption_controller->OnError(
+--- a/chrome/browser/accessibility/live_caption/BUILD.gn
++++ b/chrome/browser/accessibility/live_caption/BUILD.gn
+@@ -44,6 +44,7 @@
+     "//chrome/browser/accessibility",
+     "//chrome/browser/extensions",
+     "//chrome/browser/on_device_translation",
++    "//chrome/browser/tark_captions",
+     "//chrome/browser/ui",
+     "//chrome/browser/ui/browser_window",
+     "//components/live_caption",
+--- a/chrome/browser/ui/tab_helpers.cc
++++ b/chrome/browser/ui/tab_helpers.cc
+@@ -89,6 +89,9 @@
+ #include "chrome/browser/ui/passwords/manage_passwords_ui_controller.h"
+ #include "chrome/browser/ui/prefs/prefs_tab_helper.h"
+ #include "chrome/browser/ui/recently_audible_helper.h"
++#if BUILDFLAG(IS_MAC)
++#include "chrome/browser/tark_captions/call_captions_tab_helper.h"
++#endif
+ #include "chrome/browser/ui/safety_hub/revoked_permissions_service.h"
+ #include "chrome/browser/ui/safety_hub/revoked_permissions_service_factory.h"
+ #include "chrome/browser/ui/search_engines/search_engine_tab_helper.h"
+@@ -556,6 +559,10 @@
+   PrefsTabHelper::CreateForWebContents(web_contents);
+   prerender::NoStatePrefetchTabHelper::CreateForWebContents(web_contents);
+   RecentlyAudibleHelper::CreateForWebContents(web_contents);
++#if BUILDFLAG(IS_MAC)
++  // Tark (D4): call detection and the call's captions.
++  CallCaptionsTabHelper::CreateForWebContents(web_contents);
++#endif
+ #if BUILDFLAG(IS_ANDROID)
+   RequestDesktopSiteWebContentsObserverAndroid::CreateForWebContents(
+       web_contents);
+--- a/chrome/browser/ui/BUILD.gn
++++ b/chrome/browser/ui/BUILD.gn
+@@ -832,6 +832,7 @@
+   ]
+ 
+   deps = [
++    "//chrome/browser/tark_captions",
+     ":browser_element_identifiers",
+     ":browser_otr_state",
+     ":browser_ui_prefs",
+--- a/chrome/browser/BUILD.gn
++++ b/chrome/browser/BUILD.gn
+@@ -981,6 +981,7 @@
+     "//chrome/browser/media/router:media_router_feature",
+     "//chrome/browser/media/router/discovery/access_code:access_code_cast_feature",
+     "//chrome/browser/media/webrtc",
++    "//chrome/browser/tark_captions",
+     "//chrome/browser/memory",
+     "//chrome/browser/metrics",
+     "//chrome/browser/metrics:expired_histograms_array",
