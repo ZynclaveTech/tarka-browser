@@ -325,7 +325,7 @@
 +#endif  // CHROME_BROWSER_TARK_UPDATE_UPDATE_CHECK_SERVICE_H_
 --- /dev/null
 +++ b/chrome/browser/tark_update/update_check_service.cc
-@@ -0,0 +1,152 @@
+@@ -0,0 +1,154 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -470,6 +470,8 @@
 +  JNIEnv* env = base::android::AttachCurrentThread();
 +  if (!IsNewer(*index, Java_TarkUpdate_installedVersionCode(env))) {
 +    LOG(WARNING) << "tark update: up to date";
++    // An offer from an earlier check is no longer what gettarka.com offers.
++    Java_TarkUpdate_withdraw(env);
 +    return;
 +  }
 +  LOG(WARNING) << "tark update: " << index->version_name << " available";
@@ -480,7 +482,7 @@
 +}  // namespace tark_update
 --- /dev/null
 +++ b/chrome/browser/omaha/android/java/src/org/chromium/chrome/browser/omaha/TarkUpdate.java
-@@ -0,0 +1,108 @@
+@@ -0,0 +1,121 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -568,6 +570,19 @@
 +                .putString(KEY_NAME, versionName)
 +                .putString(KEY_URL, url)
 +                .apply();
++        UpdateStatusProvider.getInstance().onTarkUpdate();
++    }
++
++    /**
++     * A check found no newer version: an offer an earlier check kept is
++     * dropped, so a release taken back from gettarka.com stops being offered.
++     */
++    @CalledByNative
++    static void withdraw() {
++        ThreadUtils.assertOnUiThread();
++        SharedPreferences prefs = ContextUtils.getAppSharedPreferences();
++        if (!prefs.contains(KEY_URL)) return;
++        prefs.edit().remove(KEY_CODE).remove(KEY_NAME).remove(KEY_URL).apply();
 +        UpdateStatusProvider.getInstance().onTarkUpdate();
 +    }
 +

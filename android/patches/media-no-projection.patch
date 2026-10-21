@@ -1,0 +1,46 @@
+--- a/chrome/android/java/AndroidManifest.xml
++++ b/chrome/android/java/AndroidManifest.xml
+@@ -74,10 +74,8 @@
+     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA" />
+     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+-    {% set enable_screen_capture = enable_screen_capture|default(0) %}
+-    {% if enable_screen_capture == "true" %}
+-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+-    {% endif %}
++    <!-- Tark: websites can't share the screen in Tark for Android
++         (getDisplayMedia is not exposed), so no media projection. -->
+     <!-- TODO(crbug.com/40259231): Remove this tools:ignore attribute once it's no longer necessary. -->
+     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" tools:ignore="SystemPermissionTypo" />
+     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" tools:ignore="SystemPermissionTypo" />
+@@ -1259,11 +1257,7 @@
+             android:exported="false"/>
+ 
+         <service android:name="org.chromium.chrome.browser.media.MediaCaptureNotificationService"
+-            {% if enable_screen_capture == "true" %}
+-            android:foregroundServiceType="camera|microphone|mediaProjection|mediaPlayback"
+-            {% else %}
+-            android:foregroundServiceType="camera|microphone"
+-            {% endif %}
++            android:foregroundServiceType="camera|microphone|mediaPlayback"
+             android:exported="false"/>
+         <service android:name="org.chromium.chrome.browser.GracefulShutdownService"
+             android:foregroundServiceType="shortService|dataSync"
+--- a/chrome/android/java/src/org/chromium/chrome/browser/media/MediaCaptureNotificationServiceImpl.java
++++ b/chrome/android/java/src/org/chromium/chrome/browser/media/MediaCaptureNotificationServiceImpl.java
+@@ -406,13 +406,10 @@
+                 == PackageManager.PERMISSION_GRANTED) {
+             foregroundServiceType |= ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE;
+         }
++        // Tark: no media projection type; the manifest doesn't declare it,
++        // as websites can't share the screen in Tark for Android.
+         if (allMediaTypes.contains(MediaType.TAB_CAPTURE)) {
+             foregroundServiceType |= ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK;
+-            foregroundServiceType |= ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION;
+-        }
+-        if (allMediaTypes.contains(MediaType.SCREEN_CAPTURE)
+-                || allMediaTypes.contains(MediaType.WINDOW_CAPTURE)) {
+-            foregroundServiceType |= ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION;
+         }
+         return foregroundServiceType;
+     }

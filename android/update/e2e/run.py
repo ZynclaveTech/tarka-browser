@@ -114,6 +114,26 @@ def case_newer(dev):
     return ''
 
 
+def case_withdrawn(dev):
+    # A release taken back: the menu offered it, then gettarka.com's index
+    # names the installed version again. The next check drops the offer.
+    SERVER['index'] = index(dev.installed_code() + 1)
+    dev.fresh()
+    if not wait_for_check(dev) or not dev.logged('available', 5):
+        return 'the newer version was not seen'
+    if not dev.menu_offers_update():
+        return 'the menu does not offer "Update Tark" at first'
+    SERVER['index'] = index(dev.installed_code())
+    # A day passes: Local State keeps the last check's time; the offer is in
+    # the app's own preferences, which stay.
+    dev.shell('am', 'force-stop', PACKAGE)
+    dev.shell('rm', '-f', f"'/data/data/{PACKAGE}/app_chrome/Local State'")
+    dev.start()
+    if not wait_for_check(dev) or not dev.logged('up to date', 5):
+        return 'the second check did not find it up to date'
+    return 'the menu still offers the withdrawn update' if dev.menu_offers_update() else ''
+
+
 def case_same(dev):
     SERVER['index'] = index(dev.installed_code())
     dev.fresh()
