@@ -257,6 +257,11 @@ mkdir -p "$_src_dir/out/Default"
 export PATH="$_src_dir/third_party/llvm-build/Release+Asserts/bin:$PATH"
 export CC=clang CXX=clang++ AR=llvm-ar
 cat "$_main_repo/flags.gn" "$_root_dir/android/args.gn" > "$_src_dir/out/Default/args.gn"
+# A5: Tark's own version name and code (android/release/version.py), which
+# Play and the direct APK's update check compare.
+read -r _version_name _version_code < <(python3 "$_root_dir/android/release/version.py" "$_root_dir")
+printf 'android_override_version_name = "%s"\nandroid_override_version_code = "%s"\n' \
+  "$_version_name" "$_version_code" >> "$_src_dir/out/Default/args.gn"
 run python3 "$_src_dir/tools/gn/bootstrap/bootstrap.py" -o "$_src_dir/out/Default/gn" --skip-generate-buildfiles
 # Scripts run with the machine's python3, as in Chromium's source tarball (a
 # git checkout's .gn names a bundled Python the Android tree does not have).
@@ -264,6 +269,9 @@ run sed -i "s|^script_executable = .*|script_executable = \"python3\"|" "$_src_d
 run "$_src_dir/out/Default/gn" gen "$_src_dir/out/Default" --root="$_src_dir" --fail-on-unused-args
 # -k 0: one run reports every failing step, not only the first.
 run ninja -k 0 -C "$_src_dir/out/Default" chrome_public_apk
+# A5: the app bundle Play takes, from the same build (debug-signed here; the
+# release key signs it on the Mac, android/release/sign.py).
+run ninja -k 0 -C "$_src_dir/out/Default" chrome_public_bundle
 # A2: the ad blocker's unit tests (list bundle, signature, update schedule),
 # built for this machine and run here.
 run ninja -C "$_src_dir/out/Default" chrome/browser/tark_adblock:host_unittests
