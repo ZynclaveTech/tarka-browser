@@ -1,0 +1,472 @@
+--- a/chrome/services/speech/tark_caption_recognizer.cc
++++ b/chrome/services/speech/tark_caption_recognizer.cc
+@@ -39,6 +39,11 @@
+   return code.substr(0, code.find('-'));
+ }
+ 
++// "auto" or "auto:hi" (captions at once: auto-detect, starting on a hint).
++bool IsAuto(const std::string& code) {
++  return code == "auto" || code.starts_with("auto:");
++}
++
+ }  // namespace
+ 
+ // The models and what they do with the call's audio, on a thread-pool
+@@ -48,6 +53,8 @@
+   struct Callbacks {
+     tark_captions::CaptionEngine::EventCallback on_event;
+     base::RepeatingCallback<void(const std::string&)> on_detected;
++    // Captions at once: captions (or the tap) started on this guess.
++    base::RepeatingCallback<void(const std::string&)> on_guess;
+     base::RepeatingCallback<void(const std::string& language, std::vector<float>)> on_tap;
+     base::RepeatingClosure on_failed;
+   };
+@@ -73,7 +80,11 @@
+   void Flush() {
+     switch (mode_) {
+       case Mode::kDetect:
+-        // The call ended before the language was clear.
++        // The call ended before the language was clear: what was captioned
++        // on the guess is final, and the language stays unknown.
++        if (captions_) {
++          captions_->Flush(callbacks_.on_event);
++        }
+         if (gate_->speech_seconds() > 0) {
+           callbacks_.on_detected.Run("und");
+         }
+@@ -83,7 +94,7 @@
+         break;
+       case Mode::kTap:
+         if (!tap_.empty()) {
+-          callbacks_.on_tap.Run(current_, std::exchange(tap_, {}));
++          callbacks_.on_tap.Run(tap_language_, std::exchange(tap_, {}));
+         }
+         break;
+       case Mode::kIdle:
+@@ -92,9 +103,10 @@
+     }
+   }
+ 
+-  // "auto", "none", a language Tark captions, or one macOS captions (the
+-  // recognizer passes nothing else). The language it has already (heard,
+-  // or told before) is no change: the browser tells every recognizer.
++  // "auto" (or "auto:<hint>"), "none", a language Tark captions, or one
++  // macOS captions (the recognizer passes nothing else). The language it has
++  // already (heard, or told before) is no change: the browser tells every
++  // recognizer.
+   void SetLanguage(const std::string& code) {
+     if (mode_ == Mode::kFailed || code == current_) {
+       return;
+@@ -102,21 +114,31 @@
+     current_ = code;
+     gate_.reset();
+     tap_.clear();
++    guess_.clear();
+     if (code == "none") {
+       captions_.reset();
+       mode_ = Mode::kIdle;
+-    } else if (code == "auto") {
+-      captions_.reset();
++    } else if (IsAuto(code)) {
++      // Kept until the hint's engine exists: the speech model is shared and
++      // use-counted, and re-detecting on the language already captioned
++      // would otherwise unload and load it again.
++      std::unique_ptr<tark_captions::CaptionEngine> previous = std::move(captions_);
+       gate_ = tark_captions::LanguageGate::Create(models_dir_, ort_dylib_);
+-      if (gate_) {
+-        mode_ = Mode::kDetect;
+-      } else {
++      if (!gate_) {
+         Fail();
++        return;
++      }
++      mode_ = Mode::kDetect;
++      // Captions at once: start on the browser's hint (the tab title's
++      // script, the tab's last language) until the detector says otherwise.
++      if (code.size() > 5) {
++        Guess(code.substr(5));
+       }
+     } else if (std::optional<tark_captions::Language> language = ParseLanguage(code)) {
+       StartCaptions(*language);
+     } else if (IsAppleLanguage(code)) {
+       captions_.reset();
++      tap_language_ = code;
+       mode_ = Mode::kTap;
+     } else {
+       Fail();
+@@ -128,11 +150,22 @@
+ 
+   void AddMono16k(base::span<const float> pcm) {
+     switch (mode_) {
+-      case Mode::kDetect:
+-        if (std::optional<tark_captions::Detection> d = gate_->AddMono16k(pcm)) {
+-          Decided(*d);
++      case Mode::kDetect: {
++        // The guess's captions (or tap) hear everything the gate hears.
++        if (captions_) {
++          captions_->AddAudio(pcm, 1, tark_captions::MonoResampler::kRate, callbacks_.on_event);
++        } else if (!guess_.empty()) {
++          Tap(pcm);
++        }
++        tark_captions::LanguageGate::Result r = gate_->AddMono16k(pcm);
++        if (r.guess) {
++          Guess(*r.guess);
++        }
++        if (r.decision) {
++          Decided(*r.decision);
+         }
+         break;
++      }
+       case Mode::kCaption:
+         captions_->AddAudio(pcm, 1, tark_captions::MonoResampler::kRate, callbacks_.on_event);
+         break;
+@@ -145,7 +178,49 @@
+     }
+   }
+ 
+-  // Goes on from the first word the gate heard.
++  // Captions at once: captions (or the tap) start on `code` from the first
++  // word the gate heard; a different earlier guess's are dropped. Nothing
++  // starts when its model is missing (the decision then goes as before).
++  void Guess(const std::string& code) {
++    if (code == guess_) {
++      return;
++    }
++    const tark_captions::Detection::Kind kind = tark_captions::KindOfLanguage(code);
++    std::optional<tark_captions::Language> language = tark_captions::LanguageFromCode(code);
++    if (kind == tark_captions::Detection::Kind::kCaption && language) {
++      // The new engine first: the speech model is shared and use-counted,
++      // so dropping the old one first would unload and reload it.
++      std::unique_ptr<tark_captions::CaptionEngine> fresh =
++          tark_captions::CaptionEngine::Create(models_dir_, ort_dylib_);
++      if (!fresh) {
++        DropGuess();
++        return;
++      }
++      fresh->SetLanguage(*language);
++      captions_ = std::move(fresh);
++      tap_.clear();
++      guess_ = code;
++      callbacks_.on_guess.Run(code);
++      captions_->AddAudio(gate_->heard(), 1, tark_captions::MonoResampler::kRate,
++                          callbacks_.on_event);
++    } else if (kind == tark_captions::Detection::Kind::kApple) {
++      captions_.reset();
++      tap_.clear();
++      guess_ = code;
++      tap_language_ = code;
++      callbacks_.on_guess.Run(code);
++      Tap(gate_->heard());
++    }
++  }
++
++  void DropGuess() {
++    captions_.reset();
++    tap_.clear();
++    guess_.clear();
++  }
++
++  // Goes on from the first word the gate heard; when it agrees with the
++  // guess, the guess's captions (or tap) simply go on.
+   void Decided(const tark_captions::Detection& d) {
+     callbacks_.on_detected.Run(d.code);
+     // What the browser will tell every recognizer; this one has it already.
+@@ -154,20 +229,35 @@
+     current_ = decodes ? d.code : "none";
+     std::vector<float> heard = gate_->TakeHeard();
+     gate_.reset();
++    const bool kept = !guess_.empty() && d.code == guess_;
++    guess_.clear();
++    if (kept) {
++      mode_ = d.kind == tark_captions::Detection::Kind::kCaption ? Mode::kCaption : Mode::kTap;
++      return;
++    }
+     switch (d.kind) {
+-      case tark_captions::Detection::Kind::kCaption:
++      case tark_captions::Detection::Kind::kCaption: {
++        // A fresh engine: the wrong guess's segment must not carry over.
++        std::unique_ptr<tark_captions::CaptionEngine> fresh =
++            tark_captions::CaptionEngine::Create(models_dir_, ort_dylib_);
++        captions_ = std::move(fresh);
+         StartCaptions(*tark_captions::LanguageFromCode(d.code));
+         if (mode_ == Mode::kCaption) {
+           captions_->AddAudio(heard, 1, tark_captions::MonoResampler::kRate, callbacks_.on_event);
+         }
+         break;
++      }
+       case tark_captions::Detection::Kind::kApple:
++        captions_.reset();
++        tap_.clear();
++        tap_language_ = d.code;
+         mode_ = Mode::kTap;
+         Tap(heard);
+         break;
+       case tark_captions::Detection::Kind::kUnsure:
+       case tark_captions::Detection::Kind::kPlanned:
+       case tark_captions::Detection::Kind::kUnsupported:
++        DropGuess();
+         mode_ = Mode::kIdle;
+         break;
+     }
+@@ -188,7 +278,7 @@
+   void Tap(base::span<const float> pcm) {
+     tap_.insert(tap_.end(), pcm.begin(), pcm.end());
+     while (tap_.size() >= kTapChunk) {
+-      callbacks_.on_tap.Run(current_,
++      callbacks_.on_tap.Run(tap_language_,
+                             std::vector<float>(tap_.begin(), tap_.begin() + kTapChunk));
+       tap_.erase(tap_.begin(), tap_.begin() + kTapChunk);
+     }
+@@ -205,6 +295,8 @@
+   const base::FilePath models_dir_;
+   Callbacks callbacks_;
+   std::string current_;  // The language last set or decided.
++  std::string guess_;    // Captions at once: the language being guessed.
++  std::string tap_language_;  // What the tap's audio is for.
+   Mode mode_ = Mode::kIdle;
+   tark_captions::MonoResampler resampler_;
+   std::unique_ptr<tark_captions::LanguageGate> gate_;
+@@ -249,7 +341,7 @@
+   // A language neither Tark nor macOS can caption is an error the pill
+   // shows, never another language's captions presented as this one's.
+   VLOG(1) << "Tark captions: recognizer for \"" << language << "\"";
+-  if (language != "auto" && language != "none" && !ParseLanguage(language) &&
++  if (!IsAuto(language) && language != "none" && !ParseLanguage(language) &&
+       !IsAppleLanguage(language)) {
+     OnEngineFailed();
+     return;
+@@ -258,6 +350,8 @@
+   Engine::Callbacks callbacks;
+   callbacks.on_event = base::BindPostTask(
+       here, base::BindRepeating(&TarkCaptionRecognizer::OnEvent, weak_factory_.GetWeakPtr()));
++  callbacks.on_guess = base::BindPostTask(
++      here, base::BindRepeating(&TarkCaptionRecognizer::OnGuessed, weak_factory_.GetWeakPtr()));
+   callbacks.on_detected = base::BindPostTask(
+       here, base::BindRepeating(&TarkCaptionRecognizer::OnDetected, weak_factory_.GetWeakPtr()));
+   callbacks.on_tap = base::BindPostTask(
+@@ -296,7 +390,7 @@
+     tap_.reset();
+     tap_language_.clear();
+   }
+-  if (!failed_ && (language == "auto" || language == "none" || ParseLanguage(language) ||
++  if (!failed_ && (IsAuto(language) || language == "none" || ParseLanguage(language) ||
+                    IsAppleLanguage(language))) {
+     engine_.AsyncCall(&Engine::SetLanguage).WithArgs(language);
+   }
+@@ -316,7 +410,7 @@
+ }
+ 
+ void TarkCaptionRecognizer::OnTapAudio(const std::string& language, std::vector<float> pcm16k) {
+-  if (wanted_language_ != "auto" && language != wanted_language_) {
++  if (!IsAuto(wanted_language_) && language != wanted_language_) {
+     return;  // Tapped before the engine heard the language change.
+   }
+   if (language != tap_language_ || !tap_.is_bound()) {
+@@ -333,6 +427,12 @@
+   }
+ }
+ 
++void TarkCaptionRecognizer::OnGuessed(const std::string& code) {
++  VLOG(1) << "Tark captions: captioning on a guess, \"" << code << "\"";
++  client_->OnLanguageIdentificationEvent(media::mojom::LanguageIdentificationEvent::New(
++      code, media::mojom::ConfidenceLevel::kConfident, std::nullopt));
++}
++
+ void TarkCaptionRecognizer::OnDetected(const std::string& code) {
+   VLOG(1) << "Tark captions: the client speaks \"" << code << "\"";
+   client_->OnLanguageIdentificationEvent(media::mojom::LanguageIdentificationEvent::New(
+--- a/chrome/services/speech/tark_caption_recognizer.h
++++ b/chrome/services/speech/tark_caption_recognizer.h
+@@ -40,7 +40,10 @@
+   using OpenTap = base::RepeatingCallback<mojo::PendingRemote<media::mojom::TarkAudioTap>(
+       const std::string& language)>;
+ 
+-  // Binds a self-owned recognizer to `receiver`. `language` is "auto", "none"
++  // Binds a self-owned recognizer to `receiver`. `language` is "auto" (or
++  // "auto:<code>": auto-detect, captioning on the hint `code` until the
++  // detector guesses or decides otherwise; a hint nothing here captions is
++  // plain auto), "none"
+   // (the call's language is one nothing here captions: stay idle) or a code
+   // such as "hi", "hi-IN" or "es-US"; another code, or a missing ONNX
+   // Runtime or models folder, is reported to the client as an error.
+@@ -81,6 +84,9 @@
+   class Engine;
+ 
+   void OnEvent(tark_captions::CaptionEvent event);
++  // Captions at once: captions started on a guess (kConfident; the decision
++  // is kHighlyConfident).
++  void OnGuessed(const std::string& code);
+   void OnDetected(const std::string& code);
+   // Audio for the language macOS captions, through this recognizer's tap
+   // for that language.
+--- a/chrome/services/speech/tark_caption_recognizer_unittest.cc
++++ b/chrome/services/speech/tark_caption_recognizer_unittest.cc
+@@ -4,9 +4,12 @@
+ 
+ #include "chrome/services/speech/tark_caption_recognizer.h"
+ 
++#include <algorithm>
+ #include <string>
+ #include <vector>
+ 
++#include "base/files/file_util.h"
++#include "base/files/scoped_temp_dir.h"
+ #include "base/functional/bind.h"
+ #include "base/rand_util.h"
+ #include "base/test/run_until.h"
+@@ -28,16 +31,31 @@
+       const media::SpeechRecognitionResult& result,
+       OnSpeechRecognitionRecognitionEventCallback reply) override {
+     (result.is_final ? finals : drafts).push_back(result.transcription);
++    log.push_back(result.is_final ? "final" : "draft");
+     std::move(reply).Run(true);
+   }
+   void OnSpeechRecognitionStopped() override {}
+   void OnSpeechRecognitionError() override { error = true; }
+   void OnLanguageIdentificationEvent(media::mojom::LanguageIdentificationEventPtr event) override {
+-    languages.push_back(event->language);
++    // Captions at once: a guess is kConfident; a decision (or "und") is not.
++    if (event->confidence_level == media::mojom::ConfidenceLevel::kConfident) {
++      guesses.push_back(event->language);
++      log.push_back("guess:" + event->language);
++    } else {
++      languages.push_back(event->language);
++      log.push_back("lock:" + event->language);
++    }
++  }
++
++  // Where `entry` first appears in the log; the log's size when it doesn't.
++  size_t At(const std::string& entry) const {
++    return std::find(log.begin(), log.end(), entry) - log.begin();
+   }
+ 
+   std::vector<std::string> finals;
++  std::vector<std::string> guesses;
+   std::vector<std::string> languages;
++  std::vector<std::string> log;  // guesses, locks, drafts and finals in order
+   std::vector<std::string> drafts;
+   bool error = false;
+ };
+@@ -269,6 +287,122 @@
+   EXPECT_FALSE(client_.error);
+ }
+ 
++// Captions at once: with a hint, captions start before the decision.
++TEST_F(TarkCaptionRecognizerTest, HintedLanguageCaptionsBeforeTheLock) {
++  if (!Files()) {
++    GTEST_SKIP() << "set TARK_CAPTIONS_ORT, TARK_CAPTIONS_MODELS and TARK_CAPTIONS_TESTDATA";
++  }
++  Bind(*ort_, *models_, "auto:hi");
++  Play(Clip("hi_1.wav"));
++  ASSERT_FALSE(client_.guesses.empty());
++  EXPECT_EQ(client_.guesses.front(), "hi");
++  EXPECT_EQ(client_.languages, std::vector<std::string>{"hi"});
++  const size_t lock = client_.At("lock:hi");
++  EXPECT_LT(std::min(client_.At("draft"), client_.At("final")), lock);
++  EXPECT_FALSE(client_.error);
++}
++
++// A wrong hint is replaced, and the right language's captions start again
++// from the clip's first words.
++TEST_F(TarkCaptionRecognizerTest, WrongHintIsReplacedFromTheFirstWord) {
++  if (!Files()) {
++    GTEST_SKIP() << "set TARK_CAPTIONS_ORT, TARK_CAPTIONS_MODELS and TARK_CAPTIONS_TESTDATA";
++  }
++  Bind(*ort_, *models_, "auto:ta");
++  Play(Clip("hi_1.wav"));
++  ASSERT_FALSE(client_.guesses.empty());
++  EXPECT_EQ(client_.guesses.front(), "ta");
++  EXPECT_EQ(client_.languages, std::vector<std::string>{"hi"});
++  const size_t hindi = std::min(client_.At("guess:hi"), client_.At("lock:hi"));
++  const std::string ko_ek = "\xE0\xA4\x95\xE0\xA5\x8B \xE0\xA4\x8F\xE0\xA4\x95";
++  size_t finals_before = 0;
++  for (size_t i = 0; i < hindi; ++i) {
++    finals_before += client_.log[i] == "final";
++  }
++  ASSERT_GT(client_.finals.size(), finals_before);
++  EXPECT_NE(client_.finals[finals_before].find(ko_ek), std::string::npos)
++      << client_.finals[finals_before];
++}
++
++// lid/hi_1.wav is sure of itself within 2 s; not every clip is (hi_1.wav
++// is not), and those simply wait for the decision.
++TEST_F(TarkCaptionRecognizerTest, DetectorGuessArrivesBeforeTheLock) {
++  if (!Files()) {
++    GTEST_SKIP() << "set TARK_CAPTIONS_ORT, TARK_CAPTIONS_MODELS and TARK_CAPTIONS_TESTDATA";
++  }
++  Bind(*ort_, *models_, "auto");
++  Play(Clip("lid/hi_1.wav"));
++  EXPECT_LT(client_.At("guess:hi"), client_.At("lock:hi"));
++  EXPECT_LT(client_.At("lock:hi"), client_.log.size());
++}
++
++// An Apple guess taps at once; the decision agreeing keeps the same tap,
++// with no audio sent twice.
++TEST_F(TarkCaptionRecognizerTest, AppleGuessTapsBeforeTheLock) {
++  if (!Files()) {
++    GTEST_SKIP() << "set TARK_CAPTIONS_ORT, TARK_CAPTIONS_MODELS and TARK_CAPTIONS_TESTDATA";
++  }
++  Bind(*ort_, *models_, "auto");
++  std::vector<float> clip = Clip("lid/es_1.wav");
++  const size_t played = clip.size() + 16000;
++  Play(std::move(clip));
++  EXPECT_EQ(client_.guesses, std::vector<std::string>{"es"});
++  EXPECT_EQ(client_.languages, std::vector<std::string>{"es"});
++  EXPECT_EQ(tap_languages_, std::vector<std::string>{"es"});
++  EXPECT_GE(tapped_.size(), 3u * 16000);
++  EXPECT_LE(tapped_.size(), played);
++}
++
++// Without the captions download there is nothing to start: no guess, and
++// the decision comes as before.
++TEST_F(TarkCaptionRecognizerTest, GuessWithoutCaptionModelsWaitsForTheLock) {
++  if (!Files()) {
++    GTEST_SKIP() << "set TARK_CAPTIONS_ORT, TARK_CAPTIONS_MODELS and TARK_CAPTIONS_TESTDATA";
++  }
++  base::ScopedTempDir only_detection;
++  ASSERT_TRUE(only_detection.CreateUniqueTempDir());
++  for (const char* name : {"lid.onnx", "lid_labels.txt", "silero_vad.onnx"}) {
++    ASSERT_TRUE(base::CopyFile(models_->AppendASCII(name),
++                               only_detection.GetPath().AppendASCII(name)));
++  }
++  Bind(*ort_, only_detection.GetPath(), "auto:hi");
++  Play(Clip("hi_1.wav"));
++  EXPECT_TRUE(client_.guesses.empty());
++  EXPECT_EQ(client_.languages, std::vector<std::string>{"hi"});
++}
++
++// A hint nothing here captions is plain auto, never an error.
++TEST_F(TarkCaptionRecognizerTest, ParsesHintedAuto) {
++  if (!Files()) {
++    GTEST_SKIP() << "set TARK_CAPTIONS_ORT, TARK_CAPTIONS_MODELS and TARK_CAPTIONS_TESTDATA";
++  }
++  Bind(*ort_, *models_, "auto:xx");
++  Play(Clip("lid/hi_1.wav"));
++  EXPECT_FALSE(client_.error);
++  EXPECT_EQ(client_.languages, std::vector<std::string>{"hi"});
++  ASSERT_FALSE(client_.guesses.empty());
++  EXPECT_EQ(client_.guesses.front(), "hi");
++}
++
++// Review fix: auto-detect again on the language already captioned (a new
++// video starting on the tab's last lock) keeps the shared speech model
++// loaded instead of unloading and loading it again.
++TEST_F(TarkCaptionRecognizerTest, HintAfterTheSameLanguageKeepsTheModel) {
++  if (!Files()) {
++    GTEST_SKIP() << "set TARK_CAPTIONS_ORT, TARK_CAPTIONS_MODELS and TARK_CAPTIONS_TESTDATA";
++  }
++  Bind(*ort_, *models_, "hi");
++  std::vector<float> clip = Clip("hi_1.wav");
++  clip.resize(16000);
++  Send(clip);
++  env_.RunUntilIdle();
++  const int loads = tark_captions::CaptionEngine::ModelLoadsForTesting();
++  recognizer_->OnLanguageChanged("auto:hi");
++  env_.RunUntilIdle();
++  EXPECT_EQ(tark_captions::CaptionEngine::ModelLoadsForTesting(), loads);
++  EXPECT_FALSE(client_.error);
++}
++
+ TEST_F(TarkCaptionRecognizerTest, ParsesLanguages) {
+   EXPECT_EQ(TarkCaptionRecognizer::ParseLanguage("hi-IN"), tark_captions::Language::kHindi);
+   EXPECT_EQ(TarkCaptionRecognizer::ParseLanguage("ta"), tark_captions::Language::kTamil);

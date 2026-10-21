@@ -1,0 +1,791 @@
+--- /dev/null
++++ b/components/tark_captions/language_hint.h
+@@ -0,0 +1,23 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef COMPONENTS_TARK_CAPTIONS_LANGUAGE_HINT_H_
++#define COMPONENTS_TARK_CAPTIONS_LANGUAGE_HINT_H_
++
++#include <optional>
++#include <string>
++#include <string_view>
++
++namespace tark_captions {
++
++// Captions at once: a first guess at the language a tab will speak, from its
++// title's script, before any speech is heard. Devanagari is "hi", Bengali
++// "bn", Tamil "ta"; the script with the most characters wins, with at least
++// 3 of them; anything else (Latin titles included) gives no hint. The
++// detector corrects a wrong hint as soon as it hears speech.
++std::optional<std::string> ScriptHint(std::u16string_view title);
++
++}  // namespace tark_captions
++
++#endif  // COMPONENTS_TARK_CAPTIONS_LANGUAGE_HINT_H_
+--- /dev/null
++++ b/components/tark_captions/language_hint.cc
+@@ -0,0 +1,55 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/tark_captions/language_hint.h"
++
++#include <iterator>
++
++namespace tark_captions {
++namespace {
++
++struct Script {
++  char16_t first;
++  char16_t last;
++  const char* code;
++};
++
++// Unicode blocks; vowel signs and other marks inside a block count too.
++constexpr Script kScripts[] = {
++    {0x0900, 0x097F, "hi"},  // Devanagari
++    {0x0980, 0x09FF, "bn"},  // Bengali
++    {0x0B80, 0x0BFF, "ta"},  // Tamil
++};
++
++constexpr int kMinimumCharacters = 3;
++
++}  // namespace
++
++std::optional<std::string> ScriptHint(std::u16string_view title) {
++  int counts[std::size(kScripts)] = {};
++  // All three blocks are in the Basic Multilingual Plane: no surrogates.
++  for (char16_t c : title) {
++    for (size_t i = 0; i < std::size(kScripts); ++i) {
++      if (c >= kScripts[i].first && c <= kScripts[i].last) {
++        ++counts[i];
++      }
++    }
++  }
++  size_t best = 0;
++  bool tie = false;
++  for (size_t i = 1; i < std::size(kScripts); ++i) {
++    if (counts[i] > counts[best]) {
++      best = i;
++      tie = false;
++    } else if (counts[i] == counts[best]) {
++      tie = true;
++    }
++  }
++  if (tie || counts[best] < kMinimumCharacters) {
++    return std::nullopt;
++  }
++  return kScripts[best].code;
++}
++
++}  // namespace tark_captions
+--- /dev/null
++++ b/components/tark_captions/language_hint_unittest.cc
+@@ -0,0 +1,44 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/tark_captions/language_hint.h"
++
++#include <optional>
++#include <string>
++
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace tark_captions {
++namespace {
++
++TEST(ScriptHintTest, DevanagariTitleIsHindi) {
++  EXPECT_EQ(ScriptHint(u"बजट 2026 समझिए - YouTube"), "hi");
++}
++
++TEST(ScriptHintTest, TamilTitleIsTamil) {
++  EXPECT_EQ(ScriptHint(u"பட்ஜெட் விளக்கம்"), "ta");
++}
++
++TEST(ScriptHintTest, BengaliTitleIsBengali) {
++  EXPECT_EQ(ScriptHint(u"বাজেট ব্যাখ্যা"), "bn");
++}
++
++TEST(ScriptHintTest, LatinTitleHasNoHint) {
++  EXPECT_EQ(ScriptHint(u"Union Budget explained - YouTube"), std::nullopt);
++}
++
++TEST(ScriptHintTest, MostLettersWin) {
++  EXPECT_EQ(ScriptHint(u"বাজেট বাজেট बजट"), "bn");
++}
++
++TEST(ScriptHintTest, TwoLettersAreNotAHint) {
++  EXPECT_EQ(ScriptHint(u"हि - YouTube"), std::nullopt);
++}
++
++TEST(ScriptHintTest, EmptyTitleHasNoHint) {
++  EXPECT_EQ(ScriptHint(u""), std::nullopt);
++}
++
++}  // namespace
++}  // namespace tark_captions
+--- a/components/tark_captions/BUILD.gn
++++ b/components/tark_captions/BUILD.gn
+@@ -37,6 +37,8 @@
+     "language_detector.h",
+     "language_gate.cc",
+     "language_gate.h",
++    "language_hint.cc",
++    "language_hint.h",
+     "mel_frontend.cc",
+     "mel_frontend.h",
+     "model_manifest.cc",
+@@ -99,6 +101,7 @@
+     "indic_text_unittest.cc",
+     "language_detector_unittest.cc",
+     "language_gate_unittest.cc",
++    "language_hint_unittest.cc",
+     "media_players_unittest.cc",
+     "mel_frontend_unittest.cc",
+     "model_manifest_unittest.cc",
+--- a/components/tark_captions/caption_engine.cc
++++ b/components/tark_captions/caption_engine.cc
+@@ -51,6 +51,7 @@
+       return nullptr;
+     }
+     auto shared = base::WrapUnique(new SharedAsr(key, std::move(runtime), std::move(asr)));
++    ++Loads();
+     SharedAsr* raw = shared.get();
+     Registry().emplace(key, std::move(shared));
+     return raw;
+@@ -64,6 +65,17 @@
+     }
+   }
+ 
++  // Every time a model was loaded (tests: no needless reloads).
++  static int& Loads() {
++    static int loads = 0;
++    return loads;
++  }
++
++  static int LoadCount() {
++    base::AutoLock lock(RegistryLock());
++    return Loads();
++  }
++
+   static int Count() {
+     base::AutoLock lock(RegistryLock());
+     return static_cast<int>(Registry().size());
+@@ -130,6 +142,11 @@
+   return SharedAsr::Count();
+ }
+ 
++// static
++int CaptionEngine::ModelLoadsForTesting() {
++  return SharedAsr::LoadCount();
++}
++
+ CaptionEngine::CaptionEngine(SharedAsr* asr, std::unique_ptr<Vad> vad)
+     : asr_(asr), vad_(std::move(vad)), segmenter_(std::make_unique<Segmenter>()) {}
+ 
+--- a/components/tark_captions/caption_engine.h
++++ b/components/tark_captions/caption_engine.h
+@@ -48,6 +48,8 @@
+                                                const base::FilePath& ort_dylib);
+   // How many speech models are loaded in this process.
+   static int LoadedModelsForTesting();
++  // How many times a speech model has been loaded in this process.
++  static int ModelLoadsForTesting();
+ 
+   CaptionEngine(const CaptionEngine&) = delete;
+   CaptionEngine& operator=(const CaptionEngine&) = delete;
+--- a/components/tark_captions/client_language.cc
++++ b/components/tark_captions/client_language.cc
+@@ -12,25 +12,55 @@
+ 
+ ClientLanguage::~ClientLanguage() = default;
+ 
+-void ClientLanguage::ChooseAuto() {
++void ClientLanguage::ChooseAuto(const std::string& hint) {
+   ++generation_;
+   automatic_ = true;
+   code_.clear();
++  guess_.clear();
++  hint_ = hint;
+   state_ = State::kDetecting;
+ }
+ 
+ void ClientLanguage::Choose(const std::string& code) {
+   ++generation_;
+   automatic_ = false;
++  guess_.clear();
++  hint_.clear();
+   Set(code);
+ }
+ 
++bool ClientLanguage::Guessed(const std::string& code) {
++  if (!automatic_ || !code_.empty() || code.empty() || code == "und") {
++    return false;
++  }
++  const std::string guess = code == "ur" ? "hi" : code;
++  const Detection::Kind kind = KindOfLanguage(guess);
++  if (guess == guess_) {
++    return false;
++  }
++  if (!(kind == Detection::Kind::kCaption ||
++        (kind == Detection::Kind::kApple && apple_available_))) {
++    // The speech process stopped the current guess's captions for one this
++    // machine can't caption: that guess ends too (its text goes, and the
++    // next guess or the lock starts again from the first word).
++    if (guess_.empty()) {
++      return false;
++    }
++    guess_.clear();
++    return true;
++  }
++  guess_ = guess;
++  return true;
++}
++
+ std::optional<std::string> ClientLanguage::Detected(const std::string& code) {
+   if (code == "und" || code.empty()) {
+     return std::nullopt;
+   }
+   if (automatic_ && code_.empty()) {
+     Set(code);
++    guess_.clear();
++    last_locked_ = code_;
+     return recognizer_code();
+   }
+   // Locked or picked already: a recognizer that heard otherwise is told.
+@@ -39,13 +69,23 @@
+ }
+ 
+ bool ClientLanguage::AcceptsAppleCaptions(const std::string& tap_language) const {
+-  return state_ == State::kApple && tap_language.substr(0, tap_language.find('-')) == code_;
++  const std::string base = tap_language.substr(0, tap_language.find('-'));
++  // Captions at once: macOS captions a guessed Apple language too.
++  return (state_ == State::kApple && base == code_) ||
++         (state_ == State::kDetecting && !guess_.empty() && base == guess_);
++}
++
++bool ClientLanguage::AcceptsCaptionsFrom(const std::string& source_language) const {
++  if (state_ != State::kDetecting || guess_.empty() || source_language.empty()) {
++    return true;
++  }
++  return (source_language == "ur" ? "hi" : source_language) == guess_;
+ }
+ 
+ std::string ClientLanguage::recognizer_code() const {
+   switch (state_) {
+     case State::kDetecting:
+-      return "auto";
++      return hint_.empty() ? "auto" : "auto:" + hint_;
+     case State::kCaptioning:
+     case State::kApple:
+       return code_;
+--- a/components/tark_captions/client_language.h
++++ b/components/tark_captions/client_language.h
+@@ -34,8 +34,10 @@
+   // macOS 26's speech for the Apple languages (it loads in the background).
+   void set_apple_available(bool available) { apple_available_ = available; }
+ 
+-  // Auto-detect: a new call, or "Auto-detect" picked again.
+-  void ChooseAuto();
++  // Auto-detect: a new call, or "Auto-detect" picked again. Captions at
++  // once: `hint` ("hi", "es"...) is where captions start before the speech
++  // process guesses; empty for none.
++  void ChooseAuto(const std::string& hint = std::string());
+   // The user picked `code` for this call.
+   void Choose(const std::string& code);
+   // The speech process heard `code` ("und": it couldn't tell). Ignored once
+@@ -44,6 +46,17 @@
+   // otherwise), or nothing.
+   std::optional<std::string> Detected(const std::string& code);
+ 
++  // Captions at once: the speech process captions on a guess, `code`, while
++  // it listens. True when the guess changed: a new one, or none when `code`
++  // is one nothing on this machine can caption (the speech process stopped
++  // the old one's captions). Ignored once a language is locked or picked.
++  bool Guessed(const std::string& code);
++  // The language being guessed while detecting; "" when none.
++  const std::string& guess() const { return guess_; }
++  // The language the last detection in this tab locked on ("" if none),
++  // kept in memory only: a new video in the tab starts on it.
++  const std::string& last_locked() const { return last_locked_; }
++
+   State state() const { return state_; }
+   // "" while detecting.
+   const std::string& code() const { return code_; }
+@@ -60,7 +73,12 @@
+   // to this call: its language is that Apple language.
+   bool AcceptsAppleCaptions(const std::string& tap_language) const;
+ 
+-  // What the recognizers are told: "auto" until a language is known, then
++  // Captions at once, several players: while captioning on a guess, captions
++  // from a recognizer on another language ("" unknown: accepted) wait.
++  bool AcceptsCaptionsFrom(const std::string& source_language) const;
++
++  // What the recognizers are told: "auto" (or "auto:<hint>") until a
++  // language is known, then
+   // that language, or "none" when nothing on this Mac can caption it.
+   std::string recognizer_code() const;
+ 
+@@ -71,6 +89,9 @@
+   State state_ = State::kDetecting;
+   std::string code_;
+   bool automatic_ = true;
++  std::string guess_;
++  std::string hint_;
++  std::string last_locked_;
+   uint64_t generation_ = 0;
+ };
+ 
+--- a/components/tark_captions/client_language_unittest.cc
++++ b/components/tark_captions/client_language_unittest.cc
+@@ -189,5 +189,105 @@
+   EXPECT_FALSE(language.ShouldRestartForNewStream(false));
+ }
+ 
++// Captions at once: captions run on a guess until the lock.
++TEST(ClientLanguageTest, GuessWhileDetecting) {
++  ClientLanguage language(true);
++  EXPECT_TRUE(language.Guessed("hi"));
++  EXPECT_EQ(language.state(), State::kDetecting);
++  EXPECT_EQ(language.guess(), "hi");
++  EXPECT_EQ(language.code(), "");
++  EXPECT_EQ(language.recognizer_code(), "auto");
++}
++
++TEST(ClientLanguageTest, HintGoesToRecognizers) {
++  ClientLanguage language(true);
++  language.ChooseAuto("ta");
++  EXPECT_EQ(language.recognizer_code(), "auto:ta");
++  language.Detected("hi");
++  EXPECT_EQ(language.recognizer_code(), "hi");
++}
++
++TEST(ClientLanguageTest, LockClearsTheGuess) {
++  ClientLanguage language(true);
++  language.Guessed("ta");
++  language.Detected("hi");
++  EXPECT_EQ(language.code(), "hi");
++  EXPECT_EQ(language.guess(), "");
++}
++
++TEST(ClientLanguageTest, PickDuringGuessWins) {
++  ClientLanguage language(true);
++  language.Guessed("hi");
++  language.Choose("ta");
++  EXPECT_EQ(language.guess(), "");
++  EXPECT_FALSE(language.Guessed("bn"));
++  language.Detected("hi");
++  EXPECT_EQ(language.code(), "ta");
++  EXPECT_FALSE(language.detected());
++}
++
++TEST(ClientLanguageTest, GuessFromAnotherPlayerReplaces) {
++  ClientLanguage language(true);
++  EXPECT_TRUE(language.Guessed("hi"));
++  EXPECT_TRUE(language.Guessed("ta"));
++  EXPECT_FALSE(language.Guessed("ta"));
++  EXPECT_EQ(language.guess(), "ta");
++}
++
++TEST(ClientLanguageTest, UrduGuessIsHindi) {
++  ClientLanguage language(true);
++  EXPECT_TRUE(language.Guessed("ur"));
++  EXPECT_EQ(language.guess(), "hi");
++}
++
++TEST(ClientLanguageTest, AppleCaptionsAcceptedForTheGuess) {
++  ClientLanguage language(true);
++  language.Guessed("es");
++  EXPECT_TRUE(language.AcceptsAppleCaptions("es-US"));
++  EXPECT_FALSE(language.AcceptsAppleCaptions("fr"));
++}
++
++// Without macOS 26's speech an Apple language can't be captioned: no guess.
++TEST(ClientLanguageTest, GuessOfAppleLanguageNeedsAppleSpeech) {
++  ClientLanguage language(/*apple_available=*/false);
++  EXPECT_FALSE(language.Guessed("es"));
++  EXPECT_EQ(language.guess(), "");
++  EXPECT_FALSE(language.Guessed("sw"));
++}
++
++TEST(ClientLanguageTest, LastLockIsRemembered) {
++  ClientLanguage language(true);
++  language.Detected("bn");
++  language.ChooseAuto();
++  EXPECT_EQ(language.last_locked(), "bn");
++  language.Choose("ta");
++  EXPECT_EQ(language.last_locked(), "bn");
++}
++
++// Review fix: a guess this machine can't caption (an Apple language without
++// macOS 26's speech) ends the current guess: the speech process stopped its
++// captions for it, and starts again from the first word on the next one.
++TEST(ClientLanguageTest, UnservableAppleGuessDropsTheGuess) {
++  ClientLanguage language(/*apple_available=*/false);
++  EXPECT_TRUE(language.Guessed("hi"));
++  EXPECT_TRUE(language.Guessed("es"));
++  EXPECT_EQ(language.guess(), "");
++  EXPECT_TRUE(language.Guessed("hi"));
++  EXPECT_EQ(language.guess(), "hi");
++}
++
++// Review fix: with several players, captions in another language than the
++// guess wait; after the lock every recognizer is told the language.
++TEST(ClientLanguageTest, CaptionsFromAnotherLanguageWaitWhileGuessing) {
++  ClientLanguage language(true);
++  language.Guessed("hi");
++  EXPECT_FALSE(language.AcceptsCaptionsFrom("ta"));
++  EXPECT_TRUE(language.AcceptsCaptionsFrom("hi"));
++  EXPECT_TRUE(language.AcceptsCaptionsFrom("ur"));
++  EXPECT_TRUE(language.AcceptsCaptionsFrom(""));
++  language.Detected("ta");
++  EXPECT_TRUE(language.AcceptsCaptionsFrom("hi"));
++}
++
+ }  // namespace
+ }  // namespace tark_captions
+--- a/components/tark_captions/detection_policy.cc
++++ b/components/tark_captions/detection_policy.cc
+@@ -30,18 +30,16 @@
+   return std::find(set.begin(), set.end(), code) != set.end();
+ }
+ 
+-}  // namespace
+-
+-Detection DecideLanguage(base::span<const float> logits,
+-                         base::span<const std::string> labels,
+-                         double speech_seconds) {
+-  if (speech_seconds < kFirstDecision || logits.empty() || logits.size() != labels.size()) {
+-    return {};
++// The detector's probabilities by language, Urdu counted as Hindi (spoken
++// Hindustani); empty when scores and labels don't match.
++std::map<std::string, double> Probabilities(base::span<const float> logits,
++                                            base::span<const std::string> labels) {
++  std::map<std::string, double> p;
++  if (logits.empty() || logits.size() != labels.size()) {
++    return p;
+   }
+-  // Probabilities, with Urdu counted as Hindi (spoken Hindustani).
+   const float max = *std::max_element(logits.begin(), logits.end());
+   double sum = 0;
+-  std::map<std::string, double> p;
+   for (size_t i = 0; i < logits.size(); ++i) {
+     const double e = std::exp(static_cast<double>(logits[i]) - max);
+     sum += e;
+@@ -50,6 +48,21 @@
+   for (auto& [code, value] : p) {
+     value /= sum;
+   }
++  return p;
++}
++
++}  // namespace
++
++Detection DecideLanguage(base::span<const float> logits,
++                         base::span<const std::string> labels,
++                         double speech_seconds) {
++  if (speech_seconds < kFirstDecision) {
++    return {};
++  }
++  const std::map<std::string, double> p = Probabilities(logits, labels);
++  if (p.empty()) {
++    return {};
++  }
+   auto top = std::max_element(p.begin(), p.end(),
+                               [](const auto& a, const auto& b) { return a.second < b.second; });
+   const bool sure = top->second >= kLockProbability;
+@@ -76,6 +89,22 @@
+   return {KindOfLanguage(code), code};
+ }
+ 
++std::optional<std::string> GuessLanguage(base::span<const float> logits,
++                                         base::span<const std::string> labels) {
++  const std::map<std::string, double> p = Probabilities(logits, labels);
++  if (p.empty()) {
++    return std::nullopt;
++  }
++  auto top = std::max_element(p.begin(), p.end(),
++                              [](const auto& a, const auto& b) { return a.second < b.second; });
++  const Detection::Kind kind = KindOfLanguage(top->first);
++  if (top->second < kGuessProbability ||
++      (kind != Detection::Kind::kCaption && kind != Detection::Kind::kApple)) {
++    return std::nullopt;
++  }
++  return top->first;
++}
++
+ Detection::Kind KindOfLanguage(const std::string& code) {
+   if (code == "ur" || In(kCaptioned, code)) {
+     return Detection::Kind::kCaption;
+--- a/components/tark_captions/detection_policy.h
++++ b/components/tark_captions/detection_policy.h
+@@ -5,6 +5,7 @@
+ #ifndef COMPONENTS_TARK_CAPTIONS_DETECTION_POLICY_H_
+ #define COMPONENTS_TARK_CAPTIONS_DETECTION_POLICY_H_
+ 
++#include <optional>
+ #include <string>
+ 
+ #include "base/containers/span.h"
+@@ -18,6 +19,14 @@
+ inline constexpr double kFirstDecision = 3.0;
+ inline constexpr double kLastDecision = 5.0;
+ inline constexpr double kLockProbability = 0.9;
++// Captions at once: before the decision, the speech's language is guessed
++// when the speech crosses each of these, so captions can start on it; the
++// decision corrects a wrong guess. Measured on 534 FLEURS clips
++// (notes/2026-10-20-d4-language-id-spike.md): at 1 s a guess of Tark's own
++// languages is right 83 % of the time, of Apple's 99 %.
++inline constexpr double kGuessChecks[] = {1.0, 1.5, 2.0};
++inline constexpr double kGuessProbability = 0.5;
++
+ // An unsure call between neighbouring Indian languages goes to the one Tark
+ // captions when that one has at least this much.
+ inline constexpr double kNeighbourMass = 0.1;
+@@ -44,6 +53,12 @@
+                          base::span<const std::string> labels,
+                          double speech_seconds);
+ 
++// The language to start captions in before the decision: the most likely
++// one (Urdu counted as Hindi) when it has at least kGuessProbability and Tark
++// or macOS captions it; else nothing.
++std::optional<std::string> GuessLanguage(base::span<const float> logits,
++                                         base::span<const std::string> labels);
++
+ }  // namespace tark_captions
+ 
+ #endif  // COMPONENTS_TARK_CAPTIONS_DETECTION_POLICY_H_
+--- a/components/tark_captions/detection_policy_unittest.cc
++++ b/components/tark_captions/detection_policy_unittest.cc
+@@ -6,6 +6,7 @@
+ 
+ #include <cmath>
+ #include <map>
++#include <optional>
+ #include <string>
+ #include <vector>
+ 
+@@ -81,5 +82,35 @@
+   ExpectDetection(DecideLanguage(std::vector<float>(3, 0.0f), kLabels, 5.0), Kind::kUnsure, "");
+ }
+ 
++// Captions at once: the guess that starts captions before the lock.
++std::optional<std::string> Guess(const std::map<std::string, double>& named) {
++  return GuessLanguage(Scores(named), kLabels);
++}
++
++TEST(GuessLanguageTest, TakesTopTarkLanguage) {
++  EXPECT_EQ(Guess({{"hi", 0.6}, {"ta", 0.3}}), "hi");
++}
++
++TEST(GuessLanguageTest, CountsUrduAsHindi) {
++  EXPECT_EQ(Guess({{"ur", 0.3}, {"hi", 0.25}, {"en", 0.45}}), "hi");
++}
++
++TEST(GuessLanguageTest, NeedsHalf) {
++  EXPECT_EQ(Guess({{"hi", 0.45}, {"ta", 0.4}}), std::nullopt);
++}
++
++TEST(GuessLanguageTest, TakesAppleLanguage) {
++  EXPECT_EQ(Guess({{"en", 0.8}}), "en");
++}
++
++TEST(GuessLanguageTest, SkipsWhatNothingCaptions) {
++  EXPECT_EQ(Guess({{"sw", 0.9}}), std::nullopt);
++  EXPECT_EQ(Guess({{"te", 0.7}}), std::nullopt);  // Planned, not captioned yet.
++}
++
++TEST(GuessLanguageTest, ScoresAndLabelsMustMatch) {
++  EXPECT_EQ(GuessLanguage(std::vector<float>(3, 0.0f), kLabels), std::nullopt);
++}
++
+ }  // namespace
+ }  // namespace tark_captions
+--- a/components/tark_captions/language_gate.cc
++++ b/components/tark_captions/language_gate.cc
+@@ -48,11 +48,12 @@
+   vad_.reset();
+ }
+ 
+-std::optional<Detection> LanguageGate::AddMono16k(base::span<const float> pcm) {
++LanguageGate::Result LanguageGate::AddMono16k(base::span<const float> pcm) {
++  Result result;
+   if (decided_) {
+-    return std::nullopt;
++    return result;
+   }
+-  std::optional<Detection> decision;
++  std::optional<Detection>& decision = result.decision;
+   for (float sample : pcm) {
+     chunk_.push_back(sample);
+     if (chunk_.size() < Vad::kChunk) {
+@@ -81,6 +82,17 @@
+     const double before = speech_seconds();
+     speech_.insert(speech_.end(), heard_.end() - Vad::kChunk, heard_.end());
+     const double now = speech_seconds();
++    // Guess when the speech crosses each check (captions at once).
++    for (double at : kGuessChecks) {
++      if (before < at && now >= at) {
++        std::optional<std::string> g =
++            GuessLanguage(detector_->Logits(speech_), detector_->labels());
++        if (g && *g != guess_) {
++          guess_ = *g;
++          result.guess = *g;
++        }
++      }
++    }
+     // Decide when the speech crosses 3 s, and again at 5 s if unsure.
+     for (double at : {kFirstDecision, kLastDecision}) {
+       if (before < at && now >= at) {
+@@ -92,7 +104,7 @@
+       }
+     }
+   }
+-  return decision;
++  return result;
+ }
+ 
+ std::vector<float> LanguageGate::TakeHeard() {
+--- a/components/tark_captions/language_gate.h
++++ b/components/tark_captions/language_gate.h
+@@ -7,6 +7,7 @@
+ 
+ #include <memory>
+ #include <optional>
++#include <string>
+ #include <vector>
+ 
+ #include "base/containers/span.h"
+@@ -21,7 +22,9 @@
+ 
+ // The first seconds of a call (D4 Phase 3): listens until the client has
+ // spoken for kFirstDecision seconds (kLastDecision when unsure), then says
+-// which language it is. Only speech counts (Silero VAD): silence, hold music
++// which language it is. Before that it guesses (captions at once): when the
++// speech crosses each of kGuessChecks, a changed GuessLanguage is reported,
++// so captions can start in it; the decision corrects a wrong guess. Only speech counts (Silero VAD): silence, hold music
+ // and noise never decide. What it heard since the speech began is kept so
+ // the captions, or the browser's Apple captioner, start from the first word.
+ // Use on one sequence.
+@@ -36,11 +39,19 @@
+   LanguageGate& operator=(const LanguageGate&) = delete;
+   ~LanguageGate();
+ 
+-  // 16 kHz mono call audio. The decision, the one time it is made.
+-  std::optional<Detection> AddMono16k(base::span<const float> pcm);
+-
+-  // The audio since just before the speech began (at most the last 30 s);
+-  // empty after it is taken.
++  struct Result {
++    // A new guess (never the same one twice, never after the decision).
++    std::optional<std::string> guess;
++    // The decision, the one time it is made.
++    std::optional<Detection> decision;
++  };
++  // 16 kHz mono call audio.
++  Result AddMono16k(base::span<const float> pcm);
++
++  // The audio since just before the speech began (at most the last 30 s),
++  // kept: a changed guess replays it.
++  base::span<const float> heard() const { return heard_; }
++  // The same audio, taken; empty afterwards.
+   std::vector<float> TakeHeard();
+   double speech_seconds() const;
+ 
+@@ -56,6 +67,7 @@
+   std::vector<float> speech_;   // Speech only: what the detector hears.
+   std::vector<float> heard_;    // Everything since the speech began.
+   std::vector<float> preroll_;  // The half second before it began.
++  std::string guess_;  // The last guess reported, if any.
+   bool decided_ = false;
+ };
+ 
+--- a/components/tark_captions/language_gate_unittest.cc
++++ b/components/tark_captions/language_gate_unittest.cc
+@@ -7,6 +7,7 @@
+ #include <memory>
+ #include <optional>
+ #include <string>
++#include <utility>
+ #include <vector>
+ 
+ #include "base/rand_util.h"
+@@ -29,14 +30,21 @@
+     ASSERT_TRUE(gate_);
+   }
+ 
+-  // Feeds `pcm` in 10 ms blocks; the first decision, if any.
++  // Feeds `pcm` in 10 ms blocks; the first decision, if any. Guesses are
++  // kept in `guesses_`, each with the seconds of speech it came at.
+   std::optional<Detection> Feed(const std::vector<float>& pcm) {
+     std::optional<Detection> first;
+     for (size_t i = 0; i < pcm.size(); i += 160) {
+-      std::optional<Detection> d =
++      LanguageGate::Result r =
+           gate_->AddMono16k(base::span(pcm).subspan(i, std::min<size_t>(160, pcm.size() - i)));
+-      if (d && !first) {
+-        first = d;
++      if (r.guess) {
++        guesses_.emplace_back(*r.guess, gate_->speech_seconds());
++        if (!first) {
++          heard_at_guess_ = gate_->heard().size();
++        }
++      }
++      if (r.decision && !first) {
++        first = r.decision;
+       }
+     }
+     return first;
+@@ -51,6 +59,8 @@
+ 
+   std::optional<base::FilePath> ort_, models_, testdata_;
+   std::unique_ptr<LanguageGate> gate_;
++  std::vector<std::pair<std::string, double>> guesses_;
++  size_t heard_at_guess_ = 0;
+ };
+ 
+ TEST_F(LanguageGateTest, DecidesSpanishAndKeepsWhatItHeard) {
+@@ -78,6 +88,38 @@
+   }
+   EXPECT_FALSE(Feed(pcm));
+   EXPECT_LT(gate_->speech_seconds(), kFirstDecision);
++  EXPECT_TRUE(guesses_.empty());
++}
++
++// Captions at once: a guess comes from the first 1 to 2 s of speech, the
++// decision later.
++TEST_F(LanguageGateTest, GuessesBeforeDeciding) {
++  std::optional<Detection> d = Feed(Clip("lid/hi_1.wav"));
++  ASSERT_TRUE(d);
++  EXPECT_EQ(d->code, "hi");
++  ASSERT_FALSE(guesses_.empty());
++  EXPECT_EQ(guesses_.front().first, "hi");
++  // A guess is made when the speech crosses a check (one VAD chunk late at most).
++  EXPECT_LE(guesses_.front().second, kGuessChecks[std::size(kGuessChecks) - 1] + 0.05);
++}
++
++TEST_F(LanguageGateTest, GuessIsReportedOnce) {
++  ASSERT_TRUE(Feed(Clip("lid/es_1.wav")));
++  ASSERT_EQ(guesses_.size(), 1u);
++  EXPECT_EQ(guesses_.front().first, "es");
++}
++
++// The audio since the speech began stays for a replay; the decision takes it.
++TEST_F(LanguageGateTest, HeardIsKeptForReplay) {
++  std::vector<float> pcm = Clip("lid/es_1.wav");
++  // Up to 2.5 s of the clip: past the guesses, before the decision.
++  pcm.resize(std::min<size_t>(pcm.size(), 40000));
++  Feed(pcm);
++  ASSERT_FALSE(guesses_.empty());
++  EXPECT_GT(heard_at_guess_, 0u);
++  const size_t kept = gate_->heard().size();
++  EXPECT_GE(kept, heard_at_guess_);
++  EXPECT_EQ(gate_->TakeHeard().size(), kept);
+ }
+ 
+ TEST_F(LanguageGateTest, MissingDetectorIsNull) {
