@@ -1,3 +1,15 @@
+--- a/chrome/app/tark_captions_strings.grdp
++++ b/chrome/app/tark_captions_strings.grdp
+@@ -82,6 +82,9 @@
+   <message name="IDS_TARK_CAPTIONS_DETECTED" desc="Call captions pill: the language chip once Tark has worked out which language the other person speaks. $1 is the language, e.g. Tamil.">
+     <ph name="LANGUAGE">$1<ex>Tamil</ex></ph> · detected
+   </message>
++  <message name="IDS_TARK_CAPTIONS_CHECKING" desc="Call captions pill: the language chip while captions run on Tark's first guess at the other person's language, before it is sure. $1 is the language, e.g. Tamil.">
++    <ph name="LANGUAGE">$1<ex>Tamil</ex></ph> · checking
++  </message>
+   <message name="IDS_TARK_CAPTIONS_UNSUPPORTED" desc="Call captions pill: the other person speaks a language Tark cannot caption. $1 is the language, e.g. Swahili.">
+     This sounds like <ph name="LANGUAGE">$1<ex>Swahili</ex></ph>. Tark can't caption it yet — it's planned.
+   </message>
 --- a/chrome/browser/accessibility/live_caption/live_caption_speech_recognition_host.cc
 +++ b/chrome/browser/accessibility/live_caption/live_caption_speech_recognition_host.cc
 @@ -228,7 +228,9 @@
@@ -190,3 +202,86 @@
    void Pump();
    void OnRendered(bool is_final,
                    uint64_t generation,
+--- a/chrome/browser/ui/views/tark_captions/caption_pill_controller.cc
++++ b/chrome/browser/ui/views/tark_captions/caption_pill_controller.cc
+@@ -72,6 +72,8 @@
+       return l10n_util::GetStringUTF16(IDS_TARK_CAPTIONS_AUTO_DETECT);
+     case PillLanguage::Chip::kDetected:
+       return l10n_util::GetStringFUTF16(IDS_TARK_CAPTIONS_DETECTED, NameOf(pill.code));
++    case PillLanguage::Chip::kChecking:
++      return l10n_util::GetStringFUTF16(IDS_TARK_CAPTIONS_CHECKING, NameOf(pill.code));
+     case PillLanguage::Chip::kChosen:
+       return NameOf(pill.code);
+   }
+@@ -244,6 +246,16 @@
+   ShowCaption();
+ }
+ 
++void TarkCaptionPillController::OnCaptionsReplaced(CallCaptionsTabHelper* tab) {
++  if (tab != shown_) {
++    return;
++  }
++  // Captions at once: what was shown on a replaced guess goes; the same
++  // speech comes again in the right language.
++  ClearText();
++  Update();
++}
++
+ void TarkCaptionPillController::OnClientLanguageChanged(CallCaptionsTabHelper* tab) {
+   if (tab != shown_) {
+     return;
+--- a/chrome/browser/ui/views/tark_captions/caption_pill_controller.h
++++ b/chrome/browser/ui/views/tark_captions/caption_pill_controller.h
+@@ -63,6 +63,7 @@
+   void OnCaption(CallCaptionsTabHelper* tab, bool is_final, const std::string& text) override;
+   void OnCaptionsUnavailable(CallCaptionsTabHelper* tab) override;
+   void OnClientLanguageChanged(CallCaptionsTabHelper* tab) override;
++  void OnCaptionsReplaced(CallCaptionsTabHelper* tab) override;
+   void OnCaptionRendered(CallCaptionsTabHelper* tab,
+                          bool is_final,
+                          const std::string& shown,
+--- a/chrome/browser/ui/views/tark_captions/pill_language.cc
++++ b/chrome/browser/ui/views/tark_captions/pill_language.cc
+@@ -15,6 +15,11 @@
+   PillLanguage out;
+   out.code = language.code();
+   if (language.state() == State::kDetecting) {
++    if (!language.guess().empty()) {
++      // Captions at once: captions run on a guess until the lock.
++      out.code = language.guess();
++      out.chip = PillLanguage::Chip::kChecking;
++    }
+     return out;
+   }
+   out.chip = language.automatic() ? PillLanguage::Chip::kDetected : PillLanguage::Chip::kChosen;
+--- a/chrome/browser/ui/views/tark_captions/pill_language.h
++++ b/chrome/browser/ui/views/tark_captions/pill_language.h
+@@ -21,6 +21,7 @@
+   enum class Chip {
+     kAutoDetect,  // "Auto-detect": listening for it.
+     kDetected,    // "Tamil · detected".
++    kChecking,    // "Tamil · checking": captions on a guess (captions at once).
+     kChosen,      // "Tamil": the user picked it.
+   };
+   enum class Notice {
+--- a/chrome/browser/ui/views/tark_captions/pill_language_unittest.cc
++++ b/chrome/browser/ui/views/tark_captions/pill_language_unittest.cc
+@@ -22,6 +22,18 @@
+   EXPECT_EQ(pill.notice, PillLanguage::Notice::kNone);
+ }
+ 
++// Captions at once: while captions run on a guess the chip says so.
++TEST(PillLanguageTest, GuessShowsChecking) {
++  ClientLanguage language(/*apple_available=*/false);
++  language.Guessed("hi");
++  const PillLanguage pill = DescribeLanguage(language);
++  EXPECT_EQ(pill.chip, PillLanguage::Chip::kChecking);
++  EXPECT_EQ(pill.code, "hi");
++  EXPECT_EQ(pill.notice, PillLanguage::Notice::kNone);
++  language.Detected("hi");
++  EXPECT_EQ(DescribeLanguage(language).chip, PillLanguage::Chip::kDetected);
++}
++
+ TEST(PillLanguageTest, ShowsDetectedSuffix) {
+   ClientLanguage language(false);
+   language.Detected("ta");
