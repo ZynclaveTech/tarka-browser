@@ -12,14 +12,28 @@
  
      /**
       * Starts an activity showing a help page for the specified context ID.
-@@ -47,7 +48,10 @@
+@@ -47,7 +48,24 @@
       * @return The generated help URL.
       */
      static String getPLinkHelpUrl(String helpContext) {
 -        return P_LINK_URL_PREFIX + helpContext;
-+        // A help context ("privacy", "safe_browsing") names the page's section; anything else
-+        // opens the top of the page.
++        // A help context names the page's section: Tark's own ("languages"), or Chromium's, which
++        // the page does not use, turned into the page's; anything else opens the top of the page.
 +        String section = helpContext == null ? "" : helpContext.replaceAll("[^a-z0-9_-]", "");
++        switch (section) {
++            case "mobile_settings":
++            case "syncgoogleservices":
++                section = "settings";
++                break;
++            case "mobile_privacy":
++                section = "privacy";
++                break;
++            case "safebrowsing_android":
++                section = "safe_browsing";
++                break;
++            default:
++                break;
++        }
 +        return section.isEmpty() ? FALLBACK_SUPPORT_URL : P_LINK_URL_PREFIX + section;
      }
  
@@ -58,3 +72,36 @@
 +                activity, HelpAndFeedbackLauncherDelegate.FALLBACK_SUPPORT_URL + "#feedback");
      }
  }
+--- a/chrome/android/java/src/org/chromium/chrome/browser/settings/SettingsMenuHelper.java
++++ b/chrome/android/java/src/org/chromium/chrome/browser/settings/SettingsMenuHelper.java
+@@ -30,6 +30,8 @@
+ import org.chromium.build.annotations.Nullable;
+ import org.chromium.chrome.R;
+ import org.chromium.chrome.browser.feedback.HelpAndFeedbackLauncher;
++import org.chromium.chrome.browser.language.settings.LanguageSettings;
++import org.chromium.chrome.browser.search_engines.settings.SearchEngineSettings;
+ import org.chromium.chrome.browser.settings.search.SettingsSearchCoordinator;
+ import org.chromium.components.browser_ui.settings.SearchViewProvider;
+ import org.chromium.components.browser_ui.util.TraceEventVectorDrawableCompat;
+@@ -200,10 +202,20 @@
+         } else if (item.getItemId() == R.id.menu_id_general_help) {
+             RecordUserAction.record("Settings.MobileHelpAndFeedback");
+             delegate.getHelpAndFeedbackLauncher()
+-                    .show(activity, activity.getString(R.string.help_context_settings), null);
++                    .show(activity, helpContext(activity, mainFragment), null);
+             return true;
+         }
+         return false;
++    }
++
++    /**
++     * Tark (A3): the screens with their own part of Tark's help page; Chromium sends one context
++     * for every screen without its own help.
++     */
++    private static String helpContext(Activity activity, @Nullable Fragment fragment) {
++        if (fragment instanceof SearchEngineSettings) return "search_engines";
++        if (fragment instanceof LanguageSettings) return "languages";
++        return activity.getString(R.string.help_context_settings);
+     }
+ 
+     /**

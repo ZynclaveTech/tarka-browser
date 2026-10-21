@@ -390,6 +390,17 @@ class TestSettingsPadding(unittest.TestCase):
         self.assertIn('+        mHorizontalMargin = 0;', patch)
         self.assertIn('\nlook-settings-padding.patch\n', (ANDROID / 'patches' / 'series').read_text())
 
+    def test_switches_end_under_the_help_button(self):
+        # Found on the emulator (build 6): the switch sat centred in a wider
+        # widget frame, 14 px (5 dp) short of the row's end and of the "?".
+        patch = (ANDROID / 'patches' / 'look-settings-padding.patch').read_text()
+        self.assertIn('+++ b/components/browser_ui/settings/android/widget/java/src/org/chromium/'
+                      'components/browser_ui/settings/ChromeSwitchPreference.java', patch)
+        self.assertIn('+            ((LinearLayout) widgetFrame).setGravity(Gravity.END | Gravity.CENTER_VERTICAL);',
+                      patch)
+        for imp in ('android.view.Gravity', 'android.widget.LinearLayout'):
+            self.assertIn(f'+import {imp};', patch)
+
 
 class TestTarkHelp(unittest.TestCase):
     """A3 (the user: "Open Tark help on gettarka.com"): every help and
@@ -412,5 +423,59 @@ class TestTarkHelp(unittest.TestCase):
     def test_feedback_goes_to_its_section(self):
         self.assertIn('FALLBACK_SUPPORT_URL + "#feedback"', self.patch)
 
+    # The sections of gettarka.com/help/android/ (gettarka-site,
+    # src/help/android/index.html).
+    PAGE_SECTIONS = {'settings', 'search_engines', 'languages', 'ads', 'privacy', 'safe_browsing',
+                     'autofill', 'feedback'}
+
+    def test_chromium_contexts_open_the_pages_sections(self):
+        # Found on the emulator (build 6): Chromium's contexts, not the
+        # page's, so every "?" opened the top of the page.
+        added = '\n'.join(l[1:] for l in self.patch.splitlines() if l.startswith('+'))
+        mapping = {}
+        for block in re.findall(r'((?:\s*case "[a-z_]+":\n)+)\s*section = "([a-z_]+)";', added):
+            for context in re.findall(r'case "([a-z_]+)":', block[0]):
+                mapping[context] = block[1]
+        self.assertEqual(mapping, {'mobile_settings': 'settings', 'syncgoogleservices': 'settings',
+                                   'mobile_privacy': 'privacy', 'safebrowsing_android': 'safe_browsing'})
+        self.assertLessEqual(set(mapping.values()), self.PAGE_SECTIONS)
+
+    def test_search_engine_and_languages_open_their_own_sections(self):
+        # Both send Chromium's one context for every screen without its own.
+        self.assertIn('+++ b/chrome/android/java/src/org/chromium/chrome/browser/settings/SettingsMenuHelper.java',
+                      self.patch)
+        self.assertIn('+        if (fragment instanceof SearchEngineSettings) return "search_engines";', self.patch)
+        self.assertIn('+        if (fragment instanceof LanguageSettings) return "languages";', self.patch)
+        self.assertIn('+                    .show(activity, helpContext(activity, mainFragment), null);', self.patch)
+        for section in ('search_engines', 'languages'):
+            self.assertIn(section, self.PAGE_SECTIONS)
+
     def test_in_the_series(self):
         self.assertIn('\nlook-help-on-gettarka.patch\n', (ANDROID / 'patches' / 'series').read_text())
+
+
+class TestNoTranslateSettings(unittest.TestCase):
+    """A3 (the user: fix the Google Translate row): ungoogled-chromium turns
+    Translate off without --translate-script-url, yet Languages still showed
+    "Offer to send pages in other languages to Google Translate". As on the
+    Mac (removals/translate.patch), its settings show only with a server."""
+
+    def setUp(self):
+        self.patch = (ANDROID / 'patches' / 'translate-settings-off.patch').read_text()
+
+    def test_hidden_without_a_translate_server(self):
+        self.assertIn('+++ b/chrome/browser/language/android/java/src/org/chromium/chrome/browser/'
+                      'language/settings/LanguageSettings.java', self.patch)
+        self.assertIn('+        if (CommandLine.getInstance().hasSwitch("translate-script-url")) return;',
+                      self.patch)
+        self.assertIn('+import org.chromium.base.CommandLine;', self.patch)
+
+    def test_both_pages(self):
+        # The detailed page's whole section, and the basic page's switch.
+        self.assertIn('findPreference("translation_settings_section")', self.patch)
+        self.assertIn('findPreference(TRANSLATE_SWITCH_KEY)', self.patch)
+        self.assertEqual(self.patch.count('+        hideTranslateWithoutAServer();'), 2)
+
+    def test_in_the_series_after_the_languages_row(self):
+        series = (ANDROID / 'patches' / 'series').read_text().split()
+        self.assertGreater(series.index('translate-settings-off.patch'), series.index('xlit-android-settings.patch'))
