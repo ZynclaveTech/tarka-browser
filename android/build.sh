@@ -280,4 +280,6 @@ run ninja -C "$_src_dir/out/Default" components/tark_xlit:host_unittests
 run env CR_SOURCE_ROOT="$_src_dir" "$_src_dir/out/Default/clang_x64/tark_xlit_unittests"
 run ninja -C "$_src_dir/out/Default" chrome/browser/tark_xlit:host_unittests
 run "$_src_dir/out/Default/clang_x64/tark_xlit_files_unittests"
+run ninja -C "$_src_dir/out/Default" chrome/browser/tark_update:host_unittests
+run "$_src_dir/out/Default/clang_x64/tark_update_unittests"
 log "built $_src_dir/out/Default/apks/ChromePublic.apk"

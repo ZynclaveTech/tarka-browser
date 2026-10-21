@@ -100,6 +100,9 @@ MESSAGE_RENAMES = {
          'or for one site from its page info.', '3981465354637804599', '8813220890469783504',
          {'hi': 'Tark हर साइट पर विज्ञापन और ट्रैकर ब्लॉक करता है। सभी साइटों पर विज्ञापन दिखाने के लिए '
                 'इसे चालू करें, या किसी एक साइट के लिए उसकी पेज जानकारी से।'}),
+    # A5: the app menu's update item (the direct APK's daily update check).
+    'IDS_MENU_UPDATE':
+        ('Update Tark', '1553358976309200471', '8033778296507731171', {'hi': 'Tark अपडेट करें'}),
 }
 
 
