@@ -1,0 +1,210 @@
+--- a/chrome/android/java/res/xml/privacy_preferences.xml
++++ b/chrome/android/java/res/xml/privacy_preferences.xml
+@@ -63,16 +63,8 @@
+      <org.chromium.chrome.browser.safety_hub.SafetyHubExpandablePreference
+             android:key="advanced_protection_info"
+             android:title="@string/settings_privacy_and_security_advanced_protection_section_title"/>
+-    <org.chromium.components.browser_ui.settings.ChromeBasePreference
+-        android:key="safe_browsing"
+-        android:title="@string/prefs_safe_browsing_title"
+-        android:summary="@string/prefs_safe_browsing_summary"
+-        android:fragment="org.chromium.chrome.browser.safe_browsing.settings.SafeBrowsingSettingsFragment" />
+-    <org.chromium.components.browser_ui.settings.ChromeSwitchPreference
+-        android:key="password_leak_detection"
+-        android:title="@string/passwords_leak_detection_switch_title"
+-        android:summary="@string/passwords_leak_detection_switch_summary"
+-        android:persistent="false" />
++    <!-- Tark: no Safe Browsing row (ungoogled builds no Safe Browsing) and no
++         password leak check (it asks Google), as on the Mac. -->
+     <!-- Old HTTPS-First Mode toggle. Hidden if HttpsFirstBalancedMode flag is enabled.
+          TODO(crbug.com/349860796): Remove once new settings are fully rolled out. -->
+     <org.chromium.components.browser_ui.settings.ChromeSwitchPreference
+@@ -95,8 +87,5 @@
+         android:key="can_make_payment"
+         android:title="@string/can_make_payment_title"
+         android:summary="@string/settings_can_make_payment_toggle_label" />
+-    <org.chromium.components.browser_ui.settings.TextMessagePreference
+-        android:key="sync_and_services_link"
+-        android:summary="@string/privacy_sync_and_services_link_legacy"
+-        app:allowDividerBelow="false" />
++    <!-- Tark: no "go to Google Services" footer; Tark has no Google services. -->
+ </PreferenceScreen>
+--- a/chrome/android/java/src/org/chromium/chrome/browser/privacy/settings/PrivacySettings.java
++++ b/chrome/android/java/src/org/chromium/chrome/browser/privacy/settings/PrivacySettings.java
+@@ -14,7 +14,6 @@
+ import android.os.Bundle;
+ import android.text.SpannableString;
+ import android.text.SpannableStringBuilder;
+-import android.text.style.ClickableSpan;
+ import android.view.Menu;
+ import android.view.MenuInflater;
+ import android.view.MenuItem;
+@@ -46,8 +45,6 @@
+ import org.chromium.chrome.browser.privacy_guide.PrivacyGuideInteractions;
+ import org.chromium.chrome.browser.profiles.Profile;
+ import org.chromium.chrome.browser.safe_browsing.AdvancedProtectionStatusManagerAndroidBridge;
+-import org.chromium.chrome.browser.safe_browsing.metrics.SettingsAccessPoint;
+-import org.chromium.chrome.browser.safe_browsing.settings.SafeBrowsingSettingsFragment;
+ import org.chromium.chrome.browser.safety_hub.SafetyHubExpandablePreference;
+ import org.chromium.chrome.browser.safety_hub.SafetyHubModuleProperties;
+ import org.chromium.chrome.browser.safety_hub.SafetyHubModuleViewBinder;
+@@ -55,10 +52,7 @@
+ import org.chromium.chrome.browser.settings.ChromeManagedPreferenceDelegate;
+ import org.chromium.chrome.browser.settings.SettingsNavigationFactory;
+ import org.chromium.chrome.browser.settings.search.ChromeBaseSearchIndexProvider;
+-import org.chromium.chrome.browser.signin.services.IdentityServicesProvider;
+ import org.chromium.chrome.browser.ssl.HttpsFirstModeSettingsFragment;
+-import org.chromium.chrome.browser.sync.settings.GoogleServicesSettings;
+-import org.chromium.chrome.browser.sync.settings.ManageSyncSettings;
+ import org.chromium.chrome.browser.usage_stats.UsageStatsConsentDialog;
+ import org.chromium.components.browser_ui.settings.ChromeSwitchPreference;
+ import org.chromium.components.browser_ui.settings.SettingsFragment;
+@@ -93,9 +87,6 @@
+     private static final String PREF_HTTPS_FIRST_MODE_LEGACY = "https_first_mode_legacy";
+     private static final String PREF_SECURE_DNS = "secure_dns";
+     private static final String PREF_USAGE_STATS = "usage_stats_reporting";
+-    private static final String PREF_SAFE_BROWSING = "safe_browsing";
+-    private static final String PREF_PASSWORD_LEAK_DETECTION = "password_leak_detection";
+-    private static final String PREF_SYNC_AND_SERVICES_LINK = "sync_and_services_link";
+     private static final String PREF_PRIVACY_GUIDE = "privacy_guide";
+     private static final String PREF_INCOGNITO_LOCK = "incognito_lock";
+     private static final String PREF_JAVASCRIPT_OPTIMIZER = "javascript_optimizer";
+@@ -179,26 +170,10 @@
+ 
+         maybeShowAdvancedProtectionSection();
+ 
+-        Preference safeBrowsingPreference = findPreference(PREF_SAFE_BROWSING);
+-        safeBrowsingPreference.setSummary(
+-                SafeBrowsingSettingsFragment.getSafeBrowsingSummaryString(
+-                        getContext(), getProfile()));
+-        safeBrowsingPreference.setOnPreferenceClickListener(
+-                (preference) -> {
+-                    preference
+-                            .getExtras()
+-                            .putInt(
+-                                    SafeBrowsingSettingsFragment.ACCESS_POINT,
+-                                    SettingsAccessPoint.PARENT_SETTINGS);
+-                    return false;
+-                });
+-
++        // Tark: the Safe Browsing row, the password leak switch and the Google Services
++        // footer are gone from privacy_preferences.xml, so from the search index too.
+         setHasOptionsMenu(true);
+ 
+-        ChromeSwitchPreference passwordLeakTogglePref =
+-                (ChromeSwitchPreference) findPreference(PREF_PASSWORD_LEAK_DETECTION);
+-        passwordLeakTogglePref.setOnPreferenceChangeListener(this);
+-
+         ChromeSwitchPreference canMakePaymentPref =
+                 (ChromeSwitchPreference) findPreference(PREF_CAN_MAKE_PAYMENT);
+         canMakePaymentPref.setOnPreferenceChangeListener(this);
+@@ -245,9 +220,6 @@
+             httpsFirstModeLegacySwitchPref.setSummary(getContext().getString(summaryId));
+         }
+ 
+-        Preference syncAndServicesLink = findPreference(PREF_SYNC_AND_SERVICES_LINK);
+-        syncAndServicesLink.setSummary(buildFooterString());
+-
+         Preference thirdPartyCookies = findPreference(PREF_THIRD_PARTY_COOKIES);
+         if (thirdPartyCookies != null) {
+             thirdPartyCookies
+@@ -304,47 +276,6 @@
+         return mPageTitle;
+     }
+ 
+-    private SpannableString buildFooterString() {
+-        ClickableSpan servicesLink =
+-                new ClickableSpan() {
+-                    @Override
+-                    public void onClick(View view) {
+-                        SettingsNavigationFactory.createSettingsNavigation(requireContext())
+-                                .startSettings(
+-                                        getActivity(),
+-                                        GoogleServicesSettings.class,
+-                                        /* fragmentArgs= */ null,
+-                                        /* addToBackStack= */ true);
+-                    }
+-                };
+-
+-        ClickableSpan accountSettingsLink =
+-                new ClickableSpan() {
+-                    @Override
+-                    public void onClick(View view) {
+-                        SettingsNavigationFactory.createSettingsNavigation(requireContext())
+-                                .startSettings(
+-                                        getActivity(),
+-                                        ManageSyncSettings.class,
+-                                        /* fragmentArgs= */ null,
+-                                        /* addToBackStack= */ true);
+-                    }
+-                };
+-        if (assumeNonNull(IdentityServicesProvider.get().getIdentityManager(getProfile()))
+-                        .getPrimaryAccountInfo()
+-                == null) {
+-            // User is signed out, show the string with one link to "Google Services".
+-            return SpanApplier.applySpans(
+-                    getString(R.string.privacy_chrome_data_and_google_services_signed_out_footer),
+-                    new SpanApplier.SpanInfo("<link>", "</link>", servicesLink));
+-        }
+-        // Otherwise, show the string with both links to account settings and "Google Services".
+-        return SpanApplier.applySpans(
+-                getString(R.string.privacy_chrome_data_and_google_services_footer),
+-                new SpanApplier.SpanInfo("<link1>", "</link1>", accountSettingsLink),
+-                new SpanApplier.SpanInfo("<link2>", "</link2>", servicesLink));
+-    }
+-
+     @Override
+     public boolean onPreferenceChange(Preference preference, Object newValue) {
+         String key = preference.getKey();
+@@ -355,9 +286,6 @@
+             // TODO(crbug.com/349860796): Remove once new settings are fully rolled out.
+             UserPrefs.get(getProfile())
+                     .setBoolean(Pref.HTTPS_ONLY_MODE_ENABLED, (boolean) newValue);
+-        } else if (PREF_PASSWORD_LEAK_DETECTION.equals(key)) {
+-            UserPrefs.get(getProfile())
+-                    .setBoolean(Pref.PASSWORD_LEAK_DETECTION_ENABLED, (boolean) newValue);
+         }
+         return true;
+     }
+@@ -370,16 +298,6 @@
+ 
+     /** Updates the preferences. */
+     public void updatePreferences() {
+-        ChromeSwitchPreference passwordLeakTogglePref =
+-                (ChromeSwitchPreference) findPreference(PREF_PASSWORD_LEAK_DETECTION);
+-        if (passwordLeakTogglePref != null) {
+-            passwordLeakTogglePref.setEnabled(
+-                    !UserPrefs.get(getProfile())
+-                            .isManagedPreference(Pref.PASSWORD_LEAK_DETECTION_ENABLED));
+-            passwordLeakTogglePref.setChecked(
+-                    UserPrefs.get(getProfile()).getBoolean(Pref.PASSWORD_LEAK_DETECTION_ENABLED));
+-        }
+-
+         ChromeSwitchPreference canMakePaymentPref =
+                 (ChromeSwitchPreference) findPreference(PREF_CAN_MAKE_PAYMENT);
+         if (canMakePaymentPref != null) {
+@@ -415,13 +333,6 @@
+             secureDnsPref.setSummary(SecureDnsSettings.getSummary(getContext()));
+         }
+ 
+-        Preference safeBrowsingPreference = findPreference(PREF_SAFE_BROWSING);
+-        if (safeBrowsingPreference != null && safeBrowsingPreference.isVisible()) {
+-            safeBrowsingPreference.setSummary(
+-                    SafeBrowsingSettingsFragment.getSafeBrowsingSummaryString(
+-                            getContext(), getProfile()));
+-        }
+-
+         Preference httpsFirstModePreference = findPreference(PREF_HTTPS_FIRST_MODE);
+         if (httpsFirstModePreference != null && httpsFirstModePreference.isVisible()) {
+             httpsFirstModePreference.setSummary(
+@@ -636,10 +547,6 @@
+                     if (shouldHideAdvancedProtectionInfoPref()) {
+                         indexData.removeEntry(getUniqueId(PREF_ADVANCED_PROTECTION_INFO));
+                     }
+-
+-                    // The summary in 'Safe Browsing' is a template string. Removes it.
+-                    indexData.updateEntrySummaryForKey(
+-                            frag, PREF_SAFE_BROWSING, /* summaryId= */ 0);
+                 }
+             };
+ }
