@@ -3,6 +3,13 @@
 # bundle by compiling it with the browser's adblock-rust, sign it (Ed25519)
 # and publish it on gettarka.com. Phones verify the signature with the public
 # key in android/adblock/lists_pubkey.txt and compile the lists themselves.
+#
+# Two jobs, because bundling runs third-party code (uBlock Origin's scriptlet
+# module, pinned in android/adblock/ubo.json): "build" does that with nothing
+# to steal (no environment, no secrets, no id-token) and hands over only the
+# zip; "publish" holds the signing key and AWS, and runs nothing from "build"
+# or from outside this repository. It checks the zip, as data, with a list
+# tool built from its own checkout, then signs and publishes it.
 name: Android adblock lists
 
 on:
@@ -12,21 +19,19 @@ on:
 
 permissions:
   contents: read
-  id-token: write
 
 concurrency:
   group: android-adblock-lists
   cancel-in-progress: false
 
 jobs:
-  lists:
+  build:
     runs-on: ubuntu-24.04
-    # The signing key lives in this environment, which only main may use; AWS
-    # trusts the job only in it (tark-lists-publisher's trust policy).
-    environment: lists
     timeout-minutes: 30
+    permissions:
+      contents: read
     steps:
-      # Actions pinned to commits: this job holds the list-signing key.
+      # Actions pinned to commits, in both jobs.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
         with:
           persist-credentials: false
@@ -34,6 +39,52 @@ jobs:
         run: cargo build --release --locked --manifest-path android/adblock/listtool/Cargo.toml
       - name: Bundle
         run: python3 android/adblock/bundle.py build --out out
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: lists
+          path: out/lists-*.zip
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    # The signing key lives in this environment, which only main may use; AWS
+    # trusts the job only in it (tark-lists-publisher's trust policy).
+    environment: lists
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          persist-credentials: false
+      # Its own list tool, from this checkout's lock file: nothing built by
+      # the build job runs here.
+      - name: Build the list tool
+        run: cargo build --release --locked --manifest-path android/adblock/listtool/Cargo.toml
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: lists
+          path: in
+      - name: Take the zip
+        # Exactly one file, named as phones accept (ValidBundleFileName), and
+        # of a sane size, before its name is used anywhere.
+        run: |
+          shopt -s nullglob dotglob
+          files=(in/*)
+          if [[ ${#files[@]} -ne 1 || ! ${files[0]} =~ ^in/lists-[0-9]{8}\.zip$ ]]; then
+            echo "expected one lists-<8 digits>.zip, got ${#files[@]} files" >&2
+            exit 1
+          fi
+          size=$(stat -c %s "${files[0]}")
+          if (( size == 0 || size > 20000000 )); then
+            echo "the zip is $size bytes" >&2
+            exit 1
+          fi
+          mkdir out
+          cp "${files[0]}" out/
       - name: Check
         run: android/adblock/listtool/target/release/listtool check out/lists-*.zip android/adblock/canaries.txt
       - name: Sign
