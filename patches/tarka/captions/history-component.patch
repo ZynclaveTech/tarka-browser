@@ -1,0 +1,591 @@
+--- /dev/null
++++ b/components/tark_captions/caption_history.h
+@@ -0,0 +1,97 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef COMPONENTS_TARK_CAPTIONS_CAPTION_HISTORY_H_
++#define COMPONENTS_TARK_CAPTIONS_CAPTION_HISTORY_H_
++
++#include <cstddef>
++#include <cstdint>
++#include <optional>
++#include <string>
++
++#include "base/containers/circular_deque.h"
++#include "base/memory/raw_ptr.h"
++#include "base/time/time.h"
++
++namespace base {
++class TickClock;
++}
++
++namespace tark_captions {
++
++// "0:42", "1:05", "1:05:03": a row's time in the captions history.
++std::u16string HistoryTime(base::TimeDelta at);
++
++// D4 captions history (spec 2026-10-22-tark-d4-captions-history-design.md):
++// everything said in a tab since its captions came on, in memory only, for
++// the history panel. One row per final caption, in the speaker's own script
++// until its render (the chosen script and the translation) arrives.
++class CaptionHistory {
++ public:
++  enum class Kind { kLine, kNewVideo, kRestarted };
++  struct Row {
++    uint64_t id = 0;       // Stable and increasing; never reused.
++    uint32_t version = 0;  // Bumped when Rendered() changes the row.
++    Kind kind = Kind::kLine;
++    base::TimeDelta at;    // Since captions first came on.
++    std::u16string text;
++    std::u16string translation;  // Empty when Translate was off.
++  };
++  struct Draft {
++    std::u16string text;
++    std::u16string translation;
++  };
++
++  // The newest 2 hours or ~1 MB of text (UTF-16 units), whichever is less.
++  static constexpr base::TimeDelta kMaxAge = base::Hours(2);
++  static constexpr size_t kMaxChars = 500'000;
++
++  explicit CaptionHistory(const base::TickClock* clock);
++  CaptionHistory(const CaptionHistory&) = delete;
++  CaptionHistory& operator=(const CaptionHistory&) = delete;
++  ~CaptionHistory();
++
++  // Captions came on: the first call sets the time origin.
++  void Start();
++  // A final caption; returns its row's id. Clears the draft.
++  uint64_t AddFinal(const std::string& text);
++  // The final `id` as shown (another script) and translated; nothing if the
++  // row is gone.
++  void Rendered(uint64_t id, const std::string& shown, const std::string& translation);
++  void SetDraft(const std::string& text, const std::string& translation = std::string());
++  // A "New video" or "Captions restarted" line; only after a caption line.
++  void AddDivider(Kind kind);
++  // Captions at once: rows from a guess go if the guess was wrong.
++  void BeginGuess();
++  void DropGuess();
++  void KeepGuess();
++  void Clear();
++
++  const base::circular_deque<Row>& rows() const { return rows_; }
++  const Draft& draft() const { return draft_; }
++  // The oldest rows went for the limits.
++  bool dropped() const { return dropped_; }
++  bool empty() const { return rows_.empty() && draft_.text.empty(); }
++
++  // Plain text for Copy: "0:42  line", the translation indented below,
++  // dividers as "— New video —". The draft is left out.
++  std::u16string CopyText(const std::u16string& new_video, const std::u16string& restarted) const;
++
++ private:
++  void Trim();
++
++  raw_ptr<const base::TickClock> clock_;
++  std::optional<base::TimeTicks> origin_;
++  base::circular_deque<Row> rows_;
++  Draft draft_;
++  uint64_t next_id_ = 1;
++  size_t chars_ = 0;
++  bool dropped_ = false;
++  // The id of the first row of the current guess.
++  std::optional<uint64_t> guess_from_;
++};
++
++}  // namespace tark_captions
++
++#endif  // COMPONENTS_TARK_CAPTIONS_CAPTION_HISTORY_H_
+--- /dev/null
++++ b/components/tark_captions/caption_history.cc
+@@ -0,0 +1,169 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/tark_captions/caption_history.h"
++
++#include "base/strings/strcat.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/strings/string_util.h"
++#include "base/strings/stringprintf.h"
++#include "base/strings/utf_string_conversions.h"
++#include "base/time/tick_clock.h"
++
++namespace tark_captions {
++namespace {
++
++std::u16string Trimmed(const std::string& text) {
++  return std::u16string(base::TrimWhitespace(base::UTF8ToUTF16(text), base::TRIM_ALL));
++}
++
++size_t CharsOf(const CaptionHistory::Row& row) {
++  return row.text.size() + row.translation.size();
++}
++
++}  // namespace
++
++std::u16string HistoryTime(base::TimeDelta at) {
++  const int64_t total = at.InSeconds();
++  const int64_t hours = total / 3600;
++  const int64_t minutes = (total / 60) % 60;
++  const int64_t seconds = total % 60;
++  const std::string text =
++      hours > 0 ? base::StringPrintf("%lld:%02lld:%02lld", static_cast<long long>(hours),
++                                     static_cast<long long>(minutes),
++                                     static_cast<long long>(seconds))
++                : base::StringPrintf("%lld:%02lld", static_cast<long long>(minutes),
++                                     static_cast<long long>(seconds));
++  return base::ASCIIToUTF16(text);
++}
++
++CaptionHistory::CaptionHistory(const base::TickClock* clock) : clock_(clock) {}
++
++CaptionHistory::~CaptionHistory() = default;
++
++void CaptionHistory::Start() {
++  if (!origin_) {
++    origin_ = clock_->NowTicks();
++  }
++}
++
++uint64_t CaptionHistory::AddFinal(const std::string& text) {
++  Start();
++  draft_ = Draft();
++  std::u16string trimmed = Trimmed(text);
++  if (trimmed.empty()) {
++    return 0;
++  }
++  Row row;
++  row.id = next_id_++;
++  row.at = clock_->NowTicks() - *origin_;
++  row.text = std::move(trimmed);
++  chars_ += CharsOf(row);
++  rows_.push_back(std::move(row));
++  Trim();
++  return rows_.empty() ? 0 : rows_.back().id;
++}
++
++void CaptionHistory::Rendered(uint64_t id, const std::string& shown,
++                              const std::string& translation) {
++  for (Row& row : rows_) {
++    if (row.id != id) {
++      continue;
++    }
++    chars_ -= CharsOf(row);
++    if (!shown.empty()) {
++      row.text = Trimmed(shown);
++    }
++    row.translation = Trimmed(translation);
++    chars_ += CharsOf(row);
++    ++row.version;
++    Trim();
++    return;
++  }
++}
++
++void CaptionHistory::SetDraft(const std::string& text, const std::string& translation) {
++  draft_.text = Trimmed(text);
++  draft_.translation = Trimmed(translation);
++}
++
++void CaptionHistory::AddDivider(Kind kind) {
++  if (rows_.empty() || rows_.back().kind != Kind::kLine) {
++    return;
++  }
++  Start();
++  Row row;
++  row.id = next_id_++;
++  row.kind = kind;
++  row.at = clock_->NowTicks() - *origin_;
++  rows_.push_back(std::move(row));
++}
++
++void CaptionHistory::BeginGuess() {
++  guess_from_ = next_id_;
++}
++
++void CaptionHistory::DropGuess() {
++  if (!guess_from_) {
++    return;
++  }
++  while (!rows_.empty() && rows_.back().id >= *guess_from_) {
++    chars_ -= CharsOf(rows_.back());
++    rows_.pop_back();
++  }
++  draft_ = Draft();
++  guess_from_.reset();
++}
++
++void CaptionHistory::KeepGuess() {
++  guess_from_.reset();
++}
++
++void CaptionHistory::Clear() {
++  origin_.reset();
++  rows_.clear();
++  draft_ = Draft();
++  chars_ = 0;
++  dropped_ = false;
++  guess_from_.reset();
++}
++
++std::u16string CaptionHistory::CopyText(const std::u16string& new_video,
++                                        const std::u16string& restarted) const {
++  std::u16string out;
++  for (const Row& row : rows_) {
++    switch (row.kind) {
++      case Kind::kNewVideo:
++        base::StrAppend(&out, {u"— ", new_video, u" —\n"});
++        break;
++      case Kind::kRestarted:
++        base::StrAppend(&out, {u"— ", restarted, u" —\n"});
++        break;
++      case Kind::kLine:
++        base::StrAppend(&out, {HistoryTime(row.at), u"  ", row.text, u"\n"});
++        if (!row.translation.empty()) {
++          base::StrAppend(&out, {u"      ", row.translation, u"\n"});
++        }
++        break;
++    }
++  }
++  return out;
++}
++
++void CaptionHistory::Trim() {
++  const base::TimeDelta now = clock_->NowTicks() - *origin_;
++  // Always keep the newest row, however long.
++  while (rows_.size() > 1 &&
++         (now - rows_.front().at > kMaxAge || chars_ > kMaxChars)) {
++    chars_ -= CharsOf(rows_.front());
++    rows_.pop_front();
++    dropped_ = true;
++  }
++  // A divider left at the top separates nothing.
++  while (!rows_.empty() && rows_.front().kind != Kind::kLine) {
++    rows_.pop_front();
++  }
++}
++
++}  // namespace tark_captions
+--- /dev/null
++++ b/components/tark_captions/caption_history_unittest.cc
+@@ -0,0 +1,188 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/tark_captions/caption_history.h"
++
++#include <string>
++#include <vector>
++
++#include "base/test/simple_test_tick_clock.h"
++#include "base/time/time.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace tark_captions {
++namespace {
++
++std::vector<std::u16string> Texts(const CaptionHistory& history) {
++  std::vector<std::u16string> texts;
++  for (const CaptionHistory::Row& row : history.rows()) {
++    texts.push_back(row.text);
++  }
++  return texts;
++}
++
++class CaptionHistoryTest : public testing::Test {
++ protected:
++  base::SimpleTestTickClock clock_;
++  CaptionHistory history_{&clock_};
++};
++
++TEST(HistoryTimeTest, Formats) {
++  EXPECT_EQ(HistoryTime(base::Seconds(42)), u"0:42");
++  EXPECT_EQ(HistoryTime(base::Seconds(65)), u"1:05");
++  EXPECT_EQ(HistoryTime(base::Seconds(3903)), u"1:05:03");
++}
++
++TEST_F(CaptionHistoryTest, KeepsFinalsInOrderWithTimes) {
++  history_.Start();
++  clock_.Advance(base::Seconds(42));
++  const uint64_t a = history_.AddFinal("a");
++  clock_.Advance(base::Seconds(5));
++  const uint64_t b = history_.AddFinal("b");
++  EXPECT_EQ(Texts(history_), (std::vector<std::u16string>{u"a", u"b"}));
++  EXPECT_EQ(history_.rows()[0].at, base::Seconds(42));
++  EXPECT_EQ(history_.rows()[1].at, base::Seconds(47));
++  EXPECT_GT(b, a);
++  EXPECT_EQ(history_.rows()[0].kind, CaptionHistory::Kind::kLine);
++}
++
++TEST_F(CaptionHistoryTest, BlankFinalAddsNoRow) {
++  history_.Start();
++  EXPECT_EQ(history_.AddFinal("  "), 0u);
++  EXPECT_TRUE(history_.rows().empty());
++}
++
++TEST_F(CaptionHistoryTest, FinalClearsTheDraft) {
++  history_.Start();
++  history_.SetDraft("so far", "until now");
++  EXPECT_EQ(history_.draft().text, u"so far");
++  EXPECT_EQ(history_.draft().translation, u"until now");
++  history_.AddFinal("so far it went");
++  EXPECT_TRUE(history_.draft().text.empty());
++  EXPECT_TRUE(history_.draft().translation.empty());
++}
++
++TEST_F(CaptionHistoryTest, RenderedReplacesTextAndAddsTranslation) {
++  history_.Start();
++  const uint64_t id = history_.AddFinal("नमस्ते");
++  const uint32_t version = history_.rows()[0].version;
++  history_.Rendered(id, "namaste", "hello");
++  EXPECT_EQ(history_.rows()[0].text, u"namaste");
++  EXPECT_EQ(history_.rows()[0].translation, u"hello");
++  EXPECT_EQ(history_.rows()[0].version, version + 1);
++}
++
++TEST_F(CaptionHistoryTest, RenderedForUnknownIdChangesNothing) {
++  history_.Start();
++  history_.AddFinal("a");
++  history_.Rendered(999, "x", "y");
++  EXPECT_EQ(Texts(history_), std::vector<std::u16string>{u"a"});
++  EXPECT_TRUE(history_.rows()[0].translation.empty());
++}
++
++TEST_F(CaptionHistoryTest, DropGuessRemovesRowsSinceTheGuessBegan) {
++  history_.Start();
++  history_.AddFinal("a");
++  history_.BeginGuess();
++  history_.AddFinal("b");
++  const uint64_t c = history_.AddFinal("c");
++  history_.SetDraft("d so far");
++  history_.DropGuess();
++  EXPECT_EQ(Texts(history_), std::vector<std::u16string>{u"a"});
++  EXPECT_TRUE(history_.draft().text.empty());
++  EXPECT_GT(history_.AddFinal("d"), c);
++}
++
++TEST_F(CaptionHistoryTest, KeepGuessKeepsRows) {
++  history_.Start();
++  history_.BeginGuess();
++  history_.AddFinal("a");
++  history_.KeepGuess();
++  history_.DropGuess();
++  EXPECT_EQ(Texts(history_), std::vector<std::u16string>{u"a"});
++}
++
++TEST_F(CaptionHistoryTest, DropGuessWithoutAGuessDropsNothing) {
++  history_.Start();
++  history_.AddFinal("a");
++  history_.DropGuess();
++  EXPECT_EQ(Texts(history_), std::vector<std::u16string>{u"a"});
++}
++
++TEST_F(CaptionHistoryTest, DividersOnlyBetweenLines) {
++  history_.Start();
++  history_.AddDivider(CaptionHistory::Kind::kNewVideo);
++  EXPECT_TRUE(history_.rows().empty());
++  history_.AddFinal("a");
++  history_.AddDivider(CaptionHistory::Kind::kNewVideo);
++  history_.AddDivider(CaptionHistory::Kind::kRestarted);
++  ASSERT_EQ(history_.rows().size(), 2u);
++  EXPECT_EQ(history_.rows()[1].kind, CaptionHistory::Kind::kNewVideo);
++}
++
++TEST_F(CaptionHistoryTest, DropsRowsOlderThanTwoHours) {
++  history_.Start();
++  history_.AddFinal("old");
++  EXPECT_FALSE(history_.dropped());
++  clock_.Advance(CaptionHistory::kMaxAge + base::Seconds(1));
++  history_.AddFinal("new");
++  EXPECT_EQ(Texts(history_), std::vector<std::u16string>{u"new"});
++  EXPECT_TRUE(history_.dropped());
++}
++
++TEST_F(CaptionHistoryTest, DropsOldestPastTheTextLimit) {
++  history_.Start();
++  for (int i = 0; i < 4; ++i) {
++    history_.AddFinal(std::string(200'000, static_cast<char>('a' + i)));
++  }
++  size_t total = 0;
++  for (const CaptionHistory::Row& row : history_.rows()) {
++    total += row.text.size() + row.translation.size();
++  }
++  EXPECT_LE(total, CaptionHistory::kMaxChars);
++  EXPECT_EQ(history_.rows().back().text, std::u16string(200'000, u'd'));
++  EXPECT_TRUE(history_.dropped());
++}
++
++TEST_F(CaptionHistoryTest, CopyTextMixesRowsWithAndWithoutTranslation) {
++  history_.Start();
++  clock_.Advance(base::Seconds(42));
++  const uint64_t a = history_.AddFinal("a");
++  history_.Rendered(a, "a", "A");
++  history_.AddDivider(CaptionHistory::Kind::kNewVideo);
++  clock_.Advance(base::Seconds(3903 - 42));
++  history_.AddFinal("b");
++  history_.SetDraft("d");
++  EXPECT_EQ(history_.CopyText(u"New video", u"Captions restarted"),
++            u"0:42  a\n      A\n— New video —\n1:05:03  b\n");
++}
++
++TEST_F(CaptionHistoryTest, ClearForgetsEverything) {
++  history_.Start();
++  clock_.Advance(CaptionHistory::kMaxAge + base::Seconds(1));
++  history_.AddFinal("a");
++  history_.BeginGuess();
++  history_.SetDraft("b");
++  history_.Clear();
++  EXPECT_TRUE(history_.empty());
++  EXPECT_FALSE(history_.dropped());
++  clock_.Advance(base::Seconds(10));
++  history_.Start();
++  clock_.Advance(base::Seconds(3));
++  history_.AddFinal("c");
++  EXPECT_EQ(history_.rows()[0].at, base::Seconds(3));
++  history_.DropGuess();
++  EXPECT_EQ(history_.rows().size(), 1u);
++}
++
++TEST_F(CaptionHistoryTest, StartAgainKeepsTheTimeOrigin) {
++  history_.Start();
++  clock_.Advance(base::Seconds(30));
++  history_.Start();
++  history_.AddFinal("a");
++  EXPECT_EQ(history_.rows()[0].at, base::Seconds(30));
++}
++
++}  // namespace
++}  // namespace tark_captions
+--- a/components/tark_captions/BUILD.gn
++++ b/components/tark_captions/BUILD.gn
+@@ -21,6 +21,8 @@
+     "caption_engine.h",
+     "caption_model_store.cc",
+     "caption_model_store.h",
++    "caption_history.cc",
++    "caption_history.h",
+     "caption_text.cc",
+     "caption_text.h",
+     "media_players.cc",
+@@ -94,6 +96,7 @@
+     "caption_choices_unittest.cc",
+     "caption_engine_unittest.cc",
+     "caption_model_store_unittest.cc",
++    "caption_history_unittest.cc",
+     "caption_text_unittest.cc",
+     "client_language_unittest.cc",
+     "detection_policy_unittest.cc",
+--- a/components/tark_captions/render_queue.cc
++++ b/components/tark_captions/render_queue.cc
+@@ -11,12 +11,15 @@
+ RenderQueue::RenderQueue() = default;
+ RenderQueue::~RenderQueue() = default;
+ 
+-void RenderQueue::Add(bool is_final, std::string text, std::string source) {
++void RenderQueue::Add(bool is_final,
++                      std::string text,
++                      std::string source,
++                      uint64_t history_id) {
+   if (is_final) {
+     draft_.reset();
+-    finals_.emplace_back(std::move(text), std::move(source));
++    finals_.push_back({std::move(text), std::move(source), history_id});
+   } else {
+-    draft_.emplace(std::move(text), std::move(source));
++    draft_ = Waiting{std::move(text), std::move(source)};
+   }
+ }
+ 
+@@ -28,12 +31,13 @@
+   request.generation = generation_;
+   if (!finals_.empty()) {
+     request.is_final = true;
+-    request.text = std::move(finals_.front().first);
+-    request.source = finals_.front().second;
++    request.text = std::move(finals_.front().text);
++    request.source = std::move(finals_.front().source);
++    request.history_id = finals_.front().history_id;
+     finals_.pop_front();
+   } else if (draft_) {
+-    request.text = std::move(draft_->first);
+-    request.source = draft_->second;
++    request.text = std::move(draft_->text);
++    request.source = std::move(draft_->source);
+     draft_.reset();
+   } else {
+     return std::nullopt;
+@@ -54,8 +58,8 @@
+ 
+ std::vector<std::string> RenderQueue::TakeWaitingFinals() {
+   std::vector<std::string> finals;
+-  for (auto& [text, source] : finals_) {
+-    finals.push_back(std::move(text));
++  for (Waiting& waiting : finals_) {
++    finals.push_back(std::move(waiting.text));
+   }
+   finals_.clear();
+   draft_.reset();
+--- a/components/tark_captions/render_queue.h
++++ b/components/tark_captions/render_queue.h
+@@ -22,6 +22,8 @@
+   std::string source = "hi";  // The language code the caption was heard in.
+   // The choices (script, translation) it was asked with.
+   uint64_t generation = 0;
++  // A final's row in the captions history; 0 for drafts.
++  uint64_t history_id = 0;
+ };
+ 
+ // Which caption to send to the translator next (D4 Phase 2). Drafts come
+@@ -36,7 +38,10 @@
+   RenderQueue& operator=(const RenderQueue&) = delete;
+   ~RenderQueue();
+ 
+-  void Add(bool is_final, std::string text, std::string source = "hi");
++  void Add(bool is_final,
++           std::string text,
++           std::string source = "hi",
++           uint64_t history_id = 0);
+   // The next request, when none is in flight.
+   std::optional<RenderRequest> Next();
+   // The request in flight is done; true if its result is still current.
+@@ -50,8 +55,13 @@
+   void Clear();
+ 
+  private:
+-  std::deque<std::pair<std::string, std::string>> finals_;
+-  std::optional<std::pair<std::string, std::string>> draft_;
++  struct Waiting {
++    std::string text;
++    std::string source;
++    uint64_t history_id = 0;
++  };
++  std::deque<Waiting> finals_;
++  std::optional<Waiting> draft_;
+   bool in_flight_ = false;
+   uint64_t generation_ = 0;
+ };
+--- a/components/tark_captions/render_queue_unittest.cc
++++ b/components/tark_captions/render_queue_unittest.cc
+@@ -105,5 +105,17 @@
+   EXPECT_FALSE(queue.Next());
+ }
+ 
++// The captions history pairs a final with its render by this id.
++TEST(RenderQueueTest, CarriesTheHistoryId) {
++  RenderQueue queue;
++  queue.Add(true, "a", "hi", 7);
++  std::optional<RenderRequest> next = queue.Next();
++  ASSERT_TRUE(next);
++  EXPECT_EQ(next->history_id, 7u);
++  queue.Done(next->generation);
++  queue.Add(false, "b", "hi");
++  EXPECT_EQ(queue.Next()->history_id, 0u);
++}
++
+ }  // namespace
+ }  // namespace tark_captions

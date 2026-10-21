@@ -1,0 +1,539 @@
+--- a/chrome/app/settings_strings.grdp
++++ b/chrome/app/settings_strings.grdp
+@@ -650,6 +650,9 @@
+     <message name="IDS_SETTINGS_TARK_LIVE_CAPTIONS_CAPTIONS_DETAIL" desc="Live captions settings: the languages the captions download covers.">
+       Hindi, Tamil, Bengali
+     </message>
++    <message name="IDS_SETTINGS_TARK_LIVE_CAPTIONS_FIRST_TIME" desc="Live captions settings, after the introduction: how much the first downloads take. $1 and $2 are megabytes, rounded.">
++      The first time: about <ph name="CAPTIONS">$1<ex>770</ex></ph> MB for Hindi, Tamil and Bengali, plus about <ph name="TRANSLATION">$2<ex>240</ex></ph> MB to translate into English.
++    </message>
+     <message name="IDS_SETTINGS_TARK_LIVE_CAPTIONS_TO_ENGLISH" desc="Live captions settings: the download for translating into English.">
+       Translate into English
+     </message>
+--- a/chrome/app/tark_captions_strings.grdp
++++ b/chrome/app/tark_captions_strings.grdp
+@@ -103,6 +103,24 @@
+   <message name="IDS_TARK_CAPTIONS_DETECTION_DOWNLOAD_FAILED" desc="Call captions pill: that download failed; shown with Retry.">
+     Couldn't get captions ready. Check your connection.
+   </message>
++  <message name="IDS_TARK_CAPTIONS_FIRST_DOWNLOAD" desc="Caption bar, the first time captions are turned on with nothing downloaded yet: why a download is needed, before it starts. Shown with Download and Not now.">
++    Live captions download once, then work offline.
++  </message>
++  <message name="IDS_TARK_CAPTIONS_FIRST_DOWNLOAD_SIZES" desc="Caption bar, the first time captions are turned on: the sizes of the downloads, shown above the offer to download. $1 and $2 are megabytes.">
++    <ph name="DETECTION">$1<ex>88</ex></ph> MB to recognise the language · <ph name="CAPTIONS">$2<ex>676</ex></ph> MB more for Hindi, Tamil or Bengali. Nothing you watch is sent anywhere.
++  </message>
++  <message name="IDS_TARK_CAPTIONS_FIRST_DOWNLOAD_SIZE" desc="Caption bar, the first time captions are turned on, when the Indian-language captions model is already downloaded: the size of the download that remains. $1 is megabytes.">
++    <ph name="DETECTION">$1<ex>88</ex></ph> MB to recognise the language. Nothing you watch is sent anywhere.
++  </message>
++  <message name="IDS_TARK_CAPTIONS_THEN_MORE" desc="Caption bar, while the download that recognises the language runs: the download that may follow. $1 is megabytes.">
++    Then <ph name="CAPTIONS">$1<ex>676</ex></ph> MB more if it hears Hindi, Tamil or Bengali.
++  </message>
++  <message name="IDS_TARK_CAPTIONS_DOWNLOAD" desc="Button on the caption bar: start the first-time download of the captions models.">
++    Download
++  </message>
++  <message name="IDS_TARK_CAPTIONS_NOT_NOW" desc="Button on the caption bar: close the first-time download offer without downloading; captions stay off.">
++    Not now
++  </message>
+   <message name="IDS_TARK_CAPTIONS_GETTING_APPLE_READY" desc="Call captions pill (D4 Phase 3): macOS is downloading its own speech for a language from Apple. $1 is the language, e.g. Spanish; $2 a percentage.">
+     Getting <ph name="LANGUAGE">$1<ex>Spanish</ex></ph> ready · <ph name="PERCENT">$2<ex>40</ex></ph>%
+   </message>
+--- a/chrome/browser/resources/settings/a11y_page/tark_live_captions_page.html.ts
++++ b/chrome/browser/resources/settings/a11y_page/tark_live_captions_page.html.ts
+@@ -12,7 +12,9 @@
+ <settings-subpage page-title="$i18n{tarkLiveCaptionsTitle}"
+     route-path="${this.routePath}">
+   <div class="cr-row first">
+-    <div class="secondary">$i18n{tarkLiveCaptionsIntro}</div>
++    <div class="secondary">
++      $i18n{tarkLiveCaptionsIntro} $i18n{tarkLiveCaptionsFirstTime}
++    </div>
+   </div>
+   ${this.models_.map(model => html`
+     <div class="cr-row" id="${model.id}">
+--- a/chrome/browser/ui/views/tark_captions/caption_pill_controller.cc
++++ b/chrome/browser/ui/views/tark_captions/caption_pill_controller.cc
+@@ -296,6 +296,8 @@
+   for (tark_captions::ModelUnit unit : units) {
+     if (!tark_captions::TarkCaptionModels().ready(unit)) {
+       shown_ = active;
++      offering_ = OffersFirstDownload(
++          tark_captions::TarkCaptionModels().status(tark_captions::ModelUnit::kLanguageId).state);
+       WaitForModels(/*for_captions=*/true, /*turn_on=*/true, units);
+       Update();
+       return;
+@@ -577,6 +579,9 @@
+   }
+   view_->SetNoticeButton(notice_button);
+   ShowAppleDownload();
++  // A bar made just now (the first CC press in a window) gets its download
++  // row here; the store says nothing new while an offer waits.
++  ShowDownload();
+   ShowCaption();
+   Reposition();
+   if (!widget_->IsVisible()) {
+@@ -589,7 +594,8 @@
+     return;
+   }
+   if (!shown_->captions_on()) {
+-    view_->SetCaption({}, {}, std::u16string());
++    waiting_note_ = WaitingNote();
++    view_->SetCaption({}, {}, waiting_note_);
+     return;
+   }
+   const tark_captions::CaptionText::Display display = text_.GetDisplay(kCaptionChars);
+@@ -654,6 +660,16 @@
+     }
+     return;
+   }
++  if (offering_) {
++    // Download, on the first-time offer.
++    offering_ = false;
++    for (tark_captions::ModelUnit unit : waiting_units_) {
++      tark_captions::TarkCaptionModels().Download(unit);
++    }
++    ShowDownload();
++    Update();
++    return;
++  }
+   bool failed = false;
+   for (tark_captions::ModelUnit unit : waiting_units_) {
+     failed |= tark_captions::TarkCaptionModels().status(unit).state ==
+@@ -674,13 +690,35 @@
+   Update();
+ }
+ 
++void TarkCaptionPillController::OnNotNowPressed() {
++  if (!offering_) {
++    return;
++  }
++  // Captions stay off; the next CC press offers again.
++  StopWaiting();
++  Update();
++}
++
+ void TarkCaptionPillController::OnModelStatusChanged(tark_captions::ModelUnit unit) {
+   if (!waiting_ || !shown_) {
+     return;
+   }
++  if (offering_ && !OffersFirstDownload(tark_captions::TarkCaptionModels()
++                                            .status(tark_captions::ModelUnit::kLanguageId)
++                                            .state)) {
++    // Detection's model turned out to be here, or Settings or another
++    // window started it: no first time to offer; get the rest as usual.
++    offering_ = false;
++    for (tark_captions::ModelUnit needed : waiting_units_) {
++      tark_captions::TarkCaptionModels().Download(needed);
++    }
++  }
+   for (tark_captions::ModelUnit needed : waiting_units_) {
+     if (!tark_captions::TarkCaptionModels().ready(needed)) {
+       ShowDownload();
++      if (!shown_->captions_on() && WaitingNote() != waiting_note_) {
++        Update();
++      }
+       return;
+     }
+   }
+@@ -705,14 +743,18 @@
+   waiting_for_captions_ = for_captions;
+   turn_on_when_ready_ = turn_on;
+   waiting_units_ = std::move(units);
+-  for (tark_captions::ModelUnit unit : waiting_units_) {
+-    tark_captions::TarkCaptionModels().Download(unit);
++  if (!offering_) {
++    for (tark_captions::ModelUnit unit : waiting_units_) {
++      tark_captions::TarkCaptionModels().Download(unit);
++    }
+   }
+   ShowDownload();
+ }
+ 
+ void TarkCaptionPillController::StopWaiting() {
+   waiting_ = false;
++  offering_ = false;
++  waiting_note_.clear();
+   waiting_units_.clear();
+   if (view_) {
+     view_->SetDownload(std::nullopt);
+@@ -723,6 +765,13 @@
+   if (!view_ || !shown_ || !waiting_) {
+     return;
+   }
++  if (offering_) {
++    TarkCaptionPillView::Download offer;
++    offer.offer = true;
++    offer.text = l10n_util::GetStringUTF16(IDS_TARK_CAPTIONS_FIRST_DOWNLOAD);
++    view_->SetDownload(offer);
++    return;
++  }
+   int64_t done = 0;
+   int64_t total = 0;
+   bool failed = false;
+@@ -760,6 +809,37 @@
+   view_->SetDownload(download);
+ }
+ 
++std::u16string TarkCaptionPillController::WaitingNote() const {
++  if (!waiting_ || !waiting_for_captions_) {
++    return std::u16string();
++  }
++  using tark_captions::ModelUnit;
++  using State = tark_captions::CaptionModelStore::State;
++  const tark_captions::CaptionModelStore& models = tark_captions::TarkCaptionModels();
++  if (offering_) {
++    const std::u16string detection_mb = base::NumberToString16(
++        tark_captions::Megabytes(tark_captions::UnitSize(ModelUnit::kLanguageId)));
++    if (models.ready(ModelUnit::kCaptions)) {
++      return l10n_util::GetStringFUTF16(IDS_TARK_CAPTIONS_FIRST_DOWNLOAD_SIZE, detection_mb);
++    }
++    return l10n_util::GetStringFUTF16(
++        IDS_TARK_CAPTIONS_FIRST_DOWNLOAD_SIZES, detection_mb,
++        base::NumberToString16(
++            tark_captions::Megabytes(tark_captions::UnitSize(ModelUnit::kCaptions))));
++  }
++  for (ModelUnit unit : waiting_units_) {
++    if (models.status(unit).state == State::kFailed) {
++      // The bar says it failed, with Retry.
++      return std::u16string();
++    }
++  }
++  const int64_t captions_mb =
++      CaptionsMbToFollow(waiting_units_, models.status(ModelUnit::kCaptions).state);
++  return captions_mb > 0 ? l10n_util::GetStringFUTF16(IDS_TARK_CAPTIONS_THEN_MORE,
++                                                      base::NumberToString16(captions_mb))
++                         : std::u16string();
++}
++
+ void TarkCaptionPillController::ShowAppleDownload() {
+   if (!view_ || !shown_ || waiting_) {
+     return;
+--- a/chrome/browser/ui/views/tark_captions/caption_pill_controller.h
++++ b/chrome/browser/ui/views/tark_captions/caption_pill_controller.h
+@@ -76,6 +76,7 @@
+   void OnHidePressed() override;
+   void OnDragged(const gfx::Vector2d& delta) override;
+   void OnDownloadButtonPressed() override;
++  void OnNotNowPressed() override;
+   void OnNoticeButtonPressed(views::View* anchor) override;
+ 
+   // tark_captions::CaptionModelStore::Observer:
+@@ -108,6 +109,10 @@
+   void WaitForModels(bool for_captions, bool turn_on, std::vector<tark_captions::ModelUnit> units);
+   void StopWaiting();
+   void ShowDownload();
++  // The caption box's line while captions wait for their models: the sizes
++  // on the first-time offer, or the captions model that may follow
++  // detection's.
++  std::u16string WaitingNote() const;
+   // macOS downloading an Apple language's speech (no Tark model waited on).
+   void ShowAppleDownload();
+   void Reposition();
+@@ -131,6 +136,11 @@
+   bool waiting_for_captions_ = false;
+   bool turn_on_when_ready_ = false;
+   std::vector<tark_captions::ModelUnit> waiting_units_;
++  // The first time (nothing downloaded yet), the bar offers the download
++  // with its size and nothing downloads until Download is pressed.
++  bool offering_ = false;
++  // WaitingNote() as last shown, so progress alone doesn't lay the bar out.
++  std::u16string waiting_note_;
+   base::ScopedObservation<tark_captions::CaptionModelStore,
+                           tark_captions::CaptionModelStore::Observer>
+       models_observation_{this};
+--- a/chrome/browser/ui/views/tark_captions/caption_pill_view.cc
++++ b/chrome/browser/ui/views/tark_captions/caption_pill_view.cc
+@@ -54,6 +54,9 @@
+   download_button_ = pill_->AddChildView(std::make_unique<views::MdTextButton>(
+       base::BindRepeating(&Delegate::OnDownloadButtonPressed, base::Unretained(delegate_.get())),
+       l10n_util::GetStringUTF16(IDS_TARK_CAPTIONS_CANCEL)));
++  not_now_button_ = pill_->AddChildView(std::make_unique<views::MdTextButton>(
++      base::BindRepeating(&Delegate::OnNotNowPressed, base::Unretained(delegate_.get())),
++      l10n_util::GetStringUTF16(IDS_TARK_CAPTIONS_NOT_NOW)));
+   language_button_ = pill_->AddChildView(std::make_unique<views::MdTextButton>(
+       views::Button::PressedCallback(),
+       l10n_util::GetStringUTF16(IDS_TARK_CAPTIONS_HINDI)));
+@@ -105,15 +108,21 @@
+     choose_button_->SetVisible(false);
+   }
+   download_label_->SetVisible(!!download);
+-  download_progress_->SetVisible(download && !download->failed);
++  download_progress_->SetVisible(download && !download->failed && !download->offer);
+   download_button_->SetVisible(!!download);
++  not_now_button_->SetVisible(download && download->offer);
+   if (download) {
+     download_label_->SetText(download->text);
+-    download_label_->SetEnabledColor(download->failed ? ui::kColorAlertHighSeverity
+-                                                      : ui::kColorLabelForegroundSecondary);
++    download_label_->SetEnabledColor(download->failed  ? ui::kColorAlertHighSeverity
++                                     : download->offer ? ui::kColorLabelForeground
++                                                       : ui::kColorLabelForegroundSecondary);
+     download_progress_->SetValue(download->fraction);
+     download_button_->SetText(l10n_util::GetStringUTF16(
+-        download->failed ? IDS_TARK_CAPTIONS_RETRY : IDS_TARK_CAPTIONS_CANCEL));
++        download->offer    ? IDS_TARK_CAPTIONS_DOWNLOAD
++        : download->failed ? IDS_TARK_CAPTIONS_RETRY
++                           : IDS_TARK_CAPTIONS_CANCEL));
++    download_button_->SetStyle(download->offer ? ui::ButtonStyle::kProminent
++                                               : ui::ButtonStyle::kDefault);
+   }
+   PreferredSizeChanged();
+ }
+--- a/chrome/browser/ui/views/tark_captions/caption_pill_view.h
++++ b/chrome/browser/ui/views/tark_captions/caption_pill_view.h
+@@ -37,8 +37,11 @@
+     virtual void OnLanguagePressed(views::View* anchor) = 0;
+     virtual void OnHidePressed() = 0;
+     virtual void OnDragged(const gfx::Vector2d& delta) = 0;
+-    // Cancel while a model downloads, Retry after it failed.
++    // Download on the first-time offer, Cancel while a model downloads,
++    // Retry after it failed.
+     virtual void OnDownloadButtonPressed() = 0;
++    // Not now on the first-time offer.
++    virtual void OnNotNowPressed() = 0;
+     // The button beside a notice: Choose a language, or Open Settings.
+     virtual void OnNoticeButtonPressed(views::View* anchor) = 0;
+ 
+@@ -50,11 +53,13 @@
+ 
+   // A model being downloaded for Captions or Translate (D4 Phase 4):
+   // "Getting Tamil ready · 412 of 680 MB" with progress and Cancel, or the
+-  // failure with Retry.
++  // failure with Retry; or, the first time, the offer to download with
++  // Download and Not now.
+   struct Download {
+     std::u16string text;
+     double fraction = 0;
+     bool failed = false;
++    bool offer = false;
+   };
+ 
+   explicit TarkCaptionPillView(Delegate* delegate);
+@@ -97,6 +102,7 @@
+   raw_ptr<views::Label> download_label_ = nullptr;
+   raw_ptr<views::ProgressBar> download_progress_ = nullptr;
+   raw_ptr<views::MdTextButton> download_button_ = nullptr;
++  raw_ptr<views::MdTextButton> not_now_button_ = nullptr;
+   gfx::Point drag_last_;
+ };
+ 
+--- a/chrome/browser/ui/views/tark_captions/pill_language.cc
++++ b/chrome/browser/ui/views/tark_captions/pill_language.cc
+@@ -79,6 +79,23 @@
+   return active_tab ? BarMode::kBar : BarMode::kStrip;
+ }
+ 
++bool OffersFirstDownload(tark_captions::CaptionModelStore::State language_id) {
++  using State = tark_captions::CaptionModelStore::State;
++  return language_id == State::kMissing || language_id == State::kChecking;
++}
++
++int64_t CaptionsMbToFollow(const std::vector<tark_captions::ModelUnit>& waiting,
++                           tark_captions::CaptionModelStore::State captions) {
++  using tark_captions::ModelUnit;
++  using State = tark_captions::CaptionModelStore::State;
++  if (!std::ranges::contains(waiting, ModelUnit::kLanguageId) ||
++      std::ranges::contains(waiting, ModelUnit::kCaptions) ||
++      (captions != State::kMissing && captions != State::kFailed)) {
++    return 0;
++  }
++  return tark_captions::Megabytes(tark_captions::UnitSize(ModelUnit::kCaptions));
++}
++
+ bool ButtonClearOf(const gfx::Rect& button, const std::vector<gfx::Rect>& browser_windows) {
+   return std::ranges::none_of(browser_windows,
+                               [&](const gfx::Rect& window) { return window.Intersects(button); });
+--- a/chrome/browser/ui/views/tark_captions/pill_language.h
++++ b/chrome/browser/ui/views/tark_captions/pill_language.h
+@@ -5,9 +5,12 @@
+ #ifndef CHROME_BROWSER_UI_VIEWS_TARK_CAPTIONS_PILL_LANGUAGE_H_
+ #define CHROME_BROWSER_UI_VIEWS_TARK_CAPTIONS_PILL_LANGUAGE_H_
+ 
++#include <cstdint>
+ #include <string>
+ #include <vector>
+ 
++#include "components/tark_captions/caption_model_store.h"
++#include "components/tark_captions/model_manifest.h"
+ #include "ui/gfx/geometry/rect.h"
+ 
+ namespace tark_captions {
+@@ -49,6 +52,17 @@
+ enum class BarMode { kNone, kBar, kStrip };
+ BarMode BarFor(bool captions_on, bool active_tab);
+ 
++// The first-time download notice (D4 media captions, "First-time download
++// size, up front"): the first CC press with nothing downloaded offers the
++// download with its size instead of starting it, only while detection's
++// model is missing or still being checked (not coming, here, or failed).
++bool OffersFirstDownload(tark_captions::CaptionModelStore::State language_id);
++// While captions wait for detection's model alone (`waiting`), the MB of
++// Tark's captions model that follows if Hindi, Tamil or Bengali is heard;
++// 0 when it is here, already coming, or not known yet.
++int64_t CaptionsMbToFollow(const std::vector<tark_captions::ModelUnit>& waiting,
++                           tark_captions::CaptionModelStore::State captions);
++
+ // The page decides where the CC button goes (D4 any-media): it shows only
+ // where none of the browser's own windows over the page (a permission
+ // prompt, the fullscreen bubble, the omnibox popup) is, so it never covers
+--- a/chrome/browser/ui/views/tark_captions/pill_language_unittest.cc
++++ b/chrome/browser/ui/views/tark_captions/pill_language_unittest.cc
+@@ -7,7 +7,9 @@
+ #include <string>
+ #include <vector>
+ 
++#include "components/tark_captions/caption_model_store.h"
+ #include "components/tark_captions/client_language.h"
++#include "components/tark_captions/model_manifest.h"
+ #include "ui/gfx/geometry/rect.h"
+ #include "testing/gtest/include/gtest/gtest.h"
+ 
+@@ -126,4 +128,40 @@
+   EXPECT_FALSE(ButtonClearOf(button, {gfx::Rect(0, 0, 300, 120), gfx::Rect(690, 480, 320, 160)}));
+ }
+ 
++// The first CC press with nothing downloaded offers the download, with its
++// size, instead of starting it. Also while detection's model is still being
++// checked (at startup): a download asked for then starts by itself once the
++// check finds nothing. Never while it is fetched, here, or failed (that bar
++// offers Retry).
++TEST(PillLanguageTest, OffersTheFirstDownloadOnlyWhenNothingIsHere) {
++  using State = tark_captions::CaptionModelStore::State;
++  EXPECT_TRUE(OffersFirstDownload(State::kMissing));
++  EXPECT_TRUE(OffersFirstDownload(State::kChecking));
++  for (State state : {State::kDownloading, State::kReady, State::kFailed}) {
++    EXPECT_FALSE(OffersFirstDownload(state)) << static_cast<int>(state);
++  }
++}
++
++// While detection's model downloads, the captions model that may follow
++// once Hindi, Tamil or Bengali is heard ("Then 680 MB more…").
++TEST(PillLanguageTest, CaptionsModelToFollow) {
++  using tark_captions::ModelUnit;
++  using State = tark_captions::CaptionModelStore::State;
++  const std::vector<ModelUnit> detection = {ModelUnit::kLanguageId};
++  const int64_t captions_mb =
++      tark_captions::Megabytes(tark_captions::UnitSize(ModelUnit::kCaptions));
++  ASSERT_GT(captions_mb, 600);
++  EXPECT_EQ(CaptionsMbToFollow(detection, State::kMissing), captions_mb);
++  EXPECT_EQ(CaptionsMbToFollow(detection, State::kFailed), captions_mb);
++  // Already here, already coming, or not known yet.
++  EXPECT_EQ(CaptionsMbToFollow(detection, State::kReady), 0);
++  EXPECT_EQ(CaptionsMbToFollow(detection, State::kDownloading), 0);
++  EXPECT_EQ(CaptionsMbToFollow(detection, State::kChecking), 0);
++  // A chosen Tark language downloads both at once: nothing follows.
++  EXPECT_EQ(CaptionsMbToFollow({ModelUnit::kLanguageId, ModelUnit::kCaptions}, State::kMissing),
++            0);
++  // Not waiting on detection (Translate's models): nothing to say.
++  EXPECT_EQ(CaptionsMbToFollow({ModelUnit::kToEnglish}, State::kMissing), 0);
++}
++
+ }  // namespace
+--- a/chrome/browser/ui/webui/settings/tark_live_captions_handler.cc
++++ b/chrome/browser/ui/webui/settings/tark_live_captions_handler.cc
+@@ -47,8 +47,9 @@
+   }
+ }
+ 
++// As whole MB, like the caption bar; an int for the page.
+ int Megabytes(int64_t bytes) {
+-  return static_cast<int>(bytes / 1000000);
++  return static_cast<int>(tark_captions::Megabytes(bytes));
+ }
+ 
+ }  // namespace
+--- a/chrome/browser/ui/webui/settings/tark_settings_strings.cc
++++ b/chrome/browser/ui/webui/settings/tark_settings_strings.cc
+@@ -4,8 +4,11 @@
+ 
+ #include "chrome/browser/ui/webui/settings/tark_settings_strings.h"
+ 
++#include "base/strings/string_number_conversions.h"
+ #include "chrome/grit/generated_resources.h"
++#include "components/tark_captions/model_manifest.h"
+ #include "content/public/browser/web_ui_data_source.h"
++#include "ui/base/l10n/l10n_util.h"
+ #include "ui/base/webui/web_ui_util.h"
+ 
+ namespace tark {
+@@ -84,6 +87,18 @@
+       {"tarkCaptionsBengali", IDS_TARK_CAPTIONS_BENGALI},
+   };
+   html_source->AddLocalizedStrings(kStrings);
++  // The first-time download size, up front: detection and Tark's captions,
++  // and translating into English.
++  using tark_captions::ModelUnit;
++  html_source->AddString(
++      "tarkLiveCaptionsFirstTime",
++      l10n_util::GetStringFUTF16(
++          IDS_SETTINGS_TARK_LIVE_CAPTIONS_FIRST_TIME,
++          base::NumberToString16(tark_captions::AboutMegabytes(
++              tark_captions::UnitSize(ModelUnit::kLanguageId) +
++              tark_captions::UnitSize(ModelUnit::kCaptions))),
++          base::NumberToString16(
++              tark_captions::AboutMegabytes(tark_captions::UnitSize(ModelUnit::kToEnglish)))));
+ }
+ 
+ }  // namespace tark
+--- a/components/tark_captions/model_manifest.h
++++ b/components/tark_captions/model_manifest.h
+@@ -36,6 +36,13 @@
+ base::span<const ModelUnitInfo> ModelManifest();
+ 
+ int64_t UnitSize(const ModelUnitInfo& info);
++int64_t UnitSize(ModelUnit unit);
++
++// Sizes as people read them (the first-time download notice): whole MB
++// (1,000,000 bytes) in the caption bar, and "about" sizes in Settings
++// rounded to the nearest 10 MB.
++int64_t Megabytes(int64_t bytes);
++int64_t AboutMegabytes(int64_t bytes);
+ 
+ // The units a translation into `target` needs: none, to English, or (for an
+ // Indian target, which goes through English) both.
+--- a/components/tark_captions/model_manifest_unittest.cc
++++ b/components/tark_captions/model_manifest_unittest.cc
+@@ -105,5 +105,18 @@
+             UnitsForTranslation(Target::kEnglish));
+ }
+ 
++// The first-time download notice: whole MB in the bar ("88 MB"), and
++// "about" sizes in Settings rounded to the nearest 10 MB.
++TEST(ModelManifestTest, Megabytes) {
++  EXPECT_EQ(Megabytes(88'999'999), 88);
++  EXPECT_EQ(Megabytes(999'999), 0);
++  EXPECT_EQ(AboutMegabytes(768'000'000), 770);
++  EXPECT_EQ(AboutMegabytes(238'881'923), 240);
++  EXPECT_EQ(AboutMegabytes(765'000'000), 770);
++  EXPECT_EQ(AboutMegabytes(764'999'999), 760);
++  EXPECT_EQ(UnitSize(ModelUnit::kLanguageId), UnitSize(InfoOf(ModelUnit::kLanguageId)));
++  EXPECT_EQ(UnitSize(ModelUnit::kCaptions), UnitSize(InfoOf(ModelUnit::kCaptions)));
++}
++
+ }  // namespace
+ }  // namespace tark_captions
+--- a/components/tark_captions/model_units.cc
++++ b/components/tark_captions/model_units.cc
+@@ -16,6 +16,23 @@
+   return size;
+ }
+ 
++int64_t UnitSize(ModelUnit unit) {
++  for (const ModelUnitInfo& info : ModelManifest()) {
++    if (info.unit == unit) {
++      return UnitSize(info);
++    }
++  }
++  return 0;
++}
++
++int64_t Megabytes(int64_t bytes) {
++  return bytes / 1'000'000;
++}
++
++int64_t AboutMegabytes(int64_t bytes) {
++  return (bytes + 5'000'000) / 10'000'000 * 10;
++}
++
+ std::vector<ModelUnit> UnitsForTranslation(Target target) {
+   switch (target) {
+     case Target::kNone:
