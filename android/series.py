@@ -7,7 +7,8 @@
     python3 android/series.py REPO OUT
 
 OUT gets the tarka/ entries of REPO/patches/series, in order, minus
-android/desktop-only-patches.txt, then android/patches/series (Android-only
+android/desktop-only-patches.txt (an entry ending in "/" is a whole folder),
+then android/patches/series (Android-only
 patches, as android/...). android/build.sh applies
 ungoogled-chromium's own series from the submodule first, then this one.
 """
@@ -23,10 +24,16 @@ def entries(path):
             if l.strip() and not l.lstrip().startswith('#')]
 
 
+def desktop_only(entry, skip):
+    """Whether a series entry is left out: listed itself, or under a folder
+    listed with a trailing slash (tarka/captions/)."""
+    return entry in skip or any(s.endswith('/') and entry.startswith(s) for s in skip)
+
+
 def series(repo):
     skip = set(entries(HERE / 'desktop-only-patches.txt'))
     shared = [e for e in entries(pathlib.Path(repo) / 'patches' / 'series')
-              if e.startswith('tarka/') and e not in skip]
+              if e.startswith('tarka/') and not desktop_only(e, skip)]
     # Android-only patches (android/patches/), last.
     return shared + ['android/' + e for e in entries(HERE / 'patches' / 'series')]
 

@@ -29,12 +29,25 @@ class TestAndroidSeries(unittest.TestCase):
         android = [e for e in self.series if e.startswith('android/')]
         tark = [e for e in self.series if not e.startswith('android/')]
         self.assertTrue(all(e.startswith('tarka/') for e in tark))
-        self.assertEqual(tark, [e for e in self.tark if e not in self.skip])
+        import series
+        self.assertEqual(tark, [e for e in self.tark if not series.desktop_only(e, self.skip)])
         # Android-only patches (android/patches/series) come last.
         self.assertEqual(self.series[len(tark):], android)
         self.assertEqual(android, ['android/' + e for e in lines(ANDROID / 'patches' / 'series')])
         for e in android:
             self.assertTrue((ANDROID / 'patches' / e[len('android/'):]).is_file(), e)
+
+    def test_a_folder_entry_skips_every_patch_under_it(self):
+        # D4 captions keep gaining patches (#9 added three after PR #8 listed
+        # 21 one by one): the folder is listed once, so a new captions patch
+        # never slips into the Android build.
+        import series
+        self.assertIn('tarka/captions/', self.skip)
+        self.assertFalse([e for e in self.skip if e.startswith('tarka/captions/') and e != 'tarka/captions/'])
+        self.assertFalse([e for e in self.series if e.startswith('tarka/captions/')])
+        self.assertTrue(series.desktop_only('tarka/captions/new-one.patch', {'tarka/captions/'}))
+        self.assertFalse(series.desktop_only('tarka/captionsx/a.patch', {'tarka/captions/'}))
+        self.assertTrue(series.desktop_only('tarka/updater/sparkle.patch', {'tarka/updater/sparkle.patch'}))
 
     def test_locales_fix_is_android_only(self):
         self.assertIn('android/locales-android-branch.patch', self.series)
@@ -226,7 +239,11 @@ class TestAndroidSeries(unittest.TestCase):
     def test_skip_list_entries_exist(self):
         self.assertTrue(self.skip)
         for entry in self.skip:
-            self.assertIn(entry, self.tark, entry)
+            if entry.endswith('/'):
+                # A folder entry covers at least one patch.
+                self.assertTrue([e for e in self.tark if e.startswith(entry)], entry)
+            else:
+                self.assertIn(entry, self.tark, entry)
 
     def test_sparkle_skipped(self):
         self.assertNotIn('tarka/updater/sparkle.patch', self.series)
