@@ -155,3 +155,21 @@ class TestSigning(unittest.TestCase):
         _, other_aab = self.fixtures(805903902, '155.0.8059.39-r2', tag='b')
         with self.assertRaisesRegex(ValueError, 'version'):
             self.sign.release(self.apk, other_aab, self.tmp / 'mismatch', self.keystore, self.passfile)
+
+
+@unittest.skipIf(tools_missing(), tools_missing() or '')
+class TestSigningRefusesStrangeNames(TestSigning):
+    """The output names come from the APK's own version name: only Tark's
+    shape (<chromium>-r<revision>) is used, and nothing is overwritten."""
+
+    def test_a_version_name_with_a_path_is_refused(self):
+        apk, aab = self.fixtures(805903903, '../../evil', tag='c')
+        with self.assertRaisesRegex(ValueError, 'version name'):
+            self.sign.release(apk, aab, self.tmp / 'strange', self.keystore, self.passfile)
+        self.assertFalse((self.tmp / 'evil.apk').exists())
+
+    def test_an_existing_release_is_not_overwritten(self):
+        outdir = self.tmp / 'twice'
+        self.sign.release(self.apk, self.aab, outdir, self.keystore, self.passfile)
+        with self.assertRaisesRegex(ValueError, 'exists'):
+            self.sign.release(self.apk, self.aab, outdir, self.keystore, self.passfile)

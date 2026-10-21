@@ -30,6 +30,7 @@ KEYSTORE = pathlib.Path.home() / '.config' / 'tark' / 'android-release.p12'
 PASSFILE = pathlib.Path.home() / '.config' / 'tark' / 'android-release.pass'
 ALIAS = 'tark'
 # The signature files of an old signer: jarsigner adds its own beside them.
+_VERSION_NAME = re.compile(r'\d+\.\d+\.\d+\.\d+-r\d{1,2}')
 _SIGNATURE = re.compile(r'^META-INF/([^/]+\.(SF|RSA|DSA|EC)|MANIFEST\.MF)$', re.IGNORECASE)
 
 
@@ -105,9 +106,16 @@ def release(apk, aab, outdir, keystore=KEYSTORE, passfile=PASSFILE):
     package, code, name = _badging(apk)
     if _bundle_badging(aab) != (package, code, name):
         raise ValueError(f'the APK and the bundle differ in package or version: {apk}, {aab}')
+    # The file names come from the APK's own version name: only Tark's shape
+    # (android/release/version.py) is used, and a release is never replaced.
+    if not _VERSION_NAME.fullmatch(name):
+        raise ValueError(f'unexpected version name {name!r} in {apk}')
     outdir = pathlib.Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
     apk_out = outdir / f'tark-{name}.apk'
+    for out in (apk_out, outdir / f'tark-{name}.aab'):
+        if out.exists():
+            raise ValueError(f'{out} exists; a release is never overwritten')
     cert = sign_apk(apk, apk_out, keystore, passfile)
     if sign_aab(aab, outdir / f'tark-{name}.aab', keystore, passfile) != cert:
         raise ValueError('the APK and the bundle came out with different certificates')
