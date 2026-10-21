@@ -110,6 +110,13 @@ class TestDriverAndJob(unittest.TestCase):
         self.assertIn('poweroff', s)
         self.assertIn('cd /tark', s)  # never the SSM agent's folder
 
+    def test_fresh_wipes_the_base_too(self):
+        s = text('jobs/tark-build.sh')
+        line = next(l for l in s.splitlines() if l.startswith('(( fresh ))'))
+        for path in ('/tark/work/src ', '/tark/work/src-base', '/tark/work/prepared.stamp',
+                     '/tark/work/base.stamp', '/tark/work/layers.json'):
+            self.assertIn(path, line + ' ')
+
     def test_driver_archive_in_private_temp_dir(self):
         s = text('andbuild.sh')
         self.assertIn('mktemp -d', s)

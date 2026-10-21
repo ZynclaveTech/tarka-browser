@@ -6,9 +6,9 @@
 #   tark-build.sh BUCKET PREFIX SUBMODULE_COMMIT [--stop-before-gn] [--fresh]
 #
 # A1: build Tark for Android from the source andbuild.sh put in S3. /tark/work
-# keeps the Chromium checkout between runs (--fresh wipes it). The APK and the
-# log go to the job's S3 prefix; the machine powers off at the end, success
-# or not, unless another build is still running.
+# keeps the Chromium checkout and its base copy between runs (--fresh wipes
+# both). The APK and the log go to the job's S3 prefix; the machine powers off
+# at the end, success or not, unless another build is still running.
 set -uo pipefail
 B=$1; P=$2; SUB=$3; shift 3
 stop=""; fresh=0
@@ -45,7 +45,7 @@ must git -C $repo/ungoogled-chromium checkout --quiet --detach "$SUB"
 [[ $(git -C $repo/ungoogled-chromium rev-parse HEAD) == "$SUB" ]] || { echo "submodule is not $SUB" >> $log; exit 1; }
 echo "submodule $SUB" >> $log
 
-(( fresh )) && rm -rf /tark/work/src /tark/work/prepared.stamp
+(( fresh )) && rm -rf /tark/work/src /tark/work/src-base /tark/work/prepared.stamp /tark/work/base.stamp /tark/work/layers.json
 # An earlier build's APK must never be uploaded as this job's.
 rm -f /tark/work/src/out/Default/apks/ChromePublic.apk
 # A2: a list bundle staged in s3://BUCKET/lists/ (latest.json and its zip)

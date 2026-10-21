@@ -4,6 +4,7 @@ instead of run, so the order is tested on the Mac without a Chromium tree."""
 import os
 import pathlib
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -29,6 +30,7 @@ def dryrun(*args):
             if (work / 'uc' / 'utils' / 'depot_tools.patch').exists() else '',
             'uc_files': sorted(str(f.relative_to(work / 'uc')) for f in (work / 'uc').rglob('*')
                                if f.is_file()) if (work / 'uc').exists() else [],
+            'base_stamp': (work / 'base.stamp').read_text() if (work / 'base.stamp').exists() else '',
         }
         runs = [l[len('tark: run '):] for l in result.stdout.splitlines()
                 if l.startswith('tark: run ')]
@@ -203,9 +205,14 @@ class TestAndroidBuildSh(unittest.TestCase):
 
     def test_core_patches_then_tark_series(self):
         result, runs, files, tmp = dryrun('--stop-before-gn')
-        apply = runs[index_of(runs, 'utils/patches.py apply')]
-        core = apply.index('ungoogled-chromium/patches')
-        tark = apply.index(f'{tmp}/tark-patches')
+        # Two runs: the core patches belong to the base, Tark's series to
+        # Tark's layer (android/layers.py).
+        core = index_of(runs, 'utils/patches.py apply')
+        self.assertIn('ungoogled-chromium/patches', runs[core])
+        self.assertNotIn('tark-patches', runs[core])
+        tark = index_of(runs, f'{tmp}/tark-patches')
+        self.assertIn('utils/patches.py apply', runs[tark])
+        self.assertNotIn('ungoogled-chromium/patches', runs[tark])
         self.assertLess(core, tark)
         self.assertNotIn('tarka/updater/sparkle.patch', files['series'])
         self.assertIn('tarka/omnibox-translit/translit-provider.patch', files['series'])
@@ -241,6 +248,104 @@ class TestAndroidBuildSh(unittest.TestCase):
         result, runs, files, tmp = dryrun()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('ninja -k 0 -C', runs[index_of(runs, 'chrome_public_apk')])
+
+
+def hash_of(*flags):
+    return subprocess.run([sys.executable, str(REPO / 'android' / 'prep_hash.py'), *flags, str(REPO)],
+                          capture_output=True, text=True, check=True).stdout.strip()
+
+
+def build_in(work, *args):
+    env = dict(os.environ, TARK_ANDROID_DRYRUN='1')
+    result = subprocess.run(['bash', str(SCRIPT), *args, str(work)], capture_output=True, text=True, env=env)
+    runs = [l[len('tark: run '):] for l in result.stdout.splitlines() if l.startswith('tark: run ')]
+    return result, runs
+
+
+class TestLayers(unittest.TestCase):
+    """The base (Chromium, toolchains, core patches) is kept in src-base;
+    when only Tark's layer changed, it is put back and applied again
+    (android/layers.py), out/ kept."""
+
+    def test_a_new_base_is_kept_after_the_core_patches(self):
+        result, runs, files, tmp = dryrun('--stop-before-gn')
+        self.assertEqual(result.returncode, 3, result.stderr)
+        core = index_of(runs, 'ungoogled-chromium/patches')
+        copy = index_of(runs, f'cp -a {tmp}/src {tmp}/src-base')
+        tark = index_of(runs, f'{tmp}/tark-patches')
+        self.assertLess(core, copy)
+        self.assertLess(copy, tark)
+        self.assertLess(index_of(runs, '_install_xlit'), index_of(runs, 'layers.py settle'))
+        self.assertNotIn('layers.py reset', '\n'.join(runs))
+        self.assertEqual(files['base_stamp'].strip(), hash_of('--base'))
+
+    def test_base_reused_when_only_tarks_layer_changed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            work = pathlib.Path(tmp)
+            (work / 'base.stamp').write_text(hash_of('--base') + '\n')
+            (work / 'src-base').mkdir()
+            (work / 'src' / 'out' / 'Default').mkdir(parents=True)
+            (work / 'prepared.stamp').write_text('an older preparation\n')
+            result, runs = build_in(work, '--stop-before-gn')
+            self.assertEqual(result.returncode, 3, result.stderr)
+            joined = '\n'.join(runs)
+            for absent in ('clone.py', 'gclient sync', 'update_rust.py', 'ungoogled-chromium/patches',
+                           'rm -rf', 'cp -a'):
+                self.assertNotIn(absent, joined)
+            order = [index_of(runs, n) for n in (
+                f'layers.py reset {tmp}/src-base {tmp}/src {tmp}/layers.json',
+                f'{tmp}/tark-patches',
+                'utils/domain_substitution.py apply',
+                'utils/name_substitution.py --sub',
+                '_install_xlit',
+                f'layers.py settle {tmp}/src-base {tmp}/src {tmp}/layers.json',
+            )]
+            self.assertEqual(order, sorted(order))
+            self.assertEqual((work / 'prepared.stamp').read_text().strip(), hash_of())
+            self.assertTrue((work / 'src' / 'out' / 'Default').is_dir())
+
+    def test_a_changed_base_wipes_the_tree_and_its_copy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            work = pathlib.Path(tmp)
+            (work / 'base.stamp').write_text('an older base\n')
+            (work / 'src-base').mkdir()
+            (work / 'src').mkdir()
+            (work / 'src' / 'old-file').write_text('x')
+            (work / 'layers.json').write_text('{}')
+            result, runs = build_in(work, '--stop-before-gn')
+            self.assertEqual(result.returncode, 3, result.stderr)
+            self.assertIn(f'rm -rf {tmp}/src {tmp}/src-base', runs)
+            self.assertIn('clone.py', '\n'.join(runs))
+            self.assertNotIn('layers.py reset', '\n'.join(runs))
+            self.assertFalse((work / 'layers.json').exists())
+
+    def test_a_missing_copy_means_a_new_base(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            work = pathlib.Path(tmp)
+            (work / 'base.stamp').write_text(hash_of('--base') + '\n')
+            result, runs = build_in(work, '--stop-before-gn')
+            self.assertIn('clone.py', '\n'.join(runs))
+
+    def test_a_layer_cut_short_is_never_taken_as_prepared(self):
+        # The stamp goes before the layer is put back, and is written only
+        # once Tark's layer is settled.
+        s = SCRIPT.read_text()
+        self.assertLess(s.index('rm -f "$stamp"'), s.index('layers.py" reset'))
+        self.assertLess(s.index('layers.py" settle'), s.index('echo "$prep" > "$stamp"'))
+
+    def test_base_hash_covers_only_the_base(self):
+        sys.path.insert(0, str(REPO / 'android'))
+        import prep_hash
+        section = prep_hash.base_section(SCRIPT.read_text())
+        for step in ('clone.py', 'sync --nohooks', 'update_rust.py', 'install-sysroot.py', 'ungoogled-chromium/patches'):
+            self.assertIn(step if step != 'ungoogled-chromium/patches' else '$_main_repo/patches', section)
+        for step in ('tark-patches', 'domain_substitution.py', 'name_substitution.py', '_install_xlit', 'settle'):
+            self.assertNotIn(step, section)
+        self.assertTrue(set(prep_hash.BASE_INPUTS) <= set(prep_hash.INPUTS))
+        self.assertIn('android/layers.py', prep_hash.INPUTS)
+        for f in prep_hash.BASE_INPUTS:
+            self.assertFalse(f.startswith(('android/patches', 'patches/', 'utils/', 'resources/')), f)
+        self.assertNotEqual(hash_of('--base'), hash_of())
 
 
 if __name__ == '__main__':
