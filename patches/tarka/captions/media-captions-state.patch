@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/components/tark_captions/media_players.h
-@@ -0,0 +1,106 @@
+@@ -0,0 +1,112 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -53,8 +53,13 @@
 +  // rect when it isn't visible.
 +  void OnVideoRect(const PlayerKey& key, std::optional<gfx::Rect> rect);
 +  void SetTabMuted(bool muted, base::TimeTicks now);
++  // A player's tracks changed (a muted autoplay video unmuted gains audio).
++  void OnMetadata(const PlayerKey& key, bool has_video, bool has_audio, base::TimeTicks now);
++  // The tab plays sound from no media element (Web Audio).
++  void SetTabAudible(bool audible, base::TimeTicks now);
 +
-+  // Sound now: a player playing, with audio, not muted, in an unmuted tab.
++  // Sound now: a player playing, with audio, not muted, in an unmuted tab;
++  // or the tab audible (Web Audio).
 +  bool AnyAudible() const;
 +  // Whether the button shows at `now`; a call always shows it.
 +  bool ButtonShown(bool in_call, base::TimeTicks now) const;
@@ -88,6 +93,7 @@
 +
 +  base::flat_map<PlayerKey, Player> players_;
 +  bool tab_muted_ = false;
++  bool tab_audible_ = false;
 +  // When the current stretch of sound began (pauses shorter than the linger
 +  // don't end it), and when the sound last stopped.
 +  std::optional<base::TimeTicks> sound_since_;
@@ -109,7 +115,7 @@
 +#endif  // COMPONENTS_TARK_CAPTIONS_MEDIA_PLAYERS_H_
 --- /dev/null
 +++ b/components/tark_captions/media_players.cc
-@@ -0,0 +1,201 @@
+@@ -0,0 +1,226 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -194,7 +200,32 @@
 +  return player.playing && player.has_audio && !player.muted && !tab_muted_;
 +}
 +
++void MediaPlayers::OnMetadata(const PlayerKey& key,
++                              bool has_video,
++                              bool has_audio,
++                              base::TimeTicks now) {
++  auto it = players_.find(key);
++  if (it == players_.end()) {
++    return;
++  }
++  const bool was_audible = AnyAudible();
++  const base::flat_map<PlayerKey, bool> before = AudibleNow();
++  it->second.has_video = has_video;
++  it->second.has_audio = has_audio;
++  MarkSilenced(before, now);
++  Update(was_audible, now);
++}
++
++void MediaPlayers::SetTabAudible(bool audible, base::TimeTicks now) {
++  const bool was_audible = AnyAudible();
++  tab_audible_ = audible;
++  Update(was_audible, now);
++}
++
 +bool MediaPlayers::AnyAudible() const {
++  if (tab_audible_ && !tab_muted_) {
++    return true;
++  }
 +  for (const auto& [key, player] : players_) {
 +    if (Audible(player)) {
 +      return true;
@@ -313,7 +344,7 @@
 +}  // namespace tark_captions
 --- /dev/null
 +++ b/components/tark_captions/media_players_unittest.cc
-@@ -0,0 +1,164 @@
+@@ -0,0 +1,184 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -466,6 +497,26 @@
 +  players_.OnStopped(kOther, At(base::Seconds(2)));
 +  players_.OnStopped(kVideo, At(base::Seconds(3)));
 +  EXPECT_EQ(players_.AnchorVideo(), gfx::Rect(0, 0, 400, 300));
++}
++
++// A muted autoplay video the person unmutes: its metadata gains audio.
++TEST_F(MediaPlayersTest, UnmutedAutoplayGetsTheButton) {
++  players_.OnStarted(kVideo, true, /*has_audio=*/false, t0_);
++  EXPECT_FALSE(players_.AnyAudible());
++  players_.OnMetadata(kVideo, /*has_video=*/true, /*has_audio=*/true, At(base::Seconds(2)));
++  EXPECT_TRUE(players_.AnyAudible());
++  EXPECT_TRUE(players_.ButtonShown(false, At(base::Milliseconds(2500))));
++}
++
++// Sound from no media element (Web Audio): the tab is audible; the corner.
++TEST_F(MediaPlayersTest, WebAudioUsesCorner) {
++  players_.SetTabAudible(true, t0_);
++  EXPECT_TRUE(players_.AnyAudible());
++  EXPECT_TRUE(players_.ButtonShown(false, At(base::Milliseconds(500))));
++  EXPECT_EQ(PlaceButton(players_, false, kArea, kButton),
++            gfx::Rect(1200 - 16 - 30, 800 - 16 - 22, 30, 22));
++  players_.SetTabAudible(false, At(base::Seconds(5)));
++  EXPECT_FALSE(players_.AnyAudible());
 +}
 +
 +TEST_F(MediaPlayersTest, DestroyedPlayerIsForgotten) {

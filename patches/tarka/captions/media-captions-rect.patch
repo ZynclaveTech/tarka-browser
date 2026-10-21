@@ -21,20 +21,20 @@
 +class Document;
 +class HTMLVideoElement;
 +
-+// Tark (D4 any-media captions): while a video plays, tells the browser
-+// where it is on screen, so Tark's captions button can sit on its corner.
++// Tark (D4 any-media captions): once a video has played, tells the
++// browser where it is on screen, so Tark's captions button can sit on its corner.
 +// The box is the video's content box in DIPs, relative to the outermost
 +// main frame's viewport; sent after a lifecycle update when it changed.
-+// Empty: not visible. Null: not known (a frame whose position in the page
-+// can't be mapped).
++// Empty: not visible. Null: not known (a video in a cross-site frame, whose
++// place in the page lags the page's scrolling).
 +class CORE_EXPORT TarkVideoRectReporter final
 +    : public GarbageCollected<TarkVideoRectReporter>,
 +      public LocalFrameView::LifecycleNotificationObserver {
 + public:
 +  explicit TarkVideoRectReporter(HTMLVideoElement& video);
 +
-+  // Starts reporting (the video started playing). Stops by itself once the
-+  // video is paused or disconnected.
++  // Starts reporting (the video started playing); it goes on while the
++  // video stays in its document, paused or moved.
 +  void Attach();
 +  void Detach();
 +
@@ -58,7 +58,7 @@
 +#endif  // THIRD_PARTY_BLINK_RENDERER_CORE_HTML_MEDIA_TARK_VIDEO_RECT_REPORTER_H_
 --- /dev/null
 +++ b/third_party/blink/renderer/core/html/media/tark_video_rect_reporter.cc
-@@ -0,0 +1,98 @@
+@@ -0,0 +1,136 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -67,7 +67,9 @@
 +
 +#include "third_party/blink/renderer/core/dom/document.h"
 +#include "third_party/blink/renderer/core/frame/local_frame.h"
++#include "third_party/blink/renderer/core/html/html_frame_owner_element.h"
 +#include "third_party/blink/renderer/core/html/media/html_video_element.h"
++#include "third_party/blink/renderer/core/layout/layout_box.h"
 +#include "third_party/blink/renderer/core/layout/layout_video.h"
 +#include "third_party/blink/renderer/core/page/chrome_client.h"
 +#include "third_party/blink/renderer/core/page/page.h"
@@ -75,11 +77,31 @@
 +
 +namespace blink {
 +
++namespace {
++
++// `rect` (absolute, in `box`'s frame) clipped by the boxes around it that
++// clip their overflow (scrollers, overflow: hidden) and by the frame's own
++// viewport.
++PhysicalRect ClipWithinFrame(const LayoutObject& box,
++                             PhysicalRect rect,
++                             const LocalFrameView& view) {
++  for (const LayoutObject* parent = box.Parent(); parent; parent = parent->Parent()) {
++    const auto* clipper = DynamicTo<LayoutBox>(parent);
++    if (clipper && clipper->ShouldClipOverflowAlongEitherAxis()) {
++      rect.Intersect(clipper->LocalToAbsoluteRect(clipper->OverflowClipRect()));
++    }
++  }
++  rect.Intersect(PhysicalRect(PhysicalOffset(), PhysicalSize(view.Size())));
++  return rect;
++}
++
++}  // namespace
++
 +TarkVideoRectReporter::TarkVideoRectReporter(HTMLVideoElement& video) : video_(&video) {}
 +
 +void TarkVideoRectReporter::Attach() {
 +  Document& document = video_->GetDocument();
-+  if (attached_to_ || !video_->isConnected() || !document.View()) {
++  if (attached_to_ || !document.View()) {
 +    return;
 +  }
 +  document.View()->RegisterForLifecycleNotifications(this);
@@ -101,38 +123,54 @@
 +}
 +
 +void TarkVideoRectReporter::DidFinishLifecycleUpdate(const LocalFrameView&) {
-+  if (video_->paused() || !video_->isConnected() ||
-+      &video_->GetDocument() != attached_to_) {
++  if (&video_->GetDocument() != attached_to_) {
 +    Detach();
 +    return;
 +  }
-+  Send(ComputeRect());
++  // Keeps reporting once the video has played: paused (its button may stay,
++  // captions still on) and while it is moved in the page (theater mode, a
++  // floating player). Out of the page, it isn't visible.
++  Send(video_->isConnected() ? ComputeRect() : std::optional<gfx::Rect>(gfx::Rect()));
 +}
 +
 +std::optional<gfx::Rect> TarkVideoRectReporter::ComputeRect() const {
 +  LocalFrame* frame = video_->GetDocument().GetFrame();
 +  auto* layout = DynamicTo<LayoutVideo>(video_->GetLayoutObject());
-+  if (!frame || !frame->View() || !frame->GetPage()) {
++  // A frame in another process (a cross-site embed) learns where it sits in
++  // the page only now and then, so its box would lag the page's scrolling:
++  // not known (the button goes to the window's corner).
++  if (!frame || !frame->View() || !frame->GetPage() ||
++      !frame->LocalFrameRoot().IsOutermostMainFrame()) {
 +    return std::nullopt;
 +  }
 +  if (!layout) {
 +    return gfx::Rect();  // display: none.
 +  }
-+  // The content box (the picture, not the letterboxing) in the frame.
-+  PhysicalRect box = layout->LocalToAbsoluteRect(layout->ReplacedContentRect());
-+  gfx::Rect in_viewport;
-+  if (frame->LocalFrameRoot().IsOutermostMainFrame()) {
-+    // Through same-process ancestor frames to the main frame's viewport.
-+    in_viewport = frame->View()->FrameToViewport(ToEnclosingRect(box));
-+  } else {
-+    // A frame in another process (a cross-site embed): its local root
-+    // knows where it sits in the main frame.
-+    PhysicalRect in_root = frame->View()->ConvertToRootFrame(box);
-+    if (!frame->LocalFrameRoot().View()->MapToVisualRectInRemoteRootFrame(
-+            in_root, /*apply_overflow_clip=*/true, /*apply_viewport_transform=*/true)) {
-+      return std::nullopt;
++  // The content box (the picture, not the letterboxing), clipped in its frame.
++  const PhysicalRect box = ClipWithinFrame(
++      *layout, layout->LocalToAbsoluteRect(layout->ReplacedContentRect()), *frame->View());
++  if (box.IsEmpty()) {
++    return gfx::Rect();
++  }
++  // Through same-process ancestor frames to the main frame's viewport,
++  // clipped by each iframe it sits in.
++  gfx::Rect in_viewport = frame->View()->FrameToViewport(ToEnclosingRect(box));
++  for (LocalFrame* child = frame; child && !child->IsOutermostMainFrame();) {
++    auto* parent = DynamicTo<LocalFrame>(child->Tree().Parent());
++    HTMLFrameOwnerElement* owner = child->DeprecatedLocalOwner();
++    if (!parent || !parent->View() || !owner) {
++      break;
 +    }
-+    in_viewport = ToEnclosingRect(in_root);
++    if (const auto* owner_box = DynamicTo<LayoutBox>(owner->GetLayoutObject())) {
++      const PhysicalRect owner_rect = ClipWithinFrame(
++          *owner_box, owner_box->LocalToAbsoluteRect(owner_box->PhysicalContentBoxRect()),
++          *parent->View());
++      in_viewport.Intersect(parent->View()->FrameToViewport(ToEnclosingRect(owner_rect)));
++    }
++    child = parent;
++  }
++  if (in_viewport.IsEmpty()) {
++    return gfx::Rect();
 +  }
 +  // Layout is in physical pixels; the browser places windows in DIPs.
 +  const float scale = frame->GetPage()->GetChromeClient().WindowToViewportScalar(frame, 1.0f);
@@ -351,17 +389,7 @@
    visitor->Trace(wake_lock_);
    visitor->Trace(remoting_interstitial_);
    visitor->Trace(picture_in_picture_interstitial_);
-@@ -238,6 +240,9 @@
- 
- void HTMLVideoElement::RemovedFrom(ContainerNode& insertion_point) {
-   HTMLMediaElement::RemovedFrom(insertion_point);
-+  if (tark_rect_reporter_) {
-+    tark_rect_reporter_->Detach();
-+  }
-   custom_controls_fullscreen_detector_->Detach();
-   UpdateVideoVisibilityTracker();
-   SetPersistentState(false);
-@@ -245,6 +250,9 @@
+@@ -245,6 +247,9 @@
  
  void HTMLVideoElement::ContextDestroyed() {
    custom_controls_fullscreen_detector_->ContextDestroyed();
@@ -371,7 +399,7 @@
    UpdateVideoVisibilityTracker();
    HTMLMediaElement::ContextDestroyed();
  }
-@@ -874,6 +882,10 @@
+@@ -874,6 +879,10 @@
  
    wake_lock_->ElementDidMoveToNewDocument();
  
@@ -382,7 +410,7 @@
    if (visibility_tracker_) {
      // Ensure that the |visibility_tracker_| is detached when |this| is moved to
      // a new document. Calling |ElementDidMoveToNewDocument| on the tracker at
-@@ -1349,4 +1361,17 @@
+@@ -1349,4 +1358,17 @@
    }
  }
  

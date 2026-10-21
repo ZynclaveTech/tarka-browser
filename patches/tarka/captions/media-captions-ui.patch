@@ -315,7 +315,7 @@
      CaptionsChanged(was_on);
    }
    ReleaseIfOff();
-@@ -178,15 +208,71 @@
+@@ -178,15 +208,84 @@
    observers_.Notify(&Observer::OnCallStateChanged, this);
  }
  
@@ -359,6 +359,19 @@
 +void CallCaptionsTabHelper::MediaMutedStatusChanged(const content::MediaPlayerId& id,
 +                                                    bool muted) {
 +  players_.OnMuted(KeyOf(id), muted, base::TimeTicks::Now());
++  PlayersChanged();
++}
++
++void CallCaptionsTabHelper::MediaMetadataChanged(const MediaPlayerInfo& info,
++                                                 const content::MediaPlayerId& id) {
++  // A muted autoplay video, unmuted, gains audio here.
++  players_.OnMetadata(KeyOf(id), info.has_video, info.has_audio, base::TimeTicks::Now());
++  PlayersChanged();
++}
++
++void CallCaptionsTabHelper::OnAudioStateChanged(bool audible) {
++  // Sound from no media element too (Web Audio).
++  players_.SetTabAudible(audible, base::TimeTicks::Now());
 +  PlayersChanged();
 +}
 +
@@ -464,7 +477,7 @@
  
    // D4 Phase 3: macOS 26 captions the Apple languages (English, Spanish...)
    // in this process, one AppleCaptioner per tap the speech process opens.
-@@ -139,6 +154,16 @@
+@@ -139,6 +154,18 @@
    void OnIsCapturingAudioChanged(content::WebContents* web_contents,
                                   bool is_capturing_audio) override;
  
@@ -474,6 +487,8 @@
 +                           const content::MediaPlayerId& id,
 +                           MediaStoppedReason reason) override;
 +  void MediaMutedStatusChanged(const content::MediaPlayerId& id, bool muted) override;
++  void MediaMetadataChanged(const MediaPlayerInfo& info, const content::MediaPlayerId& id) override;
++  void OnAudioStateChanged(bool audible) override;
 +  void MediaDestroyed(const content::MediaPlayerId& id) override;
 +  void DidUpdateAudioMutingState(bool muted) override;
 +  void PrimaryPageChanged(content::Page& page) override;
@@ -481,7 +496,7 @@
   private:
    friend class content::WebContentsUserData<CallCaptionsTabHelper>;
    explicit CallCaptionsTabHelper(content::WebContents* web_contents);
-@@ -148,6 +173,8 @@
+@@ -148,6 +175,8 @@
    void CaptionsChanged(bool was_on);
    // Gives up being the captioning call once captions are off.
    void ReleaseIfOff();
@@ -490,7 +505,7 @@
    // Sends the next waiting caption to the translator.
    void Pump();
    void OnRendered(bool is_final,
-@@ -187,6 +214,9 @@
+@@ -187,6 +216,9 @@
  #endif
  
    tark_captions::CallState state_;
@@ -720,7 +735,7 @@
      return;
    }
    if (for_captions) {
-@@ -746,3 +801,61 @@
+@@ -746,3 +801,78 @@
    // screen share. Give it the new shape every time.
    widget_->SetAllowScreenshots(false);
  }
@@ -747,6 +762,23 @@
 +                                         TarkCaptionButtonView::kSize);
 +      if (place) {
 +        place->Offset(area.OffsetFromOrigin());
++        // The page decides where it goes: never over the browser's own
++        // windows above the page (a permission prompt, the fullscreen
++        // bubble, the omnibox popup).
++        std::vector<gfx::Rect> browser_windows;
++        const gfx::NativeView browser = browser_view_->GetWidget()->GetNativeView();
++        for (const views::Widget::Widgets& widgets :
++             {views::Widget::GetAllChildWidgets(browser), views::Widget::GetAllOwnedWidgets(browser)}) {
++          for (views::Widget* widget : widgets) {
++            if (widget->IsVisible() && widget != browser_view_->GetWidget() &&
++                widget != button_widget_.get() && widget != widget_.get()) {
++              browser_windows.push_back(widget->GetWindowBoundsInScreen());
++            }
++          }
++        }
++        if (!ButtonClearOf(*place, browser_windows)) {
++          place.reset();
++        }
 +      }
 +    }
 +  }
@@ -951,7 +983,16 @@
    raw_ptr<views::MdTextButton> translate_button_ = nullptr;
 --- a/chrome/browser/ui/views/tark_captions/pill_language.cc
 +++ b/chrome/browser/ui/views/tark_captions/pill_language.cc
-@@ -64,3 +64,10 @@
+@@ -4,6 +4,8 @@
+ 
+ #include "chrome/browser/ui/views/tark_captions/pill_language.h"
+ 
++#include <algorithm>
++
+ #include "components/tark_captions/client_language.h"
+ #include "ui/base/l10n/l10n_util.h"
+ 
+@@ -64,3 +66,15 @@
  std::u16string LanguageDisplayName(const std::string& code, const std::string& ui_locale) {
    return l10n_util::GetDisplayNameForLocale(code, ui_locale, /*is_for_ui=*/true);
  }
@@ -962,9 +1003,23 @@
 +  }
 +  return active_tab ? BarMode::kBar : BarMode::kStrip;
 +}
++
++bool ButtonClearOf(const gfx::Rect& button, const std::vector<gfx::Rect>& browser_windows) {
++  return std::ranges::none_of(browser_windows,
++                              [&](const gfx::Rect& window) { return window.Intersects(button); });
++}
 --- a/chrome/browser/ui/views/tark_captions/pill_language.h
 +++ b/chrome/browser/ui/views/tark_captions/pill_language.h
-@@ -41,6 +41,11 @@
+@@ -8,6 +8,8 @@
+ #include <string>
+ #include <vector>
+ 
++#include "ui/gfx/geometry/rect.h"
++
+ namespace tark_captions {
+ class ClientLanguage;
+ }
+@@ -41,6 +43,17 @@
  // Client speaks, after Auto-detect: Tark's own languages, then macOS 26's.
  std::vector<std::string> ClientLanguageChoices(bool apple_available);
  
@@ -973,12 +1028,26 @@
 +enum class BarMode { kNone, kBar, kStrip };
 +BarMode BarFor(bool captions_on, bool active_tab);
 +
++// The page decides where the CC button goes (D4 any-media): it shows only
++// where none of the browser's own windows over the page (a permission
++// prompt, the fullscreen bubble, the omnibox popup) is, so it never covers
++// them.
++bool ButtonClearOf(const gfx::Rect& button, const std::vector<gfx::Rect>& browser_windows);
++
  // Show their words in: CaptionChoices codes ("" is the language's own
  // script). macOS's languages are shown in their own script only.
  std::vector<std::string> ShowInChoices(const tark_captions::ClientLanguage& language);
 --- a/chrome/browser/ui/views/tark_captions/pill_language_unittest.cc
 +++ b/chrome/browser/ui/views/tark_captions/pill_language_unittest.cc
-@@ -95,4 +95,13 @@
+@@ -8,6 +8,7 @@
+ #include <vector>
+ 
+ #include "components/tark_captions/client_language.h"
++#include "ui/gfx/geometry/rect.h"
+ #include "testing/gtest/include/gtest/gtest.h"
+ 
+ namespace {
+@@ -95,4 +96,22 @@
    EXPECT_EQ(DescribeLanguage(spanish).notice, PillLanguage::Notice::kNone);
  }
  
@@ -989,6 +1058,15 @@
 +  EXPECT_EQ(BarFor(true, true), BarMode::kBar);
 +  EXPECT_EQ(BarFor(true, false), BarMode::kStrip);
 +  EXPECT_EQ(BarFor(false, false), BarMode::kNone);
++}
++
++// The page decides where the button goes: it never sits over the
++// browser's own bubbles (a permission prompt, "Press Esc").
++TEST(PillLanguageTest, ButtonStaysClearOfBrowserBubbles) {
++  const gfx::Rect button(700, 500, 30, 22);
++  EXPECT_TRUE(ButtonClearOf(button, {}));
++  EXPECT_TRUE(ButtonClearOf(button, {gfx::Rect(0, 0, 300, 120)}));
++  EXPECT_FALSE(ButtonClearOf(button, {gfx::Rect(0, 0, 300, 120), gfx::Rect(690, 480, 320, 160)}));
 +}
 +
  }  // namespace
