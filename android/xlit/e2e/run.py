@@ -158,18 +158,32 @@ def type_in_address_bar(dev, text):
     if not m:
         raise RuntimeError('no address bar')
     x1, y1, x2, y2 = map(int, m.groups())
-    dev.shell('input', 'tap', str((x1 + x2) // 2), str((y1 + y2) // 2))
-    time.sleep(1)
-    # Select all, then delete: whatever was typed before goes.
-    dev.shell('input', 'keycombination', 'KEYCODE_CTRL_LEFT', 'KEYCODE_A')
-    dev.shell('input', 'keyevent', 'KEYCODE_DEL')
-    for word in text.split(' '):
-        if word:
-            dev.shell('input', 'text', word)
-        dev.shell('input', 'keyevent', 'KEYCODE_SPACE')
-    dev.shell('input', 'keyevent', 'KEYCODE_DEL')
-    time.sleep(2.5)
-    return dev.screen()
+    last = text.split(' ')[-1]
+    for _ in range(3):
+        dev.shell('input', 'tap', str((x1 + x2) // 2), str((y1 + y2) // 2))
+        time.sleep(1)
+        # Select all, then delete: whatever was typed before goes.
+        dev.shell('input', 'keycombination', 'KEYCODE_CTRL_LEFT', 'KEYCODE_A')
+        dev.shell('input', 'keyevent', 'KEYCODE_DEL')
+        for word in text.split(' '):
+            if word:
+                dev.shell('input', 'text', word)
+            dev.shell('input', 'keyevent', 'KEYCODE_SPACE')
+        dev.shell('input', 'keyevent', 'KEYCODE_DEL')
+        time.sleep(2.5)
+        # A key can arrive late or be lost (once the trailing space was, and
+        # the delete took the last letter): the rows are read only once the
+        # address bar holds the whole last word.
+        xml = dev.screen()
+        typed = address_bar_text(xml)
+        if typed is None or typed.endswith(last):
+            return xml
+    return xml
+
+
+def address_bar_text(xml):
+    m = re.search(r'text="([^"]*)" resource-id="[^"]*(?:url_bar|search_box_text)"', xml)
+    return m.group(1) if m else None
 
 
 def rows(xml):
