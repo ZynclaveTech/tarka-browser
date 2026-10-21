@@ -1,12 +1,15 @@
 --- /dev/null
 +++ b/chrome/browser/ui/views/tark_captions/history_follow.h
-@@ -0,0 +1,27 @@
+@@ -0,0 +1,36 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
 +
 +#ifndef CHROME_BROWSER_UI_VIEWS_TARK_CAPTIONS_HISTORY_FOLLOW_H_
 +#define CHROME_BROWSER_UI_VIEWS_TARK_CAPTIONS_HISTORY_FOLLOW_H_
++
++#include <cstdint>
++#include <vector>
 +
 +// D4 captions history panel: whether it sticks to the newest line. Scrolling
 +// up holds it still and counts the lines that arrive ("↓ Live · 3 new");
@@ -27,10 +30,16 @@
 +  int last_offset_ = 0;
 +};
 +
++// The ids in `shown` (the panel's row views) that are no longer in
++// `current` (the history's rows); both ascending. By id, not by range: a
++// wrong guess dropped from the end leaves a gap that later lines sit beyond.
++std::vector<uint64_t> GoneRowIds(const std::vector<uint64_t>& shown,
++                                 const std::vector<uint64_t>& current);
++
 +#endif  // CHROME_BROWSER_UI_VIEWS_TARK_CAPTIONS_HISTORY_FOLLOW_H_
 --- /dev/null
 +++ b/chrome/browser/ui/views/tark_captions/history_follow.cc
-@@ -0,0 +1,21 @@
+@@ -0,0 +1,36 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -52,14 +61,32 @@
 +    unseen_ += count;
 +  }
 +}
++
++std::vector<uint64_t> GoneRowIds(const std::vector<uint64_t>& shown,
++                                 const std::vector<uint64_t>& current) {
++  std::vector<uint64_t> gone;
++  auto now = current.begin();
++  for (uint64_t id : shown) {
++    while (now != current.end() && *now < id) {
++      ++now;
++    }
++    if (now == current.end() || *now != id) {
++      gone.push_back(id);
++    }
++  }
++  return gone;
++}
 --- /dev/null
 +++ b/chrome/browser/ui/views/tark_captions/history_follow_unittest.cc
-@@ -0,0 +1,49 @@
+@@ -0,0 +1,66 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
 +
 +#include "chrome/browser/ui/views/tark_captions/history_follow.h"
++
++#include <cstdint>
++#include <vector>
 +
 +#include "testing/gtest/include/gtest/gtest.h"
 +
@@ -101,6 +128,20 @@
 +  follow.OnRowsAdded(1);
 +  EXPECT_TRUE(follow.following());
 +  EXPECT_EQ(follow.unseen(), 0);
++}
++
++// The panel's row views against the history's rows: a wrong guess dropped
++// from the end can leave a gap that later lines sit beyond, so rows go by
++// id, not by range.
++TEST(HistoryFollowTest, GoneRowIdsFindsAGapLeftByADroppedGuess) {
++  EXPECT_EQ(GoneRowIds({1, 2, 3}, {1, 4}), (std::vector<uint64_t>{2, 3}));
++}
++
++TEST(HistoryFollowTest, GoneRowIdsFindsRowsDroppedFromTheTop) {
++  EXPECT_EQ(GoneRowIds({1, 2, 3}, {2, 3, 4}), (std::vector<uint64_t>{1}));
++  EXPECT_EQ(GoneRowIds({1, 2}, {}), (std::vector<uint64_t>{1, 2}));
++  EXPECT_TRUE(GoneRowIds({}, {1, 2}).empty());
++  EXPECT_TRUE(GoneRowIds({1, 2}, {1, 2, 3}).empty());
 +}
 +
 +}  // namespace
@@ -192,7 +233,7 @@
 +#endif  // CHROME_BROWSER_UI_VIEWS_TARK_CAPTIONS_CAPTION_HISTORY_VIEW_H_
 --- /dev/null
 +++ b/chrome/browser/ui/views/tark_captions/caption_history_view.cc
-@@ -0,0 +1,243 @@
+@@ -0,0 +1,248 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -321,17 +362,22 @@
 +
 +void TarkCaptionHistoryView::SetHistory(const tark_captions::CaptionHistory& history) {
 +  const auto& rows = history.rows();
-+  // Rows gone: dropped from the top for the limits, a wrong guess from the
-+  // bottom, or all of them.
-+  const uint64_t first = rows.empty() ? UINT64_MAX : rows.front().id;
-+  const uint64_t last = rows.empty() ? 0 : rows.back().id;
-+  for (auto it = row_views_.begin(); it != row_views_.end();) {
-+    if (it->first < first || it->first > last) {
-+      rows_->RemoveChildViewT(it->second.row.get());
-+      it = row_views_.erase(it);
-+    } else {
-+      ++it;
-+    }
++  // Rows gone: dropped from the top for the limits, a wrong guess (whose
++  // gap later lines can sit beyond), or all of them.
++  std::vector<uint64_t> shown;
++  shown.reserve(row_views_.size());
++  for (const auto& [id, views] : row_views_) {
++    shown.push_back(id);
++  }
++  std::vector<uint64_t> current;
++  current.reserve(rows.size());
++  for (const Row& row : rows) {
++    current.push_back(row.id);
++  }
++  for (uint64_t id : GoneRowIds(shown, current)) {
++    auto it = row_views_.find(id);
++    rows_->RemoveChildViewT(it->second.row.get());
++    row_views_.erase(it);
 +  }
 +  int added = 0;
 +  for (const Row& row : rows) {
