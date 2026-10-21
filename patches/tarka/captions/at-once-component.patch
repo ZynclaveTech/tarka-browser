@@ -1,3 +1,153 @@
+--- /dev/null
++++ b/components/tark_captions/language_hint.h
+@@ -0,0 +1,23 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef COMPONENTS_TARK_CAPTIONS_LANGUAGE_HINT_H_
++#define COMPONENTS_TARK_CAPTIONS_LANGUAGE_HINT_H_
++
++#include <optional>
++#include <string>
++#include <string_view>
++
++namespace tark_captions {
++
++// Captions at once: a first guess at the language a tab will speak, from its
++// title's script, before any speech is heard. Devanagari is "hi", Bengali
++// "bn", Tamil "ta"; the script with the most characters wins, with at least
++// 3 of them; anything else (Latin titles included) gives no hint. The
++// detector corrects a wrong hint as soon as it hears speech.
++std::optional<std::string> ScriptHint(std::u16string_view title);
++
++}  // namespace tark_captions
++
++#endif  // COMPONENTS_TARK_CAPTIONS_LANGUAGE_HINT_H_
+--- /dev/null
++++ b/components/tark_captions/language_hint.cc
+@@ -0,0 +1,55 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/tark_captions/language_hint.h"
++
++#include <iterator>
++
++namespace tark_captions {
++namespace {
++
++struct Script {
++  char16_t first;
++  char16_t last;
++  const char* code;
++};
++
++// Unicode blocks; vowel signs and other marks inside a block count too.
++constexpr Script kScripts[] = {
++    {0x0900, 0x097F, "hi"},  // Devanagari
++    {0x0980, 0x09FF, "bn"},  // Bengali
++    {0x0B80, 0x0BFF, "ta"},  // Tamil
++};
++
++constexpr int kMinimumCharacters = 3;
++
++}  // namespace
++
++std::optional<std::string> ScriptHint(std::u16string_view title) {
++  int counts[std::size(kScripts)] = {};
++  // All three blocks are in the Basic Multilingual Plane: no surrogates.
++  for (char16_t c : title) {
++    for (size_t i = 0; i < std::size(kScripts); ++i) {
++      if (c >= kScripts[i].first && c <= kScripts[i].last) {
++        ++counts[i];
++      }
++    }
++  }
++  size_t best = 0;
++  bool tie = false;
++  for (size_t i = 1; i < std::size(kScripts); ++i) {
++    if (counts[i] > counts[best]) {
++      best = i;
++      tie = false;
++    } else if (counts[i] == counts[best]) {
++      tie = true;
++    }
++  }
++  if (tie || counts[best] < kMinimumCharacters) {
++    return std::nullopt;
++  }
++  return kScripts[best].code;
++}
++
++}  // namespace tark_captions
+--- /dev/null
++++ b/components/tark_captions/language_hint_unittest.cc
+@@ -0,0 +1,44 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/tark_captions/language_hint.h"
++
++#include <optional>
++#include <string>
++
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace tark_captions {
++namespace {
++
++TEST(ScriptHintTest, DevanagariTitleIsHindi) {
++  EXPECT_EQ(ScriptHint(u"बजट 2026 समझिए - YouTube"), "hi");
++}
++
++TEST(ScriptHintTest, TamilTitleIsTamil) {
++  EXPECT_EQ(ScriptHint(u"பட்ஜெட் விளக்கம்"), "ta");
++}
++
++TEST(ScriptHintTest, BengaliTitleIsBengali) {
++  EXPECT_EQ(ScriptHint(u"বাজেট ব্যাখ্যা"), "bn");
++}
++
++TEST(ScriptHintTest, LatinTitleHasNoHint) {
++  EXPECT_EQ(ScriptHint(u"Union Budget explained - YouTube"), std::nullopt);
++}
++
++TEST(ScriptHintTest, MostLettersWin) {
++  EXPECT_EQ(ScriptHint(u"বাজেট বাজেট बजट"), "bn");
++}
++
++TEST(ScriptHintTest, TwoLettersAreNotAHint) {
++  EXPECT_EQ(ScriptHint(u"हि - YouTube"), std::nullopt);
++}
++
++TEST(ScriptHintTest, EmptyTitleHasNoHint) {
++  EXPECT_EQ(ScriptHint(u""), std::nullopt);
++}
++
++}  // namespace
++}  // namespace tark_captions
+--- a/components/tark_captions/BUILD.gn
++++ b/components/tark_captions/BUILD.gn
+@@ -37,6 +37,8 @@
+     "language_detector.h",
+     "language_gate.cc",
+     "language_gate.h",
++    "language_hint.cc",
++    "language_hint.h",
+     "mel_frontend.cc",
+     "mel_frontend.h",
+     "model_manifest.cc",
+@@ -99,6 +101,7 @@
+     "indic_text_unittest.cc",
+     "language_detector_unittest.cc",
+     "language_gate_unittest.cc",
++    "language_hint_unittest.cc",
+     "media_players_unittest.cc",
+     "mel_frontend_unittest.cc",
+     "model_manifest_unittest.cc",
 --- a/components/tark_captions/detection_policy.cc
 +++ b/components/tark_captions/detection_policy.cc
 @@ -30,18 +30,16 @@
