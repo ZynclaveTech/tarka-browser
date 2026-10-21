@@ -141,9 +141,6 @@ class TestSpecLists(unittest.TestCase):
             'easylist': 0, 'easyprivacy': 0, 'IND-0': 0})
 
 
-if __name__ == '__main__':
-    unittest.main()
-
 
 WORKFLOW = ADBLOCK.parents[1] / '.github' / 'workflows' / 'android-adblock-lists.yml'
 
@@ -256,3 +253,102 @@ class TestBundleNames(unittest.TestCase):
         y = WORKFLOW.read_text()
         self.assertIn("--if-none-match '*'", y)
         self.assertLess(y.index("--if-none-match '*'"), y.index('lists/android/v1/latest.json --content-type'))
+
+
+class TestUboPin(unittest.TestCase):
+    """uBlock Origin's code runs while bundling (scriptlets.mjs imports it):
+    only a version reviewed into the repository, with the tarball's sha256,
+    never whatever release is newest (security review, 2026-10-21)."""
+
+    def tarball(self, tag='1.75.0'):
+        import tarfile
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode='w:gz') as t:
+            data = b'{}'
+            info = tarfile.TarInfo(f'uBlock-{tag}/assets/assets.json')
+            info.size = len(data)
+            t.addfile(info, io.BytesIO(data))
+        return buf.getvalue()
+
+    def test_the_pin_is_in_the_repository(self):
+        pin = json.loads((ADBLOCK / 'ubo.json').read_text())
+        self.assertEqual(set(pin), {'tag', 'sha256'})
+        self.assertRegex(pin['tag'], r'^[0-9]+\.[0-9]+\.[0-9]+$')
+        self.assertRegex(pin['sha256'], r'^[0-9a-f]{64}$')
+        self.assertEqual(bundle.ubo_pin(), pin)
+
+    def test_never_the_newest_release(self):
+        import inspect
+        self.assertFalse(hasattr(bundle, '_latest_ubo_tag'))
+        self.assertNotIn('releases/latest', inspect.getsource(bundle))
+        self.assertNotIn('ubo_tag', inspect.signature(bundle.build).parameters)
+
+    def test_the_pinned_tarball_is_unpacked(self):
+        import tempfile
+        data = self.tarball()
+        pin = {'tag': '1.75.0', 'sha256': hashlib.sha256(data).hexdigest()}
+        urls = []
+        with tempfile.TemporaryDirectory() as tmp:
+            src = bundle._ubo_source(pin, tmp, fetch=lambda url: urls.append(url) or data)
+            self.assertTrue((src / 'assets' / 'assets.json').is_file())
+        self.assertEqual(urls, ['https://codeload.github.com/gorhill/uBlock/tar.gz/refs/tags/1.75.0'])
+
+    def test_a_tarball_with_another_hash_is_refused_before_unpacking(self):
+        import tempfile
+        pin = {'tag': '1.75.0', 'sha256': '0' * 64}
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(ValueError, 'not the pinned'):
+                bundle._ubo_source(pin, tmp, fetch=lambda url: self.tarball())
+            self.assertEqual(list(pathlib.Path(tmp).iterdir()), [])
+
+    def test_pinning_a_new_release_prints_its_hash(self):
+        data = self.tarball('1.76.0')
+        self.assertEqual(bundle.pin_ubo('1.76.0', fetch=lambda url: data),
+                         {'tag': '1.76.0', 'sha256': hashlib.sha256(data).hexdigest()})
+
+
+class TestUntrustedBuild(unittest.TestCase):
+    """The bundling runs third-party code, so it runs where there is nothing
+    to steal: a job with no environment, no secrets and no id-token, whose
+    only output is the zip. The job that signs and publishes runs nothing
+    from it (security review, 2026-10-21)."""
+
+    def setUp(self):
+        y = WORKFLOW.read_text()
+        # Comments explain the jobs; only what the workflow says counts.
+        self.top = '\n'.join(l for l in y[:y.index('\njobs:\n')].splitlines() if not l.startswith('#'))
+        self.build = y[y.index('\n  build:\n'):y.index('\n  publish:\n')]
+        self.publish = y[y.index('\n  publish:\n'):]
+
+    def test_nothing_but_reading_the_repository_by_default(self):
+        self.assertIn('\npermissions:\n  contents: read\n', self.top)
+        self.assertNotIn('id-token', self.top)
+
+    def test_the_build_job_has_nothing_to_steal(self):
+        for word in ('secrets.', 'id-token', 'environment:', 'role-to-assume', 'TARK_LISTS_SIGNING_KEY'):
+            self.assertNotIn(word, self.build)
+        self.assertIn('    permissions:\n      contents: read\n', self.build)
+        self.assertIn('bundle.py build --out out', self.build)
+        self.assertIn('actions/upload-artifact@', self.build)
+        self.assertIn('retention-days: 1', self.build)
+
+    def test_the_publish_job_runs_no_third_party_code(self):
+        self.assertIn('    needs: build\n', self.publish)
+        self.assertIn('    environment: lists\n', self.publish)
+        self.assertIn('      id-token: write\n', self.publish)
+        for word in ('bundle.py build', 'node ', 'scriptlets', 'npm', 'pip install'):
+            self.assertNotIn(word, self.publish)
+        self.assertIn('actions/download-artifact@', self.publish)
+
+    def test_the_publish_job_takes_one_well_named_zip_and_checks_it_before_signing(self):
+        p = self.publish
+        self.assertIn('lists-[0-9]{8}\\.zip$', p)
+        self.assertLess(p.index('actions/download-artifact@'), p.index('lists-[0-9]{8}'))
+        self.assertLess(p.index('lists-[0-9]{8}'), p.index('listtool/target/release/listtool check'))
+        self.assertLess(p.index('listtool/target/release/listtool check'), p.index('bundle.py sign'))
+        # Its list tool is its own, built from this checkout's lock file.
+        self.assertIn('cargo build --release --locked', p)
+
+
+if __name__ == '__main__':
+    unittest.main()
