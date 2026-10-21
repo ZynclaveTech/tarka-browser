@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/chrome/browser/ui/views/tark_captions/history_follow.h
-@@ -0,0 +1,23 @@
+@@ -0,0 +1,27 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -10,10 +10,13 @@
 +
 +// D4 captions history panel: whether it sticks to the newest line. Scrolling
 +// up holds it still and counts the lines that arrive ("↓ Live · 3 new");
-+// back at the bottom it follows again.
++// back at the bottom it follows again. Content growing below (new lines, a
++// line gaining its translation) moves the bottom, not the scroll offset, so
++// it is not taken for the user scrolling up.
 +class HistoryFollow {
 + public:
-+  void OnScrolled(bool at_bottom);
++  // `offset`: how far the rows are scrolled from the top.
++  void OnScrolled(int offset, bool at_bottom);
 +  void OnRowsAdded(int count);
 +  bool following() const { return following_; }
 +  int unseen() const { return unseen_; }
@@ -21,23 +24,27 @@
 + private:
 +  bool following_ = true;
 +  int unseen_ = 0;
++  int last_offset_ = 0;
 +};
 +
 +#endif  // CHROME_BROWSER_UI_VIEWS_TARK_CAPTIONS_HISTORY_FOLLOW_H_
 --- /dev/null
 +++ b/chrome/browser/ui/views/tark_captions/history_follow.cc
-@@ -0,0 +1,18 @@
+@@ -0,0 +1,21 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
 +
 +#include "chrome/browser/ui/views/tark_captions/history_follow.h"
 +
-+void HistoryFollow::OnScrolled(bool at_bottom) {
-+  following_ = at_bottom;
++void HistoryFollow::OnScrolled(int offset, bool at_bottom) {
 +  if (at_bottom) {
++    following_ = true;
 +    unseen_ = 0;
++  } else if (offset < last_offset_) {
++    following_ = false;
 +  }
++  last_offset_ = offset;
 +}
 +
 +void HistoryFollow::OnRowsAdded(int count) {
@@ -47,7 +54,7 @@
 +}
 --- /dev/null
 +++ b/chrome/browser/ui/views/tark_captions/history_follow_unittest.cc
-@@ -0,0 +1,36 @@
+@@ -0,0 +1,49 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -61,7 +68,8 @@
 +TEST(HistoryFollowTest, FollowsUntilScrolledUp) {
 +  HistoryFollow follow;
 +  EXPECT_TRUE(follow.following());
-+  follow.OnScrolled(/*at_bottom=*/false);
++  follow.OnScrolled(/*offset=*/300, /*at_bottom=*/true);
++  follow.OnScrolled(/*offset=*/120, /*at_bottom=*/false);
 +  follow.OnRowsAdded(2);
 +  EXPECT_FALSE(follow.following());
 +  EXPECT_EQ(follow.unseen(), 2);
@@ -69,9 +77,10 @@
 +
 +TEST(HistoryFollowTest, BackAtBottomFollowsAgain) {
 +  HistoryFollow follow;
-+  follow.OnScrolled(/*at_bottom=*/false);
++  follow.OnScrolled(/*offset=*/300, /*at_bottom=*/true);
++  follow.OnScrolled(/*offset=*/100, /*at_bottom=*/false);
 +  follow.OnRowsAdded(3);
-+  follow.OnScrolled(/*at_bottom=*/true);
++  follow.OnScrolled(/*offset=*/500, /*at_bottom=*/true);
 +  EXPECT_TRUE(follow.following());
 +  EXPECT_EQ(follow.unseen(), 0);
 +}
@@ -83,10 +92,21 @@
 +  EXPECT_EQ(follow.unseen(), 0);
 +}
 +
++// Lines arriving (or a line growing with its translation) push the bottom
++// down without the user scrolling: still following.
++TEST(HistoryFollowTest, ContentGrowingBelowKeepsFollowing) {
++  HistoryFollow follow;
++  follow.OnScrolled(/*offset=*/300, /*at_bottom=*/true);
++  follow.OnScrolled(/*offset=*/300, /*at_bottom=*/false);
++  follow.OnRowsAdded(1);
++  EXPECT_TRUE(follow.following());
++  EXPECT_EQ(follow.unseen(), 0);
++}
++
 +}  // namespace
 --- /dev/null
 +++ b/chrome/browser/ui/views/tark_captions/caption_history_view.h
-@@ -0,0 +1,85 @@
+@@ -0,0 +1,83 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -166,15 +186,13 @@
 +  raw_ptr<views::MdTextButton> live_ = nullptr;
 +  std::map<uint64_t, RowViews> row_views_;
 +  HistoryFollow follow_;
-+  // Set while this view scrolls, so the scroll isn't taken for the user's.
-+  bool scrolling_ = false;
 +  base::CallbackListSubscription scrolled_subscription_;
 +};
 +
 +#endif  // CHROME_BROWSER_UI_VIEWS_TARK_CAPTIONS_CAPTION_HISTORY_VIEW_H_
 --- /dev/null
 +++ b/chrome/browser/ui/views/tark_captions/caption_history_view.cc
-@@ -0,0 +1,247 @@
+@@ -0,0 +1,243 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -278,7 +296,7 @@
 +  live_ = AddChildView(std::make_unique<views::MdTextButton>(
 +      base::BindRepeating(
 +          [](TarkCaptionHistoryView* view) {
-+            view->follow_.OnScrolled(/*at_bottom=*/true);
++            view->follow_.OnScrolled(view->scroll_->GetVisibleRect().y(), /*at_bottom=*/true);
 +            view->ScrollToBottom();
 +            view->UpdateLive();
 +          },
@@ -391,11 +409,9 @@
 +}
 +
 +void TarkCaptionHistoryView::OnScrolled() {
-+  if (scrolling_) {
-+    return;
-+  }
++  // Our own scrolls go down, so they never stop the following.
 +  const gfx::Rect visible = scroll_->GetVisibleRect();
-+  follow_.OnScrolled(visible.bottom() + kBottomSlop >= rows_->height());
++  follow_.OnScrolled(visible.y(), visible.bottom() + kBottomSlop >= rows_->height());
 +  UpdateLive();
 +}
 +
@@ -403,9 +419,7 @@
 +  if (views::Widget* widget = GetWidget()) {
 +    widget->LayoutRootViewIfNecessary();
 +  }
-+  scrolling_ = true;
 +  rows_->ScrollRectToVisible(gfx::Rect(0, rows_->height() - 1, 1, 1));
-+  scrolling_ = false;
 +}
 +
 +void TarkCaptionHistoryView::UpdateLive() {
@@ -1068,6 +1082,146 @@
      "pill_language_unittest.cc",
      "tark_caption_box_unittests_main.cc",
    ]
+--- a/chrome/browser/ui/views/tark_captions/caption_box_view.cc
++++ b/chrome/browser/ui/views/tark_captions/caption_box_view.cc
+@@ -89,6 +89,9 @@
+ TarkCaptionBoxView::~TarkCaptionBoxView() = default;
+ 
+ void TarkCaptionBoxView::SetTextWidth(int width) {
++  if (width != text_width_) {
++    grown_ = gfx::Size();
++  }
+   text_width_ = width;
+   label_->SizeToFit(text_width_);
+   translation_->SizeToFit(text_width_);
+@@ -110,6 +113,11 @@
+                                     const std::u16string& translation_status) {
+   const bool translated =
+       message.empty() && !(translation.committed.empty() && translation.draft.empty());
++  if (translated != translated_) {
++    // Translate switched on or off: a line more or less.
++    grown_ = gfx::Size();
++    translated_ = translated;
++  }
+   bool any = false;
+   if (translated) {
+     any |= Fill(translation_, translation, u"", kTranslationSizeDelta, kFinalColor, text_width_);
+@@ -128,8 +136,25 @@
+     }
+   }
+   SetVisible(any);
++  if (any) {
++    grown_.SetToMax(views::View::CalculatePreferredSize(views::SizeBounds()));
++  } else {
++    grown_ = gfx::Size();
++  }
+   PreferredSizeChanged();
+ }
+ 
++void TarkCaptionBoxView::ResetGrowth() {
++  grown_ = gfx::Size();
++  PreferredSizeChanged();
++}
++
++gfx::Size TarkCaptionBoxView::CalculatePreferredSize(
++    const views::SizeBounds& available_size) const {
++  gfx::Size size = views::View::CalculatePreferredSize(available_size);
++  size.SetToMax(grown_);
++  return size;
++}
++
+ BEGIN_METADATA(TarkCaptionBoxView)
+ END_METADATA
+--- a/chrome/browser/ui/views/tark_captions/caption_box_view.h
++++ b/chrome/browser/ui/views/tark_captions/caption_box_view.h
+@@ -11,6 +11,7 @@
+ #include "components/tark_captions/caption_text.h"
+ #include "third_party/skia/include/core/SkColor.h"
+ #include "ui/base/metadata/metadata_header_macros.h"
++#include "ui/gfx/geometry/size.h"
+ #include "ui/views/view.h"
+ 
+ namespace views {
+@@ -51,6 +52,12 @@
+                   const std::u16string& message,
+                   const std::u16string& translation_status = std::u16string());
+ 
++  // The bar closed or moved to another tab: the next caption starts small.
++  void ResetGrowth();
++
++  // views::View:
++  gfx::Size CalculatePreferredSize(const views::SizeBounds& available_size) const override;
++
+   views::StyledLabel* label_for_testing() { return label_; }
+   views::StyledLabel* translation_for_testing() { return translation_; }
+ 
+@@ -59,6 +66,12 @@
+   raw_ptr<views::StyledLabel> translation_ = nullptr;
+   int text_width_ = 420;
+   bool strip_ = false;
++  // The largest the box has been while showing: it only grows, so new
++  // words never make it jump (the user, 2026-10-22). Reset when it hides or
++  // its width changes.
++  gfx::Size grown_;
++  // Whether the last caption had a translation: switching resets grown_.
++  bool translated_ = false;
+ };
+ 
+ #endif  // CHROME_BROWSER_UI_VIEWS_TARK_CAPTIONS_CAPTION_BOX_VIEW_H_
+--- a/chrome/browser/ui/views/tark_captions/caption_box_view_unittest.cc
++++ b/chrome/browser/ui/views/tark_captions/caption_box_view_unittest.cc
+@@ -132,4 +132,51 @@
+   EXPECT_FALSE(box_->GetVisible());
+ }
+ 
++// The user (2026-10-22): "if the caption box grew full width and height
++// never resize after that". While it shows, the box only grows, so new
++// words never make it jump; it starts small again once it hides.
++TEST_F(TarkCaptionBoxViewTest, GrowsButNeverShrinksWhileShowing) {
++  const std::u16string long_text(
++      u"this sentence is long enough to fill the whole width of the caption box "
++      u"and to wrap onto a second line, maybe even a third one when it keeps going");
++  box_->SetCaption({long_text, u""}, u"");
++  const gfx::Size grown = box_->GetPreferredSize();
++  box_->SetCaption({u"short", u""}, u"");
++  EXPECT_EQ(box_->GetPreferredSize(), grown);
++
++  // Hidden (captions off, the bar closed): the next caption starts small.
++  box_->SetCaption({u"", u""}, u"");
++  EXPECT_FALSE(box_->GetVisible());
++  box_->SetCaption({u"short", u""}, u"");
++  EXPECT_LT(box_->GetPreferredSize().width(), grown.width());
++  EXPECT_LT(box_->GetPreferredSize().height(), grown.height());
++}
++
++TEST_F(TarkCaptionBoxViewTest, NewWidthStartsSmallAgain) {
++  box_->SetCaption({std::u16string(200, u'x') + u" y", u""}, u"");
++  const gfx::Size wide = box_->GetPreferredSize();
++  // The bar becomes the narrower strip.
++  box_->SetTextWidth(320);
++  box_->SetCaption({u"short", u""}, u"");
++  EXPECT_LT(box_->GetPreferredSize().width(), wide.width());
++}
++
++// The bar closed or moved to another tab: the next caption starts small.
++TEST_F(TarkCaptionBoxViewTest, ResetGrowthStartsSmall) {
++  box_->SetCaption({std::u16string(150, u'x') + u" y z", u""}, u"");
++  const gfx::Size grown = box_->GetPreferredSize();
++  box_->ResetGrowth();
++  box_->SetCaption({u"short", u""}, u"");
++  EXPECT_LT(box_->GetPreferredSize().width(), grown.width());
++}
++
++// Translate switched off: the box loses the translation's line instead of
++// keeping its height.
++TEST_F(TarkCaptionBoxViewTest, TranslateSwitchStartsSmall) {
++  box_->SetCaption({u"original words", u""}, {u"the translated words", u""}, u"");
++  const gfx::Size with_translation = box_->GetPreferredSize();
++  box_->SetCaption({u"original words", u""}, {}, u"");
++  EXPECT_LT(box_->GetPreferredSize().height(), with_translation.height());
++}
++
+ }  // namespace
 --- a/chrome/browser/ui/views/tark_captions/caption_pill_controller.cc
 +++ b/chrome/browser/ui/views/tark_captions/caption_pill_controller.cc
 @@ -148,6 +148,11 @@
@@ -1151,7 +1305,18 @@
          target = helper;
          mode = TarkCaptionPillView::Mode::kStrip;
        }
-@@ -578,6 +598,19 @@
+@@ -542,6 +562,10 @@
+   }
+   if (target != shown_) {
+     StopWaiting();
++    if (view_) {
++      // Another tab's captions: the box starts small.
++      view_->ResetCaptionGrowth();
++    }
+   }
+   shown_ = target;
+ 
+@@ -578,6 +602,19 @@
              : IDS_TARK_CAPTIONS_CHOOSE_LANGUAGE);
    }
    view_->SetNoticeButton(notice_button);
@@ -1171,7 +1336,15 @@
    ShowAppleDownload();
    // A bar made just now (the first CC press in a window) gets its download
    // row here; the store says nothing new while an offer waits.
-@@ -657,6 +690,7 @@
+@@ -631,6 +668,7 @@
+   ClearText();
+   StopWaiting();
+   if (widget_ && view_) {
++    view_->ResetCaptionGrowth();
+     widget_->Hide();
+   }
+ }
+@@ -657,6 +695,7 @@
        shown_->RetryAppleDownload();
      } else {
        shown_->SetCaptionsOn(false);
@@ -1179,7 +1352,7 @@
      }
      return;
    }
-@@ -690,6 +724,30 @@
+@@ -690,6 +729,30 @@
    Update();
  }
  
@@ -1210,7 +1383,7 @@
  void TarkCaptionPillController::OnNotNowPressed() {
    if (!offering_) {
      return;
-@@ -873,7 +931,11 @@
+@@ -873,7 +936,11 @@
    if (!widget_ || !view_ || !browser_view_->GetWidget()) {
      return;
    }
@@ -1223,7 +1396,7 @@
    gfx::Size size = view_->GetPreferredSize();
    size.SetToMin(area.size());
    const bool strip = mode_ == TarkCaptionPillView::Mode::kStrip;
-@@ -925,7 +987,8 @@
+@@ -925,7 +992,8 @@
               {views::Widget::GetAllChildWidgets(browser), views::Widget::GetAllOwnedWidgets(browser)}) {
            for (views::Widget* widget : widgets) {
              if (widget->IsVisible() && widget != browser_view_->GetWidget() &&
@@ -1307,7 +1480,7 @@
    if (download) {
      choose_button_->SetVisible(false);
    }
-@@ -127,6 +137,24 @@
+@@ -127,6 +137,28 @@
    PreferredSizeChanged();
  }
  
@@ -1329,6 +1502,10 @@
 +  PreferredSizeChanged();
 +}
 +
++void TarkCaptionPillView::ResetCaptionGrowth() {
++  caption_box_->ResetGrowth();
++}
++
  void TarkCaptionPillView::SetLanguageName(const std::u16string& name) {
    language_button_->SetText(name + u" ▾");
  }
@@ -1343,7 +1520,7 @@
      // The button beside a notice: Choose a language, or Open Settings.
      virtual void OnNoticeButtonPressed(views::View* anchor) = 0;
  
-@@ -78,6 +80,11 @@
+@@ -78,6 +80,13 @@
    // Replaces the pill's buttons (not ✕) with the download row, or puts them
    // back.
    void SetDownload(const std::optional<Download>& download);
@@ -1352,10 +1529,12 @@
 +  void SetStopped(bool stopped);
 +  // ☰ Earlier: shown while there is a history, prominent while it is open.
 +  void SetHistoryState(bool available, bool open);
++  // The caption box starts small again (it only grows while it shows).
++  void ResetCaptionGrowth();
    // Shows `original` (in the script the user reads) and, when it is not
    // empty, `translation` below it; or `message` (Listening…, Captions
    // unavailable) alone. Hides the box when all are empty.
-@@ -103,6 +110,11 @@
+@@ -103,6 +112,11 @@
    raw_ptr<views::ProgressBar> download_progress_ = nullptr;
    raw_ptr<views::MdTextButton> download_button_ = nullptr;
    raw_ptr<views::MdTextButton> not_now_button_ = nullptr;
