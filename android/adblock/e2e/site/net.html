@@ -1,0 +1,35 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>running</title>
+<!-- A2 network cases; results go to the title as JSON for run.py. -->
+<script>
+const results = {};
+const done = () => { document.title = 'done:' + JSON.stringify(results); };
+const pending = new Set(['blocked', 'exception', 'redirect', 'chain', 'ws', 'worker', 'frame', 'real']);
+const set = (k, v) => { if (!pending.has(k)) return; results[k] = v; pending.delete(k); if (!pending.size) done(); };
+const script = (k, src, onload) => {
+  const s = document.createElement('script');
+  s.src = src;
+  s.onload = () => set(k, onload ? onload() : 'loaded');
+  s.onerror = () => set(k, 'failed');
+  document.head.appendChild(s);
+};
+script('blocked', '/ads/tark-test-ad.js');
+script('exception', '/allowed/tark-test-ad.js');
+script('redirect', '/ads/tark-redirect-ad.js', () => window.tarkRedirectRan ? 'original' : 'stub');
+script('chain', '/redirect?to=/ads/tark-test-ad.js%3Fchain');
+// The shipped lists block it outright (adsbygoogle.js gets uBO's stub instead).
+script('real', 'https://ads.pubmatic.com/AdServer/js/pwt/1/pwt.js');
+try {
+  const ws = new WebSocket('ws://' + location.host + '/tark-test-ws');
+  ws.onopen = () => { set('ws', 'open'); ws.close(); };
+  ws.onerror = () => set('ws', 'failed');
+} catch (e) { set('ws', 'failed'); }
+const w = new Worker('/worker.js');
+w.onmessage = (e) => set('worker', e.data);
+const f = document.createElement('iframe');
+f.src = '/tark-test-frame.html';
+f.onload = () => { try { set('frame', f.contentDocument && f.contentDocument.title === 'frame' ? 'loaded' : 'failed'); } catch (e) { set('frame', 'failed'); } };
+document.documentElement.appendChild(f);
+setTimeout(done, 15000);
+</script>

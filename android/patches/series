@@ -1,0 +1,242 @@
+# Android-only Tark patches (A1), applied after Tark's shared patches. They
+# live outside patches/tarka/ so the Mac and Windows series never see them.
+#
+# ungoogled's enable-extra-locales.patch (desktop) deletes Chromium's Android
+# branch in build/config/locales.gni, which breaks gn on Android
+# (components/strings removes "cy", which is then in neither list). Only the
+# extended_locales half comes back: the same patch makes Android's
+# locale_settings grd emit Welsh paks, so Welsh stays in platform_pak_locales.
+locales-android-branch.patch
+#
+# ungoogled builds chrome/browser/safe_browsing without Safe Browsing: the
+# target's base block is `if (false)` and defines no deps, so its is_android
+# block's `deps +=` is an undefined identifier on Android. That block (Safe
+# Browsing's Android UI and API pieces) is off as well.
+safe-browsing-no-android-deps.patch
+#
+# ungoogled's add-suggestions-url-field.patch gives ResetTemplateURL a
+# suggestions_url argument, which it writes over the engine's own; Android's
+# callers (desktop never compiles them) pass the engine's existing one, so
+# they behave as upstream.
+search-engines-android-suggestions-url.patch
+#
+# ungoogled's disable-untraceable-urls.patch removes Google's RLZ server
+# (rlz_lib::kFinancialServer), which Android's RLZ ping handler uses. Tark
+# sends no RLZ pings: the JNI entry reports failure without a request.
+rlz-ping-handler-no-ping.patch
+#
+# Android-only code that still names Safe Browsing pieces ungoogled removes
+# (safe_browsing_mode=0): download obfuscation's deep-scan check, the
+# proceed-anyway pref in interstitial reporting, suspicious-notification UKM,
+# the Safe Browsing page's deep-scan log, and an include the removed prefs
+# header used to bring in.
+safe-browsing-android-leftovers.patch
+#
+# ungoogled's add-flag-to-configure-extension-downloading.patch includes
+# extensions/browser/extension_util.h unconditionally; its one use is inside
+# ENABLE_EXTENSIONS_CORE, which Android does not build.
+download-extension-util-include.patch
+#
+# libchrome.so's link: Android's Java UI declares Safe Browsing natives
+# (SafeBrowsingBridge and two dialog bridges) and interstitials link the
+# settings launchers, none of which ungoogled builds. A Tark file gives them
+# stand-ins that read Safe Browsing as off; the remaining callers of removed
+# code (suspicious-notification UKM, the tips agent's enhanced-protection
+# check, password reuse detection) drop or guard the call.
+safe-browsing-android-link.patch
+#
+# Direct APK ≤ 130 MB (the user's decision, 2026-10-20): libchrome.so is
+# stored compressed and extracted at install (Chromium stores it
+# uncompressed: 317 MB), and the XR module (Android XR headsets, ARCore) is
+# left out.
+direct-apk-size.patch
+#
+# ungoogled never calls ProfileOAuth2TokenService::LoadCredentials, so the
+# Android token service's account seeding (the device's Google accounts, from
+# Java at startup) hit its CHECK and crashed every start. Tark uses no Google
+# accounts: seeding is skipped when credentials were never loaded.
+signin-android-no-account-seeding.patch
+#
+# ungoogled stops registering the sign-in prefs; Android's first run reads
+# signin.allowed and PrefService CHECKs on an unregistered pref. It is
+# registered again on Android, false: sign-in is not allowed.
+signin-android-allowed-pref.patch
+#
+# Google contacts A1's emulator run found that the Mac build never makes:
+# the first-run variations seed (Java, clientservices.googleapis.com, outside
+# the net log), FCM tokens and IDs from Play Services (policy invalidations at
+# startup; Web Push uses the same path), Widevine provisioning at startup
+# (www.googleapis.com), and the new tab page's built-in tiles, which fetch
+# icons from freenode.net, github.com and others.
+google-callers-off.patch
+#
+# The launcher label and widget titles are Android resources, which Tark's
+# name substitution does not reach: Chromium becomes Tark.
+app-name-tark.patch
+#
+# Home as on the Mac (the user's request, 2026-10-20): a new tab opens
+# Shodhya Today (shodhya.com) instead of Android's own page, except in
+# Incognito and offline; no first-run welcome.
+home-shodhya-today.patch
+#
+# ungoogled builds no sync service, so SyncServiceFactory gives null on
+# Android; the tab switcher's tab groups list registered a listener on it and
+# crashed when opened (seen on a phone). It now reads sync as off.
+tab-groups-without-sync.patch
+#
+# A4 (spec §13): the Mac's Paper palette at its source — Chromium's colour
+# ramps retuned (indigo primary, warm neutrals, paper and raised surfaces), the
+# theme's text, background and hairline roles on Tark's tokens — and no
+# dynamic colour, so Tark looks the same on every phone.
+look-paper-palette.patch
+#
+# A4: the mockup's address bar — no home or profile button, the mark as the
+# menu button (MenuButton took the icon as a bitmap; it now takes the vector),
+# the mark instead of Shodhya's favicon (a dark square in private mode, the
+# user's report), and a hairline round the address pill.
+look-address-bar.patch
+#
+# A4: the Tark app icon — the mark on dark paper as the adaptive launcher
+# icon, and the mark as Android's themed (monochrome) icon. The in-app copies
+# (mipmap app_icon) come from resources/branding/mark/install.txt.
+look-app-icon.patch
+#
+# A4: the menu as the Mac's Tark sheet for a phone — New tab, New private
+# tab, History and Downloads as tiles (each tile is the old item's own model);
+# no Delete browsing data (it stays in History and Settings), Recent tabs
+# (sync), Customize new tab page or Help & feedback (Google).
+look-menu.patch
+#
+# A4: the tab switcher on paper — the palette does most of it; here the pane
+# switcher (Tabs / Private / Groups) becomes a full pill and other tabs'
+# cards raised paper.
+look-tab-switcher.patch
+#
+# A4: Settings as the Mac's — a header with the summary line ("Private by
+# default. No Google · no sync", English and Hindi) and tiles that open the
+# rows below; no sign-in, Google services or Safety check rows. The plain
+# words ("Passwords", "Site permissions", …) come from name substitution.
+# Every settings screen draws hairline dividers between rows.
+look-settings.patch
+#
+# A2: adblock-rust 0.13.3 in Chromium's Rust crates. Chromium's Cargo.toml,
+# Cargo.lock and gnrt_config.toml gain adblock and its ten new dependencies
+# (configured as brave-core does), with the BUILD.gn files gnrt generates for
+# them; regex, which Chromium ships only to tests, becomes shippable; bitflags
+# and serde gain the features adblock asks for. The crates' sources are put in
+# place by android/adblock/crates.py (pinned sha256), with two crate patches
+# recorded here: adblock uses Chromium's thiserror 2 and drops the url crate
+# (one unused error conversion); seahash gets the MIT licence it declares.
+adblock-crates.patch
+#
+# A2: the ad blocker's engine. Brave's cxx bridge to adblock-rust (trimmed),
+# its domain resolver and redirect stub response go to third_party/
+# brave_adblock (MPL-2.0); Tark's service compiles the newest list bundle
+# (the APK's asset or a verified download) on its own sequence, caches the
+# compiled engine, and blocks nothing until it is ready. Its updater fetches
+# the daily signed bundle from gettarka.com (a day on Wi-Fi, three on mobile
+# data); the bundle and update rules have unit tests built for the build
+# machine (android/build.sh runs them).
+adblock-engine.patch
+#
+# A2: Android has no extensions, so uBlock Origin's resource pak (Tark's
+# shared patches add it on every platform) is left out of Android's paks; the
+# engine-level blocker replaces it.
+adblock-no-ublock-pak.patch
+#
+# A2: ad requests blocked before they leave. A proxying URLLoaderFactory
+# (modelled on Chromium's signin one) sits in front of every page, frame and
+# worker factory; the engine's answer fails a request as uBlock Origin does
+# (ERR_BLOCKED_BY_CLIENT, element collapsed) or serves its $redirect stub, and
+# redirects are checked again. Frames' WebSockets are checked too. A site the
+# person turned blocking off for (ADS = allow) passes untouched.
+adblock-network.patch
+#
+# A2: hiding rules and scriptlets. Each frame asks the browser (synchronously,
+# at commit) for its page's resources; at document start, before the page's
+# own scripts, the scriptlets run in the page's world and the hide selectors
+# become a user stylesheet; a collector in an isolated world reports class
+# and id names, and their generic hide rules follow.
+adblock-cosmetic.patch
+#
+# A2: "Block ads on this site" in the page info sheet (English and Hindi);
+# off stores ADS = allow for the site, which the proxy and the cosmetic
+# resources read; the page reloads.
+adblock-site-switch.patch
+#
+# The Mac's "What Tark connects to" (spec §5.3) in Privacy and security:
+# Shodhya, and gettarka.com for the ad blocker's lists, in plain words,
+# English and Hindi.
+look-connects.patch
+#
+# The Mac's offline new tab page (spec §13, left for later at A4): online a
+# new tab opens Shodhya Today, so Android's own new tab page only shows
+# offline. It becomes the Mac's page on paper: the mark, the search pill
+# (raised, a rule hairline, no shadow, the search loupe) and "You're offline.
+# Searches will run when you're back." (English and Hindi) while there is no
+# connection; the page is paper in light mode too (Chromium's home surface
+# colour was raised); no tiles, tips cards or theme sheet.
+look-offline-new-tab.patch
+#
+# Privacy and security without Google leftovers, as on the Mac: no Safe
+# Browsing row ("Safe Browsing is off": ungoogled builds none), no "Warn you if
+# a password was compromised" switch (the check asks Google), no "go to Google
+# Services" footer. The rows leave privacy_preferences.xml, so settings search
+# no longer finds them; Safe Browsing's own page, with no row leading to it,
+# drops out of the search index as an orphan.
+privacy-no-google-rows.patch
+#
+# Page info for Tark's own pages (about:blank, chrome://) shows Tark's mark in
+# its colours instead of Chromium's tinted logo.
+look-page-info-mark.patch
+#
+# A3 (spec §5): the Mac's Indian-language rows on Android. The model and word
+# lists are downloaded into the app's data directory, one word-list file per
+# language (android/xlit/files.py); tark_xlit reads them from there once they
+# are in place, and its unit tests run on the build machine.
+xlit-android-files.patch
+#
+# A3: the provider runs on Android too; until the files are in place it adds
+# one row that offers them ("Type in हिन्दी?"). Java shows an Indian-language
+# row's language at the right edge, as the Mac does, and opens the offer.
+xlit-android-rows.patch
+#
+# A3: the download. The model and the word lists of the person's languages
+# come from gettarka.com only after they say yes (the offer row's dialog or
+# Settings), on Wi-Fi unless they choose "Download now"; each file is checked
+# against the size and sha256 compiled into the APK.
+xlit-android-download.patch
+#
+# A3: Settings > Languages > Indian-language suggestions: on downloads (on
+# Wi-Fi), off stops the rows and keeps the files.
+xlit-android-settings.patch
+#
+# A3: Android's keyword chip (Chromium's site search) is off by default; on,
+# Tark's @ sources open a chip and search that site, as on the Mac.
+omnibox-site-search-on.patch
+#
+# A3 (the user: "add divider in all screens in settings"): ten screens turned
+# A4's hairline off for themselves (Theme, Image descriptions, Accessibility,
+# the site-settings screens); the one place that reads that choice now draws
+# it on every screen.
+look-settings-dividers.patch
+#
+# A3 (the user: "make sure it aligns with back button and question mark from
+# header"): Chromium's containment styling adds a 16dp side margin around
+# settings rows on top of their own padding; without it, rows line up with
+# the toolbar.
+look-settings-padding.patch
+#
+# A3 (the user: "Open Tark help on gettarka.com"): help and feedback opened
+# Google's Chrome help; they open Tark's help page, the screen's section.
+look-help-on-gettarka.patch
+#
+# A3 (the user: fix the Google Translate row): Translate is off without a
+# server (ungoogled-chromium), so its settings go unless one is given, as on the Mac.
+translate-settings-off.patch
+#
+# Faster Indian-language rows (the user, 2026-10-21): a decoder step's
+# products of one to four rows read each weight row once and take dot
+# products, instead of Eigen packing the whole weight matrix on every call
+# (41% of a word's time on Android).
+xlit-small-products.patch

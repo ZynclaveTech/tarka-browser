@@ -131,8 +131,9 @@ def substitute_grit_file(args):
         original_text = file.read()
 
     text = original_text.replace('&#36;', '!!dollar-sign-literal!!')
-    replaced, fp_map = util.replace_grit_tree(text)
-    if not fp_map:
+    android = util.is_android_strings(arcname)
+    replaced, fp_map = util.replace_grit_tree(text, android)
+    if not fp_map and not (android and util.has_message_renames(text)):
         return None
 
     print(f"Replaced strings in {arcname}")
@@ -158,7 +159,7 @@ def substitute_xtb_file(args):
         original_text = file.read()
 
     text = original_text.replace('&#36;', '!!dollar-sign-literal!!')
-    replaced = util.replace_xtb_tree(text, fp_map)
+    replaced = util.replace_xtb_tree(text, fp_map, util.is_android_strings(arcname))
     if not replaced:
         return None
 

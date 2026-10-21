@@ -58,6 +58,90 @@ ENGLISH_ONLY_REGEXES = [
 ]
 
 
+def is_english(lang):
+    """Whether an .xtb language is a variant of English (en-GB): its
+    translations get Tark's English words, as the English source does."""
+    return lang == 'en' or lang.startswith('en-')
+
+
+# Tark (A4, Android): plain words for whole messages, by message name:
+# name -> (English, old id, new id, {language: Tark's wording}). The English
+# text is replaced; translations stay under the old id (other messages can
+# share the old English) and are copied to the new id, Hindi with Tark's
+# wording and English variants (en-GB) with the English, unless the new id
+# already has a translation of its own. The ids
+# are grit's fingerprints, pinned so the .xtb pass needs no grit
+# (utils/tests/test_name_substitution.py checks them against grit).
+MESSAGE_RENAMES = {
+    'IDS_PASSWORD_MANAGER_SETTINGS_TITLE':
+        ('Passwords', '6247557882553405851', '7029809446516969842', {'hi': 'पासवर्ड'}),
+    'IDS_CLEAR_BROWSING_DATA_TITLE':
+        ('Clear history and site data', '961856697154696964', '7602233293931907714',
+         {'hi': 'इतिहास और साइट का डेटा मिटाएं'}),
+    'IDS_PREFS_SITE_SETTINGS':
+        ('Site permissions', '4165986682804962316', '523862956770478816',
+         {'hi': 'साइट की अनुमतियां'}),
+    # A2: Site permissions' "Intrusive ads" (Chromium's filter for abusive
+    # sites) is Tark's ad blocker on Android: "Ads", allowed or blocked.
+    'IDS_SITE_SETTINGS_PAGE_INTRUSIVE_ADS_LABEL':
+        ('Ads', '8899807382908246773', '1919345977826869612', {'hi': 'विज्ञापन'}),
+    'IDS_SITE_SETTINGS_PAGE_INTRUSIVE_ALLOWED_SUB_LABEL':
+        ('Sites can show ads; Tark does not block them', '8077120325605624147',
+         '6776312556175280371', {'hi': 'साइटें विज्ञापन दिखा सकती हैं; Tark उन्हें ब्लॉक नहीं करता'}),
+    'IDS_SITE_SETTINGS_PAGE_INTRUSIVE_BLOCKED_SUB_LABEL':
+        ('Tark blocks ads and trackers on every site', '8681886425883659911',
+         '7919551752479614882', {'hi': 'Tark हर साइट पर विज्ञापन और ट्रैकर ब्लॉक करता है'}),
+    'IDS_SITE_SETTINGS_PAGE_INTRUSIVE_ADS_A11Y':
+        ('When on, sites can show ads. When off, Tark blocks ads and trackers.',
+         '4755971844837804407', '4963902051023881364',
+         {'hi': 'चालू होने पर, साइटें विज्ञापन दिखा सकती हैं। बंद होने पर, Tark विज्ञापन और ट्रैकर ब्लॉक करता है।'}),
+    'IDS_WEBSITE_SETTINGS_ADS_PAGE_DESCRIPTION':
+        ('Tark blocks ads and trackers on every site. Turn ads on here to allow them everywhere, '
+         'or for one site from its page info.', '3981465354637804599', '8813220890469783504',
+         {'hi': 'Tark हर साइट पर विज्ञापन और ट्रैकर ब्लॉक करता है। सभी साइटों पर विज्ञापन दिखाने के लिए '
+                'इसे चालू करें, या किसी एक साइट के लिए उसकी पेज जानकारी से।'}),
+}
+
+
+def is_android_strings(path):
+    """Whether a .grd/.grdp/.xtb path holds Android UI strings, the only ones
+    MESSAGE_RENAMES applies to (the Mac's strings stay as they are)."""
+    return '/android/' in '/' + str(path)
+
+
+def has_message_renames(text):
+    """Whether a .grd/.grdp text holds a message MESSAGE_RENAMES renames."""
+    return any(f'name="{name}"' in text for name in MESSAGE_RENAMES)
+
+
+def rename_message(message):
+    """Tark's plain word for a whole message (MESSAGE_RENAMES)."""
+    rename = MESSAGE_RENAMES.get(message.get('name'))
+    if rename and message.text and not len(message):
+        message.text = message.text.replace(message.text.strip(), rename[0])
+
+
+def copy_renamed_translations(xml_tree):
+    """Adds each renamed message's translation under its new id (see
+    MESSAGE_RENAMES); returns whether any was added."""
+    lang = xml_tree.get('lang', '')
+    by_id = {t.get('id'): t for t in xml_tree.findall('.//translation')}
+    added = False
+    for english, old_id, new_id, by_lang in MESSAGE_RENAMES.values():
+        if new_id in by_id or old_id not in by_id:
+            continue
+        old = by_id[old_id]
+        copy = xml.Element('translation', {'id': new_id})
+        tark_words = by_lang.get(lang, english if is_english(lang) else None)
+        copy.text = tark_words or old.text
+        if not tark_words:
+            copy.extend(list(old))
+        copy.tail = old.tail
+        xml_tree.append(copy)
+        added = True
+    return added
+
+
 def add_grit_to_path(tree):
     """Inserts the grit/ folder into the module loading path."""
     grit_path = tree / 'tools' / 'grit'
@@ -172,12 +256,13 @@ def replace_grit_message(msg, translation=False):
     return had_any_match
 
 
-def replace_xtb_translation(msg, fp_map):
+def replace_xtb_translation(msg, fp_map, english=False):
     """
     Replaces instances of Chrom(e | ium) with Tark in a
-    .xtb <translation>.
+    .xtb <translation>, and in an English variant's (en-GB) also Incognito
+    with private.
     """
-    had_match = replace_grit_message(msg, translation=True)
+    had_match = replace_grit_message(msg, translation=not english)
 
     # Tark: a translation follows its English message to the new id even when
     # the translation itself had nothing to replace ("Neues Inkognitofenster"
@@ -194,13 +279,15 @@ def get_parser():
     return xml.XMLParser(target=xml.TreeBuilder(insert_comments=True))
 
 
-def replace_grit_tree(text):
+def replace_grit_tree(text, android=False):
     """Replaces instances of Chrom(e | ium) with Tark, where desired"""
     xml_tree = xml.fromstring(text, get_parser())
     fp_map = {}
 
     for message in xml_tree.findall('.//message'):
         old_fp = compute_fp(message)
+        if android:
+            rename_message(message)
         if replace_grit_message(message):
             new_fp = compute_fp(message)
             if old_fp != new_fp:
@@ -227,15 +314,18 @@ def dedup_translations_in_place(translation, seen):
     seen.add(translation_id)
 
 
-def replace_xtb_tree(text, fp_map):
+def replace_xtb_tree(text, fp_map, android=False):
     """Same as replace_grit_tree(), but on .xtb translation files."""
     xml_tree = xml.fromstring(text, get_parser())
     changed = False
     ids_seen = set()
+    english = is_english(xml_tree.get('lang', ''))
 
+    if android:
+        changed |= copy_renamed_translations(xml_tree)
     for translation in xml_tree.findall('.//translation'):
         assert translation.get('id')
-        changed |= replace_xtb_translation(translation, fp_map)
+        changed |= replace_xtb_translation(translation, fp_map, english)
         dedup_translations_in_place(translation, ids_seen)
 
     if changed:

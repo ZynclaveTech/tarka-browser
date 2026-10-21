@@ -1,0 +1,127 @@
+--- /dev/null
++++ b/chrome/android/java/src/org/chromium/chrome/browser/page_info/TarkAdblockSiteSwitch.java
+@@ -0,0 +1,77 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++package org.chromium.chrome.browser.page_info;
++
++import android.content.Context;
++import android.view.Gravity;
++import android.view.View;
++import android.view.ViewGroup;
++import android.widget.LinearLayout;
++import android.widget.TextView;
++
++import com.google.android.material.materialswitch.MaterialSwitch;
++
++import org.chromium.build.annotations.NullMarked;
++import org.chromium.chrome.R;
++import org.chromium.chrome.browser.profiles.Profile;
++import org.chromium.components.browser_ui.site_settings.WebsitePreferenceBridge;
++import org.chromium.components.content_settings.ContentSetting;
++import org.chromium.components.content_settings.ContentSettingsType;
++import org.chromium.content_public.browser.WebContents;
++import org.chromium.url.GURL;
++
++/**
++ * Tark (A2, spec §4): "Block ads on this site" in the page info sheet. On (the
++ * default) blocks ads; off allows them on this site, stored as the site's ADS
++ * content setting (ALLOW; on writes BLOCK, so the global "Ads" setting in Site
++ * permissions cannot override a site turned back on), which the ad blocker reads for every request and
++ * page. A change reloads the page.
++ */
++@NullMarked
++final class TarkAdblockSiteSwitch {
++    private TarkAdblockSiteSwitch() {}
++
++    static View create(Context context, Profile profile, WebContents webContents) {
++        GURL url = webContents.getVisibleUrl();
++        int sides = context.getResources().getDimensionPixelSize(R.dimen.page_info_popup_padding_sides);
++        int vertical =
++                context.getResources().getDimensionPixelSize(R.dimen.page_info_popup_padding_vertical);
++        float density = context.getResources().getDisplayMetrics().density;
++
++        LinearLayout row = new LinearLayout(context);
++        row.setOrientation(LinearLayout.HORIZONTAL);
++        row.setGravity(Gravity.CENTER_VERTICAL);
++        // Aligned with the other rows' titles (icon 24dp, 8dp before, 24dp after).
++        row.setPaddingRelative(sides + Math.round(56 * density), vertical, sides, vertical);
++        row.setLayoutParams(
++                new LinearLayout.LayoutParams(
++                        ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
++
++        TextView title = new TextView(context);
++        title.setText(R.string.tark_page_info_block_ads);
++        title.setTextAppearance(R.style.TextAppearance_TextLarge_Primary);
++        row.addView(title, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
++
++        MaterialSwitch toggle = new MaterialSwitch(context);
++        toggle.setChecked(
++                WebsitePreferenceBridge.getContentSetting(
++                                profile, ContentSettingsType.ADS, url, url)
++                        != ContentSetting.ALLOW);
++        toggle.setContentDescription(context.getString(R.string.tark_page_info_block_ads));
++        toggle.setOnCheckedChangeListener(
++                (button, checked) -> {
++                    WebsitePreferenceBridge.setContentSettingDefaultScope(
++                            profile,
++                            ContentSettingsType.ADS,
++                            url,
++                            url,
++                            checked ? ContentSetting.BLOCK : ContentSetting.ALLOW);
++                    webContents.getNavigationController().reload(true);
++                });
++        row.addView(toggle);
++        row.setOnClickListener(v -> toggle.toggle());
++        return row;
++    }
++}
+--- a/chrome/android/java/src/org/chromium/chrome/browser/page_info/ChromePageInfoControllerDelegate.java
++++ b/chrome/android/java/src/org/chromium/chrome/browser/page_info/ChromePageInfoControllerDelegate.java
+@@ -285,6 +285,12 @@
+             PageInfoMainController mainController, ViewGroup rowWrapper) {
+         Collection<PageInfoSubpageController> controllers = new ArrayList<>();
+ 
++        // Tark (A2): "Block ads on this site" (spec §4), for web pages.
++        if (UrlUtilities.isHttpOrHttps(mWebContents.getVisibleUrl())) {
++            rowWrapper.addView(
++                    TarkAdblockSiteSwitch.create(rowWrapper.getContext(), mProfile, mWebContents));
++        }
++
+         // Add history row.
+         final Tab tab = TabUtils.fromWebContents(mWebContents);
+         var historyRow = new PageInfoRowView(rowWrapper.getContext(), null);
+--- a/chrome/android/chrome_java_sources.gni
++++ b/chrome/android/chrome_java_sources.gni
+@@ -978,6 +978,7 @@
+   "java/src/org/chromium/chrome/browser/page_info/PageInfoAboutThisSiteController.java",
+   "java/src/org/chromium/chrome/browser/page_info/PageInfoHistoryController.java",
+   "java/src/org/chromium/chrome/browser/page_info/SiteSettingsHelper.java",
++  "java/src/org/chromium/chrome/browser/page_info/TarkAdblockSiteSwitch.java",
+   "java/src/org/chromium/chrome/browser/paint_preview/StartupPaintPreviewHelper.java",
+   "java/src/org/chromium/chrome/browser/paint_preview/StartupPaintPreviewHelperSupplier.java",
+   "java/src/org/chromium/chrome/browser/password_manager/AccountChooserDialog.java",
+--- a/chrome/browser/ui/android/strings/android_chrome_strings.grd
++++ b/chrome/browser/ui/android/strings/android_chrome_strings.grd
+@@ -845,6 +845,10 @@
+       <message name="IDS_TARK_SETTINGS_SUMMARY_DETAIL" desc="Tark: the rest of the summary line at the top of Settings.">
+         No Google · no sync
+       </message>
++      <!-- Tark: the ad blocker's switch in page info (A2). -->
++      <message name="IDS_TARK_PAGE_INFO_BLOCK_ADS" desc="Tark: switch in the page info sheet that turns ad blocking on or off for the current site.">
++        Block ads on this site
++      </message>
+       <message name="IDS_PASSWORD_MANAGER_SETTINGS_TITLE" desc="Title for the settings menu item leading to the Password Manager UI surface. This allows users to e.g. manage their saved passwords, toggle saving and auto-sign-in on/off, etc. [CHAR_LIMIT=32]">
+         Google Password Manager
+       </message>
+--- a/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb
++++ b/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb
+@@ -2154,4 +2154,5 @@
+ <translation id="99907655649633293"><ph name="TAB_TITLE" />, गुप्त टैब</translation>
+ <translation id="4052894432451380501">डिफ़ॉल्ट रूप से निजी।</translation>
+ <translation id="4895029394010859418">Google नहीं · सिंक नहीं</translation>
++<translation id="502232591958917855">इस साइट पर विज्ञापन ब्लॉक करें</translation>
+ </translationbundle>
+\ No newline at end of file

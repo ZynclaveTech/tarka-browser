@@ -169,7 +169,9 @@ class ManifestTest(unittest.TestCase):
     def test_generated_files_match_the_committed_ones(self):
         here = os.path.dirname(__file__)
         mark_dir = os.path.join(here, '..', '..', 'resources', 'branding', 'mark')
-        entries = mark.read_manifest(os.path.join(mark_dir, 'install.txt'))
+        self.assertEqual(mark.MANIFESTS, ('install.txt', 'install-android.txt'))
+        entries = [e for name in mark.MANIFESTS
+                   for e in mark.read_manifest(os.path.join(mark_dir, name))]
         self.assertTrue(entries)
         for entry in entries:
             with open(os.path.join(mark_dir, 'tree', entry.dest), 'rb') as f:

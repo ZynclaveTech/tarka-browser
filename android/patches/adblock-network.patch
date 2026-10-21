@@ -1,0 +1,654 @@
+--- /dev/null
++++ b/chrome/browser/tark_adblock/tark_adblock_proxying_url_loader_factory.cc
+@@ -0,0 +1,478 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/tark_adblock/tark_adblock_proxying_url_loader_factory.h"
++
++#include <algorithm>
++#include <utility>
++#include <vector>
++
++#include "base/byte_size.h"
++#include "base/check.h"
++#include "base/containers/span.h"
++#include "base/functional/bind.h"
++#include "base/memory/ptr_util.h"
++#include "base/memory/raw_ptr.h"
++#include "base/memory/weak_ptr.h"
++#include "base/supports_user_data.h"
++#include "chrome/browser/content_settings/host_content_settings_map_factory.h"
++#include "chrome/browser/tark_adblock/tark_adblock_service.h"
++#include "components/content_settings/core/common/content_settings.h"
++#include "components/content_settings/core/common/content_settings_types.h"
++#include "content/public/browser/browser_context.h"
++#include "content/public/browser/browser_thread.h"
++#include "content/public/browser/render_frame_host.h"
++#include "mojo/public/cpp/bindings/receiver.h"
++#include "mojo/public/cpp/system/data_pipe.h"
++#include "net/base/net_errors.h"
++#include "net/url_request/redirect_info.h"
++#include "services/network/public/cpp/resource_request.h"
++#include "services/network/public/cpp/url_loader_completion_status.h"
++#include "services/network/public/mojom/early_hints.mojom.h"
++#include "services/network/public/mojom/url_loader.mojom.h"
++#include "services/network/public/mojom/url_response_head.mojom.h"
++#include "services/network/public/mojom/websocket.mojom.h"
++#include "third_party/blink/public/mojom/loader/resource_load_info.mojom-shared.h"
++#include "third_party/brave_adblock/adblock_stub_response.h"
++#include "url/gurl.h"
++
++namespace tark_adblock {
++
++namespace {
++
++const void* const kBrowserContextUserDataKey = &kBrowserContextUserDataKey;
++
++// adblock-rust's request types, mapped as brave-core maps them.
++std::string RequestType(int resource_type) {
++  switch (static_cast<blink::mojom::ResourceType>(resource_type)) {
++    case blink::mojom::ResourceType::kMainFrame:
++      return "main_frame";
++    case blink::mojom::ResourceType::kSubFrame:
++      return "sub_frame";
++    case blink::mojom::ResourceType::kStylesheet:
++      return "stylesheet";
++    case blink::mojom::ResourceType::kScript:
++      return "script";
++    case blink::mojom::ResourceType::kFavicon:
++    case blink::mojom::ResourceType::kImage:
++      return "image";
++    case blink::mojom::ResourceType::kFontResource:
++      return "font";
++    case blink::mojom::ResourceType::kSubResource:
++      return "other";
++    case blink::mojom::ResourceType::kObject:
++      return "object";
++    case blink::mojom::ResourceType::kMedia:
++      return "media";
++    case blink::mojom::ResourceType::kXhr:
++      return "xhr";
++    case blink::mojom::ResourceType::kPing:
++      return "ping";
++    default:
++      return std::string();
++  }
++}
++
++// Owns a profile's proxies, as signin's BrowserContextData does.
++class BrowserContextData : public base::SupportsUserData::Data {
++ public:
++  BrowserContextData(const BrowserContextData&) = delete;
++  BrowserContextData& operator=(const BrowserContextData&) = delete;
++  ~BrowserContextData() override = default;
++
++  static void StartProxying(content::BrowserContext* browser_context,
++                            const net::IsolationInfo& isolation_info,
++                            network::URLLoaderFactoryBuilder& factory_builder) {
++    auto* self = static_cast<BrowserContextData*>(
++        browser_context->GetUserData(kBrowserContextUserDataKey));
++    if (!self) {
++      self = new BrowserContextData();
++      browser_context->SetUserData(kBrowserContextUserDataKey,
++                                   base::WrapUnique(self));
++    }
++    self->proxies_.emplace(std::make_unique<ProxyingURLLoaderFactory>(
++        base::WrapRefCounted(
++            HostContentSettingsMapFactory::GetForProfile(browser_context)),
++        isolation_info, factory_builder,
++        base::BindOnce(&BrowserContextData::RemoveProxy,
++                       self->weak_factory_.GetWeakPtr())));
++  }
++
++  void RemoveProxy(ProxyingURLLoaderFactory* proxy) {
++    auto it = proxies_.find(proxy);
++    CHECK(it != proxies_.end());
++    proxies_.erase(it);
++  }
++
++ private:
++  BrowserContextData() = default;
++
++  std::set<std::unique_ptr<ProxyingURLLoaderFactory>, base::UniquePtrComparator>
++      proxies_;
++  base::WeakPtrFactory<BrowserContextData> weak_factory_{this};
++};
++
++}  // namespace
++
++bool AdsAllowed(const HostContentSettingsMap* settings,
++                const std::optional<url::Origin>& top_frame_origin) {
++  if (!settings || !top_frame_origin || top_frame_origin->opaque()) {
++    return false;
++  }
++  const GURL url = top_frame_origin->GetURL();
++  return settings->GetContentSetting(url, url, ContentSettingsType::ADS) ==
++         CONTENT_SETTING_ALLOW;
++}
++
++class ProxyingURLLoaderFactory::InProgressRequest
++    : public network::mojom::URLLoader,
++      public network::mojom::URLLoaderClient {
++ public:
++  InProgressRequest(
++      ProxyingURLLoaderFactory* factory,
++      mojo::PendingReceiver<network::mojom::URLLoader> loader_receiver,
++      int32_t request_id,
++      uint32_t options,
++      const network::ResourceRequest& request,
++      mojo::PendingRemote<network::mojom::URLLoaderClient> client,
++      const net::MutableNetworkTrafficAnnotationTag& traffic_annotation)
++      : factory_(factory),
++        request_(request),
++        request_type_(RequestType(request.resource_type)),
++        request_id_(request_id),
++        options_(options),
++        traffic_annotation_(traffic_annotation),
++        loader_receiver_(this, std::move(loader_receiver)),
++        target_client_(std::move(client)) {
++    // The page cancelled or went away: nothing more to do.
++    loader_receiver_.set_disconnect_handler(base::BindOnce(
++        &InProgressRequest::OnDisconnect, base::Unretained(this)));
++    target_client_.set_disconnect_handler(base::BindOnce(
++        &InProgressRequest::OnDisconnect, base::Unretained(this)));
++  }
++  InProgressRequest(const InProgressRequest&) = delete;
++  InProgressRequest& operator=(const InProgressRequest&) = delete;
++  ~InProgressRequest() override = default;
++
++  void Start() {
++    if (!ShouldCheck(request_.url)) {
++      StartTarget();
++      return;
++    }
++    AdblockService::Get()->ShouldBlock(
++        request_.url, *request_.request_initiator, request_type_,
++        request_.method,
++        base::BindOnce(&InProgressRequest::OnDecision,
++                       weak_factory_.GetWeakPtr()));
++  }
++
++  // network::mojom::URLLoader:
++  void FollowRedirect(
++      network::HttpRequestHeadersUpdateParams headers_update_params,
++      const std::optional<GURL>& new_url) override {
++    if (target_loader_) {
++      target_loader_->FollowRedirect(std::move(headers_update_params),
++                                     new_url);
++    }
++  }
++  void SetPriority(net::RequestPriority priority,
++                   int32_t intra_priority_value) override {
++    if (target_loader_) {
++      target_loader_->SetPriority(priority, intra_priority_value);
++    } else {
++      request_.priority = priority;
++    }
++  }
++
++  // network::mojom::URLLoaderClient:
++  void OnReceiveEarlyHints(network::mojom::EarlyHintsPtr early_hints) override {
++    target_client_->OnReceiveEarlyHints(std::move(early_hints));
++  }
++  void OnReceiveResponse(
++      network::mojom::URLResponseHeadPtr head,
++      mojo::ScopedDataPipeConsumerHandle body,
++      std::optional<mojo_base::BigBuffer> cached_metadata) override {
++    target_client_->OnReceiveResponse(std::move(head), std::move(body),
++                                      std::move(cached_metadata));
++  }
++  void OnReceiveRedirect(const net::RedirectInfo& redirect_info,
++                         network::mojom::URLResponseHeadPtr head) override {
++    if (!ShouldCheck(redirect_info.new_url)) {
++      target_client_->OnReceiveRedirect(redirect_info, std::move(head));
++      return;
++    }
++    // A redirect to an ad is blocked like a request for one.
++    AdblockService::Get()->ShouldBlock(
++        redirect_info.new_url, *request_.request_initiator, request_type_,
++        redirect_info.new_method,
++        base::BindOnce(&InProgressRequest::OnRedirectDecision,
++                       weak_factory_.GetWeakPtr(), redirect_info,
++                       std::move(head)));
++  }
++  void OnUploadProgress(int64_t current_position,
++                        int64_t total_size,
++                        OnUploadProgressCallback callback) override {
++    target_client_->OnUploadProgress(current_position, total_size,
++                                     std::move(callback));
++  }
++  void OnTransferSizeUpdated(int32_t transfer_size_diff) override {
++    target_client_->OnTransferSizeUpdated(transfer_size_diff);
++  }
++  void OnComplete(const network::URLLoaderCompletionStatus& status) override {
++    completed_ = true;
++    target_client_->OnComplete(status);
++  }
++
++ private:
++  // Only page-initiated http(s) subresources and subframes are checked,
++  // and none on a site where the person turned ad blocking off.
++  bool ShouldCheck(const GURL& url) const {
++    return url.SchemeIsHTTPOrHTTPS() && request_.request_initiator &&
++           request_.resource_type !=
++               static_cast<int>(blink::mojom::ResourceType::kMainFrame) &&
++           !AdsAllowed(factory_->settings_.get(), TopFrameOrigin());
++  }
++
++  std::optional<url::Origin> TopFrameOrigin() const {
++    if (factory_->top_frame_origin_) {
++      return factory_->top_frame_origin_;
++    }
++    if (request_.trusted_params &&
++        request_.trusted_params->isolation_info.top_frame_origin()) {
++      return request_.trusted_params->isolation_info.top_frame_origin();
++    }
++    return request_.request_initiator;
++  }
++
++  void OnDecision(BlockResult result) {
++    if (!result.block) {
++      StartTarget();
++    } else if (result.redirect) {
++      ServeStub(*result.redirect);
++    } else {
++      Fail();
++    }
++  }
++
++  void OnRedirectDecision(const net::RedirectInfo& redirect_info,
++                          network::mojom::URLResponseHeadPtr head,
++                          BlockResult result) {
++    if (!result.block) {
++      target_client_->OnReceiveRedirect(redirect_info, std::move(head));
++      return;
++    }
++    target_loader_.reset();
++    client_receiver_.reset();
++    Fail();
++  }
++
++  void StartTarget() {
++    if (!factory_->target_factory_.is_bound()) {
++      target_client_->OnComplete(
++          network::URLLoaderCompletionStatus(net::ERR_FAILED));
++      return;
++    }
++    factory_->target_factory_->CreateLoaderAndStart(
++        target_loader_.BindNewPipeAndPassReceiver(), request_id_, options_,
++        request_, client_receiver_.BindNewPipeAndPassRemote(),
++        traffic_annotation_);
++    // The network side went away (its service restarted, say) without
++    // completing: the page hears it failed instead of waiting forever.
++    client_receiver_.set_disconnect_handler(base::BindOnce(
++        &InProgressRequest::OnNetworkDisconnect, base::Unretained(this)));
++  }
++
++  void OnNetworkDisconnect() {
++    if (!completed_) {
++      target_client_->OnComplete(
++          network::URLLoaderCompletionStatus(net::ERR_FAILED));
++    }
++    OnDisconnect();
++  }
++
++  // As uBlock Origin: the request fails as if blocked by the client, and
++  // the element that made it collapses.
++  void Fail() {
++    network::URLLoaderCompletionStatus status(net::ERR_BLOCKED_BY_CLIENT);
++    status.should_collapse_initiator = true;
++    completed_ = true;
++    target_client_->OnComplete(status);
++  }
++
++  // A $redirect rule: answer with the resource (a data: URL) instead.
++  void ServeStub(const std::string& data_url) {
++    auto head = network::mojom::URLResponseHead::New();
++    std::string body;
++    brave_shields::MakeStubResponse(data_url, request_, &head, &body);
++    mojo::ScopedDataPipeProducerHandle producer;
++    mojo::ScopedDataPipeConsumerHandle consumer;
++    if (mojo::CreateDataPipe(
++            static_cast<uint32_t>(std::max<size_t>(body.size(), 1)), producer,
++            consumer) != MOJO_RESULT_OK ||
++        (!body.empty() &&
++         producer->WriteAllData(base::as_byte_span(body)) != MOJO_RESULT_OK)) {
++      Fail();
++      return;
++    }
++    producer.reset();
++    head->content_length = body.size();
++    target_client_->OnReceiveResponse(std::move(head), std::move(consumer),
++                                      std::nullopt);
++    network::URLLoaderCompletionStatus status(net::OK);
++    status.encoded_data_length = base::ByteSize(body.size());
++    status.encoded_body_length = base::ByteSize(body.size());
++    status.decoded_body_length = base::ByteSize(body.size());
++    completed_ = true;
++    target_client_->OnComplete(status);
++  }
++
++  void OnDisconnect() {
++    // Destroys `this`.
++    factory_->RemoveRequest(this);
++  }
++
++  const raw_ptr<ProxyingURLLoaderFactory> factory_;
++  network::ResourceRequest request_;
++  const std::string request_type_;
++  const int32_t request_id_;
++  const uint32_t options_;
++  const net::MutableNetworkTrafficAnnotationTag traffic_annotation_;
++  // Whether the page has had its OnComplete.
++  bool completed_ = false;
++
++  mojo::Receiver<network::mojom::URLLoader> loader_receiver_;
++  mojo::Remote<network::mojom::URLLoaderClient> target_client_;
++  mojo::Receiver<network::mojom::URLLoaderClient> client_receiver_{this};
++  mojo::Remote<network::mojom::URLLoader> target_loader_;
++
++  base::WeakPtrFactory<InProgressRequest> weak_factory_{this};
++};
++
++// static
++void ProxyingURLLoaderFactory::MaybeProxyRequest(
++    content::BrowserContext* browser_context,
++    content::ContentBrowserClient::URLLoaderFactoryType type,
++    const net::IsolationInfo& isolation_info,
++    network::URLLoaderFactoryBuilder& factory_builder) {
++  DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
++  using Type = content::ContentBrowserClient::URLLoaderFactoryType;
++  if (type == Type::kDownload || type == Type::kDevTools) {
++    return;
++  }
++  BrowserContextData::StartProxying(browser_context, isolation_info,
++                                    factory_builder);
++}
++
++// static
++void ProxyingURLLoaderFactory::MaybeConnectWebSocket(
++    content::RenderFrameHost* frame,
++    content::ContentBrowserClient::WebSocketFactory factory,
++    const GURL& url,
++    mojo::PendingRemote<network::mojom::WebSocketHandshakeClient>
++        handshake_client,
++    mojo::PendingRemote<network::mojom::TrustedHeaderClient> header_client) {
++  DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
++  auto connect = base::BindOnce(
++      [](content::ContentBrowserClient::WebSocketFactory factory,
++         const GURL& url,
++         mojo::PendingRemote<network::mojom::WebSocketHandshakeClient>
++             handshake_client,
++         mojo::PendingRemote<network::mojom::TrustedHeaderClient>
++             header_client,
++         BlockResult result) {
++        // A blocked socket never connects: dropping the handshake client
++        // fails it in the page.
++        if (result.block) {
++          return;
++        }
++        std::move(factory).Run(url, {}, std::move(handshake_client),
++                               mojo::NullRemote(), std::move(header_client));
++      },
++      std::move(factory), url, std::move(handshake_client),
++      std::move(header_client));
++  const HostContentSettingsMap* settings =
++      HostContentSettingsMapFactory::GetForProfile(frame->GetBrowserContext());
++  if (!url.SchemeIsWSOrWSS() ||
++      AdsAllowed(settings,
++                 frame->GetOutermostMainFrame()->GetLastCommittedOrigin())) {
++    std::move(connect).Run(BlockResult());
++    return;
++  }
++  AdblockService::Get()->ShouldBlock(url, frame->GetLastCommittedOrigin(),
++                                     "websocket", "GET", std::move(connect));
++}
++
++ProxyingURLLoaderFactory::ProxyingURLLoaderFactory(
++    scoped_refptr<HostContentSettingsMap> settings,
++    const net::IsolationInfo& isolation_info,
++    network::URLLoaderFactoryBuilder& factory_builder,
++    DisconnectCallback on_disconnect)
++    : settings_(std::move(settings)),
++      top_frame_origin_(isolation_info.top_frame_origin()),
++      on_disconnect_(std::move(on_disconnect)) {
++  auto [loader_receiver, target_factory] = factory_builder.Append();
++  target_factory_.Bind(std::move(target_factory));
++  target_factory_.set_disconnect_handler(
++      base::BindOnce(&ProxyingURLLoaderFactory::OnTargetFactoryError,
++                     base::Unretained(this)));
++  proxy_receivers_.Add(this, std::move(loader_receiver));
++  proxy_receivers_.set_disconnect_handler(
++      base::BindRepeating(&ProxyingURLLoaderFactory::OnProxyBindingError,
++                          base::Unretained(this)));
++}
++
++ProxyingURLLoaderFactory::~ProxyingURLLoaderFactory() = default;
++
++void ProxyingURLLoaderFactory::CreateLoaderAndStart(
++    mojo::PendingReceiver<network::mojom::URLLoader> loader_receiver,
++    int32_t request_id,
++    uint32_t options,
++    const network::ResourceRequest& request,
++    mojo::PendingRemote<network::mojom::URLLoaderClient> client,
++    const net::MutableNetworkTrafficAnnotationTag& traffic_annotation) {
++  auto in_progress = std::make_unique<InProgressRequest>(
++      this, std::move(loader_receiver), request_id, options, request,
++      std::move(client), traffic_annotation);
++  InProgressRequest* raw = in_progress.get();
++  requests_.insert(std::move(in_progress));
++  raw->Start();
++}
++
++void ProxyingURLLoaderFactory::Clone(
++    mojo::PendingReceiver<network::mojom::URLLoaderFactory> loader_receiver) {
++  proxy_receivers_.Add(this, std::move(loader_receiver));
++}
++
++void ProxyingURLLoaderFactory::OnTargetFactoryError() {
++  // Stop calls to CreateLoaderAndStart() when `target_factory_` is invalid.
++  target_factory_.reset();
++  proxy_receivers_.Clear();
++  MaybeDestroySelf();
++}
++
++void ProxyingURLLoaderFactory::OnProxyBindingError() {
++  if (proxy_receivers_.empty()) {
++    target_factory_.reset();
++  }
++  MaybeDestroySelf();
++}
++
++void ProxyingURLLoaderFactory::RemoveRequest(InProgressRequest* request) {
++  auto it = requests_.find(request);
++  CHECK(it != requests_.end());
++  requests_.erase(it);
++  MaybeDestroySelf();
++}
++
++void ProxyingURLLoaderFactory::MaybeDestroySelf() {
++  // Even with every factory pipe closed, it stays alive until all active
++  // requests have completed.
++  if (target_factory_.is_bound() || !requests_.empty()) {
++    return;
++  }
++  // Deletes `this`.
++  std::move(on_disconnect_).Run(this);
++}
++
++}  // namespace tark_adblock
+--- /dev/null
++++ b/chrome/browser/tark_adblock/tark_adblock_proxying_url_loader_factory.h
+@@ -0,0 +1,115 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_TARK_ADBLOCK_TARK_ADBLOCK_PROXYING_URL_LOADER_FACTORY_H_
++#define CHROME_BROWSER_TARK_ADBLOCK_TARK_ADBLOCK_PROXYING_URL_LOADER_FACTORY_H_
++
++#include <memory>
++#include <optional>
++#include <set>
++#include <string>
++
++#include "base/containers/unique_ptr_adapters.h"
++#include "base/functional/callback.h"
++#include "base/memory/scoped_refptr.h"
++#include "components/content_settings/core/browser/host_content_settings_map.h"
++#include "content/public/browser/content_browser_client.h"
++#include "mojo/public/cpp/bindings/pending_receiver.h"
++#include "mojo/public/cpp/bindings/pending_remote.h"
++#include "mojo/public/cpp/bindings/receiver_set.h"
++#include "mojo/public/cpp/bindings/remote.h"
++#include "net/base/isolation_info.h"
++#include "services/network/public/cpp/url_loader_factory_builder.h"
++#include "services/network/public/mojom/url_loader_factory.mojom.h"
++#include "services/network/public/mojom/network_context.mojom-forward.h"
++#include "services/network/public/mojom/websocket.mojom-forward.h"
++#include "url/origin.h"
++
++class GURL;
++
++namespace content {
++class BrowserContext;
++class RenderFrameHost;
++}  // namespace content
++
++namespace net {
++class SiteForCookies;
++}  // namespace net
++
++namespace tark_adblock {
++
++// Whether the person turned ad blocking off for the site whose top frame
++// has `top_frame_origin` ("Block ads on this site" off: ADS == ALLOW).
++bool AdsAllowed(const HostContentSettingsMap* settings,
++                const std::optional<url::Origin>& top_frame_origin);
++
++// Puts Tark's ad blocker in front of a page's requests (spec §4): each
++// request a page, a frame or a worker makes is checked by the engine before
++// it leaves; a blocked one fails with ERR_BLOCKED_BY_CLIENT (its element
++// collapsed), as with uBlock Origin, and a $redirect rule answers with its
++// stub. Redirects are checked again. Modelled on Chromium's
++// signin::ProxyingURLLoaderFactory. UI thread only.
++class ProxyingURLLoaderFactory : public network::mojom::URLLoaderFactory {
++ public:
++  using DisconnectCallback =
++      base::OnceCallback<void(ProxyingURLLoaderFactory*)>;
++
++  static void MaybeProxyRequest(
++      content::BrowserContext* browser_context,
++      content::ContentBrowserClient::URLLoaderFactoryType type,
++      const net::IsolationInfo& isolation_info,
++      network::URLLoaderFactoryBuilder& factory_builder);
++
++  // Checks a WebSocket a frame opens; connects it through `factory` unless
++  // the engine blocks it (then the handshake client is dropped).
++  static void MaybeConnectWebSocket(
++      content::RenderFrameHost* frame,
++      content::ContentBrowserClient::WebSocketFactory factory,
++      const GURL& url,
++      mojo::PendingRemote<network::mojom::WebSocketHandshakeClient>
++          handshake_client,
++      mojo::PendingRemote<network::mojom::TrustedHeaderClient> header_client);
++
++  ProxyingURLLoaderFactory(scoped_refptr<HostContentSettingsMap> settings,
++                           const net::IsolationInfo& isolation_info,
++                           network::URLLoaderFactoryBuilder& factory_builder,
++                           DisconnectCallback on_disconnect);
++  ProxyingURLLoaderFactory(const ProxyingURLLoaderFactory&) = delete;
++  ProxyingURLLoaderFactory& operator=(const ProxyingURLLoaderFactory&) =
++      delete;
++  ~ProxyingURLLoaderFactory() override;
++
++  // network::mojom::URLLoaderFactory:
++  void CreateLoaderAndStart(
++      mojo::PendingReceiver<network::mojom::URLLoader> loader_receiver,
++      int32_t request_id,
++      uint32_t options,
++      const network::ResourceRequest& request,
++      mojo::PendingRemote<network::mojom::URLLoaderClient> client,
++      const net::MutableNetworkTrafficAnnotationTag& traffic_annotation)
++      override;
++  void Clone(mojo::PendingReceiver<network::mojom::URLLoaderFactory>
++                 loader_receiver) override;
++
++ private:
++  class InProgressRequest;
++
++  void OnTargetFactoryError();
++  void OnProxyBindingError();
++  void RemoveRequest(InProgressRequest* request);
++  void MaybeDestroySelf();
++
++  scoped_refptr<HostContentSettingsMap> settings_;
++  std::optional<url::Origin> top_frame_origin_;
++
++  mojo::ReceiverSet<network::mojom::URLLoaderFactory> proxy_receivers_;
++  std::set<std::unique_ptr<InProgressRequest>, base::UniquePtrComparator>
++      requests_;
++  mojo::Remote<network::mojom::URLLoaderFactory> target_factory_;
++  DisconnectCallback on_disconnect_;
++};
++
++}  // namespace tark_adblock
++
++#endif  // CHROME_BROWSER_TARK_ADBLOCK_TARK_ADBLOCK_PROXYING_URL_LOADER_FACTORY_H_
+--- a/chrome/browser/BUILD.gn
++++ b/chrome/browser/BUILD.gn
+@@ -1639,6 +1639,8 @@
+   if (is_android) {
+     # Tark's ad blocker (A2, spec §4).
+     sources += [
++      "tark_adblock/tark_adblock_proxying_url_loader_factory.cc",
++      "tark_adblock/tark_adblock_proxying_url_loader_factory.h",
+       "tark_adblock/tark_adblock_service.cc",
+       "tark_adblock/tark_adblock_service.h",
+       "tark_adblock/tark_adblock_updater.cc",
+--- a/chrome/browser/chrome_content_browser_client.cc
++++ b/chrome/browser/chrome_content_browser_client.cc
+@@ -176,6 +176,8 @@
+ #include "chrome/browser/service_worker/service_worker_synthetic_response.h"
+ #include "chrome/browser/sharing/sms/sms_remote_fetcher.h"
+ #include "chrome/browser/signin/chrome_signin_proxying_url_loader_factory.h"
++#include "chrome/browser/tark_adblock/tark_adblock_proxying_url_loader_factory.h"
++#include "chrome/browser/tark_adblock/tark_adblock_service.h"
+ #include "chrome/browser/signin/chrome_signin_url_loader_throttle.h"
+ #include "chrome/browser/signin/header_modification_delegate_impl.h"
+ #include "chrome/browser/site_protection/site_familiarity_process_selection_deferring_condition.h"
+@@ -6733,6 +6735,10 @@
+       frame, type == URLLoaderFactoryType::kNavigation, request_initiator,
+       isolation_info, factory_builder);
+ 
++  // Tark (A2): ad blocking, before requests leave (spec §4).
++  tark_adblock::ProxyingURLLoaderFactory::MaybeProxyRequest(
++      browser_context, type, isolation_info, factory_builder);
++
+ #if BUILDFLAG(ENABLE_CAPTIVE_PORTAL_DETECTION)
+   if (disable_secure_dns) {
+     WebContents* web_contents = WebContents::FromRenderFrameHost(frame);
+@@ -6864,7 +6870,8 @@
+     return web_request_api->MayHaveProxiesForFrame(frame);
+   }
+ #else
+-  return false;
++  // Tark (A2): a frame's WebSockets are checked by the ad blocker.
++  return frame && tark_adblock::AdblockService::Get()->IsReady();
+ #endif
+ }
+ 
+@@ -6906,6 +6913,11 @@
+   web_request_api->ProxyWebSocket(
+       frame, std::move(factory), url, site_for_cookies, user_agent,
+       std::move(handshake_client), std::move(options.header_client));
++#else
++  // Tark (A2): see WillInterceptWebSocket().
++  tark_adblock::ProxyingURLLoaderFactory::MaybeConnectWebSocket(
++      frame, std::move(factory), url, std::move(handshake_client),
++      std::move(options.header_client));
+ #endif
+ }
+ 

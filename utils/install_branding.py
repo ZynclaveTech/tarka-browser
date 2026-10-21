@@ -4,9 +4,10 @@
 # found in the LICENSE file.
 """Copy Tark's generated brand files over Chromium's (spec 6.3).
 
-    python3 utils/install_branding.py resources/branding/mark build/src
+    python3 utils/install_branding.py MARK_DIR TREE [LIST...]
 
-Each line of <mark dir>/install.txt names a file Chromium ships; the
+Each line of a list in <mark dir> (install.txt unless lists are named;
+android/build.sh adds install-android.txt) names a file Chromium ships; the
 replacement is <mark dir>/tree/<that path>. A destination that does not
 exist fails the install: a Chromium update moved or renamed the file, and
 Tark would otherwise ship the old logo without noticing.
@@ -25,8 +26,8 @@ class MissingDestination(Exception):
     pass
 
 
-def install(mark_dir, tree):
-    entries = mark.read_manifest(os.path.join(mark_dir, 'install.txt'))
+def install(mark_dir, tree, manifests=('install.txt',)):
+    entries = [e for name in manifests for e in mark.read_manifest(os.path.join(mark_dir, name))]
     missing = [e.dest for e in entries if not os.path.isfile(os.path.join(tree, e.dest))]
     if missing:
         raise MissingDestination('not in the tree (moved upstream?): ' + ', '.join(missing))
@@ -36,9 +37,9 @@ def install(mark_dir, tree):
 
 
 def main():
-    if len(sys.argv) != 3:
-        sys.exit('usage: install_branding.py MARK_DIR TREE')
-    count = install(sys.argv[1], sys.argv[2])
+    if len(sys.argv) < 3:
+        sys.exit('usage: install_branding.py MARK_DIR TREE [LIST...]')
+    count = install(sys.argv[1], sys.argv[2], tuple(sys.argv[3:]) or ('install.txt',))
     print('installed %d brand files' % count)
 
 

@@ -1,0 +1,77 @@
+--- a/chrome/browser/download/chrome_download_manager_delegate.cc
++++ b/chrome/browser/download/chrome_download_manager_delegate.cc
+@@ -1186,7 +1186,8 @@
+ 
+ bool ChromeDownloadManagerDelegate::ShouldObfuscateDownload(
+     download::DownloadItem* item) {
+-#if BUILDFLAG(ENTERPRISE_CONTENT_ANALYSIS) || BUILDFLAG(IS_ANDROID)
++#if BUILDFLAG(ENTERPRISE_CONTENT_ANALYSIS) || \
++    (BUILDFLAG(IS_ANDROID) && BUILDFLAG(SAFE_BROWSING_AVAILABLE))
+   if (!base::FeatureList::IsEnabled(
+           enterprise_obfuscation::kEnterpriseFileObfuscation)) {
+     return false;
+--- a/chrome/browser/download/download_ui_safe_browsing_util.cc
++++ b/chrome/browser/download/download_ui_safe_browsing_util.cc
+@@ -4,6 +4,7 @@
+ 
+ #include "chrome/browser/download/download_ui_safe_browsing_util.h"
+ 
++#include "base/files/file_path.h"
+ #include "base/metrics/histogram_functions.h"
+ #include "base/strings/stringprintf.h"
+ #include "chrome/browser/profiles/profile.h"
+--- a/chrome/browser/interstitials/enterprise_util.cc
++++ b/chrome/browser/interstitials/enterprise_util.cc
+@@ -119,8 +119,6 @@
+ #endif  // BUILDFLAG(ENABLE_EXTENSIONS) && BUILDFLAG(SAFE_BROWSING_AVAILABLE)
+ 
+ #if BUILDFLAG(ENTERPRISE_CONTENT_ANALYSIS) || BUILDFLAG(IS_ANDROID)
+-  content::BrowserContext* browser_context = web_contents->GetBrowserContext();
+-  PrefService* prefs = Profile::FromBrowserContext(browser_context)->GetPrefs();
+   enterprise_connectors::ReportingEventRouter* reporting_event_router =
+       GetReportingEventRouter(web_contents);
+ 
+@@ -136,8 +134,8 @@
+ 
+   reporting_event_router->OnSecurityInterstitialShown(
+       page_url, reason, net_error_code,
+-      prefs->GetBoolean(prefs::kSafeBrowsingProceedAnywayDisabled),
+-      referrer_chain, tab_title);
++      // Tark: no Safe Browsing, so no pref that disables proceeding.
++      /*proceed_anyway_disabled=*/false, referrer_chain, tab_title);
+ 
+ #endif  // BUILDFLAG(ENTERPRISE_CONTENT_ANALYSIS) || BUILDFLAG(IS_ANDROID)
+ }
+--- a/chrome/browser/notifications/persistent_notification_handler.cc
++++ b/chrome/browser/notifications/persistent_notification_handler.cc
+@@ -393,7 +393,7 @@
+     const GURL& url,
+     const std::string& notification_id,
+     Profile* profile) {
+-#if BUILDFLAG(IS_ANDROID)
++#if BUILDFLAG(IS_ANDROID) && BUILDFLAG(SAFE_BROWSING_AVAILABLE)
+   safe_browsing::NotificationContentDetectionUkmUtil::
+       RecordSuspiciousNotificationInteractionUkm(
+           static_cast<int>(
+--- a/components/enterprise/connectors/core/cloud_content_scanning/cloud_binary_upload_service_base.cc
++++ b/components/enterprise/connectors/core/cloud_content_scanning/cloud_binary_upload_service_base.cc
+@@ -362,17 +362,8 @@
+     ScanRequestUploadResult result,
+     BinaryUploadRequest* request,
+     const ContentAnalysisResponse& response) {
+-#if !BUILDFLAG(IS_IOS)
+-  safe_browsing::WebUIContentInfoSingleton::GetInstance()
+-      ->AddToDeepScanRequests(request->per_profile_request(),
+-                              request->access_token(), upload_info,
+-                              request->GetUrlWithParams().spec(),
+-                              request->content_analysis_request());
+-  safe_browsing::WebUIContentInfoSingleton::GetInstance()
+-      ->AddToDeepScanResponses(active_tokens_[request->id()],
+-                               ScanRequestUploadResultToString(result),
+-                               response);
+-#endif
++  // Tark: ungoogled removes the Safe Browsing page's deep-scan log
++  // (as in files_request_handler_base.cc).
+ }
+ 
+ void CloudBinaryUploadServiceBase::IsAuthorized(const GURL& url,

@@ -1,0 +1,577 @@
+--- a/components/tark_xlit/languages.h
++++ b/components/tark_xlit/languages.h
+@@ -64,6 +64,23 @@
+ // whitespace-separated words.
+ bool LooksTransliterable(std::u16string_view text);
+ 
++// Tark for Android (A3): whether the person has been asked to download the
++// model and word lists. Stored as an int in local state
++// (tark.xlit.offer); do not renumber.
++enum class OfferState {
++  kNotAsked = 0,
++  kAccepted = 1,
++  kDeclined = 2,
++};
++
++// Whether the address bar shows the one "Type in हिन्दी?" row for `text`: only
++// while the files are missing, the person has not been asked, the tab is not
++// private, and `text` looks transliterable.
++bool ShouldOffer(std::u16string_view text,
++                 bool files_ready,
++                 OfferState offer_state,
++                 bool off_the_record);
++
+ // The Wikipedia language code for a query: "en" for Latin text or text with no
+ // letters. Otherwise the first language in `accept_languages` whose script
+ // matches the query's dominant script, else that script's default.
+--- a/components/tark_xlit/languages.cc
++++ b/components/tark_xlit/languages.cc
+@@ -309,6 +309,14 @@
+   return rows;
+ }
+ 
++bool ShouldOffer(std::u16string_view text,
++                 bool files_ready,
++                 OfferState offer_state,
++                 bool off_the_record) {
++  return !files_ready && offer_state == OfferState::kNotAsked &&
++         !off_the_record && LooksTransliterable(text);
++}
++
+ bool LooksTransliterable(std::u16string_view text) {
+   size_t letters = 0;
+   size_t words = 0;
+--- a/components/tark_xlit/transliterator.h
++++ b/components/tark_xlit/transliterator.h
+@@ -16,6 +16,7 @@
+ #include "base/functional/callback.h"
+ #include "base/memory/raw_ptr.h"
+ #include "base/memory/ref_counted.h"
++#include "components/tark_xlit/languages.h"
+ #include "components/tark_xlit/model.h"
+ #include "components/tark_xlit/word_list.h"
+ 
+@@ -137,6 +138,11 @@
+ bool FilesReady();
+ void SetFilesReady(bool ready);
+ 
++// The download offer's state, for the provider (the download service sets it
++// from local state at startup and when the person answers).
++void SetOfferState(OfferState state);
++OfferState GetOfferState();
++
+ // A Transliterator over LoadResourcesFromDirectory(`directory`), or nullptr.
+ // Same threading rules.
+ std::unique_ptr<Transliterator> LoadFromDirectory(
+--- a/components/tark_xlit/transliterator.cc
++++ b/components/tark_xlit/transliterator.cc
+@@ -62,6 +62,7 @@
+ }
+ 
+ std::atomic<bool> g_files_ready{false};
++std::atomic<OfferState> g_offer_state{OfferState::kNotAsked};
+ 
+ // The model's vocabulary has these tokens, and a candidate that spells one out
+ // is not a word.
+@@ -284,6 +285,14 @@
+   g_files_ready.store(ready, std::memory_order_release);
+ }
+ 
++void SetOfferState(OfferState state) {
++  g_offer_state.store(state, std::memory_order_relaxed);
++}
++
++OfferState GetOfferState() {
++  return g_offer_state.load(std::memory_order_relaxed);
++}
++
+ scoped_refptr<Resources> LoadResourcesFromBundle() {
+   base::FilePath downloaded;
+   {
+--- a/components/tark_xlit/BUILD.gn
++++ b/components/tark_xlit/BUILD.gn
+@@ -67,6 +67,7 @@
+     testonly = true
+     sources = [
+       "android_files_unittest.cc",
++      "android_offer_unittest.cc",
+       "languages_unittest.cc",
+       "model_unittest.cc",
+       "transliterator_unittest.cc",
+--- /dev/null
++++ b/components/tark_xlit/android_offer_unittest.cc
+@@ -0,0 +1,47 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// Tark for Android (A3): the address bar's one offer to download the model.
++
++#include "components/tark_xlit/languages.h"
++#include "components/tark_xlit/transliterator.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace tark_xlit {
++namespace {
++
++// The "Type in हिन्दी?" row: once, while the files are missing, never in a
++// private tab.
++TEST(TarkXlitAndroidOfferTest, ShouldOfferOnlyWhenFilesMissingAndNotAsked) {
++  EXPECT_TRUE(ShouldOffer(u"namaste", /*files_ready=*/false,
++                          OfferState::kNotAsked, /*off_the_record=*/false));
++  EXPECT_FALSE(ShouldOffer(u"namaste", /*files_ready=*/true,
++                           OfferState::kNotAsked, false));
++  EXPECT_FALSE(
++      ShouldOffer(u"namaste", false, OfferState::kAccepted, false));
++  EXPECT_FALSE(
++      ShouldOffer(u"namaste", false, OfferState::kDeclined, false));
++}
++
++TEST(TarkXlitAndroidOfferTest, ShouldOfferNeverInPrivate) {
++  EXPECT_FALSE(ShouldOffer(u"namaste", false, OfferState::kNotAsked,
++                           /*off_the_record=*/true));
++}
++
++TEST(TarkXlitAndroidOfferTest, ShouldOfferNeedsTwoLatinLetters) {
++  EXPECT_FALSE(ShouldOffer(u"n", false, OfferState::kNotAsked, false));
++  EXPECT_FALSE(ShouldOffer(u"नमस्ते", false, OfferState::kNotAsked, false));
++  EXPECT_FALSE(ShouldOffer(u"12", false, OfferState::kNotAsked, false));
++  EXPECT_TRUE(ShouldOffer(u"na", false, OfferState::kNotAsked, false));
++}
++
++TEST(TarkXlitAndroidOfferTest, OfferStateIsProcessWide) {
++  SetOfferState(OfferState::kDeclined);
++  EXPECT_EQ(GetOfferState(), OfferState::kDeclined);
++  SetOfferState(OfferState::kNotAsked);
++  EXPECT_EQ(GetOfferState(), OfferState::kNotAsked);
++}
++
++}  // namespace
++}  // namespace tark_xlit
+--- a/components/omnibox/browser/BUILD.gn
++++ b/components/omnibox/browser/BUILD.gn
+@@ -514,9 +514,9 @@
+     deps += [ "//components/vector_icons" ]
+   }
+ 
+-  # Indian-language rows worked out on the device; //components/tark_xlit is
+-  # macOS-only.
+-  if (is_mac) {
++  # Indian-language rows worked out on the device: macOS, and Android (A3),
++  # where the model is downloaded rather than bundled.
++  if (is_mac || is_android) {
+     sources += [
+       "tark_transliteration_provider.cc",
+       "tark_transliteration_provider.h",
+--- a/components/omnibox/browser/autocomplete_controller.cc
++++ b/components/omnibox/browser/autocomplete_controller.cc
+@@ -118,7 +118,7 @@
+ #include "components/open_from_clipboard/clipboard_recent_content_generic.h"
+ #endif
+ 
+-#if BUILDFLAG(IS_MAC)
++#if BUILDFLAG(IS_MAC) || BUILDFLAG(IS_ANDROID)
+ #include "components/omnibox/browser/tark_transliteration_provider.h"
+ #endif
+ 
+@@ -1247,7 +1247,7 @@
+           return (keyword_turl->starter_pack_id() ==
+                   template_url_starter_pack_data::StarterPackId::kTabs);
+ 
+-#if BUILDFLAG(IS_MAC)
++#if BUILDFLAG(IS_MAC) || BUILDFLAG(IS_ANDROID)
+         // Indian-language rows (TarkTransliterationProvider): web sources
+         // only, never @bookmarks, @history or @tabs.
+         case AutocompleteProvider::TYPE_QUERY_TILE:
+@@ -1417,8 +1417,8 @@
+     contextual_search_provider_ = contextual_search_provider.get();
+     providers_.push_back(std::move(contextual_search_provider));
+   }
+-#if BUILDFLAG(IS_MAC)
+-  // TYPE_QUERY_TILE is unused on desktop; it carries the Indian-language rows
++#if BUILDFLAG(IS_MAC) || BUILDFLAG(IS_ANDROID)
++  // TYPE_QUERY_TILE is unused on desktop and Android; it carries the Indian-language rows
+   // so that no provider type has to be added.
+   if (provider_types & AutocompleteProvider::TYPE_QUERY_TILE) {
+     providers_.push_back(base::MakeRefCounted<TarkTransliterationProvider>(
+--- a/components/omnibox/browser/autocomplete_classifier.cc
++++ b/components/omnibox/browser/autocomplete_classifier.cc
+@@ -83,6 +83,8 @@
+       AutocompleteProvider::TYPE_OPEN_TAB |
+       // Only enabled for hub search.
+       AutocompleteProvider::TYPE_TAB_GROUP |
++      // Tark (A3): Indian-language rows, as on macOS.
++      AutocompleteProvider::TYPE_QUERY_TILE |
+       // Keyword search for Android.
+       (base::FeatureList::IsEnabled(omnibox::kOmniboxSiteSearch)
+            ? AutocompleteProvider::TYPE_KEYWORD |
+--- a/components/omnibox/browser/tark_transliteration_provider.cc
++++ b/components/omnibox/browser/tark_transliteration_provider.cc
+@@ -10,6 +10,7 @@
+ #include <utility>
+ 
+ #include "base/functional/bind.h"
++#include "build/build_config.h"
+ #include "base/location.h"
+ #include "base/logging.h"
+ #include "base/no_destructor.h"
+@@ -50,6 +51,14 @@
+ // The language tag of a row ("hi"), for the row's UI.
+ constexpr char kLanguageInfoKey[] = "tark_xlit_lang";
+ 
++#if BUILDFLAG(IS_ANDROID)
++// Tark for Android (A3): the row that offers to download the model and the
++// word lists ("Type in हिन्दी?"), carrying the language's tag. Below where
++// the rows would be; Java opens the offer instead of searching.
++constexpr char kOfferInfoKey[] = "tark_xlit_offer";
++constexpr int kOfferRelevance = 1296;
++#endif
++
+ // The one sequence every provider's worker runs on, so that the shared model
+ // is loaded, referenced and released on a single sequence.
+ scoped_refptr<base::SequencedTaskRunner> WorkerTaskRunner() {
+@@ -82,6 +91,13 @@
+     DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+     idle_timer_.Start(FROM_HERE, kIdleRelease, this,
+                       &SharedResources::Release);
++#if BUILDFLAG(IS_ANDROID)
++    // The files are downloaded (A3): nothing to load, and nothing failed,
++    // until they are in place.
++    if (!resources_ && !tark_xlit::FilesReady()) {
++      return nullptr;
++    }
++#endif
+     if (!resources_ && !load_failed_) {
+       resources_ = tark_xlit::LoadResourcesFromBundle();
+       // Do not retry on every keystroke: the files ship inside the app, so a
+@@ -280,6 +296,19 @@
+     return;
+   }
+ 
++#if BUILDFLAG(IS_ANDROID)
++  // Until the files are downloaded there are no rows; the first time, one row
++  // offers them, in the first row language.
++  if (!tark_xlit::FilesReady()) {
++    if (tark_xlit::ShouldOffer(request->text, /*files_ready=*/false,
++                               tark_xlit::GetOfferState(),
++                               client_->IsOffTheRecord())) {
++      AddOfferMatch(*request);
++    }
++    return;
++  }
++#endif
++
+   EnsureWorker();
+ 
+   std::vector<std::string> tags;
+@@ -297,6 +326,28 @@
+                            weak_ptr_factory_.GetWeakPtr(), request_id_,
+                            std::move(*request)));
+ }
++
++#if BUILDFLAG(IS_ANDROID)
++void TarkTransliterationProvider::AddOfferMatch(const Request& request) {
++  const tark_xlit::Language& language = *request.languages.front();
++  AutocompleteMatch match(this, kOfferRelevance, /*deletable=*/false,
++                          AutocompleteMatchType::SEARCH_SUGGEST);
++  // Its own address: a search for what was typed would have the "search for"
++  // row's URL, and the two would be merged into one. Java opens the offer and
++  // never loads it.
++  match.destination_url =
++      GURL(base::StrCat({"chrome://tark-xlit-offer/", language.tag}));
++  match.fill_into_edit = request.input.text();
++  match.contents = request.text;
++  match.contents_class.emplace_back(0, ACMatchClassification::NONE);
++  // The language's own name, which Java puts into "Type in हिन्दी?".
++  match.description = std::u16string(language.native_name);
++  match.description_class.emplace_back(0, ACMatchClassification::DIM);
++  match.allowed_to_be_default_match = false;
++  match.RecordAdditionalInfo(kOfferInfoKey, std::string(language.tag));
++  matches_.push_back(std::move(match));
++}
++#endif
+ 
+ void TarkTransliterationProvider::EnsureWorker() {
+   if (worker_.is_null()) {
+--- a/components/omnibox/browser/tark_transliteration_provider.h
++++ b/components/omnibox/browser/tark_transliteration_provider.h
+@@ -16,6 +16,7 @@
+ #include "base/memory/weak_ptr.h"
+ #include "base/sequence_checker.h"
+ #include "base/threading/sequence_bound.h"
++#include "build/build_config.h"
+ #include "components/omnibox/browser/autocomplete_enums.h"
+ #include "components/omnibox/browser/autocomplete_provider.h"
+ #include "components/search_engines/template_url_starter_pack_data.h"
+@@ -74,6 +75,11 @@
+   // Creates `worker_` on the shared worker sequence if there is none yet.
+   void EnsureWorker();
+ 
++#if BUILDFLAG(IS_ANDROID)
++  // Tark for Android (A3): the row that offers the download, for `request`.
++  void AddOfferMatch(const Request& request);
++#endif
++
+   // The worker's reply: one entry per language of `request`, nullopt where
+   // nothing changed.
+   void OnPhrases(uint64_t request_id,
+--- a/components/omnibox/browser/autocomplete_match.cc
++++ b/components/omnibox/browser/autocomplete_match.cc
+@@ -1710,7 +1710,8 @@
+ 
+   // Tark's Indian-language rows (TarkTransliterationProvider) carry their
+   // language name as the description; the engine name must not replace it.
+-  if (additional_info.contains("tark_xlit_lang")) {
++  if (additional_info.contains("tark_xlit_lang") ||
++      additional_info.contains("tark_xlit_offer")) {
+     return true;
+   }
+ 
+--- a/components/omnibox/browser/autocomplete_match_android.cc
++++ b/components/omnibox/browser/autocomplete_match_android.cc
+@@ -131,6 +131,17 @@
+               : std::nullopt,
+           associated_keyword, j_suggest_template, document_type));
+ 
++  // Tark (A3): an Indian-language row shows its language at the right edge;
++  // the download offer's row opens the offer instead of searching.
++  const std::string offer_tag =
++      GetAdditionalInfoForDebugging("tark_xlit_offer");
++  const bool is_transliteration =
++      !GetAdditionalInfoForDebugging("tark_xlit_lang").empty();
++  if (is_transliteration || !offer_tag.empty()) {
++    Java_AutocompleteMatch_setTarkXlit(env, *java_match_, is_transliteration,
++                                       offer_tag);
++  }
++
+   return ScopedJavaLocalRef<jobject>(*java_match_);
+ }
+ 
+--- a/components/omnibox/browser/android/java/src/org/chromium/components/omnibox/AutocompleteMatch.java
++++ b/components/omnibox/browser/android/java/src/org/chromium/components/omnibox/AutocompleteMatch.java
+@@ -80,6 +80,9 @@
+     private final List<MatchClassification> mDisplayTextClassifications;
+     private String mDescription;
+     private final List<MatchClassification> mDescriptionClassifications;
++    // Tark (A3): an Indian-language row, and the download offer's row.
++    private boolean mIsTarkTransliteration;
++    private @Nullable String mTarkXlitOfferTag;
+     private @Nullable RichAnswerTemplate mAnswerTemplate;
+     private final String mFillIntoEdit;
+     private GURL mUrl;
+@@ -358,6 +361,28 @@
+         }
+     }
+ 
++    /**
++     * Tark (A3): marks an Indian-language row, whose description is its language's name, shown at
++     * the right edge; or the row that offers to download the model, for the language {@code
++     * offerTag} (empty otherwise).
++     */
++    @CalledByNative
++    private void setTarkXlit(
++            boolean isTransliteration, @JniType("std::string") String offerTag) {
++        mIsTarkTransliteration = isTransliteration;
++        mTarkXlitOfferTag = TextUtils.isEmpty(offerTag) ? null : offerTag;
++    }
++
++    /** Tark (A3): whether this is an Indian-language row. */
++    public boolean isTarkTransliteration() {
++        return mIsTarkTransliteration;
++    }
++
++    /** Tark (A3): the language tag of the download offer's row, or null. */
++    public @Nullable String getTarkXlitOfferTag() {
++        return mTarkXlitOfferTag;
++    }
++
+     @CalledByNative
+     private void setAnswerTemplate(byte[] serializedAnswerTemplate) {
+         if (serializedAnswerTemplate != null) {
+--- a/chrome/browser/ui/android/omnibox/java/res/layout/omnibox_basic_suggestion.xml
++++ b/chrome/browser/ui/android/omnibox/java/res/layout/omnibox_basic_suggestion.xml
+@@ -12,15 +12,35 @@
+     android:gravity="center"
+     android:orientation="vertical">
+ 
+-    <org.chromium.ui.widget.TextViewWithLeading
+-        android:id="@+id/line_1"
++    <!-- Tark (A3): an Indian-language row's language at the right edge, as on
++         the Mac. -->
++    <LinearLayout
+         android:layout_width="match_parent"
+         android:layout_height="wrap_content"
+-        android:textAppearance="@style/TextAppearance.TextLarge.Primary"
+-        app:leading="@dimen/text_size_large_leading"
+-        android:maxLines="1"
+-        android:ellipsize="end"
+-        android:textAlignment="viewStart" />
++        android:gravity="center_vertical"
++        android:orientation="horizontal">
++
++        <org.chromium.ui.widget.TextViewWithLeading
++            android:id="@+id/line_1"
++            android:layout_width="0dp"
++            android:layout_height="wrap_content"
++            android:layout_weight="1"
++            android:textAppearance="@style/TextAppearance.TextLarge.Primary"
++            app:leading="@dimen/text_size_large_leading"
++            android:maxLines="1"
++            android:ellipsize="end"
++            android:textAlignment="viewStart" />
++
++        <TextView
++            android:id="@+id/tark_xlit_label"
++            android:layout_width="wrap_content"
++            android:layout_height="wrap_content"
++            android:layout_marginStart="8dp"
++            android:textAppearance="@style/TextAppearance.TextMedium.Secondary"
++            android:maxLines="1"
++            android:visibility="gone"
++            android:importantForAccessibility="no" />
++    </LinearLayout>
+ 
+     <TextView
+         android:id="@+id/line_2"
+--- a/chrome/browser/ui/android/omnibox/java/src/org/chromium/chrome/browser/omnibox/suggestions/basic/SuggestionViewProperties.java
++++ b/chrome/browser/ui/android/omnibox/java/src/org/chromium/chrome/browser/omnibox/suggestions/basic/SuggestionViewProperties.java
+@@ -42,6 +42,9 @@
+     @VisibleForTesting
+     WritableBooleanPropertyKey TEXT_LINE_2_WRAP = new WritableBooleanPropertyKey();
+ 
++    /** Tark (A3): an Indian-language row's language name, at the right edge; null otherwise. */
++    WritableObjectPropertyKey<String> TARK_XLIT_LABEL = new WritableObjectPropertyKey<>();
++
+     PropertyKey[] ALL_UNIQUE_KEYS =
+             new PropertyKey[] {
+                 CONTENT_DESCRIPTION,
+@@ -49,7 +52,8 @@
+                 TEXT_LINE_1_TEXT,
+                 TEXT_LINE_1_WRAP,
+                 TEXT_LINE_2_TEXT,
+-                TEXT_LINE_2_WRAP
++                TEXT_LINE_2_WRAP,
++                TARK_XLIT_LABEL
+             };
+ 
+     PropertyKey[] ALL_KEYS =
+--- a/chrome/browser/ui/android/omnibox/java/src/org/chromium/chrome/browser/omnibox/suggestions/basic/SuggestionViewViewBinder.java
++++ b/chrome/browser/ui/android/omnibox/java/src/org/chromium/chrome/browser/omnibox/suggestions/basic/SuggestionViewViewBinder.java
+@@ -53,6 +53,11 @@
+                 tv.setVisibility(View.GONE);
+                 view.setMinimumHeight(getResourceProvider(model).getSuggestionMinHeight(1));
+             }
++        } else if (propertyKey == SuggestionViewProperties.TARK_XLIT_LABEL) {
++            TextView tv = view.findViewById(R.id.tark_xlit_label);
++            final String label = model.get(SuggestionViewProperties.TARK_XLIT_LABEL);
++            tv.setText(label);
++            tv.setVisibility(TextUtils.isEmpty(label) ? View.GONE : View.VISIBLE);
+         } else if (propertyKey == SuggestionViewProperties.TEXT_LINE_2_WRAP) {
+             updateMaxLines(
+                     view.findViewById(R.id.line_2),
+--- a/chrome/browser/ui/android/omnibox/java/src/org/chromium/chrome/browser/omnibox/suggestions/basic/BasicSuggestionProcessor.java
++++ b/chrome/browser/ui/android/omnibox/java/src/org/chromium/chrome/browser/omnibox/suggestions/basic/BasicSuggestionProcessor.java
+@@ -31,6 +31,7 @@
+ import org.chromium.components.omnibox.OmniboxSuggestionType;
+ import org.chromium.components.omnibox.SuggestTemplateInfoProto.SuggestTemplateInfo;
+ import org.chromium.components.omnibox.suggestions.OmniboxSuggestionUiType;
++import org.chromium.chrome.browser.tark_xlit.TarkXlitOffer;
+ import org.chromium.components.search_engines.StarterPackId;
+ import org.chromium.ui.modelutil.PropertyModel;
+ import org.chromium.url.GURL;
+@@ -241,6 +242,21 @@
+                 getSuggestedQuery(
+                         suggestion, !isSearchSuggestion && !isDocumentSuggestion, !urlHighlighted);
+ 
++        // Tark (A3): an Indian-language row shows its language at the right edge, not on a second
++        // line; the download offer's row reads "Type in हिन्दी?".
++        String xlitLabel = null;
++        if (suggestion.isTarkTransliteration()) {
++            xlitLabel = suggestion.getDescription();
++            textLine2 = null;
++        } else if (suggestion.getTarkXlitOfferTag() != null) {
++            textLine1 =
++                    new SuggestionSpannable(
++                            mContext.getString(
++                                    R.string.tark_xlit_offer, suggestion.getDescription()));
++            textLine2 = null;
++        }
++        model.set(SuggestionViewProperties.TARK_XLIT_LABEL, xlitLabel);
++
+         applyTextColor(textLine1, mUiContext.resourceProvider.getSuggestionPrimaryTextColor());
+         applyTextColor(textLine2, textLine2Color);
+ 
+@@ -276,12 +292,17 @@
+         if (totalInGroup > 0) {
+             String announcement;
+             String suggestionKindStr = mContext.getString(getSuggestionKindString(suggestion));
+-            if (textLine2 != null && !TextUtils.isEmpty(textLine2.toString())) {
++            // Tark (A3): the language is read out as the row's description.
++            String description =
++                    xlitLabel != null
++                            ? xlitLabel
++                            : textLine2 != null ? textLine2.toString() : null;
++            if (!TextUtils.isEmpty(description)) {
+                 announcement =
+                         mUiContext.resourceProvider.getString(
+                                 R.string.acc_omnibox_suggestion_in_group_with_type_and_description,
+                                 textLine1.toString(),
+-                                textLine2.toString(),
++                                description,
+                                 suggestionKindStr,
+                                 String.valueOf(indexInGroup),
+                                 String.valueOf(totalInGroup),
+@@ -306,7 +327,20 @@
+             fetchSuggestionFavicon(model, suggestion.getUrl());
+         }
+ 
+-        setRemoveOrRefineAction(model, input, suggestion, position);
++        if (suggestion.getTarkXlitOfferTag() == null) {
++            setRemoveOrRefineAction(model, input, suggestion, position);
++        }
++    }
++
++    @Override
++    protected void onSuggestionClicked(AutocompleteMatch suggestion, int position, int modifiers) {
++        // Tark (A3): the download offer's row asks; it never searches.
++        final String offerTag = suggestion.getTarkXlitOfferTag();
++        if (offerTag != null) {
++            TarkXlitOffer.show(mContext, offerTag, suggestion.getDescription());
++            return;
++        }
++        super.onSuggestionClicked(suggestion, position, modifiers);
+     }
+ 
+     private int getSuggestionKindString(AutocompleteMatch suggestion) {
+--- a/chrome/browser/ui/android/omnibox/BUILD.gn
++++ b/chrome/browser/ui/android/omnibox/BUILD.gn
+@@ -222,6 +222,8 @@
+   deps = [
+     ":java_resources",
+     "$google_play_services_package:google_play_services_location_java",
++    # Tark (A3): the download offer's dialog.
++    "//chrome/browser/tark_xlit/android:java",
+     "$google_play_services_package:google_play_services_tasks_java",
+     "//base:base_java",
+     "//base:service_loader_java",
+--- a/chrome/browser/ui/android/strings/android_chrome_strings.grd
++++ b/chrome/browser/ui/android/strings/android_chrome_strings.grd
+@@ -861,6 +861,9 @@
+       <message name="IDS_TARK_CONNECTS_SHODHYA" desc="Tark: item in the list of services Tark connects to: its default search engine, with its host names.">
+         Shodhya, for search, search suggestions and the new tab page (shodhya.com, api.shodhya.com)
+       </message>
++      <message name="IDS_TARK_XLIT_OFFER" desc="Tark: a row in the address bar's suggestions, the first time someone types Latin letters, offering suggestions in an Indian language (the language's own name, such as हिन्दी). Tapping it asks to download them.">
++        Type in <ph name="LANGUAGE">%1$s<ex>हिन्दी</ex></ph>?
++      </message>
+       <message name="IDS_TARK_CONNECTS_LISTS" desc="Tark: item in the list of services Tark connects to: the ad blocker's daily lists from Tark's site, with its host name.">
+         Tark's ad-blocking lists, once a day on Wi-Fi or every three days on mobile data (gettarka.com)
+       </message>
+--- a/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb
++++ b/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb
+@@ -2161,4 +2161,5 @@
+ <translation id="5542059870322282057">Tark ख़ुद सिर्फ़ इन सेवाओं से जुड़ता है, और सिर्फ़ इन कामों के लिए। आप जो वेबसाइटें खोलते हैं, वे अपनी पसंद की चीज़ें लोड करती हैं।</translation>
+ <translation id="3441881045024360042">Shodhya, खोज, खोज के सुझावों और नए टैब पेज के लिए (shodhya.com, api.shodhya.com)</translation>
+ <translation id="4695926840610114405">Tark की विज्ञापन ब्लॉक करने वाली सूचियां, Wi-Fi पर दिन में एक बार या मोबाइल डेटा पर हर तीन दिन में (gettarka.com)</translation>
++<translation id="8102292694969518018"><ph name="LANGUAGE"/> में टाइप करें?</translation>
+ </translationbundle>
+\ No newline at end of file

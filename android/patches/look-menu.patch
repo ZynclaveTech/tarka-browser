@@ -1,0 +1,266 @@
+--- a/chrome/android/java/res/values/ids.xml
++++ b/chrome/android/java/res/values/ids.xml
+@@ -168,6 +168,8 @@
+     <!-- App Menu -->
+     <!-- go/keep-sorted start -->
+     <item type="id" name="about_chrome_menu_id" />
++    <!-- Tark: the app menu's tiles. -->
++    <item type="id" name="tark_tiles_menu_id" />
+     <item type="id" name="add_tab_to_reading_list_menu_id" />
+     <item type="id" name="add_to_existing_group_menu_item_id" />
+     <item type="id" name="add_to_group_incognito_sub_menu_id" />
+--- a/chrome/android/java/src/org/chromium/chrome/browser/tabbed_mode/TabbedAppMenuPropertiesDelegate.java
++++ b/chrome/android/java/src/org/chromium/chrome/browser/tabbed_mode/TabbedAppMenuPropertiesDelegate.java
+@@ -6,11 +6,19 @@
+ 
+ import static org.chromium.build.NullUtil.assumeNonNull;
+ 
++import com.google.android.material.color.MaterialColors;
+ import android.content.Context;
++import android.content.res.ColorStateList;
+ import android.content.res.Resources;
+ import android.graphics.drawable.Drawable;
++import android.graphics.drawable.GradientDrawable;
+ import android.util.SparseArray;
++import android.util.TypedValue;
+ import android.view.View;
++import android.view.ViewGroup;
++import android.widget.ImageView;
++import android.widget.LinearLayout;
++import android.widget.TextView;
+ 
+ import androidx.annotation.IntDef;
+ import androidx.annotation.StringRes;
+@@ -68,6 +76,7 @@
+ import org.chromium.chrome.browser.toolbar.ToolbarManager;
+ import org.chromium.chrome.browser.toolbar.menu_button.MenuItemState;
+ import org.chromium.chrome.browser.toolbar.top.ToolbarUtils;
++import org.chromium.chrome.browser.ui.appmenu.AppMenuClickHandler;
+ import org.chromium.chrome.browser.ui.appmenu.AppMenuDelegate;
+ import org.chromium.chrome.browser.ui.appmenu.AppMenuHandler;
+ import org.chromium.chrome.browser.ui.appmenu.AppMenuItemProperties;
+@@ -94,6 +103,7 @@
+ import org.chromium.ui.modelutil.MVCListAdapter.ListItem;
+ import org.chromium.ui.modelutil.MVCListAdapter.ModelList;
+ import org.chromium.ui.modelutil.ModelListAdapter;
++import org.chromium.ui.modelutil.PropertyKey;
+ import org.chromium.ui.modelutil.PropertyModel;
+ import org.chromium.url.GURL;
+ 
+@@ -109,7 +119,11 @@
+ @NullMarked
+ public class TabbedAppMenuPropertiesDelegate extends AppMenuPropertiesDelegateImpl {
+ 
+-    @IntDef({TabbedAppMenuItemType.UPDATE_ITEM, TabbedAppMenuItemType.NEW_INCOGNITO})
++    @IntDef({
++        TabbedAppMenuItemType.UPDATE_ITEM,
++        TabbedAppMenuItemType.NEW_INCOGNITO,
++        TabbedAppMenuItemType.TARK_TILES
++    })
+     @Retention(RetentionPolicy.SOURCE)
+     public @interface TabbedAppMenuItemType {
+         /** Regular Android menu item that contains a title and an icon if icon is specified. */
+@@ -120,6 +134,9 @@
+          * It is different from the regular menu item because it contains two separate buttons.
+          */
+         int NEW_INCOGNITO = AppMenuHandler.AppMenuItemType.NUM_ENTRIES + 2;
++
++        /** Tark: four tiles (New tab, New private tab, History, Downloads), as the Mac menu. */
++        int TARK_TILES = AppMenuHandler.AppMenuItemType.NUM_ENTRIES + 3;
+     }
+ 
+     AppMenuDelegate mAppMenuDelegate;
+@@ -264,6 +281,106 @@
+                 TabbedAppMenuItemType.NEW_INCOGNITO,
+                 new LayoutViewBuilder<>(R.layout.custom_view_menu_item),
+                 IncognitoMenuItemViewBinder::bind);
++
++        modelListAdapter.registerType(
++                TabbedAppMenuItemType.TARK_TILES,
++                TabbedAppMenuPropertiesDelegate::buildTarkTilesView,
++                TabbedAppMenuPropertiesDelegate::bindTarkTiles);
++        // The menu sizes itself from its rows: the tiles' block is two rows of
++        // tiles, not one 48dp row.
++        customSizingSuppliers.append(
++                TabbedAppMenuItemType.TARK_TILES,
++                (context, model) -> {
++                    int tiles = model.get(AppMenuItemProperties.ADDITIONAL_ICONS).size();
++                    int rows = (tiles + 1) / 2;
++                    return tarkDp(context, rows * (TARK_TILE_HEIGHT_DP + 8) + 8);
++                });
++    }
++
++    private static final int TARK_TILE_HEIGHT_DP = 76;
++
++    // Tark: the menu's tiles. Each tile is an existing item's own model, so a tap
++    // goes through the menu's click handler exactly as that item's row did.
++    private static View buildTarkTilesView(ViewGroup parent) {
++        LinearLayout grid = new LinearLayout(parent.getContext());
++        grid.setOrientation(LinearLayout.VERTICAL);
++        int pad = tarkDp(parent.getContext(), 8);
++        grid.setPadding(pad, pad / 2, pad, pad / 2);
++        grid.setLayoutParams(
++                new ViewGroup.LayoutParams(
++                        ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
++        return grid;
++    }
++
++    private static void bindTarkTiles(PropertyModel model, View view, PropertyKey key) {
++        if (key != AppMenuItemProperties.ADDITIONAL_ICONS) return;
++        LinearLayout grid = (LinearLayout) view;
++        grid.removeAllViews();
++        Context context = view.getContext();
++        ModelList tiles = model.get(AppMenuItemProperties.ADDITIONAL_ICONS);
++        AppMenuClickHandler handler = model.get(AppMenuItemProperties.CLICK_HANDLER);
++        LinearLayout row = null;
++        for (int i = 0; i < tiles.size(); i++) {
++            if (i % 2 == 0) {
++                row = new LinearLayout(context);
++                row.setOrientation(LinearLayout.HORIZONTAL);
++                grid.addView(row);
++            }
++            LinearLayout.LayoutParams params =
++                    new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
++            int margin = tarkDp(context, 4);
++            params.setMargins(margin, margin, margin, margin);
++            assumeNonNull(row).addView(buildTarkTile(context, tiles.get(i).model, handler), params);
++        }
++    }
++
++    private static View buildTarkTile(
++            Context context, PropertyModel item, @Nullable AppMenuClickHandler handler) {
++        LinearLayout tile = new LinearLayout(context);
++        tile.setOrientation(LinearLayout.VERTICAL);
++        int pad = tarkDp(context, 12);
++        tile.setPadding(pad, pad, pad, pad);
++        tile.setMinimumHeight(tarkDp(context, TARK_TILE_HEIGHT_DP));
++        GradientDrawable background = new GradientDrawable();
++        background.setCornerRadius(tarkDp(context, 14));
++        background.setColor(MaterialColors.getColor(context, R.attr.colorSurface, 0));
++        background.setStroke(
++                tarkDp(context, 1), MaterialColors.getColor(context, R.attr.colorOutlineVariant, 0));
++        tile.setBackground(background);
++
++        ImageView icon = new ImageView(context);
++        icon.setImageResource(tarkTileIcon(item.get(AppMenuItemProperties.MENU_ITEM_ID)));
++        icon.setImageTintList(
++                ColorStateList.valueOf(MaterialColors.getColor(context, R.attr.colorPrimary, 0)));
++        int iconSize = tarkDp(context, 24);
++        tile.addView(icon, new LinearLayout.LayoutParams(iconSize, iconSize));
++
++        TextView title = new TextView(context);
++        title.setText(item.get(AppMenuItemProperties.TITLE));
++        title.setTextColor(MaterialColors.getColor(context, R.attr.colorOnSurface, 0));
++        title.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
++        title.setPadding(0, tarkDp(context, 8), 0, 0);
++        tile.addView(title);
++
++        boolean enabled = item.get(AppMenuItemProperties.ENABLED);
++        tile.setEnabled(enabled);
++        tile.setAlpha(enabled ? 1f : 0.38f);
++        tile.setContentDescription(item.get(AppMenuItemProperties.TITLE));
++        if (handler != null && enabled) {
++            tile.setOnClickListener(v -> handler.onItemClick(item));
++        }
++        return tile;
++    }
++
++    private static int tarkTileIcon(int menuItemId) {
++        if (menuItemId == R.id.new_incognito_tab_menu_id) return R.drawable.ic_incognito;
++        if (menuItemId == R.id.downloads_menu_id) return R.drawable.ic_download_done_24dp;
++        if (menuItemId == R.id.open_history_menu_id) return R.drawable.ic_history_24dp;
++        return R.drawable.ic_add_box_rounded_corner;
++    }
++
++    private static int tarkDp(Context context, int dp) {
++        return Math.round(dp * context.getResources().getDisplayMetrics().density);
+     }
+ 
+     private FaviconHelper getFaviconHelper() {
+@@ -361,16 +478,26 @@
+         boolean isIncognitoForced = IncognitoUtils.isIncognitoModeForced(profile);
+         boolean separateIncognitoWindow = IncognitoUtils.shouldOpenIncognitoAsWindow();
+         boolean isIncognito = isIncognitoShowing();
++        boolean shouldShowIconBeforeItem = shouldShowIconBeforeItem();
++        // Tark: New tab, New private tab, History and Downloads as tiles.
++        List<PropertyModel> tiles = new ArrayList<>();
+         if (!separateIncognitoWindow || !isIncognito || isIncognitoForced) {
+-            modelList.add(buildNewTabItem(isIncognitoForced));
++            tiles.add(buildNewTabItem(isIncognitoForced).model);
+         }
+-
+         if (!separateIncognitoWindow || isIncognito) {
+-            modelList.add(buildNewIncognitoTabItem());
++            tiles.add(buildNewIncognitoTabItem().model);
++        }
++        if (!IncognitoUtils.shouldOpenIncognitoAsWindow() || !isIncognitoShowing()) {
++            tiles.add(mHistoryItemBuilder.buildHistoryItem(shouldShowIconBeforeItem).model);
+         }
++        tiles.add(buildDownloadsItem().model);
++        modelList.add(
++                new ListItem(
++                        TabbedAppMenuItemType.TARK_TILES,
++                        AppMenuItemUtils.buildModelForIconRow(
++                                R.id.tark_tiles_menu_id, tiles, isMenuIconAtStart())));
+ 
+         // Add to Group
+-        boolean shouldShowIconBeforeItem = shouldShowIconBeforeItem();
+         if (mTabGroupItemBuilder.shouldShowAddToGroup(currentTab)) {
+             modelList.add(
+                     mTabGroupItemBuilder.buildAddToGroupItem(currentTab, shouldShowIconBeforeItem));
+@@ -393,21 +520,8 @@
+         // Divider
+         AppMenuItemUtils.maybeAddDividerLine(modelList, R.id.divider_line_id);
+ 
+-        // Open History
+-        if (!IncognitoUtils.shouldOpenIncognitoAsWindow() || !isIncognitoShowing()) {
+-            modelList.add(mHistoryItemBuilder.buildHistoryItem(shouldShowIconBeforeItem));
+-        }
+-
+         boolean isPageInfoItemShown = shouldShowPageInfoItem();
+ 
+-        // Quick Delete
+-        if (shouldShowQuickDeleteItem()) {
+-            modelList.add(buildQuickDeleteItem());
+-            if (!isPageInfoItemShown) {
+-                AppMenuItemUtils.maybeAddDividerLine(modelList, R.id.quick_delete_divider_line_id);
+-            }
+-        }
+-
+         // Page info
+         if (isPageInfoItemShown) {
+             modelList.add(buildPageInfoItem(currentTab, shouldShowIconBeforeItem));
+@@ -419,17 +533,9 @@
+             modelList.add(buildHomepageItem());
+         }
+ 
+-        // Downloads
+-        modelList.add(buildDownloadsItem());
+-
+         // Bookmarks
+         modelList.add(mBookmarksItemBuilder.buildBookmarksItem(shouldShowIconBeforeItem));
+ 
+-        // Recent Tabs
+-        if (mHistoryItemBuilder.shouldShowRecentTabsItem()) {
+-            modelList.add(mHistoryItemBuilder.buildRecentTabsItem(shouldShowIconBeforeItem));
+-        }
+-
+         // Extensions
+         if (shouldShowExtensionsItem()) {
+             modelList.add(buildExtensionsMenuItem(shouldShowIconBeforeItem));
+@@ -546,15 +652,6 @@
+         // Settings
+         modelList.add(buildSettingsItem());
+ 
+-        // NTP Customizations
+-        if (mMoreToolsItemBuilder.shouldShowNtpCustomizations(currentTab)) {
+-            modelList.add(
+-                    mMoreToolsItemBuilder.buildNtpCustomizationsItem(shouldShowIconBeforeItem));
+-        }
+-
+-        // Help
+-        modelList.add(buildHelpItem());
+-
+         // Managed by
+         if (shouldShowManagedByMenuItem(currentTab)) {
+             AppMenuItemUtils.maybeAddDividerLine(modelList, R.id.managed_by_divider_line_id);
