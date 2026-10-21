@@ -86,7 +86,7 @@
 +}  // namespace
 --- /dev/null
 +++ b/chrome/browser/ui/views/tark_captions/caption_history_view.h
-@@ -0,0 +1,81 @@
+@@ -0,0 +1,85 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -98,6 +98,7 @@
 +#include <map>
 +#include <string>
 +
++#include "base/callback_list.h"
 +#include "base/memory/raw_ptr.h"
 +#include "chrome/browser/ui/views/tark_captions/history_follow.h"
 +#include "components/tark_captions/caption_history.h"
@@ -138,6 +139,8 @@
 +  // Rows are kept by id: new ones are added, changed ones updated, gone ones
 +  // removed; the rest stay as they are.
 +  void SetHistory(const tark_captions::CaptionHistory& history);
++  // Another tab's history comes next: its row ids start again at 1.
++  void Reset();
 +
 + private:
 +  struct RowViews {
@@ -165,18 +168,20 @@
 +  HistoryFollow follow_;
 +  // Set while this view scrolls, so the scroll isn't taken for the user's.
 +  bool scrolling_ = false;
++  base::CallbackListSubscription scrolled_subscription_;
 +};
 +
 +#endif  // CHROME_BROWSER_UI_VIEWS_TARK_CAPTIONS_CAPTION_HISTORY_VIEW_H_
 --- /dev/null
 +++ b/chrome/browser/ui/views/tark_captions/caption_history_view.cc
-@@ -0,0 +1,231 @@
+@@ -0,0 +1,247 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
 +
 +#include "chrome/browser/ui/views/tark_captions/caption_history_view.h"
 +
++#include <limits>
 +#include <memory>
 +#include <utility>
 +#include <vector>
@@ -255,6 +260,9 @@
 +
 +  scroll_ = AddChildView(std::make_unique<views::ScrollView>());
 +  scroll_->SetHorizontalScrollBarMode(views::ScrollView::ScrollBarMode::kDisabled);
++  // Bounded: the rows get the viewport's width (lines wrap) and their own
++  // height, and scroll past it.
++  scroll_->ClipHeightTo(0, std::numeric_limits<int>::max());
 +  scroll_->SetBackgroundColor(std::nullopt);
 +  auto rows = std::make_unique<views::BoxLayoutView>();
 +  rows->SetOrientation(views::BoxLayout::Orientation::kVertical);
@@ -264,7 +272,7 @@
 +  draft_->SetBorder(views::CreateEmptyBorder(gfx::Insets::VH(5, 0)));
 +  draft_->SetVisible(false);
 +  static_cast<views::BoxLayout*>(GetLayoutManager())->SetFlexForView(scroll_, 1);
-+  scroll_->AddContentsScrolledCallback(
++  scrolled_subscription_ = scroll_->AddContentsScrolledCallback(
 +      base::BindRepeating(&TarkCaptionHistoryView::OnScrolled, base::Unretained(this)));
 +
 +  live_ = AddChildView(std::make_unique<views::MdTextButton>(
@@ -331,6 +339,18 @@
 +    ScrollToBottom();
 +  }
 +  UpdateLive();
++}
++
++void TarkCaptionHistoryView::Reset() {
++  for (auto& [id, views] : row_views_) {
++    rows_->RemoveChildViewT(views.row.get());
++  }
++  row_views_.clear();
++  follow_ = HistoryFollow();
++  draft_->SetVisible(false);
++  dropped_->SetVisible(false);
++  UpdateLive();
++  InvalidateLayout();
 +}
 +
 +views::View* TarkCaptionHistoryView::MakeRow(const Row& row, RowViews* views) {
@@ -404,7 +424,7 @@
 +END_METADATA
 --- /dev/null
 +++ b/chrome/browser/ui/views/tark_captions/caption_history_panel.h
-@@ -0,0 +1,88 @@
+@@ -0,0 +1,93 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -451,6 +471,10 @@
 +  CallCaptionsTabHelper* tab() const { return tab_; }
 +  // The width it covers on the right of the page; 0 when closed or hidden.
 +  int OccupiedWidth() const;
++  bool IsPanelWidget(const views::Widget* widget) const { return widget == widget_.get(); }
++  // The tab's captions are off only while Tark downloads a model they need
++  // (they come back on by themselves): not "Captions stopped".
++  void SetModelsPending(bool pending);
 +
 +  // Runs when it appears, closes or hides: the bar re-centres.
 +  void set_on_visibility_changed(base::RepeatingClosure callback) {
@@ -481,6 +505,7 @@
 +  raw_ptr<CallCaptionsTabHelper> tab_ = nullptr;
 +  std::unique_ptr<views::Widget> widget_;
 +  raw_ptr<TarkCaptionHistoryView> view_ = nullptr;
++  bool models_pending_ = false;
 +  // Captions come several times a second; the panel takes at most four.
 +  base::OneShotTimer refresh_timer_;
 +  base::RepeatingClosure on_visibility_changed_;
@@ -495,7 +520,7 @@
 +#endif  // CHROME_BROWSER_UI_VIEWS_TARK_CAPTIONS_CAPTION_HISTORY_PANEL_H_
 --- /dev/null
 +++ b/chrome/browser/ui/views/tark_captions/caption_history_panel.cc
-@@ -0,0 +1,165 @@
+@@ -0,0 +1,177 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -537,6 +562,10 @@
 +    tab_observation_.Reset();
 +    tab_ = tab;
 +    tab_observation_.Observe(tab);
++    models_pending_ = false;
++    if (view_) {
++      view_->Reset();
++    }
 +  }
 +  if (!widget_) {
 +    views::Widget::InitParams params(views::Widget::InitParams::CLIENT_OWNS_WIDGET,
@@ -575,6 +604,13 @@
 +
 +int TarkCaptionHistoryPanel::OccupiedWidth() const {
 +  return widget_ && widget_->IsVisible() ? widget_->GetWindowBoundsInScreen().width() : 0;
++}
++
++void TarkCaptionHistoryPanel::SetModelsPending(bool pending) {
++  if (models_pending_ != pending) {
++    models_pending_ = pending;
++    ScheduleRefresh();
++  }
 +}
 +
 +void TarkCaptionHistoryPanel::OnHistoryChanged(CallCaptionsTabHelper* tab) {
@@ -633,7 +669,7 @@
 +    return;
 +  }
 +  view_->SetTitle(tab_->web_contents()->GetTitle());
-+  view_->SetStopped(!tab_->captions_on());
++  view_->SetStopped(!tab_->captions_on() && !models_pending_);
 +  view_->SetHistory(tab_->history());
 +}
 +
@@ -644,7 +680,8 @@
 +  const bool was_visible = widget_->IsVisible();
 +  const gfx::Rect area = browser_view_->contents_web_view()->GetBoundsInScreen();
 +  // Full-screen video takes the whole screen; the panel waits.
-+  const bool hide = !tab_ || area.IsEmpty() || tab_->web_contents()->IsFullscreen();
++  content::WebContents* front = browser_view_->GetActiveWebContents();
++  const bool hide = !tab_ || area.IsEmpty() || (front && front->IsFullscreen());
 +  if (hide) {
 +    widget_->Hide();
 +  } else {
@@ -683,7 +720,7 @@
 +    Close captions history
 +  </message>
 +  <message name="IDS_TARK_CAPTIONS_HISTORY_STOPPED_NOTE" desc="Captions history panel, after captions stopped by themselves: how long what was said stays.">
-+    Captions stopped. This stays until you press ✕ on the bar or leave the page.
++    Captions stopped. This stays until you press ✕ on the bar or leave this site.
 +  </message>
 +  <message name="IDS_TARK_CAPTIONS_HISTORY_DROPPED" desc="Captions history panel: the oldest lines were let go to stay within its limits.">
 +    Earlier lines were dropped
@@ -702,26 +739,66 @@
    </message>
 --- a/chrome/browser/tark_captions/call_captions_tab_helper.cc
 +++ b/chrome/browser/tark_captions/call_captions_tab_helper.cc
-@@ -205,6 +205,7 @@
+@@ -123,6 +123,8 @@
+ }
+ 
+ void CallCaptionsTabHelper::SetLanguage(tark_captions::Language language) {
++  // A language chosen or detecting afresh: a running guess ends here.
++  history_.KeepGuess();
+   const bool was_other_script = !effective_show_in().empty();
+   language_ = language;
+   client_language_.set_apple_available(AppleAvailable());
+@@ -144,6 +146,8 @@
+ }
+ 
+ void CallCaptionsTabHelper::ChooseLanguage(const std::string& code) {
++  // A language chosen or detecting afresh: a running guess ends here.
++  history_.KeepGuess();
+   if (std::optional<tark_captions::Language> language = tark_captions::LanguageFromCode(code)) {
+     SetLanguage(*language);
+     return;
+@@ -166,6 +170,8 @@
+ }
+ 
+ void CallCaptionsTabHelper::ChooseAutoDetect() {
++  // A language chosen or detecting afresh: a running guess ends here.
++  history_.KeepGuess();
+   RestartAutoDetect(TitleHint());
+ }
+ 
+@@ -174,6 +180,8 @@
+ }
+ 
+ void CallCaptionsTabHelper::RestartAutoDetect(const std::string& hint) {
++  // A language chosen or detecting afresh: a running guess ends here.
++  history_.KeepGuess();
+   client_language_.ChooseAuto(hint);
+   render_queue_.ChoicesChanged();
+   if (state_.captions_on()) {
+@@ -205,6 +213,9 @@
        language_ = *guessed;
      }
      ReplaceCaptions();
-+    history_.BeginGuess();
++    if (!client_language_.guess().empty()) {
++      history_.BeginGuess();
++    }
      render_queue_.ChoicesChanged();
      UpdateModelsInUse();
      observers_.Notify(&Observer::OnClientLanguageChanged, this);
-@@ -223,6 +224,10 @@
+@@ -223,6 +234,12 @@
        speech->OnTarkCaptionsLanguageChanged(*tell);
      }
    }
-+  if (!guessed.empty() && client_language_.code() == guessed) {
-+    // The guess was right: its lines stay.
++  if (guessed.empty() || client_language_.code() == before ||
++      client_language_.code() == guessed) {
++    // The guess was right (or nothing changed): its lines stay. A wrong
++    // one's go below, with the bar's.
 +    history_.KeepGuess();
 +  }
    if (client_language_.code() == before) {
      return;  // Picked by the user, already locked, or "und".
    }
-@@ -246,6 +251,8 @@
+@@ -246,6 +263,8 @@
      // A new video: its language may not be the last one's, but most often
      // is, so captions start on it.
      VLOG(1) << "Tark captions: a new stream, detecting again";
@@ -730,7 +807,7 @@
      RestartAutoDetect(client_language_.last_locked().empty() ? TitleHint()
                                                               : client_language_.last_locked());
    }
-@@ -311,6 +318,10 @@
+@@ -311,6 +330,10 @@
      UpdateModelsInUse();
      observers_.Notify(&Observer::OnCallStateChanged, this);
    }
@@ -741,7 +818,7 @@
    site_ = site;
  }
  
-@@ -332,10 +343,17 @@
+@@ -332,10 +355,17 @@
    VLOG(1) << "Tark captions: " << (result.is_final ? "final" : "draft") << ", "
            << result.transcription.size() << " bytes";
    observers_.Notify(&Observer::OnCaption, this, result.is_final, result.transcription);
@@ -760,7 +837,7 @@
      Pump();
    }
  }
-@@ -357,7 +375,23 @@
+@@ -357,7 +387,28 @@
  
  void CallCaptionsTabHelper::ReplaceCaptions() {
    render_queue_.Clear();
@@ -771,28 +848,66 @@
 +}
 +
 +void CallCaptionsTabHelper::ClearHistory() {
-+  if (history_.empty() && !history_.dropped()) {
-+    return;
-+  }
++  const bool had = !history_.empty() || history_.dropped();
++  // Always: the next line's time counts from when captions come on again.
 +  history_.Clear();
-+  observers_.Notify(&Observer::OnHistoryChanged, this);
++  restart_pending_ = false;
++  if (had) {
++    observers_.Notify(&Observer::OnHistoryChanged, this);
++  }
 +}
 +
 +void CallCaptionsTabHelper::MarkCaptionsRestarted() {
-+  history_.AddDivider(tark_captions::CaptionHistory::Kind::kRestarted);
-+  observers_.Notify(&Observer::OnHistoryChanged, this);
++  restart_pending_ = true;
++}
++
++uint64_t CallCaptionsTabHelper::LatestHistoryId() const {
++  return history_.rows().empty() ? 0 : history_.rows().back().id;
  }
  
  void CallCaptionsTabHelper::SetTranslateOn(bool on) {
-@@ -439,6 +473,7 @@
+@@ -439,14 +490,15 @@
    if (next->is_final) {
      in_flight_final_ = text;
    }
-+  in_flight_history_id_ = next->history_id;
++  const uint64_t history_id = next->is_final ? next->history_id : LatestHistoryId();
  #if BUILDFLAG(IS_MAC)
    if (!tark_captions::LanguageFromCode(next->source)) {
      // An Apple language: Apple's Translation into English, then Tark's own
-@@ -480,6 +515,15 @@
+     // translator for an Indian target.
+     tark_captions::AppleSpeechLibrary* library = tark_captions::AppleSpeechLibrary::Get();
+     if (!library) {
+-      OnRendered(next->is_final, next->generation, text, /*ok=*/false, std::string(),
+-                 std::string());
++      OnRendered(next->is_final, next->generation, history_id, text, /*ok=*/false,
++                 std::string(), std::string());
+       return;
+     }
+     tark_captions::RenderApple(
+@@ -454,7 +506,7 @@
+         base::BindOnce(&CallCaptionsTabHelper::RenderIndianHop, weak_factory_.GetWeakPtr(),
+                        translate_to()),
+         base::BindOnce(&CallCaptionsTabHelper::OnAppleRendered, weak_factory_.GetWeakPtr(),
+-                       next->is_final, next->generation, text));
++                       next->is_final, next->generation, history_id, text));
+     return;
+   }
+ #endif
+@@ -462,11 +514,12 @@
+                       translate_on_ ? translate_to() : std::string(),
+                       base::BindOnce(&CallCaptionsTabHelper::OnRendered,
+                                      weak_factory_.GetWeakPtr(), next->is_final,
+-                                     next->generation, text));
++                                     next->generation, history_id, text));
+ }
+ 
+ void CallCaptionsTabHelper::OnRendered(bool is_final,
+                                        uint64_t generation,
++                                       uint64_t history_id,
+                                        const std::string& original,
+                                        bool ok,
+                                        const std::string& shown,
+@@ -480,6 +533,15 @@
    if (current && state_.captions_on()) {
      observers_.Notify(&Observer::OnCaptionRendered, this, is_final,
                        shown.empty() ? original : shown, translation, translate_on_ && !ok);
@@ -800,23 +915,53 @@
 +    // as heard.
 +    const std::string translated = ok && translate_on_ ? translation : std::string();
 +    if (is_final) {
-+      history_.Rendered(in_flight_history_id_, shown, translated);
-+    } else {
++      history_.Rendered(history_id, shown, translated);
++    } else if (history_id == LatestHistoryId()) {
 +      history_.SetDraft(shown.empty() ? original : shown, translated);
 +    }
 +    observers_.Notify(&Observer::OnHistoryChanged, this);
    }
    Pump();
  }
-@@ -736,6 +780,8 @@
+@@ -504,6 +566,7 @@
+ #if BUILDFLAG(IS_MAC)
+ void CallCaptionsTabHelper::OnAppleRendered(bool is_final,
+                                             uint64_t generation,
++                                            uint64_t history_id,
+                                             const std::string& original,
+                                             tark_captions::AppleRenderError error,
+                                             const std::string& translation) {
+@@ -512,7 +575,8 @@
+     translation_language_missing_ = missing;
+     observers_.Notify(&Observer::OnClientLanguageChanged, this);
+   }
+-  OnRendered(is_final, generation, original, error == tark_captions::AppleRenderError::kNone,
++  OnRendered(is_final, generation, history_id, original,
++             error == tark_captions::AppleRenderError::kNone,
+              std::string(), translation);
+ }
+ #endif
+@@ -734,9 +798,20 @@
+ }
+ 
  void CallCaptionsTabHelper::CaptionsChanged(bool was_on) {
++  // Whatever guess was running ends with the captions it was for.
++  history_.KeepGuess();
    if (was_on) {
      StopRendering();
++    // Words still coming won't come.
++    history_.SetDraft(std::string());
 +  } else {
 +    history_.Start();
++    if (restart_pending_) {
++      history_.AddDivider(tark_captions::CaptionHistory::Kind::kRestarted);
++      restart_pending_ = false;
++    }
    }
++  observers_.Notify(&Observer::OnHistoryChanged, this);
    // Before the renderers bind recognizers: they open taps through it.
    BindTapSource(/*bind=*/!was_on);
+   Profile* profile = Profile::FromBrowserContext(GetWebContents().GetBrowserContext());
 --- a/chrome/browser/tark_captions/call_captions_tab_helper.h
 +++ b/chrome/browser/tark_captions/call_captions_tab_helper.h
 @@ -15,9 +15,11 @@
@@ -841,7 +986,7 @@
    };
  
    CallCaptionsTabHelper(const CallCaptionsTabHelper&) = delete;
-@@ -95,6 +100,15 @@
+@@ -95,6 +100,16 @@
    const tark_captions::ClientLanguage& client_language() const { return client_language_; }
  
    void SetCaptionsOn(bool on);
@@ -852,17 +997,41 @@
 +  const tark_captions::CaptionHistory& history() const { return history_; }
 +  // The user turned captions off (✕, CC, Cancel).
 +  void ClearHistory();
-+  // The user turned captions on again: a "Captions restarted" line.
++  // The user turned captions on again: a "Captions restarted" line once
++  // they are on.
 +  void MarkCaptionsRestarted();
    // The user picked the client's language for this call.
    void SetLanguage(tark_captions::Language language);
    // The user picked "Auto-detect" again: listen afresh.
-@@ -253,6 +267,9 @@
+@@ -195,8 +210,11 @@
+   // The language a caption from the speech process is in.
+   std::string CaptionLanguageCode() const;
+   void Pump();
++  // `history_id`: a final's row in the history; for a draft, the newest row
++  // when it was sent (a draft render after a newer final is old news).
+   void OnRendered(bool is_final,
+                   uint64_t generation,
++                  uint64_t history_id,
+                   const std::string& original,
+                   bool ok,
+                   const std::string& shown,
+@@ -226,6 +244,7 @@
+ #if BUILDFLAG(IS_MAC)
+   void OnAppleRendered(bool is_final,
+                        uint64_t generation,
++                       uint64_t history_id,
+                        const std::string& original,
+                        tark_captions::AppleRenderError error,
+                        const std::string& translation);
+@@ -253,6 +272,12 @@
    tark_captions::RenderQueue render_queue_;
    // The final being rendered, to show as it is if rendering stops.
    std::optional<std::string> in_flight_final_;
-+  // Its row in the history; one request is in flight at a time.
-+  uint64_t in_flight_history_id_ = 0;
++  // The newest row's id in the history, 0 when empty.
++  uint64_t LatestHistoryId() const;
++  // The user turned captions on again: the history gets a "Captions
++  // restarted" line once they are on (not on Tark's own off-then-on).
++  bool restart_pending_ = false;
 +  tark_captions::CaptionHistory history_{base::DefaultTickClock::GetInstance()};
    mojo::Remote<media::mojom::TarkCaptionTranslator> translator_;
    mojo::Receiver<media::mojom::TarkAudioTapSource> tap_source_{this};
@@ -940,7 +1109,19 @@
    Update();
  }
  
-@@ -509,6 +519,9 @@
+@@ -472,6 +482,11 @@
+   }
+   // The browser window is closing: stop following it.
+   button_timer_.Stop();
++  if (history_panel_) {
++    // Without laying the bar out again over a closing window.
++    history_panel_->set_on_visibility_changed(base::RepeatingClosure());
++    history_panel_.reset();
++  }
+   if (button_widget_) {
+     button_widget_->Hide();
+   }
+@@ -509,6 +524,9 @@
    if (helper == shown_) {
      shown_ = nullptr;
    }
@@ -950,7 +1131,7 @@
  }
  
  void TarkCaptionPillController::Update() {
-@@ -518,7 +531,8 @@
+@@ -518,7 +536,8 @@
    CallCaptionsTabHelper* active = HelperFor(model->GetActiveWebContents());
    // The bar shows once captions are on, or while the models they need
    // download (D4 any-media: the CC button turns them on).
@@ -960,7 +1141,7 @@
                   (waiting_ && shown_ == active))) {
      target = active;
    } else {
-@@ -526,7 +540,8 @@
+@@ -526,7 +545,8 @@
      for (int i = 0; i < model->count() && !target; ++i) {
        CallCaptionsTabHelper* helper = HelperFor(model->GetWebContentsAt(i));
        if (helper && helper != active &&
@@ -970,7 +1151,7 @@
          target = helper;
          mode = TarkCaptionPillView::Mode::kStrip;
        }
-@@ -578,6 +593,16 @@
+@@ -578,6 +598,19 @@
              : IDS_TARK_CAPTIONS_CHOOSE_LANGUAGE);
    }
    view_->SetNoticeButton(notice_button);
@@ -981,13 +1162,16 @@
 +    // The panel follows the tab that captions.
 +    history_panel_->Show(target);
 +  }
++  if (history_panel_ && history_panel_->tab() == target) {
++    history_panel_->SetModelsPending(waiting_ && turn_on_when_ready_);
++  }
 +  view_->SetHistoryState(shown_has_history_,
 +                         history_panel_ && history_panel_->showing() &&
 +                             history_panel_->tab() == target);
    ShowAppleDownload();
    // A bar made just now (the first CC press in a window) gets its download
    // row here; the store says nothing new while an offer waits.
-@@ -657,6 +682,7 @@
+@@ -657,6 +690,7 @@
        shown_->RetryAppleDownload();
      } else {
        shown_->SetCaptionsOn(false);
@@ -995,7 +1179,7 @@
      }
      return;
    }
-@@ -690,6 +716,30 @@
+@@ -690,6 +724,30 @@
    Update();
  }
  
@@ -1026,7 +1210,7 @@
  void TarkCaptionPillController::OnNotNowPressed() {
    if (!offering_) {
      return;
-@@ -873,7 +923,11 @@
+@@ -873,7 +931,11 @@
    if (!widget_ || !view_ || !browser_view_->GetWidget()) {
      return;
    }
@@ -1039,6 +1223,16 @@
    gfx::Size size = view_->GetPreferredSize();
    size.SetToMin(area.size());
    const bool strip = mode_ == TarkCaptionPillView::Mode::kStrip;
+@@ -925,7 +987,8 @@
+              {views::Widget::GetAllChildWidgets(browser), views::Widget::GetAllOwnedWidgets(browser)}) {
+           for (views::Widget* widget : widgets) {
+             if (widget->IsVisible() && widget != browser_view_->GetWidget() &&
+-                widget != button_widget_.get() && widget != widget_.get()) {
++                widget != button_widget_.get() && widget != widget_.get() &&
++                !(history_panel_ && history_panel_->IsPanelWidget(widget))) {
+               browser_windows.push_back(widget->GetWindowBoundsInScreen());
+             }
+           }
 --- a/chrome/browser/ui/views/tark_captions/caption_pill_controller.h
 +++ b/chrome/browser/ui/views/tark_captions/caption_pill_controller.h
 @@ -15,6 +15,7 @@
