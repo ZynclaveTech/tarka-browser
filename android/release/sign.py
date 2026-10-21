@@ -34,8 +34,15 @@ _VERSION_NAME = re.compile(r'\d+\.\d+\.\d+\.\d+-r\d{1,2}')
 _SIGNATURE = re.compile(r'^META-INF/([^/]+\.(SF|RSA|DSA|EC)|MANIFEST\.MF)$', re.IGNORECASE)
 
 
+def _tools_version(path):
+    # "36.0.0" -> (36, 0, 0, 1); "36.0.0-rc1" -> (36, 0, 0, 0): a release
+    # candidate comes before its release.
+    numbers, _, suffix = path.name.partition('-')
+    return (*(int(n) for n in re.findall(r'\d+', numbers)), 0 if suffix else 1)
+
+
 def _build_tool(name):
-    return str(sorted((SDK / 'build-tools').glob('*'))[-1] / name)
+    return str(max((SDK / 'build-tools').glob('*'), key=_tools_version) / name)
 
 
 def _badging(apk_like):

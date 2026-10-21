@@ -157,6 +157,25 @@ class TestSigning(unittest.TestCase):
             self.sign.release(self.apk, other_aab, self.tmp / 'mismatch', self.keystore, self.passfile)
 
 
+class TestBuildToolsVersion(unittest.TestCase):
+    """The newest build-tools by version, not by string: "9.0.0" sorts after
+    "36.0.0" as text, and a release candidate is older than its release."""
+
+    def test_newest_by_version(self):
+        import tempfile
+        sys.path.insert(0, str(REPO / 'android' / 'release'))
+        import sign
+        with tempfile.TemporaryDirectory() as tmp:
+            for v in ('9.0.0', '36.0.0-rc1', '35.0.1', '36.0.0'):
+                (pathlib.Path(tmp) / 'build-tools' / v).mkdir(parents=True)
+            old = sign.SDK
+            sign.SDK = pathlib.Path(tmp)
+            try:
+                self.assertEqual(pathlib.Path(sign._build_tool('aapt2')).parent.name, '36.0.0')
+            finally:
+                sign.SDK = old
+
+
 @unittest.skipIf(tools_missing(), tools_missing() or '')
 class TestSigningRefusesStrangeNames(TestSigning):
     """The output names come from the APK's own version name: only Tark's
@@ -218,6 +237,24 @@ class TestPublish(TestSigning):
         self.assertIn('max-age=300', joined[1])
         self.assertIn('cloudfront create-invalidation', joined[2])
         self.assertIn('--paths /android/v1/latest.json', joined[2])
+
+    def test_refuses_an_index_not_newer_than_the_live_one(self):
+        # A lower or equal code would point new direct installs at an older
+        # build (the app never offers a downgrade, but the site would).
+        import publish
+        apk, r, cert_file = self.signed()
+        index = publish.index_for(apk, r['version_name'], r['version_code'])
+        for live in (r['version_code'], r['version_code'] + 1):
+            with self.assertRaisesRegex(ValueError, 'not newer'):
+                publish.publish(apk, index, cert_file=cert_file, live_code=live, dry_run=True)
+        publish.publish(apk, index, cert_file=cert_file, live_code=r['version_code'] - 1, dry_run=True)
+
+    def test_index_refuses_a_strange_version_name(self):
+        import publish
+        apk, r, _ = self.signed()
+        for name in ('../x', '155.0.8059.39', '155.0.8059.39-r1/../a'):
+            with self.assertRaisesRegex(ValueError, 'version name'):
+                publish.index_for(apk, name, r['version_code'])
 
     def test_refuses_a_foreign_certificate(self):
         import publish
