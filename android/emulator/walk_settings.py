@@ -136,10 +136,21 @@ def screen_has_dividers(img, items):
     return False
 
 
+def is_tark_screen(xml):
+    """Whether Tark draws the screen shown: Default browser and Notifications
+    open Android's own Settings, which Tark cannot change."""
+    m = re.search(r'package="([^"]+)"', xml)
+    return bool(m) and m.group(1) == PACKAGE
+
+
 def check_dividers(dev):
-    """'ok', 'MISSING' or 'n/a' (fewer than two rows) for the screen shown."""
+    """'ok', 'MISSING' or 'n/a' (fewer than two rows, or another app's
+    screen) for the screen shown."""
     dev.shell('uiautomator', 'dump', '/sdcard/ui.xml')
-    items = list_items(dev.shell('cat', '/sdcard/ui.xml'))
+    xml = dev.shell('cat', '/sdcard/ui.xml')
+    if not is_tark_screen(xml):
+        return 'n/a'
+    items = list_items(xml)
     if len(items) < 2:
         return 'n/a'
     data = subprocess.run(dev.adb + ['exec-out', 'screencap'], capture_output=True).stdout

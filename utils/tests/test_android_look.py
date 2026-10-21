@@ -296,6 +296,16 @@ class TestDividers(unittest.TestCase):
         img = walk_settings.parse_screencap(_image(200, 120, [(39, 60, 100)]))
         self.assertFalse(walk_settings.screen_has_dividers(img, self.ITEMS))
 
+    def test_another_apps_screen_is_not_judged(self):
+        # Found on the emulator: Default browser and Notifications open
+        # Android's own Settings, whose rows Tark cannot draw.
+        system = ('<hierarchy><node package="com.android.settings" class="android.widget.FrameLayout" '
+                  'bounds="[0,0][200,300]"/></hierarchy>')
+        tark = ('<hierarchy><node package="com.gettarka.tarka" class="android.widget.FrameLayout" '
+                'bounds="[0,0][200,300]"/></hierarchy>')
+        self.assertFalse(walk_settings.is_tark_screen(system))
+        self.assertTrue(walk_settings.is_tark_screen(tark))
+
     def test_rows_are_the_list_children(self):
         xml = ('<hierarchy><node class="android.widget.FrameLayout" bounds="[0,0][200,300]">'
                '<node class="androidx.recyclerview.widget.RecyclerView" bounds="[0,0][200,300]">'
