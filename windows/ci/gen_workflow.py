@@ -135,8 +135,11 @@ STAGE = '''
         if: steps.build.outputs.finished == 'false'
         shell: pwsh
         run: |
+          # 7-Zip exits 1 for warnings: the Chromium tarball's symbolic links
+          # (test data) cannot be read on Windows and are not needed.
           7z a -tzip C:\\tw\\tree.zip C:\\tw\\build\\src -mx=3 -mtc=on
-          if ($LASTEXITCODE) {{ exit $LASTEXITCODE }}
+          if ($LASTEXITCODE -ge 2) {{ exit $LASTEXITCODE }}
+          exit 0
       - name: Hand the tree on
         if: steps.build.outputs.finished == 'false'
         uses: {upload}
@@ -176,8 +179,9 @@ RESUME = '''      - name: The tree from the last stage
         shell: pwsh
         run: |
           7z x C:\\tw\\build\\tree.zip -oC:\\tw\\build -y
-          if ($LASTEXITCODE) {{ exit $LASTEXITCODE }}
+          if ($LASTEXITCODE -ge 2) {{ exit $LASTEXITCODE }}
           Remove-Item C:\\tw\\build\\tree.zip
+          exit 0
 '''
 
 COMPLETE = '''
@@ -205,7 +209,7 @@ def main():
         cond = '' if n == 1 else f"    if: needs.{prev}.outputs.finished != 'true'\n"
         resume = '' if n == 1 else RESUME.format(download=DOWNLOAD)
         text += STAGE.format(n=n, needs=prev, cond=cond, resume=resume, checkout=CHECKOUT,
-                             hours='2.5' if n == 1 else '3.5',
+                             hours='3.5',
                              setup_python=SETUP_PYTHON, download=DOWNLOAD, upload=UPLOAD)
     text += COMPLETE.format(needs=', '.join(f'build-{n}' for n in range(1, STAGES + 1)))
     out = pathlib.Path(__file__).resolve().parents[2] / '.github' / 'workflows' / 'windows.yml'
