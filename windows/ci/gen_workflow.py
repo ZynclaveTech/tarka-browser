@@ -136,8 +136,9 @@ STAGE = '''
         shell: pwsh
         run: |
           # 7-Zip exits 1 for warnings: the Chromium tarball's symbolic links
-          # (test data) cannot be read on Windows and are not needed.
-          7z a -tzip C:\\tw\\tree.zip C:\\tw\\build\\src -mx=3 -mtc=on
+          # (test data) cannot be read on Windows and are not needed. Volumes
+          # of 2 GB: one 8 GB file in an artifact failed to download.
+          7z a -tzip -v2000m C:\\tw\\tree.zip C:\\tw\\build\\src -mx=3 -mtc=on
           if ($LASTEXITCODE -ge 2) {{ exit $LASTEXITCODE }}
           exit 0
       - name: Hand the tree on
@@ -145,7 +146,7 @@ STAGE = '''
         uses: {upload}
         with:
           name: build-tree
-          path: C:\\tw\\tree.zip
+          path: C:\\tw\\tree.zip.*
           compression-level: 0
           retention-days: 3
           overwrite: true
@@ -178,9 +179,9 @@ RESUME = '''      - name: The tree from the last stage
       - name: Unpack the tree
         shell: pwsh
         run: |
-          7z x C:\\tw\\build\\tree.zip -oC:\\tw\\build -y
+          7z x C:\\tw\\build\\tree.zip.001 -oC:\\tw\\build -y
           if ($LASTEXITCODE -ge 2) {{ exit $LASTEXITCODE }}
-          Remove-Item C:\\tw\\build\\tree.zip
+          Remove-Item C:\\tw\\build\\tree.zip.*
           exit 0
 '''
 
