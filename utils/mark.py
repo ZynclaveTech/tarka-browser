@@ -11,7 +11,8 @@ use the mid palette, which holds 3:1 on paper and raised in both modes.
 
     python3 utils/mark.py --out resources/branding/mark
 
-writes every file listed in resources/branding/mark/install.txt under
+writes every file listed in resources/branding/mark/install.txt and
+install-android.txt under
 resources/branding/mark/tree/, at the path it replaces in the Chromium tree.
 utils/install_branding.py copies them into the tree at setup.
 """
@@ -206,11 +207,16 @@ def render(entry):
     raise ValueError('unknown kind %r in %s' % (entry.kind, entry.dest))
 
 
+# Every list of generated files: the shared one, and Android's own icons
+# (installed by android/build.sh only).
+MANIFESTS = ('install.txt', 'install-android.txt')
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     parser.add_argument('--out', required=True, help='resources/branding/mark')
     args = parser.parse_args()
-    for entry in read_manifest(os.path.join(args.out, 'install.txt')):
+    for entry in (e for name in MANIFESTS for e in read_manifest(os.path.join(args.out, name))):
         path = os.path.join(args.out, 'tree', entry.dest)
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, 'wb') as f:

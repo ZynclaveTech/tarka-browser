@@ -220,6 +220,10 @@ class TestAndroidBuildSh(unittest.TestCase):
         self.assertIn('ln -sfn', SCRIPT.read_text())
         self.assertIn('android/patches" "$work/tark-patches/android"', SCRIPT.read_text())
 
+    def test_android_icons_installed_with_the_shared_ones(self):
+        result, runs, files, tmp = dryrun('--stop-before-gn')
+        self.assertIn('install.txt install-android.txt', runs[index_of(runs, 'utils/install_branding.py')])
+
     def test_ublock_sources_unpacked_until_a2(self):
         # Tark's shared patches put uBlock Origin's files into the resource
         # paks (chrome_paks.gni) on every platform; A1 unpacks them as the Mac

@@ -123,7 +123,11 @@ class TestAppIcon(unittest.TestCase):
         self.assertEqual(themed.count('+        android:pathData="M'), 3)
 
     def test_in_app_icon_pngs(self):
-        lines = (REPO / 'resources' / 'branding' / 'mark' / 'install.txt').read_text().splitlines()
+        # Their own list: the Mac's tree has no Android files, and the shared
+        # install.txt fails a build whose tree lacks a destination.
+        lines = (REPO / 'resources' / 'branding' / 'mark' / 'install-android.txt').read_text().splitlines()
+        shared = (REPO / 'resources' / 'branding' / 'mark' / 'install.txt').read_text()
+        self.assertNotIn('chrome/android/', shared)
         for size, dpi in ((48, 'mdpi'), (72, 'hdpi'), (96, 'xhdpi'), (144, 'xxhdpi'), (192, 'xxxhdpi')):
             path = f'chrome/android/java/res_chromium_base/mipmap-{dpi}/app_icon.png'
             self.assertIn(f'png {size}x{size} center mid {path}', lines)

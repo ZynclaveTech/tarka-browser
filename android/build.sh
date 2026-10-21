@@ -181,7 +181,8 @@ else
   #    (Tark's shared patches put its files into the resource paks on every
   #    platform; Android never loads them, having no extension system, and
   #    A2's engine-level blocker removes them), IndicXlit (D1).
-  run python3 "$_root_dir/utils/install_branding.py" "$_root_dir/resources/branding/mark" "$_src_dir"
+  run python3 "$_root_dir/utils/install_branding.py" "$_root_dir/resources/branding/mark" "$_src_dir" \
+    install.txt install-android.txt
   run mkdir -p "$_src_dir/ui/webui/resources/fonts"
   run cp "$_root_dir"/resources/fonts/inter-latin.woff2 "$_root_dir"/resources/fonts/inter-latin-ext.woff2 \
     "$_src_dir/ui/webui/resources/fonts/"
