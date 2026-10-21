@@ -1,0 +1,157 @@
+--- a/components/tark_captions/detection_policy.cc
++++ b/components/tark_captions/detection_policy.cc
+@@ -30,18 +30,16 @@
+   return std::find(set.begin(), set.end(), code) != set.end();
+ }
+ 
+-}  // namespace
+-
+-Detection DecideLanguage(base::span<const float> logits,
+-                         base::span<const std::string> labels,
+-                         double speech_seconds) {
+-  if (speech_seconds < kFirstDecision || logits.empty() || logits.size() != labels.size()) {
+-    return {};
++// The detector's probabilities by language, Urdu counted as Hindi (spoken
++// Hindustani); empty when scores and labels don't match.
++std::map<std::string, double> Probabilities(base::span<const float> logits,
++                                            base::span<const std::string> labels) {
++  std::map<std::string, double> p;
++  if (logits.empty() || logits.size() != labels.size()) {
++    return p;
+   }
+-  // Probabilities, with Urdu counted as Hindi (spoken Hindustani).
+   const float max = *std::max_element(logits.begin(), logits.end());
+   double sum = 0;
+-  std::map<std::string, double> p;
+   for (size_t i = 0; i < logits.size(); ++i) {
+     const double e = std::exp(static_cast<double>(logits[i]) - max);
+     sum += e;
+@@ -50,6 +48,21 @@
+   for (auto& [code, value] : p) {
+     value /= sum;
+   }
++  return p;
++}
++
++}  // namespace
++
++Detection DecideLanguage(base::span<const float> logits,
++                         base::span<const std::string> labels,
++                         double speech_seconds) {
++  if (speech_seconds < kFirstDecision) {
++    return {};
++  }
++  const std::map<std::string, double> p = Probabilities(logits, labels);
++  if (p.empty()) {
++    return {};
++  }
+   auto top = std::max_element(p.begin(), p.end(),
+                               [](const auto& a, const auto& b) { return a.second < b.second; });
+   const bool sure = top->second >= kLockProbability;
+@@ -76,6 +89,22 @@
+   return {KindOfLanguage(code), code};
+ }
+ 
++std::optional<std::string> GuessLanguage(base::span<const float> logits,
++                                         base::span<const std::string> labels) {
++  const std::map<std::string, double> p = Probabilities(logits, labels);
++  if (p.empty()) {
++    return std::nullopt;
++  }
++  auto top = std::max_element(p.begin(), p.end(),
++                              [](const auto& a, const auto& b) { return a.second < b.second; });
++  const Detection::Kind kind = KindOfLanguage(top->first);
++  if (top->second < kGuessProbability ||
++      (kind != Detection::Kind::kCaption && kind != Detection::Kind::kApple)) {
++    return std::nullopt;
++  }
++  return top->first;
++}
++
+ Detection::Kind KindOfLanguage(const std::string& code) {
+   if (code == "ur" || In(kCaptioned, code)) {
+     return Detection::Kind::kCaption;
+--- a/components/tark_captions/detection_policy.h
++++ b/components/tark_captions/detection_policy.h
+@@ -5,6 +5,7 @@
+ #ifndef COMPONENTS_TARK_CAPTIONS_DETECTION_POLICY_H_
+ #define COMPONENTS_TARK_CAPTIONS_DETECTION_POLICY_H_
+ 
++#include <optional>
+ #include <string>
+ 
+ #include "base/containers/span.h"
+@@ -18,6 +19,14 @@
+ inline constexpr double kFirstDecision = 3.0;
+ inline constexpr double kLastDecision = 5.0;
+ inline constexpr double kLockProbability = 0.9;
++// Captions at once: before the decision, the speech's language is guessed
++// when the speech crosses each of these, so captions can start on it; the
++// decision corrects a wrong guess. Measured on 534 FLEURS clips
++// (notes/2026-10-20-d4-language-id-spike.md): at 1 s a guess of Tark's own
++// languages is right 83 % of the time, of Apple's 99 %.
++inline constexpr double kGuessChecks[] = {1.0, 1.5, 2.0};
++inline constexpr double kGuessProbability = 0.5;
++
+ // An unsure call between neighbouring Indian languages goes to the one Tark
+ // captions when that one has at least this much.
+ inline constexpr double kNeighbourMass = 0.1;
+@@ -44,6 +53,12 @@
+                          base::span<const std::string> labels,
+                          double speech_seconds);
+ 
++// The language to start captions in before the decision: the most likely
++// one (Urdu counted as Hindi) when it has at least kGuessProbability and Tark
++// or macOS captions it; else nothing.
++std::optional<std::string> GuessLanguage(base::span<const float> logits,
++                                         base::span<const std::string> labels);
++
+ }  // namespace tark_captions
+ 
+ #endif  // COMPONENTS_TARK_CAPTIONS_DETECTION_POLICY_H_
+--- a/components/tark_captions/detection_policy_unittest.cc
++++ b/components/tark_captions/detection_policy_unittest.cc
+@@ -6,6 +6,7 @@
+ 
+ #include <cmath>
+ #include <map>
++#include <optional>
+ #include <string>
+ #include <vector>
+ 
+@@ -81,5 +82,35 @@
+   ExpectDetection(DecideLanguage(std::vector<float>(3, 0.0f), kLabels, 5.0), Kind::kUnsure, "");
+ }
+ 
++// Captions at once: the guess that starts captions before the lock.
++std::optional<std::string> Guess(const std::map<std::string, double>& named) {
++  return GuessLanguage(Scores(named), kLabels);
++}
++
++TEST(GuessLanguageTest, TakesTopTarkLanguage) {
++  EXPECT_EQ(Guess({{"hi", 0.6}, {"ta", 0.3}}), "hi");
++}
++
++TEST(GuessLanguageTest, CountsUrduAsHindi) {
++  EXPECT_EQ(Guess({{"ur", 0.3}, {"hi", 0.25}, {"en", 0.45}}), "hi");
++}
++
++TEST(GuessLanguageTest, NeedsHalf) {
++  EXPECT_EQ(Guess({{"hi", 0.45}, {"ta", 0.4}}), std::nullopt);
++}
++
++TEST(GuessLanguageTest, TakesAppleLanguage) {
++  EXPECT_EQ(Guess({{"en", 0.8}}), "en");
++}
++
++TEST(GuessLanguageTest, SkipsWhatNothingCaptions) {
++  EXPECT_EQ(Guess({{"sw", 0.9}}), std::nullopt);
++  EXPECT_EQ(Guess({{"te", 0.7}}), std::nullopt);  // Planned, not captioned yet.
++}
++
++TEST(GuessLanguageTest, ScoresAndLabelsMustMatch) {
++  EXPECT_EQ(GuessLanguage(std::vector<float>(3, 0.0f), kLabels), std::nullopt);
++}
++
+ }  // namespace
+ }  // namespace tark_captions
