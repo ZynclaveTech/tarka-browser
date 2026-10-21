@@ -1,0 +1,847 @@
+--- /dev/null
++++ b/chrome/browser/tark_update/BUILD.gn
+@@ -0,0 +1,43 @@
++# Copyright 2026 The Tark Authors
++# Use of this source code is governed by a BSD-style license that can be
++# found in the LICENSE file.
++#
++# Tark for Android (A5): the direct APK's daily update check. The service
++# builds as part of //chrome/browser on Android; the index's rules have no
++# browser dependencies, so their unit tests also build for the build machine
++# (android/build.sh runs them).
++
++import("//testing/test.gni")
++
++static_library("index") {
++  sources = [
++    "update_index.cc",
++    "update_index.h",
++  ]
++  deps = [
++    "//base",
++    "//url",
++  ]
++}
++
++if (!is_android) {
++  # For the build machine only, as tark_xlit_files_unittests.
++  test("tark_update_unittests") {
++    sources = [ "update_index_unittest.cc" ]
++    deps = [
++      ":index",
++      "//base",
++      "//base/test:run_all_unittests",
++      "//base/test:test_support",
++      "//testing/gtest",
++      "//url",
++    ]
++  }
++}
++
++if (current_toolchain == default_toolchain) {
++  group("host_unittests") {
++    testonly = true
++    deps = [ ":tark_update_unittests($host_toolchain)" ]
++  }
++}
+--- /dev/null
++++ b/chrome/browser/tark_update/DEPS
+@@ -0,0 +1,3 @@
++include_rules = [
++  "+services/network/public",
++]
+--- /dev/null
++++ b/chrome/browser/tark_update/update_index.h
+@@ -0,0 +1,53 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_TARK_UPDATE_UPDATE_INDEX_H_
++#define CHROME_BROWSER_TARK_UPDATE_UPDATE_INDEX_H_
++
++#include <cstddef>
++#include <cstdint>
++#include <optional>
++#include <string>
++#include <string_view>
++
++#include "base/time/time.h"
++#include "url/gurl.h"
++
++// Tark for Android (A5): the direct APK's daily check for a newer version.
++// The index at gettarka.com/android/v1/latest.json names the newest APK; these
++// are its rules, with no browser or network dependencies, so that their unit
++// tests build for the build machine.
++namespace tark_update {
++
++inline constexpr char kIndexUrl[] = "https://gettarka.com/android/v1/latest.json";
++// Every APK the index may name lives here.
++inline constexpr char kApkPrefix[] = "https://gettarka.com/android/v1/";
++// The index is a few hundred bytes; anything larger is not one.
++inline constexpr size_t kMaxIndexBytes = 64 * 1024;
++inline constexpr base::TimeDelta kCheckInterval = base::Hours(24);
++
++struct UpdateIndex {
++  int64_t version_code = 0;
++  std::string version_name;
++  GURL url;
++  int64_t size = 0;
++  std::string sha256;
++};
++
++// The index, or nullopt for anything else: not JSON, a field missing or of
++// the wrong type, an APK outside kApkPrefix, or more than kMaxIndexBytes.
++std::optional<UpdateIndex> ParseIndex(std::string_view json);
++
++// Whether the index names a version newer than the installed one; never a
++// downgrade.
++bool IsNewer(const UpdateIndex& index, int64_t installed_code);
++
++// Whether a check is due: never checked, the last check kCheckInterval or more
++// ago, or the last check in the future (a clock that was ahead). A failed
++// check counts as a check, so a failure waits a day too.
++bool ShouldCheckNow(base::Time now, base::Time last_check);
++
++}  // namespace tark_update
++
++#endif  // CHROME_BROWSER_TARK_UPDATE_UPDATE_INDEX_H_
+--- /dev/null
++++ b/chrome/browser/tark_update/update_index.cc
+@@ -0,0 +1,53 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/tark_update/update_index.h"
++
++#include "base/json/json_reader.h"
++#include "base/strings/string_util.h"
++#include "base/values.h"
++
++namespace tark_update {
++
++std::optional<UpdateIndex> ParseIndex(std::string_view json) {
++  if (json.size() > kMaxIndexBytes) {
++    return std::nullopt;
++  }
++  std::optional<base::DictValue> dict =
++      base::JSONReader::ReadDict(json, base::JSON_PARSE_RFC);
++  if (!dict) {
++    return std::nullopt;
++  }
++  const std::optional<int> code = dict->FindInt("version_code");
++  const std::string* name = dict->FindString("version_name");
++  const std::string* url = dict->FindString("url");
++  const std::optional<int> size = dict->FindInt("size");
++  const std::string* sha256 = dict->FindString("sha256");
++  if (!code || *code <= 0 || !name || !url || !size || *size <= 0 ||
++      !sha256) {
++    return std::nullopt;
++  }
++  UpdateIndex index;
++  index.version_code = *code;
++  index.version_name = *name;
++  index.url = GURL(*url);
++  index.size = *size;
++  index.sha256 = *sha256;
++  if (!index.url.is_valid() ||
++      !base::StartsWith(index.url.spec(), kApkPrefix)) {
++    return std::nullopt;
++  }
++  return index;
++}
++
++bool IsNewer(const UpdateIndex& index, int64_t installed_code) {
++  return index.version_code > installed_code;
++}
++
++bool ShouldCheckNow(base::Time now, base::Time last_check) {
++  return last_check.is_null() || last_check > now ||
++         now - last_check >= kCheckInterval;
++}
++
++}  // namespace tark_update
+--- /dev/null
++++ b/chrome/browser/tark_update/update_index_unittest.cc
+@@ -0,0 +1,96 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/tark_update/update_index.h"
++
++#include <string>
++
++#include "base/time/time.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace tark_update {
++namespace {
++
++constexpr char kIndex[] = R"({
++  "version_code": 805903902,
++  "version_name": "155.0.8059.39-r2",
++  "url": "https://gettarka.com/android/v1/tark-155.0.8059.39-r2.apk",
++  "size": 180386822,
++  "sha256": "e2e53f9658f8cff7694701eccc8e5a476d97819e6780b8e4f799409b543b9788"
++})";
++
++TEST(TarkUpdateIndexTest, ParseIndex_ReadsTheIndex) {
++  const std::optional<UpdateIndex> index = ParseIndex(kIndex);
++  ASSERT_TRUE(index);
++  EXPECT_EQ(index->version_code, 805903902);
++  EXPECT_EQ(index->version_name, "155.0.8059.39-r2");
++  EXPECT_EQ(index->url.spec(),
++            "https://gettarka.com/android/v1/tark-155.0.8059.39-r2.apk");
++  EXPECT_EQ(index->size, 180386822);
++}
++
++TEST(TarkUpdateIndexTest, ParseIndex_RejectsBadInput) {
++  // Not JSON, a list, a field missing, a field of the wrong type.
++  EXPECT_FALSE(ParseIndex("not json"));
++  EXPECT_FALSE(ParseIndex("[]"));
++  EXPECT_FALSE(ParseIndex(R"({"version_name": "x", "url":
++      "https://gettarka.com/android/v1/a.apk", "size": 1, "sha256": "ab"})"));
++  EXPECT_FALSE(ParseIndex(R"({"version_code": "805903902", "version_name": "x",
++      "url": "https://gettarka.com/android/v1/a.apk", "size": 1,
++      "sha256": "ab"})"));
++  // Only Tark's own folder on gettarka.com, over HTTPS.
++  for (const char* url :
++       {"http://gettarka.com/android/v1/a.apk",
++        "https://example.com/android/v1/a.apk",
++        "https://gettarka.com.example.com/android/v1/a.apk",
++        "https://gettarka.com/other/a.apk"}) {
++    const std::string json =
++        std::string(R"({"version_code": 2, "version_name": "x", "url": ")") +
++        url + R"(", "size": 1, "sha256": "ab"})";
++    EXPECT_FALSE(ParseIndex(json)) << url;
++  }
++  // Over 64 KiB, even if it would parse.
++  std::string big(R"({"version_code": 2, "version_name": "x", "url":
++      "https://gettarka.com/android/v1/a.apk", "size": 1, "sha256": "ab",
++      "pad": ")");
++  big += std::string(kMaxIndexBytes, 'a') + "\"}";
++  EXPECT_FALSE(ParseIndex(big));
++}
++
++TEST(TarkUpdateIndexTest, IsNewer_HigherIs) {
++  const UpdateIndex index = *ParseIndex(kIndex);
++  EXPECT_TRUE(IsNewer(index, 805903901));
++}
++
++TEST(TarkUpdateIndexTest, IsNewer_SameOrLowerIsNot) {
++  // An older index (a mistake on the site) never offers a downgrade.
++  const UpdateIndex index = *ParseIndex(kIndex);
++  EXPECT_FALSE(IsNewer(index, 805903902));
++  EXPECT_FALSE(IsNewer(index, 805903999));
++}
++
++TEST(TarkUpdateIndexTest, ShouldCheckNow_FirstTime) {
++  EXPECT_TRUE(ShouldCheckNow(base::Time::Now(), base::Time()));
++}
++
++TEST(TarkUpdateIndexTest, ShouldCheckNow_23hNo_24hYes) {
++  const base::Time last = base::Time::Now();
++  EXPECT_FALSE(ShouldCheckNow(last + base::Hours(23), last));
++  EXPECT_TRUE(ShouldCheckNow(last + base::Hours(24), last));
++}
++
++TEST(TarkUpdateIndexTest, ShouldCheckNow_FutureLastCheckChecks) {
++  // A phone whose clock was ahead and then corrected: never waits forever.
++  const base::Time now = base::Time::Now();
++  EXPECT_TRUE(ShouldCheckNow(now, now + base::Days(30)));
++}
++
++TEST(TarkUpdateIndexTest, FailedCheckWaitsADay) {
++  // A failed check is recorded as the last check too: no tight retry loop.
++  const base::Time failed_at = base::Time::Now();
++  EXPECT_FALSE(ShouldCheckNow(failed_at + base::Hours(1), failed_at));
++}
++
++}  // namespace
++}  // namespace tark_update
+--- /dev/null
++++ b/chrome/browser/tark_update/update_check_service.h
+@@ -0,0 +1,59 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_TARK_UPDATE_UPDATE_CHECK_SERVICE_H_
++#define CHROME_BROWSER_TARK_UPDATE_UPDATE_CHECK_SERVICE_H_
++
++#include <memory>
++#include <optional>
++#include <string>
++
++#include "base/memory/weak_ptr.h"
++#include "base/no_destructor.h"
++#include "base/sequence_checker.h"
++#include "base/timer/timer.h"
++
++class PrefRegistrySimple;
++
++namespace network {
++class SimpleURLLoader;
++}  // namespace network
++
++namespace tark_update {
++
++// Local state: when the index was last fetched, successfully or not.
++inline constexpr char kLastCheckPref[] = "tark.update.last_check";
++
++// Tark for Android (A5): the direct APK's check for a newer version, at most
++// once a day, while Tark runs. A plain GET of gettarka.com's index, with no
++// cookies and no query string; a newer version shows as the app menu's
++// "Update" item (UpdateStatusProvider). Never started when Play installed the
++// app: Play updates it.
++class UpdateCheckService {
++ public:
++  static void RegisterPrefs(PrefRegistrySimple* registry);
++  // Created at browser start (chrome_browser_main_android.cc).
++  static UpdateCheckService& Get();
++
++  UpdateCheckService(const UpdateCheckService&) = delete;
++  UpdateCheckService& operator=(const UpdateCheckService&) = delete;
++
++ private:
++  friend class base::NoDestructor<UpdateCheckService>;
++  UpdateCheckService();
++  ~UpdateCheckService();
++
++  void MaybeCheck();
++  void OnFetched(std::optional<std::string> body);
++
++  std::unique_ptr<network::SimpleURLLoader> loader_;
++  base::OneShotTimer first_;
++  base::RepeatingTimer hourly_;
++  SEQUENCE_CHECKER(sequence_checker_);
++  base::WeakPtrFactory<UpdateCheckService> weak_factory_{this};
++};
++
++}  // namespace tark_update
++
++#endif  // CHROME_BROWSER_TARK_UPDATE_UPDATE_CHECK_SERVICE_H_
+--- /dev/null
++++ b/chrome/browser/tark_update/update_check_service.cc
+@@ -0,0 +1,152 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/tark_update/update_check_service.h"
++
++#include <utility>
++
++#include "base/android/jni_android.h"
++#include "base/android/jni_string.h"
++#include "base/command_line.h"
++#include "base/functional/bind.h"
++#include "base/logging.h"
++#include "chrome/browser/browser_process.h"
++#include "chrome/browser/tark_update/update_index.h"
++#include "components/prefs/pref_registry_simple.h"
++#include "components/prefs/pref_service.h"
++#include "net/traffic_annotation/network_traffic_annotation.h"
++#include "services/network/public/cpp/resource_request.h"
++#include "services/network/public/cpp/shared_url_loader_factory.h"
++#include "services/network/public/cpp/simple_url_loader.h"
++#include "services/network/public/mojom/fetch_api.mojom-shared.h"
++#include "url/gurl.h"
++
++// Must come after all headers that specialize FromJniType() / ToJniType().
++#include "chrome/browser/omaha/android/jni_headers/TarkUpdate_jni.h"
++
++namespace tark_update {
++
++namespace {
++
++constexpr base::TimeDelta kFirstCheckDelay = base::Seconds(30);
++constexpr base::TimeDelta kTimeout = base::Seconds(30);
++
++// For android/update/e2e/run.py only: the index's URL instead of
++// gettarka.com's. Chrome reads command-line flags from a file only on a
++// debuggable or rooted device, as with --tark-xlit-base-url.
++constexpr char kIndexUrlSwitch[] = "tark-update-base-url";
++
++constexpr net::NetworkTrafficAnnotationTag kTrafficAnnotation =
++    net::DefineNetworkTrafficAnnotation("tark_update_check", R"(
++      semantics {
++        sender: "Tark update check"
++        description:
++          "Reads the small index of the newest Tark for Android on "
++          "gettarka.com, so that the app menu can offer a newer version of "
++          "the APK the person installed from gettarka.com."
++        trigger: "At most once a day while Tark runs; never when Tark was "
++          "installed from Google Play."
++        data: "None: no cookies, no identifiers, no query string."
++        destination: OTHER
++      }
++      policy {
++        cookies_allowed: NO
++        setting: "Installing Tark from Google Play instead turns it off."
++        policy_exception_justification: "Tark has no enterprise policies."
++      })");
++
++GURL IndexUrl() {
++  const base::CommandLine& command_line =
++      *base::CommandLine::ForCurrentProcess();
++  return command_line.HasSwitch(kIndexUrlSwitch)
++             ? GURL(command_line.GetSwitchValueASCII(kIndexUrlSwitch))
++             : GURL(kIndexUrl);
++}
++
++}  // namespace
++
++// static
++void UpdateCheckService::RegisterPrefs(PrefRegistrySimple* registry) {
++  registry->RegisterTimePref(kLastCheckPref, base::Time());
++}
++
++// static
++UpdateCheckService& UpdateCheckService::Get() {
++  static base::NoDestructor<UpdateCheckService> service;
++  return *service;
++}
++
++UpdateCheckService::UpdateCheckService() {
++  if (!Java_TarkUpdate_isEnabled(base::android::AttachCurrentThread())) {
++    return;
++  }
++  first_.Start(FROM_HERE, kFirstCheckDelay,
++               base::BindOnce(&UpdateCheckService::MaybeCheck,
++                              weak_factory_.GetWeakPtr()));
++  hourly_.Start(FROM_HERE, base::Hours(1),
++                base::BindRepeating(&UpdateCheckService::MaybeCheck,
++                                    weak_factory_.GetWeakPtr()));
++}
++
++UpdateCheckService::~UpdateCheckService() = default;
++
++void UpdateCheckService::MaybeCheck() {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  PrefService* local_state = g_browser_process->local_state();
++  if (loader_ || !ShouldCheckNow(base::Time::Now(),
++                                 local_state->GetTime(kLastCheckPref))) {
++    return;
++  }
++  // Recorded before the result: a failure waits a day too.
++  local_state->SetTime(kLastCheckPref, base::Time::Now());
++  auto request = std::make_unique<network::ResourceRequest>();
++  request->url = IndexUrl();
++  request->method = "GET";
++  request->credentials_mode = network::mojom::CredentialsMode::kOmit;
++  loader_ = network::SimpleURLLoader::Create(std::move(request),
++                                             kTrafficAnnotation);
++  loader_->SetTimeoutDuration(kTimeout);
++  // The index is served as it is; a redirect anywhere is refused.
++  loader_->SetOnRedirectCallback(base::BindRepeating(
++      [](base::WeakPtr<UpdateCheckService> service, const GURL&,
++         const net::RedirectInfo&, const network::mojom::URLResponseHead&,
++         std::vector<std::string>*) {
++        if (service) {
++          service->loader_.reset();
++        }
++      },
++      weak_factory_.GetWeakPtr()));
++  loader_->DownloadToString(
++      g_browser_process->shared_url_loader_factory().get(),
++      base::BindOnce(
++          [](base::WeakPtr<UpdateCheckService> service,
++             std::optional<std::string> body) {
++            if (service) {
++              service->OnFetched(std::move(body));
++            }
++          },
++          weak_factory_.GetWeakPtr()),
++      kMaxIndexBytes);
++}
++
++void UpdateCheckService::OnFetched(std::optional<std::string> body) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  loader_.reset();
++  const std::optional<UpdateIndex> index =
++      body ? ParseIndex(*body) : std::nullopt;
++  if (!index) {
++    LOG(WARNING) << "tark update: no index";
++    return;
++  }
++  JNIEnv* env = base::android::AttachCurrentThread();
++  if (!IsNewer(*index, Java_TarkUpdate_installedVersionCode(env))) {
++    LOG(WARNING) << "tark update: up to date";
++    return;
++  }
++  LOG(WARNING) << "tark update: " << index->version_name << " available";
++  Java_TarkUpdate_offer(env, index->version_code, index->version_name,
++                        index->url.spec());
++}
++
++}  // namespace tark_update
+--- /dev/null
++++ b/chrome/browser/omaha/android/java/src/org/chromium/chrome/browser/omaha/TarkUpdate.java
+@@ -0,0 +1,108 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++package org.chromium.chrome.browser.omaha;
++
++import android.content.Context;
++import android.content.SharedPreferences;
++import android.content.pm.PackageManager;
++import android.os.Build;
++
++import org.jni_zero.CalledByNative;
++import org.jni_zero.JNINamespace;
++import org.jni_zero.JniType;
++
++import org.chromium.base.ContextUtils;
++import org.chromium.base.ThreadUtils;
++import org.chromium.build.annotations.NullMarked;
++import org.chromium.build.annotations.Nullable;
++import org.chromium.chrome.browser.omaha.UpdateStatusProvider.UpdateState;
++import org.chromium.chrome.browser.omaha.UpdateStatusProvider.UpdateStatus;
++
++/**
++ * Tark for Android (A5): the direct APK's update check, Java side. The native
++ * UpdateCheckService fetches gettarka.com's index at most once a day; a newer
++ * version is kept here and shown by {@link UpdateStatusProvider} as the app
++ * menu's "Update" item. Nothing runs when Google Play installed the app.
++ */
++@NullMarked
++@JNINamespace("tark_update")
++public final class TarkUpdate {
++    private static final String PLAY_STORE = "com.android.vending";
++    private static final String KEY_CODE = "tark.update.latest_code";
++    private static final String KEY_NAME = "tark.update.latest_name";
++    private static final String KEY_URL = "tark.update.latest_url";
++
++    private TarkUpdate() {}
++
++    /** Whether Google Play installed Tark: Play updates it, not this check. */
++    static boolean installedFromPlay() {
++        Context context = ContextUtils.getApplicationContext();
++        PackageManager pm = context.getPackageManager();
++        String installer;
++        try {
++            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
++                installer =
++                        pm.getInstallSourceInfo(context.getPackageName())
++                                .getInstallingPackageName();
++            } else {
++                installer = pm.getInstallerPackageName(context.getPackageName());
++            }
++        } catch (PackageManager.NameNotFoundException e) {
++            return false;
++        }
++        return PLAY_STORE.equals(installer);
++    }
++
++    @CalledByNative
++    static boolean isEnabled() {
++        return !installedFromPlay();
++    }
++
++    @CalledByNative
++    static long installedVersionCode() {
++        Context context = ContextUtils.getApplicationContext();
++        try {
++            return context.getPackageManager()
++                    .getPackageInfo(context.getPackageName(), 0)
++                    .getLongVersionCode();
++        } catch (PackageManager.NameNotFoundException e) {
++            return Long.MAX_VALUE;
++        }
++    }
++
++    /** A newer version, from the native check: kept, and shown in the menu. */
++    @CalledByNative
++    static void offer(
++            long versionCode,
++            @JniType("std::string") String versionName,
++            @JniType("std::string") String url) {
++        ThreadUtils.assertOnUiThread();
++        ContextUtils.getAppSharedPreferences()
++                .edit()
++                .putLong(KEY_CODE, versionCode)
++                .putString(KEY_NAME, versionName)
++                .putString(KEY_URL, url)
++                .apply();
++        UpdateStatusProvider.getInstance().onTarkUpdate();
++    }
++
++    /**
++     * The update the menu offers: the newest version a check found, while it
++     * is newer than the installed one; otherwise an update state of NONE.
++     */
++    static UpdateStatus status() {
++        UpdateStatus status = new UpdateStatus();
++        status.updateState = UpdateState.NONE;
++        if (installedFromPlay()) return status;
++        SharedPreferences prefs = ContextUtils.getAppSharedPreferences();
++        @Nullable String url = prefs.getString(KEY_URL, null);
++        if (url != null && prefs.getLong(KEY_CODE, 0) > installedVersionCode()) {
++            status.updateState = UpdateState.UPDATE_AVAILABLE;
++            status.updateUrl = url;
++            status.latestVersion = prefs.getString(KEY_NAME, null);
++        }
++        return status;
++    }
++}
+--- a/chrome/browser/omaha/android/BUILD.gn
++++ b/chrome/browser/omaha/android/BUILD.gn
+@@ -3,6 +3,7 @@
+ # found in the LICENSE file.
+ 
+ import("//build/config/android/rules.gni")
++import("//third_party/jni_zero/jni_zero.gni")
+ 
+ android_library("java") {
+   sources = [
+@@ -10,6 +11,7 @@
+     "java/src/org/chromium/chrome/browser/omaha/MarketURLGetter.java",
+     "java/src/org/chromium/chrome/browser/omaha/OmahaPrefUtils.java",
+     "java/src/org/chromium/chrome/browser/omaha/RequestFailureException.java",
++    "java/src/org/chromium/chrome/browser/omaha/TarkUpdate.java",
+     "java/src/org/chromium/chrome/browser/omaha/StringSanitizer.java",
+     "java/src/org/chromium/chrome/browser/omaha/UpdateConfigs.java",
+     "java/src/org/chromium/chrome/browser/omaha/UpdateStatusProvider.java",
+@@ -19,8 +21,11 @@
+     "java/src/org/chromium/chrome/browser/omaha/metrics/TrackingProvider.java",
+     "java/src/org/chromium/chrome/browser/omaha/metrics/UpdateSuccessMetrics.java",
+   ]
++  srcjar_deps = [ ":jni_headers" ]
+   deps = [
+     ":update_proto_java",
++    "//build/android:build_java",
++    "//third_party/jni_zero:jni_zero_java",
+     "$google_play_services_package:google_play_services_base_java",
+     "//base:base_java",
+     "//base:base_shared_preferences_java",
+@@ -37,6 +42,12 @@
+   ]
+ }
+ 
++# Tark (A5): the direct APK's update check calls TarkUpdate from
++# //chrome/browser/tark_update.
++generate_jni("jni_headers") {
++  sources = [ "java/src/org/chromium/chrome/browser/omaha/TarkUpdate.java" ]
++}
++
+ proto_java_library("update_proto_java") {
+   proto_path = "java/src/org/chromium/chrome/browser/omaha/metrics"
+   sources = [ "$proto_path/update_success_tracking.proto" ]
+--- a/chrome/browser/omaha/android/java/src/org/chromium/chrome/browser/omaha/UpdateStatusProvider.java
++++ b/chrome/browser/omaha/android/java/src/org/chromium/chrome/browser/omaha/UpdateStatusProvider.java
+@@ -10,20 +10,13 @@
+ import android.content.Context;
+ import android.content.Intent;
+ import android.net.Uri;
+-import android.os.Environment;
+-import android.os.StatFs;
+ import android.text.TextUtils;
+ 
+ import androidx.annotation.IntDef;
+-
+-import com.google.android.gms.common.GooglePlayServicesUtil;
+ 
+ import org.chromium.base.ApkInfo;
+ import org.chromium.base.Callback;
+-import org.chromium.base.DeviceInfo;
+ import org.chromium.base.ObserverList;
+-import org.chromium.base.PackageUtils;
+-import org.chromium.base.ThreadUtils;
+ import org.chromium.base.task.AsyncTask;
+ import org.chromium.base.task.AsyncTask.Status;
+ import org.chromium.base.task.PostTask;
+@@ -34,9 +27,7 @@
+ import org.chromium.chrome.browser.omaha.metrics.UpdateSuccessMetrics;
+ import org.chromium.chrome.browser.preferences.ChromePreferenceKeys;
+ import org.chromium.chrome.browser.preferences.ChromeSharedPreferences;
+-import org.chromium.components.browser_ui.util.ConversionUtils;
+-
+-import java.io.File;
++
+ import java.lang.annotation.Retention;
+ import java.lang.annotation.RetentionPolicy;
+ 
+@@ -192,8 +183,9 @@
+             mMetrics.startUpdate();
+ 
+             Intent intent = new Intent(Intent.ACTION_VIEW, Uri.parse(mStatus.updateUrl));
+-            // Ensure that the app vs browser disambiguation dialog is not shown.
+-            intent.addFlags(Intent.FLAG_ACTIVITY_REQUIRE_NON_BROWSER);
++            // Tark (A5): the update is an APK on gettarka.com, which Tark itself
++            // opens and downloads (no app store, no chooser).
++            intent.setPackage(context.getPackageName());
+             if (newTask) intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+             context.startActivity(intent);
+         } catch (ActivityNotFoundException e) {
+@@ -206,6 +198,19 @@
+     private UpdateStatusProvider() {
+         mOmahaQuery = new UpdateQuery(this::resolveStatus);
+         mMetrics = new UpdateSuccessMetrics();
++    }
++
++    /**
++     * Tark (A5): the update check (TarkUpdate) found a newer version: the menu shows it now,
++     * without waiting for the next start.
++     */
++    void onTarkUpdate() {
++        if (mStatus == null) return; // The first status, when it comes, reads it.
++        UpdateStatus tark = TarkUpdate.status();
++        mStatus.updateState = tark.updateState;
++        mStatus.updateUrl = tark.updateUrl;
++        mStatus.latestVersion = tark.latestVersion;
++        pingObservers();
+     }
+ 
+     @RequiresNonNull("mStatus")
+--- a/chrome/browser/omaha/android/java/src/org/chromium/chrome/browser/omaha/UpdateStatusProvider.java
++++ b/chrome/browser/omaha/android/java/src/org/chromium/chrome/browser/omaha/UpdateStatusProvider.java
+@@ -295,50 +295,9 @@
+         }
+ 
+         private UpdateStatus getRealStatus() {
+-            UpdateStatus status = new UpdateStatus();
+-
+-            if (VersionNumberGetter.isNewerVersionAvailable()) {
+-                status.updateUrl = MarketURLGetter.getMarketUrl();
+-                status.latestVersion = VersionNumberGetter.getInstance().getLatestKnownVersion();
+-
+-                boolean allowedToUpdate =
+-                        checkForSufficientStorage()
+-                                // Disable the version update check for automotive. See b/297925838.
+-                                && !DeviceInfo.isAutomotive()
+-                                && PackageUtils.isPackageInstalled(
+-                                        GooglePlayServicesUtil.GOOGLE_PLAY_STORE_PACKAGE);
+-                status.updateState =
+-                        allowedToUpdate ? UpdateState.UPDATE_AVAILABLE : UpdateState.NONE;
+-
+-                ChromeSharedPreferences.getInstance()
+-                        .removeKey(ChromePreferenceKeys.LATEST_UNSUPPORTED_VERSION);
+-            } else if (!VersionNumberGetter.isCurrentOsVersionSupported()) {
+-                status.updateState = UpdateState.UNSUPPORTED_OS_VERSION;
+-                status.latestUnsupportedVersion =
+-                        ChromeSharedPreferences.getInstance()
+-                                .readString(ChromePreferenceKeys.LATEST_UNSUPPORTED_VERSION, null);
+-            } else {
+-                status.updateState = UpdateState.NONE;
+-            }
+-
+-            return status;
+-        }
+-
+-        private boolean checkForSufficientStorage() {
+-            assert !ThreadUtils.runningOnUiThread();
+-
+-            File path = Environment.getDataDirectory();
+-            StatFs statFs = new StatFs(path.getAbsolutePath());
+-            long size = getSize(statFs);
+-
+-            int minRequiredStorage = UpdateConfigs.getMinRequiredStorage();
+-            if (minRequiredStorage == -1) return true;
+-
+-            return size >= minRequiredStorage;
+-        }
+-
+-        private long getSize(StatFs statFs) {
+-            return ConversionUtils.bytesToMegabytes(statFs.getAvailableBytes());
++            // Tark (A5): the newest version the update check found (TarkUpdate),
++            // never Google's update service or the Play Store.
++            return TarkUpdate.status();
+         }
+     }
+ }
+--- a/chrome/browser/BUILD.gn
++++ b/chrome/browser/BUILD.gn
+@@ -1662,8 +1662,14 @@
+       "tark_xlit/android/tark_xlit_bridge.cc",
+       "tark_xlit/xlit_download_service.cc",
+       "tark_xlit/xlit_download_service.h",
+-    ]
+-    deps += [
++
++      # The direct APK's daily update check (A5).
++      "tark_update/update_check_service.cc",
++      "tark_update/update_check_service.h",
++    ]
++    deps += [
++      "//chrome/browser/omaha/android:jni_headers",
++      "//chrome/browser/tark_update:index",
+       "//chrome/browser/tark_xlit:files",
+       "//chrome/browser/tark_xlit/android:jni_headers",
+     ]
+--- a/chrome/browser/chrome_browser_main_android.cc
++++ b/chrome/browser/chrome_browser_main_android.cc
+@@ -20,6 +20,7 @@
+ #include "chrome/browser/data_saver/data_saver.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/tark_adblock/tark_adblock_service.h"
++#include "chrome/browser/tark_update/update_check_service.h"
+ #include "chrome/browser/tark_xlit/xlit_download_service.h"
+ #include "chrome/browser/webauthn/android/cable_module_android.h"
+ #include "components/crash/content/browser/child_exit_observer_android.h"
+@@ -123,6 +124,10 @@
+   // Tark (A3): finds the Indian-language suggestions' downloaded files, and
+   // resumes a download the person said yes to. Fetches nothing otherwise.
+   tark_xlit::XlitDownloadService::Get();
++
++  // Tark (A5): the direct APK's check for a newer version, once a day; off
++  // when Google Play installed Tark.
++  tark_update::UpdateCheckService::Get();
+ }
+ 
+ void ChromeBrowserMainPartsAndroid::ShowMissingLocaleMessageBox() {
+--- a/chrome/browser/prefs/browser_prefs.cc
++++ b/chrome/browser/prefs/browser_prefs.cc
+@@ -275,6 +275,7 @@
+ 
+ #if BUILDFLAG(IS_ANDROID)
+ #include "chrome/browser/accessibility/accessibility_prefs/android/accessibility_prefs_controller.h"
++#include "chrome/browser/tark_update/update_check_service.h"
+ #include "chrome/browser/tark_xlit/xlit_download_service.h"
+ #include "chrome/browser/android/ntp/recent_tabs_page_prefs.h"
+ #include "chrome/browser/android/oom_intervention/oom_intervention_decider.h"
+@@ -1419,6 +1420,7 @@
+   tark::RegisterWidevineLocalStatePrefs(registry);
+ #if BUILDFLAG(IS_ANDROID)
+   tark_xlit::XlitDownloadService::RegisterPrefs(registry);
++  tark_update::UpdateCheckService::RegisterPrefs(registry);
+   accessibility::AccessibilityPrefsController::RegisterLocalStatePrefs(
+       registry);
+ #endif
+--- a/chrome/browser/ui/android/strings/android_chrome_strings.grd
++++ b/chrome/browser/ui/android/strings/android_chrome_strings.grd
+@@ -894,6 +894,9 @@
+       <message name="IDS_TARK_XLIT_SWITCH_DOWNLOADED" desc="Tark: summary of the Indian-language suggestions switch: on, with the languages whose suggestions are downloaded, in their own names.">
+         Downloaded: <ph name="LANGUAGES">%1$s<ex>हिन्दी, தமிழ்</ex></ph>
+       </message>
++      <message name="IDS_TARK_CONNECTS_UPDATE" desc="Tark: item in the list of services Tark connects to: the direct APK's daily check for a newer version, with its host name.">
++        New versions of Tark, checked once a day unless Google Play installed it (gettarka.com)
++      </message>
+       <message name="IDS_TARK_CONNECTS_LISTS" desc="Tark: item in the list of services Tark connects to: the ad blocker's daily lists from Tark's site, with its host name.">
+         Tark's ad-blocking lists, once a day on Wi-Fi or every three days on mobile data (gettarka.com)
+       </message>
+--- a/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb
++++ b/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb
+@@ -2169,4 +2169,5 @@
+ <translation id="6612875707773743625">भारतीय भाषाओं में सुझाव</translation>
+ <translation id="8304126055697421220">Wi-Fi का इंतज़ार है</translation>
+ <translation id="9054517922063697959">डाउनलोड हो गए: <ph name="LANGUAGES"/></translation>
++<translation id="8955589894175271948">Tark के नए वर्शन, दिन में एक बार जांचे जाते हैं, जब तक इसे Google Play से इंस्टॉल न किया गया हो (gettarka.com)</translation>
+ </translationbundle>
+\ No newline at end of file
+--- a/chrome/android/java/res/xml/privacy_preferences.xml
++++ b/chrome/android/java/res/xml/privacy_preferences.xml
+@@ -59,6 +59,9 @@
+     <org.chromium.components.browser_ui.settings.TextMessagePreference
+         android:key="tark_connects_xlit"
+         android:summary="@string/tark_connects_xlit" />
++    <org.chromium.components.browser_ui.settings.TextMessagePreference
++        android:key="tark_connects_update"
++        android:summary="@string/tark_connects_update" />
+ 
+     <org.chromium.components.browser_ui.settings.ChromeBasePreferenceCategory
+         android:key="security_section"

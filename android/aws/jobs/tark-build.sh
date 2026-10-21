@@ -47,7 +47,7 @@ echo "submodule $SUB" >> $log
 
 (( fresh )) && rm -rf /tark/work/src /tark/work/src-base /tark/work/prepared.stamp /tark/work/base.stamp /tark/work/layers.json
 # An earlier build's APK must never be uploaded as this job's.
-rm -f /tark/work/src/out/Default/apks/ChromePublic.apk
+rm -f /tark/work/src/out/Default/apks/ChromePublic.apk /tark/work/src/out/Default/apks/ChromePublic.aab
 # A2: a list bundle staged in s3://BUCKET/lists/ (latest.json and its zip)
 # stands in for gettarka.com's; build.sh checks its signature either way.
 rm -rf /tark/lists && mkdir -p /tark/lists
@@ -59,6 +59,7 @@ timeout 8h bash $repo/android/build.sh $stop /tark/work >> $log 2>&1
 code=$?
 echo "exit $code" >> $log
 (( code == 0 )) && upload /tark/work/src/out/Default/apks/ChromePublic.apk ChromePublic.apk
+(( code == 0 )) && upload /tark/work/src/out/Default/apks/ChromePublic.aab ChromePublic.aab
 # A3: the IndicXlit files this APK pins (android/xlit/files.py), for the
 # emulator checks and for publishing on gettarka.com.
 if (( code == 0 )); then
