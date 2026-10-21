@@ -28,9 +28,14 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / 'utils'))
 from net_hosts import load_allowed, strangers  # noqa: E402
 
 _ETHERNET, _RAW, _IPV4, _IPV6 = 1, 101, 228, 229
-_GOOGLE = ('google', 'gstatic', 'googleapis', 'gvt1', 'gvt2', 'youtube', 'doubleclick',
-           'googlesyndication', 'googleusercontent', 'firebase', 'app-measurement',
-           'android.com', 'ggpht')
+# Google's names: any label that starts with one of these (google-analytics,
+# googlevideo, gvt1, firebaseio...), or one of Google's other domains. Taking
+# a stranger for Google only makes the check stricter; the other way round,
+# the idle baseline could hide Tark contacting Google.
+_GOOGLE_PREFIXES = ('google', 'gstatic', 'gvt', 'youtube', 'doubleclick', 'firebase', 'ggpht',
+                    'app-measurement')
+_GOOGLE_DOMAINS = ('youtu.be', 'android.com', 'goo.gl', 'g.co', 'gmail.com', 'recaptcha.net',
+                   'withgoogle.com', 'blogger.com', 'admob.com', '2mdn.net')
 _MAGIC = {b'\xd4\xc3\xb2\xa1': '<', b'\xa1\xb2\xc3\xd4': '>',
           b'\x4d\x3c\xb2\xa1': '<', b'\xa1\xb2\x3c\x4d': '>'}
 
@@ -144,7 +149,10 @@ def main(argv=None):
 
 def is_google(host):
     """Whether a name belongs to Google (the baseline never hides these)."""
-    return any(part in host.split('.') or host.endswith('.' + part) for part in _GOOGLE)
+    host = host.lower().rstrip('.')
+    if any(label.startswith(_GOOGLE_PREFIXES) for label in host.split('.')):
+        return True
+    return any(host == d or host.endswith('.' + d) for d in _GOOGLE_DOMAINS)
 
 
 if __name__ == '__main__':

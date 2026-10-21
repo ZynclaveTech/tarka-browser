@@ -98,6 +98,29 @@ class TestPcapHosts(unittest.TestCase):
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn('www.google.com', result.stdout.split('Not on the allowed list:')[1])
 
+    def test_every_google_name_is_google(self):
+        # Review (2026-10-21): names where "google" is not a whole label, and
+        # Google's other domains, were taken for strangers to Google, so the
+        # idle baseline could hide Tark contacting them.
+        import pcap_hosts
+        for host in ('google-analytics.com', 'www.googletagmanager.com', 'googleadservices.com',
+                     'rr1---sn-ab.googlevideo.com', 'youtu.be', 'android.com', 'www.android.com',
+                     'myapp.firebaseio.com', 'x.firebaseapp.com', 'app-measurement.com',
+                     'www.google.co.in', 'fonts.gstatic.com', 'redirector.gvt1.com', 'lh3.ggpht.com',
+                     'ad.doubleclick.net', 'goo.gl', 'www.gmail.com', 'www.recaptcha.net'):
+            self.assertTrue(pcap_hosts.is_google(host), host)
+        for host in ('shodhya.com', 'gettarka.com', 'pool.ntp.org', 'easylist.to', 'notandroid.com',
+                     'mygoogle-fan.example'):
+            self.assertFalse(pcap_hosts.is_google(host), host)
+
+    def test_baseline_never_hides_googles_other_domains(self):
+        run = self.write([ethernet(udp_ipv4(dns_query('www.google-analytics.com')), 0x0800)])
+        idle = self.write([ethernet(udp_ipv4(dns_query('www.google-analytics.com')), 0x0800)])
+        result = subprocess.run([sys.executable, str(TOOL), str(run), '--baseline', str(idle)],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn('www.google-analytics.com', result.stdout.split('Not on the allowed list:')[1])
+
     def test_os_host_is_named_and_shown(self):
         # A Google name Android itself looks up is left out only when named.
         run = self.write([ethernet(udp_ipv4(dns_query('android.googleapis.com')), 0x0800),

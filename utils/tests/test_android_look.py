@@ -306,6 +306,59 @@ class TestDividers(unittest.TestCase):
         self.assertFalse(walk_settings.is_tark_screen(system))
         self.assertTrue(walk_settings.is_tark_screen(tark))
 
+    class FakeDevice:
+        """check_dividers' view of a phone: what a UI dump and a screencap
+        return, each as a list of successive answers."""
+
+        def __init__(self, dumps, screencaps=()):
+            self.dumps, self.screencaps = list(dumps), list(screencaps)
+            walk_settings.RETRY_WAIT = 0
+
+        def shell(self, *args):
+            if args[:2] == ('cat', '/sdcard/ui.xml'):
+                return self.dumps.pop(0) if self.dumps else ''
+            return ''
+
+        def screencap(self):
+            return self.screencaps.pop(0) if self.screencaps else b''
+
+    TWO_ROWS = ('<hierarchy><node package="com.gettarka.tarka" class="androidx.recyclerview.widget.RecyclerView" '
+                'bounds="[0,0][200,120]"><node class="android.widget.LinearLayout" bounds="[0,0][200,40]"/>'
+                '<node class="android.widget.LinearLayout" bounds="[0,40][200,80]"/></node></hierarchy>')
+
+    def test_an_empty_dump_is_an_error_not_a_pass(self):
+        # Review (2026-10-21): a failed dump read as "n/a", which passed.
+        self.assertEqual(walk_settings.check_dividers(self.FakeDevice(['', '', ''])), 'ERROR')
+
+    def test_a_malformed_dump_is_an_error_not_a_crash(self):
+        self.assertEqual(walk_settings.check_dividers(self.FakeDevice(['<hierarchy><node'] * 3)), 'ERROR')
+
+    def test_a_dump_that_fails_once_is_tried_again(self):
+        img = _image(200, 120, [(39, 16, 200)])
+        dev = self.FakeDevice(['', self.TWO_ROWS], [img])
+        self.assertEqual(walk_settings.check_dividers(dev), 'ok')
+
+    def test_an_unreadable_screencap_is_an_error(self):
+        dev = self.FakeDevice([self.TWO_ROWS], [b'', b'\x01\x02', b''])
+        self.assertEqual(walk_settings.check_dividers(dev), 'ERROR')
+
+    def test_only_tarks_crashes_count(self):
+        # Review (2026-10-21): another app's crash in the log was taken for
+        # Tark's.
+        log = '\n'.join([
+            'E AndroidRuntime: FATAL EXCEPTION: main',
+            'E AndroidRuntime: Process: com.android.settings, PID: 812',
+            'F libc    : Fatal signal 11 (SIGSEGV), code 1, fault addr 0x0 in tid 900 (RenderThread), pid 880 (ndroid.systemui)',
+            'I other   : unrelated',
+            'E AndroidRuntime: FATAL EXCEPTION: main',
+            'E AndroidRuntime: Process: com.gettarka.tarka, PID: 4300',
+            'F libc    : Fatal signal 6 (SIGABRT), code -1 in tid 5100 (CrRendererMain), pid 5090 (sandboxed_proce)',
+            'F DEBUG   : pid: 5090, tid: 5100, name: CrRendererMain  >>> com.gettarka.tarka:sandboxed_process0 <<<',
+        ])
+        tark, others = walk_settings.split_crashes(log)
+        self.assertEqual(len(tark), 2, tark)
+        self.assertEqual(len(others), 2, others)
+
     def test_rows_are_the_list_children(self):
         xml = ('<hierarchy><node class="android.widget.FrameLayout" bounds="[0,0][200,300]">'
                '<node class="androidx.recyclerview.widget.RecyclerView" bounds="[0,0][200,300]">'

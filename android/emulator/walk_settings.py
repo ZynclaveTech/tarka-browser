@@ -11,8 +11,8 @@ Defaults to the emulator (emulator-5554); a real phone only with
 
 --dividers (A3): also checks that every screen with a list of two or more
 rows draws a hairline between rows somewhere, from a screenshot; prints
-"divider ok", "divider MISSING" or "divider n/a" per screen, and exits 1 on
-any missing.
+"divider ok", "divider MISSING", "divider n/a" or "divider ERROR" (the
+screen could not be read) per screen, and exits 1 on any missing or error.
 """
 import argparse
 import re
@@ -63,16 +63,43 @@ class Device:
         time.sleep(4)
 
     def crashes(self):
-        log = self.run('logcat', '-d')
-        return [l for l in log.splitlines() if 'Fatal signal' in l or 'FATAL EXCEPTION' in l]
+        """Tark's crashes in the log; other apps' are printed and ignored."""
+        tark, others = split_crashes(self.run('logcat', '-d'))
+        if others:
+            print(f'         ({len(others)} crash(es) in other apps, ignored)')
+        return tark
+
+    def screencap(self):
+        return subprocess.run(self.adb + ['exec-out', 'screencap'], capture_output=True).stdout
 
     def alive(self):
         return self.shell('pidof', PACKAGE).strip() != ''
 
 
+# Seconds between tries of a UI dump or screencap that came back unreadable.
+RETRY_WAIT = 1.0
+_CRASH_STARTS = ('Fatal signal', 'FATAL EXCEPTION')
+
+
+def split_crashes(log):
+    """(Tark's, other apps') crash reports in a logcat dump: each starts at a
+    "Fatal signal" or "FATAL EXCEPTION" line and runs up to the next one (30
+    lines at most); it is Tark's when it names the package, as the Java
+    report's "Process:" line and the native report's ">>> name <<<" line do."""
+    lines = log.splitlines()
+    starts = [i for i, l in enumerate(lines) if any(s in l for s in _CRASH_STARTS)]
+    tark, others = [], []
+    for n, i in enumerate(starts):
+        end = min(starts[n + 1] if n + 1 < len(starts) else len(lines), i + 30)
+        (tark if any(PACKAGE in l for l in lines[i:end]) else others).append(lines[i])
+    return tark, others
+
+
 def parse_screencap(data):
     """(width, height, RGBA bytes) of `adb exec-out screencap` output, whose
     header is 12 bytes, or 16 from Android 10 (a colour space)."""
+    if len(data) < 16:
+        raise ValueError('no screencap')
     width, height = struct.unpack('<II', data[:8])
     header = len(data) - width * height * 4
     if header not in (12, 16):
@@ -143,18 +170,47 @@ def is_tark_screen(xml):
     return bool(m) and m.group(1) == PACKAGE
 
 
+def _readable_dump(dev, tries=3):
+    """The screen's UI dump, tried again when it comes back empty or cut
+    short; None when it never parses."""
+    for attempt in range(tries):
+        dev.shell('uiautomator', 'dump', '/sdcard/ui.xml')
+        xml = dev.shell('cat', '/sdcard/ui.xml')
+        try:
+            ET.fromstring(xml)
+            return xml
+        except ET.ParseError:
+            if attempt + 1 < tries:
+                time.sleep(RETRY_WAIT)
+    return None
+
+
+def _readable_screencap(dev, tries=3):
+    for attempt in range(tries):
+        try:
+            return parse_screencap(dev.screencap())
+        except (ValueError, struct.error):
+            if attempt + 1 < tries:
+                time.sleep(RETRY_WAIT)
+    return None
+
+
 def check_dividers(dev):
-    """'ok', 'MISSING' or 'n/a' (fewer than two rows, or another app's
-    screen) for the screen shown."""
-    dev.shell('uiautomator', 'dump', '/sdcard/ui.xml')
-    xml = dev.shell('cat', '/sdcard/ui.xml')
+    """'ok', 'MISSING', 'n/a' (fewer than two rows, or another app's
+    screen) or 'ERROR' (the screen could not be read: a failure, never a
+    pass) for the screen shown."""
+    xml = _readable_dump(dev)
+    if xml is None:
+        return 'ERROR'
     if not is_tark_screen(xml):
         return 'n/a'
     items = list_items(xml)
     if len(items) < 2:
         return 'n/a'
-    data = subprocess.run(dev.adb + ['exec-out', 'screencap'], capture_output=True).stdout
-    return 'ok' if screen_has_dividers(parse_screencap(data), items) else 'MISSING'
+    img = _readable_screencap(dev)
+    if img is None:
+        return 'ERROR'
+    return 'ok' if screen_has_dividers(img, items) else 'MISSING'
 
 
 def collect(dev, pages=4):
@@ -220,7 +276,7 @@ def main(argv=None):
         failed += result != 'ok'
         print(f'{result:8} ' + (' > '.join(path) or 'Settings'))
         if divider:
-            failed += divider[0] == 'MISSING'
+            failed += divider[0] in ('MISSING', 'ERROR')
             print(f'divider {divider[0]} ' + (' > '.join(path) or 'Settings'))
     return 1 if failed else 0
 
