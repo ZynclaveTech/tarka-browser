@@ -1,0 +1,122 @@
+--- a/components/tark_xlit/blas_eigen.cc
++++ b/components/tark_xlit/blas_eigen.cc
+@@ -14,6 +14,14 @@
+     Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
+ using ConstMatrix = Eigen::Map<const RowMajor, 0, Eigen::OuterStride<>>;
+ using Matrix = Eigen::Map<RowMajor, 0, Eigen::OuterStride<>>;
++using ConstVector = Eigen::Map<const Eigen::VectorXf>;
++
++// Tark for Android: up to this many rows of a, GemmNT reads each row of b
++// once, straight from the weights, and dots it with every row of a. Eigen's
++// general product packs all of b first, on every call; with a decoder step's
++// one to four rows that copy cost more than the products themselves, three
++// times more when compiled for size, as Android is (41% of a word's time).
++constexpr int kDotRows = 16;
+ 
+ }  // namespace
+ 
+@@ -29,6 +37,18 @@
+             int ldc) {
+   const ConstMatrix am(a, m, k, Eigen::OuterStride<>(lda));
+   const ConstMatrix bm(b, n, k, Eigen::OuterStride<>(ldb));
++  if (m <= kDotRows) {
++    for (int j = 0; j < n; ++j) {
++      const ConstVector row_b(b + static_cast<ptrdiff_t>(j) * ldb, k);
++      for (int i = 0; i < m; ++i) {
++        const float dot =
++            row_b.dot(ConstVector(a + static_cast<ptrdiff_t>(i) * lda, k));
++        float& out = c[static_cast<ptrdiff_t>(i) * ldc + j];
++        out = beta == 0.0f ? dot : out + dot;
++      }
++    }
++    return;
++  }
+   Matrix cm(c, m, n, Eigen::OuterStride<>(ldc));
+   if (beta == 0.0f) {
+     cm.noalias() = am * bm.transpose();
+--- /dev/null
++++ b/components/tark_xlit/blas_unittest.cc
+@@ -0,0 +1,73 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// The matrix products (blas.h) against a plain reference: few rows take the
++// dot-product path, more take Eigen's general product (blas_eigen.cc).
++
++#include "components/tark_xlit/blas.h"
++
++#include <cmath>
++#include <cstddef>
++#include <vector>
++
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace tark_xlit::blas {
++namespace {
++
++// Deterministic values in [-1, 1).
++std::vector<float> Values(size_t count, unsigned seed) {
++  std::vector<float> values(count);
++  unsigned state = seed;
++  for (float& value : values) {
++    state = state * 1664525u + 1013904223u;
++    value = static_cast<float>(state >> 8) / static_cast<float>(1u << 23) - 1.0f;
++  }
++  return values;
++}
++
++// c = a b^T + beta c, in double.
++void Reference(int m, int n, int k, const std::vector<float>& a, int lda,
++               const std::vector<float>& b, int ldb, float beta,
++               std::vector<float>& c, int ldc) {
++  for (int i = 0; i < m; ++i) {
++    for (int j = 0; j < n; ++j) {
++      double sum = 0;
++      for (int p = 0; p < k; ++p) {
++        sum += static_cast<double>(a[i * lda + p]) * b[j * ldb + p];
++      }
++      c[i * ldc + j] = static_cast<float>(sum + beta * c[i * ldc + j]);
++    }
++  }
++}
++
++TEST(TarkXlitBlasTest, GemmNTMatchesTheReferenceForFewAndManyRows) {
++  constexpr int kN = 37;
++  constexpr int kK = 130;
++  // Strides wider than the rows, as the model's views into larger buffers.
++  constexpr int kLda = kK + 3;
++  constexpr int kLdb = kK + 5;
++  constexpr int kLdc = kN + 2;
++  for (int m : {1, 4, 16, 17, 40}) {
++    for (float beta : {0.0f, 1.0f}) {
++      SCOPED_TRACE(testing::Message() << "m=" << m << " beta=" << beta);
++      const std::vector<float> a = Values(static_cast<size_t>(m) * kLda, 1);
++      const std::vector<float> b = Values(static_cast<size_t>(kN) * kLdb, 2);
++      std::vector<float> c = Values(static_cast<size_t>(m) * kLdc, 3);
++      std::vector<float> expected = c;
++      GemmNT(m, kN, kK, a.data(), kLda, b.data(), kLdb, beta, c.data(), kLdc);
++      Reference(m, kN, kK, a, kLda, b, kLdb, beta, expected, kLdc);
++      for (int i = 0; i < m; ++i) {
++        for (int j = 0; j < kLdc; ++j) {
++          // Columns past n (the stride's padding) are never written.
++          EXPECT_NEAR(c[i * kLdc + j], expected[i * kLdc + j], 1e-4f)
++              << "row " << i << " column " << j;
++        }
++      }
++    }
++  }
++}
++
++}  // namespace
++}  // namespace tark_xlit::blas
+--- a/components/tark_xlit/BUILD.gn
++++ b/components/tark_xlit/BUILD.gn
+@@ -67,6 +67,7 @@
+     testonly = true
+     sources = [
+       "android_files_unittest.cc",
++      "blas_unittest.cc",
+       "android_offer_unittest.cc",
+       "languages_unittest.cc",
+       "model_unittest.cc",

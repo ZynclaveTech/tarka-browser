@@ -398,3 +398,31 @@ class TestPatchesWellFormed(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TestSmallProducts(unittest.TestCase):
+    """Faster rows (2026-10-21, the user: "Yes, implement the dot-product path
+    for small products test-first"): on the phone p95 was 110-122 ms against
+    100. The profile: 41% of the time in Eigen packing a whole weight matrix
+    before each product of 1-4 rows (a decoder step), 25% in the product."""
+
+    def setUp(self):
+        self.patch = (ROOT / 'android' / 'patches' / 'xlit-small-products.patch').read_text()
+        self.added = '\n'.join(l[1:] for l in self.patch.splitlines() if l.startswith('+'))
+
+    def test_few_rows_take_the_dot_product_path(self):
+        self.assertIn('+++ b/components/tark_xlit/blas_eigen.cc', self.patch)
+        self.assertIn('constexpr int kDotRows = 16;', self.added)
+        self.assertIn('if (m <= kDotRows) {', self.added)
+        self.assertIn('.dot(', self.added)
+
+    def test_products_are_checked_against_a_reference(self):
+        self.assertIn('+++ b/components/tark_xlit/blas_unittest.cc', self.patch)
+        self.assertIn('TEST(TarkXlitBlasTest, GemmNTMatchesTheReferenceForFewAndManyRows)', self.added)
+        self.assertIn('"blas_unittest.cc",', self.added)
+        for m in ('1, 4, 16, 17, 40',):
+            self.assertIn(m, self.added)
+
+    def test_in_the_series_after_the_files(self):
+        series = (ROOT / 'android' / 'patches' / 'series').read_text().split()
+        self.assertGreater(series.index('xlit-small-products.patch'), series.index('xlit-android-files.patch'))
