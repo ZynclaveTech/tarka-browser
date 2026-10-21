@@ -63,6 +63,11 @@ def prepare(repo, work):
     core_list.write_text(text, encoding='utf-8')
     (work / 'domain_substitution.list').write_text(text, encoding='utf-8')
 
+    # The targets ninja builds first (W2), so a compile error in Tark's code
+    # shows within the first CI stage.
+    (work / 'tark_ninja_first.txt').write_text(
+        '\n'.join(entries(HERE / 'ninja-first.txt')) + '\n', encoding='utf-8')
+
     shutil.copy2(HERE / 'tark_post_patch.py', work / 'tark_post_patch.py')
     (work / 'tark_repo.txt').write_text(str(repo) + '\n', encoding='utf-8')
     return len(series), len(tark)
