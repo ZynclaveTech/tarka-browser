@@ -305,3 +305,186 @@
 +
  }  // namespace
  }  // namespace tark_captions
+--- a/components/tark_captions/language_gate.cc
++++ b/components/tark_captions/language_gate.cc
+@@ -48,11 +48,12 @@
+   vad_.reset();
+ }
+ 
+-std::optional<Detection> LanguageGate::AddMono16k(base::span<const float> pcm) {
++LanguageGate::Result LanguageGate::AddMono16k(base::span<const float> pcm) {
++  Result result;
+   if (decided_) {
+-    return std::nullopt;
++    return result;
+   }
+-  std::optional<Detection> decision;
++  std::optional<Detection>& decision = result.decision;
+   for (float sample : pcm) {
+     chunk_.push_back(sample);
+     if (chunk_.size() < Vad::kChunk) {
+@@ -81,6 +82,17 @@
+     const double before = speech_seconds();
+     speech_.insert(speech_.end(), heard_.end() - Vad::kChunk, heard_.end());
+     const double now = speech_seconds();
++    // Guess when the speech crosses each check (captions at once).
++    for (double at : kGuessChecks) {
++      if (before < at && now >= at) {
++        std::optional<std::string> g =
++            GuessLanguage(detector_->Logits(speech_), detector_->labels());
++        if (g && *g != guess_) {
++          guess_ = *g;
++          result.guess = *g;
++        }
++      }
++    }
+     // Decide when the speech crosses 3 s, and again at 5 s if unsure.
+     for (double at : {kFirstDecision, kLastDecision}) {
+       if (before < at && now >= at) {
+@@ -92,7 +104,7 @@
+       }
+     }
+   }
+-  return decision;
++  return result;
+ }
+ 
+ std::vector<float> LanguageGate::TakeHeard() {
+--- a/components/tark_captions/language_gate.h
++++ b/components/tark_captions/language_gate.h
+@@ -7,6 +7,7 @@
+ 
+ #include <memory>
+ #include <optional>
++#include <string>
+ #include <vector>
+ 
+ #include "base/containers/span.h"
+@@ -21,7 +22,9 @@
+ 
+ // The first seconds of a call (D4 Phase 3): listens until the client has
+ // spoken for kFirstDecision seconds (kLastDecision when unsure), then says
+-// which language it is. Only speech counts (Silero VAD): silence, hold music
++// which language it is. Before that it guesses (captions at once): when the
++// speech crosses each of kGuessChecks, a changed GuessLanguage is reported,
++// so captions can start in it; the decision corrects a wrong guess. Only speech counts (Silero VAD): silence, hold music
+ // and noise never decide. What it heard since the speech began is kept so
+ // the captions, or the browser's Apple captioner, start from the first word.
+ // Use on one sequence.
+@@ -36,11 +39,19 @@
+   LanguageGate& operator=(const LanguageGate&) = delete;
+   ~LanguageGate();
+ 
+-  // 16 kHz mono call audio. The decision, the one time it is made.
+-  std::optional<Detection> AddMono16k(base::span<const float> pcm);
+-
+-  // The audio since just before the speech began (at most the last 30 s);
+-  // empty after it is taken.
++  struct Result {
++    // A new guess (never the same one twice, never after the decision).
++    std::optional<std::string> guess;
++    // The decision, the one time it is made.
++    std::optional<Detection> decision;
++  };
++  // 16 kHz mono call audio.
++  Result AddMono16k(base::span<const float> pcm);
++
++  // The audio since just before the speech began (at most the last 30 s),
++  // kept: a changed guess replays it.
++  base::span<const float> heard() const { return heard_; }
++  // The same audio, taken; empty afterwards.
+   std::vector<float> TakeHeard();
+   double speech_seconds() const;
+ 
+@@ -56,6 +67,7 @@
+   std::vector<float> speech_;   // Speech only: what the detector hears.
+   std::vector<float> heard_;    // Everything since the speech began.
+   std::vector<float> preroll_;  // The half second before it began.
++  std::string guess_;  // The last guess reported, if any.
+   bool decided_ = false;
+ };
+ 
+--- a/components/tark_captions/language_gate_unittest.cc
++++ b/components/tark_captions/language_gate_unittest.cc
+@@ -7,6 +7,7 @@
+ #include <memory>
+ #include <optional>
+ #include <string>
++#include <utility>
+ #include <vector>
+ 
+ #include "base/rand_util.h"
+@@ -29,14 +30,21 @@
+     ASSERT_TRUE(gate_);
+   }
+ 
+-  // Feeds `pcm` in 10 ms blocks; the first decision, if any.
++  // Feeds `pcm` in 10 ms blocks; the first decision, if any. Guesses are
++  // kept in `guesses_`, each with the seconds of speech it came at.
+   std::optional<Detection> Feed(const std::vector<float>& pcm) {
+     std::optional<Detection> first;
+     for (size_t i = 0; i < pcm.size(); i += 160) {
+-      std::optional<Detection> d =
++      LanguageGate::Result r =
+           gate_->AddMono16k(base::span(pcm).subspan(i, std::min<size_t>(160, pcm.size() - i)));
+-      if (d && !first) {
+-        first = d;
++      if (r.guess) {
++        guesses_.emplace_back(*r.guess, gate_->speech_seconds());
++        if (!first) {
++          heard_at_guess_ = gate_->heard().size();
++        }
++      }
++      if (r.decision && !first) {
++        first = r.decision;
+       }
+     }
+     return first;
+@@ -51,6 +59,8 @@
+ 
+   std::optional<base::FilePath> ort_, models_, testdata_;
+   std::unique_ptr<LanguageGate> gate_;
++  std::vector<std::pair<std::string, double>> guesses_;
++  size_t heard_at_guess_ = 0;
+ };
+ 
+ TEST_F(LanguageGateTest, DecidesSpanishAndKeepsWhatItHeard) {
+@@ -78,6 +88,38 @@
+   }
+   EXPECT_FALSE(Feed(pcm));
+   EXPECT_LT(gate_->speech_seconds(), kFirstDecision);
++  EXPECT_TRUE(guesses_.empty());
++}
++
++// Captions at once: a guess comes from the first 1 to 2 s of speech, the
++// decision later.
++TEST_F(LanguageGateTest, GuessesBeforeDeciding) {
++  std::optional<Detection> d = Feed(Clip("lid/hi_1.wav"));
++  ASSERT_TRUE(d);
++  EXPECT_EQ(d->code, "hi");
++  ASSERT_FALSE(guesses_.empty());
++  EXPECT_EQ(guesses_.front().first, "hi");
++  // A guess is made when the speech crosses a check (one VAD chunk late at most).
++  EXPECT_LE(guesses_.front().second, kGuessChecks[std::size(kGuessChecks) - 1] + 0.05);
++}
++
++TEST_F(LanguageGateTest, GuessIsReportedOnce) {
++  ASSERT_TRUE(Feed(Clip("lid/es_1.wav")));
++  ASSERT_EQ(guesses_.size(), 1u);
++  EXPECT_EQ(guesses_.front().first, "es");
++}
++
++// The audio since the speech began stays for a replay; the decision takes it.
++TEST_F(LanguageGateTest, HeardIsKeptForReplay) {
++  std::vector<float> pcm = Clip("lid/es_1.wav");
++  // Up to 2.5 s of the clip: past the guesses, before the decision.
++  pcm.resize(std::min<size_t>(pcm.size(), 40000));
++  Feed(pcm);
++  ASSERT_FALSE(guesses_.empty());
++  EXPECT_GT(heard_at_guess_, 0u);
++  const size_t kept = gate_->heard().size();
++  EXPECT_GE(kept, heard_at_guess_);
++  EXPECT_EQ(gate_->TakeHeard().size(), kept);
+ }
+ 
+ TEST_F(LanguageGateTest, MissingDetectorIsNull) {
