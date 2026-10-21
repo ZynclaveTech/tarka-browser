@@ -397,40 +397,30 @@
 +}  // namespace speech
 --- a/chrome/browser/chrome_content_browser_client.cc
 +++ b/chrome/browser/chrome_content_browser_client.cc
-@@ -482,6 +482,7 @@
- #include "chrome/browser/enterprise/platform_auth/platform_auth_proxying_url_loader_factory.h"
+@@ -483,4 +483,5 @@
  #include "chrome/common/chrome_version.h"
  #include "components/enterprise/platform_auth/platform_auth_features.h"
 +#include "chrome/browser/speech/chrome_speech_recognition_service.h"
  #include "components/soda/constants.h"
  #include "sandbox/mac/sandbox_serializer.h"
- #include "sandbox/policy/mac/params.h"
-@@ -8412,16 +8413,17 @@
-     sandbox::mojom::Sandbox sandbox_type,
+@@ -8413,5 +8414,9 @@
      sandbox::SandboxSerializer* serializer) {
    if (sandbox_type == sandbox::mojom::Sandbox::kSpeechRecognition) {
 -    base::FilePath soda_component_path = speech::GetSodaDirectory();
--    CHECK(!soda_component_path.empty());
 +    // Tark (D4): the speech service runs Tark's caption engine; it reads its
 +    // models from the captions folder (ONNX Runtime is in the app bundle,
 +    // which the sandbox already lets it read).
-+    const base::FilePath models_dir =
++    base::FilePath soda_component_path =
 +        speech::ChromeSpeechRecognitionService::TarkCaptionsModelsDir();
-+    CHECK(!models_dir.empty());
+     CHECK(!soda_component_path.empty());
      CHECK(serializer->SetParameter(sandbox::policy::kParamSodaComponentPath,
--                                   soda_component_path.value()));
--
--    base::FilePath soda_language_pack_path =
--        speech::GetSodaLanguagePacksDirectory();
--    CHECK(!soda_language_pack_path.empty());
-+                                   models_dir.value()));
-     CHECK(serializer->SetParameter(sandbox::policy::kParamSodaLanguagePackPath,
--                                   soda_language_pack_path.value()));
-+                                   models_dir.value()));
-+    return true;
-   }
+@@ -8419,5 +8424,5 @@
  
-   return false;
+     base::FilePath soda_language_pack_path =
+-        speech::GetSodaLanguagePacksDirectory();
++        speech::ChromeSpeechRecognitionService::TarkCaptionsModelsDir();
+     CHECK(!soda_language_pack_path.empty());
+     CHECK(serializer->SetParameter(sandbox::policy::kParamSodaLanguagePackPath,
 --- a/chrome/browser/speech/chrome_speech_recognition_service.h
 +++ b/chrome/browser/speech/chrome_speech_recognition_service.h
 @@ -32,6 +32,10 @@
