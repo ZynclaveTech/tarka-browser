@@ -151,6 +151,26 @@ class TestSigning(unittest.TestCase):
         self.assertEqual(result['cert_sha256'], self.fingerprint())
         self.assertEqual((result['version_name'], result['version_code']), ('155.0.8059.39-r1', 805903901))
 
+    def test_a_failed_check_leaves_nothing_and_a_rerun_works(self):
+        # The APK signs, then the bundle's check fails: nothing may stay in
+        # OUTDIR, or every rerun would refuse ("never overwritten").
+        outdir = self.tmp / 'failed'
+        real = self.sign.sign_aab
+
+        def failing(*args, **kwargs):
+            real(*args, **kwargs)
+            raise ValueError('bundle check failed')
+        self.sign.sign_aab = failing
+        try:
+            with self.assertRaisesRegex(ValueError, 'bundle check failed'):
+                self.sign.release(self.apk, self.aab, outdir, self.keystore, self.passfile)
+        finally:
+            self.sign.sign_aab = real
+        self.assertEqual(list(outdir.iterdir()), [])
+        self.sign.release(self.apk, self.aab, outdir, self.keystore, self.passfile)
+        self.assertEqual(sorted(p.name for p in outdir.iterdir()),
+                         ['tark-155.0.8059.39-r1.aab', 'tark-155.0.8059.39-r1.apk'])
+
     def test_mismatched_versions_refused(self):
         _, other_aab = self.fixtures(805903902, '155.0.8059.39-r2', tag='b')
         with self.assertRaisesRegex(ValueError, 'version'):
@@ -237,6 +257,63 @@ class TestPublish(TestSigning):
         self.assertIn('max-age=300', joined[1])
         self.assertIn('cloudfront create-invalidation', joined[2])
         self.assertIn('--paths /android/v1/latest.json', joined[2])
+
+    def test_dry_run_leaves_the_index_to_read(self):
+        import publish
+        apk, r, cert_file = self.signed()
+        index = publish.index_for(apk, r['version_name'], r['version_code'])
+        commands = publish.publish(apk, index, cert_file=cert_file, dry_run=True)
+        index_file = pathlib.Path(commands[1][3])
+        self.assertEqual(json.loads(index_file.read_text()), index)
+
+    def fake_aws(self, remote_etag):
+        """A stand-in for subprocess.run: records each command; head-object
+        answers with REMOTE_ETAG, or 'Not Found' when it is None."""
+        calls = []
+
+        def run(command, **kwargs):
+            calls.append(command)
+            if 'head-object' in command:
+                if remote_etag is None:
+                    return subprocess.CompletedProcess(command, 254, '', 'An error occurred (404) when calling '
+                                                       'the HeadObject operation: Not Found')
+                return subprocess.CompletedProcess(command, 0, json.dumps({'ETag': f'"{remote_etag}"'}), '')
+            return subprocess.CompletedProcess(command, 0, '', '')
+        return run, calls
+
+    def test_a_new_release_uploads_all_three(self):
+        import publish
+        apk, r, cert_file = self.signed()
+        index = publish.index_for(apk, r['version_name'], r['version_code'])
+        run, calls = self.fake_aws(None)
+        publish.publish(apk, index, cert_file=cert_file, live_code=r['version_code'] - 1, dry_run=False, run=run)
+        done = [c[1:3] for c in calls if 'head-object' not in c]
+        self.assertEqual(done, [['s3api', 'put-object'], ['s3', 'cp'], ['cloudfront', 'create-invalidation']])
+
+    def test_a_rerun_resumes_after_the_apk_is_up(self):
+        # Step 1 succeeded and step 2 or 3 failed: the same APK is already in
+        # S3, so a rerun skips it and finishes the index and invalidation,
+        # whether or not the index already shows the new code.
+        import hashlib
+        import publish
+        apk, r, cert_file = self.signed()
+        index = publish.index_for(apk, r['version_name'], r['version_code'])
+        md5 = hashlib.md5(apk.read_bytes()).hexdigest()
+        for live in (r['version_code'] - 1, r['version_code']):
+            run, calls = self.fake_aws(md5)
+            publish.publish(apk, index, cert_file=cert_file, live_code=live, dry_run=False, run=run)
+            done = [c[1:3] for c in calls if 'head-object' not in c]
+            self.assertEqual(done, [['s3', 'cp'], ['cloudfront', 'create-invalidation']])
+
+    def test_refuses_a_different_apk_under_the_same_name(self):
+        import publish
+        apk, r, cert_file = self.signed()
+        index = publish.index_for(apk, r['version_name'], r['version_code'])
+        run, calls = self.fake_aws('0' * 32)
+        with self.assertRaisesRegex(ValueError, 'differs'):
+            publish.publish(apk, index, cert_file=cert_file, live_code=r['version_code'] - 1, dry_run=False,
+                            run=run)
+        self.assertFalse([c for c in calls if 'head-object' not in c])
 
     def test_refuses_an_index_not_newer_than_the_live_one(self):
         # A lower or equal code would point new direct installs at an older

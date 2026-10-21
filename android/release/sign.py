@@ -119,13 +119,19 @@ def release(apk, aab, outdir, keystore=KEYSTORE, passfile=PASSFILE):
         raise ValueError(f'unexpected version name {name!r} in {apk}')
     outdir = pathlib.Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
-    apk_out = outdir / f'tark-{name}.apk'
-    for out in (apk_out, outdir / f'tark-{name}.aab'):
+    apk_out, aab_out = outdir / f'tark-{name}.apk', outdir / f'tark-{name}.aab'
+    for out in (apk_out, aab_out):
         if out.exists():
             raise ValueError(f'{out} exists; a release is never overwritten')
-    cert = sign_apk(apk, apk_out, keystore, passfile)
-    if sign_aab(aab, outdir / f'tark-{name}.aab', keystore, passfile) != cert:
-        raise ValueError('the APK and the bundle came out with different certificates')
+    # Both files are made and checked out of sight, then moved in together:
+    # a failed check leaves nothing in OUTDIR to block the next run.
+    with tempfile.TemporaryDirectory(dir=outdir, prefix='.partial-') as tmp:
+        apk_tmp, aab_tmp = pathlib.Path(tmp) / apk_out.name, pathlib.Path(tmp) / aab_out.name
+        cert = sign_apk(apk, apk_tmp, keystore, passfile)
+        if sign_aab(aab, aab_tmp, keystore, passfile) != cert:
+            raise ValueError('the APK and the bundle came out with different certificates')
+        apk_tmp.replace(apk_out)
+        aab_tmp.replace(aab_out)
     return {'version_name': name, 'version_code': code, 'cert_sha256': cert,
             'apk_sha256': hashlib.sha256(apk_out.read_bytes()).hexdigest(), 'apk_size': apk_out.stat().st_size}
 
