@@ -73,15 +73,30 @@ def test_main_exits_nonzero_when_a_stranger_appears(tmp_path, capsys):
 
 
 def _settings_page_hosts():
-    """Hosts the Settings page lists, read from the patch that adds them."""
+    """Hosts the Settings page lists: the rows that every patch in the series
+    touching tark_contacted_hosts.cc adds (the settings patch makes the list,
+    later patches add their own rows)."""
     import re
     root = pathlib.Path(__file__).resolve().parents[2]
-    patch = (root / "patches/tarka/settings/contacted-hosts.patch").read_text()
-    added = "\n".join(l[1:] for l in patch.splitlines() if l.startswith("+"))
-    start = added.index("kRows[] = {")
-    rows = added[start:added.index("};", start)]
-    text = ",".join(re.findall(r'u"([^"]*)"', rows))
-    return {h.strip() for h in text.split(",") if h.strip()}
+    hosts = set()
+    for name in (root / "patches/series").read_text().split():
+        patch = (root / "patches" / name).read_text()
+        added, current = [], ""
+        for line in patch.splitlines():
+            if line.startswith("+++ "):
+                current = line
+            elif line.startswith("+") and current.endswith("/tark_contacted_hosts.cc"):
+                added.append(line[1:])
+        added = "\n".join(added)
+        if added:
+            for row in re.findall(r'\{"tarkConnects\w+",\s*IDS_\w+,\s*((?:u"[^"]*"\s*)+)\}', added):
+                text = "".join(re.findall(r'u"([^"]*)"', row))
+                hosts |= {h.strip() for h in text.split(",") if h.strip()}
+    return hosts
+
+
+def test_settings_page_hosts_include_later_patches_rows():
+    assert {"shodhya.com", "pgl.yoyo.org", "gettarka.com"} <= _settings_page_hosts()
 
 
 def test_allowed_list_matches_the_settings_page():

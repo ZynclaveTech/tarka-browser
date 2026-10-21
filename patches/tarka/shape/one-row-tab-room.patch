@@ -1,0 +1,206 @@
+--- a/chrome/browser/ui/views/tabs/tab_strip.cc
++++ b/chrome/browser/ui/views/tabs/tab_strip.cc
+@@ -1203,6 +1203,9 @@
+       AddChildViewAt(MakeTabContainer(this, hover_card_controller_.get(),
+                                       base::to_address(drag_context_)),
+                      0);
++  if (available_width_callback_) {
++    tab_container_->SetAvailableWidthCallback(available_width_callback_);
++  }
+ }
+ 
+ void TabStrip::Reset() {
+@@ -1219,7 +1222,12 @@
+ 
+ void TabStrip::SetAvailableWidthCallback(
+     base::RepeatingCallback<int()> available_width_callback) {
+-  tab_container_->SetAvailableWidthCallback(available_width_callback);
++  // Tark: kept for the tab container Initialize() makes, as one row sets the
++  // callback before the tab strip is initialized.
++  available_width_callback_ = available_width_callback;
++  if (tab_container_) {
++    tab_container_->SetAvailableWidthCallback(available_width_callback_);
++  }
+ }
+ 
+ void TabStrip::NewTabButtonPressed(const ui::Event& event) {
+--- a/chrome/browser/ui/views/tabs/tab_strip.h
++++ b/chrome/browser/ui/views/tabs/tab_strip.h
+@@ -427,6 +427,10 @@
+   // The View parent for the tabs and the various group views.
+   raw_ptr<TabContainer, AcrossTasksDanglingUntriaged> tab_container_;
+ 
++  // Tark: what SetAvailableWidthCallback() was last given, for a tab
++  // container made later by Initialize().
++  base::RepeatingCallback<int()> available_width_callback_;
++
+   // Location of the mouse at the time of the last move.
+   gfx::Point last_mouse_move_location_;
+ 
+--- a/chrome/browser/ui/views/toolbar/toolbar_view.cc
++++ b/chrome/browser/ui/views/toolbar/toolbar_view.cc
+@@ -5,12 +5,14 @@
+ #include "chrome/browser/ui/views/toolbar/toolbar_view.h"
+ 
+ #include <algorithm>
++#include <limits>
+ #include <memory>
+ #include <optional>
+ #include <utility>
+ 
+ #include "ui/views/view_observer.h"
+ #include "base/scoped_observation.h"
++#include "base/auto_reset.h"
+ #include "base/command_line.h"
+ #include "base/containers/fixed_flat_map.h"
+ #include "base/feature_list.h"
+@@ -246,19 +248,39 @@
+   // (the address pill first, as it has the next order), then the tabs take
+   // the rest up to the tab strip's preferred width. Never below the tab
+   // strip's minimum.
++  //
++  // The room comes from the toolbar's width (ToolbarView::GetTarkTabRoom()),
++  // not from `bounds`: FlexLayout offers the well less in later passes when
++  // it asks for less, so a well following `bounds` dipped while a new tab
++  // animated in (the tabs then ask only for their animated width) and jumped
++  // back when it ended.
+   static gfx::Size FlexRule(const views::View* view,
+                             const views::SizeBounds& bounds) {
+-    constexpr int kTabsFloor = 200;
+-    constexpr int kAddressReserve = 220;
+-    const int preferred = view->GetPreferredSize().width();
+-    const int minimum = view->GetMinimumSize().width();
+-    int width = preferred;
++    const auto* toolbar = views::AsViewClass<ToolbarView>(view->parent());
++    const int room =
++        toolbar ? toolbar->GetTarkTabRoom() : std::numeric_limits<int>::max();
++    int width = std::min(view->GetPreferredSize().width(), room);
+     if (bounds.width().is_bounded()) {
+-      width = std::max(
+-          std::min(preferred, bounds.width().value() - kAddressReserve),
+-          std::min({preferred, kTabsFloor, bounds.width().value()}));
++      const int offered = bounds.width().value();
++      width = std::max(std::min(width, offered),
++                       std::min({view->GetPreferredSize().width(),
++                                 kTabsFloor, offered}));
++    }
++    return gfx::Size(std::max(width, view->GetMinimumSize().width()), 0);
++  }
++  // The room the row has for the tabs out of `offered`, the space the well
++  // has with every other item at its minimum: what the flex rule above gives
++  // tabs that ask for more than there is.
++  static int Room(const views::View* view, int offered) {
++    return std::max({offered - kAddressReserve,
++                     std::min(kTabsFloor, offered),
++                     view->GetMinimumSize().width()});
++  }
++
++  ~TarkTabWell() override {
++    if (tab_strip_) {
++      tab_strip_->SetAvailableWidthCallback(base::NullCallback());
+     }
+-    return gfx::Size(std::max(width, minimum), 0);
+   }
+ 
+   void AddedToWidget() override {
+@@ -267,6 +289,10 @@
+         region && !observation_.IsObserving()) {
+       observation_.Observe(region);
+       tab_strip_ = views::AsViewClass<TabStrip>(region->GetTabStripView());
++      if (tab_strip_) {
++        tab_strip_->SetAvailableWidthCallback(base::BindRepeating(
++            &TarkTabWell::GetAvailableWidthForTabs, base::Unretained(this)));
++      }
+     }
+   }
+ 
+@@ -320,6 +346,31 @@
+     return held_preferred_ != before;
+   }
+ 
++  static constexpr int kTabsFloor = 200;
++  static constexpr int kAddressReserve = 220;
++
++  // The width the tabs lay themselves out in: the room the row has for the
++  // well, less what the tab strip region needs beside the tabs (the new tab
++  // button and the like). Upstream the tabs use the region's width, but here
++  // the region is only as wide as the well, and the well only as wide as the
++  // tabs ask: a new tab would be fitted into the old width, squeezing every
++  // tab and widening the address pill until the insert animation ended and
++  // the well caught up.
++  int GetAvailableWidthForTabs() const {
++    const views::View* region = GetHorizontalTabStrip();
++    const auto* toolbar = views::AsViewClass<ToolbarView>(parent());
++    const int room = toolbar ? toolbar->GetTarkTabRoom() : 0;
++    if (!region || room <= 0) {
++      // As TabContainerImpl does without a callback.
++      const views::SizeBound width =
++          tab_strip_->parent()->GetAvailableSize(tab_strip_).width();
++      return width.is_bounded() ? width.value() : tab_strip_->width();
++    }
++    const int beside_tabs = region->GetPreferredSize().width() -
++                            tab_strip_->GetPreferredSize().width();
++    return std::max(0, room - beside_tabs);
++  }
++
+   const views::View* GetHorizontalTabStrip() const {
+     if (!browser_view_->ShouldDrawTabStrip() ||
+         browser_view_->ShouldDrawVerticalTabStrip()) {
+@@ -1438,12 +1489,35 @@
+   if (!tab_well_ || !layout_manager_) {
+     return gfx::Rect();
+   }
++  // The well's room follows the width being laid out, which BrowserView asks
++  // for before the toolbar has been resized to it.
++  base::AutoReset<std::optional<int>> layout_width(&tark_layout_width_,
++                                                   toolbar_size.width());
+   const views::ProposedLayout layout =
+       layout_manager_->GetProposedLayout(toolbar_size);
+   const views::ChildLayout* well = layout.GetLayoutFor(tab_well_);
+   return well && well->visible ? well->bounds : gfx::Rect();
+ }
+ 
++int ToolbarView::GetTarkTabRoom() const {
++  if (!tab_well_ || !layout_manager_ || !tab_well_->GetVisible()) {
++    return 0;
++  }
++  int width = tark_layout_width_.value_or(this->width());
++  if (!layout_manager_->include_host_insets_in_layout()) {
++    width -= GetInsets().width();
++  }
++  if (width <= 0) {
++    return 0;
++  }
++  // The space the well (order 1) has with every other item at its minimum
++  // (non-flex ones at their preferred size). Safe inside a layout pass: it
++  // reads no cached layout and never runs the well's own flex rule.
++  const int offered = layout_manager_->CalculateMainAxisSpaceAvailableToView(
++      tab_well_, 1, views::SizeBounds(width, {}));
++  return TarkTabWell::Room(tab_well_, offered);
++}
++
+ void ToolbarView::RecordHitTestMetrics(bool is_caption_area) {
+   const bool is_mouse_down = GetWidget() && GetWidget()->IsMouseButtonDown();
+ 
+--- a/chrome/browser/ui/views/toolbar/toolbar_view.h
++++ b/chrome/browser/ui/views/toolbar/toolbar_view.h
+@@ -176,6 +176,10 @@
+   // toolbar of `toolbar_size`, or an empty rect without a well.
+   bool HasTarkTabWell() const { return tab_well_ != nullptr; }
+   gfx::Rect GetTarkTabWellBounds(const gfx::Size& toolbar_size) const;
++  // The most width the tab well takes, however many tabs there are: the
++  // room the tabs size themselves against. Follows the width being laid out
++  // (see GetTarkTabWellBounds()), else the toolbar's own. 0 without a well.
++  int GetTarkTabRoom() const;
+ 
+   // Records user metrics based on hit test results within the toolbar view.
+   void RecordHitTestMetrics(bool is_caption_area);
+@@ -441,6 +445,8 @@
+   raw_ptr<MediaToolbarButton> media_button_ = nullptr;
+   raw_ptr<BrowserAppMenuButton> app_menu_button_ = nullptr;
+   raw_ptr<views::View> tab_well_ = nullptr;
++  // Tark: the toolbar width GetTarkTabWellBounds() is laying out, if any.
++  mutable std::optional<int> tark_layout_width_;
+ 
+   // The button currently holding the lock to be shown/hidden.
+   raw_ptr<glic::GlicButtonInterface> locked_expansion_button_ = nullptr;

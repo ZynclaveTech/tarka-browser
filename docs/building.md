@@ -363,3 +363,133 @@ unpacked to `build/src/third_party/sparkle` by `dev.sh setup` and
 - **Bump `revision.txt`** for every Tark release on the same Chromium
   version; reset it to 1 on a new Chromium version.
 - Tests: `python3 -m pytest utils/tests/test_install_sparkle.py`.
+
+## Live captions (D4)
+
+- **ONNX Runtime** runs the caption models: Microsoft's official macOS
+  arm64 release (MIT), pinned by hash in `downloads-onnxruntime.ini` and
+  unpacked into `build/src/third_party/tark_onnxruntime/` by `dev.sh` and
+  `build.sh`. `components/tark_captions` compiles against its `include/` and
+  `dlopen()`s `libonnxruntime.1.31.0.dylib` at run time, as Chromium does
+  with SODA; nothing links against it. `sign_and_package_app.sh` copies the
+  dylib into `Tark.app/Contents/Frameworks` (`utils/install_onnxruntime.sh`)
+  and signs it with Tark's identity, because the speech helper runs with
+  library validation. Bump: new version and hash in the ini, the dylib name
+  in `install_onnxruntime.sh` and `sign_and_package_app.sh`, and check
+  github.com/microsoft/onnxruntime/security/advisories first.
+- **Telemetry stays off.** Microsoft's builds send telemetry unless
+  `ORT_DISABLE_TELEMETRY=1` is set before the library loads;
+  `components/tark_captions/ort_runtime.cc` sets it and also calls
+  `DisableTelemetryEvents`, and refuses to run if that call fails.
+- **The models** are not in the repository. `utils/captions_export.py export
+  MODELS_DIR SILERO_VAD OUT_DIR` writes the folder the engine loads (int8
+  IndicConformer encoder, CTC decoder, vocabulary, language masks, Silero
+  VAD, the mel window and matrix) from IndicConformer's `assets/` and
+  `silero_vad.onnx`. Tark reads it from
+  `~/Library/Application Support/Tark/Captions/models`, and downloads what
+  is missing from gettarka.com (Phase 4, below).
+- **Tests:** set `TARK_CAPTIONS_ORT` (the dylib under
+  `third_party/tark_onnxruntime/lib`), `TARK_CAPTIONS_MODELS` (the models
+  folder) and `TARK_CAPTIONS_TESTDATA` (`resources/captions/testdata`), then
+  run `out/Default/tark_captions_unittests` (engine) and
+  `out/Default/tark_speech_unittests` (the speech service's recognizer).
+  `golden.json` there comes from `captions_export.py golden`; the clips are
+  FLEURS (CC-BY-4.0, test data only, see `ATTRIBUTION.md`).
+- **Bench:** `out/Default/tark_captions_bench` with the same variables plays
+  the test clips through the engine in real time and prints cores used,
+  decode times and draft lag (Phase 1: 0.23 cores, draft lag 0.51 s).
+- **Trying a call without a second device:** serve
+  `resources/captions/testdata` on `127.0.0.1:8765` and open
+  `loopback.html?clip=hi_1.wav`, which plays a clip as the remote side of a
+  same-page WebRTC call. Give the test profile
+  `{"webrtc":{"ip_handling_policy":"default"}}` in `Default/Preferences`
+  (Tark hides local addresses, so the loopback never connects otherwise),
+  grant the page the microphone, and launch with
+  `--use-fake-device-for-media-stream`. Starting the microphone puts the tab
+  in a call and the pill appears; `--vmodule=call_captions_tab_helper=1`
+  logs each caption's kind and size (never its text).
+- **Credits:** `utils/install_captions_credits.sh` (run by `dev.sh` and
+  `build.sh`) puts `README.chromium` and `LICENSE` for ONNX Runtime,
+  IndicConformer and Silero VAD under `third_party/`, from
+  `resources/captions/credits/`, for about:credits.
+- **Translation (Phase 2):** `utils/indictrans_export.py export INDIC_EN_DIR
+  EN_INDIC_DIR OUT_DIR` turns AI4Bharat's IndicTrans2 distilled 200M
+  checkpoints (MIT) into `it2_indic_en/` and `it2_en_indic/` in the models
+  folder: an int8 ONNX encoder and cached decoder step, the SentencePiece
+  model and vocabularies. It rebuilds the model in plain PyTorch, because
+  AI4Bharat's code needs a transformers release with known vulnerabilities.
+  `golden` writes `resources/captions/testdata/mt_golden.json`: every stage
+  of the Python reference pipeline on 16 real captions. The C++ engine
+  (`components/tark_captions/translation_engine.cc`, with the text steps
+  ported from IndicNLP, IndicTransToolkit and sacremoses in `indic_text.cc`)
+  must match it token for token, pivots included. Indian→Indian goes
+  through English, feeding the English model tokens straight into the
+  second hop.
+- **Where translation runs:** `media.mojom.TarkCaptionTranslator` in the
+  speech utility process (`chrome/services/speech/tark_caption_translator.cc`),
+  bound through `SpeechRecognitionService.BindTarkCaptionTranslator`. Text
+  from call audio is changed (English letters, another script) and
+  translated in the sandbox, never in the browser. The tab helper sends one
+  caption at a time (`RenderQueue`: the newest draft replaces a waiting one;
+  finals all go; results asked with old choices are dropped). "Show their
+  words in" and "Translate to" are remembered in local state
+  (`CaptionChoices`); incognito keeps its changes in memory.
+- **Bench:** `out/Default/tark_captions_bench --translate` (M3 Pro: 0.08 s
+  per caption to English, 0.05 s per draft, 0.18 s Indian→Indian; peak
+  1.12 GB with captions and one direction, 1.47 GB with both).
+  `--romanize` prints the test captions in English letters to review the
+  spellings.
+- **Model downloads (Phase 4):** three units: captions (IndicConformer +
+  Silero VAD), to English (`it2_indic_en/`), from English (`it2_en_indic/`).
+  `utils/captions_manifest.py MODELS_DIR
+  components/tark_captions/model_manifest.cc` writes the table of every
+  file's size and SHA-256 compiled into Tark; `--check` compares a folder
+  with it. `CaptionModelStore` downloads a unit's files from
+  `https://gettarka.com/models/captions/v1/` (no cookies, system network
+  context), checks each hash in `.download/`, then moves them in and writes
+  `.ready-<unit>`. The pill waits for a missing unit with a progress bar;
+  Settings › Accessibility › Live captions downloads, cancels and removes
+  them. `--tark-captions-models-url=http://127.0.0.1:PORT/models/captions/v1/`
+  points a test copy at a local server. Every published name has an
+  extension: gettarka.com serves a path without one as `<path>/index.html`
+  (so the IndicTrans2 licences ship as `LICENSE.txt`).
+- **Publishing the models:** `utils/publish_caption_models.sh MODELS_DIR`
+  (`--dry-run` first) checks the folder against the manifest, uploads each
+  file once to the site bucket with an immutable cache header and its hash
+  as metadata, and reads every file back through CloudFront. v1 never
+  changes: new models go to `v2/` with a new manifest. gettarka-site's
+  `publish.sh` keeps `models/` out of its `--delete` sync.
+
+- **Auto-detect (Phase 3):** the speech process starts in "auto": Silero VAD
+  keeps the client's speech, SpeechBrain's VoxLingua107 ECAPA (Apache-2.0,
+  `utils/lid_export.py export` → `lid.onnx` + `lid_labels.txt`, fp32: int8
+  lost 2.7% top-1) decides at 3 s of speech, 5 s when unsure
+  (`components/tark_captions/detection_policy.cc`, tuned with
+  `lid_export.py policy` on FLEURS: hi .96, ta .94, bn .96, en/es/fr/zh 1.0,
+  Swahili called unsupported .96). The recognizer reports it as a
+  LanguageIdentificationEvent and captions from the first word (what it
+  heard is replayed); Apple languages go to the browser through
+  `SpeechRecognitionService.BindTarkAudioTap` (Part B captions them).
+  `language_id` is a download unit holding the detector and the VAD, so
+  detection never needs the 679 MB captions unit. The pill's chip reads
+  "Auto-detect", then "Tamil · detected"; a language Tark can't caption
+  gets a line and "Choose a language".
+- **Apple languages (Phase 3 Part B):** English, Spanish, French, German,
+  Italian, Portuguese, Japanese, Korean, Chinese and Cantonese caption
+  through macOS 26's own speech (SpeechAnalyzer/SpeechTranscriber) and
+  translate through its Translation framework, in the browser process.
+  Chromium's Mac toolchain builds no Swift, so
+  `chrome/browser/tark_captions/apple/` holds a small Swift library with C
+  entry points (`tark_apple_speech.h`) that a GN action builds with
+  Xcode's swiftc against Chromium's SDK (arm64, macOS 26);
+  `sign_and_package_app.sh` installs it into `Contents/Frameworks`
+  (`utils/install_apple_speech.sh`) and signs it, and the browser loads it
+  on macOS 26 only (`AppleSpeechLibrary`). Each recognizer opens its own
+  tap (`TarkAudioTapSource.OpenTap`) for an Apple language; the call's tab
+  runs one `AppleCaptioner` per tap. macOS downloads a language's speech
+  from Apple the first time (the pill shows "Getting Spanish ready · 40%");
+  a translation language the user hasn't added shows "Open Settings".
+  Apple's Translation answers only while the calling thread's run loop
+  runs (the browser's UI thread does). Tests:
+  `tark_apple_speech_unittests` (the real library, macOS 26, Spanish
+  installed) and `tark_apple_captions_unittests` (a fake of it).
