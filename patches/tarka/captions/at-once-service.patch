@@ -57,7 +57,7 @@
    void SetLanguage(const std::string& code) {
      if (mode_ == Mode::kFailed || code == current_) {
        return;
-@@ -102,21 +114,28 @@
+@@ -102,21 +114,31 @@
      current_ = code;
      gate_.reset();
      tap_.clear();
@@ -66,8 +66,12 @@
        captions_.reset();
        mode_ = Mode::kIdle;
 -    } else if (code == "auto") {
+-      captions_.reset();
 +    } else if (IsAuto(code)) {
-       captions_.reset();
++      // Kept until the hint's engine exists: the speech model is shared and
++      // use-counted, and re-detecting on the language already captioned
++      // would otherwise unload and load it again.
++      std::unique_ptr<tark_captions::CaptionEngine> previous = std::move(captions_);
        gate_ = tark_captions::LanguageGate::Create(models_dir_, ort_dylib_);
 -      if (gate_) {
 -        mode_ = Mode::kDetect;
@@ -90,7 +94,7 @@
        mode_ = Mode::kTap;
      } else {
        Fail();
-@@ -128,11 +147,22 @@
+@@ -128,11 +150,22 @@
  
    void AddMono16k(base::span<const float> pcm) {
      switch (mode_) {
@@ -116,7 +120,7 @@
        case Mode::kCaption:
          captions_->AddAudio(pcm, 1, tark_captions::MonoResampler::kRate, callbacks_.on_event);
          break;
-@@ -145,7 +175,49 @@
+@@ -145,7 +178,49 @@
      }
    }
  
@@ -167,7 +171,7 @@
    void Decided(const tark_captions::Detection& d) {
      callbacks_.on_detected.Run(d.code);
      // What the browser will tell every recognizer; this one has it already.
-@@ -154,20 +226,35 @@
+@@ -154,20 +229,35 @@
      current_ = decodes ? d.code : "none";
      std::vector<float> heard = gate_->TakeHeard();
      gate_.reset();
@@ -204,7 +208,7 @@
          mode_ = Mode::kIdle;
          break;
      }
-@@ -188,7 +275,7 @@
+@@ -188,7 +278,7 @@
    void Tap(base::span<const float> pcm) {
      tap_.insert(tap_.end(), pcm.begin(), pcm.end());
      while (tap_.size() >= kTapChunk) {
@@ -213,7 +217,7 @@
                              std::vector<float>(tap_.begin(), tap_.begin() + kTapChunk));
        tap_.erase(tap_.begin(), tap_.begin() + kTapChunk);
      }
-@@ -205,6 +292,8 @@
+@@ -205,6 +295,8 @@
    const base::FilePath models_dir_;
    Callbacks callbacks_;
    std::string current_;  // The language last set or decided.
@@ -222,7 +226,7 @@
    Mode mode_ = Mode::kIdle;
    tark_captions::MonoResampler resampler_;
    std::unique_ptr<tark_captions::LanguageGate> gate_;
-@@ -249,7 +338,7 @@
+@@ -249,7 +341,7 @@
    // A language neither Tark nor macOS can caption is an error the pill
    // shows, never another language's captions presented as this one's.
    VLOG(1) << "Tark captions: recognizer for \"" << language << "\"";
@@ -231,7 +235,7 @@
        !IsAppleLanguage(language)) {
      OnEngineFailed();
      return;
-@@ -258,6 +347,8 @@
+@@ -258,6 +350,8 @@
    Engine::Callbacks callbacks;
    callbacks.on_event = base::BindPostTask(
        here, base::BindRepeating(&TarkCaptionRecognizer::OnEvent, weak_factory_.GetWeakPtr()));
@@ -240,7 +244,7 @@
    callbacks.on_detected = base::BindPostTask(
        here, base::BindRepeating(&TarkCaptionRecognizer::OnDetected, weak_factory_.GetWeakPtr()));
    callbacks.on_tap = base::BindPostTask(
-@@ -296,7 +387,7 @@
+@@ -296,7 +390,7 @@
      tap_.reset();
      tap_language_.clear();
    }
@@ -249,7 +253,7 @@
                     IsAppleLanguage(language))) {
      engine_.AsyncCall(&Engine::SetLanguage).WithArgs(language);
    }
-@@ -316,7 +407,7 @@
+@@ -316,7 +410,7 @@
  }
  
  void TarkCaptionRecognizer::OnTapAudio(const std::string& language, std::vector<float> pcm16k) {
@@ -258,7 +262,7 @@
      return;  // Tapped before the engine heard the language change.
    }
    if (language != tap_language_ || !tap_.is_bound()) {
-@@ -333,6 +424,12 @@
+@@ -333,6 +427,12 @@
    }
  }
  
@@ -343,7 +347,7 @@
    std::vector<std::string> drafts;
    bool error = false;
  };
-@@ -269,6 +287,103 @@
+@@ -269,6 +287,122 @@
    EXPECT_FALSE(client_.error);
  }
  
@@ -442,6 +446,25 @@
 +  EXPECT_EQ(client_.languages, std::vector<std::string>{"hi"});
 +  ASSERT_FALSE(client_.guesses.empty());
 +  EXPECT_EQ(client_.guesses.front(), "hi");
++}
++
++// Review fix: auto-detect again on the language already captioned (a new
++// video starting on the tab's last lock) keeps the shared speech model
++// loaded instead of unloading and loading it again.
++TEST_F(TarkCaptionRecognizerTest, HintAfterTheSameLanguageKeepsTheModel) {
++  if (!Files()) {
++    GTEST_SKIP() << "set TARK_CAPTIONS_ORT, TARK_CAPTIONS_MODELS and TARK_CAPTIONS_TESTDATA";
++  }
++  Bind(*ort_, *models_, "hi");
++  std::vector<float> clip = Clip("hi_1.wav");
++  clip.resize(16000);
++  Send(clip);
++  env_.RunUntilIdle();
++  const int loads = tark_captions::CaptionEngine::ModelLoadsForTesting();
++  recognizer_->OnLanguageChanged("auto:hi");
++  env_.RunUntilIdle();
++  EXPECT_EQ(tark_captions::CaptionEngine::ModelLoadsForTesting(), loads);
++  EXPECT_FALSE(client_.error);
 +}
 +
  TEST_F(TarkCaptionRecognizerTest, ParsesLanguages) {

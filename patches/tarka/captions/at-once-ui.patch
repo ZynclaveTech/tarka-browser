@@ -12,17 +12,42 @@
    </message>
 --- a/chrome/browser/accessibility/live_caption/live_caption_speech_recognition_host.cc
 +++ b/chrome/browser/accessibility/live_caption/live_caption_speech_recognition_host.cc
-@@ -228,7 +228,9 @@
+@@ -172,7 +172,7 @@
+     OnSpeechRecognitionRecognitionEventCallback reply) {
+   // Tark (D4): the call's captions go to its tab (and the pill).
+   if (CallCaptionsTabHelper* tab = GetTarkCallCaptions()) {
+-    tab->OnCaption(result);
++    tab->OnCaption(result, tark_language_);
+     std::move(reply).Run(tab->captions_on());
+     return;
+   }
+@@ -228,7 +228,12 @@
      media::mojom::LanguageIdentificationEventPtr event) {
    // Tark (D4 Phase 3): the language the call's client speaks, for its tab.
    if (CallCaptionsTabHelper* tab = GetTarkCallCaptions()) {
 -    tab->OnLanguageDetected(event->language);
 +    // A guess (captions at once) is kConfident; a decision or "und" is not.
++    if (event->language != "und") {
++      tark_language_ = event->language;
++    }
 +    tab->OnLanguageDetected(event->language, event->confidence_level !=
 +                                                 media::mojom::ConfidenceLevel::kConfident);
      return;
    }
    LiveCaptionController* live_caption_controller = GetLiveCaptionController();
+--- a/chrome/browser/accessibility/live_caption/live_caption_speech_recognition_host.h
++++ b/chrome/browser/accessibility/live_caption/live_caption_speech_recognition_host.h
+@@ -141,6 +141,10 @@
+ 
+   std::unique_ptr<captions::GreedyTextStabilizer> greedy_text_stabilizer_;
+ 
++  // Tark (captions at once): the language this recognizer last said it
++  // guessed or heard, sent with its captions ("" until it says).
++  std::string tark_language_;
++
+   base::WeakPtrFactory<LiveCaptionSpeechRecognitionHost> weak_factory_{this};
+ };
+ 
 --- a/chrome/browser/tark_captions/call_captions_tab_helper.cc
 +++ b/chrome/browser/tark_captions/call_captions_tab_helper.cc
 @@ -19,6 +19,7 @@
@@ -50,7 +75,7 @@
    render_queue_.ChoicesChanged();
    if (state_.captions_on()) {
      Profile* profile = Profile::FromBrowserContext(GetWebContents().GetBrowserContext());
-@@ -179,13 +188,31 @@
+@@ -179,13 +188,32 @@
    observers_.Notify(&Observer::OnCallStateChanged, this);
  }
  
@@ -66,6 +91,7 @@
 +      return;
 +    }
 +    VLOG(1) << "Tark captions: captioning on a guess, \"" << client_language_.guess() << "\"";
++    // An empty guess: the last one ended (one this machine can't caption).
 +    if (std::optional<tark_captions::Language> guessed =
 +            tark_captions::LanguageFromCode(client_language_.guess())) {
 +      language_ = *guessed;
@@ -84,7 +110,7 @@
    // Every recognizer in the tab (one per audio player on the call page)
    // hears the lock, or is told it when it heard otherwise.
    if (std::optional<std::string> tell = client_language_.Detected(code)) {
-@@ -198,6 +225,11 @@
+@@ -198,6 +226,11 @@
    if (client_language_.code() == before) {
      return;  // Picked by the user, already locked, or "und".
    }
@@ -96,7 +122,7 @@
    if (client_language_.state() == tark_captions::ClientLanguage::State::kCaptioning) {
      // The speech process already captions it; captions come after this.
      language_ = *tark_captions::LanguageFromCode(client_language_.code());
-@@ -210,9 +242,11 @@
+@@ -210,9 +243,11 @@
  
  void CallCaptionsTabHelper::OnRecognizerBound() {
    if (state_.captions_on() && client_language_.ShouldRestartForNewStream(state_.in_call())) {
@@ -110,7 +136,19 @@
    }
  }
  
-@@ -299,14 +333,31 @@
+@@ -288,8 +323,9 @@
+   observers_.Notify(&Observer::OnPlayersChanged, this);
+ }
+ 
+-void CallCaptionsTabHelper::OnCaption(const media::SpeechRecognitionResult& result) {
+-  if (!state_.captions_on()) {
++void CallCaptionsTabHelper::OnCaption(const media::SpeechRecognitionResult& result,
++                                      const std::string& source_language) {
++  if (!state_.captions_on() || !client_language_.AcceptsCaptionsFrom(source_language)) {
+     return;
+   }
+   // Never the text: call content stays out of logs.
+@@ -299,14 +335,31 @@
    if (renders()) {
      // macOS's captions are in the language detected or picked; Tark's own in
      // the one its engine decodes.
@@ -146,7 +184,17 @@
  void CallCaptionsTabHelper::SetTranslateOn(bool on) {
    if (on && !state_.captions_on()) {
      return;
-@@ -689,6 +740,11 @@
+@@ -552,7 +605,8 @@
+   if (!client_language_.AcceptsAppleCaptions(language)) {
+     return;
+   }
+-  OnCaption(media::SpeechRecognitionResult(text, is_final));
++  // Already matched to the call's language (AcceptsAppleCaptions).
++  OnCaption(media::SpeechRecognitionResult(text, is_final), std::string());
+ }
+ 
+ void CallCaptionsTabHelper::OnAppleStatusChanged() {
+@@ -689,6 +743,11 @@
    speech::SpeechRecognitionClientBrowserInterface* speech =
        SpeechRecognitionClientBrowserInterfaceFactory::GetForProfile(profile);
    if (speech) {
@@ -175,8 +223,16 @@
      // A caption in the script the user reads and, with Translate on, its
      // translation (Phase 2). Sent instead of OnCaption's text when
      // renders() is true; `translation_failed` when the translation models
-@@ -119,8 +122,9 @@
-   void OnCaption(const media::SpeechRecognitionResult& result);
+@@ -116,11 +119,16 @@
+   bool renders() const;
+ 
+   // From the speech recognition host of one of this tab's frames.
+-  void OnCaption(const media::SpeechRecognitionResult& result);
++  // `source_language`: what the sending recognizer last guessed or heard
++  // ("" unknown); with several players, captions in another language than
++  // the guess wait (captions at once).
++  void OnCaption(const media::SpeechRecognitionResult& result,
++                 const std::string& source_language);
    void OnCaptionsError();
    // The speech process heard which language the client speaks ("und" when
 -  // it couldn't tell).
@@ -187,7 +243,7 @@
    // A recognizer bound for one of this tab's audio streams (a new video, or
    // a call's new participant).
    void OnRecognizerBound();
-@@ -178,6 +182,14 @@
+@@ -178,6 +186,14 @@
    // After a player change: sound on or off for CallState, and observers.
    void PlayersChanged();
    // Sends the next waiting caption to the translator.
