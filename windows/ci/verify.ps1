@@ -53,7 +53,8 @@ Check 'onnxruntime runs Silero VAD' {
   $env:TARK_CAPTIONS_ORT = "$out\onnxruntime.dll"
   $env:TARK_CAPTIONS_MODELS = $models
   try {
-    Run-Test 'tark_captions_unittests.exe' 'onnxruntime' @('--gtest_filter=OrtRuntimeTest.*')
+    # One process, so gtest's own summary is printed (the launcher prints its own).
+    Run-Test 'tark_captions_unittests.exe' 'onnxruntime' @('--gtest_filter=OrtRuntimeTest.*', '--single-process-tests')
     $text = Get-Content "$Report\onnxruntime.txt" -Raw
     if ($text -match '\[  SKIPPED \]') { throw 'an ONNX Runtime test was skipped' }
     if (-not ($text -match '\[  PASSED  \] (\d+) tests?') -or [int]$Matches[1] -lt 3) {
@@ -110,3 +111,4 @@ if ($failed.Count) {
   exit 1
 }
 'All checks passed.'
+exit 0

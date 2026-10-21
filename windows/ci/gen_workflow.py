@@ -40,7 +40,8 @@ permissions:
 
 concurrency:
   group: windows-${{{{ github.ref }}}}
-  cancel-in-progress: true
+  # A push does not cancel a running build (a day and a half); cancel by hand.
+  cancel-in-progress: false
 
 jobs:
   onnxruntime:
@@ -63,7 +64,7 @@ jobs:
         uses: {CACHE}
         with:
           path: C:\\ort-out
-          key: onnxruntime-1.31.0-402979a-static-${{{{ hashFiles('windows/ci/build_onnxruntime.ps1') }}}}
+          key: onnxruntime-1.31.0-402979a-static-${{{{ hashFiles('windows/ci/build_onnxruntime.ps1', 'windows/ci/onnxruntime-patches/*') }}}}
       - name: Build ONNX Runtime 1.31.0
         if: steps.cache.outputs.cache-hit != 'true'
         shell: pwsh
@@ -128,7 +129,7 @@ STAGE = '''
           python build.py --ci --tarball -j 3
           $code = $LASTEXITCODE
           if ($code -eq 0) {{ 'finished=true' >> $env:GITHUB_OUTPUT }}
-          elseif ($code -eq 124) {{ 'finished=false' >> $env:GITHUB_OUTPUT }}
+          elseif ($code -eq 124) {{ 'finished=false' >> $env:GITHUB_OUTPUT; exit 0 }}
           else {{ exit $code }}
       - name: Pack the tree for the next stage
         if: steps.build.outputs.finished == 'false'

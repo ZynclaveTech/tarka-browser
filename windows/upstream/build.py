@@ -360,12 +360,20 @@ def main():
     # error in Tark's code shows within the first stage, not a day in; Tark's
     # Windows test binaries are built with the browser.
     _tark_first = _ROOT_DIR / 'tark_ninja_first.txt'
-    first_commandline = None
+    first_commandlines = []
     if _tark_first.exists():
         first = _tark_known_ninja_targets(
             Path('out') / 'Default', _tark_first.read_text(encoding=ENCODING).split())
-        if first:
-            first_commandline = ninja_commandline + first
+        # The command goes through cmd.exe, whose lines hold at most 8191
+        # characters: several ninja calls of at most 6000.
+        chunk = []
+        for target in first:
+            if chunk and len(' '.join(map('"{}"'.format, ninja_commandline + chunk + [target]))) > 6000:
+                first_commandlines.append(ninja_commandline + chunk)
+                chunk = []
+            chunk.append(target)
+        if chunk:
+            first_commandlines.append(ninja_commandline + chunk)
     ninja_commandline.append('chrome')
     ninja_commandline.append('chromedriver')
     ninja_commandline.append('mini_installer')
@@ -377,14 +385,14 @@ def main():
         # Both passes share the stage's 3.5 hours (TARK_NINJA_HOURS: less for
         # the first stage, which also unpacks and patches the source).
         deadline = time.monotonic() + float(os.environ.get('TARK_NINJA_HOURS', '3.5'))*60*60
-        if first_commandline:
-            _run_build_process_timeout(*first_commandline, timeout=deadline - time.monotonic())
+        for first_commandline in first_commandlines:
+            _run_build_process_timeout(*first_commandline, timeout=max(60, deadline - time.monotonic()))
         _run_build_process_timeout(*ninja_commandline, timeout=max(60, deadline - time.monotonic()))
         # package (Tark: a failed package fails the build)
         os.chdir(_ROOT_DIR)
         subprocess.run([sys.executable, 'package.py', '--cpu-arch', '32bit' if args.x86 else 'arm' if args.arm else '64bit'], check=True)
     else:
-        if first_commandline:
+        for first_commandline in first_commandlines:
             _run_build_process(*first_commandline)
         _run_build_process(*ninja_commandline)
 
