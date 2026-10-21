@@ -808,6 +808,46 @@
 +
  }  // namespace
  }  // namespace tark_captions
+--- a/components/tark_captions/caption_model_store.cc
++++ b/components/tark_captions/caption_model_store.cc
+@@ -369,6 +369,12 @@
+   u.loader.reset();
+   u.status.state = State::kFailed;
+   u.status.done = 0;
++  // Every file was in place and the ready marker failed: nothing to remove,
++  // and a retry checks the files again and writes the marker.
++  if (u.next_file >= Info(unit)->files.size()) {
++    Notify(unit);
++    return;
++  }
+   // Only the file being fetched goes: the ones already checked and in place
+   // stay, so a retry fetches what is left. Observers hear once it is gone.
+   files_->PostTaskAndReply(
+--- a/components/tark_captions/caption_model_store_unittest.cc
++++ b/components/tark_captions/caption_model_store_unittest.cc
+@@ -196,6 +196,22 @@
+   ASSERT_TRUE(base::test::RunUntil([&] { return DownloadFolderEmpty(); }));
+ }
+ 
++// Every file in place but the ready marker can't be written (a full disk,
++// permissions): the download fails, nothing crashes, and a retry works.
++TEST_F(CaptionModelStoreTest, MarkerWriteFailureFails) {
++  auto store = MakeStore();
++  WaitChecked(store.get());
++  const base::FilePath marker = dir_.GetPath().AppendASCII(".ready-captions");
++  ASSERT_TRUE(base::CreateDirectory(marker));
++  Serve(captions_);
++  store->Download(ModelUnit::kCaptions);
++  ASSERT_TRUE(WaitFor(store.get(), ModelUnit::kCaptions, State::kFailed));
++  EXPECT_EQ(Read("a.bin"), "alpha");
++  ASSERT_TRUE(base::DeletePathRecursively(marker));
++  store->Download(ModelUnit::kCaptions);
++  ASSERT_TRUE(WaitFor(store.get(), ModelUnit::kCaptions, State::kReady));
++}
++
+ TEST_F(CaptionModelStoreTest, WrongSizeFails) {
+   auto store = MakeStore();
+   WaitChecked(store.get());
 --- a/components/tark_captions/client_language.h
 +++ b/components/tark_captions/client_language.h
 @@ -50,6 +50,10 @@

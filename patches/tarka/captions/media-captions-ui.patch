@@ -1123,3 +1123,68 @@
        {"tarkLiveCaptionsShowIn", IDS_SETTINGS_TARK_LIVE_CAPTIONS_SHOW_IN},
        {"tarkLiveCaptionsTranslateTo", IDS_SETTINGS_TARK_LIVE_CAPTIONS_TRANSLATE_TO},
        {"tarkLiveCaptionsProgress", IDS_SETTINGS_TARK_LIVE_CAPTIONS_PROGRESS},
+--- a/chrome/services/speech/tark_caption_recognizer.cc
++++ b/chrome/services/speech/tark_caption_recognizer.cc
+@@ -245,7 +245,7 @@
+     const base::FilePath& models_dir,
+     const std::string& language,
+     OpenTap open_tap)
+-    : client_(std::move(client)), open_tap_(std::move(open_tap)) {
++    : client_(std::move(client)), open_tap_(std::move(open_tap)), wanted_language_(language) {
+   // A language neither Tark nor macOS can caption is an error the pill
+   // shows, never another language's captions presented as this one's.
+   VLOG(1) << "Tark captions: recognizer for \"" << language << "\"";
+@@ -290,6 +290,7 @@
+ }
+ 
+ void TarkCaptionRecognizer::OnLanguageChanged(const std::string& language) {
++  wanted_language_ = language;
+   if (!IsAppleLanguage(language)) {
+     // No more audio for macOS: its transcriber goes.
+     tap_.reset();
+@@ -315,6 +316,9 @@
+ }
+ 
+ void TarkCaptionRecognizer::OnTapAudio(const std::string& language, std::vector<float> pcm16k) {
++  if (wanted_language_ != "auto" && language != wanted_language_) {
++    return;  // Tapped before the engine heard the language change.
++  }
+   if (language != tap_language_ || !tap_.is_bound()) {
+     tap_.reset();
+     tap_language_ = language;
+--- a/chrome/services/speech/tark_caption_recognizer.h
++++ b/chrome/services/speech/tark_caption_recognizer.h
+@@ -91,6 +91,10 @@
+   OpenTap open_tap_;
+   mojo::Remote<media::mojom::TarkAudioTap> tap_;
+   std::string tap_language_;
++  // The language the browser last told this recognizer ("auto": the engine
++  // may pick an Apple language itself). Tap audio for any other Apple
++  // language is stale: tapped before the engine heard the change.
++  std::string wanted_language_;
+   base::SequenceBound<Engine> engine_;
+   bool failed_ = false;
+   base::WeakPtrFactory<TarkCaptionRecognizer> weak_factory_{this};
+--- a/chrome/services/speech/tark_caption_recognizer_unittest.cc
++++ b/chrome/services/speech/tark_caption_recognizer_unittest.cc
+@@ -328,5 +328,20 @@
+   EXPECT_EQ(taps_.size(), 1u);  // The first was closed.
+ }
+ 
++// Leaving an Apple language: audio the engine tapped before it heard the
++// change must not open a new tap for the old language (a macOS transcriber
++// nobody uses).
++TEST_F(TarkCaptionRecognizerTest, StaleTapAudioAfterLeavingAnAppleLanguageIsDropped) {
++  if (!Files()) {
++    GTEST_SKIP() << "set TARK_CAPTIONS_ORT, TARK_CAPTIONS_MODELS and TARK_CAPTIONS_TESTDATA";
++  }
++  Bind(*ort_, *models_, "es-US");
++  Send(Clip("lid/es_1.wav"));
++  recognizer_->OnLanguageChanged("hi");
++  env_.RunUntilIdle();
++  EXPECT_TRUE(tap_languages_.empty());
++  EXPECT_EQ(taps_.size(), 0u);
++}
++
+ }  // namespace
+ }  // namespace speech
