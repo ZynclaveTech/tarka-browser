@@ -1,0 +1,810 @@
+--- /dev/null
++++ b/components/tark_captions/media_players.h
+@@ -0,0 +1,106 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef COMPONENTS_TARK_CAPTIONS_MEDIA_PLAYERS_H_
++#define COMPONENTS_TARK_CAPTIONS_MEDIA_PLAYERS_H_
++
++#include <optional>
++
++#include "base/containers/flat_map.h"
++#include "base/time/time.h"
++#include "ui/gfx/geometry/rect.h"
++#include "ui/gfx/geometry/size.h"
++
++namespace tark_captions {
++
++// One media player in a tab: content::MediaPlayerId without content.
++struct PlayerKey {
++  int child_id = 0;
++  int frame_routing_id = 0;
++  int player_id = 0;
++  friend auto operator<=>(const PlayerKey&, const PlayerKey&) = default;
++};
++
++// The captions button (D4 any-media) shows a moment after sound starts and
++// stays a few seconds after it stops, so a pause doesn't make it blink.
++inline constexpr base::TimeDelta kButtonAppearDelay = base::Milliseconds(500);
++inline constexpr base::TimeDelta kButtonLingerDelay = base::Seconds(3);
++// On a video: in from its right edge, and lifted above the player's own
++// control bar. Otherwise: from the content area's bottom-right corner.
++inline constexpr int kButtonInset = 10;
++inline constexpr int kButtonLift = 50;
++inline constexpr int kWindowCornerMargin = 16;
++
++// The tab's media players, as the browser hears of them: which play sound,
++// and where the playing videos are. Times come from the caller.
++class MediaPlayers {
++ public:
++  MediaPlayers();
++  MediaPlayers(const MediaPlayers&) = delete;
++  MediaPlayers& operator=(const MediaPlayers&) = delete;
++  ~MediaPlayers();
++
++  void OnStarted(const PlayerKey& key, bool has_video, bool has_audio, base::TimeTicks now);
++  void OnStopped(const PlayerKey& key, base::TimeTicks now);
++  void OnMuted(const PlayerKey& key, bool muted, base::TimeTicks now);
++  void OnDestroyed(const PlayerKey& key, base::TimeTicks now);
++  // The video's box in the content area's coordinates (DIP): nullopt when it
++  // isn't known (never reported, or a frame that can't be mapped), an empty
++  // rect when it isn't visible.
++  void OnVideoRect(const PlayerKey& key, std::optional<gfx::Rect> rect);
++  void SetTabMuted(bool muted, base::TimeTicks now);
++
++  // Sound now: a player playing, with audio, not muted, in an unmuted tab.
++  bool AnyAudible() const;
++  // Whether the button shows at `now`; a call always shows it.
++  bool ButtonShown(bool in_call, base::TimeTicks now) const;
++  // When ButtonShown() changes next by itself, if it does.
++  std::optional<base::TimeTicks> NextChange(bool in_call, base::TimeTicks now) const;
++  // The box of the audible video that started last or, with none audible,
++  // of the video heard last (paused: the button stays on it), if its box is
++  // known (possibly empty: not visible).
++  std::optional<gfx::Rect> AnchorVideo() const;
++
++ private:
++  struct Player {
++    bool has_video = false;
++    bool has_audio = false;
++    bool playing = false;
++    bool muted = false;
++    base::TimeTicks started;
++    // When it last stopped being audible.
++    std::optional<base::TimeTicks> heard_until;
++    std::optional<gfx::Rect> rect;
++  };
++
++  bool Audible(const Player& player) const;
++  // Players that were audible before a change and aren't now were last
++  // heard `now`.
++  void MarkSilenced(const base::flat_map<PlayerKey, bool>& was_audible, base::TimeTicks now);
++  base::flat_map<PlayerKey, bool> AudibleNow() const;
++  const Player* Anchor() const;
++  // After any change: starts or ends a stretch of sound.
++  void Update(bool was_audible, base::TimeTicks now);
++
++  base::flat_map<PlayerKey, Player> players_;
++  bool tab_muted_ = false;
++  // When the current stretch of sound began (pauses shorter than the linger
++  // don't end it), and when the sound last stopped.
++  std::optional<base::TimeTicks> sound_since_;
++  std::optional<base::TimeTicks> silent_since_;
++};
++
++// Where the button goes, in the content area's coordinates: on the audible
++// video that started last (or the video heard last), lifted above its
++// controls; the content area's
++// bottom-right corner in a call, for sound with no video, or when that
++// video's box isn't known; nowhere (nullopt) when it is off screen.
++std::optional<gfx::Rect> PlaceButton(const MediaPlayers& players,
++                                     bool in_call,
++                                     const gfx::Size& content_area,
++                                     const gfx::Size& button);
++
++}  // namespace tark_captions
++
++#endif  // COMPONENTS_TARK_CAPTIONS_MEDIA_PLAYERS_H_
+--- /dev/null
++++ b/components/tark_captions/media_players.cc
+@@ -0,0 +1,201 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/tark_captions/media_players.h"
++
++namespace tark_captions {
++
++MediaPlayers::MediaPlayers() = default;
++MediaPlayers::~MediaPlayers() = default;
++
++void MediaPlayers::OnStarted(const PlayerKey& key,
++                             bool has_video,
++                             bool has_audio,
++                             base::TimeTicks now) {
++  const bool was_audible = AnyAudible();
++  Player& player = players_[key];
++  player.has_video = has_video;
++  player.has_audio = has_audio;
++  player.playing = true;
++  player.started = now;
++  Update(was_audible, now);
++}
++
++void MediaPlayers::OnStopped(const PlayerKey& key, base::TimeTicks now) {
++  const bool was_audible = AnyAudible();
++  const base::flat_map<PlayerKey, bool> before = AudibleNow();
++  if (auto it = players_.find(key); it != players_.end()) {
++    it->second.playing = false;
++  }
++  MarkSilenced(before, now);
++  Update(was_audible, now);
++}
++
++void MediaPlayers::OnMuted(const PlayerKey& key, bool muted, base::TimeTicks now) {
++  const bool was_audible = AnyAudible();
++  const base::flat_map<PlayerKey, bool> before = AudibleNow();
++  players_[key].muted = muted;
++  MarkSilenced(before, now);
++  Update(was_audible, now);
++}
++
++void MediaPlayers::OnDestroyed(const PlayerKey& key, base::TimeTicks now) {
++  const bool was_audible = AnyAudible();
++  players_.erase(key);
++  Update(was_audible, now);
++}
++
++void MediaPlayers::OnVideoRect(const PlayerKey& key, std::optional<gfx::Rect> rect) {
++  if (auto it = players_.find(key); it != players_.end()) {
++    it->second.rect = rect;
++  }
++}
++
++void MediaPlayers::SetTabMuted(bool muted, base::TimeTicks now) {
++  const bool was_audible = AnyAudible();
++  const base::flat_map<PlayerKey, bool> before = AudibleNow();
++  tab_muted_ = muted;
++  MarkSilenced(before, now);
++  Update(was_audible, now);
++}
++
++base::flat_map<PlayerKey, bool> MediaPlayers::AudibleNow() const {
++  base::flat_map<PlayerKey, bool> audible;
++  for (const auto& [key, player] : players_) {
++    audible[key] = Audible(player);
++  }
++  return audible;
++}
++
++void MediaPlayers::MarkSilenced(const base::flat_map<PlayerKey, bool>& was_audible,
++                                base::TimeTicks now) {
++  for (auto& [key, player] : players_) {
++    auto it = was_audible.find(key);
++    if (it != was_audible.end() && it->second && !Audible(player)) {
++      player.heard_until = now;
++    }
++  }
++}
++
++bool MediaPlayers::Audible(const Player& player) const {
++  return player.playing && player.has_audio && !player.muted && !tab_muted_;
++}
++
++bool MediaPlayers::AnyAudible() const {
++  for (const auto& [key, player] : players_) {
++    if (Audible(player)) {
++      return true;
++    }
++  }
++  return false;
++}
++
++void MediaPlayers::Update(bool was_audible, base::TimeTicks now) {
++  const bool audible = AnyAudible();
++  if (audible == was_audible) {
++    return;
++  }
++  if (audible) {
++    // Sound again within the linger after the button showed: the same
++    // stretch, so the button doesn't wait again.
++    const bool continues = sound_since_ && silent_since_ &&
++                           now - *silent_since_ < kButtonLingerDelay;
++    if (!continues) {
++      sound_since_ = now;
++    }
++    silent_since_.reset();
++    return;
++  }
++  // Sound stopped before the button showed: nothing lingers.
++  if (sound_since_ && now - *sound_since_ < kButtonAppearDelay) {
++    sound_since_.reset();
++    return;
++  }
++  silent_since_ = now;
++}
++
++bool MediaPlayers::ButtonShown(bool in_call, base::TimeTicks now) const {
++  if (in_call) {
++    return true;
++  }
++  if (!sound_since_) {
++    return false;
++  }
++  if (silent_since_ && now - *silent_since_ >= kButtonLingerDelay) {
++    return false;
++  }
++  return now - *sound_since_ >= kButtonAppearDelay;
++}
++
++std::optional<base::TimeTicks> MediaPlayers::NextChange(bool in_call,
++                                                        base::TimeTicks now) const {
++  if (in_call || !sound_since_) {
++    return std::nullopt;
++  }
++  const base::TimeTicks appear = *sound_since_ + kButtonAppearDelay;
++  if (now < appear) {
++    return appear;
++  }
++  if (silent_since_) {
++    const base::TimeTicks leave = *silent_since_ + kButtonLingerDelay;
++    if (now < leave) {
++      return leave;
++    }
++  }
++  return std::nullopt;
++}
++
++const MediaPlayers::Player* MediaPlayers::Anchor() const {
++  const Player* anchor = nullptr;
++  for (const auto& [key, player] : players_) {
++    if (Audible(player) && (!anchor || player.started > anchor->started)) {
++      anchor = &player;
++    }
++  }
++  if (anchor) {
++    return anchor;
++  }
++  // Nothing audible: the video heard last (paused, the button lingering or
++  // captions still on).
++  for (const auto& [key, player] : players_) {
++    if (player.has_video && player.heard_until &&
++        (!anchor || *player.heard_until > *anchor->heard_until)) {
++      anchor = &player;
++    }
++  }
++  return anchor;
++}
++
++std::optional<gfx::Rect> MediaPlayers::AnchorVideo() const {
++  const Player* anchor = Anchor();
++  if (!anchor || !anchor->has_video) {
++    return std::nullopt;
++  }
++  return anchor->rect;
++}
++
++std::optional<gfx::Rect> PlaceButton(const MediaPlayers& players,
++                                     bool in_call,
++                                     const gfx::Size& content_area,
++                                     const gfx::Size& button) {
++  const gfx::Rect area(content_area);
++  const gfx::Rect corner(area.right() - kWindowCornerMargin - button.width(),
++                         area.bottom() - kWindowCornerMargin - button.height(),
++                         button.width(), button.height());
++  const std::optional<gfx::Rect> video = players.AnchorVideo();
++  if (in_call || !video) {
++    // No video to sit on (a call, sound only), or one whose box isn't known.
++    return corner;
++  }
++  if (!video->Intersects(area)) {
++    return std::nullopt;
++  }
++  gfx::Rect place(video->right() - kButtonInset - button.width(),
++                  video->bottom() - kButtonLift - button.height(), button.width(),
++                  button.height());
++  place.AdjustToFit(area);
++  return place;
++}
++
++}  // namespace tark_captions
+--- /dev/null
++++ b/components/tark_captions/media_players_unittest.cc
+@@ -0,0 +1,164 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/tark_captions/media_players.h"
++
++#include "base/time/time.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace tark_captions {
++namespace {
++
++constexpr PlayerKey kVideo{1, 2, 3};
++constexpr PlayerKey kOther{1, 2, 4};
++constexpr gfx::Size kArea(1200, 800);
++constexpr gfx::Size kButton(30, 22);
++
++class MediaPlayersTest : public testing::Test {
++ protected:
++  base::TimeTicks At(base::TimeDelta d) const { return t0_ + d; }
++
++  const base::TimeTicks t0_ = base::TimeTicks() + base::Seconds(100);
++  MediaPlayers players_;
++};
++
++TEST_F(MediaPlayersTest, ButtonAppearsAfterHalfASecond) {
++  players_.OnStarted(kVideo, /*has_video=*/true, /*has_audio=*/true, t0_);
++  EXPECT_TRUE(players_.AnyAudible());
++  EXPECT_FALSE(players_.ButtonShown(false, At(base::Milliseconds(499))));
++  EXPECT_TRUE(players_.ButtonShown(false, At(base::Milliseconds(500))));
++  EXPECT_EQ(players_.NextChange(false, t0_), At(base::Milliseconds(500)));
++}
++
++// A pause keeps the button for 3 s, and playing again within them shows it
++// at once.
++TEST_F(MediaPlayersTest, ButtonStaysThroughShortPause) {
++  players_.OnStarted(kVideo, true, true, t0_);
++  players_.OnStopped(kVideo, At(base::Seconds(5)));
++  EXPECT_FALSE(players_.AnyAudible());
++  EXPECT_TRUE(players_.ButtonShown(false, At(base::Milliseconds(7900))));
++  EXPECT_FALSE(players_.ButtonShown(false, At(base::Seconds(8))));
++  EXPECT_EQ(players_.NextChange(false, At(base::Seconds(6))), At(base::Seconds(8)));
++  players_.OnStarted(kVideo, true, true, At(base::Seconds(6)));
++  EXPECT_TRUE(players_.ButtonShown(false, At(base::Seconds(6))));
++  EXPECT_TRUE(players_.ButtonShown(false, At(base::Seconds(9))));
++}
++
++TEST_F(MediaPlayersTest, ShortBlipShowsNothing) {
++  players_.OnStarted(kVideo, true, true, t0_);
++  players_.OnStopped(kVideo, At(base::Milliseconds(200)));
++  EXPECT_FALSE(players_.ButtonShown(false, At(base::Milliseconds(600))));
++  EXPECT_EQ(players_.NextChange(false, At(base::Milliseconds(300))), std::nullopt);
++}
++
++TEST_F(MediaPlayersTest, MutedPlayerIsNotSound) {
++  players_.OnStarted(kVideo, true, true, t0_);
++  players_.OnMuted(kVideo, true, t0_);
++  EXPECT_FALSE(players_.AnyAudible());
++  EXPECT_FALSE(players_.ButtonShown(false, At(base::Seconds(1))));
++}
++
++TEST_F(MediaPlayersTest, SilentVideoIsNotSound) {
++  players_.OnStarted(kVideo, true, /*has_audio=*/false, t0_);
++  EXPECT_FALSE(players_.AnyAudible());
++}
++
++TEST_F(MediaPlayersTest, TabMutedMeansNoButton) {
++  players_.OnStarted(kVideo, true, true, t0_);
++  players_.SetTabMuted(true, t0_);
++  EXPECT_FALSE(players_.AnyAudible());
++  EXPECT_FALSE(players_.ButtonShown(false, At(base::Seconds(1))));
++  players_.SetTabMuted(false, At(base::Seconds(2)));
++  EXPECT_TRUE(players_.AnyAudible());
++}
++
++TEST_F(MediaPlayersTest, CallShowsTheButtonAtOnce) {
++  EXPECT_TRUE(players_.ButtonShown(/*in_call=*/true, t0_));
++}
++
++TEST_F(MediaPlayersTest, CallUsesWindowCorner) {
++  players_.OnStarted(kVideo, true, true, t0_);
++  players_.OnVideoRect(kVideo, gfx::Rect(100, 100, 640, 360));
++  EXPECT_EQ(PlaceButton(players_, /*in_call=*/true, kArea, kButton),
++            gfx::Rect(1200 - 16 - 30, 800 - 16 - 22, 30, 22));
++}
++
++TEST_F(MediaPlayersTest, ButtonSitsOnTheVideo) {
++  players_.OnStarted(kVideo, true, true, t0_);
++  players_.OnVideoRect(kVideo, gfx::Rect(100, 100, 640, 360));
++  EXPECT_EQ(PlaceButton(players_, false, kArea, kButton),
++            gfx::Rect(100 + 640 - 10 - 30, 100 + 360 - 50 - 22, 30, 22));
++}
++
++TEST_F(MediaPlayersTest, LatestAudibleVideoWins) {
++  players_.OnStarted(kVideo, true, true, t0_);
++  players_.OnVideoRect(kVideo, gfx::Rect(0, 0, 400, 300));
++  players_.OnStarted(kOther, true, true, At(base::Seconds(1)));
++  players_.OnVideoRect(kOther, gfx::Rect(500, 400, 400, 300));
++  EXPECT_EQ(players_.AnchorVideo(), gfx::Rect(500, 400, 400, 300));
++  players_.OnStopped(kOther, At(base::Seconds(2)));
++  EXPECT_EQ(players_.AnchorVideo(), gfx::Rect(0, 0, 400, 300));
++}
++
++// Spec: a video scrolled away hides its button.
++TEST_F(MediaPlayersTest, OffScreenVideoHidesButton) {
++  players_.OnStarted(kVideo, true, true, t0_);
++  players_.OnVideoRect(kVideo, gfx::Rect());
++  EXPECT_EQ(PlaceButton(players_, false, kArea, kButton), std::nullopt);
++  players_.OnVideoRect(kVideo, gfx::Rect(0, 900, 640, 360));
++  EXPECT_EQ(PlaceButton(players_, false, kArea, kButton), std::nullopt);
++}
++
++// A video whose box isn't known (an embed Tark can't map): the window corner.
++TEST_F(MediaPlayersTest, UnknownBoxUsesCorner) {
++  players_.OnStarted(kVideo, true, true, t0_);
++  EXPECT_EQ(PlaceButton(players_, false, kArea, kButton),
++            gfx::Rect(1200 - 16 - 30, 800 - 16 - 22, 30, 22));
++}
++
++TEST_F(MediaPlayersTest, AudioOnlyUsesCorner) {
++  players_.OnStarted(kVideo, /*has_video=*/false, true, t0_);
++  EXPECT_EQ(PlaceButton(players_, false, kArea, kButton),
++            gfx::Rect(1200 - 16 - 30, 800 - 16 - 22, 30, 22));
++}
++
++TEST_F(MediaPlayersTest, ButtonStaysInsideTheArea) {
++  players_.OnStarted(kVideo, true, true, t0_);
++  players_.OnVideoRect(kVideo, gfx::Rect(800, 700, 640, 360));
++  const std::optional<gfx::Rect> place = PlaceButton(players_, false, kArea, kButton);
++  ASSERT_TRUE(place);
++  EXPECT_TRUE(gfx::Rect(kArea).Contains(*place));
++}
++
++// After a pause the button stays on the video it belongs to (the linger,
++// or captions still on), not the window's corner.
++TEST_F(MediaPlayersTest, PausedVideoKeepsTheButton) {
++  players_.OnStarted(kVideo, true, true, t0_);
++  players_.OnVideoRect(kVideo, gfx::Rect(100, 100, 640, 360));
++  players_.OnStopped(kVideo, At(base::Seconds(5)));
++  EXPECT_EQ(PlaceButton(players_, false, kArea, kButton),
++            gfx::Rect(100 + 640 - 10 - 30, 100 + 360 - 50 - 22, 30, 22));
++}
++
++// Of two silent videos, the one heard last keeps it.
++TEST_F(MediaPlayersTest, LastHeardVideoKeepsTheButton) {
++  players_.OnStarted(kVideo, true, true, t0_);
++  players_.OnVideoRect(kVideo, gfx::Rect(0, 0, 400, 300));
++  players_.OnStarted(kOther, true, true, At(base::Seconds(1)));
++  players_.OnVideoRect(kOther, gfx::Rect(500, 400, 400, 300));
++  players_.OnStopped(kOther, At(base::Seconds(2)));
++  players_.OnStopped(kVideo, At(base::Seconds(3)));
++  EXPECT_EQ(players_.AnchorVideo(), gfx::Rect(0, 0, 400, 300));
++}
++
++TEST_F(MediaPlayersTest, DestroyedPlayerIsForgotten) {
++  players_.OnStarted(kVideo, true, true, t0_);
++  players_.OnVideoRect(kVideo, gfx::Rect(100, 100, 640, 360));
++  players_.OnDestroyed(kVideo, At(base::Seconds(1)));
++  EXPECT_FALSE(players_.AnyAudible());
++  EXPECT_EQ(players_.AnchorVideo(), std::nullopt);
++}
++
++}  // namespace
++}  // namespace tark_captions
+--- a/components/tark_captions/BUILD.gn
++++ b/components/tark_captions/BUILD.gn
+@@ -23,6 +23,8 @@
+     "caption_model_store.h",
+     "caption_text.cc",
+     "caption_text.h",
++    "media_players.cc",
++    "media_players.h",
+     "client_language.cc",
+     "client_language.h",
+     "detection_policy.cc",
+@@ -67,6 +69,7 @@
+     "//third_party/icu",
+     "//third_party/pffft",
+     "//third_party/sentencepiece",
++    "//ui/gfx/geometry",
+   ]
+ }
+ 
+@@ -96,6 +99,7 @@
+     "indic_text_unittest.cc",
+     "language_detector_unittest.cc",
+     "language_gate_unittest.cc",
++    "media_players_unittest.cc",
+     "mel_frontend_unittest.cc",
+     "model_manifest_unittest.cc",
+     "mono_resampler_unittest.cc",
+@@ -119,6 +123,8 @@
+     "//services/network:test_support",
+     "//services/network/public/cpp",
+     "//testing/gtest",
++    "//ui/gfx/geometry",
++    "//ui/gfx:test_support",
+     "//third_party/icu",
+   ]
+ }
+--- a/components/tark_captions/call_state.cc
++++ b/components/tark_captions/call_state.cc
+@@ -12,27 +12,32 @@
+   }
+   in_call_ = capturing;
+   captions_on_ = false;
+-  hidden_ = false;
+ }
+ 
+-bool CallState::SetCaptionsOn(bool on) {
+-  if (on && (!in_call_ || hidden_)) {
++void CallState::OnSoundPlaying(bool playing) {
++  playing_sound_ = playing;
++}
++
++bool CallState::SetCaptionsOn(bool on, bool sound_recently) {
++  if (on && !in_call_ && !playing_sound_ && !sound_recently) {
+     return false;
+   }
+   captions_on_ = on;
+   return true;
+ }
+ 
+-void CallState::HideForThisCall() {
++void CallState::OnLeftSite() {
+   captions_on_ = false;
+-  hidden_ = in_call_;
+ }
+ 
+ CallState::Phase CallState::phase() const {
+-  if (!in_call_) {
+-    return Phase::kIdle;
++  if (captions_on_) {
++    return Phase::kCaptioning;
++  }
++  if (in_call_) {
++    return Phase::kInCall;
+   }
+-  return captions_on_ ? Phase::kCaptioning : Phase::kInCall;
++  return playing_sound_ ? Phase::kSound : Phase::kIdle;
+ }
+ 
+ }  // namespace tark_captions
+--- a/components/tark_captions/call_state.h
++++ b/components/tark_captions/call_state.h
+@@ -9,34 +9,40 @@
+ 
+ namespace tark_captions {
+ 
+-// One tab's call and captions state. A tab is in a call while it captures
+-// the microphone. Captions start off in every call and only the user turns
+-// them on (nothing listens before that); the call ending turns them off and
+-// forgets "hide for this call".
++// One tab's captions state. Captions can start while the tab is in a call
++// (it captures the microphone) or plays sound (a video, a podcast), and only
++// when the user turns them on: nothing listens before that, and a call
++// starting doesn't turn them on (D4 any-media). They stay on until the user
++// turns them off, the tab goes to another site, or the call ends.
+ class CallState {
+  public:
+-  enum class Phase { kIdle, kInCall, kCaptioning };
++  enum class Phase { kIdle, kInCall, kSound, kCaptioning };
+ 
+   void OnMicCapturing(bool capturing);
+-  // False (and no change) outside a call or after HideForThisCall().
+-  bool SetCaptionsOn(bool on);
+-  // The pill's ✕: captions off and no pill until the next call.
+-  void HideForThisCall();
++  void OnSoundPlaying(bool playing);
++  // False (and no change) when turning on with neither a call nor sound.
++  // `sound_recently`: the sound stopped moments ago and the captions button
++  // is still there.
++  bool SetCaptionsOn(bool on, bool sound_recently = false);
++  // The tab went to another site: captions off.
++  void OnLeftSite();
+ 
+   Phase phase() const;
+   bool in_call() const { return in_call_; }
++  bool playing_sound() const { return playing_sound_; }
+   bool captions_on() const { return captions_on_; }
+-  bool hidden() const { return hidden_; }
++  // Captions are on, or could be turned on now.
++  bool can_caption() const { return in_call_ || playing_sound_ || captions_on_; }
+ 
+  private:
+   bool in_call_ = false;
++  bool playing_sound_ = false;
+   bool captions_on_ = false;
+-  bool hidden_ = false;
+ };
+ 
+-// Which call has captions on. One call captions at a time: the engine
+-// decodes one language for the profile, and only that call's audio may reach
+-// it. Turning captions on in a call takes them from the other one.
++// Which tab has captions on. One tab captions at a time: the engine decodes
++// one language for the profile, and only that tab's audio may reach it.
++// Turning captions on in a tab takes them from the other one.
+ template <typename Call>
+ class CaptioningCall {
+  public:
+--- a/components/tark_captions/call_state_unittest.cc
++++ b/components/tark_captions/call_state_unittest.cc
+@@ -25,35 +25,69 @@
+   EXPECT_EQ(state.phase(), CallState::Phase::kCaptioning);
+ }
+ 
+-TEST(CallStateTest, CaptionsNeedACall) {
++// Nothing plays and no call: the button isn't there and captions can't
++// start.
++TEST(CallStateTest, SilenceRefusesCaptions) {
+   CallState state;
+   EXPECT_FALSE(state.SetCaptionsOn(true));
+   EXPECT_FALSE(state.captions_on());
++  EXPECT_EQ(state.phase(), CallState::Phase::kIdle);
+ }
+ 
+-TEST(CallStateTest, CallEndStopsEngine) {
++TEST(CallStateTest, CallEndTurnsCaptionsOff) {
+   CallState state;
++  state.OnSoundPlaying(true);
+   state.OnMicCapturing(true);
+   state.SetCaptionsOn(true);
+   state.OnMicCapturing(false);
+-  EXPECT_EQ(state.phase(), CallState::Phase::kIdle);
+   EXPECT_FALSE(state.captions_on());
+   // The next call starts with captions off again.
+   state.OnMicCapturing(true);
+   EXPECT_FALSE(state.captions_on());
+ }
+ 
+-TEST(CallStateTest, HiddenForThisCall) {
++TEST(CallStateTest, CallStartDoesNotTurnCaptionsOn) {
+   CallState state;
+   state.OnMicCapturing(true);
++  EXPECT_FALSE(state.captions_on());
++}
++
++// D4 any-media: sound playing in the tab (a video, a podcast) is enough.
++TEST(CallStateTest, SoundLetsCaptionsOn) {
++  CallState state;
++  state.OnSoundPlaying(true);
++  EXPECT_TRUE(state.playing_sound());
++  EXPECT_EQ(state.phase(), CallState::Phase::kSound);
++  EXPECT_TRUE(state.SetCaptionsOn(true));
++  EXPECT_EQ(state.phase(), CallState::Phase::kCaptioning);
++}
++
++TEST(CallStateTest, PauseKeepsCaptions) {
++  CallState state;
++  state.OnSoundPlaying(true);
+   state.SetCaptionsOn(true);
+-  state.HideForThisCall();
++  state.OnSoundPlaying(false);
++  EXPECT_TRUE(state.captions_on());
++  EXPECT_TRUE(state.can_caption());
++  EXPECT_TRUE(state.SetCaptionsOn(false));
++  EXPECT_FALSE(state.can_caption());
++}
++
++// The button stays a few seconds after the sound stops; pressing it then
++// still turns captions on.
++TEST(CallStateTest, RecentSoundLetsCaptionsOn) {
++  CallState state;
++  EXPECT_FALSE(state.SetCaptionsOn(true, /*sound_recently=*/false));
++  EXPECT_TRUE(state.SetCaptionsOn(true, /*sound_recently=*/true));
++  EXPECT_TRUE(state.captions_on());
++}
++
++TEST(CallStateTest, LeavingTheSiteTurnsCaptionsOff) {
++  CallState state;
++  state.OnSoundPlaying(true);
++  state.SetCaptionsOn(true);
++  state.OnLeftSite();
+   EXPECT_FALSE(state.captions_on());
+-  EXPECT_TRUE(state.hidden());
+-  EXPECT_FALSE(state.SetCaptionsOn(true));
+-  state.OnMicCapturing(false);
+-  state.OnMicCapturing(true);
+-  EXPECT_FALSE(state.hidden());
+ }
+ 
+ // One call captions at a time: its language is the profile's, and only its
+--- a/components/tark_captions/caption_choices.cc
++++ b/components/tark_captions/caption_choices.cc
+@@ -38,6 +38,7 @@
+ void CaptionChoices::RegisterLocalStatePrefs(PrefRegistrySimple* registry) {
+   registry->RegisterStringPref(kShowInPref, "");
+   registry->RegisterStringPref(kTranslateToPref, "en");
++  registry->RegisterBooleanPref(kShowButtonPref, true);
+ }
+ 
+ // static
+@@ -87,4 +88,12 @@
+   }
+ }
+ 
++bool CaptionChoices::show_button() const {
++  return local_state_->GetBoolean(kShowButtonPref);
++}
++
++void CaptionChoices::SetShowButton(bool show) {
++  local_state_->SetBoolean(kShowButtonPref, show);
++}
++
+ }  // namespace tark_captions
+--- a/components/tark_captions/caption_choices.h
++++ b/components/tark_captions/caption_choices.h
+@@ -24,6 +24,8 @@
+  public:
+   static constexpr char kShowInPref[] = "tark.captions.show_in";
+   static constexpr char kTranslateToPref[] = "tark.captions.translate_to";
++  // D4 any-media: Settings › Live captions › "Show the captions button".
++  static constexpr char kShowButtonPref[] = "tark.captions.show_button";
+ 
+   static void RegisterLocalStatePrefs(PrefRegistrySimple* registry);
+   static void ResetIncognitoForTesting();
+@@ -38,6 +40,9 @@
+   // Unknown codes are ignored.
+   void SetShowIn(const std::string& code, bool off_the_record);
+   void SetTranslateTo(const std::string& code, bool off_the_record);
++  // The CC button on videos and calls (Settings only; incognito reads it).
++  bool show_button() const;
++  void SetShowButton(bool show);
+ 
+  private:
+   raw_ptr<PrefService> local_state_;
+--- a/components/tark_captions/caption_choices_unittest.cc
++++ b/components/tark_captions/caption_choices_unittest.cc
+@@ -56,5 +56,14 @@
+   EXPECT_EQ(choices.translate_to(false), "en");
+ }
+ 
++// D4 any-media: the CC button shows unless the user turned it off in
++// Settings; incognito follows the setting and never changes it.
++TEST_F(CaptionChoicesTest, CaptionsButtonShowsByDefault) {
++  EXPECT_TRUE(CaptionChoices(&local_state_).show_button());
++  CaptionChoices(&local_state_).SetShowButton(false);
++  EXPECT_FALSE(CaptionChoices(&local_state_).show_button());
++  EXPECT_FALSE(local_state_.GetBoolean(CaptionChoices::kShowButtonPref));
++}
++
+ }  // namespace
+ }  // namespace tark_captions
+--- a/components/tark_captions/client_language.h
++++ b/components/tark_captions/client_language.h
+@@ -50,6 +50,10 @@
+   bool automatic() const { return automatic_; }
+   // Locked by detection (the pill says "· detected").
+   bool detected() const { return automatic_ && !code_.empty(); }
++  // D4 any-media: a new audio stream started (a new video) in a tab that
++  // isn't in a call, and the language was detected rather than picked:
++  // listen afresh. In a call a new stream is another participant.
++  bool ShouldRestartForNewStream(bool in_call) const { return !in_call && detected(); }
+   // Bumped by every choice, so answers about an older one can be dropped.
+   uint64_t generation() const { return generation_; }
+   // Captions macOS made for a tap in `tap_language` ("es", "es-US") belong
+--- a/components/tark_captions/client_language_unittest.cc
++++ b/components/tark_captions/client_language_unittest.cc
+@@ -159,5 +159,35 @@
+   EXPECT_FALSE(detecting.AcceptsAppleCaptions("es"));
+ }
+ 
++// D4 any-media: a new video (a new audio stream in a tab that isn't in a
++// call) is listened to afresh when its language was detected, so a new
++// language isn't captioned under the old one's label.
++TEST(ClientLanguageTest, NewStreamRedetectsWhenDetected) {
++  ClientLanguage language(/*apple_available=*/false);
++  language.ChooseAuto();
++  language.Detected("hi");
++  EXPECT_TRUE(language.ShouldRestartForNewStream(/*in_call=*/false));
++}
++
++TEST(ClientLanguageTest, NewStreamKeepsPickedLanguage) {
++  ClientLanguage language(/*apple_available=*/false);
++  language.Choose("ta");
++  EXPECT_FALSE(language.ShouldRestartForNewStream(false));
++}
++
++// A call's new streams are new participants: the lock holds.
++TEST(ClientLanguageTest, NewStreamInCallKeepsLock) {
++  ClientLanguage language(/*apple_available=*/false);
++  language.ChooseAuto();
++  language.Detected("hi");
++  EXPECT_FALSE(language.ShouldRestartForNewStream(/*in_call=*/true));
++}
++
++TEST(ClientLanguageTest, NewStreamWhileDetectingChangesNothing) {
++  ClientLanguage language(/*apple_available=*/false);
++  language.ChooseAuto();
++  EXPECT_FALSE(language.ShouldRestartForNewStream(false));
++}
++
+ }  // namespace
+ }  // namespace tark_captions
