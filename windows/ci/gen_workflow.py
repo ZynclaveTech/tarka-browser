@@ -48,6 +48,10 @@ jobs:
     runs-on: windows-2022
     timeout-minutes: 300
     steps:
+      - name: Line endings as committed
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.eol lf
       - uses: {CHECKOUT}
         with:
           persist-credentials: false
@@ -83,6 +87,10 @@ STAGE = '''
     outputs:
       finished: ${{{{ steps.build.outputs.finished }}}}
     steps:
+      - name: Line endings as committed
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.eol lf
       - uses: {checkout}
         with:
           submodules: true

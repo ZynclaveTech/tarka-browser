@@ -38,6 +38,22 @@ if (-not $CheckOnly) {
   $head = (git -C $src rev-parse HEAD).Trim()
   if ($head -ne $Commit) { throw "onnxruntime $Tag is $head, expected $Commit" }
 
+  # ONNX Runtime patches ONNX v1.22.0 and FlatBuffers v23.5.26 as it fetches
+  # them, with patches that apply only loosely (whitespace and offsets); the
+  # runner's older GNU patch rejects them. onnxruntime-patches\ holds the same
+  # changes made against those exact sources, which apply with no fuzz.
+  $patches = @{
+    'onnx\onnx.patch'               = '18194802BCCD5CAD6DAB5E28F36C39F09910DF99EC5B0C27FFA6615F42ACB50E'
+    'flatbuffers\flatbuffers.patch' = '9C597B79B3B35302A19B31A42B4680C4E36F9C3934A5B1B988DDD5A36C68EE33'
+  }
+  foreach ($name in $patches.Keys) {
+    $original = "$src\cmake\patches\$name"
+    if ((Get-FileHash $original -Algorithm SHA256).Hash -ne $patches[$name]) {
+      throw "$original is not the patch onnxruntime-patches\ was made from"
+    }
+    Copy-Item "$PSScriptRoot\onnxruntime-patches\$(Split-Path $name -Leaf)" $original -Force
+  }
+
   python "$src\tools\ci_build\build.py" --build_dir $build --config Release --build_shared_lib `
     --parallel --skip_tests --skip_submodule_sync --compile_no_warning_as_error `
     --enable_msvc_static_runtime --cmake_generator 'Visual Studio 17 2022' `
