@@ -226,3 +226,23 @@ class TestPublish(TestSigning):
         index = publish.index_for(apk, r['version_name'], r['version_code'])
         with self.assertRaisesRegex(ValueError, 'certificate'):
             publish.publish(apk, index, cert_file=cert_file, dry_run=True)
+
+
+class TestPlayArt(unittest.TestCase):
+    """A5 Task 6: the Play listing's icon (512x512) and feature graphic
+    (1024x500, no transparency) from the mark, on Tark's paper colour."""
+
+    def test_sizes_and_no_alpha(self):
+        import struct
+        import tempfile
+        sys.path.insert(0, str(REPO / 'android' / 'release'))
+        import play_art
+        with tempfile.TemporaryDirectory() as tmp:
+            out = pathlib.Path(tmp)
+            play_art.write(out)
+            for name, size in (('icon-512.png', (512, 512)), ('feature-1024x500.png', (1024, 500))):
+                data = (out / name).read_bytes()
+                self.assertEqual(data[:8], b'\x89PNG\r\n\x1a\n', name)
+                width, height, depth, colour = struct.unpack('>IIBB', data[16:26])
+                self.assertEqual((width, height), size, name)
+                self.assertEqual((depth, colour), (8, 2), f'{name}: 8-bit RGB, no alpha')
