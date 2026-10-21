@@ -148,6 +148,209 @@
      "media_players_unittest.cc",
      "mel_frontend_unittest.cc",
      "model_manifest_unittest.cc",
+--- a/components/tark_captions/client_language.cc
++++ b/components/tark_captions/client_language.cc
+@@ -12,25 +12,45 @@
+ 
+ ClientLanguage::~ClientLanguage() = default;
+ 
+-void ClientLanguage::ChooseAuto() {
++void ClientLanguage::ChooseAuto(const std::string& hint) {
+   ++generation_;
+   automatic_ = true;
+   code_.clear();
++  guess_.clear();
++  hint_ = hint;
+   state_ = State::kDetecting;
+ }
+ 
+ void ClientLanguage::Choose(const std::string& code) {
+   ++generation_;
+   automatic_ = false;
++  guess_.clear();
++  hint_.clear();
+   Set(code);
+ }
+ 
++bool ClientLanguage::Guessed(const std::string& code) {
++  if (!automatic_ || !code_.empty() || code.empty() || code == "und") {
++    return false;
++  }
++  const std::string guess = code == "ur" ? "hi" : code;
++  const Detection::Kind kind = KindOfLanguage(guess);
++  if (guess == guess_ || !(kind == Detection::Kind::kCaption ||
++                           (kind == Detection::Kind::kApple && apple_available_))) {
++    return false;
++  }
++  guess_ = guess;
++  return true;
++}
++
+ std::optional<std::string> ClientLanguage::Detected(const std::string& code) {
+   if (code == "und" || code.empty()) {
+     return std::nullopt;
+   }
+   if (automatic_ && code_.empty()) {
+     Set(code);
++    guess_.clear();
++    last_locked_ = code_;
+     return recognizer_code();
+   }
+   // Locked or picked already: a recognizer that heard otherwise is told.
+@@ -39,13 +59,16 @@
+ }
+ 
+ bool ClientLanguage::AcceptsAppleCaptions(const std::string& tap_language) const {
+-  return state_ == State::kApple && tap_language.substr(0, tap_language.find('-')) == code_;
++  const std::string base = tap_language.substr(0, tap_language.find('-'));
++  // Captions at once: macOS captions a guessed Apple language too.
++  return (state_ == State::kApple && base == code_) ||
++         (state_ == State::kDetecting && !guess_.empty() && base == guess_);
+ }
+ 
+ std::string ClientLanguage::recognizer_code() const {
+   switch (state_) {
+     case State::kDetecting:
+-      return "auto";
++      return hint_.empty() ? "auto" : "auto:" + hint_;
+     case State::kCaptioning:
+     case State::kApple:
+       return code_;
+--- a/components/tark_captions/client_language.h
++++ b/components/tark_captions/client_language.h
+@@ -34,8 +34,10 @@
+   // macOS 26's speech for the Apple languages (it loads in the background).
+   void set_apple_available(bool available) { apple_available_ = available; }
+ 
+-  // Auto-detect: a new call, or "Auto-detect" picked again.
+-  void ChooseAuto();
++  // Auto-detect: a new call, or "Auto-detect" picked again. Captions at
++  // once: `hint` ("hi", "es"...) is where captions start before the speech
++  // process guesses; empty for none.
++  void ChooseAuto(const std::string& hint = std::string());
+   // The user picked `code` for this call.
+   void Choose(const std::string& code);
+   // The speech process heard `code` ("und": it couldn't tell). Ignored once
+@@ -44,6 +46,16 @@
+   // otherwise), or nothing.
+   std::optional<std::string> Detected(const std::string& code);
+ 
++  // Captions at once: the speech process captions on a guess, `code`, while
++  // it listens. True when that is a new guess; ignored once a language is
++  // locked or picked, and for one nothing on this Mac can caption.
++  bool Guessed(const std::string& code);
++  // The language being guessed while detecting; "" when none.
++  const std::string& guess() const { return guess_; }
++  // The language the last detection in this tab locked on ("" if none),
++  // kept in memory only: a new video in the tab starts on it.
++  const std::string& last_locked() const { return last_locked_; }
++
+   State state() const { return state_; }
+   // "" while detecting.
+   const std::string& code() const { return code_; }
+@@ -60,7 +72,8 @@
+   // to this call: its language is that Apple language.
+   bool AcceptsAppleCaptions(const std::string& tap_language) const;
+ 
+-  // What the recognizers are told: "auto" until a language is known, then
++  // What the recognizers are told: "auto" (or "auto:<hint>") until a
++  // language is known, then
+   // that language, or "none" when nothing on this Mac can caption it.
+   std::string recognizer_code() const;
+ 
+@@ -71,6 +84,9 @@
+   State state_ = State::kDetecting;
+   std::string code_;
+   bool automatic_ = true;
++  std::string guess_;
++  std::string hint_;
++  std::string last_locked_;
+   uint64_t generation_ = 0;
+ };
+ 
+--- a/components/tark_captions/client_language_unittest.cc
++++ b/components/tark_captions/client_language_unittest.cc
+@@ -189,5 +189,80 @@
+   EXPECT_FALSE(language.ShouldRestartForNewStream(false));
+ }
+ 
++// Captions at once: captions run on a guess until the lock.
++TEST(ClientLanguageTest, GuessWhileDetecting) {
++  ClientLanguage language(true);
++  EXPECT_TRUE(language.Guessed("hi"));
++  EXPECT_EQ(language.state(), State::kDetecting);
++  EXPECT_EQ(language.guess(), "hi");
++  EXPECT_EQ(language.code(), "");
++  EXPECT_EQ(language.recognizer_code(), "auto");
++}
++
++TEST(ClientLanguageTest, HintGoesToRecognizers) {
++  ClientLanguage language(true);
++  language.ChooseAuto("ta");
++  EXPECT_EQ(language.recognizer_code(), "auto:ta");
++  language.Detected("hi");
++  EXPECT_EQ(language.recognizer_code(), "hi");
++}
++
++TEST(ClientLanguageTest, LockClearsTheGuess) {
++  ClientLanguage language(true);
++  language.Guessed("ta");
++  language.Detected("hi");
++  EXPECT_EQ(language.code(), "hi");
++  EXPECT_EQ(language.guess(), "");
++}
++
++TEST(ClientLanguageTest, PickDuringGuessWins) {
++  ClientLanguage language(true);
++  language.Guessed("hi");
++  language.Choose("ta");
++  EXPECT_EQ(language.guess(), "");
++  EXPECT_FALSE(language.Guessed("bn"));
++  language.Detected("hi");
++  EXPECT_EQ(language.code(), "ta");
++  EXPECT_FALSE(language.detected());
++}
++
++TEST(ClientLanguageTest, GuessFromAnotherPlayerReplaces) {
++  ClientLanguage language(true);
++  EXPECT_TRUE(language.Guessed("hi"));
++  EXPECT_TRUE(language.Guessed("ta"));
++  EXPECT_FALSE(language.Guessed("ta"));
++  EXPECT_EQ(language.guess(), "ta");
++}
++
++TEST(ClientLanguageTest, UrduGuessIsHindi) {
++  ClientLanguage language(true);
++  EXPECT_TRUE(language.Guessed("ur"));
++  EXPECT_EQ(language.guess(), "hi");
++}
++
++TEST(ClientLanguageTest, AppleCaptionsAcceptedForTheGuess) {
++  ClientLanguage language(true);
++  language.Guessed("es");
++  EXPECT_TRUE(language.AcceptsAppleCaptions("es-US"));
++  EXPECT_FALSE(language.AcceptsAppleCaptions("fr"));
++}
++
++// Without macOS 26's speech an Apple language can't be captioned: no guess.
++TEST(ClientLanguageTest, GuessOfAppleLanguageNeedsAppleSpeech) {
++  ClientLanguage language(/*apple_available=*/false);
++  EXPECT_FALSE(language.Guessed("es"));
++  EXPECT_EQ(language.guess(), "");
++  EXPECT_FALSE(language.Guessed("sw"));
++}
++
++TEST(ClientLanguageTest, LastLockIsRemembered) {
++  ClientLanguage language(true);
++  language.Detected("bn");
++  language.ChooseAuto();
++  EXPECT_EQ(language.last_locked(), "bn");
++  language.Choose("ta");
++  EXPECT_EQ(language.last_locked(), "bn");
++}
++
+ }  // namespace
+ }  // namespace tark_captions
 --- a/components/tark_captions/detection_policy.cc
 +++ b/components/tark_captions/detection_policy.cc
 @@ -30,18 +30,16 @@
