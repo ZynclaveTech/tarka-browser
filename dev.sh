@@ -25,6 +25,8 @@ _arch=arm64
 
 # shellcheck source=utils/install_xlit.sh
 source "$_root_dir/utils/install_xlit.sh"
+# shellcheck source=utils/install_captions_credits.sh
+source "$_root_dir/utils/install_captions_credits.sh"
 
 # depot_tools needs Python 3.13 or earlier; the system has 3.14.
 export PATH="/opt/homebrew/opt/python@3.13/libexec/bin:$PATH"
@@ -117,6 +119,10 @@ MSG
   # Tark: Sparkle 2, the updater (M5); installed into the app when it is signed.
   python3 "$_main_repo/utils/downloads.py" retrieve -i "$_root_dir/downloads-sparkle.ini" -c "$_download_cache"
   python3 "$_main_repo/utils/downloads.py" unpack -i "$_root_dir/downloads-sparkle.ini" -c "$_download_cache" "$_src_dir"
+  # Tark: ONNX Runtime for live captions (D4); installed into the app when it is signed.
+  python3 "$_main_repo/utils/downloads.py" retrieve -i "$_root_dir/downloads-onnxruntime.ini" -c "$_download_cache"
+  python3 "$_main_repo/utils/downloads.py" unpack -i "$_root_dir/downloads-onnxruntime.ini" -c "$_download_cache" "$_src_dir"
+  _install_captions_credits
   python3 "$_root_dir/utils/ublock_key.py" "$_src_dir/third_party/ublock/manifest.json" "$_root_dir/resources/ublock/key.txt"
 
   # Tark: IndicXlit weights and word lists for the address bar (D1).

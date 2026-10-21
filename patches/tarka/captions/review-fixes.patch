@@ -1,0 +1,1025 @@
+--- /dev/null
++++ b/chrome/browser/ui/views/tark_captions/BUILD.gn
+@@ -0,0 +1,40 @@
++# Copyright 2026 The Tark Authors
++# Use of this source code is governed by a BSD-style license that can be
++# found in the LICENSE file.
++
++# Tark (D4): the call captions caption box, on its own so it can be tested
++# without the browser UI. The pill and its controller are in
++# //chrome/browser/ui.
++
++import("//testing/test.gni")
++
++source_set("caption_box") {
++  sources = [
++    "caption_box_view.cc",
++    "caption_box_view.h",
++  ]
++  public_deps = [
++    "//components/tark_captions",
++    "//skia",
++    "//ui/views",
++  ]
++  deps = [
++    "//ui/base",
++    "//ui/gfx",
++  ]
++}
++
++test("tark_caption_box_unittests") {
++  sources = [
++    "caption_box_view_unittest.cc",
++    "tark_caption_box_unittests_main.cc",
++  ]
++  deps = [
++    ":caption_box",
++    "//mojo/core/embedder",
++    "//testing/gtest",
++    "//ui/resources:ui_test_pak",
++    "//ui/views:test_support",
++  ]
++  data_deps = [ "//ui/resources:ui_test_pak_data" ]
++}
+--- /dev/null
++++ b/chrome/browser/ui/views/tark_captions/caption_box_view.h
+@@ -0,0 +1,49 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_TARK_CAPTIONS_CAPTION_BOX_VIEW_H_
++#define CHROME_BROWSER_UI_VIEWS_TARK_CAPTIONS_CAPTION_BOX_VIEW_H_
++
++#include <string>
++
++#include "base/memory/raw_ptr.h"
++#include "components/tark_captions/caption_text.h"
++#include "third_party/skia/include/core/SkColor.h"
++#include "ui/base/metadata/metadata_header_macros.h"
++#include "ui/views/view.h"
++
++namespace views {
++class StyledLabel;
++}  // namespace views
++
++// Tark (D4): the caption box above the pill (and the strip): the latest final
++// text in white, the draft of what is being said now faded after it, on a
++// dark translucent rounded box. Hidden when there is nothing to show.
++class TarkCaptionBoxView : public views::View {
++  METADATA_HEADER(TarkCaptionBoxView, views::View)
++
++ public:
++  static constexpr SkColor kFinalColor = SK_ColorWHITE;
++  static constexpr SkColor kDraftColor = SkColorSetARGB(0x99, 0xFF, 0xFF, 0xFF);
++
++  TarkCaptionBoxView();
++  TarkCaptionBoxView(const TarkCaptionBoxView&) = delete;
++  TarkCaptionBoxView& operator=(const TarkCaptionBoxView&) = delete;
++  ~TarkCaptionBoxView() override;
++
++  // The text's wrapping width.
++  void SetTextWidth(int width);
++  // Shows `display`, or `message` (Listening…, Captions unavailable) when it
++  // is not empty.
++  void SetCaption(const tark_captions::CaptionText::Display& display,
++                  const std::u16string& message);
++
++  views::StyledLabel* label_for_testing() { return label_; }
++
++ private:
++  raw_ptr<views::StyledLabel> label_ = nullptr;
++  int text_width_ = 420;
++};
++
++#endif  // CHROME_BROWSER_UI_VIEWS_TARK_CAPTIONS_CAPTION_BOX_VIEW_H_
+--- /dev/null
++++ b/chrome/browser/ui/views/tark_captions/caption_box_view.cc
+@@ -0,0 +1,79 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/ui/views/tark_captions/caption_box_view.h"
++
++#include <memory>
++
++#include "ui/base/metadata/metadata_impl_macros.h"
++#include "ui/gfx/range/range.h"
++#include "ui/views/background.h"
++#include "ui/views/border.h"
++#include "ui/views/controls/styled_label.h"
++#include "ui/views/layout/box_layout.h"
++
++namespace {
++
++constexpr SkColor kBackground = SkColorSetARGB(0xCC, 0x12, 0x12, 0x14);
++
++}  // namespace
++
++TarkCaptionBoxView::TarkCaptionBoxView() {
++  SetLayoutManager(std::make_unique<views::BoxLayout>(views::BoxLayout::Orientation::kVertical));
++  SetBackground(views::CreateRoundedRectBackground(kBackground, 10));
++  SetBorder(views::CreateEmptyBorder(gfx::Insets::VH(8, 14)));
++  label_ = AddChildView(std::make_unique<views::StyledLabel>());
++  label_->SetDisplayedOnBackgroundColor(kBackground);
++  label_->SizeToFit(text_width_);
++  SetVisible(false);
++}
++
++TarkCaptionBoxView::~TarkCaptionBoxView() = default;
++
++void TarkCaptionBoxView::SetTextWidth(int width) {
++  text_width_ = width;
++  label_->SizeToFit(text_width_);
++  PreferredSizeChanged();
++}
++
++void TarkCaptionBoxView::SetCaption(const tark_captions::CaptionText::Display& display,
++                                    const std::u16string& message) {
++  std::u16string text;
++  size_t draft_start = 0;
++  if (!message.empty()) {
++    text = message;
++    draft_start = text.size();
++  } else {
++    text = display.committed;
++    if (!display.draft.empty()) {
++      if (!text.empty()) {
++        text += u" ";
++      }
++      draft_start = text.size();
++      text += display.draft;
++    } else {
++      draft_start = text.size();
++    }
++  }
++  SetVisible(!text.empty());
++  // StyledLabel keeps its old styles when the text is unchanged (a final
++  // usually repeats the last draft): clear it so the styles start afresh.
++  label_->SetText(std::u16string());
++  label_->SetText(text);
++  views::StyledLabel::RangeStyleInfo final_style;
++  final_style.override_color = kFinalColor;
++  views::StyledLabel::RangeStyleInfo draft_style;
++  draft_style.override_color = kDraftColor;
++  if (draft_start > 0) {
++    label_->AddStyleRange(gfx::Range(0, draft_start), final_style);
++  }
++  if (draft_start < text.size()) {
++    label_->AddStyleRange(gfx::Range(draft_start, text.size()), draft_style);
++  }
++  label_->SizeToFit(text_width_);
++  PreferredSizeChanged();
++}
++
++BEGIN_METADATA(TarkCaptionBoxView)
++END_METADATA
+--- /dev/null
++++ b/chrome/browser/ui/views/tark_captions/caption_box_view_unittest.cc
+@@ -0,0 +1,66 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/ui/views/tark_captions/caption_box_view.h"
++
++#include <memory>
++
++#include "ui/views/controls/label.h"
++#include "ui/views/controls/styled_label.h"
++#include "ui/views/test/views_test_base.h"
++#include "ui/views/test/views_test_utils.h"
++#include "ui/views/widget/widget.h"
++
++namespace {
++
++class TarkCaptionBoxViewTest : public views::ViewsTestBase {
++ protected:
++  void SetUp() override {
++    views::ViewsTestBase::SetUp();
++    widget_ = CreateTestWidget(views::Widget::InitParams::CLIENT_OWNS_WIDGET);
++    box_ = widget_->SetContentsView(std::make_unique<TarkCaptionBoxView>());
++    widget_->SetBounds(gfx::Rect(0, 0, 500, 200));
++  }
++  void TearDown() override {
++    widget_.reset();
++    views::ViewsTestBase::TearDown();
++  }
++
++  // The colours the box's text is drawn in, one per run of text.
++  std::vector<SkColor> Colors() {
++    views::test::RunScheduledLayout(box_->label_for_testing());
++    std::vector<SkColor> colors;
++    for (views::View* child : box_->label_for_testing()->children()) {
++      if (auto* label = views::AsViewClass<views::Label>(child)) {
++        colors.push_back(label->GetEnabledColor());
++      }
++    }
++    return colors;
++  }
++
++  std::unique_ptr<views::Widget> widget_;
++  raw_ptr<TarkCaptionBoxView> box_ = nullptr;
++};
++
++TEST_F(TarkCaptionBoxViewTest, DraftFaded) {
++  box_->SetCaption({u"one two", u"three"}, u"");
++  EXPECT_EQ(Colors(), (std::vector<SkColor>{TarkCaptionBoxView::kFinalColor,
++                                            TarkCaptionBoxView::kDraftColor}));
++}
++
++// The final usually repeats the last draft word for word: it must turn white.
++TEST_F(TarkCaptionBoxViewTest, FinalMatchingTheDraftIsNotFaded) {
++  box_->SetCaption({u"", u"one two"}, u"");
++  box_->SetCaption({u"one two", u""}, u"");
++  EXPECT_EQ(Colors(), (std::vector<SkColor>{TarkCaptionBoxView::kFinalColor}));
++}
++
++TEST_F(TarkCaptionBoxViewTest, HiddenWhenEmpty) {
++  box_->SetCaption({u"one", u""}, u"");
++  EXPECT_TRUE(box_->GetVisible());
++  box_->SetCaption({}, u"");
++  EXPECT_FALSE(box_->GetVisible());
++}
++
++}  // namespace
+--- /dev/null
++++ b/chrome/browser/ui/views/tark_captions/tark_caption_box_unittests_main.cc
+@@ -0,0 +1,11 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "mojo/core/embedder/embedder.h"
++#include "ui/views/views_test_suite.h"
++
++int main(int argc, char** argv) {
++  mojo::core::Init();
++  return views::ViewsTestSuite(argc, argv).RunTests();
++}
+--- /dev/null
++++ b/chrome/services/speech/tark_speech_service_unittest.cc
+@@ -0,0 +1,61 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include <utility>
++
++#include "base/files/file_path.h"
++#include "base/functional/callback_helpers.h"
++#include "base/test/run_until.h"
++#include "base/test/task_environment.h"
++#include "chrome/services/speech/speech_recognition_service_impl.h"
++#include "media/mojo/mojom/speech_recognition.mojom.h"
++#include "media/mojo/mojom/speech_recognition_service.mojom.h"
++#include "media/mojo/mojom/speech_recognition_result.h"
++#include "mojo/public/cpp/bindings/receiver.h"
++#include "mojo/public/cpp/bindings/remote.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace speech {
++namespace {
++
++class FakeClient : public media::mojom::SpeechRecognitionRecognizerClient {
++ public:
++  void OnSpeechRecognitionRecognitionEvent(
++      const media::SpeechRecognitionResult& result,
++      OnSpeechRecognitionRecognitionEventCallback reply) override {
++    std::move(reply).Run(true);
++  }
++  void OnSpeechRecognitionStopped() override {}
++  void OnSpeechRecognitionError() override { error = true; }
++  void OnLanguageIdentificationEvent(media::mojom::LanguageIdentificationEventPtr) override {}
++
++  bool error = false;
++};
++
++// Before the models are on this Mac, pressing Captions must say captions are
++// unavailable; the client must not just be dropped (the pill would wait on
++// "Listening…" for ever).
++TEST(TarkSpeechServiceTest, MissingModelsReachTheClientAsAnError) {
++  base::test::TaskEnvironment env;
++  mojo::Remote<media::mojom::SpeechRecognitionService> service;
++  SpeechRecognitionServiceImpl impl(service.BindNewPipeAndPassReceiver());
++  service->SetSodaPaths(base::FilePath("/nonexistent/libonnxruntime.dylib"),
++                        {{"hi", base::FilePath("/nonexistent/models")}}, "hi");
++  mojo::Remote<media::mojom::SpeechRecognitionContext> context;
++  service->BindSpeechRecognitionContext(context.BindNewPipeAndPassReceiver());
++
++  FakeClient client;
++  mojo::Receiver<media::mojom::SpeechRecognitionRecognizerClient> client_receiver(&client);
++  mojo::Remote<media::mojom::SpeechRecognitionRecognizer> recognizer;
++  auto options = media::mojom::SpeechRecognitionOptions::New();
++  options->recognizer_client_type = media::mojom::RecognizerClientType::kLiveCaption;
++  options->language = "hi";
++  context->BindRecognizer(recognizer.BindNewPipeAndPassReceiver(),
++                          client_receiver.BindNewPipeAndPassRemote(), std::move(options),
++                          base::DoNothing());
++  ASSERT_TRUE(base::test::RunUntil([&] { return client.error; }));
++}
++
++}  // namespace
++}  // namespace speech
+--- a/chrome/browser/speech/chrome_speech_recognition_service.cc
++++ b/chrome/browser/speech/chrome_speech_recognition_service.cc
+@@ -23,6 +23,8 @@
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/common/chrome_paths_internal.h"
+ #include "chrome/browser/speech/on_device_live_caption_recognizer.h"
++#include "chrome/browser/speech/speech_recognition_client_browser_interface.h"
++#include "chrome/browser/speech/speech_recognition_client_browser_interface_factory.h"
+ #include "chrome/grit/generated_resources.h"
+ #include "components/live_caption/pref_names.h"
+ #include "components/optimization_guide/core/model_execution/model_broker_client.h"
+@@ -81,11 +83,13 @@
+   std::string language_name;
+   if (options && options->language.has_value()) {
+     language_name = options->language.value();
+-  } else {
+-    PrefService* profile_prefs = user_prefs::UserPrefs::Get(context_);
+-    if (profile_prefs) {
+-      language_name = prefs::GetLiveCaptionLanguageCode(profile_prefs);
+-    }
++  } else if (SpeechRecognitionClientBrowserInterface* captions =
++                 SpeechRecognitionClientBrowserInterfaceFactory::GetForProfile(
++                     Profile::FromBrowserContext(context_))) {
++    // Tark (D4): renderers bind without a language; the call's language is
++    // the one its pill chose. (Chromium's Live Caption language, English by
++    // default, is not one Tark captions.)
++    language_name = captions->tark_captions_language();
+   }
+   if (options && !options->language.has_value()) {
+     options->language = language_name;
+@@ -236,10 +240,10 @@
+   DCHECK(global_prefs);
+ 
+   // Tark (D4): Tark's caption engine instead of SODA. The "binary" is ONNX
+-  // Runtime and the one "language pack" is the captions models folder; the
+-  // utility process checks both exist before making a recognizer. The
+-  // folder holds every language; each recognizer gets its call's language
+-  // from the pill (through the renderer), not from this default.
++  // Runtime and the one "language pack" is the captions models folder; a
++  // recognizer reports either missing as an error. The folder holds every
++  // language; BindRecognizer() gives each recognizer the captioning call's
++  // language (the pill's), not this default.
+   const std::string language_name = "hi";
+   const base::FilePath binary_path = TarkOnnxRuntimePath();
+   const base::FilePath models_dir = TarkCaptionsModelsDir();
+--- a/chrome/browser/speech/speech_recognition_client_browser_interface.h
++++ b/chrome/browser/speech/speech_recognition_client_browser_interface.h
+@@ -68,6 +68,11 @@
+   void OnTarkCaptionsChanged(bool on, const std::string& language);
+   // Tark (D4): the captioning tab's language changed.
+   void OnTarkCaptionsLanguageChanged(const std::string& language);
++  // The language the captioning call's pill chose ("hi", "ta", "bn"): what
++  // a recognizer bound without a language decodes.
++  const std::string& tark_captions_language() const {
++    return tark_captions_language_;
++  }
+ 
+   // SodaInstaller::Observer:
+   void OnSodaInstalled(speech::LanguageCode language_code) override;
+--- a/chrome/browser/tark_captions/call_captions_tab_helper.cc
++++ b/chrome/browser/tark_captions/call_captions_tab_helper.cc
+@@ -5,6 +5,7 @@
+ #include "chrome/browser/tark_captions/call_captions_tab_helper.h"
+ 
+ #include "base/logging.h"
++#include "base/no_destructor.h"
+ #include "chrome/browser/media/webrtc/media_capture_devices_dispatcher.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/speech/speech_recognition_client_browser_interface.h"
+@@ -12,6 +13,15 @@
+ #include "content/public/browser/web_contents.h"
+ #include "media/mojo/mojom/speech_recognition_result.h"
+ 
++namespace {
++
++tark_captions::CaptioningCall<CallCaptionsTabHelper>& Captioning() {
++  static base::NoDestructor<tark_captions::CaptioningCall<CallCaptionsTabHelper>> captioning;
++  return *captioning;
++}
++
++}  // namespace
++
+ CallCaptionsTabHelper::CallCaptionsTabHelper(content::WebContents* web_contents)
+     : content::WebContentsUserData<CallCaptionsTabHelper>(*web_contents),
+       indicator_(MediaCaptureDevicesDispatcher::GetInstance()->GetMediaStreamCaptureIndicator()) {
+@@ -20,6 +30,7 @@
+ }
+ 
+ CallCaptionsTabHelper::~CallCaptionsTabHelper() {
++  Captioning().Release(this);
+   if (state_.captions_on()) {
+     state_.SetCaptionsOn(false);
+     CaptionsChanged(/*was_on=*/true);
+@@ -28,9 +39,16 @@
+ 
+ void CallCaptionsTabHelper::SetCaptionsOn(bool on) {
+   const bool was_on = state_.captions_on();
++  if (on && !was_on && state_.in_call() && !state_.hidden()) {
++    // One call captions at a time: this one takes them from any other.
++    if (CallCaptionsTabHelper* other = Captioning().Take(this)) {
++      other->SetCaptionsOn(false);
++    }
++  }
+   if (state_.SetCaptionsOn(on) && was_on != on) {
+     CaptionsChanged(was_on);
+   }
++  ReleaseIfOff();
+   observers_.Notify(&Observer::OnCallStateChanged, this);
+ }
+ 
+@@ -52,6 +70,7 @@
+   if (was_on) {
+     CaptionsChanged(was_on);
+   }
++  ReleaseIfOff();
+   observers_.Notify(&Observer::OnCallStateChanged, this);
+ }
+ 
+@@ -88,9 +107,16 @@
+   if (was_on && !state_.captions_on()) {
+     CaptionsChanged(was_on);
+   }
++  ReleaseIfOff();
+   observers_.Notify(&Observer::OnCallStateChanged, this);
+ }
+ 
++void CallCaptionsTabHelper::ReleaseIfOff() {
++  if (!state_.captions_on()) {
++    Captioning().Release(this);
++  }
++}
++
+ void CallCaptionsTabHelper::CaptionsChanged(bool was_on) {
+   Profile* profile = Profile::FromBrowserContext(GetWebContents().GetBrowserContext());
+   speech::SpeechRecognitionClientBrowserInterface* speech =
+--- a/chrome/browser/tark_captions/call_captions_tab_helper.h
++++ b/chrome/browser/tark_captions/call_captions_tab_helper.h
+@@ -69,6 +69,8 @@
+   // Tells the profile's renderers (through the speech client interface)
+   // whether this tab's captions turned on or off.
+   void CaptionsChanged(bool was_on);
++  // Gives up being the captioning call once captions are off.
++  void ReleaseIfOff();
+ 
+   tark_captions::CallState state_;
+   tark_captions::Language language_ = tark_captions::Language::kHindi;
+--- a/chrome/browser/ui/BUILD.gn
++++ b/chrome/browser/ui/BUILD.gn
+@@ -833,6 +833,7 @@
+ 
+   deps = [
+     "//chrome/browser/tark_captions",
++    "//chrome/browser/ui/views/tark_captions:caption_box",
+     ":browser_element_identifiers",
+     ":browser_otr_state",
+     ":browser_ui_prefs",
+--- a/chrome/browser/ui/views/tark_captions/caption_pill_view.cc
++++ b/chrome/browser/ui/views/tark_captions/caption_pill_view.cc
+@@ -7,9 +7,9 @@
+ #include <memory>
+ 
+ #include "base/functional/bind.h"
++#include "chrome/browser/ui/views/tark_captions/caption_box_view.h"
+ #include "chrome/grit/generated_resources.h"
+ #include "components/vector_icons/vector_icons.h"
+-#include "third_party/skia/include/core/SkColor.h"
+ #include "ui/base/l10n/l10n_util.h"
+ #include "ui/base/metadata/metadata_impl_macros.h"
+ #include "ui/base/models/image_model.h"
+@@ -21,7 +21,6 @@
+ #include "ui/views/controls/button/image_button_factory.h"
+ #include "ui/views/controls/button/md_text_button.h"
+ #include "ui/views/controls/image_view.h"
+-#include "ui/views/controls/styled_label.h"
+ #include "ui/views/layout/box_layout.h"
+ 
+ namespace {
+@@ -29,9 +28,6 @@
+ // The caption box's width over the call; in the strip (call tab hidden).
+ constexpr int kCaptionWidth = 420;
+ constexpr int kStripWidth = 320;
+-constexpr SkColor kCaptionBackground = SkColorSetARGB(0xCC, 0x12, 0x12, 0x14);
+-constexpr SkColor kCaptionText = SK_ColorWHITE;
+-constexpr SkColor kDraftText = SkColorSetARGB(0x99, 0xFF, 0xFF, 0xFF);
+ 
+ }  // namespace
+ 
+@@ -40,15 +36,7 @@
+       views::BoxLayout::Orientation::kVertical, gfx::Insets(), 8))
+       ->set_cross_axis_alignment(views::BoxLayout::CrossAxisAlignment::kCenter);
+ 
+-  caption_box_ = AddChildView(std::make_unique<views::View>());
+-  caption_box_->SetLayoutManager(std::make_unique<views::BoxLayout>(
+-      views::BoxLayout::Orientation::kVertical));
+-  caption_box_->SetBackground(views::CreateRoundedRectBackground(kCaptionBackground, 10));
+-  caption_box_->SetBorder(views::CreateEmptyBorder(gfx::Insets::VH(8, 14)));
+-  caption_ = caption_box_->AddChildView(std::make_unique<views::StyledLabel>());
+-  caption_->SetDisplayedOnBackgroundColor(kCaptionBackground);
+-  caption_->SizeToFit(kCaptionWidth);
+-  caption_box_->SetVisible(false);
++  caption_box_ = AddChildView(std::make_unique<TarkCaptionBoxView>());
+ 
+   pill_ = AddChildView(std::make_unique<views::View>());
+   auto* row = pill_->SetLayoutManager(std::make_unique<views::BoxLayout>(
+@@ -85,8 +73,7 @@
+ 
+ void TarkCaptionPillView::SetMode(Mode mode) {
+   pill_->SetVisible(mode == Mode::kPill);
+-  caption_width_ = mode == Mode::kPill ? kCaptionWidth : kStripWidth;
+-  caption_->SizeToFit(caption_width_);
++  caption_box_->SetTextWidth(mode == Mode::kPill ? kCaptionWidth : kStripWidth);
+   PreferredSizeChanged();
+ }
+ 
+@@ -100,36 +87,7 @@
+ 
+ void TarkCaptionPillView::SetCaption(const tark_captions::CaptionText::Display& display,
+                                      const std::u16string& message) {
+-  std::u16string text;
+-  size_t draft_start = 0;
+-  if (!message.empty()) {
+-    text = message;
+-    draft_start = text.size();
+-  } else {
+-    text = display.committed;
+-    if (!display.draft.empty()) {
+-      if (!text.empty()) {
+-        text += u" ";
+-      }
+-      draft_start = text.size();
+-      text += display.draft;
+-    } else {
+-      draft_start = text.size();
+-    }
+-  }
+-  caption_box_->SetVisible(!text.empty());
+-  caption_->SetText(text);
+-  views::StyledLabel::RangeStyleInfo final_style;
+-  final_style.override_color = kCaptionText;
+-  views::StyledLabel::RangeStyleInfo draft_style;
+-  draft_style.override_color = kDraftText;
+-  if (draft_start > 0) {
+-    caption_->AddStyleRange(gfx::Range(0, draft_start), final_style);
+-  }
+-  if (draft_start < text.size()) {
+-    caption_->AddStyleRange(gfx::Range(draft_start, text.size()), draft_style);
+-  }
+-  caption_->SizeToFit(caption_width_);
++  caption_box_->SetCaption(display, message);
+   PreferredSizeChanged();
+ }
+ 
+--- a/chrome/browser/ui/views/tark_captions/caption_pill_view.h
++++ b/chrome/browser/ui/views/tark_captions/caption_pill_view.h
+@@ -13,9 +13,10 @@
+ #include "ui/gfx/geometry/point.h"
+ #include "ui/views/view.h"
+ 
++class TarkCaptionBoxView;
++
+ namespace views {
+ class MdTextButton;
+-class StyledLabel;
+ }  // namespace views
+ 
+ // Tark (D4): the call captions pill (mockup pill-states.html, steps 1-3):
+@@ -61,12 +62,10 @@
+   gfx::Point ScreenLocation(const ui::MouseEvent& event) const;
+ 
+   raw_ptr<Delegate> delegate_;
+-  raw_ptr<views::View> caption_box_ = nullptr;
+-  raw_ptr<views::StyledLabel> caption_ = nullptr;
++  raw_ptr<TarkCaptionBoxView> caption_box_ = nullptr;
+   raw_ptr<views::View> pill_ = nullptr;
+   raw_ptr<views::MdTextButton> captions_button_ = nullptr;
+   raw_ptr<views::MdTextButton> language_button_ = nullptr;
+-  int caption_width_ = 420;
+   gfx::Point drag_last_;
+ };
+ 
+--- a/chrome/services/speech/BUILD.gn
++++ b/chrome/services/speech/BUILD.gn
+@@ -113,7 +113,10 @@
+ # Tark (D4): the speech service's caption recognizer with Tark's engine.
+ # Same environment variables as tark_captions_unittests.
+ test("tark_speech_unittests") {
+-  sources = [ "tark_caption_recognizer_unittest.cc" ]
++  sources = [
++    "tark_caption_recognizer_unittest.cc",
++    "tark_speech_service_unittest.cc",
++  ]
+   deps = [
+     ":lib",
+     "//base",
+--- a/chrome/services/speech/speech_recognition_service_impl.cc
++++ b/chrome/services/speech/speech_recognition_service_impl.cc
+@@ -187,25 +187,18 @@
+     return false;
+   }
+ 
+-  // Destroy the speech recognition service if the SODA files haven't been
+-  // downloaded yet.
+-  if (!FilePathsExist()) {
+-    speech_recognition_contexts_.Clear();
+-    receiver_.reset();
+-    return false;
+-  }
+-
+   auto language = options->language.has_value()
+                       ? options->language.value()
+                       : default_live_caption_language_;
+   // Tark (D4): Tark's caption engine instead of SODA. binary_path_ is ONNX
+   // Runtime and the one config path is the captions models folder (see
+-  // ChromeSpeechRecognitionService::LaunchIfNotRunning()).
+-  if (config_paths_.empty()) {
+-    return false;
+-  }
++  // ChromeSpeechRecognitionService::LaunchIfNotRunning()). When either is
++  // missing the recognizer tells the client, so the pill says captions are
++  // unavailable; SODA's check here dropped the client without a word.
++  const base::FilePath models_dir =
++      config_paths_.empty() ? base::FilePath() : config_paths_.begin()->second;
+   TarkCaptionRecognizer::Create(std::move(receiver), std::move(client), binary_path_,
+-                                config_paths_.begin()->second, language);
++                                models_dir, language);
+ 
+   return true;
+ }
+--- a/chrome/services/speech/tark_caption_recognizer.cc
++++ b/chrome/services/speech/tark_caption_recognizer.cc
+@@ -89,11 +89,19 @@
+     const base::FilePath& models_dir,
+     const std::string& language)
+     : client_(std::move(client)) {
++  // A language Tark cannot caption is an error the pill shows, never another
++  // language's captions presented as this one's.
++  const std::optional<tark_captions::Language> parsed = ParseLanguage(language);
++  VLOG(1) << "Tark captions: recognizer for \"" << language << "\"";
++  if (!parsed) {
++    OnEngineFailed();
++    return;
++  }
+   scoped_refptr<base::SequencedTaskRunner> here = base::SequencedTaskRunner::GetCurrentDefault();
+   engine_ = base::SequenceBound<Engine>(
+       base::ThreadPool::CreateSequencedTaskRunner(
+           {base::MayBlock(), base::TaskPriority::USER_VISIBLE}),
+-      ort_dylib, models_dir, ParseLanguage(language).value_or(tark_captions::Language::kHindi),
++      ort_dylib, models_dir, *parsed,
+       base::BindPostTask(here, base::BindRepeating(&TarkCaptionRecognizer::OnEvent,
+                                                    weak_factory_.GetWeakPtr())),
+       base::BindPostTask(here, base::BindOnce(&TarkCaptionRecognizer::OnEngineFailed,
+@@ -113,11 +121,14 @@
+ }
+ 
+ void TarkCaptionRecognizer::MarkDone() {
+-  engine_.AsyncCall(&Engine::Flush);
++  if (!failed_) {
++    engine_.AsyncCall(&Engine::Flush);
++  }
+ }
+ 
+ void TarkCaptionRecognizer::OnLanguageChanged(const std::string& language) {
+-  if (std::optional<tark_captions::Language> parsed = ParseLanguage(language)) {
++  std::optional<tark_captions::Language> parsed = ParseLanguage(language);
++  if (!failed_ && parsed) {
+     engine_.AsyncCall(&Engine::SetLanguage).WithArgs(*parsed);
+   }
+ }
+--- a/chrome/services/speech/tark_caption_recognizer.h
++++ b/chrome/services/speech/tark_caption_recognizer.h
+@@ -27,7 +27,8 @@
+ class TarkCaptionRecognizer : public media::mojom::SpeechRecognitionRecognizer {
+  public:
+   // Binds a self-owned recognizer to `receiver`. `language` is a code such
+-  // as "hi" or "hi-IN"; an unsupported one means Hindi.
++  // as "hi" or "hi-IN"; one Tark cannot caption, or a missing ONNX Runtime
++  // or models folder, is reported to the client as an error.
+   static void Create(
+       mojo::PendingReceiver<media::mojom::SpeechRecognitionRecognizer> receiver,
+       mojo::PendingRemote<media::mojom::SpeechRecognitionRecognizerClient> client,
+--- a/chrome/services/speech/tark_caption_recognizer_unittest.cc
++++ b/chrome/services/speech/tark_caption_recognizer_unittest.cc
+@@ -91,6 +91,20 @@
+   ASSERT_TRUE(base::test::RunUntil([&] { return client_.error; }));
+ }
+ 
++// Tark has no English captions: a language it cannot caption is an error the
++// pill shows, never another language's captions.
++TEST_F(TarkCaptionRecognizerTest, UnknownLanguageIsAnError) {
++  // With real files: a missing engine also reports an error, so missing
++  // files would hide the behaviour under test.
++  std::optional<base::FilePath> ort = tark_captions::test::OrtPath();
++  std::optional<base::FilePath> models = tark_captions::test::ModelsDir();
++  if (!ort || !models) {
++    GTEST_SKIP() << "set TARK_CAPTIONS_ORT and TARK_CAPTIONS_MODELS";
++  }
++  Bind(*ort, *models, "en-US");
++  ASSERT_TRUE(base::test::RunUntil([&] { return client_.error; }));
++}
++
+ TEST_F(TarkCaptionRecognizerTest, ParsesLanguages) {
+   EXPECT_EQ(TarkCaptionRecognizer::ParseLanguage("hi-IN"), tark_captions::Language::kHindi);
+   EXPECT_EQ(TarkCaptionRecognizer::ParseLanguage("ta"), tark_captions::Language::kTamil);
+--- a/components/tark_captions/call_state.h
++++ b/components/tark_captions/call_state.h
+@@ -5,6 +5,8 @@
+ #ifndef COMPONENTS_TARK_CAPTIONS_CALL_STATE_H_
+ #define COMPONENTS_TARK_CAPTIONS_CALL_STATE_H_
+ 
++#include "base/memory/raw_ptr.h"
++
+ namespace tark_captions {
+ 
+ // One tab's call and captions state. A tab is in a call while it captures
+@@ -32,6 +34,31 @@
+   bool hidden_ = false;
+ };
+ 
++// Which call has captions on. One call captions at a time: the engine
++// decodes one language for the profile, and only that call's audio may reach
++// it. Turning captions on in a call takes them from the other one.
++template <typename Call>
++class CaptioningCall {
++ public:
++  // Makes `call` the captioning call; returns the call that was captioning
++  // before, which must turn its captions off, or null.
++  Call* Take(Call* call) {
++    Call* previous = current_ == call ? nullptr : current_.get();
++    current_ = call;
++    return previous;
++  }
++  // `call`'s captions are off; nothing changes if another call has them.
++  void Release(Call* call) {
++    if (current_ == call) {
++      current_ = nullptr;
++    }
++  }
++  Call* current() const { return current_; }
++
++ private:
++  raw_ptr<Call> current_ = nullptr;
++};
++
+ }  // namespace tark_captions
+ 
+ #endif  // COMPONENTS_TARK_CAPTIONS_CALL_STATE_H_
+--- a/components/tark_captions/call_state_unittest.cc
++++ b/components/tark_captions/call_state_unittest.cc
+@@ -56,5 +56,28 @@
+   EXPECT_FALSE(state.hidden());
+ }
+ 
++// One call captions at a time: its language is the profile's, and only its
++// audio may reach the engine.
++TEST(CaptioningCallTest, TurningOnTakesCaptionsFromTheOtherCall) {
++  int a = 0;
++  int b = 0;
++  CaptioningCall<int> captioning;
++  EXPECT_EQ(captioning.Take(&a), nullptr);
++  EXPECT_EQ(captioning.Take(&b), &a);
++  EXPECT_EQ(captioning.current(), &b);
++  EXPECT_EQ(captioning.Take(&b), nullptr);
++}
++
++TEST(CaptioningCallTest, OnlyTheCaptioningCallReleases) {
++  int a = 0;
++  int b = 0;
++  CaptioningCall<int> captioning;
++  captioning.Take(&a);
++  captioning.Release(&b);
++  EXPECT_EQ(captioning.current(), &a);
++  captioning.Release(&a);
++  EXPECT_EQ(captioning.current(), nullptr);
++}
++
+ }  // namespace
+ }  // namespace tark_captions
+--- a/components/tark_captions/caption_engine.cc
++++ b/components/tark_captions/caption_engine.cc
+@@ -5,10 +5,13 @@
+ #include "components/tark_captions/caption_engine.h"
+ 
+ #include <algorithm>
++#include <map>
+ #include <utility>
+ 
+ #include "base/functional/bind.h"
+ #include "base/memory/ptr_util.h"
++#include "base/no_destructor.h"
++#include "base/synchronization/lock.h"
+ #include "base/time/time.h"
+ #include "components/tark_captions/ort_runtime.h"
+ #include "components/tark_captions/segmenter.h"
+@@ -25,33 +28,116 @@
+ 
+ }  // namespace
+ 
++// One loaded speech model (ONNX Runtime and IndicConformer) for a models
++// folder, shared by every engine in the process that uses it. Loading,
++// lookup and release all happen under one lock, so an engine never picks up
++// a model that is being unloaded.
++class SharedAsr {
++ public:
++  // Null if ONNX Runtime or the model is missing.
++  static SharedAsr* Acquire(const base::FilePath& models_dir, const base::FilePath& ort_dylib) {
++    base::AutoLock lock(RegistryLock());
++    auto key = std::make_pair(models_dir, ort_dylib);
++    auto it = Registry().find(key);
++    if (it != Registry().end()) {
++      ++it->second->users_;
++      return it->second.get();
++    }
++    std::unique_ptr<OrtRuntime> runtime = OrtRuntime::Load(ort_dylib);
++    if (!runtime) {
++      return nullptr;
++    }
++    std::unique_ptr<AsrModel> asr = AsrModel::Load(runtime.get(), models_dir, kThreads);
++    if (!asr) {
++      return nullptr;
++    }
++    auto shared = base::WrapUnique(new SharedAsr(key, std::move(runtime), std::move(asr)));
++    SharedAsr* raw = shared.get();
++    Registry().emplace(key, std::move(shared));
++    return raw;
++  }
++
++  static void Release(SharedAsr* shared) {
++    base::AutoLock lock(RegistryLock());
++    if (--shared->users_ == 0) {
++      // Erase by iterator: the key lives in the object being erased.
++      Registry().erase(Registry().find(shared->key_));
++    }
++  }
++
++  static int Count() {
++    base::AutoLock lock(RegistryLock());
++    return static_cast<int>(Registry().size());
++  }
++
++  SharedAsr(const SharedAsr&) = delete;
++  SharedAsr& operator=(const SharedAsr&) = delete;
++  ~SharedAsr() {
++    // The model before the runtime that loaded it.
++    asr_.reset();
++  }
++
++  // Engines run on their own sequences and the runtime and the model's
++  // front end are not made for concurrent use, so their uses take turns.
++  std::unique_ptr<Vad> LoadVad(const base::FilePath& models_dir) {
++    base::AutoLock lock(lock_);
++    return Vad::Load(runtime_.get(), models_dir);
++  }
++  std::string Decode(base::span<const float> pcm16k, Language language) {
++    base::AutoLock lock(lock_);
++    return asr_->Decode(pcm16k, language);
++  }
++
++ private:
++  using Key = std::pair<base::FilePath, base::FilePath>;
++
++  static base::Lock& RegistryLock() {
++    static base::NoDestructor<base::Lock> lock;
++    return *lock;
++  }
++  static std::map<Key, std::unique_ptr<SharedAsr>>& Registry() {
++    static base::NoDestructor<std::map<Key, std::unique_ptr<SharedAsr>>> registry;
++    return *registry;
++  }
++
++  SharedAsr(Key key, std::unique_ptr<OrtRuntime> runtime, std::unique_ptr<AsrModel> asr)
++      : key_(std::move(key)), runtime_(std::move(runtime)), asr_(std::move(asr)) {}
++
++  const Key key_;
++  int users_ = 1;  // Guarded by RegistryLock().
++  std::unique_ptr<OrtRuntime> runtime_;
++  std::unique_ptr<AsrModel> asr_;
++  base::Lock lock_;
++};
++
+ // static
+ std::unique_ptr<CaptionEngine> CaptionEngine::Create(const base::FilePath& models_dir,
+                                                      const base::FilePath& ort_dylib) {
+-  std::unique_ptr<OrtRuntime> runtime = OrtRuntime::Load(ort_dylib);
+-  if (!runtime) {
++  SharedAsr* asr = SharedAsr::Acquire(models_dir, ort_dylib);
++  if (!asr) {
+     return nullptr;
+   }
+-  std::unique_ptr<AsrModel> asr = AsrModel::Load(runtime.get(), models_dir, kThreads);
+-  std::unique_ptr<Vad> vad = Vad::Load(runtime.get(), models_dir);
+-  if (!asr || !vad) {
++  // VAD keeps state per stream, so each engine has its own (2 MB).
++  std::unique_ptr<Vad> vad = asr->LoadVad(models_dir);
++  if (!vad) {
++    SharedAsr::Release(asr);
+     return nullptr;
+   }
+-  return base::WrapUnique(new CaptionEngine(std::move(runtime), std::move(asr), std::move(vad)));
++  return base::WrapUnique(new CaptionEngine(asr, std::move(vad)));
++}
++
++// static
++int CaptionEngine::LoadedModelsForTesting() {
++  return SharedAsr::Count();
+ }
+ 
+-CaptionEngine::CaptionEngine(std::unique_ptr<OrtRuntime> runtime,
+-                             std::unique_ptr<AsrModel> asr,
+-                             std::unique_ptr<Vad> vad)
+-    : runtime_(std::move(runtime)),
+-      asr_(std::move(asr)),
+-      vad_(std::move(vad)),
+-      segmenter_(std::make_unique<Segmenter>()) {}
++CaptionEngine::CaptionEngine(SharedAsr* asr, std::unique_ptr<Vad> vad)
++    : asr_(asr), vad_(std::move(vad)), segmenter_(std::make_unique<Segmenter>()) {}
+ 
+ CaptionEngine::~CaptionEngine() {
+-  // Models before the runtime that loaded them.
+-  asr_.reset();
++  // The VAD before the shared runtime that loaded it.
+   vad_.reset();
++  SharedAsr::Release(asr_.ExtractAsDangling());
+ }
+ 
+ void CaptionEngine::SetLanguage(Language language) {
+--- a/components/tark_captions/caption_engine.h
++++ b/components/tark_captions/caption_engine.h
+@@ -13,6 +13,7 @@
+ #include "base/containers/span.h"
+ #include "base/files/file_path.h"
+ #include "base/functional/callback.h"
++#include "base/memory/raw_ptr.h"
+ #include "components/tark_captions/asr_model.h"
+ 
+ namespace media {
+@@ -21,7 +22,7 @@
+ 
+ namespace tark_captions {
+ 
+-class OrtRuntime;
++class SharedAsr;
+ class Segmenter;
+ class Vad;
+ 
+@@ -43,9 +44,13 @@
+     std::vector<double> decode_seconds;  // wall time of each decode
+   };
+ 
+-  // Null if ONNX Runtime or any model is missing.
++  // Null if ONNX Runtime or any model is missing. Engines in one process
++  // share the loaded speech model (a call page can have several audio
++  // players, each with its own recognizer); it unloads with the last one.
+   static std::unique_ptr<CaptionEngine> Create(const base::FilePath& models_dir,
+                                                const base::FilePath& ort_dylib);
++  // How many speech models are loaded in this process.
++  static int LoadedModelsForTesting();
+ 
+   CaptionEngine(const CaptionEngine&) = delete;
+   CaptionEngine& operator=(const CaptionEngine&) = delete;
+@@ -64,15 +69,13 @@
+   const Stats& stats() const { return stats_; }
+ 
+  private:
+-  CaptionEngine(std::unique_ptr<OrtRuntime> runtime,
+-                std::unique_ptr<AsrModel> asr,
+-                std::unique_ptr<Vad> vad);
++  CaptionEngine(SharedAsr* asr, std::unique_ptr<Vad> vad);
+ 
+   void AddMono16k(base::span<const float> pcm, const EventCallback& on_event);
+   void Decode(bool is_final, double start_s, double end_s, const EventCallback& on_event);
+ 
+-  std::unique_ptr<OrtRuntime> runtime_;
+-  std::unique_ptr<AsrModel> asr_;
++  // Shared with other engines; released (not owned) on destruction.
++  raw_ptr<SharedAsr> asr_;
+   std::unique_ptr<Vad> vad_;
+   std::unique_ptr<Segmenter> segmenter_;
+   Language language_ = Language::kHindi;
+--- a/components/tark_captions/caption_engine_unittest.cc
++++ b/components/tark_captions/caption_engine_unittest.cc
+@@ -129,6 +129,20 @@
+   EXPECT_LE(cer48, cer16 + 0.01) << "16k " << cer16 << ": " << at16 << " | 48k " << cer48 << ": " << at48;
+ }
+ 
++// A call page with several audio players gets one recognizer (and engine)
++// per player: they must share one loaded model, not load ~600 MB each.
++TEST_F(CaptionEngineTest, EnginesShareTheModel) {
++  EXPECT_EQ(CaptionEngine::LoadedModelsForTesting(), 0);
++  std::unique_ptr<CaptionEngine> first = CaptionEngine::Create(models_, ort_);
++  std::unique_ptr<CaptionEngine> second = CaptionEngine::Create(models_, ort_);
++  ASSERT_TRUE(first && second);
++  EXPECT_EQ(CaptionEngine::LoadedModelsForTesting(), 1);
++  first.reset();
++  EXPECT_EQ(CaptionEngine::LoadedModelsForTesting(), 1);
++  second.reset();
++  EXPECT_EQ(CaptionEngine::LoadedModelsForTesting(), 0);
++}
++
+ TEST_F(CaptionEngineTest, MissingModelsFail) {
+   EXPECT_FALSE(CaptionEngine::Create(base::FilePath("/nonexistent"), ort_));
+ }

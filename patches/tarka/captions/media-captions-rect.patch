@@ -1,0 +1,480 @@
+--- /dev/null
++++ b/third_party/blink/renderer/core/html/media/tark_video_rect_reporter.h
+@@ -0,0 +1,55 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef THIRD_PARTY_BLINK_RENDERER_CORE_HTML_MEDIA_TARK_VIDEO_RECT_REPORTER_H_
++#define THIRD_PARTY_BLINK_RENDERER_CORE_HTML_MEDIA_TARK_VIDEO_RECT_REPORTER_H_
++
++#include <optional>
++
++#include "third_party/blink/renderer/core/core_export.h"
++#include "third_party/blink/renderer/core/frame/local_frame_view.h"
++#include "third_party/blink/renderer/platform/heap/garbage_collected.h"
++#include "third_party/blink/renderer/platform/heap/member.h"
++#include "ui/gfx/geometry/rect.h"
++
++namespace blink {
++
++class Document;
++class HTMLVideoElement;
++
++// Tark (D4 any-media captions): once a video has played, tells the
++// browser where it is on screen, so Tark's captions button can sit on its corner.
++// The box is the video's content box in DIPs, relative to the outermost
++// main frame's viewport; sent after a lifecycle update when it changed.
++// Empty: not visible. Null: not known (a video in a cross-site frame, whose
++// place in the page lags the page's scrolling).
++class CORE_EXPORT TarkVideoRectReporter final
++    : public GarbageCollected<TarkVideoRectReporter>,
++      public LocalFrameView::LifecycleNotificationObserver {
++ public:
++  explicit TarkVideoRectReporter(HTMLVideoElement& video);
++
++  // Starts reporting (the video started playing); it goes on while the
++  // video stays in its document, paused or moved.
++  void Attach();
++  void Detach();
++
++  // LocalFrameView::LifecycleNotificationObserver:
++  void DidFinishLifecycleUpdate(const LocalFrameView&) override;
++
++  void Trace(Visitor*) const override;
++
++ private:
++  std::optional<gfx::Rect> ComputeRect() const;
++  void Send(const std::optional<gfx::Rect>& rect);
++
++  Member<HTMLVideoElement> video_;
++  Member<Document> attached_to_;
++  // What the browser was last told; nothing yet when unset.
++  std::optional<std::optional<gfx::Rect>> sent_;
++};
++
++}  // namespace blink
++
++#endif  // THIRD_PARTY_BLINK_RENDERER_CORE_HTML_MEDIA_TARK_VIDEO_RECT_REPORTER_H_
+--- /dev/null
++++ b/third_party/blink/renderer/core/html/media/tark_video_rect_reporter.cc
+@@ -0,0 +1,136 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "third_party/blink/renderer/core/html/media/tark_video_rect_reporter.h"
++
++#include "third_party/blink/renderer/core/dom/document.h"
++#include "third_party/blink/renderer/core/frame/local_frame.h"
++#include "third_party/blink/renderer/core/html/html_frame_owner_element.h"
++#include "third_party/blink/renderer/core/html/media/html_video_element.h"
++#include "third_party/blink/renderer/core/layout/layout_box.h"
++#include "third_party/blink/renderer/core/layout/layout_video.h"
++#include "third_party/blink/renderer/core/page/chrome_client.h"
++#include "third_party/blink/renderer/core/page/page.h"
++#include "ui/gfx/geometry/rect_conversions.h"
++
++namespace blink {
++
++namespace {
++
++// `rect` (absolute, in `box`'s frame) clipped by the boxes around it that
++// clip their overflow (scrollers, overflow: hidden) and by the frame's own
++// viewport.
++PhysicalRect ClipWithinFrame(const LayoutObject& box,
++                             PhysicalRect rect,
++                             const LocalFrameView& view) {
++  for (const LayoutObject* parent = box.Parent(); parent; parent = parent->Parent()) {
++    const auto* clipper = DynamicTo<LayoutBox>(parent);
++    if (clipper && clipper->ShouldClipOverflowAlongEitherAxis()) {
++      rect.Intersect(clipper->LocalToAbsoluteRect(clipper->OverflowClipRect()));
++    }
++  }
++  rect.Intersect(PhysicalRect(PhysicalOffset(), PhysicalSize(view.Size())));
++  return rect;
++}
++
++}  // namespace
++
++TarkVideoRectReporter::TarkVideoRectReporter(HTMLVideoElement& video) : video_(&video) {}
++
++void TarkVideoRectReporter::Attach() {
++  Document& document = video_->GetDocument();
++  if (attached_to_ || !document.View()) {
++    return;
++  }
++  document.View()->RegisterForLifecycleNotifications(this);
++  attached_to_ = &document;
++  // A page that doesn't change gets no lifecycle update by itself while the
++  // video plays: ask for one, so the box is sent now.
++  document.View()->ScheduleAnimation();
++}
++
++void TarkVideoRectReporter::Detach() {
++  if (!attached_to_) {
++    return;
++  }
++  if (LocalFrameView* view = attached_to_->View()) {
++    view->UnregisterFromLifecycleNotifications(this);
++  }
++  attached_to_ = nullptr;
++  sent_.reset();
++}
++
++void TarkVideoRectReporter::DidFinishLifecycleUpdate(const LocalFrameView&) {
++  if (&video_->GetDocument() != attached_to_) {
++    Detach();
++    return;
++  }
++  // Keeps reporting once the video has played: paused (its button may stay,
++  // captions still on) and while it is moved in the page (theater mode, a
++  // floating player). Out of the page, it isn't visible.
++  Send(video_->isConnected() ? ComputeRect() : std::optional<gfx::Rect>(gfx::Rect()));
++}
++
++std::optional<gfx::Rect> TarkVideoRectReporter::ComputeRect() const {
++  LocalFrame* frame = video_->GetDocument().GetFrame();
++  auto* layout = DynamicTo<LayoutVideo>(video_->GetLayoutObject());
++  // A frame in another process (a cross-site embed) learns where it sits in
++  // the page only now and then, so its box would lag the page's scrolling:
++  // not known (the button goes to the window's corner).
++  if (!frame || !frame->View() || !frame->GetPage() ||
++      !frame->LocalFrameRoot().IsOutermostMainFrame()) {
++    return std::nullopt;
++  }
++  if (!layout) {
++    return gfx::Rect();  // display: none.
++  }
++  // The content box (the picture, not the letterboxing), clipped in its frame.
++  const PhysicalRect box = ClipWithinFrame(
++      *layout, layout->LocalToAbsoluteRect(layout->ReplacedContentRect()), *frame->View());
++  if (box.IsEmpty()) {
++    return gfx::Rect();
++  }
++  // Through same-process ancestor frames to the main frame's viewport,
++  // clipped by each iframe it sits in.
++  gfx::Rect in_viewport = frame->View()->FrameToViewport(ToEnclosingRect(box));
++  for (LocalFrame* child = frame; child && !child->IsOutermostMainFrame();) {
++    auto* parent = DynamicTo<LocalFrame>(child->Tree().Parent());
++    HTMLFrameOwnerElement* owner = child->DeprecatedLocalOwner();
++    if (!parent || !parent->View() || !owner) {
++      break;
++    }
++    if (const auto* owner_box = DynamicTo<LayoutBox>(owner->GetLayoutObject())) {
++      const PhysicalRect owner_rect = ClipWithinFrame(
++          *owner_box, owner_box->LocalToAbsoluteRect(owner_box->PhysicalContentBoxRect()),
++          *parent->View());
++      in_viewport.Intersect(parent->View()->FrameToViewport(ToEnclosingRect(owner_rect)));
++    }
++    child = parent;
++  }
++  if (in_viewport.IsEmpty()) {
++    return gfx::Rect();
++  }
++  // Layout is in physical pixels; the browser places windows in DIPs.
++  const float scale = frame->GetPage()->GetChromeClient().WindowToViewportScalar(frame, 1.0f);
++  if (scale <= 0) {
++    return std::nullopt;
++  }
++  return gfx::ToEnclosingRect(gfx::ScaleRect(gfx::RectF(in_viewport), 1.0f / scale));
++}
++
++void TarkVideoRectReporter::Send(const std::optional<gfx::Rect>& rect) {
++  if (sent_ && *sent_ == rect) {
++    return;
++  }
++  sent_ = rect;
++  video_->TarkSendVideoRect(rect);
++}
++
++void TarkVideoRectReporter::Trace(Visitor* visitor) const {
++  visitor->Trace(video_);
++  visitor->Trace(attached_to_);
++  LocalFrameView::LifecycleNotificationObserver::Trace(visitor);
++}
++
++}  // namespace blink
+--- /dev/null
++++ b/content/public/browser/tark_media_rect.h
+@@ -0,0 +1,37 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CONTENT_PUBLIC_BROWSER_TARK_MEDIA_RECT_H_
++#define CONTENT_PUBLIC_BROWSER_TARK_MEDIA_RECT_H_
++
++#include <optional>
++
++#include "content/common/content_export.h"
++#include "ui/gfx/geometry/rect.h"
++
++namespace content {
++
++class WebContents;
++struct MediaPlayerId;
++
++// Tark (D4 any-media captions): where a playing video's picture is, in DIPs
++// relative to the outermost main frame's viewport; empty when it isn't
++// visible, nullopt when it isn't known. One observer for the browser, on the
++// UI thread (a hook of its own so WebContentsObserver, which most of the
++// browser includes, stays as Chromium ships it).
++class CONTENT_EXPORT TarkMediaRectObserver {
++ public:
++  virtual ~TarkMediaRectObserver() = default;
++  virtual void OnVideoRectChanged(WebContents* web_contents,
++                                  const MediaPlayerId& id,
++                                  const std::optional<gfx::Rect>& rect) = 0;
++};
++
++// Sets the observer (null clears it); it must outlive its registration.
++CONTENT_EXPORT void SetTarkMediaRectObserver(TarkMediaRectObserver* observer);
++CONTENT_EXPORT TarkMediaRectObserver* GetTarkMediaRectObserver();
++
++}  // namespace content
++
++#endif  // CONTENT_PUBLIC_BROWSER_TARK_MEDIA_RECT_H_
+--- /dev/null
++++ b/content/browser/media/tark_media_rect.cc
+@@ -0,0 +1,26 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "content/public/browser/tark_media_rect.h"
++
++#include "base/check.h"
++#include "content/public/browser/browser_thread.h"
++
++namespace content {
++
++namespace {
++TarkMediaRectObserver* g_observer = nullptr;
++}  // namespace
++
++void SetTarkMediaRectObserver(TarkMediaRectObserver* observer) {
++  DCHECK_CURRENTLY_ON(BrowserThread::UI);
++  g_observer = observer;
++}
++
++TarkMediaRectObserver* GetTarkMediaRectObserver() {
++  DCHECK_CURRENTLY_ON(BrowserThread::UI);
++  return g_observer;
++}
++
++}  // namespace content
+--- a/content/browser/BUILD.gn
++++ b/content/browser/BUILD.gn
+@@ -1289,6 +1289,7 @@
+     "media/media_stream_web_contents_observer.cc",
+     "media/media_stream_web_contents_observer.h",
+     "media/media_web_contents_observer.cc",
++    "media/tark_media_rect.cc",
+     "media/media_web_contents_observer.h",
+     "media/midi_host.cc",
+     "media/midi_host.h",
+--- a/content/browser/media/media_web_contents_observer.cc
++++ b/content/browser/media/media_web_contents_observer.cc
+@@ -23,6 +23,7 @@
+ #include "content/browser/renderer_host/render_frame_host_impl.h"
+ #include "content/browser/web_contents/web_contents_impl.h"
+ #include "content/public/browser/render_frame_host.h"
++#include "content/public/browser/tark_media_rect.h"
+ #include "content/public/browser/web_contents.h"
+ #include "mojo/public/cpp/bindings/message.h"
+ #include "mojo/public/cpp/bindings/pending_receiver.h"
+@@ -688,6 +689,14 @@
+       ->OnVideoFrameAvailabilityChanged(media_player_id_, available);
+ }
+ 
++void MediaWebContentsObserver::MediaPlayerObserverHostImpl::OnVideoRectChanged(
++    const std::optional<::gfx::Rect>& rect) {
++  if (TarkMediaRectObserver* observer = GetTarkMediaRectObserver()) {
++    observer->OnVideoRectChanged(media_web_contents_observer_->web_contents_impl(),
++                                 media_player_id_, rect);
++  }
++}
++
+ bool MediaWebContentsObserver::IsMediaPlayerRemoteAvailable(
+     const MediaPlayerId& player_id) {
+   return media_player_remotes_.contains(player_id);
+--- a/content/browser/media/media_web_contents_observer.h
++++ b/content/browser/media/media_web_contents_observer.h
+@@ -260,6 +260,7 @@
+     void OnVideoVisibilityChanged(bool meets_visibility_threshold) override;
+     void NotifyAudioStreamMonitorIfNeeded();
+     void OnVideoFrameAvailabilityChanged(bool available) override;
++    void OnVideoRectChanged(const std::optional<::gfx::Rect>& rect) override;
+ 
+    private:
+     PlayerInfo* GetPlayerInfo();
+--- a/content/public/browser/BUILD.gn
++++ b/content/public/browser/BUILD.gn
+@@ -503,6 +503,7 @@
+     "web_contents_media_capture_id.cc",
+     "web_contents_media_capture_id.h",
+     "web_contents_observer.cc",
++    "tark_media_rect.h",
+     "web_contents_observer.h",
+     "web_contents_user_data.h",
+     "web_contents_view_delegate.cc",
+--- a/media/mojo/mojom/media_player.mojom
++++ b/media/mojo/mojom/media_player.mojom
+@@ -135,6 +135,12 @@
+ 
+   // Notifies the browser process of save video frame's availability.
+   OnVideoFrameAvailabilityChanged(bool available);
++
++  // Tark (D4 any-media captions): where the playing video's picture is, in
++  // DIPs relative to the outermost main frame's viewport. Empty when it
++  // isn't visible; null when it isn't known (a frame whose place in the page
++  // can't be mapped).
++  OnVideoRectChanged(gfx.mojom.Rect? rect);
+ };
+ 
+ // Implemented by MediaWebContentsObserver::MediaPlayerHostImpl in the browser
+--- a/third_party/blink/renderer/core/html/build.gni
++++ b/third_party/blink/renderer/core/html/build.gni
+@@ -532,6 +532,8 @@
+   "media/media_source_tracer.h",
+   "media/media_video_visibility_tracker.cc",
+   "media/media_video_visibility_tracker.h",
++  "media/tark_video_rect_reporter.cc",
++  "media/tark_video_rect_reporter.h",
+   "media/picture_in_picture_interstitial.cc",
+   "media/picture_in_picture_interstitial.h",
+   "media/remote_playback_controller.cc",
+--- a/third_party/blink/renderer/core/html/media/html_media_element.cc
++++ b/third_party/blink/renderer/core/html/media/html_media_element.cc
+@@ -5175,6 +5175,12 @@
+ void HTMLMediaElement::DidPlayerStartPlaying() {
+   for (auto& observer : media_player_observer_remote_set_->Value())
+     observer->OnMediaPlaying();
++  // Tark (D4 any-media captions): where the video is, for the browser's
++  // captions button. Here (not OnPlay()) so the autoplay attribute's start
++  // is covered too.
++  if (auto* video = DynamicTo<HTMLVideoElement>(this)) {
++    video->TarkStartReportingRect();
++  }
+ }
+ 
+ void HTMLMediaElement::DidPlayerPaused(bool stream_ended) {
+--- a/third_party/blink/renderer/core/html/media/html_media_element_test.cc
++++ b/third_party/blink/renderer/core/html/media/html_media_element_test.cc
+@@ -306,6 +306,8 @@
+ 
+   void OnVideoVisibilityChanged(bool meets_visibility_threshold) override {}
+ 
++  void OnVideoRectChanged(const std::optional<gfx::Rect>& rect) override {}
++
+   void OnVideoFrameAvailabilityChanged(bool available) override {
+     received_video_frame_availability_ = available;
+     if (run_loop_) {
+--- a/third_party/blink/renderer/core/html/media/html_video_element.cc
++++ b/third_party/blink/renderer/core/html/media/html_video_element.cc
+@@ -62,6 +62,7 @@
+ #include "third_party/blink/renderer/core/html/media/media_custom_controls_fullscreen_detector.h"
+ #include "third_party/blink/renderer/core/html/media/media_remoting_interstitial.h"
+ #include "third_party/blink/renderer/core/html/media/media_video_visibility_tracker.h"
++#include "third_party/blink/renderer/core/html/media/tark_video_rect_reporter.h"
+ #include "third_party/blink/renderer/core/html/media/picture_in_picture_interstitial.h"
+ #include "third_party/blink/renderer/core/html/media/video_frame_callback_requester.h"
+ #include "third_party/blink/renderer/core/html/media/video_wake_lock.h"
+@@ -153,6 +154,7 @@
+   visitor->Trace(image_loader_);
+   visitor->Trace(custom_controls_fullscreen_detector_);
+   visitor->Trace(visibility_tracker_);
++  visitor->Trace(tark_rect_reporter_);
+   visitor->Trace(wake_lock_);
+   visitor->Trace(remoting_interstitial_);
+   visitor->Trace(picture_in_picture_interstitial_);
+@@ -245,6 +247,9 @@
+ 
+ void HTMLVideoElement::ContextDestroyed() {
+   custom_controls_fullscreen_detector_->ContextDestroyed();
++  if (tark_rect_reporter_) {
++    tark_rect_reporter_->Detach();
++  }
+   UpdateVideoVisibilityTracker();
+   HTMLMediaElement::ContextDestroyed();
+ }
+@@ -874,6 +879,10 @@
+ 
+   wake_lock_->ElementDidMoveToNewDocument();
+ 
++  if (tark_rect_reporter_) {
++    tark_rect_reporter_->Detach();
++  }
++
+   if (visibility_tracker_) {
+     // Ensure that the |visibility_tracker_| is detached when |this| is moved to
+     // a new document. Calling |ElementDidMoveToNewDocument| on the tracker at
+@@ -1349,4 +1358,17 @@
+   }
+ }
+ 
++void HTMLVideoElement::TarkStartReportingRect() {
++  if (!tark_rect_reporter_) {
++    tark_rect_reporter_ = MakeGarbageCollected<TarkVideoRectReporter>(*this);
++  }
++  tark_rect_reporter_->Attach();
++}
++
++void HTMLVideoElement::TarkSendVideoRect(const std::optional<gfx::Rect>& rect) {
++  for (auto& observer : GetMediaPlayerObserverRemoteSet()) {
++    observer->OnVideoRectChanged(rect);
++  }
++}
++
+ }  // namespace blink
+--- a/third_party/blink/renderer/core/html/media/html_video_element.h
++++ b/third_party/blink/renderer/core/html/media/html_video_element.h
+@@ -26,6 +26,8 @@
+ #ifndef THIRD_PARTY_BLINK_RENDERER_CORE_HTML_MEDIA_HTML_VIDEO_ELEMENT_H_
+ #define THIRD_PARTY_BLINK_RENDERER_CORE_HTML_MEDIA_HTML_VIDEO_ELEMENT_H_
+ 
++#include <optional>
++
+ #include "third_party/blink/public/platform/web_media_player.h"
+ #include "third_party/blink/renderer/core/core_export.h"
+ #include "third_party/blink/renderer/core/html/canvas/canvas_image_source.h"
+@@ -35,6 +37,7 @@
+ #include "third_party/blink/renderer/platform/graphics/canvas_non_2d_resource_provider.h"
+ #include "third_party/blink/renderer/platform/graphics/canvas_snapshot_info.h"
+ #include "third_party/blink/renderer/platform/timer.h"
++#include "ui/gfx/geometry/rect.h"
+ 
+ namespace gfx {
+ class Size;
+@@ -46,6 +49,7 @@
+ class IntersectionObserverEntry;
+ class MediaCustomControlsFullscreenDetector;
+ class MediaVideoVisibilityTracker;
++class TarkVideoRectReporter;
+ class MediaRemotingInterstitial;
+ class PictureInPictureInterstitial;
+ class StaticBitmapImage;
+@@ -93,6 +97,11 @@
+   void DidEnterFullscreen();
+   void DidExitFullscreen();
+ 
++  // Tark (D4 any-media captions): playback started — report where the video
++  // is while it plays (TarkVideoRectReporter), which sends it here.
++  void TarkStartReportingRect();
++  void TarkSendVideoRect(const std::optional<gfx::Rect>& rect);
++
+   // Statistics
+   unsigned webkitDecodedFrameCount() const;
+   unsigned webkitDroppedFrameCount() const;
+@@ -305,6 +314,10 @@
+   // intersection and occluding elements.
+   Member<MediaVideoVisibilityTracker> visibility_tracker_;
+ 
++  // Tark (D4 any-media captions): where the playing video is, for the
++  // browser's captions button.
++  Member<TarkVideoRectReporter> tark_rect_reporter_;
++
+   // Represents whether the video is 'persistent'. It is used for videos with
+   // custom controls that are in auto-pip (Android). This boolean is used by a
+   // CSS rule.

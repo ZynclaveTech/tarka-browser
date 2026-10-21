@@ -1,0 +1,1125 @@
+--- /dev/null
++++ b/chrome/browser/ui/views/tark_captions/caption_button_view.h
+@@ -0,0 +1,32 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_TARK_CAPTIONS_CAPTION_BUTTON_VIEW_H_
++#define CHROME_BROWSER_UI_VIEWS_TARK_CAPTIONS_CAPTION_BUTTON_VIEW_H_
++
++#include "ui/base/metadata/metadata_header_macros.h"
++#include "ui/gfx/geometry/size.h"
++#include "ui/views/controls/button/label_button.h"
++
++// Tark (D4 any-media captions): the small "CC" button on a playing video, or
++// at the window's corner for a call or sound with no video (mockup
++// button-look.html). Prominent while captions are on.
++class TarkCaptionButtonView : public views::LabelButton {
++  METADATA_HEADER(TarkCaptionButtonView, views::LabelButton)
++
++ public:
++  static constexpr gfx::Size kSize{30, 22};
++
++  explicit TarkCaptionButtonView(PressedCallback callback);
++  TarkCaptionButtonView(const TarkCaptionButtonView&) = delete;
++  TarkCaptionButtonView& operator=(const TarkCaptionButtonView&) = delete;
++  ~TarkCaptionButtonView() override;
++
++  void SetCaptionsOn(bool on);
++
++  // views::LabelButton:
++  gfx::Size CalculatePreferredSize(const views::SizeBounds& available_size) const override;
++};
++
++#endif  // CHROME_BROWSER_UI_VIEWS_TARK_CAPTIONS_CAPTION_BUTTON_VIEW_H_
+--- /dev/null
++++ b/chrome/browser/ui/views/tark_captions/caption_button_view.cc
+@@ -0,0 +1,55 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/ui/views/tark_captions/caption_button_view.h"
++
++#include <utility>
++
++#include "chrome/grit/generated_resources.h"
++#include "ui/base/l10n/l10n_util.h"
++#include "ui/base/metadata/metadata_impl_macros.h"
++#include "ui/color/color_id.h"
++#include "ui/gfx/font.h"
++#include "ui/gfx/font_list.h"
++#include "ui/views/accessibility/view_accessibility.h"
++#include "ui/views/background.h"
++#include "ui/views/border.h"
++
++namespace {
++constexpr int kRadius = 6;
++}  // namespace
++
++TarkCaptionButtonView::TarkCaptionButtonView(PressedCallback callback)
++    : views::LabelButton(std::move(callback), u"CC") {
++  SetHorizontalAlignment(gfx::ALIGN_CENTER);
++  SetBorder(nullptr);
++  label()->SetFontList(
++      gfx::FontList().DeriveWithSizeDelta(-2).DeriveWithWeight(gfx::Font::Weight::BOLD));
++  SetCaptionsOn(false);
++}
++
++TarkCaptionButtonView::~TarkCaptionButtonView() = default;
++
++void TarkCaptionButtonView::SetCaptionsOn(bool on) {
++  const ui::ColorId background =
++      on ? ui::kColorButtonBackgroundProminent : ui::kColorDialogBackground;
++  const ui::ColorId foreground =
++      on ? ui::kColorButtonForegroundProminent : ui::kColorLabelForeground;
++  SetBackground(views::CreateRoundedRectBackground(background, kRadius));
++  SetBorder(views::CreateRoundedRectBorder(
++      1, kRadius, on ? ui::kColorButtonBackgroundProminent : ui::kColorSeparator));
++  SetEnabledTextColors(foreground);
++  const std::u16string name = l10n_util::GetStringUTF16(
++      on ? IDS_TARK_CAPTIONS_BUTTON_OFF : IDS_TARK_CAPTIONS_BUTTON_ON);
++  SetTooltipText(name);
++  GetViewAccessibility().SetName(name);
++}
++
++gfx::Size TarkCaptionButtonView::CalculatePreferredSize(
++    const views::SizeBounds& available_size) const {
++  return kSize;
++}
++
++BEGIN_METADATA(TarkCaptionButtonView)
++END_METADATA
+--- a/chrome/app/settings_strings.grdp
++++ b/chrome/app/settings_strings.grdp
+@@ -686,6 +686,12 @@
+     <message name="IDS_SETTINGS_TARK_LIVE_CAPTIONS_FAILED" desc="Live captions settings: shown when a model download failed.">
+       Couldn't download. Check your connection.
+     </message>
++    <message name="IDS_SETTINGS_TARK_LIVE_CAPTIONS_SHOW_BUTTON" desc="Live captions settings: a switch that shows or hides Tark's small CC button on videos and calls.">
++      Show the captions button
++    </message>
++    <message name="IDS_SETTINGS_TARK_LIVE_CAPTIONS_SHOW_BUTTON_SUB" desc="Live captions settings: the line under the captions button switch.">
++      On videos and calls that play sound. Captions start only when you click it.
++    </message>
+     <message name="IDS_SETTINGS_TARK_LIVE_CAPTIONS_SHOW_IN" desc="Live captions settings: the script the other person's words are shown in.">
+       Show their words in
+     </message>
+--- a/chrome/app/tark_captions_strings.grdp
++++ b/chrome/app/tark_captions_strings.grdp
+@@ -1,8 +1,11 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <!-- Tark (D4): the call captions pill. -->
+ <grit-part>
+-  <message name="IDS_TARK_CAPTIONS_CAPTIONS" desc="Button on the call captions pill: show the other person's words as captions.">
+-    Captions
++  <message name="IDS_TARK_CAPTIONS_BUTTON_ON" desc="Tooltip and accessible name of the small CC button on a playing video or at the window's corner during a call: show captions of what is said.">
++    Turn on captions
++  </message>
++  <message name="IDS_TARK_CAPTIONS_BUTTON_OFF" desc="Tooltip and accessible name of the CC button and of the close button on the caption bar, while captions are on: stop the captions.">
++    Turn off captions
+   </message>
+   <message name="IDS_TARK_CAPTIONS_TRANSLATE" desc="Button on the call captions pill: show a translation under the captions.">
+     Translate
+@@ -22,9 +25,6 @@
+   <message name="IDS_TARK_CAPTIONS_UNAVAILABLE" desc="Shown on the call captions pill when captions cannot run (for example, the caption models are not on this Mac).">
+     Captions unavailable
+   </message>
+-  <message name="IDS_TARK_CAPTIONS_HIDE" desc="Tooltip and accessible name of the close button on the call captions pill: hide the pill until the next call.">
+-    Hide for this call
+-  </message>
+   <message name="IDS_TARK_CAPTIONS_CLIENT_SPEAKS" desc="Title of the first section of the call captions language menu: the language the other person in the call speaks.">
+     Client speaks
+   </message>
+--- a/chrome/browser/accessibility/live_caption/live_caption_speech_recognition_host.cc
++++ b/chrome/browser/accessibility/live_caption/live_caption_speech_recognition_host.cc
+@@ -121,6 +121,10 @@
+   if (!web_contents)
+     return;
+   Observe(web_contents);
++  // Tark (D4 any-media): a new stream may be a new video in a new language.
++  if (CallCaptionsTabHelper* tab = GetTarkCallCaptions()) {
++    tab->OnRecognizerBound();
++  }
+   prefs_ = Profile::FromBrowserContext(GetWebContents()->GetBrowserContext())
+                ->GetPrefs();
+   context_ = CaptionBubbleContextBrowser::Create(web_contents);
+--- a/chrome/browser/chrome_browser_interface_binders.cc
++++ b/chrome/browser/chrome_browser_interface_binders.cc
+@@ -300,8 +300,9 @@
+   if (!profile) {
+     return;
+   }
+-  // Tark (D4): only a tab whose call captions are on may send audio to the
+-  // speech service. Chromium's own Live Caption is not used.
++  // Tark (D4): only a tab whose captions are on (a call, or any sound the
++  // user turned them on for) may send audio to the speech service.
++  // Chromium's own Live Caption is not used.
+   content::WebContents* web_contents =
+       content::WebContents::FromRenderFrameHost(frame_host);
+   CallCaptionsTabHelper* tark_tab =
+@@ -338,8 +339,8 @@
+     content::RenderFrameHost* frame_host,
+     mojo::PendingReceiver<media::mojom::SpeechRecognitionRecognizerClient>
+         client_receiver) {
+-  // Tark (D4): results come back only to a tab whose call captions are on
+-  // (they go on to the pill). Chromium's own Live Caption is not used.
++  // Tark (D4): results come back only to a tab whose captions are on (they
++  // go on to the caption bar). Chromium's own Live Caption is not used.
+   content::WebContents* web_contents =
+       content::WebContents::FromRenderFrameHost(frame_host);
+   CallCaptionsTabHelper* tark_tab =
+--- a/chrome/browser/resources/settings/a11y_page/tark_live_captions_page.html.ts
++++ b/chrome/browser/resources/settings/a11y_page/tark_live_captions_page.html.ts
+@@ -47,6 +47,16 @@
+     <div class="secondary" id="apple">$i18n{tarkLiveCaptionsApple}</div>
+   </div>
+   <div class="cr-row">
++    <div class="flex">
++      <div id="showButtonLabel">$i18n{tarkLiveCaptionsShowButton}</div>
++      <div class="secondary">$i18n{tarkLiveCaptionsShowButtonSub}</div>
++    </div>
++    <cr-toggle id="showButton" ?checked="${this.showButton_}"
++        aria-labelledby="showButtonLabel"
++        @change="${this.onShowButtonChange_}">
++    </cr-toggle>
++  </div>
++  <div class="cr-row">
+     <div class="flex">$i18n{tarkLiveCaptionsShowIn}</div>
+     <select id="showIn" class="md-select" @change="${this.onShowInChange_}">
+       ${this.showInOptions_.map(option => html`
+--- a/chrome/browser/resources/settings/a11y_page/tark_live_captions_page.ts
++++ b/chrome/browser/resources/settings/a11y_page/tark_live_captions_page.ts
+@@ -10,6 +10,7 @@
+ 
+ import '//resources/cr_elements/cr_button/cr_button.js';
+ import '//resources/cr_elements/cr_icon/cr_icon.js';
++import '//resources/cr_elements/cr_toggle/cr_toggle.js';
+ import '//resources/cr_elements/icons.html.js';
+ import '../settings_page/settings_subpage.js';
+ 
+@@ -64,6 +65,7 @@
+       usedMb_: {type: Number},
+       showIn_: {type: String},
+       translateTo_: {type: String},
++      showButton_: {type: Boolean},
+     };
+   }
+ 
+@@ -71,6 +73,7 @@
+   protected accessor usedMb_: number = 0;
+   protected accessor showIn_: string = '';
+   protected accessor translateTo_: string = 'en';
++  protected accessor showButton_: boolean = true;
+ 
+   protected showInOptions_: Option[] = [
+     {value: '', name: loadTimeData.getString('tarkCaptionsOwnScript')},
+@@ -93,10 +96,12 @@
+         (models: TarkCaptionModels) => this.setModels_(models));
+     sendWithPromise<TarkCaptionModels>('getTarkCaptionModels')
+         .then(models => this.setModels_(models));
+-    sendWithPromise<{showIn: string, translateTo: string}>('getTarkCaptionChoices')
++    sendWithPromise<{showIn: string, translateTo: string, showButton: boolean}>(
++        'getTarkCaptionChoices')
+         .then(choices => {
+           this.showIn_ = choices.showIn;
+           this.translateTo_ = choices.translateTo;
++          this.showButton_ = choices.showButton;
+         });
+   }
+ 
+@@ -152,6 +157,11 @@
+     chrome.send('removeTarkCaptionModel', [this.modelIdOf_(e)]);
+   }
+ 
++  protected onShowButtonChange_(e: CustomEvent<boolean>) {
++    this.showButton_ = e.detail;
++    chrome.send('setTarkCaptionShowButton', [this.showButton_]);
++  }
++
+   protected onShowInChange_(e: Event) {
+     this.showIn_ = (e.target as HTMLSelectElement).value;
+     chrome.send('setTarkCaptionShowIn', [this.showIn_]);
+--- a/chrome/browser/tark_captions/call_captions_tab_helper.cc
++++ b/chrome/browser/tark_captions/call_captions_tab_helper.cc
+@@ -21,6 +21,10 @@
+ #include "components/tark_captions/detection_policy.h"
+ #include "components/tark_captions/model_manifest.h"
+ #include "content/public/browser/browser_context.h"
++#include "content/public/browser/media_player_id.h"
++#include "content/public/browser/page.h"
++#include "content/public/browser/render_frame_host.h"
++#include "content/public/browser/tark_media_rect.h"
+ #include "content/public/browser/web_contents.h"
+ #include "media/mojo/mojom/speech_recognition_result.h"
+ #include "mojo/public/cpp/bindings/pending_receiver.h"
+@@ -37,6 +41,23 @@
+   return *captioning;
+ }
+ 
++tark_captions::PlayerKey KeyOf(const content::MediaPlayerId& id) {
++  return {id.frame_routing_id.child_id.GetUnsafeValue(), id.frame_routing_id.frame_routing_id,
++          id.player_id};
++}
++
++// Where playing videos are, to their tabs.
++class VideoRects : public content::TarkMediaRectObserver {
++ public:
++  void OnVideoRectChanged(content::WebContents* web_contents,
++                          const content::MediaPlayerId& id,
++                          const std::optional<gfx::Rect>& rect) override {
++    if (CallCaptionsTabHelper* tab = CallCaptionsTabHelper::FromWebContents(web_contents)) {
++      tab->OnVideoRect(id, rect);
++    }
++  }
++};
++
+ }  // namespace
+ 
+ #if BUILDFLAG(IS_MAC)
+@@ -49,10 +70,17 @@
+ 
+ CallCaptionsTabHelper::CallCaptionsTabHelper(content::WebContents* web_contents)
+     : content::WebContentsUserData<CallCaptionsTabHelper>(*web_contents),
++      content::WebContentsObserver(web_contents),
+       indicator_(MediaCaptureDevicesDispatcher::GetInstance()->GetMediaStreamCaptureIndicator()),
+       off_the_record_(web_contents->GetBrowserContext()->IsOffTheRecord()) {
+   capture_observation_.Observe(indicator_.get());
+   state_.OnMicCapturing(indicator_->IsCapturingAudio(web_contents));
++  site_ = net::SchemefulSite(web_contents->GetPrimaryMainFrame()->GetLastCommittedOrigin());
++  players_.SetTabMuted(web_contents->IsAudioMuted(), base::TimeTicks::Now());
++  static base::NoDestructor<VideoRects> video_rects;
++  if (!content::GetTarkMediaRectObserver()) {
++    content::SetTarkMediaRectObserver(video_rects.get());
++  }
+ #if BUILDFLAG(IS_MAC)
+   // macOS 26's speech, for the Apple languages: loaded once, off this thread.
+   tark_captions::AppleSpeechLibrary::StartLoading();
+@@ -77,13 +105,15 @@
+ 
+ void CallCaptionsTabHelper::SetCaptionsOn(bool on) {
+   const bool was_on = state_.captions_on();
+-  if (on && !was_on && state_.in_call() && !state_.hidden()) {
+-    // One call captions at a time: this one takes them from any other.
++  // The button stays a few seconds after the sound stops; a press then counts.
++  const bool sound_recently = players_.ButtonShown(/*in_call=*/false, base::TimeTicks::Now());
++  if (on && !was_on && (state_.in_call() || state_.playing_sound() || sound_recently)) {
++    // One tab captions at a time: this one takes them from any other.
+     if (CallCaptionsTabHelper* other = Captioning().Take(this)) {
+       other->SetCaptionsOn(false);
+     }
+   }
+-  if (state_.SetCaptionsOn(on) && was_on != on) {
++  if (state_.SetCaptionsOn(on, sound_recently) && was_on != on) {
+     CaptionsChanged(was_on);
+   }
+   ReleaseIfOff();
+@@ -178,15 +208,84 @@
+   observers_.Notify(&Observer::OnCallStateChanged, this);
+ }
+ 
+-void CallCaptionsTabHelper::HideForThisCall() {
+-  const bool was_on = state_.captions_on();
+-  state_.HideForThisCall();
+-  if (was_on) {
+-    CaptionsChanged(was_on);
++void CallCaptionsTabHelper::OnRecognizerBound() {
++  if (state_.captions_on() && client_language_.ShouldRestartForNewStream(state_.in_call())) {
++    // A new video: its language may not be the last one's.
++    VLOG(1) << "Tark captions: a new stream, detecting again";
++    ChooseAutoDetect();
+   }
+-  ReleaseIfOff();
+-  UpdateModelsInUse();
+-  observers_.Notify(&Observer::OnCallStateChanged, this);
++}
++
++void CallCaptionsTabHelper::OnVideoRect(const content::MediaPlayerId& id,
++                                        const std::optional<gfx::Rect>& rect) {
++  // Numbers only: where a video is, never what it shows.
++  VLOG(1) << "Tark captions: video rect " << (rect ? rect->ToString() : "unknown");
++  players_.OnVideoRect(KeyOf(id), rect);
++  observers_.Notify(&Observer::OnPlayersChanged, this);
++}
++
++void CallCaptionsTabHelper::MediaStartedPlaying(const MediaPlayerInfo& info,
++                                                const content::MediaPlayerId& id) {
++  players_.OnStarted(KeyOf(id), info.has_video, info.has_audio, base::TimeTicks::Now());
++  PlayersChanged();
++}
++
++void CallCaptionsTabHelper::MediaStoppedPlaying(const MediaPlayerInfo& info,
++                                                const content::MediaPlayerId& id,
++                                                MediaStoppedReason reason) {
++  players_.OnStopped(KeyOf(id), base::TimeTicks::Now());
++  PlayersChanged();
++}
++
++void CallCaptionsTabHelper::MediaMutedStatusChanged(const content::MediaPlayerId& id,
++                                                    bool muted) {
++  players_.OnMuted(KeyOf(id), muted, base::TimeTicks::Now());
++  PlayersChanged();
++}
++
++void CallCaptionsTabHelper::MediaMetadataChanged(const MediaPlayerInfo& info,
++                                                 const content::MediaPlayerId& id) {
++  // A muted autoplay video, unmuted, gains audio here.
++  players_.OnMetadata(KeyOf(id), info.has_video, info.has_audio, base::TimeTicks::Now());
++  PlayersChanged();
++}
++
++void CallCaptionsTabHelper::OnAudioStateChanged(bool audible) {
++  // Sound from no media element too (Web Audio).
++  players_.SetTabAudible(audible, base::TimeTicks::Now());
++  PlayersChanged();
++}
++
++void CallCaptionsTabHelper::MediaDestroyed(const content::MediaPlayerId& id) {
++  players_.OnDestroyed(KeyOf(id), base::TimeTicks::Now());
++  PlayersChanged();
++}
++
++void CallCaptionsTabHelper::DidUpdateAudioMutingState(bool muted) {
++  players_.SetTabMuted(muted, base::TimeTicks::Now());
++  PlayersChanged();
++}
++
++void CallCaptionsTabHelper::PrimaryPageChanged(content::Page& page) {
++  const net::SchemefulSite site(page.GetMainDocument().GetLastCommittedOrigin());
++  if (site_ && *site_ != site && state_.captions_on()) {
++    // Captions are for the site the user turned them on for.
++    state_.OnLeftSite();
++    CaptionsChanged(/*was_on=*/true);
++    ReleaseIfOff();
++    UpdateModelsInUse();
++    observers_.Notify(&Observer::OnCallStateChanged, this);
++  }
++  site_ = site;
++}
++
++void CallCaptionsTabHelper::PlayersChanged() {
++  const bool was_playing = state_.playing_sound();
++  state_.OnSoundPlaying(players_.AnyAudible());
++  if (state_.playing_sound() != was_playing) {
++    observers_.Notify(&Observer::OnCallStateChanged, this);
++  }
++  observers_.Notify(&Observer::OnPlayersChanged, this);
+ }
+ 
+ void CallCaptionsTabHelper::OnCaption(const media::SpeechRecognitionResult& result) {
+--- a/chrome/browser/tark_captions/call_captions_tab_helper.h
++++ b/chrome/browser/tark_captions/call_captions_tab_helper.h
+@@ -19,13 +19,16 @@
+ #include "components/tark_captions/asr_model.h"
+ #include "components/tark_captions/call_state.h"
+ #include "components/tark_captions/client_language.h"
++#include "components/tark_captions/media_players.h"
+ #include "components/tark_captions/render_queue.h"
+ #include "build/build_config.h"
+ #include "media/mojo/mojom/tark_audio_tap.mojom.h"
+ #include "media/mojo/mojom/tark_caption_translator.mojom.h"
+ #include "mojo/public/cpp/bindings/receiver.h"
+ #include "mojo/public/cpp/bindings/remote.h"
++#include "content/public/browser/web_contents_observer.h"
+ #include "content/public/browser/web_contents_user_data.h"
++#include "net/base/schemeful_site.h"
+ 
+ namespace media {
+ struct SpeechRecognitionResult;
+@@ -44,12 +47,15 @@
+ // ending turns captions off.
+ class CallCaptionsTabHelper
+     : public content::WebContentsUserData<CallCaptionsTabHelper>,
++      public content::WebContentsObserver,
+       public MediaStreamCaptureIndicator::Observer,
+       public media::mojom::TarkAudioTapSource {
+  public:
+   class Observer : public base::CheckedObserver {
+    public:
+     virtual void OnCallStateChanged(CallCaptionsTabHelper* tab) {}
++    // D4 any-media: a player started, stopped or moved (players()).
++    virtual void OnPlayersChanged(CallCaptionsTabHelper* tab) {}
+     virtual void OnCaption(CallCaptionsTabHelper* tab,
+                            bool is_final,
+                            const std::string& text) {}
+@@ -74,7 +80,12 @@
+ 
+   bool in_call() const { return state_.in_call(); }
+   bool captions_on() const { return state_.captions_on(); }
+-  bool hidden() const { return state_.hidden(); }
++  // D4 any-media: the tab plays sound (a video, a podcast).
++  bool playing_sound() const { return state_.playing_sound(); }
++  // Captions are on, or the captions button can turn them on.
++  bool can_caption() const { return state_.can_caption(); }
++  // The tab's players: which play sound, where their videos are.
++  const tark_captions::MediaPlayers& players() const { return players_; }
+   // The language Tark's own captions decode: the one detected or picked.
+   tark_captions::Language language() const { return language_; }
+   // D4 Phase 3: Auto-detect, or what was detected or picked, for this call.
+@@ -88,7 +99,6 @@
+   // The user picked the client's language for this call: one of Tark's
+   // own (SetLanguage) or one macOS captions ("es").
+   void ChooseLanguage(const std::string& code);
+-  void HideForThisCall();
+ 
+   // Translate is per call: off when a call starts and when captions go off.
+   bool translate_on() const { return translate_on_; }
+@@ -111,6 +121,11 @@
+   // The speech process heard which language the client speaks ("und" when
+   // it couldn't tell).
+   void OnLanguageDetected(const std::string& code);
++  // A recognizer bound for one of this tab's audio streams (a new video, or
++  // a call's new participant).
++  void OnRecognizerBound();
++  // Where a playing video is (content::TarkMediaRectObserver).
++  void OnVideoRect(const content::MediaPlayerId& id, const std::optional<gfx::Rect>& rect);
+ 
+   // D4 Phase 3: macOS 26 captions the Apple languages (English, Spanish...)
+   // in this process, one AppleCaptioner per tap the speech process opens.
+@@ -139,6 +154,18 @@
+   void OnIsCapturingAudioChanged(content::WebContents* web_contents,
+                                  bool is_capturing_audio) override;
+ 
++  // content::WebContentsObserver:
++  void MediaStartedPlaying(const MediaPlayerInfo& info, const content::MediaPlayerId& id) override;
++  void MediaStoppedPlaying(const MediaPlayerInfo& info,
++                           const content::MediaPlayerId& id,
++                           MediaStoppedReason reason) override;
++  void MediaMutedStatusChanged(const content::MediaPlayerId& id, bool muted) override;
++  void MediaMetadataChanged(const MediaPlayerInfo& info, const content::MediaPlayerId& id) override;
++  void OnAudioStateChanged(bool audible) override;
++  void MediaDestroyed(const content::MediaPlayerId& id) override;
++  void DidUpdateAudioMutingState(bool muted) override;
++  void PrimaryPageChanged(content::Page& page) override;
++
+  private:
+   friend class content::WebContentsUserData<CallCaptionsTabHelper>;
+   explicit CallCaptionsTabHelper(content::WebContents* web_contents);
+@@ -148,6 +175,8 @@
+   void CaptionsChanged(bool was_on);
+   // Gives up being the captioning call once captions are off.
+   void ReleaseIfOff();
++  // After a player change: sound on or off for CallState, and observers.
++  void PlayersChanged();
+   // Sends the next waiting caption to the translator.
+   void Pump();
+   void OnRendered(bool is_final,
+@@ -187,6 +216,9 @@
+ #endif
+ 
+   tark_captions::CallState state_;
++  tark_captions::MediaPlayers players_;
++  // The site the tab is on: captions go off when it goes to another one.
++  std::optional<net::SchemefulSite> site_;
+   tark_captions::Language language_ = tark_captions::Language::kHindi;
+   // Part A: macOS's own captions (Part B) are not wired yet, so an Apple
+   // language is shown as unavailable.
+--- a/chrome/browser/ui/BUILD.gn
++++ b/chrome/browser/ui/BUILD.gn
+@@ -2752,6 +2752,8 @@
+       "views/frame/vertical_tab_strip_region_view.h",
+       "views/tab_search_bubble_host.cc",
+       "views/tab_search_bubble_host.h",
++      "views/tark_captions/caption_button_view.cc",
++      "views/tark_captions/caption_button_view.h",
+       "views/tark_captions/caption_pill_controller.cc",
+       "views/tark_captions/caption_pill_controller.h",
+       "views/tark_captions/caption_pill_view.cc",
+--- a/chrome/browser/ui/views/tark_captions/caption_pill_controller.cc
++++ b/chrome/browser/ui/views/tark_captions/caption_pill_controller.cc
+@@ -13,9 +13,12 @@
+ #include "chrome/browser/ui/browser.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
++#include "chrome/browser/ui/views/tark_captions/caption_button_view.h"
+ #include "chrome/browser/ui/views/tark_captions/pill_language.h"
+ #include "chrome/grit/generated_resources.h"
+ #include "components/tark_captions/asr_model.h"
++#include "components/tark_captions/caption_choices.h"
++#include "components/tark_captions/media_players.h"
+ #include "components/tark_captions/model_manifest.h"
+ #include "content/public/browser/web_contents.h"
+ #include "ui/base/l10n/l10n_util.h"
+@@ -135,6 +138,10 @@
+   }
+   browser_widget_observation_.Observe(browser_view_->GetWidget());
+   view_observation_.AddObservation(browser_view_->contents_web_view());
++  local_state_changes_.Init(g_browser_process->local_state());
++  local_state_changes_.Add(tark_captions::CaptionChoices::kShowButtonPref,
++                           base::BindRepeating(&TarkCaptionPillController::UpdateButton,
++                                               base::Unretained(this)));
+   Update();
+ }
+ 
+@@ -144,6 +151,9 @@
+   pill_widget_observation_.Reset();
+   view_ = nullptr;
+   widget_.reset();
++  button_widget_observation_.Reset();
++  button_view_ = nullptr;
++  button_widget_.reset();
+ }
+ 
+ void TarkCaptionPillController::OnTabStripModelChanged(
+@@ -176,6 +186,10 @@
+   Update();
+ }
+ 
++void TarkCaptionPillController::OnPlayersChanged(CallCaptionsTabHelper* tab) {
++  UpdateButton();
++}
++
+ void TarkCaptionPillController::OnCaption(CallCaptionsTabHelper* tab,
+                                           bool is_final,
+                                           const std::string& text) {
+@@ -246,24 +260,36 @@
+   Update();
+ }
+ 
+-void TarkCaptionPillController::OnCaptionsPressed() {
+-  if (!shown_) {
++void TarkCaptionPillController::OnCaptionButtonPressed() {
++  CallCaptionsTabHelper* active =
++      HelperFor(browser_view_->browser()->GetTabStripModel()->GetActiveWebContents());
++  if (!active) {
+     return;
+   }
+-  if (!shown_->captions_on()) {
+-    // Detection (and the captions engine) listen through the language_id
+-    // unit; Tark's own captions model is needed once the language is one of
+-    // its own.
+-    const std::vector<tark_captions::ModelUnit> units =
+-        tark_captions::UnitsForCaptions(shown_->client_language());
+-    for (tark_captions::ModelUnit unit : units) {
+-      if (!tark_captions::TarkCaptionModels().ready(unit)) {
+-        WaitForModels(/*for_captions=*/true, /*turn_on=*/true, units);
+-        return;
+-      }
++  if (active->captions_on()) {
++    active->SetCaptionsOn(false);
++    return;
++  }
++  if (waiting_ && shown_ == active) {
++    // Pressed again while its models download: never mind.
++    StopWaiting();
++    Update();
++    return;
++  }
++  // Detection (and the captions engine) listen through the language_id
++  // unit; Tark's own captions model is needed once the language is one of
++  // its own. The bar shows the download meanwhile.
++  const std::vector<tark_captions::ModelUnit> units =
++      tark_captions::UnitsForCaptions(active->client_language());
++  for (tark_captions::ModelUnit unit : units) {
++    if (!tark_captions::TarkCaptionModels().ready(unit)) {
++      shown_ = active;
++      WaitForModels(/*for_captions=*/true, /*turn_on=*/true, units);
++      Update();
++      return;
+     }
+   }
+-  shown_->SetCaptionsOn(!shown_->captions_on());
++  active->SetCaptionsOn(true);
+ }
+ 
+ void TarkCaptionPillController::OnTranslatePressed() {
+@@ -328,9 +354,14 @@
+ }
+ 
+ void TarkCaptionPillController::OnHidePressed() {
+-  if (shown_) {
+-    shown_->HideForThisCall();
++  if (!shown_) {
++    return;
+   }
++  if (waiting_) {
++    StopWaiting();
++  }
++  shown_->SetCaptionsOn(false);
++  Update();
+ }
+ 
+ void TarkCaptionPillController::OnDragged(const gfx::Vector2d& delta) {
+@@ -400,10 +431,21 @@
+ 
+ void TarkCaptionPillController::OnWidgetBoundsChanged(views::Widget* widget,
+                                                       const gfx::Rect& new_bounds) {
++  if (button_widget_ && widget == button_widget_.get()) {
++    return;
++  }
+   Reposition();
++  if (widget == browser_view_->GetWidget()) {
++    UpdateButton();
++  }
+ }
+ 
+ void TarkCaptionPillController::OnWidgetDestroying(views::Widget* widget) {
++  if (button_widget_ && widget == button_widget_.get()) {
++    button_widget_observation_.Reset();
++    button_view_ = nullptr;
++    return;
++  }
+   if (widget_ && widget == widget_.get()) {
+     // The pill's window went with the browser window's.
+     menu_runner_.reset();
+@@ -415,6 +457,10 @@
+     return;
+   }
+   // The browser window is closing: stop following it.
++  button_timer_.Stop();
++  if (button_widget_) {
++    button_widget_->Hide();
++  }
+   Close();
+   browser_widget_observation_.Reset();
+   view_observation_.RemoveAllObservations();
+@@ -422,6 +468,9 @@
+ 
+ void TarkCaptionPillController::OnViewBoundsChanged(views::View* observed_view) {
+   Reposition();
++  if (observed_view == browser_view_->contents_web_view()) {
++    UpdateButton();
++  }
+ }
+ 
+ void TarkCaptionPillController::OnViewPreferredSizeChanged(views::View* observed_view) {
+@@ -453,18 +502,23 @@
+   CallCaptionsTabHelper* target = nullptr;
+   TarkCaptionPillView::Mode mode = TarkCaptionPillView::Mode::kPill;
+   CallCaptionsTabHelper* active = HelperFor(model->GetActiveWebContents());
+-  if (active && active->in_call() && !active->hidden()) {
++  // The bar shows once captions are on, or while the models they need
++  // download (D4 any-media: the CC button turns them on).
++  if (active && (BarFor(active->captions_on(), /*active_tab=*/true) == BarMode::kBar ||
++                 (waiting_ && shown_ == active))) {
+     target = active;
+   } else {
+-    // The call is in another tab: its captions (if on) show as the strip.
++    // Captions are on in another tab: they show as the strip.
+     for (int i = 0; i < model->count() && !target; ++i) {
+       CallCaptionsTabHelper* helper = HelperFor(model->GetWebContentsAt(i));
+-      if (helper && helper->in_call() && !helper->hidden() && helper->captions_on()) {
++      if (helper && helper != active &&
++          BarFor(helper->captions_on(), /*active_tab=*/false) == BarMode::kStrip) {
+         target = helper;
+         mode = TarkCaptionPillView::Mode::kStrip;
+       }
+     }
+   }
++  UpdateButton();
+   if (!target || !browser_view_->GetWidget()) {
+     Close();
+     return;
+@@ -499,7 +553,6 @@
+   }
+   mode_ = mode;
+   view_->SetMode(mode);
+-  view_->SetCaptionsOn(target->captions_on());
+   view_->SetTranslateState(target->captions_on(), target->translate_on());
+   const PillLanguage pill = Describe(target);
+   view_->SetLanguageName(ChipText(pill));
+@@ -606,6 +659,7 @@
+     tark_captions::TarkCaptionModels().Cancel(unit);
+   }
+   StopWaiting();
++  Update();
+ }
+ 
+ void TarkCaptionPillController::OnModelStatusChanged(tark_captions::ModelUnit unit) {
+@@ -622,6 +676,7 @@
+   const bool turn_on = turn_on_when_ready_;
+   StopWaiting();
+   if (!turn_on) {
++    Update();
+     return;
+   }
+   if (for_captions) {
+@@ -746,3 +801,78 @@
+   // screen share. Give it the new shape every time.
+   widget_->SetAllowScreenshots(false);
+ }
++
++void TarkCaptionPillController::UpdateButton() {
++  button_timer_.Stop();
++  CallCaptionsTabHelper* active =
++      HelperFor(browser_view_->browser()->GetTabStripModel()->GetActiveWebContents());
++  const base::TimeTicks now = base::TimeTicks::Now();
++  std::optional<gfx::Rect> place;
++  if (active && browser_view_->GetWidget() &&
++      tark_captions::CaptionChoices(g_browser_process->local_state()).show_button()) {
++    if (std::optional<base::TimeTicks> next =
++            active->players().NextChange(active->in_call(), now)) {
++      button_timer_.Start(FROM_HERE, *next - now,
++                          base::BindOnce(&TarkCaptionPillController::UpdateButton,
++                                         base::Unretained(this)));
++    }
++    // Captions on (or on their way) keep the button, to turn them off.
++    if (active->captions_on() || (waiting_ && shown_ == active) ||
++        active->players().ButtonShown(active->in_call(), now)) {
++      const gfx::Rect area = browser_view_->contents_web_view()->GetBoundsInScreen();
++      place = tark_captions::PlaceButton(active->players(), active->in_call(), area.size(),
++                                         TarkCaptionButtonView::kSize);
++      if (place) {
++        place->Offset(area.OffsetFromOrigin());
++        // The page decides where it goes: never over the browser's own
++        // windows above the page (a permission prompt, the fullscreen
++        // bubble, the omnibox popup).
++        std::vector<gfx::Rect> browser_windows;
++        const gfx::NativeView browser = browser_view_->GetWidget()->GetNativeView();
++        for (const views::Widget::Widgets& widgets :
++             {views::Widget::GetAllChildWidgets(browser), views::Widget::GetAllOwnedWidgets(browser)}) {
++          for (views::Widget* widget : widgets) {
++            if (widget->IsVisible() && widget != browser_view_->GetWidget() &&
++                widget != button_widget_.get() && widget != widget_.get()) {
++              browser_windows.push_back(widget->GetWindowBoundsInScreen());
++            }
++          }
++        }
++        if (!ButtonClearOf(*place, browser_windows)) {
++          place.reset();
++        }
++      }
++    }
++  }
++  if (!place) {
++    if (button_widget_) {
++      button_widget_->Hide();
++    }
++    return;
++  }
++  if (!button_widget_) {
++    views::Widget::InitParams params(views::Widget::InitParams::CLIENT_OWNS_WIDGET,
++                                     views::Widget::InitParams::TYPE_POPUP);
++    params.parent = browser_view_->GetWidget()->GetNativeView();
++    params.activatable = views::Widget::InitParams::Activatable::kNo;
++    params.opacity = views::Widget::InitParams::WindowOpacity::kTranslucent;
++    params.shadow_type = views::Widget::InitParams::ShadowType::kNone;
++    params.name = "TarkCaptionButton";
++    button_widget_ = std::make_unique<views::Widget>();
++    button_widget_->Init(std::move(params));
++    button_view_ = button_widget_->SetContentsView(std::make_unique<TarkCaptionButtonView>(
++        base::BindRepeating(&TarkCaptionPillController::OnCaptionButtonPressed,
++                            base::Unretained(this))));
++    button_widget_observation_.Observe(button_widget_.get());
++  }
++  if (!button_view_) {
++    return;
++  }
++  button_view_->SetCaptionsOn(active->captions_on());
++  button_widget_->SetBounds(*place);
++  // Out of screen shares, with every new shape (see Reposition()).
++  button_widget_->SetAllowScreenshots(false);
++  if (!button_widget_->IsVisible()) {
++    button_widget_->ShowInactive();
++  }
++}
+--- a/chrome/browser/ui/views/tark_captions/caption_pill_controller.h
++++ b/chrome/browser/ui/views/tark_captions/caption_pill_controller.h
+@@ -12,29 +12,33 @@
+ #include "base/memory/raw_ptr.h"
+ #include "base/scoped_multi_source_observation.h"
+ #include "base/scoped_observation.h"
++#include "base/timer/timer.h"
+ #include "chrome/browser/tark_captions/call_captions_tab_helper.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model_observer.h"
+ #include "chrome/browser/ui/views/tark_captions/caption_pill_view.h"
+ #include "components/tark_captions/caption_model_store.h"
+ #include "components/tark_captions/caption_text.h"
++#include "components/prefs/pref_change_registrar.h"
+ #include "ui/menus/simple_menu_model.h"
+ #include "ui/gfx/geometry/vector2d.h"
+ #include "ui/views/view_observer.h"
+ #include "ui/views/widget/widget_observer.h"
+ 
+ class BrowserView;
++class TarkCaptionButtonView;
+ 
+ namespace views {
+ class MenuRunner;
+ class Widget;
+ }  // namespace views
+ 
+-// Tark (D4): shows the call captions pill for one browser window. The pill
+-// floats over the call's tab while it is in front (captions off until the
+-// user presses Captions); when another tab is in front and the call's
+-// captions are on, only the caption box shows (the strip). Captions and the
+-// pill go when the call ends or the user hides them for the call. The
+-// pill's window is left out of screen shares and screenshots.
++// Tark (D4): the captions button and caption bar for one browser window.
++// The CC button shows while the tab in front plays sound or is in a call
++// (D4 any-media); pressing it turns captions on and the bar (the pill)
++// floats over the tab. When another tab is in front and its captions are
++// on, only the caption box shows (the strip). The bar goes when captions go
++// off (✕, the button, the call ending, another site). Both windows are left
++// out of screen shares and screenshots.
+ class TarkCaptionPillController : public TabStripModelObserver,
+                                   public CallCaptionsTabHelper::Observer,
+                                   public TarkCaptionPillView::Delegate,
+@@ -55,6 +59,7 @@
+ 
+   // CallCaptionsTabHelper::Observer:
+   void OnCallStateChanged(CallCaptionsTabHelper* tab) override;
++  void OnPlayersChanged(CallCaptionsTabHelper* tab) override;
+   void OnCaption(CallCaptionsTabHelper* tab, bool is_final, const std::string& text) override;
+   void OnCaptionsUnavailable(CallCaptionsTabHelper* tab) override;
+   void OnClientLanguageChanged(CallCaptionsTabHelper* tab) override;
+@@ -65,7 +70,6 @@
+                          bool translation_failed) override;
+ 
+   // TarkCaptionPillView::Delegate:
+-  void OnCaptionsPressed() override;
+   void OnTranslatePressed() override;
+   void OnLanguagePressed(views::View* anchor) override;
+   void OnHidePressed() override;
+@@ -106,6 +110,10 @@
+   // macOS downloading an Apple language's speech (no Tark model waited on).
+   void ShowAppleDownload();
+   void Reposition();
++  // D4 any-media: the CC button on the active tab's playing video, or at the
++  // window's corner for a call or sound with no video; hidden otherwise.
++  void UpdateButton();
++  void OnCaptionButtonPressed();
+ 
+   raw_ptr<BrowserView> browser_view_;
+   // The tab the pill or strip is showing; null when it is closed.
+@@ -136,6 +144,13 @@
+       tabs_observation_{this};
+   base::ScopedObservation<views::Widget, views::WidgetObserver> browser_widget_observation_{this};
+   base::ScopedObservation<views::Widget, views::WidgetObserver> pill_widget_observation_{this};
++  std::unique_ptr<views::Widget> button_widget_;
++  raw_ptr<TarkCaptionButtonView> button_view_ = nullptr;
++  base::ScopedObservation<views::Widget, views::WidgetObserver> button_widget_observation_{this};
++  // The button's next appear or leave (MediaPlayers::NextChange).
++  base::OneShotTimer button_timer_;
++  // Settings' "Show the captions button".
++  PrefChangeRegistrar local_state_changes_;
+   base::ScopedMultiSourceObservation<views::View, views::ViewObserver> view_observation_{this};
+ };
+ 
+--- a/chrome/browser/ui/views/tark_captions/caption_pill_view.cc
++++ b/chrome/browser/ui/views/tark_captions/caption_pill_view.cc
+@@ -54,9 +54,6 @@
+   download_button_ = pill_->AddChildView(std::make_unique<views::MdTextButton>(
+       base::BindRepeating(&Delegate::OnDownloadButtonPressed, base::Unretained(delegate_.get())),
+       l10n_util::GetStringUTF16(IDS_TARK_CAPTIONS_CANCEL)));
+-  captions_button_ = pill_->AddChildView(std::make_unique<views::MdTextButton>(
+-      base::BindRepeating(&Delegate::OnCaptionsPressed, base::Unretained(delegate_.get())),
+-      l10n_util::GetStringUTF16(IDS_TARK_CAPTIONS_CAPTIONS)));
+   language_button_ = pill_->AddChildView(std::make_unique<views::MdTextButton>(
+       views::Button::PressedCallback(),
+       l10n_util::GetStringUTF16(IDS_TARK_CAPTIONS_HINDI)));
+@@ -80,9 +77,8 @@
+   auto* hide = pill_->AddChildView(views::CreateVectorImageButtonWithNativeTheme(
+       base::BindRepeating(&Delegate::OnHidePressed, base::Unretained(delegate_.get())),
+       vector_icons::kCloseIcon, 16));
+-  hide->SetTooltipText(l10n_util::GetStringUTF16(IDS_TARK_CAPTIONS_HIDE));
+-  hide->GetViewAccessibility().SetName(l10n_util::GetStringUTF16(IDS_TARK_CAPTIONS_HIDE));
+-  SetCaptionsOn(false);
++  hide->SetTooltipText(l10n_util::GetStringUTF16(IDS_TARK_CAPTIONS_BUTTON_OFF));
++  hide->GetViewAccessibility().SetName(l10n_util::GetStringUTF16(IDS_TARK_CAPTIONS_BUTTON_OFF));
+   SetTranslateState(/*enabled=*/false, /*on=*/false);
+   SetDownload(std::nullopt);
+   SetNoticeButton(std::u16string());
+@@ -97,17 +93,12 @@
+   PreferredSizeChanged();
+ }
+ 
+-void TarkCaptionPillView::SetCaptionsOn(bool on) {
+-  captions_button_->SetStyle(on ? ui::ButtonStyle::kProminent : ui::ButtonStyle::kDefault);
+-}
+-
+ void TarkCaptionPillView::SetTranslateState(bool enabled, bool on) {
+   translate_button_->SetEnabled(enabled);
+   translate_button_->SetStyle(on ? ui::ButtonStyle::kProminent : ui::ButtonStyle::kDefault);
+ }
+ 
+ void TarkCaptionPillView::SetDownload(const std::optional<Download>& download) {
+-  captions_button_->SetVisible(!download);
+   language_button_->SetVisible(!download);
+   translate_button_->SetVisible(!download);
+   if (download) {
+--- a/chrome/browser/ui/views/tark_captions/caption_pill_view.h
++++ b/chrome/browser/ui/views/tark_captions/caption_pill_view.h
+@@ -22,18 +22,17 @@
+ class ProgressBar;
+ }  // namespace views
+ 
+-// Tark (D4): the call captions pill (mockup pill-states.html, steps 1-3):
+-// the caption box (last final line and a faded draft) above a pill with
+-// the mark, Captions, the language, Translate (disabled until Phase 2) and
+-// ✕. In strip mode (the call's tab is not in front) only a narrower
+-// caption box shows.
++// Tark (D4): the caption bar (mockup pill-states.html, steps 2-3; shown
++// once the CC button turned captions on): the caption box (last final line
++// and a faded draft) above a pill with the mark, the language, Translate and
++// ✕ (captions off). In strip mode (the captioning tab is not in front) only
++// a narrower caption box shows.
+ class TarkCaptionPillView : public views::View {
+   METADATA_HEADER(TarkCaptionPillView, views::View)
+ 
+  public:
+   class Delegate {
+    public:
+-    virtual void OnCaptionsPressed() = 0;
+     virtual void OnTranslatePressed() = 0;
+     virtual void OnLanguagePressed(views::View* anchor) = 0;
+     virtual void OnHidePressed() = 0;
+@@ -64,7 +63,6 @@
+   ~TarkCaptionPillView() override;
+ 
+   void SetMode(Mode mode);
+-  void SetCaptionsOn(bool on);
+   // Translate's button: usable while captions are on, prominent when on.
+   void SetTranslateState(bool enabled, bool on);
+   void SetLanguageName(const std::u16string& name);
+@@ -93,7 +91,6 @@
+   raw_ptr<Delegate> delegate_;
+   raw_ptr<TarkCaptionBoxView> caption_box_ = nullptr;
+   raw_ptr<views::View> pill_ = nullptr;
+-  raw_ptr<views::MdTextButton> captions_button_ = nullptr;
+   raw_ptr<views::MdTextButton> language_button_ = nullptr;
+   raw_ptr<views::MdTextButton> choose_button_ = nullptr;
+   raw_ptr<views::MdTextButton> translate_button_ = nullptr;
+--- a/chrome/browser/ui/views/tark_captions/pill_language.cc
++++ b/chrome/browser/ui/views/tark_captions/pill_language.cc
+@@ -4,6 +4,8 @@
+ 
+ #include "chrome/browser/ui/views/tark_captions/pill_language.h"
+ 
++#include <algorithm>
++
+ #include "components/tark_captions/client_language.h"
+ #include "ui/base/l10n/l10n_util.h"
+ 
+@@ -64,3 +66,15 @@
+ std::u16string LanguageDisplayName(const std::string& code, const std::string& ui_locale) {
+   return l10n_util::GetDisplayNameForLocale(code, ui_locale, /*is_for_ui=*/true);
+ }
++
++BarMode BarFor(bool captions_on, bool active_tab) {
++  if (!captions_on) {
++    return BarMode::kNone;
++  }
++  return active_tab ? BarMode::kBar : BarMode::kStrip;
++}
++
++bool ButtonClearOf(const gfx::Rect& button, const std::vector<gfx::Rect>& browser_windows) {
++  return std::ranges::none_of(browser_windows,
++                              [&](const gfx::Rect& window) { return window.Intersects(button); });
++}
+--- a/chrome/browser/ui/views/tark_captions/pill_language.h
++++ b/chrome/browser/ui/views/tark_captions/pill_language.h
+@@ -8,6 +8,8 @@
+ #include <string>
+ #include <vector>
+ 
++#include "ui/gfx/geometry/rect.h"
++
+ namespace tark_captions {
+ class ClientLanguage;
+ }
+@@ -41,6 +43,17 @@
+ // Client speaks, after Auto-detect: Tark's own languages, then macOS 26's.
+ std::vector<std::string> ClientLanguageChoices(bool apple_available);
+ 
++// D4 any-media: what the caption bar shows for a tab — nothing until
++// captions are on, the bar in the tab in front, the strip in another.
++enum class BarMode { kNone, kBar, kStrip };
++BarMode BarFor(bool captions_on, bool active_tab);
++
++// The page decides where the CC button goes (D4 any-media): it shows only
++// where none of the browser's own windows over the page (a permission
++// prompt, the fullscreen bubble, the omnibox popup) is, so it never covers
++// them.
++bool ButtonClearOf(const gfx::Rect& button, const std::vector<gfx::Rect>& browser_windows);
++
+ // Show their words in: CaptionChoices codes ("" is the language's own
+ // script). macOS's languages are shown in their own script only.
+ std::vector<std::string> ShowInChoices(const tark_captions::ClientLanguage& language);
+--- a/chrome/browser/ui/views/tark_captions/pill_language_unittest.cc
++++ b/chrome/browser/ui/views/tark_captions/pill_language_unittest.cc
+@@ -8,6 +8,7 @@
+ #include <vector>
+ 
+ #include "components/tark_captions/client_language.h"
++#include "ui/gfx/geometry/rect.h"
+ #include "testing/gtest/include/gtest/gtest.h"
+ 
+ namespace {
+@@ -95,4 +96,22 @@
+   EXPECT_EQ(DescribeLanguage(spanish).notice, PillLanguage::Notice::kNone);
+ }
+ 
++// D4 any-media: the caption bar shows only once captions are on (the CC
++// button turns them on); for a tab in the background it is the strip.
++TEST(PillLanguageTest, BarOnlyWithCaptionsOn) {
++  EXPECT_EQ(BarFor(/*captions_on=*/false, /*active_tab=*/true), BarMode::kNone);
++  EXPECT_EQ(BarFor(true, true), BarMode::kBar);
++  EXPECT_EQ(BarFor(true, false), BarMode::kStrip);
++  EXPECT_EQ(BarFor(false, false), BarMode::kNone);
++}
++
++// The page decides where the button goes: it never sits over the
++// browser's own bubbles (a permission prompt, "Press Esc").
++TEST(PillLanguageTest, ButtonStaysClearOfBrowserBubbles) {
++  const gfx::Rect button(700, 500, 30, 22);
++  EXPECT_TRUE(ButtonClearOf(button, {}));
++  EXPECT_TRUE(ButtonClearOf(button, {gfx::Rect(0, 0, 300, 120)}));
++  EXPECT_FALSE(ButtonClearOf(button, {gfx::Rect(0, 0, 300, 120), gfx::Rect(690, 480, 320, 160)}));
++}
++
+ }  // namespace
+--- a/chrome/browser/ui/webui/settings/tark_live_captions_handler.cc
++++ b/chrome/browser/ui/webui/settings/tark_live_captions_handler.cc
+@@ -68,6 +68,7 @@
+   add("getTarkCaptionChoices", &TarkLiveCaptionsHandler::HandleGetChoices);
+   add("setTarkCaptionShowIn", &TarkLiveCaptionsHandler::HandleSetShowIn);
+   add("setTarkCaptionTranslateTo", &TarkLiveCaptionsHandler::HandleSetTranslateTo);
++  add("setTarkCaptionShowButton", &TarkLiveCaptionsHandler::HandleSetShowButton);
+ }
+ 
+ void TarkLiveCaptionsHandler::OnJavascriptAllowed() {
+@@ -127,7 +128,8 @@
+   ResolveJavascriptCallback(args[0],
+                             base::DictValue()
+                                 .Set("showIn", choices.show_in(/*off_the_record=*/false))
+-                                .Set("translateTo", choices.translate_to(/*off_the_record=*/false)));
++                                .Set("translateTo", choices.translate_to(/*off_the_record=*/false))
++                                .Set("showButton", choices.show_button()));
+ }
+ 
+ void TarkLiveCaptionsHandler::HandleSetShowIn(const base::ListValue& args) {
+@@ -144,4 +146,11 @@
+   }
+ }
+ 
++void TarkLiveCaptionsHandler::HandleSetShowButton(const base::ListValue& args) {
++  if (!args.empty() && args[0].is_bool()) {
++    tark_captions::CaptionChoices(g_browser_process->local_state())
++        .SetShowButton(args[0].GetBool());
++  }
++}
++
+ }  // namespace settings
+--- a/chrome/browser/ui/webui/settings/tark_live_captions_handler.h
++++ b/chrome/browser/ui/webui/settings/tark_live_captions_handler.h
+@@ -39,6 +39,7 @@
+   void HandleGetChoices(const base::ListValue& args);
+   void HandleSetShowIn(const base::ListValue& args);
+   void HandleSetTranslateTo(const base::ListValue& args);
++  void HandleSetShowButton(const base::ListValue& args);
+ 
+   // {models: [{id, sizeMb, doneMb, state}], usedMb}.
+   base::DictValue Models() const;
+--- a/chrome/browser/ui/webui/settings/tark_settings_strings.cc
++++ b/chrome/browser/ui/webui/settings/tark_settings_strings.cc
+@@ -67,6 +67,8 @@
+       {"tarkLiveCaptionsCancel", IDS_SETTINGS_TARK_LIVE_CAPTIONS_CANCEL},
+       {"tarkLiveCaptionsInUse", IDS_SETTINGS_TARK_LIVE_CAPTIONS_IN_USE},
+       {"tarkLiveCaptionsFailed", IDS_SETTINGS_TARK_LIVE_CAPTIONS_FAILED},
++      {"tarkLiveCaptionsShowButton", IDS_SETTINGS_TARK_LIVE_CAPTIONS_SHOW_BUTTON},
++      {"tarkLiveCaptionsShowButtonSub", IDS_SETTINGS_TARK_LIVE_CAPTIONS_SHOW_BUTTON_SUB},
+       {"tarkLiveCaptionsShowIn", IDS_SETTINGS_TARK_LIVE_CAPTIONS_SHOW_IN},
+       {"tarkLiveCaptionsTranslateTo", IDS_SETTINGS_TARK_LIVE_CAPTIONS_TRANSLATE_TO},
+       {"tarkLiveCaptionsProgress", IDS_SETTINGS_TARK_LIVE_CAPTIONS_PROGRESS},
