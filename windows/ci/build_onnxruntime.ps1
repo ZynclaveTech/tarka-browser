@@ -29,7 +29,11 @@ function Find-Dumpbin {
 if (-not $CheckOnly) {
   $src = 'C:\ort-src'
   $build = 'C:\ort-build'
-  git clone --quiet --depth 1 --branch $Tag https://github.com/microsoft/onnxruntime.git $src
+  # LF line endings: ONNX Runtime patches what it downloads (cmake/patches)
+  # with LF sources, and its .gitattributes (text=auto) would otherwise check
+  # the patches out with Windows line endings, which then fail to apply.
+  git -c core.autocrlf=false -c core.eol=lf clone --quiet --depth 1 --branch $Tag `
+    https://github.com/microsoft/onnxruntime.git $src
   if ($LASTEXITCODE) { throw "git clone of onnxruntime $Tag failed" }
   $head = (git -C $src rev-parse HEAD).Trim()
   if ($head -ne $Commit) { throw "onnxruntime $Tag is $head, expected $Commit" }
