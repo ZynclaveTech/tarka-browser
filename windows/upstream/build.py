@@ -374,8 +374,9 @@ def main():
 
     # Run ninja
     if args.ci:
-        # Both passes share the stage's 3.5 hours.
-        deadline = time.monotonic() + 3.5*60*60
+        # Both passes share the stage's 3.5 hours (TARK_NINJA_HOURS: less for
+        # the first stage, which also unpacks and patches the source).
+        deadline = time.monotonic() + float(os.environ.get('TARK_NINJA_HOURS', '3.5'))*60*60
         if first_commandline:
             _run_build_process_timeout(*first_commandline, timeout=deadline - time.monotonic())
         _run_build_process_timeout(*ninja_commandline, timeout=max(60, deadline - time.monotonic()))
