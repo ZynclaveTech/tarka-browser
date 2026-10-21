@@ -173,3 +173,56 @@ class TestSigningRefusesStrangeNames(TestSigning):
         self.sign.release(self.apk, self.aab, outdir, self.keystore, self.passfile)
         with self.assertRaisesRegex(ValueError, 'exists'):
             self.sign.release(self.apk, self.aab, outdir, self.keystore, self.passfile)
+
+
+@unittest.skipIf(tools_missing(), tools_missing() or '')
+class TestPublish(TestSigning):
+    """A5 Task 4: the direct APK and its index on gettarka.com/android/v1/,
+    in the format the app's update check reads (ParseIndex)."""
+
+    def signed(self):
+        sys.path.insert(0, str(REPO / 'android' / 'release'))
+        out = self.tmp / f'pub-{self._testMethodName}'
+        r = self.sign.release(self.apk, self.aab, out, self.keystore, self.passfile)
+        cert_file = self.tmp / f'cert-{self._testMethodName}.txt'
+        cert_file.write_text(r['cert_sha256'] + '\n')
+        return out / f"tark-{r['version_name']}.apk", r, cert_file
+
+    def test_index_matches_the_apps_format(self):
+        import publish
+        apk, r, _ = self.signed()
+        index = publish.index_for(apk, r['version_name'], r['version_code'])
+        self.assertEqual(set(index), {'version_code', 'version_name', 'url', 'size', 'sha256'})
+        self.assertEqual(index['url'], 'https://gettarka.com/android/v1/tark-155.0.8059.39-r1.apk')
+        self.assertEqual(index['size'], apk.stat().st_size)
+        import hashlib
+        self.assertEqual(index['sha256'], hashlib.sha256(apk.read_bytes()).hexdigest())
+        # The app's own rules (update_index.h) agree on the prefix and the cap.
+        h = (REPO / 'android' / 'patches' / 'update-check.patch').read_text()
+        self.assertIn(f'+inline constexpr char kApkPrefix[] = "{publish.APK_PREFIX}";', h)
+        self.assertLess(len(publish.json.dumps(index)), 64 * 1024)
+
+    def test_publish_dry_run_order(self):
+        import publish
+        apk, r, cert_file = self.signed()
+        index = publish.index_for(apk, r['version_name'], r['version_code'])
+        commands = publish.publish(apk, index, cert_file=cert_file, dry_run=True)
+        joined = [' '.join(map(str, c)) for c in commands]
+        self.assertEqual(len(joined), 3, joined)
+        self.assertIn('s3api put-object', joined[0])
+        self.assertIn('--key android/v1/tark-155.0.8059.39-r1.apk', joined[0])
+        self.assertIn("--if-none-match *", joined[0])
+        self.assertIn('immutable', joined[0])
+        self.assertIn('application/vnd.android.package-archive', joined[0])
+        self.assertIn('android/v1/latest.json', joined[1])
+        self.assertIn('max-age=300', joined[1])
+        self.assertIn('cloudfront create-invalidation', joined[2])
+        self.assertIn('--paths /android/v1/latest.json', joined[2])
+
+    def test_refuses_a_foreign_certificate(self):
+        import publish
+        apk, r, cert_file = self.signed()
+        cert_file.write_text('00' * 32 + '\n')
+        index = publish.index_for(apk, r['version_name'], r['version_code'])
+        with self.assertRaisesRegex(ValueError, 'certificate'):
+            publish.publish(apk, index, cert_file=cert_file, dry_run=True)
