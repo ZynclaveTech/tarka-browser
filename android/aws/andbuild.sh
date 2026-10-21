@@ -12,7 +12,8 @@
 #
 #   andbuild.sh status
 #   andbuild.sh start                     start the instance, wait for SSM
-#   andbuild.sh job JOB.sh [ARGS...]      run a job on HEAD; prints the S3 prefix
+#   andbuild.sh job [--new-base] JOB.sh [ARGS...]
+#                                         run a job on HEAD; prints the S3 prefix
 #   andbuild.sh wait COMMAND_ID           wait for a job, print its tail
 #   andbuild.sh fetch PREFIX DIR          download a job's artifacts
 #   andbuild.sh stop
@@ -28,6 +29,20 @@ I=$(aws ec2 describe-instances --region $R \
 
 state() { aws ec2 describe-instances --region $R --instance-ids $I --query 'Reservations[0].Instances[0].State.Name' --output text; }
 
+# A short read-only command on the machine (running, SSM online); prints its
+# output.
+remote() {
+  local id s
+  id=$(aws ssm send-command --region $R --instance-ids $I --document-name AWS-RunShellScript \
+    --comment "tark read" --timeout-seconds 60 \
+    --parameters "$(python3 -c 'import json,sys; print(json.dumps({"commands":[sys.argv[1]]}))' "$1")" \
+    --query Command.CommandId --output text)
+  until s=$(aws ssm get-command-invocation --region $R --command-id $id --instance-id $I --query Status --output text 2>/dev/null) \
+      && [[ $s != InProgress && $s != Pending && $s != Delayed ]]; do sleep 2; done
+  [[ $s == Success ]] || { echo "could not read the machine ($s)" >&2; return 1; }
+  aws ssm get-command-invocation --region $R --command-id $id --instance-id $I --query StandardOutputContent --output text
+}
+
 case ${1:-} in
 status) echo "$I $(state)";;
 start)
@@ -38,7 +53,28 @@ start)
       --query 'InstanceInformationList[0].PingStatus' --output text) == Online ]]; do sleep 10; done
   echo "$I running, SSM online";;
 job)
-  job=$2; shift 2
+  shift
+  new_base=0
+  [[ ${1:-} == --new-base ]] && { new_base=1; shift; }
+  job=$1; shift
+  # A build whose base (Chromium, its toolchains, ungoogled's core patches:
+  # android/prep_hash.py --base) differs from the one kept on the machine
+  # prepares everything from scratch: about two hours, about $6. It runs only
+  # with --new-base, once the user has approved it (2026-10-21).
+  if grep -q 'android/build.sh' $job && (( ! new_base )); then
+    want=$(python3 $REPO/android/prep_hash.py --base $REPO)
+    have=$(remote 'test -d /tark/work/src-base && cat /tark/work/base.stamp || true' | tr -d '[:space:]')
+    why=""
+    if (( ${@[(Ie)--fresh]} )); then why="--fresh wipes the base"
+    elif [[ -z $have ]]; then why="the machine keeps no base yet"
+    elif [[ $have != $want ]]; then why="the base changed (machine ${have[1,12]}, this checkout ${want[1,12]})"
+    fi
+    if [[ -n $why ]]; then
+      echo "refused: this build would prepare Chromium from scratch: $why." >&2
+      echo "That is about two hours on the machine (about \$6). Run it with --new-base once approved." >&2
+      exit 3
+    fi
+  fi
   name=${job:t:r}
   prefix=jobs/$name-$(date +%Y%m%d-%H%M%S)
   sub=$(git -C $REPO rev-parse HEAD:ungoogled-chromium)

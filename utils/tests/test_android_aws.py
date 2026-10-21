@@ -1,6 +1,7 @@
-"""A1: the Android build machine's scripts (android/aws/). Static checks only:
-the machine is reachable over SSM alone, sized as approved, stops itself,
-and is created only after the user's OK."""
+"""A1: the Android build machine's scripts (android/aws/): the machine is
+reachable over SSM alone, sized as approved, stops itself, and is created
+only after the user's OK; a build that would prepare from scratch needs it
+too (run against a stand-in aws CLI)."""
 import pathlib
 import re
 import subprocess
@@ -141,3 +142,92 @@ class TestDriverAndJob(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+STUB_AWS = r'''#!/usr/bin/env python3
+"""A stand-in for the aws CLI: the machine is running, SSM answers, and
+every call is logged; the machine's base.stamp comes from $STUB_STAMP."""
+import os, sys
+args = sys.argv[1:]
+with open(os.environ['STUB_LOG'], 'a') as log:
+    log.write(' '.join(args) + '\n')
+joined = ' '.join(args)
+if args[:2] == ['sts', 'get-caller-identity']:
+    print('123456789012')
+elif args[:2] == ['ec2', 'describe-instances']:
+    print('running' if 'State.Name' in joined else 'i-0stub')
+elif args[:2] == ['ssm', 'send-command']:
+    print('cmd-stub')
+elif args[:2] == ['ssm', 'get-command-invocation']:
+    print('Success' if 'Status' in joined else os.environ.get('STUB_STAMP', ''))
+'''
+
+
+class TestNewBaseNeedsTheUsersOk(unittest.TestCase):
+    """A build that would prepare Chromium again from scratch (about two
+    hours on the machine, about $6) runs only with --new-base, given once
+    the user has approved it (the user, 2026-10-21: "very expensive please
+    do not run from scratch all the time")."""
+
+    def run_job(self, stamp, *args):
+        import os
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            stub = pathlib.Path(tmp) / 'aws'
+            stub.write_text(STUB_AWS)
+            stub.chmod(0o755)
+            log = pathlib.Path(tmp) / 'log'
+            log.write_text('')
+            env = dict(os.environ, PATH=f'{tmp}:{os.environ["PATH"]}', STUB_LOG=str(log),
+                       STUB_STAMP=stamp)
+            r = subprocess.run(['zsh', str(AWS / 'andbuild.sh'), 'job', *args],
+                               capture_output=True, text=True, env=env)
+            return r, log.read_text()
+
+    def base(self):
+        repo = AWS.parents[1]
+        return subprocess.run(['python3', str(repo / 'android' / 'prep_hash.py'), '--base', str(repo)],
+                              capture_output=True, text=True, check=True).stdout.strip()
+
+    def uploaded(self, log):
+        return 'src.tar.gz' in log
+
+    def test_the_same_base_builds(self):
+        r, log = self.run_job(self.base(), str(AWS / 'jobs' / 'tark-build.sh'))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue(self.uploaded(log))
+
+    def test_another_base_is_refused_before_anything_is_uploaded(self):
+        r, log = self.run_job('0' * 64, str(AWS / 'jobs' / 'tark-build.sh'))
+        self.assertEqual(r.returncode, 3)
+        self.assertIn('from scratch', r.stderr)
+        self.assertIn('--new-base', r.stderr)
+        self.assertFalse(self.uploaded(log))
+
+    def test_a_machine_without_a_base_is_refused(self):
+        r, log = self.run_job('', str(AWS / 'jobs' / 'tark-build.sh'))
+        self.assertEqual(r.returncode, 3)
+        self.assertFalse(self.uploaded(log))
+
+    def test_fresh_is_a_new_base(self):
+        r, log = self.run_job(self.base(), str(AWS / 'jobs' / 'tark-build.sh'), '--fresh')
+        self.assertEqual(r.returncode, 3)
+        self.assertFalse(self.uploaded(log))
+
+    def test_new_base_runs_once_approved(self):
+        for args in ([], ['--fresh']):
+            r, log = self.run_job('0' * 64, '--new-base', str(AWS / 'jobs' / 'tark-build.sh'), *args)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertTrue(self.uploaded(log))
+            self.assertIn('--fresh' if args else 'tark-build', log)
+
+    def test_jobs_that_do_not_build_are_not_checked(self):
+        import tempfile
+        with tempfile.NamedTemporaryFile('w', suffix='.sh', delete=False) as job:
+            job.write('echo hello\n')
+        try:
+            r, log = self.run_job('0' * 64, job.name)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertTrue(self.uploaded(log))
+        finally:
+            pathlib.Path(job.name).unlink()
