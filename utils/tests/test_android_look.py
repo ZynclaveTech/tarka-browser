@@ -387,15 +387,29 @@ class TestSettingsPadding(unittest.TestCase):
         self.assertIn('\nlook-settings-padding.patch\n', (ANDROID / 'patches' / 'series').read_text())
 
     def test_switches_end_under_the_help_button(self):
-        # Found on the emulator (build 6): the switch sat centred in a wider
-        # widget frame, 14 px (5 dp) short of the row's end and of the "?".
+        # Found on the emulator (rebase build): Widget.BrowserUI.Switch draws
+        # the switch scaled down (scaleX/scaleY) around its centre, so its
+        # visible edge stopped 14 px (5 dp) short of the row's end and of the
+        # "?". It now scales towards its end edge (the start edge in RTL).
         patch = (ANDROID / 'patches' / 'look-settings-padding.patch').read_text()
         self.assertIn('+++ b/components/browser_ui/settings/android/widget/java/src/org/chromium/'
                       'components/browser_ui/settings/ChromeSwitchPreference.java', patch)
-        self.assertIn('+            ((LinearLayout) widgetFrame).setGravity(Gravity.END | Gravity.CENTER_VERTICAL);',
-                      patch)
-        for imp in ('android.view.Gravity', 'android.widget.LinearLayout'):
-            self.assertIn(f'+import {imp};', patch)
+        added = '\n'.join(l[1:] for l in patch.splitlines() if l.startswith('+'))
+        self.assertIn('v.setPivotX(v.getLayoutDirection() == View.LAYOUT_DIRECTION_RTL ? 0 : v.getWidth());',
+                      added)
+        # An explicit pivot X makes pivot Y explicit too: it stays the centre.
+        self.assertIn('v.setPivotY(v.getHeight() / 2f);', added)
+        # Again on every layout (the width is known only then), never twice.
+        self.assertIn('removeOnLayoutChangeListener(SCALE_TOWARDS_END);', added)
+        self.assertIn('addOnLayoutChangeListener(SCALE_TOWARDS_END);', added)
+        self.assertIn('holder.findViewById(android.R.id.widget_frame)', added)
+
+    def test_the_widget_frame_keeps_its_gravity(self):
+        # The first try, END gravity on the frame, moved nothing: the
+        # switch's view already filled the frame.
+        patch = (ANDROID / 'patches' / 'look-settings-padding.patch').read_text()
+        self.assertNotIn('setGravity', patch)
+        self.assertNotIn('+import android.view.Gravity;', patch)
 
 
 class TestTarkHelp(unittest.TestCase):
