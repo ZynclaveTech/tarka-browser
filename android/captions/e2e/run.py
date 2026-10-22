@@ -133,6 +133,13 @@ def open_page_and_play(dev):
     time.sleep(3)
 
 
+def pause(dev):
+    # A playing page never lets uiautomator see an idle screen; the bar stays
+    # while captions are on.
+    dev.shell('input', 'keyevent', 'KEYCODE_MEDIA_PAUSE')
+    time.sleep(2)
+
+
 def bar_shown(dev):
     return 'Captions' in dev.screen()
 
@@ -180,6 +187,7 @@ def case_wifi(dev):
     open_page_and_play(dev)
     assert captions_on(dev), 'no Captions chip'
     time.sleep(8)
+    pause(dev)
     assert 'Waiting for Wi-Fi' in dev.screen(), 'no "Waiting for Wi-Fi" on mobile data'
     assert 'tark captions: downloading' not in dev.log(), 'downloaded on mobile data'
     assert xlit.tap_text(dev, 'Download now', tries=3), 'no "Download now"'
@@ -219,6 +227,7 @@ def case_tamper(dev):
 
 def case_settings(dev):
     case_download(dev)
+    pause(dev)
     dev.shell('am', 'start', '-n', f'{PACKAGE}/org.chromium.chrome.browser.settings.SettingsActivity',
               '--es', 'show_fragment',
               'org.chromium.chrome.browser.tark_captions.TarkLiveCaptionsSettings')

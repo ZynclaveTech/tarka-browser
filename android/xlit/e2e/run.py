@@ -109,8 +109,18 @@ class Device:
         self.run('reverse', '--remove', f'tcp:{PORT}')
 
     def screen(self):
-        self.shell('uiautomator', 'dump', '/sdcard/ui.xml')
-        return self.shell('cat', '/sdcard/ui.xml')
+        # uiautomator dumps only an idle screen ("could not get idle state"
+        # while a page plays media) and then leaves the previous ui.xml in
+        # place: remove it first, so a failed dump reads as nothing rather
+        # than as an old screen.
+        for _ in range(3):
+            self.shell('rm', '-f', '/sdcard/ui.xml')
+            self.shell('uiautomator', 'dump', '/sdcard/ui.xml')
+            xml = self.shell('cat', '/sdcard/ui.xml')
+            if '<hierarchy' in xml:
+                return xml
+            time.sleep(1)
+        return ''
 
     def logged(self, text, timeout):
         end = time.time() + timeout

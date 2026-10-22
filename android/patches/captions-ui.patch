@@ -279,7 +279,7 @@
              mBottomContainer = null;
 --- /dev/null
 +++ b/chrome/android/java/src/org/chromium/chrome/browser/tark_captions/TarkCaptionBarCoordinator.java
-@@ -0,0 +1,201 @@
+@@ -0,0 +1,213 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -287,6 +287,7 @@
 +package org.chromium.chrome.browser.tark_captions;
 +
 +import android.app.Activity;
++import android.text.TextUtils;
 +import android.text.format.Formatter;
 +import android.view.Gravity;
 +import android.view.LayoutInflater;
@@ -426,9 +427,10 @@
 +        if (!state.barVisible) return;
 +
 +        mCaptionsChip.setSelected(state.captionsOn);
-+        mLanguageChip.setText(
-+                mActivity.getString(R.string.tark_captions_language_chip,
-+                        languageName(state.language)));
++        setTextIfChanged(
++                mLanguageChip,
++                mActivity.getString(
++                        R.string.tark_captions_language_chip, languageName(state.language)));
 +
 +        boolean ready = state.unitState == TarkCaptionsBridge.UNIT_READY;
 +        mDownloadCard.setVisibility(state.captionsOn && !ready ? View.VISIBLE : View.GONE);
@@ -438,7 +440,8 @@
 +    }
 +
 +    private void renderDownload(TarkCaptionsBridge.State state) {
-+        mDownloadTitle.setText(
++        setTextIfChanged(
++                mDownloadTitle,
 +                mActivity.getString(
 +                        R.string.tark_captions_getting_ready,
 +                        languageName(state.language),
@@ -446,39 +449,48 @@
 +        mDownloadProgress.setMax(1000);
 +        mDownloadProgress.setProgress(
 +                state.total > 0 ? (int) (1000 * state.bytes / state.total) : 0);
-+        mDownloadAction.setVisibility(View.GONE);
++        int line = R.string.tark_captions_on_this_phone;
++        int action = 0;
 +        switch (state.unitState) {
 +            case TarkCaptionsBridge.UNIT_WAITING_FOR_WIFI:
-+                mDownloadLine.setText(R.string.tark_captions_waiting_for_wifi);
-+                mDownloadAction.setText(R.string.tark_captions_download_now);
-+                mDownloadAction.setVisibility(View.VISIBLE);
++                line = R.string.tark_captions_waiting_for_wifi;
++                action = R.string.tark_captions_download_now;
 +                break;
 +            case TarkCaptionsBridge.UNIT_FAILED:
-+                mDownloadLine.setText(R.string.tark_captions_download_failed);
-+                mDownloadAction.setText(R.string.tark_captions_try_again);
-+                mDownloadAction.setVisibility(View.VISIBLE);
++                line = R.string.tark_captions_download_failed;
++                action = R.string.tark_captions_try_again;
 +                break;
 +            default:
-+                mDownloadLine.setText(R.string.tark_captions_on_this_phone);
 +                break;
 +        }
++        setTextIfChanged(mDownloadLine, mActivity.getString(line));
++        if (action != 0) setTextIfChanged(mDownloadAction, mActivity.getString(action));
++        // Hidden then shown again on every tick would be an accessibility event each second.
++        mDownloadAction.setVisibility(action != 0 ? View.VISIBLE : View.GONE);
 +    }
 +
 +    private void renderCaptions(TarkCaptionsBridge.State state) {
 +        if (state.cantCaption) {
-+            mFinalText.setText("");
-+            mDraftText.setText(R.string.tark_captions_cant_caption);
++            setTextIfChanged(mFinalText, "");
++            setTextIfChanged(mDraftText, mActivity.getString(R.string.tark_captions_cant_caption));
 +            return;
 +        }
 +        if (state.finalText.isEmpty() && state.draftText.isEmpty()) {
-+            mFinalText.setText("");
-+            mDraftText.setText(R.string.tark_captions_listening);
++            setTextIfChanged(mFinalText, "");
++            setTextIfChanged(mDraftText, mActivity.getString(R.string.tark_captions_listening));
 +            return;
 +        }
 +        // Word by word: the last final line above what is being said; a phrase at a time: the
 +        // last phrase.
-+        mFinalText.setText(state.draftText.isEmpty() ? "" : state.finalText);
-+        mDraftText.setText(state.draftText.isEmpty() ? state.finalText : state.draftText);
++        setTextIfChanged(mFinalText, state.draftText.isEmpty() ? "" : state.finalText);
++        setTextIfChanged(mDraftText, state.draftText.isEmpty() ? state.finalText : state.draftText);
++    }
++
++    // The tab's state arrives every second (its tick); setting the same text
++    // again would still send an accessibility "content changed" event, so a
++    // screen reader would hear the caption again and the screen never settles.
++    private static void setTextIfChanged(TextView view, CharSequence text) {
++        if (!TextUtils.equals(view.getText(), text)) view.setText(text);
 +    }
 +}
 --- /dev/null
