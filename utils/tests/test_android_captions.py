@@ -50,6 +50,46 @@ class TestEnginePatch(unittest.TestCase):
         self.assertIn('tarka/captions/\n', text)
 
 
+def hunk_count_errors(text):
+    """Hunks whose @@ -a,b +c,d @@ counts disagree with their lines."""
+    errors, lines, i = [], text.splitlines(), 0
+    while i < len(lines):
+        m = re.match(r'@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@', lines[i])
+        if not m:
+            i += 1
+            continue
+        old, new = int(m.group(1) or 1), int(m.group(2) or 1)
+        header, i = lines[i], i + 1
+        while i < len(lines) and (old or new) and not lines[i].startswith('@@'):
+            kind = lines[i][:1]
+            if kind in (' ', ''):
+                old, new = old - 1, new - 1
+            elif kind == '-':
+                old -= 1
+            elif kind == '+':
+                new -= 1
+            elif lines[i].startswith('\\'):
+                pass
+            else:
+                break
+            i += 1
+        if old or new:
+            errors.append(header)
+    return errors
+
+
+class TestPatchShapes(unittest.TestCase):
+    def test_hunk_counts_match(self):
+        for name in ('captions-ort.patch', 'captions-engine.patch'):
+            text = (ANDROID / 'patches' / name).read_text(encoding='utf-8')
+            self.assertEqual(hunk_count_errors(text), [], name)
+        conventions = ROOT / 'patches' / 'tarka' / 'captions' / 'engine-conventions.patch'
+        self.assertEqual(hunk_count_errors(conventions.read_text(encoding='utf-8')), [])
+
+    def test_counter_finds_a_wrong_count(self):
+        self.assertTrue(hunk_count_errors('@@ -1,1 +1,3 @@\n a\n+b\n'))
+
+
 class TestOnnxRuntime(unittest.TestCase):
     def test_ort_pinned(self):
         text = (ANDROID / 'captions' / 'ort.sh').read_text(encoding='utf-8')
