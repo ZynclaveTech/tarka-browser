@@ -194,7 +194,7 @@
 +#endif  // CHROME_BROWSER_TARK_CAPTIONS_ANDROID_ANDROID_TARK_CAPTIONS_BRIDGE_H_
 --- /dev/null
 +++ b/chrome/browser/tark_captions_android/tark_captions_tab.cc
-@@ -0,0 +1,332 @@
+@@ -0,0 +1,359 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -272,6 +272,12 @@
 +  logic_.ChooseLanguage(language.empty() ? kDefaultLanguage : language);
 +  CaptionDownloads::Get().AddObserver(this);
 +  switches_.set_disconnect_handler(base::BindRepeating([](mojo::RemoteSetElementId) {}));
++  // A player's connection closing: captions may follow another one.
++  audio_receivers_.set_disconnect_handler(base::BindRepeating(
++      [](TarkCaptionsTab* self) {
++        self->logic_.ForgetSource(self->audio_receivers_.current_receiver());
++      },
++      base::Unretained(this)));
 +}
 +
 +TarkCaptionsTab::~TarkCaptionsTab() {
@@ -296,7 +302,18 @@
 +  if (on && !UnitReady()) {
 +    CaptionDownloads::Get().Request(logic_.state().language, /*now=*/false);
 +  }
++  if (!on) {
++    CancelDownload();
++  }
 +  Update();
++}
++
++void TarkCaptionsTab::CancelDownload() {
++  // Captions off before the language arrived: its download (and any "Download
++  // now" consent to mobile data) goes too.
++  if (!UnitReady()) {
++    CaptionDownloads::Get().Cancel(logic_.state().language);
++  }
 +}
 +
 +void TarkCaptionsTab::ChooseLanguage(const std::string& language) {
@@ -304,6 +321,7 @@
 +    return;
 +  }
 +  g_browser_process->local_state()->SetString(kLanguagePref, language);
++  CancelDownload();  // the language moved away from
 +  StopEngine();  // a new language is a new model
 +  final_text_.clear();
 +  draft_text_.clear();
@@ -323,6 +341,7 @@
 +void TarkCaptionsTab::HideBarForPage() {
 +  bar_hidden_for_page_ = true;
 +  logic_.SetCaptionsOn(false, base::TimeTicks::Now());
++  CancelDownload();
 +  Update();
 +}
 +
@@ -388,11 +407,14 @@
 +    return;
 +  }
 +  const bool was_cant_caption = logic_.state().cant_caption;
-+  logic_.OnAudio(base::TimeTicks::Now());
-+  if (was_cant_caption) {
-+    Update();  // audio came back: captions start again
++  const bool was_wanted = logic_.WantsEngine();
++  // Each player has its own connection; captions follow one of them.
++  const bool captioned =
++      logic_.OnAudio(audio_receivers_.current_receiver(), base::TimeTicks::Now());
++  if (was_cant_caption || !was_wanted) {
++    Update();  // audio came back: captions (and the model, if unloaded) again
 +  }
-+  if (service_.is_bound()) {
++  if (captioned && service_.is_bound()) {
 +    service_->AddAudio(mono, sample_rate);
 +  }
 +}
@@ -449,14 +471,19 @@
 +  } else if (!logic_.WantsEngine() && service_.is_bound()) {
 +    StopEngine();
 +  }
-+  if (logic_.state().captions_on && !tick_.IsRunning()) {
++  // The timer runs while captions are on, and while a hidden tab still holds
++  // its captions process (until TabCaptions lets it go).
++  const bool tick =
++      logic_.state().captions_on &&
++      (web_contents()->GetVisibility() != content::Visibility::HIDDEN || service_.is_bound());
++  if (tick && !tick_.IsRunning()) {
 +    tick_.Start(FROM_HERE, kTick, base::BindRepeating(
 +                                      [](TarkCaptionsTab* self) {
 +                                        self->logic_.OnTick(base::TimeTicks::Now());
 +                                        self->Update();
 +                                      },
 +                                      base::Unretained(this)));
-+  } else if (!logic_.state().captions_on && tick_.IsRunning()) {
++  } else if (!tick && tick_.IsRunning()) {
 +    tick_.Stop();
 +  }
 +  NotifyCaptionBar(web_contents());
@@ -529,7 +556,7 @@
 +}  // namespace tark_captions
 --- /dev/null
 +++ b/chrome/browser/tark_captions_android/tark_captions_tab.h
-@@ -0,0 +1,125 @@
+@@ -0,0 +1,126 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -633,6 +660,7 @@
 +  void StopEngine();
 +  void OnServiceGone();
 +  bool UnitReady() const;
++  void CancelDownload();
 +
 +  TabCaptions logic_;
 +  Style style_ = Style::kPhrase;

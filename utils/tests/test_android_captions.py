@@ -90,6 +90,13 @@ class TestPatchShapes(unittest.TestCase):
         self.assertTrue(hunk_count_errors('@@ -1,1 +1,3 @@\n a\n+b\n'))
 
 
+class TestCaptionsAudio(unittest.TestCase):
+    def test_muted_players_send_no_audio(self):
+        # A muted player (a background or preview video) never feeds captions.
+        added = '\n'.join(added_lines('captions-audio.patch', 'media/renderers/audio_renderer_impl.cc'))
+        self.assertRegex(added, r'if \(transcribe_audio_callback_ && volume_ != 0\)')
+
+
 class TestOnnxRuntime(unittest.TestCase):
     def test_ort_pinned(self):
         text = (ANDROID / 'captions' / 'ort.sh').read_text(encoding='utf-8')
@@ -236,6 +243,23 @@ class TestCaptionsUi(unittest.TestCase):
         text = (ANDROID / 'patches' / 'captions-ui.patch').read_text(encoding='utf-8')
         for m in re.finditer(r'^ </translationbundle>\n(.*)$', text, re.M):
             self.assertEqual(m.group(1), '\\ No newline at end of file')
+
+    def test_only_download_now_agrees_to_mobile_data(self):
+        # "Try again" after a failure must not become consent to mobile data.
+        bar = '\n'.join(added_lines(
+            'captions-ui.patch',
+            'chrome/android/java/src/org/chromium/chrome/browser/tark_captions/'
+            'TarkCaptionBarCoordinator.java'))
+        self.assertNotIn('requestDownload(mWebContents, /* now= */ true)', bar)
+        self.assertRegex(bar, r'unitState\s*==\s*TarkCaptionsBridge\.UNIT_WAITING_FOR_WIFI')
+
+    def test_bar_updates_views_only_when_they_change(self):
+        bar = '\n'.join(added_lines(
+            'captions-ui.patch',
+            'chrome/android/java/src/org/chromium/chrome/browser/tark_captions/'
+            'TarkCaptionBarCoordinator.java'))
+        self.assertIn('setTextIfChanged', bar)
+        self.assertNotRegex(bar, r'm(Final|Draft|Download\w*|LanguageChip)Text?\.setText\(')
 
     def test_bar_has_no_translate_in_phase1(self):
         bar = '\n'.join(added_lines('captions-ui.patch', 'chrome/android/java/res/layout/tark_caption_bar.xml'))

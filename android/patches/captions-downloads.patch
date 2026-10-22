@@ -116,7 +116,7 @@
 +}
 --- /dev/null
 +++ b/chrome/browser/tark_captions_android/caption_downloads.cc
-@@ -0,0 +1,435 @@
+@@ -0,0 +1,449 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -288,7 +288,9 @@
 +
 +bool CaptionDownloads::Ready(std::string_view unit) const {
 +  auto it = present_.find(unit);
-+  return it != present_.end() && UnitReady(unit, it->second);
++  // A removal waiting for the captions process is not ready: tabs turn
++  // captions off and let it go, and Settings drops the row.
++  return it != present_.end() && UnitReady(unit, it->second) && !use_.Removing(unit);
 +}
 +
 +void CaptionDownloads::Request(std::string_view unit, bool now) {
@@ -331,6 +333,8 @@
 +  Cancel(unit);
 +  if (use_.RequestRemove(unit)) {
 +    DeleteUnit(std::string(unit));
++  } else {
++    Notify(std::string(unit));  // in use: tabs see it is no longer ready
 +  }
 +}
 +
@@ -380,7 +384,7 @@
 +  });
 +  if (failed_.contains(unit) || failed_.contains("common")) {
 +    state.state = State::kFailed;
-+  } else if (queued && current_) {
++  } else if (queued && current_ && std::ranges::contains(UnitsToFetch(unit), current_->unit)) {
 +    state.state = State::kDownloading;
 +  } else if (queued) {
 +    state.state = State::kWaitingForWifi;
@@ -437,19 +441,29 @@
 +  if (!scanned_ || current_ || retry_timer_.IsRunning() || attempts_.exhausted()) {
 +    return;
 +  }
-+  while (!queue_.empty() && Ready(queue_.front())) {
-+    SetCellularOk(queue_.front(), false);
-+    LOG(WARNING) << "tark captions: ready " << queue_.front();
-+    Notify(queue_.front());
-+    queue_.pop_front();
++  std::vector<std::string> done;
++  std::erase_if(queue_, [&](const std::string& unit) {
++    if (!Ready(unit)) {
++      return false;
++    }
++    done.push_back(unit);
++    return true;
++  });
++  for (const std::string& unit : done) {
++    SetCellularOk(unit, false);
++    LOG(WARNING) << "tark captions: ready " << unit;
++    Notify(unit);
 +  }
-+  if (queue_.empty()) {
++  if (current_) {
++    return;  // a Notify above may have started the next one
++  }
++  const std::optional<std::string> next = NextToFetch(queue_, [&](const std::string& unit) {
++    return ShouldStartNow(CurrentNetwork(), CellularOk(unit));
++  });
++  if (!next) {
 +    return;
 +  }
-+  const std::string unit = queue_.front();
-+  if (!ShouldStartNow(CurrentNetwork(), CellularOk(unit))) {
-+    return;
-+  }
++  const std::string unit = *next;
 +  const std::vector<std::string>& present = present_[unit];
 +  for (const CaptionFile* file : FilesOf(unit)) {
 +    if (std::ranges::find(present, file->name) == present.end()) {
@@ -681,7 +695,7 @@
 +#endif  // CHROME_BROWSER_TARK_CAPTIONS_ANDROID_CAPTION_DOWNLOADS_H_
 --- /dev/null
 +++ b/chrome/browser/tark_captions_android/model_files.cc
-@@ -0,0 +1,197 @@
+@@ -0,0 +1,211 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -842,6 +856,16 @@
 +  });
 +}
 +
++std::optional<std::string> NextToFetch(const std::deque<std::string>& queue,
++                                       base::FunctionRef<bool(const std::string&)> can_start) {
++  for (const std::string& unit : queue) {
++    if (can_start(unit)) {
++      return unit;
++    }
++  }
++  return std::nullopt;
++}
++
 +UnitUse::UnitUse() = default;
 +UnitUse::~UnitUse() = default;
 +
@@ -878,10 +902,14 @@
 +  return false;
 +}
 +
++bool UnitUse::Removing(std::string_view unit) const {
++  return pending_remove_.contains(unit);
++}
++
 +}  // namespace tark_captions
 --- /dev/null
 +++ b/chrome/browser/tark_captions_android/model_files.h
-@@ -0,0 +1,87 @@
+@@ -0,0 +1,97 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -890,13 +918,16 @@
 +#define CHROME_BROWSER_TARK_CAPTIONS_ANDROID_MODEL_FILES_H_
 +
 +#include <cstdint>
++#include <deque>
 +#include <map>
++#include <optional>
 +#include <set>
 +#include <string>
 +#include <string_view>
 +#include <vector>
 +
 +#include "base/containers/span.h"
++#include "base/functional/function_ref.h"
 +
 +namespace base {
 +class FilePath;
@@ -951,6 +982,11 @@
 +
 +// Which units are captioning. A unit deleted in Settings while it is in use
 +// is removed when it is released, never under a running engine.
++// The first unit in `queue` that `can_start` allows (the network, the
++// person's "Download now"), so one waiting for Wi-Fi blocks no other.
++std::optional<std::string> NextToFetch(const std::deque<std::string>& queue,
++                                       base::FunctionRef<bool(const std::string&)> can_start);
++
 +class UnitUse {
 + public:
 +  UnitUse();
@@ -960,6 +996,8 @@
 +  bool SetInUse(std::string_view unit, bool in_use);
 +  // True when `unit` can be removed now; otherwise it is removed on release.
 +  bool RequestRemove(std::string_view unit);
++  // Whether `unit` waits to be removed (no longer ready to the person).
++  bool Removing(std::string_view unit) const;
 +
 + private:
 +  std::map<std::string, int, std::less<>> in_use_;
@@ -971,13 +1009,15 @@
 +#endif  // CHROME_BROWSER_TARK_CAPTIONS_ANDROID_MODEL_FILES_H_
 --- /dev/null
 +++ b/chrome/browser/tark_captions_android/model_files_unittest.cc
-@@ -0,0 +1,84 @@
+@@ -0,0 +1,110 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
 +
 +#include "chrome/browser/tark_captions_android/model_files.h"
 +
++#include <deque>
++#include <optional>
 +#include <string>
 +#include <vector>
 +
@@ -1047,6 +1087,30 @@
 +  EXPECT_FALSE(use.SetInUse("hi", false));
 +}
 +
++// Deleted in Settings while captioning: the language stops counting as
++// ready at once (captions go off, Settings drops the row), and the files go
++// when the captions process lets them go.
++TEST(TarkCaptionFilesTest, PendingRemovalIsNotReady) {
++  UnitUse use;
++  use.SetInUse("hi", true);
++  EXPECT_FALSE(use.Removing("hi"));
++  EXPECT_FALSE(use.RequestRemove("hi"));
++  EXPECT_TRUE(use.Removing("hi"));
++  EXPECT_FALSE(use.Removing("ta"));
++  EXPECT_TRUE(use.SetInUse("hi", false));
++  EXPECT_FALSE(use.Removing("hi"));  // removed: a new download may start
++}
++
++// On mobile data: Hindi waits for Wi-Fi; English, with "Download now",
++// starts although it was queued after Hindi.
++TEST(TarkCaptionFilesTest, QueueSkipsAUnitWaitingForWifi) {
++  const std::deque<std::string> queue = {"hi", "en"};
++  auto allowed = [](const std::string& unit) { return unit == "en"; };
++  EXPECT_EQ(NextToFetch(queue, allowed), "en");
++  EXPECT_EQ(NextToFetch(queue, [](const std::string&) { return true; }), "hi");
++  EXPECT_EQ(NextToFetch(queue, [](const std::string&) { return false; }), std::nullopt);
++}
++
 +TEST(TarkCaptionFilesTest, UrlIsContentAddressed) {
 +  // gettarka.com serves a path without an extension as a folder's
 +  // index.html, so the files carry ".bin", as xlit's do.
@@ -1058,7 +1122,7 @@
 +}  // namespace tark_captions
 --- /dev/null
 +++ b/chrome/browser/tark_captions_android/tab_captions.cc
-@@ -0,0 +1,109 @@
+@@ -0,0 +1,139 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -1102,6 +1166,9 @@
 +}
 +
 +void TabCaptions::OnHidden(bool hidden, base::TimeTicks now) {
++  if (hidden && !hidden_) {
++    hidden_since_ = now;
++  }
 +  hidden_ = hidden;
 +  Recompute(now);
 +}
@@ -1122,14 +1189,36 @@
 +}
 +
 +void TabCaptions::OnUnitReady(bool ready, base::TimeTicks now) {
++  if (state_.unit_ready && !ready) {
++    // Deleted (Settings): captions go off; the next tap downloads it again.
++    state_.captions_on = false;
++    state_.cant_caption = false;
++    state_.bar_visible = !audible_.empty();
++  }
 +  state_.unit_ready = ready;
 +  Recompute(now);
 +}
 +
-+void TabCaptions::OnAudio(base::TimeTicks now) {
++bool TabCaptions::OnAudio(uint64_t source, base::TimeTicks now) {
++  auto last = source_last_.find(source);
++  const bool starting = last == source_last_.end() || now - last->second > kSourceQuiet;
++  const bool current_quiet =
++      !source_ || (*source_ != source && now - source_last_[*source_] > kSourceQuiet);
++  if (starting || current_quiet) {
++    source_ = source;
++  }
++  source_last_[source] = now;
 +  waiting_since_ = now;
 +  state_.cant_caption = false;
 +  Recompute(now);
++  return *source_ == source;
++}
++
++void TabCaptions::ForgetSource(uint64_t source) {
++  source_last_.erase(source);
++  if (source_ == source) {
++    source_.reset();
++  }
 +}
 +
 +void TabCaptions::OnTick(base::TimeTicks now) {
@@ -1143,24 +1232,29 @@
 +void TabCaptions::OnServiceGone() {
 +  state_.captions_on = false;
 +  state_.cant_caption = false;
-+  Recompute(waiting_since_);
++  Recompute(last_event_);
 +}
 +
 +bool TabCaptions::ShouldForwardAudio() const {
 +  return state_.captions_on && state_.unit_ready && !hidden_;
 +}
 +
-+bool TabCaptions::WantsEngine() const {
-+  return ShouldForwardAudio() && !state_.cant_caption;
-+}
-+
 +void TabCaptions::Recompute(base::TimeTicks now) {
++  last_event_ = now;
 +  const bool forwarding = ShouldForwardAudio();
 +  if (forwarding && !forwarding_) {
 +    waiting_since_ = now;  // hidden or off time is not "no audio"
 +  }
 +  forwarding_ = forwarding;
-+  const bool wanted = WantsEngine();
++  // The process outlives a short hide and "can't caption" (a rebuffer), so
++  // that neither reloads the ~500 MB model; it goes after a long hide or a
++  // few minutes without audio.
++  bool wanted = state_.captions_on && state_.unit_ready;
++  if (hidden_) {
++    wanted = wanted && now - hidden_since_ < kHiddenGrace;
++  } else {
++    wanted = wanted && now - waiting_since_ < kIdleUnload;
++  }
 +  if (wanted && !wanted_) {
 +    ++engine_starts_;
 +  }
@@ -1170,7 +1264,7 @@
 +}  // namespace tark_captions
 --- /dev/null
 +++ b/chrome/browser/tark_captions_android/tab_captions.h
-@@ -0,0 +1,78 @@
+@@ -0,0 +1,99 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -1178,6 +1272,10 @@
 +#ifndef CHROME_BROWSER_TARK_CAPTIONS_ANDROID_TAB_CAPTIONS_H_
 +#define CHROME_BROWSER_TARK_CAPTIONS_ANDROID_TAB_CAPTIONS_H_
 +
++#include <stdint.h>
++
++#include <map>
++#include <optional>
 +#include <set>
 +#include <string>
 +
@@ -1209,6 +1307,14 @@
 +  // How long captions wait for the tab's audio before saying they can't
 +  // caption this video.
 +  static constexpr base::TimeDelta kNoAudio = base::Seconds(10);
++  // A tab hidden this long (Home, the lock screen, the tab switcher) lets
++  // its captions process go; back sooner, captions go on without reloading.
++  static constexpr base::TimeDelta kHiddenGrace = base::Seconds(60);
++  // Captions on but no audio this long (a paused video, a page without
++  // media): the model is unloaded; audio coming back loads it again.
++  static constexpr base::TimeDelta kIdleUnload = base::Minutes(3);
++  // A source silent this long hands captions to another one.
++  static constexpr base::TimeDelta kSourceQuiet = base::Seconds(1);
 +
 +  TabCaptions();
 +  ~TabCaptions();
@@ -1218,7 +1324,12 @@
 +  void SetCaptionsOn(bool on, base::TimeTicks now);
 +  void ChooseLanguage(const std::string& language);
 +  void OnUnitReady(bool ready, base::TimeTicks now);
-+  void OnAudio(base::TimeTicks now);
++  // Audio from `source` (one player's connection). Captions follow one
++  // source at a time: the one that started most recently, or any once that
++  // one is quiet or gone. Returns whether this audio goes to the engine.
++  bool OnAudio(uint64_t source, base::TimeTicks now);
++  // `source`'s player went away.
++  void ForgetSource(uint64_t source);
 +  void OnTick(base::TimeTicks now);
 +  // The captions process died (Android reclaimed its memory).
 +  void OnServiceGone();
@@ -1229,7 +1340,7 @@
 +  // that audio coming back clears it.
 +  bool ShouldForwardAudio() const;
 +  // Whether the captions process should be running for this tab.
-+  bool WantsEngine() const;
++  bool WantsEngine() const { return wanted_; }
 +  // How many times WantsEngine() went from false to true (one process each).
 +  int engine_starts() const { return engine_starts_; }
 +
@@ -1240,6 +1351,10 @@
 +  State state_;
 +  std::set<int> audible_;
 +  bool hidden_ = false;
++  base::TimeTicks hidden_since_;
++  base::TimeTicks last_event_;
++  std::map<uint64_t, base::TimeTicks> source_last_;  // each source's last audio
++  std::optional<uint64_t> source_;                    // the one captioned
 +  bool forwarding_ = false;
 +  bool wanted_ = false;
 +  base::TimeTicks waiting_since_;  // the last audio, or when forwarding began
@@ -1251,7 +1366,7 @@
 +#endif  // CHROME_BROWSER_TARK_CAPTIONS_ANDROID_TAB_CAPTIONS_H_
 --- /dev/null
 +++ b/chrome/browser/tark_captions_android/tab_captions_unittest.cc
-@@ -0,0 +1,133 @@
+@@ -0,0 +1,217 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -1315,16 +1430,18 @@
 +  EXPECT_FALSE(tab_.state().cant_caption);
 +  tab_.OnTick(At(11.5));
 +  EXPECT_TRUE(tab_.state().cant_caption);
-+  EXPECT_FALSE(tab_.WantsEngine());
++  // The model stays loaded: a long rebuffer is no reason to reload it.
++  EXPECT_TRUE(tab_.WantsEngine());
 +  // Audio after all (a seek, an ad ending) clears it.
-+  tab_.OnAudio(At(12));
++  tab_.OnAudio(1, At(12));
 +  EXPECT_FALSE(tab_.state().cant_caption);
++  EXPECT_EQ(tab_.engine_starts(), 1);
 +}
 +
 +TEST_F(TabCaptionsTest, AudioKeepsCantCaptionAway) {
 +  Captioning();
 +  for (double t = 1.5; t < 30; t += 1) {
-+    tab_.OnAudio(At(t));
++    tab_.OnAudio(1, At(t));
 +    tab_.OnTick(At(t + 0.5));
 +  }
 +  EXPECT_FALSE(tab_.state().cant_caption);
@@ -1339,23 +1456,105 @@
 +  EXPECT_EQ(tab_.engine_starts(), 1);
 +}
 +
++// Several players can send audio (an ad iframe and the video); captions
++// follow one, the most recently started, never a mix of both.
++TEST_F(TabCaptionsTest, OneSourceAtATime) {
++  Captioning();
++  EXPECT_TRUE(tab_.OnAudio(/*source=*/7, At(2)));
++  EXPECT_TRUE(tab_.OnAudio(7, At(2.1)));
++  EXPECT_TRUE(tab_.OnAudio(9, At(2.2)));   // a second player starts: it wins
++  EXPECT_FALSE(tab_.OnAudio(7, At(2.3)));  // the first keeps going: dropped
++  EXPECT_TRUE(tab_.OnAudio(9, At(2.4)));
++  EXPECT_FALSE(tab_.OnAudio(7, At(2.5)));
++}
++
++TEST_F(TabCaptionsTest, QuietSourceHandsOver) {
++  Captioning();
++  const double quiet = TabCaptions::kSourceQuiet.InSecondsF();
++  EXPECT_TRUE(tab_.OnAudio(7, At(2)));
++  EXPECT_TRUE(tab_.OnAudio(9, At(2.1)));
++  EXPECT_FALSE(tab_.OnAudio(7, At(2.2)));
++  // 9 stops (the ad ended); 7 still plays.
++  EXPECT_FALSE(tab_.OnAudio(7, At(2.1 + quiet / 2)));
++  EXPECT_TRUE(tab_.OnAudio(7, At(2.1 + quiet + 0.1)));
++}
++
++TEST_F(TabCaptionsTest, ForgottenSourceHandsOver) {
++  Captioning();
++  EXPECT_TRUE(tab_.OnAudio(7, At(2)));
++  EXPECT_TRUE(tab_.OnAudio(9, At(2.1)));
++  tab_.ForgetSource(9);  // its player went away
++  EXPECT_TRUE(tab_.OnAudio(7, At(2.2)));
++}
++
 +TEST_F(TabCaptionsTest, HiddenTabForwardsNoAudio) {
 +  Captioning();
 +  tab_.OnHidden(true, At(3));
 +  EXPECT_FALSE(tab_.ShouldForwardAudio());
-+  EXPECT_FALSE(tab_.WantsEngine());
 +  tab_.OnTick(At(30));  // hidden time is not "no audio"
 +  tab_.OnHidden(false, At(31));
 +  EXPECT_TRUE(tab_.ShouldForwardAudio());
 +  EXPECT_FALSE(tab_.state().cant_caption);
 +}
 +
-+TEST_F(TabCaptionsTest, UnitRemovedStopsCaptions) {
++// Home, the lock screen, the tab switcher, Settings: back within a minute,
++// captions go on without reloading the model.
++TEST_F(TabCaptionsTest, BriefHideKeepsTheEngine) {
 +  Captioning();
-+  tab_.OnUnitReady(false, At(4));  // deleted in Settings
++  tab_.OnAudio(1, At(2));
++  tab_.OnHidden(true, At(3));
++  tab_.OnTick(At(3 + TabCaptions::kHiddenGrace.InSecondsF() - 1));
++  EXPECT_TRUE(tab_.WantsEngine());
++  tab_.OnHidden(false, At(3 + TabCaptions::kHiddenGrace.InSecondsF() - 0.5));
++  EXPECT_TRUE(tab_.WantsEngine());
++  EXPECT_EQ(tab_.engine_starts(), 1);
++}
++
++TEST_F(TabCaptionsTest, LongHideStopsTheEngine) {
++  Captioning();
++  tab_.OnHidden(true, At(3));
++  tab_.OnTick(At(3 + TabCaptions::kHiddenGrace.InSecondsF() + 1));
++  EXPECT_FALSE(tab_.WantsEngine());
++  tab_.OnHidden(false, At(200));  // back: a new process
++  EXPECT_TRUE(tab_.WantsEngine());
++  EXPECT_EQ(tab_.engine_starts(), 2);
++}
++
++// A paused video, or a page without media, with captions left on: the
++// ~500 MB model is unloaded after a few minutes without audio.
++TEST_F(TabCaptionsTest, IdleUnloadsTheEngine) {
++  Captioning();
++  tab_.OnAudio(1, At(2));
++  const double idle = TabCaptions::kIdleUnload.InSecondsF();
++  tab_.OnTick(At(2 + idle - 1));
++  EXPECT_TRUE(tab_.WantsEngine());
++  tab_.OnTick(At(2 + idle + 1));
++  EXPECT_FALSE(tab_.WantsEngine());
++  EXPECT_TRUE(tab_.ShouldForwardAudio());  // so that audio can bring it back
++  EXPECT_TRUE(tab_.state().captions_on);
++  tab_.OnAudio(1, At(2 + idle + 30));  // play again
++  EXPECT_TRUE(tab_.WantsEngine());
++  EXPECT_EQ(tab_.engine_starts(), 2);
++}
++
++// The language is deleted in Settings: captions go off, the chip stays, and
++// the next tap offers the download again (no card stuck without a button).
++TEST_F(TabCaptionsTest, UnitRemovedTurnsCaptionsOff) {
++  Captioning();
++  tab_.OnUnitReady(false, At(4));
++  EXPECT_FALSE(tab_.state().captions_on);
++  EXPECT_EQ(tab_.state().language, "hi");
 +  EXPECT_FALSE(tab_.ShouldForwardAudio());
 +  EXPECT_FALSE(tab_.WantsEngine());
-+  EXPECT_TRUE(tab_.state().captions_on);  // the bar offers "Getting Hindi ready"
++}
++
++// Choosing a language not yet on the phone is not a removal.
++TEST_F(TabCaptionsTest, NewLanguageIsNotARemoval) {
++  Captioning();
++  tab_.ChooseLanguage("ta");
++  tab_.OnUnitReady(false, At(5));
++  EXPECT_TRUE(tab_.state().captions_on);  // "Getting Tamil ready"
++  EXPECT_FALSE(tab_.WantsEngine());
 +}
 +
 +TEST_F(TabCaptionsTest, ServiceDisconnectTurnsCaptionsOff) {
