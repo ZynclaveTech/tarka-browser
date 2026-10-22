@@ -274,6 +274,24 @@ run python3 "$_src_dir/tools/gn/bootstrap/bootstrap.py" -o "$_src_dir/out/Defaul
 # git checkout's .gn names a bundled Python the Android tree does not have).
 run sed -i "s|^script_executable = .*|script_executable = \"python3\"|" "$_src_dir/.gn"
 run "$_src_dir/out/Default/gn" gen "$_src_dir/out/Default" --root="$_src_dir" --fail-on-unused-args
+# Live captions' test binaries, before the APK (a build whose APK does not
+# compile still reports them): each runs even when an earlier one failed;
+# the build fails after the APK if any did.
+test_failures=0
+run_test() {
+  echo "tark: run $*"
+  if [[ "$dryrun" != 1 ]] && ! "$@"; then
+    echo "tark: FAILED $*"
+    test_failures=$((test_failures + 1))
+  fi
+}
+run ninja -C "$_src_dir/out/Default" components/tark_captions:host_unittests
+run_test env TARK_CAPTIONS_TESTDATA="$_root_dir/resources/captions/testdata" \
+  "$_src_dir/out/Default/clang_x64/tark_captions_engine_unittests"
+run ninja -C "$_src_dir/out/Default" chrome/browser/tark_captions_android:host_unittests
+run_test "$_src_dir/out/Default/clang_x64/tark_captions_android_unittests"
+run ninja -C "$_src_dir/out/Default" chrome/services/tark_captions:host_unittests
+run_test "$_src_dir/out/Default/clang_x64/tark_captions_session_unittests"
 # -k 0: one run reports every failing step, not only the first.
 run ninja -k 0 -C "$_src_dir/out/Default" chrome_public_apk
 # A5: the app bundle Play takes, from the same build (debug-signed here; the
@@ -291,23 +309,5 @@ run ninja -C "$_src_dir/out/Default" chrome/browser/tark_update:host_unittests
 run "$_src_dir/out/Default/clang_x64/tark_update_unittests"
 # Live captions: the engine's own tests (front end, speech model, segmenter,
 # VAD, ONNX Runtime loader), built for this machine.
-# Live captions' test binaries: each runs even when an earlier one failed
-# (a build that shows tests failing on purpose shows all of them); the build
-# fails after the last.
-test_failures=0
-run_test() {
-  echo "tark: run $*"
-  if [[ "$dryrun" != 1 ]] && ! "$@"; then
-    echo "tark: FAILED $*"
-    test_failures=$((test_failures + 1))
-  fi
-}
-run ninja -C "$_src_dir/out/Default" components/tark_captions:host_unittests
-run_test env TARK_CAPTIONS_TESTDATA="$_root_dir/resources/captions/testdata" \
-  "$_src_dir/out/Default/clang_x64/tark_captions_engine_unittests"
-run ninja -C "$_src_dir/out/Default" chrome/browser/tark_captions_android:host_unittests
-run_test "$_src_dir/out/Default/clang_x64/tark_captions_android_unittests"
-run ninja -C "$_src_dir/out/Default" chrome/services/tark_captions:host_unittests
-run_test "$_src_dir/out/Default/clang_x64/tark_captions_session_unittests"
 (( test_failures == 0 )) || { log "$test_failures test binaries failed"; exit 1; }
 log "built $_src_dir/out/Default/apks/ChromePublic.apk"
