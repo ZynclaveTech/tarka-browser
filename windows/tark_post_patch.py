@@ -78,6 +78,9 @@ def main():
         '--backup-path', WORK / 'build' / 'namesubs.tar')
     # The mark, wherever Chromium ships a logo file the manifest names.
     run(py, REPO / 'utils' / 'install_branding.py', REPO / 'resources' / 'branding' / 'mark', src)
+    # Certificate trust data: CT log list, Chrome Root Store, CRLSet (resources/trust).
+    run(py, REPO / 'utils' / 'trust_data.py', 'install', src,
+        '--domain-regex', CORE / 'domain_regex.list')
     # Inter for WebUI pages, served as chrome://resources/fonts/.
     fonts = src / 'ui' / 'webui' / 'resources' / 'fonts'
     fonts.mkdir(parents=True, exist_ok=True)
