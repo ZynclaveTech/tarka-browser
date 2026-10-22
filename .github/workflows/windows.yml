@@ -7,12 +7,23 @@ name: Windows build
 
 on:
   workflow_dispatch:
+    inputs:
+      resume_run:
+        description: Resume this failed run (its id); empty builds from the start
+        type: string
+        default: ''
+      resume_stage:
+        description: The stage to resume at, with the tree the stage before it handed on
+        type: number
+        default: 1
   push:
     branches:
       - feat/w2-windows-parity
 
 permissions:
   contents: read
+  # Downloading the tree from the run being resumed.
+  actions: read
 
 concurrency:
   group: windows-${{ github.ref }}
@@ -57,6 +68,7 @@ jobs:
   build-1:
     name: Build, stage 1
     needs: onnxruntime
+    if: ${{ !(inputs.resume_run != '' && inputs.resume_stage > 1) }}
     runs-on: windows-2022
     timeout-minutes: 355
     outputs:
@@ -146,8 +158,11 @@ jobs:
 
   build-2:
     name: Build, stage 2
-    needs: build-1
-    if: needs.build-1.outputs.finished != 'true'
+    needs: [onnxruntime, build-1]
+    if: >-
+      ${{ !cancelled() && needs.onnxruntime.result == 'success' && (
+      (needs.build-1.result == 'success' && needs.build-1.outputs.finished == 'false') ||
+      (inputs.resume_run != '' && inputs.resume_stage == 2)) }}
     runs-on: windows-2022
     timeout-minutes: 355
     outputs:
@@ -183,10 +198,19 @@ jobs:
         shell: pwsh
         run: python windows\prepare_workdir.py $env:GITHUB_WORKSPACE C:\tw
       - name: The tree from the last stage
+        if: ${{ !(inputs.resume_run != '' && inputs.resume_stage == 2) }}
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
         with:
           name: build-tree
           path: C:\tw\build
+      - name: The tree from the run being resumed
+        if: ${{ inputs.resume_run != '' && inputs.resume_stage == 2 }}
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: build-tree
+          path: C:\tw\build
+          run-id: ${{ inputs.resume_run }}
+          github-token: ${{ github.token }}
       - name: Unpack the tree
         shell: pwsh
         run: |
@@ -194,6 +218,13 @@ jobs:
           if ($LASTEXITCODE -ge 2) { exit $LASTEXITCODE }
           Remove-Item C:\tw\build\tree.zip.*
           exit 0
+      - name: The fix for the run being resumed
+        if: ${{ inputs.resume_run != '' && inputs.resume_stage == 2 && hashFiles('windows/ci/resume.patch') != '' }}
+        shell: pwsh
+        working-directory: C:\tw\build\src
+        run: |
+          git apply -p1 --verbose "$env:GITHUB_WORKSPACE\windows\ci\resume.patch"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Build
         id: build
         shell: pwsh
@@ -249,8 +280,11 @@ jobs:
 
   build-3:
     name: Build, stage 3
-    needs: build-2
-    if: needs.build-2.outputs.finished != 'true'
+    needs: [onnxruntime, build-2]
+    if: >-
+      ${{ !cancelled() && needs.onnxruntime.result == 'success' && (
+      (needs.build-2.result == 'success' && needs.build-2.outputs.finished == 'false') ||
+      (inputs.resume_run != '' && inputs.resume_stage == 3)) }}
     runs-on: windows-2022
     timeout-minutes: 355
     outputs:
@@ -286,10 +320,19 @@ jobs:
         shell: pwsh
         run: python windows\prepare_workdir.py $env:GITHUB_WORKSPACE C:\tw
       - name: The tree from the last stage
+        if: ${{ !(inputs.resume_run != '' && inputs.resume_stage == 3) }}
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
         with:
           name: build-tree
           path: C:\tw\build
+      - name: The tree from the run being resumed
+        if: ${{ inputs.resume_run != '' && inputs.resume_stage == 3 }}
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: build-tree
+          path: C:\tw\build
+          run-id: ${{ inputs.resume_run }}
+          github-token: ${{ github.token }}
       - name: Unpack the tree
         shell: pwsh
         run: |
@@ -297,6 +340,13 @@ jobs:
           if ($LASTEXITCODE -ge 2) { exit $LASTEXITCODE }
           Remove-Item C:\tw\build\tree.zip.*
           exit 0
+      - name: The fix for the run being resumed
+        if: ${{ inputs.resume_run != '' && inputs.resume_stage == 3 && hashFiles('windows/ci/resume.patch') != '' }}
+        shell: pwsh
+        working-directory: C:\tw\build\src
+        run: |
+          git apply -p1 --verbose "$env:GITHUB_WORKSPACE\windows\ci\resume.patch"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Build
         id: build
         shell: pwsh
@@ -352,8 +402,11 @@ jobs:
 
   build-4:
     name: Build, stage 4
-    needs: build-3
-    if: needs.build-3.outputs.finished != 'true'
+    needs: [onnxruntime, build-3]
+    if: >-
+      ${{ !cancelled() && needs.onnxruntime.result == 'success' && (
+      (needs.build-3.result == 'success' && needs.build-3.outputs.finished == 'false') ||
+      (inputs.resume_run != '' && inputs.resume_stage == 4)) }}
     runs-on: windows-2022
     timeout-minutes: 355
     outputs:
@@ -389,10 +442,19 @@ jobs:
         shell: pwsh
         run: python windows\prepare_workdir.py $env:GITHUB_WORKSPACE C:\tw
       - name: The tree from the last stage
+        if: ${{ !(inputs.resume_run != '' && inputs.resume_stage == 4) }}
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
         with:
           name: build-tree
           path: C:\tw\build
+      - name: The tree from the run being resumed
+        if: ${{ inputs.resume_run != '' && inputs.resume_stage == 4 }}
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: build-tree
+          path: C:\tw\build
+          run-id: ${{ inputs.resume_run }}
+          github-token: ${{ github.token }}
       - name: Unpack the tree
         shell: pwsh
         run: |
@@ -400,6 +462,13 @@ jobs:
           if ($LASTEXITCODE -ge 2) { exit $LASTEXITCODE }
           Remove-Item C:\tw\build\tree.zip.*
           exit 0
+      - name: The fix for the run being resumed
+        if: ${{ inputs.resume_run != '' && inputs.resume_stage == 4 && hashFiles('windows/ci/resume.patch') != '' }}
+        shell: pwsh
+        working-directory: C:\tw\build\src
+        run: |
+          git apply -p1 --verbose "$env:GITHUB_WORKSPACE\windows\ci\resume.patch"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Build
         id: build
         shell: pwsh
@@ -455,8 +524,11 @@ jobs:
 
   build-5:
     name: Build, stage 5
-    needs: build-4
-    if: needs.build-4.outputs.finished != 'true'
+    needs: [onnxruntime, build-4]
+    if: >-
+      ${{ !cancelled() && needs.onnxruntime.result == 'success' && (
+      (needs.build-4.result == 'success' && needs.build-4.outputs.finished == 'false') ||
+      (inputs.resume_run != '' && inputs.resume_stage == 5)) }}
     runs-on: windows-2022
     timeout-minutes: 355
     outputs:
@@ -492,10 +564,19 @@ jobs:
         shell: pwsh
         run: python windows\prepare_workdir.py $env:GITHUB_WORKSPACE C:\tw
       - name: The tree from the last stage
+        if: ${{ !(inputs.resume_run != '' && inputs.resume_stage == 5) }}
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
         with:
           name: build-tree
           path: C:\tw\build
+      - name: The tree from the run being resumed
+        if: ${{ inputs.resume_run != '' && inputs.resume_stage == 5 }}
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: build-tree
+          path: C:\tw\build
+          run-id: ${{ inputs.resume_run }}
+          github-token: ${{ github.token }}
       - name: Unpack the tree
         shell: pwsh
         run: |
@@ -503,6 +584,13 @@ jobs:
           if ($LASTEXITCODE -ge 2) { exit $LASTEXITCODE }
           Remove-Item C:\tw\build\tree.zip.*
           exit 0
+      - name: The fix for the run being resumed
+        if: ${{ inputs.resume_run != '' && inputs.resume_stage == 5 && hashFiles('windows/ci/resume.patch') != '' }}
+        shell: pwsh
+        working-directory: C:\tw\build\src
+        run: |
+          git apply -p1 --verbose "$env:GITHUB_WORKSPACE\windows\ci\resume.patch"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Build
         id: build
         shell: pwsh
@@ -558,8 +646,11 @@ jobs:
 
   build-6:
     name: Build, stage 6
-    needs: build-5
-    if: needs.build-5.outputs.finished != 'true'
+    needs: [onnxruntime, build-5]
+    if: >-
+      ${{ !cancelled() && needs.onnxruntime.result == 'success' && (
+      (needs.build-5.result == 'success' && needs.build-5.outputs.finished == 'false') ||
+      (inputs.resume_run != '' && inputs.resume_stage == 6)) }}
     runs-on: windows-2022
     timeout-minutes: 355
     outputs:
@@ -595,10 +686,19 @@ jobs:
         shell: pwsh
         run: python windows\prepare_workdir.py $env:GITHUB_WORKSPACE C:\tw
       - name: The tree from the last stage
+        if: ${{ !(inputs.resume_run != '' && inputs.resume_stage == 6) }}
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
         with:
           name: build-tree
           path: C:\tw\build
+      - name: The tree from the run being resumed
+        if: ${{ inputs.resume_run != '' && inputs.resume_stage == 6 }}
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: build-tree
+          path: C:\tw\build
+          run-id: ${{ inputs.resume_run }}
+          github-token: ${{ github.token }}
       - name: Unpack the tree
         shell: pwsh
         run: |
@@ -606,6 +706,13 @@ jobs:
           if ($LASTEXITCODE -ge 2) { exit $LASTEXITCODE }
           Remove-Item C:\tw\build\tree.zip.*
           exit 0
+      - name: The fix for the run being resumed
+        if: ${{ inputs.resume_run != '' && inputs.resume_stage == 6 && hashFiles('windows/ci/resume.patch') != '' }}
+        shell: pwsh
+        working-directory: C:\tw\build\src
+        run: |
+          git apply -p1 --verbose "$env:GITHUB_WORKSPACE\windows\ci\resume.patch"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Build
         id: build
         shell: pwsh
@@ -661,8 +768,11 @@ jobs:
 
   build-7:
     name: Build, stage 7
-    needs: build-6
-    if: needs.build-6.outputs.finished != 'true'
+    needs: [onnxruntime, build-6]
+    if: >-
+      ${{ !cancelled() && needs.onnxruntime.result == 'success' && (
+      (needs.build-6.result == 'success' && needs.build-6.outputs.finished == 'false') ||
+      (inputs.resume_run != '' && inputs.resume_stage == 7)) }}
     runs-on: windows-2022
     timeout-minutes: 355
     outputs:
@@ -698,10 +808,19 @@ jobs:
         shell: pwsh
         run: python windows\prepare_workdir.py $env:GITHUB_WORKSPACE C:\tw
       - name: The tree from the last stage
+        if: ${{ !(inputs.resume_run != '' && inputs.resume_stage == 7) }}
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
         with:
           name: build-tree
           path: C:\tw\build
+      - name: The tree from the run being resumed
+        if: ${{ inputs.resume_run != '' && inputs.resume_stage == 7 }}
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: build-tree
+          path: C:\tw\build
+          run-id: ${{ inputs.resume_run }}
+          github-token: ${{ github.token }}
       - name: Unpack the tree
         shell: pwsh
         run: |
@@ -709,6 +828,13 @@ jobs:
           if ($LASTEXITCODE -ge 2) { exit $LASTEXITCODE }
           Remove-Item C:\tw\build\tree.zip.*
           exit 0
+      - name: The fix for the run being resumed
+        if: ${{ inputs.resume_run != '' && inputs.resume_stage == 7 && hashFiles('windows/ci/resume.patch') != '' }}
+        shell: pwsh
+        working-directory: C:\tw\build\src
+        run: |
+          git apply -p1 --verbose "$env:GITHUB_WORKSPACE\windows\ci\resume.patch"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Build
         id: build
         shell: pwsh
@@ -764,8 +890,11 @@ jobs:
 
   build-8:
     name: Build, stage 8
-    needs: build-7
-    if: needs.build-7.outputs.finished != 'true'
+    needs: [onnxruntime, build-7]
+    if: >-
+      ${{ !cancelled() && needs.onnxruntime.result == 'success' && (
+      (needs.build-7.result == 'success' && needs.build-7.outputs.finished == 'false') ||
+      (inputs.resume_run != '' && inputs.resume_stage == 8)) }}
     runs-on: windows-2022
     timeout-minutes: 355
     outputs:
@@ -801,10 +930,19 @@ jobs:
         shell: pwsh
         run: python windows\prepare_workdir.py $env:GITHUB_WORKSPACE C:\tw
       - name: The tree from the last stage
+        if: ${{ !(inputs.resume_run != '' && inputs.resume_stage == 8) }}
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
         with:
           name: build-tree
           path: C:\tw\build
+      - name: The tree from the run being resumed
+        if: ${{ inputs.resume_run != '' && inputs.resume_stage == 8 }}
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: build-tree
+          path: C:\tw\build
+          run-id: ${{ inputs.resume_run }}
+          github-token: ${{ github.token }}
       - name: Unpack the tree
         shell: pwsh
         run: |
@@ -812,6 +950,13 @@ jobs:
           if ($LASTEXITCODE -ge 2) { exit $LASTEXITCODE }
           Remove-Item C:\tw\build\tree.zip.*
           exit 0
+      - name: The fix for the run being resumed
+        if: ${{ inputs.resume_run != '' && inputs.resume_stage == 8 && hashFiles('windows/ci/resume.patch') != '' }}
+        shell: pwsh
+        working-directory: C:\tw\build\src
+        run: |
+          git apply -p1 --verbose "$env:GITHUB_WORKSPACE\windows\ci\resume.patch"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Build
         id: build
         shell: pwsh
@@ -867,8 +1012,11 @@ jobs:
 
   build-9:
     name: Build, stage 9
-    needs: build-8
-    if: needs.build-8.outputs.finished != 'true'
+    needs: [onnxruntime, build-8]
+    if: >-
+      ${{ !cancelled() && needs.onnxruntime.result == 'success' && (
+      (needs.build-8.result == 'success' && needs.build-8.outputs.finished == 'false') ||
+      (inputs.resume_run != '' && inputs.resume_stage == 9)) }}
     runs-on: windows-2022
     timeout-minutes: 355
     outputs:
@@ -904,10 +1052,19 @@ jobs:
         shell: pwsh
         run: python windows\prepare_workdir.py $env:GITHUB_WORKSPACE C:\tw
       - name: The tree from the last stage
+        if: ${{ !(inputs.resume_run != '' && inputs.resume_stage == 9) }}
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
         with:
           name: build-tree
           path: C:\tw\build
+      - name: The tree from the run being resumed
+        if: ${{ inputs.resume_run != '' && inputs.resume_stage == 9 }}
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: build-tree
+          path: C:\tw\build
+          run-id: ${{ inputs.resume_run }}
+          github-token: ${{ github.token }}
       - name: Unpack the tree
         shell: pwsh
         run: |
@@ -915,6 +1072,13 @@ jobs:
           if ($LASTEXITCODE -ge 2) { exit $LASTEXITCODE }
           Remove-Item C:\tw\build\tree.zip.*
           exit 0
+      - name: The fix for the run being resumed
+        if: ${{ inputs.resume_run != '' && inputs.resume_stage == 9 && hashFiles('windows/ci/resume.patch') != '' }}
+        shell: pwsh
+        working-directory: C:\tw\build\src
+        run: |
+          git apply -p1 --verbose "$env:GITHUB_WORKSPACE\windows\ci\resume.patch"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Build
         id: build
         shell: pwsh
@@ -970,8 +1134,11 @@ jobs:
 
   build-10:
     name: Build, stage 10
-    needs: build-9
-    if: needs.build-9.outputs.finished != 'true'
+    needs: [onnxruntime, build-9]
+    if: >-
+      ${{ !cancelled() && needs.onnxruntime.result == 'success' && (
+      (needs.build-9.result == 'success' && needs.build-9.outputs.finished == 'false') ||
+      (inputs.resume_run != '' && inputs.resume_stage == 10)) }}
     runs-on: windows-2022
     timeout-minutes: 355
     outputs:
@@ -1007,10 +1174,19 @@ jobs:
         shell: pwsh
         run: python windows\prepare_workdir.py $env:GITHUB_WORKSPACE C:\tw
       - name: The tree from the last stage
+        if: ${{ !(inputs.resume_run != '' && inputs.resume_stage == 10) }}
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
         with:
           name: build-tree
           path: C:\tw\build
+      - name: The tree from the run being resumed
+        if: ${{ inputs.resume_run != '' && inputs.resume_stage == 10 }}
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: build-tree
+          path: C:\tw\build
+          run-id: ${{ inputs.resume_run }}
+          github-token: ${{ github.token }}
       - name: Unpack the tree
         shell: pwsh
         run: |
@@ -1018,6 +1194,13 @@ jobs:
           if ($LASTEXITCODE -ge 2) { exit $LASTEXITCODE }
           Remove-Item C:\tw\build\tree.zip.*
           exit 0
+      - name: The fix for the run being resumed
+        if: ${{ inputs.resume_run != '' && inputs.resume_stage == 10 && hashFiles('windows/ci/resume.patch') != '' }}
+        shell: pwsh
+        working-directory: C:\tw\build\src
+        run: |
+          git apply -p1 --verbose "$env:GITHUB_WORKSPACE\windows\ci\resume.patch"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Build
         id: build
         shell: pwsh
@@ -1073,8 +1256,11 @@ jobs:
 
   build-11:
     name: Build, stage 11
-    needs: build-10
-    if: needs.build-10.outputs.finished != 'true'
+    needs: [onnxruntime, build-10]
+    if: >-
+      ${{ !cancelled() && needs.onnxruntime.result == 'success' && (
+      (needs.build-10.result == 'success' && needs.build-10.outputs.finished == 'false') ||
+      (inputs.resume_run != '' && inputs.resume_stage == 11)) }}
     runs-on: windows-2022
     timeout-minutes: 355
     outputs:
@@ -1110,10 +1296,19 @@ jobs:
         shell: pwsh
         run: python windows\prepare_workdir.py $env:GITHUB_WORKSPACE C:\tw
       - name: The tree from the last stage
+        if: ${{ !(inputs.resume_run != '' && inputs.resume_stage == 11) }}
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
         with:
           name: build-tree
           path: C:\tw\build
+      - name: The tree from the run being resumed
+        if: ${{ inputs.resume_run != '' && inputs.resume_stage == 11 }}
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: build-tree
+          path: C:\tw\build
+          run-id: ${{ inputs.resume_run }}
+          github-token: ${{ github.token }}
       - name: Unpack the tree
         shell: pwsh
         run: |
@@ -1121,6 +1316,13 @@ jobs:
           if ($LASTEXITCODE -ge 2) { exit $LASTEXITCODE }
           Remove-Item C:\tw\build\tree.zip.*
           exit 0
+      - name: The fix for the run being resumed
+        if: ${{ inputs.resume_run != '' && inputs.resume_stage == 11 && hashFiles('windows/ci/resume.patch') != '' }}
+        shell: pwsh
+        working-directory: C:\tw\build\src
+        run: |
+          git apply -p1 --verbose "$env:GITHUB_WORKSPACE\windows\ci\resume.patch"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Build
         id: build
         shell: pwsh
@@ -1176,8 +1378,11 @@ jobs:
 
   build-12:
     name: Build, stage 12
-    needs: build-11
-    if: needs.build-11.outputs.finished != 'true'
+    needs: [onnxruntime, build-11]
+    if: >-
+      ${{ !cancelled() && needs.onnxruntime.result == 'success' && (
+      (needs.build-11.result == 'success' && needs.build-11.outputs.finished == 'false') ||
+      (inputs.resume_run != '' && inputs.resume_stage == 12)) }}
     runs-on: windows-2022
     timeout-minutes: 355
     outputs:
@@ -1213,10 +1418,19 @@ jobs:
         shell: pwsh
         run: python windows\prepare_workdir.py $env:GITHUB_WORKSPACE C:\tw
       - name: The tree from the last stage
+        if: ${{ !(inputs.resume_run != '' && inputs.resume_stage == 12) }}
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
         with:
           name: build-tree
           path: C:\tw\build
+      - name: The tree from the run being resumed
+        if: ${{ inputs.resume_run != '' && inputs.resume_stage == 12 }}
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: build-tree
+          path: C:\tw\build
+          run-id: ${{ inputs.resume_run }}
+          github-token: ${{ github.token }}
       - name: Unpack the tree
         shell: pwsh
         run: |
@@ -1224,6 +1438,13 @@ jobs:
           if ($LASTEXITCODE -ge 2) { exit $LASTEXITCODE }
           Remove-Item C:\tw\build\tree.zip.*
           exit 0
+      - name: The fix for the run being resumed
+        if: ${{ inputs.resume_run != '' && inputs.resume_stage == 12 && hashFiles('windows/ci/resume.patch') != '' }}
+        shell: pwsh
+        working-directory: C:\tw\build\src
+        run: |
+          git apply -p1 --verbose "$env:GITHUB_WORKSPACE\windows\ci\resume.patch"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Build
         id: build
         shell: pwsh
@@ -1279,8 +1500,11 @@ jobs:
 
   build-13:
     name: Build, stage 13
-    needs: build-12
-    if: needs.build-12.outputs.finished != 'true'
+    needs: [onnxruntime, build-12]
+    if: >-
+      ${{ !cancelled() && needs.onnxruntime.result == 'success' && (
+      (needs.build-12.result == 'success' && needs.build-12.outputs.finished == 'false') ||
+      (inputs.resume_run != '' && inputs.resume_stage == 13)) }}
     runs-on: windows-2022
     timeout-minutes: 355
     outputs:
@@ -1316,10 +1540,19 @@ jobs:
         shell: pwsh
         run: python windows\prepare_workdir.py $env:GITHUB_WORKSPACE C:\tw
       - name: The tree from the last stage
+        if: ${{ !(inputs.resume_run != '' && inputs.resume_stage == 13) }}
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
         with:
           name: build-tree
           path: C:\tw\build
+      - name: The tree from the run being resumed
+        if: ${{ inputs.resume_run != '' && inputs.resume_stage == 13 }}
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: build-tree
+          path: C:\tw\build
+          run-id: ${{ inputs.resume_run }}
+          github-token: ${{ github.token }}
       - name: Unpack the tree
         shell: pwsh
         run: |
@@ -1327,6 +1560,13 @@ jobs:
           if ($LASTEXITCODE -ge 2) { exit $LASTEXITCODE }
           Remove-Item C:\tw\build\tree.zip.*
           exit 0
+      - name: The fix for the run being resumed
+        if: ${{ inputs.resume_run != '' && inputs.resume_stage == 13 && hashFiles('windows/ci/resume.patch') != '' }}
+        shell: pwsh
+        working-directory: C:\tw\build\src
+        run: |
+          git apply -p1 --verbose "$env:GITHUB_WORKSPACE\windows\ci\resume.patch"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Build
         id: build
         shell: pwsh
@@ -1382,8 +1622,11 @@ jobs:
 
   build-14:
     name: Build, stage 14
-    needs: build-13
-    if: needs.build-13.outputs.finished != 'true'
+    needs: [onnxruntime, build-13]
+    if: >-
+      ${{ !cancelled() && needs.onnxruntime.result == 'success' && (
+      (needs.build-13.result == 'success' && needs.build-13.outputs.finished == 'false') ||
+      (inputs.resume_run != '' && inputs.resume_stage == 14)) }}
     runs-on: windows-2022
     timeout-minutes: 355
     outputs:
@@ -1419,10 +1662,19 @@ jobs:
         shell: pwsh
         run: python windows\prepare_workdir.py $env:GITHUB_WORKSPACE C:\tw
       - name: The tree from the last stage
+        if: ${{ !(inputs.resume_run != '' && inputs.resume_stage == 14) }}
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
         with:
           name: build-tree
           path: C:\tw\build
+      - name: The tree from the run being resumed
+        if: ${{ inputs.resume_run != '' && inputs.resume_stage == 14 }}
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: build-tree
+          path: C:\tw\build
+          run-id: ${{ inputs.resume_run }}
+          github-token: ${{ github.token }}
       - name: Unpack the tree
         shell: pwsh
         run: |
@@ -1430,6 +1682,13 @@ jobs:
           if ($LASTEXITCODE -ge 2) { exit $LASTEXITCODE }
           Remove-Item C:\tw\build\tree.zip.*
           exit 0
+      - name: The fix for the run being resumed
+        if: ${{ inputs.resume_run != '' && inputs.resume_stage == 14 && hashFiles('windows/ci/resume.patch') != '' }}
+        shell: pwsh
+        working-directory: C:\tw\build\src
+        run: |
+          git apply -p1 --verbose "$env:GITHUB_WORKSPACE\windows\ci\resume.patch"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Build
         id: build
         shell: pwsh
@@ -1485,8 +1744,11 @@ jobs:
 
   build-15:
     name: Build, stage 15
-    needs: build-14
-    if: needs.build-14.outputs.finished != 'true'
+    needs: [onnxruntime, build-14]
+    if: >-
+      ${{ !cancelled() && needs.onnxruntime.result == 'success' && (
+      (needs.build-14.result == 'success' && needs.build-14.outputs.finished == 'false') ||
+      (inputs.resume_run != '' && inputs.resume_stage == 15)) }}
     runs-on: windows-2022
     timeout-minutes: 355
     outputs:
@@ -1522,10 +1784,19 @@ jobs:
         shell: pwsh
         run: python windows\prepare_workdir.py $env:GITHUB_WORKSPACE C:\tw
       - name: The tree from the last stage
+        if: ${{ !(inputs.resume_run != '' && inputs.resume_stage == 15) }}
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
         with:
           name: build-tree
           path: C:\tw\build
+      - name: The tree from the run being resumed
+        if: ${{ inputs.resume_run != '' && inputs.resume_stage == 15 }}
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: build-tree
+          path: C:\tw\build
+          run-id: ${{ inputs.resume_run }}
+          github-token: ${{ github.token }}
       - name: Unpack the tree
         shell: pwsh
         run: |
@@ -1533,6 +1804,13 @@ jobs:
           if ($LASTEXITCODE -ge 2) { exit $LASTEXITCODE }
           Remove-Item C:\tw\build\tree.zip.*
           exit 0
+      - name: The fix for the run being resumed
+        if: ${{ inputs.resume_run != '' && inputs.resume_stage == 15 && hashFiles('windows/ci/resume.patch') != '' }}
+        shell: pwsh
+        working-directory: C:\tw\build\src
+        run: |
+          git apply -p1 --verbose "$env:GITHUB_WORKSPACE\windows\ci\resume.patch"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Build
         id: build
         shell: pwsh
@@ -1588,8 +1866,11 @@ jobs:
 
   build-16:
     name: Build, stage 16
-    needs: build-15
-    if: needs.build-15.outputs.finished != 'true'
+    needs: [onnxruntime, build-15]
+    if: >-
+      ${{ !cancelled() && needs.onnxruntime.result == 'success' && (
+      (needs.build-15.result == 'success' && needs.build-15.outputs.finished == 'false') ||
+      (inputs.resume_run != '' && inputs.resume_stage == 16)) }}
     runs-on: windows-2022
     timeout-minutes: 355
     outputs:
@@ -1625,10 +1906,19 @@ jobs:
         shell: pwsh
         run: python windows\prepare_workdir.py $env:GITHUB_WORKSPACE C:\tw
       - name: The tree from the last stage
+        if: ${{ !(inputs.resume_run != '' && inputs.resume_stage == 16) }}
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
         with:
           name: build-tree
           path: C:\tw\build
+      - name: The tree from the run being resumed
+        if: ${{ inputs.resume_run != '' && inputs.resume_stage == 16 }}
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: build-tree
+          path: C:\tw\build
+          run-id: ${{ inputs.resume_run }}
+          github-token: ${{ github.token }}
       - name: Unpack the tree
         shell: pwsh
         run: |
@@ -1636,6 +1926,13 @@ jobs:
           if ($LASTEXITCODE -ge 2) { exit $LASTEXITCODE }
           Remove-Item C:\tw\build\tree.zip.*
           exit 0
+      - name: The fix for the run being resumed
+        if: ${{ inputs.resume_run != '' && inputs.resume_stage == 16 && hashFiles('windows/ci/resume.patch') != '' }}
+        shell: pwsh
+        working-directory: C:\tw\build\src
+        run: |
+          git apply -p1 --verbose "$env:GITHUB_WORKSPACE\windows\ci\resume.patch"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Build
         id: build
         shell: pwsh

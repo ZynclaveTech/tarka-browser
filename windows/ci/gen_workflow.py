@@ -11,6 +11,12 @@ each stage builds for 3.5 hours (build.py --ci) and hands the source tree to
 the next as an artifact, until one finishes, packages Tark and checks it
 (windows/ci/verify.ps1). A first job builds ONNX Runtime with the static C
 runtime (windows/ci/build_onnxruntime.ps1), cached between runs.
+
+A failed run can be resumed rather than rebuilt: run the workflow by hand
+with resume_run (the failed run's id) and resume_stage (the stage that
+failed). That stage takes the tree the stage before it handed on (kept
+3 days), applies windows/ci/resume.patch to it if there is one (the fix,
+since build.py --ci does not re-patch a tree it is handed), and builds on.
 """
 
 import pathlib
@@ -31,12 +37,23 @@ name: Windows build
 
 on:
   workflow_dispatch:
+    inputs:
+      resume_run:
+        description: Resume this failed run (its id); empty builds from the start
+        type: string
+        default: ''
+      resume_stage:
+        description: The stage to resume at, with the tree the stage before it handed on
+        type: number
+        default: 1
   push:
     branches:
       - feat/w2-windows-parity
 
 permissions:
   contents: read
+  # Downloading the tree from the run being resumed.
+  actions: read
 
 concurrency:
   group: windows-${{{{ github.ref }}}}
@@ -172,10 +189,19 @@ STAGE = '''
 '''
 
 RESUME = '''      - name: The tree from the last stage
+        if: ${{{{ !(inputs.resume_run != '' && inputs.resume_stage == {n}) }}}}
         uses: {download}
         with:
           name: build-tree
           path: C:\\tw\\build
+      - name: The tree from the run being resumed
+        if: ${{{{ inputs.resume_run != '' && inputs.resume_stage == {n} }}}}
+        uses: {download}
+        with:
+          name: build-tree
+          path: C:\\tw\\build
+          run-id: ${{{{ inputs.resume_run }}}}
+          github-token: ${{{{ github.token }}}}
       - name: Unpack the tree
         shell: pwsh
         run: |
@@ -183,6 +209,13 @@ RESUME = '''      - name: The tree from the last stage
           if ($LASTEXITCODE -ge 2) {{ exit $LASTEXITCODE }}
           Remove-Item C:\\tw\\build\\tree.zip.*
           exit 0
+      - name: The fix for the run being resumed
+        if: ${{{{ inputs.resume_run != '' && inputs.resume_stage == {n} && hashFiles('windows/ci/resume.patch') != '' }}}}
+        shell: pwsh
+        working-directory: C:\\tw\\build\\src
+        run: |
+          git apply -p1 --verbose "$env:GITHUB_WORKSPACE\\windows\\ci\\resume.patch"
+          if ($LASTEXITCODE -ne 0) {{ exit $LASTEXITCODE }}
 '''
 
 COMPLETE = '''
@@ -206,9 +239,16 @@ COMPLETE = '''
 def main():
     text = HEADER
     for n in range(1, STAGES + 1):
-        prev = 'onnxruntime' if n == 1 else f'build-{n - 1}'
-        cond = '' if n == 1 else f"    if: needs.{prev}.outputs.finished != 'true'\n"
-        resume = '' if n == 1 else RESUME.format(download=DOWNLOAD)
+        if n == 1:
+            prev = 'onnxruntime'
+            cond = ("    if: ${{ !(inputs.resume_run != '' && inputs.resume_stage > 1) }}\n")
+        else:
+            prev = f'[onnxruntime, build-{n - 1}]'
+            cond = ("    if: >-\n"
+                    "      ${{ !cancelled() && needs.onnxruntime.result == 'success' && (\n"
+                    f"      (needs.build-{n - 1}.result == 'success' && needs.build-{n - 1}.outputs.finished == 'false') ||\n"
+                    f"      (inputs.resume_run != '' && inputs.resume_stage == {n})) }}}}\n")
+        resume = '' if n == 1 else RESUME.format(download=DOWNLOAD, n=n)
         text += STAGE.format(n=n, needs=prev, cond=cond, resume=resume, checkout=CHECKOUT,
                              hours='3.5',
                              setup_python=SETUP_PYTHON, download=DOWNLOAD, upload=UPLOAD)
