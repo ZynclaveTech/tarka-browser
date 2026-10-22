@@ -1054,7 +1054,7 @@
 +}  // namespace tark_captions
 --- /dev/null
 +++ b/chrome/browser/tark_captions_android/tab_captions.cc
-@@ -0,0 +1,33 @@
+@@ -0,0 +1,109 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -1062,35 +1062,111 @@
 +#include "chrome/browser/tark_captions_android/tab_captions.h"
 +
 +namespace tark_captions {
++namespace {
++
++// A flagship: a core of 2.8 GHz or more and about 8 GB or more (phones sold
++// as 8 GB report a little under 7.5 GB).
++constexpr int kFlagshipKhz = 2800000;
++constexpr int kFlagshipRamMb = 7000;
++
++}  // namespace
 +
 +Style StyleForDevice(int fastest_khz, int ram_mb, int pref) {
-+  return Style::kWordByWord;
++  if (pref == 1) {
++    return Style::kWordByWord;
++  }
++  if (pref == 2) {
++    return Style::kPhrase;
++  }
++  return fastest_khz >= kFlagshipKhz && ram_mb >= kFlagshipRamMb ? Style::kWordByWord
++                                                                  : Style::kPhrase;
 +}
 +
 +TabCaptions::TabCaptions() = default;
 +TabCaptions::~TabCaptions() = default;
 +
-+void TabCaptions::OnPlayerAudible(int player_id, bool audible, base::TimeTicks now) {}
-+void TabCaptions::OnHidden(bool hidden, base::TimeTicks now) {}
-+void TabCaptions::SetCaptionsOn(bool on, base::TimeTicks now) {}
-+void TabCaptions::ChooseLanguage(const std::string& language) {}
-+void TabCaptions::OnUnitReady(bool ready, base::TimeTicks now) {}
-+void TabCaptions::OnAudio(base::TimeTicks now) {}
-+void TabCaptions::OnTick(base::TimeTicks now) {}
-+void TabCaptions::OnServiceGone() {}
++void TabCaptions::OnPlayerAudible(int player_id, bool audible, base::TimeTicks now) {
++  if (audible) {
++    if (audible_.insert(player_id).second) {
++      waiting_since_ = now;  // a player (re)starting is a fresh wait
++    }
++  } else {
++    audible_.erase(player_id);
++  }
++  state_.bar_visible = !audible_.empty() || state_.captions_on;
++  Recompute(now);
++}
++
++void TabCaptions::OnHidden(bool hidden, base::TimeTicks now) {
++  hidden_ = hidden;
++  Recompute(now);
++}
++
++void TabCaptions::SetCaptionsOn(bool on, base::TimeTicks now) {
++  state_.captions_on = on;
++  state_.cant_caption = false;
++  state_.bar_visible = !audible_.empty() || on;
++  Recompute(now);
++}
++
++void TabCaptions::ChooseLanguage(const std::string& language) {
++  if (language != state_.language) {
++    state_.language = language;
++    state_.unit_ready = false;
++    state_.cant_caption = false;
++  }
++}
++
++void TabCaptions::OnUnitReady(bool ready, base::TimeTicks now) {
++  state_.unit_ready = ready;
++  Recompute(now);
++}
++
++void TabCaptions::OnAudio(base::TimeTicks now) {
++  waiting_since_ = now;
++  state_.cant_caption = false;
++  Recompute(now);
++}
++
++void TabCaptions::OnTick(base::TimeTicks now) {
++  if (forwarding_ && !audible_.empty() && !state_.cant_caption &&
++      now - waiting_since_ > kNoAudio) {
++    state_.cant_caption = true;
++  }
++  Recompute(now);
++}
++
++void TabCaptions::OnServiceGone() {
++  state_.captions_on = false;
++  state_.cant_caption = false;
++  Recompute(waiting_since_);
++}
 +
 +bool TabCaptions::ShouldForwardAudio() const {
-+  return false;
++  return state_.captions_on && state_.unit_ready && !hidden_;
 +}
 +
 +bool TabCaptions::WantsEngine() const {
-+  return false;
++  return ShouldForwardAudio() && !state_.cant_caption;
++}
++
++void TabCaptions::Recompute(base::TimeTicks now) {
++  const bool forwarding = ShouldForwardAudio();
++  if (forwarding && !forwarding_) {
++    waiting_since_ = now;  // hidden or off time is not "no audio"
++  }
++  forwarding_ = forwarding;
++  const bool wanted = WantsEngine();
++  if (wanted && !wanted_) {
++    ++engine_starts_;
++  }
++  wanted_ = wanted;
 +}
 +
 +}  // namespace tark_captions
 --- /dev/null
 +++ b/chrome/browser/tark_captions_android/tab_captions.h
-@@ -0,0 +1,71 @@
+@@ -0,0 +1,78 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -1144,7 +1220,9 @@
 +  void OnServiceGone();
 +
 +  const State& state() const { return state_; }
-+  // Whether audio arriving from the tab goes to the captions process.
++  // Whether the tab's renderers send audio (captions on, the model ready,
++  // the tab shown). Audio still arrives while captions can't caption, so
++  // that audio coming back clears it.
 +  bool ShouldForwardAudio() const;
 +  // Whether the captions process should be running for this tab.
 +  bool WantsEngine() const;
@@ -1152,10 +1230,15 @@
 +  int engine_starts() const { return engine_starts_; }
 +
 + private:
++  // Updates what follows from the state after an event at `now`.
++  void Recompute(base::TimeTicks now);
++
 +  State state_;
 +  std::set<int> audible_;
 +  bool hidden_ = false;
-+  base::TimeTicks waiting_since_;
++  bool forwarding_ = false;
++  bool wanted_ = false;
++  base::TimeTicks waiting_since_;  // the last audio, or when forwarding began
 +  int engine_starts_ = 0;
 +};
 +

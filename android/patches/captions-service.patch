@@ -215,7 +215,7 @@
 +#endif  // CHROME_SERVICES_TARK_CAPTIONS_CAPTION_SERVICE_IMPL_H_
 --- /dev/null
 +++ b/chrome/services/tark_captions/caption_session.cc
-@@ -0,0 +1,31 @@
+@@ -0,0 +1,46 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -233,18 +233,33 @@
 +
 +// static
 +std::vector<std::string> CaptionSession::RequiredFiles() {
-+  return {};
++  return {"encoder.int8.onnx", "ctc_decoder.onnx",    "window.f32",  "mel_fb.f32",
++          "vocab.json",        "language_masks.json", "engine.json", "silero_vad.onnx"};
 +}
 +
 +bool CaptionSession::Start(std::map<std::string, base::File> files,
 +                           const EngineOptions& options,
 +                           CaptionCallback on_caption) {
-+  return false;
++  engine_.reset();
++  for (const std::string& name : RequiredFiles()) {
++    auto it = files.find(name);
++    if (it == files.end() || !it->second.IsValid()) {
++      return false;
++    }
++  }
++  engine_ = factory_.Run(std::move(files), options, std::move(on_caption));
++  return engine_ != nullptr;
 +}
 +
-+void CaptionSession::AddAudio(base::span<const float> pcm, int sample_rate) {}
++void CaptionSession::AddAudio(base::span<const float> pcm, int sample_rate) {
++  if (engine_) {
++    engine_->AddAudio(pcm, sample_rate);
++  }
++}
 +
-+void CaptionSession::Stop() {}
++void CaptionSession::Stop() {
++  engine_.reset();
++}
 +
 +}  // namespace tark_captions
 --- /dev/null
