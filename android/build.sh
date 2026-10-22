@@ -45,17 +45,6 @@ run() {
     "$@"
   fi
 }
-# Live captions' test binaries: each runs even when an earlier one failed
-# (a build that shows tests failing on purpose shows all of them); the build
-# fails after the last.
-test_failures=0
-run_test() {
-  echo "tark: run $*"
-  if [[ "$dryrun" != 1 ]] && ! "$@"; then
-    echo "tark: FAILED $*"
-    test_failures=$((test_failures + 1))
-  fi
-}
 
 mkdir -p "$_src_dir" "$_download_cache"
 # gclient writes state files into its working directory: work from WORKDIR.
@@ -302,6 +291,17 @@ run ninja -C "$_src_dir/out/Default" chrome/browser/tark_update:host_unittests
 run "$_src_dir/out/Default/clang_x64/tark_update_unittests"
 # Live captions: the engine's own tests (front end, speech model, segmenter,
 # VAD, ONNX Runtime loader), built for this machine.
+# Live captions' test binaries: each runs even when an earlier one failed
+# (a build that shows tests failing on purpose shows all of them); the build
+# fails after the last.
+test_failures=0
+run_test() {
+  echo "tark: run $*"
+  if [[ "$dryrun" != 1 ]] && ! "$@"; then
+    echo "tark: FAILED $*"
+    test_failures=$((test_failures + 1))
+  fi
+}
 run ninja -C "$_src_dir/out/Default" components/tark_captions:host_unittests
 run_test env TARK_CAPTIONS_TESTDATA="$_root_dir/resources/captions/testdata" \
   "$_src_dir/out/Default/clang_x64/tark_captions_engine_unittests"
