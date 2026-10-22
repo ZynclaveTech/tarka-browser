@@ -4,6 +4,7 @@ import hashlib
 import io
 import json
 import os
+import pathlib
 import struct
 import subprocess
 import sys
@@ -293,6 +294,21 @@ class RefreshTest(TmpCase):
         with self.assertRaisesRegex(td.TrustDataError, 'older than what resources/trust has: CRLSet'):
             td.refresh(self.data, log=lambda m: None)
         td.refresh(self.data, allow_older=True, log=lambda m: None)
+
+
+class AndroidPrepHashTest(unittest.TestCase):
+    """android/build.sh reuses a prepared tree while prep_hash.py's hash is
+    unchanged, so a trust-data refresh must change that hash, or the APK
+    ships the old data."""
+
+    def test_trust_data_is_hashed(self):
+        root = pathlib.Path(__file__).resolve().parents[2]
+        sys.path.insert(0, str(root / 'android'))
+        import prep_hash
+        hashed = set(prep_hash._files(root, prep_hash.INPUTS, prep_hash.GLOBS))
+        trust = [root / 'utils' / 'trust_data.py'] + sorted((root / 'resources' / 'trust').iterdir())
+        self.assertTrue(len(trust) > 5)
+        self.assertEqual([str(f.relative_to(root)) for f in trust if f not in hashed], [])
 
 
 if __name__ == '__main__':
