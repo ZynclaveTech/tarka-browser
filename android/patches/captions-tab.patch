@@ -194,7 +194,7 @@
 +#endif  // CHROME_BROWSER_TARK_CAPTIONS_ANDROID_ANDROID_TARK_CAPTIONS_BRIDGE_H_
 --- /dev/null
 +++ b/chrome/browser/tark_captions_android/tark_captions_tab.cc
-@@ -0,0 +1,359 @@
+@@ -0,0 +1,369 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -396,6 +396,16 @@
 +}
 +
 +void TarkCaptionsTab::OnUnitChanged(const std::string& unit) {
++  // Captions on, the language never ready in this tab, and neither here nor
++  // coming (another tab cancelled it): ask again, on Wi-Fi. Not after a
++  // removal (it was ready: TabCaptions turns captions off) and not while one
++  // waits (Request would skip it and notify again).
++  if (unit == logic_.state().language && logic_.state().captions_on &&
++      !logic_.state().unit_ready && !CaptionDownloads::Get().Removing(unit) &&
++      CaptionDownloads::Get().State(unit).state == CaptionDownloads::State::kMissing) {
++    CaptionDownloads::Get().Request(unit, /*now=*/false);
++    return;  // Request notifies again
++  }
 +  if (unit == logic_.state().language || unit == "common") {
 +    logic_.OnUnitReady(UnitReady(), base::TimeTicks::Now());
 +    Update();

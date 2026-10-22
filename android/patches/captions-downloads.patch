@@ -116,7 +116,7 @@
 +}
 --- /dev/null
 +++ b/chrome/browser/tark_captions_android/caption_downloads.cc
-@@ -0,0 +1,449 @@
+@@ -0,0 +1,460 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -278,10 +278,15 @@
 +  }
 +  scanned_ = true;
 +  // A "Download now" that was not finished resumes.
++  // Copied first: Request() rewrites this list (SetCellularOk).
++  std::vector<std::string> resume;
 +  for (const base::Value& unit : g_browser_process->local_state()->GetList(kCellularOkPref)) {
 +    if (unit.is_string()) {
-+      Request(unit.GetString(), /*now=*/true);
++      resume.push_back(unit.GetString());
 +    }
++  }
++  for (const std::string& unit : resume) {
++    Request(unit, /*now=*/true);
 +  }
 +  MaybeDownloadNext();
 +}
@@ -303,7 +308,8 @@
 +      SetCellularOk(u, true);
 +    }
 +    failed_.erase(u);
-+    if (!Ready(u) && std::ranges::find(queue_, u) == queue_.end()) {
++    // Being removed (its files still on disk): requested again once gone.
++    if (!Ready(u) && !use_.Removing(u) && std::ranges::find(queue_, u) == queue_.end()) {
 +      queue_.push_back(u);
 +    }
 +  }
@@ -458,7 +464,7 @@
 +    return;  // a Notify above may have started the next one
 +  }
 +  const std::optional<std::string> next = NextToFetch(queue_, [&](const std::string& unit) {
-+    return ShouldStartNow(CurrentNetwork(), CellularOk(unit));
++    return !use_.Removing(unit) && ShouldStartNow(CurrentNetwork(), CellularOk(unit));
 +  });
 +  if (!next) {
 +    return;
@@ -471,7 +477,12 @@
 +      break;
 +    }
 +  }
-+  CHECK(current_);
++  if (!current_) {
++    // Nothing missing yet not ready: drop it rather than fetch nothing.
++    std::erase(queue_, unit);
++    Notify(unit);
++    return;
++  }
 +  current_bytes_ = 0;
 +  const uint64_t generation = ++generation_;
 +  base::CreateDirectory(UnitDir(unit));
@@ -568,7 +579,7 @@
 +}  // namespace tark_captions
 --- /dev/null
 +++ b/chrome/browser/tark_captions_android/caption_downloads.h
-@@ -0,0 +1,124 @@
+@@ -0,0 +1,126 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -648,6 +659,8 @@
 +  std::map<std::string, int64_t> ReadyUnits() const;
 +  // Engines hold their unit while they run.
 +  void SetInUse(std::string_view unit, bool in_use);
++  // Whether `unit` waits to be removed (in use when Remove() was called).
++  bool Removing(std::string_view unit) const { return use_.Removing(unit); }
 +  // Where a unit's files are: <app data>/captions/<unit>.
 +  base::FilePath UnitDir(std::string_view unit) const;
 +
