@@ -362,7 +362,42 @@ unpacked to `build/src/third_party/sparkle` by `dev.sh setup` and
   uploads `appcast.xml` (five-minute cache) and any delta files.
 - **Bump `revision.txt`** for every Tark release on the same Chromium
   version; reset it to 1 on a new Chromium version.
+- **Refresh the trust data** first (see *Trust data* below).
 - Tests: `python3 -m pytest utils/tests/test_install_sparkle.py`.
+
+## Trust data (r8)
+
+Tark's component updater fetches only Widevine, so Chrome's CRLSet, Chrome
+Root Store and CT log-list updates never reach it. Every release carries
+them instead, in `resources/trust/` (design: tarka-notes
+`notes/2026-10-22-trust-data-updates.md`).
+
+- **Before every release:** `python3 utils/trust_data.py refresh
+  --chromium-src build/src`, review the log (root-store additions and
+  removals are listed), commit `resources/trust/`. Then `python3
+  utils/trust_data.py check` must pass: it fails once the log list is 21
+  days old. Chromium stops enforcing CT 70 days after the list's date,
+  silently, so **a release is due at least every 8 weeks** even with nothing
+  else to ship; `check` prints the lapse date.
+- **What refresh checks:** the log list against its `.sig` with Google's
+  log-list key (pinned in the script); the CRLSet and PKI-metadata
+  components' CRX3 signatures against the keys Chromium pins
+  (`--chromium-src` compares the pins too). The root store is written from
+  the component's `crs.pb`, the one Chrome is using, minus
+  `resources/trust/distrust.txt`; a proto field Chromium 155 does not know
+  fails it. It refuses data older than what is committed (`--allow-older`).
+  Only the build machine contacts Google; users never do.
+- **Install:** `dev.sh setup`, `build.sh`, `android/build.sh` and
+  `windows/tark_post_patch.py` run `trust_data.py install` after domain
+  substitution. It writes the log list (substituted) and the root store over
+  Chromium's files, and the CRLSet as `chrome/browser/net/tark_crl_set_data.inc`
+  for `core/bundled-crl-set.patch`, which hands it to the certificate
+  verifier at startup. To update a development tree: run install, then
+  `ninja`.
+- **Tark-only distrust:** a root goes in `distrust.txt`; an intermediate or
+  any other key goes in the static SPKI blocklist by patch
+  (`core/emudhra-distrust.patch` is the example).
+- Tests: `python3 -m pytest utils/tests/test_trust_data.py`.
 
 ## Live captions (D4)
 
