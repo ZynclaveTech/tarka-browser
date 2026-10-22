@@ -1,0 +1,171 @@
+--- a/chrome/browser/ui/startup/startup_browser_creator_impl.cc
++++ b/chrome/browser/ui/startup/startup_browser_creator_impl.cc
+@@ -44,6 +44,7 @@
+ #include "chrome/browser/ui/browser_window/public/create_browser_window.h"
+ #include "chrome/browser/ui/browser_window/public/global_browser_collection.h"
+ #include "chrome/browser/ui/navigator/browser_navigator.h"
++#include "chrome/browser/ui/navigator/tark/switch_to_open_tab.h"
+ #include "chrome/browser/ui/navigator/browser_navigator_params.h"
+ #include "chrome/browser/ui/startup/infobar_utils.h"
+ #include "chrome/browser/ui/startup/startup_browser_creator.h"
+@@ -430,6 +431,14 @@
+       continue;
+     }
+ 
++    // Tark: a link opened from another app while Tark runs goes to the tab
++    // already showing that page in this window.
++    if (process_startup == chrome::startup::IsProcessStartup::kNo && !create_new_browser &&
++        tark::MaybeSwitchToOpenTabForLaunch(browser, tab.url, tab.is_untrusted_launch)) {
++      first_tab = false;
++      continue;
++    }
++
+     int add_types = first_tab ? AddTabTypes::ADD_ACTIVE : AddTabTypes::ADD_NONE;
+     add_types |= AddTabTypes::ADD_FORCE_INDEX;
+     if (tab.type == StartupTab::Type::kPinned) {
+--- a/chrome/browser/ui/navigator/tark/switch_to_open_tab.h
++++ b/chrome/browser/ui/navigator/tark/switch_to_open_tab.h
+@@ -5,6 +5,8 @@
+ #ifndef CHROME_BROWSER_UI_NAVIGATOR_TARK_SWITCH_TO_OPEN_TAB_H_
+ #define CHROME_BROWSER_UI_NAVIGATOR_TARK_SWITCH_TO_OPEN_TAB_H_
+ 
++class BrowserWindowInterface;
++class GURL;
+ struct NavigateParams;
+ 
+ namespace tark {
+@@ -15,6 +17,13 @@
+ // must not go on.
+ bool MaybeSwitchToOpenTab(const NavigateParams& params);
+ 
++// The same for a link opened from another app (Claude, Mail, Slack) while
++// Tark runs: `browser` is the window it would open in. "Open anyway" opens it
++// as that launch would have (`untrusted_launch`: from an opaque origin).
++bool MaybeSwitchToOpenTabForLaunch(BrowserWindowInterface* browser,
++                                   const GURL& url,
++                                   bool untrusted_launch);
++
+ }  // namespace tark
+ 
+ #endif  // CHROME_BROWSER_UI_NAVIGATOR_TARK_SWITCH_TO_OPEN_TAB_H_
+--- a/chrome/browser/ui/navigator/tark/switch_to_open_tab.cc
++++ b/chrome/browser/ui/navigator/tark/switch_to_open_tab.cc
+@@ -66,8 +66,71 @@
+   Navigate(&params);
+ }
+ 
++// Opens a link from another app in a new tab, as that launch would have.
++void OpenLaunchAnyway(base::WeakPtr<BrowserWindowInterface> browser,
++                      GURL url,
++                      bool untrusted_launch) {
++  if (!browser) {
++    return;
++  }
++  NavigateParams params(browser.get(), url, ui::PAGE_TRANSITION_AUTO_TOPLEVEL);
++  if (untrusted_launch) {
++    params.initiator_origin = url::Origin();
++  }
++  params.disposition = WindowOpenDisposition::NEW_FOREGROUND_TAB;
++  Navigate(&params);
++}
++
++// The tab in `tabs` already showing `url`, other than `except`; kNoTab if
++// none.
++int IndexOfOpenTab(TabStripModel* tabs, const GURL& url, const content::WebContents* except) {
++  for (int i = 0; i < tabs->count(); ++i) {
++    content::WebContents* contents = tabs->GetWebContentsAt(i);
++    if (contents != except && IsSameLinkTarget(contents->GetVisibleURL(), url)) {
++      return i;
++    }
++  }
++  return TabStripModel::kNoTab;
++}
++
++// Switches to tab `index` and shows the notice, whose "Open anyway" runs
++// `open_anyway`.
++void SwitchAndNotify(BrowserWindowInterface* browser, int index, base::OnceClosure open_anyway) {
++  browser->GetTabStripModel()->ActivateTabAt(
++      index, TabStripUserGestureDetails(TabStripUserGestureDetails::GestureType::kOther));
++  const void* window = browser;
++  const uint64_t id = SetOpenAnyway(window, std::move(open_anyway));
++  if (ToastService* toasts = ToastService::From(browser)) {
++    ToastParams toast(ToastId::kTarkSwitchedToOpenTab);
++    toast.toast_close_callback =
++        base::ScopedClosureRunner(base::BindOnce(&ClearOpenAnyway, window, id));
++    toasts->toast_controller()->MaybeShowToast(std::move(toast));
++  } else {
++    ClearOpenAnyway(window, id);
++  }
++}
++
+ }  // namespace
+ 
++bool MaybeSwitchToOpenTabForLaunch(BrowserWindowInterface* browser,
++                                   const GURL& url,
++                                   bool untrusted_launch) {
++  if (!browser || browser->GetType() != BrowserWindowInterface::Type::TYPE_NORMAL) {
++    return false;
++  }
++  TabStripModel* tabs = browser->GetTabStripModel();
++  if (!tabs) {
++    return false;
++  }
++  const int open_index = IndexOfOpenTab(tabs, url, /*except=*/nullptr);
++  if (open_index == TabStripModel::kNoTab) {
++    return false;
++  }
++  SwitchAndNotify(browser, open_index,
++                  base::BindOnce(&OpenLaunchAnyway, browser->GetWeakPtr(), url, untrusted_launch));
++  return true;
++}
++
+ bool MaybeSwitchToOpenTab(const NavigateParams& params) {
+   if (g_opening_anyway || !params.browser || !params.source_contents ||
+       !IsSwitchableLinkClick(params.disposition, params.transition, !!params.post_data,
+@@ -81,25 +144,14 @@
+   if (!tabs || tabs->GetIndexOfWebContents(params.source_contents) == TabStripModel::kNoTab) {
+     return false;
+   }
+-  int open_index = TabStripModel::kNoTab;
+-  for (int i = 0; i < tabs->count(); ++i) {
+-    content::WebContents* contents = tabs->GetWebContentsAt(i);
+-    // A link to the page you are on still opens a new tab.
+-    if (contents != params.source_contents &&
+-        IsSameLinkTarget(contents->GetVisibleURL(), params.url)) {
+-      open_index = i;
+-      break;
+-    }
+-  }
++  // A link to the page you are on still opens a new tab.
++  const int open_index = IndexOfOpenTab(tabs, params.url, params.source_contents);
+   if (open_index == TabStripModel::kNoTab) {
+     return false;
+   }
+-  tabs->ActivateTabAt(open_index, TabStripUserGestureDetails(
+-                                      TabStripUserGestureDetails::GestureType::kOther));
+ 
+   // "Open anyway" opens the link as the click would have, while the notice
+   // shows.
+-  const void* window = browser;
+   SkippedClick click;
+   click.url = params.url;
+   click.referrer = params.referrer;
+@@ -124,16 +176,8 @@
+     click.initiator_frame_token.reset();
+     click.initiator_process_id = content::ChildProcessHost::kInvalidUniqueID;
+   }
+-  const uint64_t id = SetOpenAnyway(
+-      window, base::BindOnce(&OpenAnyway, browser->GetWeakPtr(), std::move(click)));
+-  if (ToastService* toasts = ToastService::From(browser)) {
+-    ToastParams toast(ToastId::kTarkSwitchedToOpenTab);
+-    toast.toast_close_callback =
+-        base::ScopedClosureRunner(base::BindOnce(&ClearOpenAnyway, window, id));
+-    toasts->toast_controller()->MaybeShowToast(std::move(toast));
+-  } else {
+-    ClearOpenAnyway(window, id);
+-  }
++  SwitchAndNotify(browser, open_index,
++                  base::BindOnce(&OpenAnyway, browser->GetWeakPtr(), std::move(click)));
+   return true;
+ }
+ 

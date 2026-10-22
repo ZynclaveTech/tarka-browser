@@ -183,6 +183,8 @@ else
   #    A2's engine-level blocker removes them), IndicXlit (D1).
   run python3 "$_root_dir/utils/install_branding.py" "$_root_dir/resources/branding/mark" "$_src_dir" \
     install.txt install-android.txt
+  # Certificate trust data: CT log list, Chrome Root Store, CRLSet (resources/trust).
+  run python3 "$_root_dir/utils/trust_data.py" install "$_src_dir" --domain-regex "$_main_repo/domain_regex.list"
   run mkdir -p "$_src_dir/ui/webui/resources/fonts"
   run cp "$_root_dir"/resources/fonts/inter-latin.woff2 "$_root_dir"/resources/fonts/inter-latin-ext.woff2 \
     "$_src_dir/ui/webui/resources/fonts/"
