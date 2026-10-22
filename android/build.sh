@@ -252,6 +252,13 @@ fi
 
 # 6. gn and ninja, with the clang and Rust fetched while preparing; gn is
 #    bootstrapped from source as on the Mac.
+# Live captions: the model files the APK pins (android/captions/files.json,
+# built on the Mac by models.py; the files themselves are on gettarka.com).
+run python3 "$_root_dir/android/captions/models.py" header "$_root_dir/android/captions/files.json" \
+  "$_src_dir/chrome/browser/tark_captions_android/model_files.inc"
+# Live captions: ONNX Runtime's headers and its arm64 .so, pinned
+# (android/captions/ort.sh).
+run bash "$_root_dir/android/captions/ort.sh" "$_src_dir/third_party/tark_onnxruntime"
 mkdir -p "$_src_dir/out/Default"
 # Chromium's own clang (fetched while preparing) builds gn and everything else.
 export PATH="$_src_dir/third_party/llvm-build/Release+Asserts/bin:$PATH"
@@ -282,4 +289,9 @@ run ninja -C "$_src_dir/out/Default" chrome/browser/tark_xlit:host_unittests
 run "$_src_dir/out/Default/clang_x64/tark_xlit_files_unittests"
 run ninja -C "$_src_dir/out/Default" chrome/browser/tark_update:host_unittests
 run "$_src_dir/out/Default/clang_x64/tark_update_unittests"
+# Live captions: the engine's own tests (front end, speech model, segmenter,
+# VAD, ONNX Runtime loader), built for this machine.
+run ninja -C "$_src_dir/out/Default" components/tark_captions:host_unittests
+run env TARK_CAPTIONS_TESTDATA="$_root_dir/resources/captions/testdata" \
+  "$_src_dir/out/Default/clang_x64/tark_captions_engine_unittests"
 log "built $_src_dir/out/Default/apks/ChromePublic.apk"
