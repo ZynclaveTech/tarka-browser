@@ -273,13 +273,14 @@
 +#endif  // CHROME_BROWSER_UI_NAVIGATOR_TARK_SWITCH_TO_OPEN_TAB_H_
 --- /dev/null
 +++ b/chrome/browser/ui/navigator/tark/switch_to_open_tab.cc
-@@ -0,0 +1,92 @@
+@@ -0,0 +1,140 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
 +
 +#include "chrome/browser/ui/navigator/tark/switch_to_open_tab.h"
 +
++#include <optional>
 +#include <utility>
 +
 +#include "base/auto_reset.h"
@@ -294,7 +295,11 @@
 +#include "chrome/browser/ui/toasts/api/toast_id.h"
 +#include "chrome/browser/ui/toasts/toast_controller.h"
 +#include "chrome/browser/ui/toasts/toast_service.h"
++#include "content/public/browser/child_process_host.h"
++#include "content/public/browser/site_instance.h"
 +#include "content/public/browser/web_contents.h"
++#include "third_party/blink/public/common/tokens/tokens.h"
++#include "url/origin.h"
 +
 +namespace tark {
 +namespace {
@@ -302,17 +307,37 @@
 +// Set while "Open anyway" opens the link, which must not switch again.
 +bool g_opening_anyway = false;
 +
-+void OpenAnyway(base::WeakPtr<BrowserWindowInterface> browser,
-+                GURL url,
-+                content::Referrer referrer,
-+                ui::PageTransition transition,
-+                WindowOpenDisposition disposition) {
++// The skipped link click, as the page made it: "Open anyway" replays it with
++// the same initiator, so the site gets what a click from that page gives it
++// (SameSite cookies, Sec-Fetch-Site), not what a typed address would.
++struct SkippedClick {
++  GURL url;
++  content::Referrer referrer;
++  ui::PageTransition transition = ui::PAGE_TRANSITION_LINK;
++  WindowOpenDisposition disposition = WindowOpenDisposition::NEW_FOREGROUND_TAB;
++  std::optional<blink::LocalFrameToken> initiator_frame_token;
++  int initiator_process_id = content::ChildProcessHost::kInvalidUniqueID;
++  std::optional<url::Origin> initiator_origin;
++  std::optional<GURL> initiator_base_url;
++  bool is_renderer_initiated = false;
++  scoped_refptr<content::SiteInstance> source_site_instance;
++  base::WeakPtr<content::WebContents> source_contents;
++};
++
++void OpenAnyway(base::WeakPtr<BrowserWindowInterface> browser, SkippedClick click) {
 +  if (!browser) {
 +    return;
 +  }
-+  NavigateParams params(browser.get(), url, transition);
-+  params.referrer = referrer;
-+  params.disposition = disposition;
++  NavigateParams params(browser.get(), click.url, click.transition);
++  params.referrer = click.referrer;
++  params.disposition = click.disposition;
++  params.initiator_frame_token = click.initiator_frame_token;
++  params.initiator_process_id = click.initiator_process_id;
++  params.initiator_origin = click.initiator_origin;
++  params.initiator_base_url = click.initiator_base_url;
++  params.is_renderer_initiated = click.is_renderer_initiated;
++  params.source_site_instance = click.source_site_instance;
++  params.source_contents = click.source_contents.get();
 +  base::AutoReset<bool> opening(&g_opening_anyway, true);
 +  Navigate(&params);
 +}
@@ -351,9 +376,32 @@
 +  // "Open anyway" opens the link as the click would have, while the notice
 +  // shows.
 +  const void* window = browser;
-+  const uint64_t id =
-+      SetOpenAnyway(window, base::BindOnce(&OpenAnyway, browser->GetWeakPtr(), params.url,
-+                                           params.referrer, params.transition, params.disposition));
++  SkippedClick click;
++  click.url = params.url;
++  click.referrer = params.referrer;
++  click.transition = params.transition;
++  click.disposition = params.disposition;
++  click.initiator_frame_token = params.initiator_frame_token;
++  click.initiator_process_id = params.initiator_process_id;
++  click.initiator_origin = params.initiator_origin;
++  click.initiator_base_url = params.initiator_base_url;
++  click.is_renderer_initiated = params.is_renderer_initiated;
++  click.source_site_instance = params.source_site_instance;
++  click.source_contents = params.source_contents->GetWeakPtr();
++  if (!click.initiator_origin) {
++    // A target=_blank link arrives as the tab the page already made, its
++    // initiator inside that tab's pending navigation, which can't be read.
++    // That tab is dropped (nothing loads unseen), and "Open anyway" starts
++    // from an opaque origin: always cross-site to the site, never more
++    // trusted than the click itself.
++    click.initiator_origin = url::Origin();
++    click.is_renderer_initiated = true;
++    click.source_site_instance = nullptr;
++    click.initiator_frame_token.reset();
++    click.initiator_process_id = content::ChildProcessHost::kInvalidUniqueID;
++  }
++  const uint64_t id = SetOpenAnyway(
++      window, base::BindOnce(&OpenAnyway, browser->GetWeakPtr(), std::move(click)));
 +  if (ToastService* toasts = ToastService::From(browser)) {
 +    ToastParams toast(ToastId::kTarkSwitchedToOpenTab);
 +    toast.toast_close_callback =
