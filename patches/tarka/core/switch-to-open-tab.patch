@@ -1,0 +1,535 @@
+--- /dev/null
++++ b/chrome/browser/ui/navigator/tark/BUILD.gn
+@@ -0,0 +1,29 @@
++# Copyright 2026 The Tark Authors
++# Use of this source code is governed by a BSD-style license that can be
++# found in the LICENSE file.
++
++# Tark: a link that would open a new tab goes to the tab already showing that
++# page. The rules on their own, so they can be tested without the browser.
++
++import("//testing/test.gni")
++
++source_set("rules") {
++  sources = [
++    "switch_to_open_tab_rules.cc",
++    "switch_to_open_tab_rules.h",
++  ]
++  public_deps = [
++    "//ui/base",
++    "//url",
++  ]
++  deps = [ "//base" ]
++}
++
++test("tark_switch_to_open_tab_unittests") {
++  sources = [ "switch_to_open_tab_unittest.cc" ]
++  deps = [
++    ":rules",
++    "//base/test:run_all_unittests",
++    "//testing/gtest",
++  ]
++}
+--- /dev/null
++++ b/chrome/browser/ui/navigator/tark/switch_to_open_tab_rules.h
+@@ -0,0 +1,41 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_NAVIGATOR_TARK_SWITCH_TO_OPEN_TAB_RULES_H_
++#define CHROME_BROWSER_UI_NAVIGATOR_TARK_SWITCH_TO_OPEN_TAB_RULES_H_
++
++#include <cstdint>
++
++#include "base/functional/callback.h"
++#include "ui/base/page_transition_types.h"
++#include "ui/base/window_open_disposition.h"
++
++class GURL;
++
++namespace tark {
++
++// A link click that would open a new tab (the page's own target=_blank,
++// ⌘-click, middle-click, "Open Link in New Tab"): the kind that goes to the
++// tab already showing the page. Not a form submission, and not a page script
++// keeping a handle on the window it opens.
++bool IsSwitchableLinkClick(WindowOpenDisposition disposition,
++                           ui::PageTransition transition,
++                           bool has_post_data,
++                           bool has_opener);
++
++// Whether an open tab at `open` already shows the link to `wanted`: the
++// same web address, ignoring only the part after #.
++bool IsSameLinkTarget(const GURL& open, const GURL& wanted);
++
++// The link a switch skipped, kept per window (`window` is only a key) until
++// its notice closes: "Open anyway" opens it once. A newer switch in the same
++// window replaces it; SetOpenAnyway() returns an id so that closing the
++// older notice clears only its own link.
++uint64_t SetOpenAnyway(const void* window, base::OnceClosure open);
++void RunOpenAnyway(const void* window);
++void ClearOpenAnyway(const void* window, uint64_t id);
++
++}  // namespace tark
++
++#endif  // CHROME_BROWSER_UI_NAVIGATOR_TARK_SWITCH_TO_OPEN_TAB_RULES_H_
+--- /dev/null
++++ b/chrome/browser/ui/navigator/tark/switch_to_open_tab_rules.cc
+@@ -0,0 +1,78 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/ui/navigator/tark/switch_to_open_tab_rules.h"
++
++#include <map>
++#include <utility>
++
++#include "base/no_destructor.h"
++#include "url/gurl.h"
++
++namespace tark {
++namespace {
++
++struct Pending {
++  uint64_t id = 0;
++  base::OnceClosure open;
++};
++
++std::map<const void*, Pending>& PendingOpens() {
++  static base::NoDestructor<std::map<const void*, Pending>> pending;
++  return *pending;
++}
++
++GURL WithoutRef(const GURL& url) {
++  GURL::Replacements no_ref;
++  no_ref.ClearRef();
++  return url.ReplaceComponents(no_ref);
++}
++
++}  // namespace
++
++bool IsSwitchableLinkClick(WindowOpenDisposition disposition,
++                           ui::PageTransition transition,
++                           bool has_post_data,
++                           bool has_opener) {
++  return (disposition == WindowOpenDisposition::NEW_FOREGROUND_TAB ||
++          disposition == WindowOpenDisposition::NEW_BACKGROUND_TAB) &&
++         ui::PageTransitionCoreTypeIs(transition, ui::PAGE_TRANSITION_LINK) && !has_post_data &&
++         !has_opener;
++}
++
++bool IsSameLinkTarget(const GURL& open, const GURL& wanted) {
++  if (!open.is_valid() || !wanted.is_valid() || !open.SchemeIsHTTPOrHTTPS()) {
++    return false;
++  }
++  return WithoutRef(open) == WithoutRef(wanted);
++}
++
++uint64_t SetOpenAnyway(const void* window, base::OnceClosure open) {
++  static uint64_t next_id = 1;
++  Pending& pending = PendingOpens()[window];
++  pending.id = next_id++;
++  pending.open = std::move(open);
++  return pending.id;
++}
++
++void RunOpenAnyway(const void* window) {
++  auto it = PendingOpens().find(window);
++  if (it == PendingOpens().end()) {
++    return;
++  }
++  base::OnceClosure open = std::move(it->second.open);
++  PendingOpens().erase(it);
++  if (open) {
++    std::move(open).Run();
++  }
++}
++
++void ClearOpenAnyway(const void* window, uint64_t id) {
++  auto it = PendingOpens().find(window);
++  if (it != PendingOpens().end() && it->second.id == id) {
++    PendingOpens().erase(it);
++  }
++}
++
++}  // namespace tark
+--- /dev/null
++++ b/chrome/browser/ui/navigator/tark/switch_to_open_tab_unittest.cc
+@@ -0,0 +1,90 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/ui/navigator/tark/switch_to_open_tab_rules.h"
++
++#include "base/functional/bind.h"
++#include "testing/gtest/include/gtest/gtest.h"
++#include "ui/base/page_transition_types.h"
++#include "ui/base/window_open_disposition.h"
++#include "url/gurl.h"
++
++namespace tark {
++namespace {
++
++// The user (2026-10-22): links that would open a new tab go to the tab
++// already showing the page: target=_blank, ⌘-click, middle-click and "Open
++// Link in New Tab".
++TEST(SwitchToOpenTabTest, NewTabLinkClicksSwitch) {
++  for (auto disposition : {WindowOpenDisposition::NEW_FOREGROUND_TAB,
++                           WindowOpenDisposition::NEW_BACKGROUND_TAB}) {
++    EXPECT_TRUE(IsSwitchableLinkClick(disposition, ui::PAGE_TRANSITION_LINK,
++                                      /*has_post_data=*/false, /*has_opener=*/false));
++  }
++}
++
++TEST(SwitchToOpenTabTest, OtherOpensDoNot) {
++  // A normal click in the same tab, a pop-up window, a new window.
++  for (auto disposition : {WindowOpenDisposition::CURRENT_TAB, WindowOpenDisposition::NEW_POPUP,
++                           WindowOpenDisposition::NEW_WINDOW, WindowOpenDisposition::OFF_THE_RECORD}) {
++    EXPECT_FALSE(IsSwitchableLinkClick(disposition, ui::PAGE_TRANSITION_LINK, false, false));
++  }
++  // Typed in the address bar or from a bookmark: not a link click.
++  EXPECT_FALSE(IsSwitchableLinkClick(WindowOpenDisposition::NEW_FOREGROUND_TAB,
++                                     ui::PAGE_TRANSITION_TYPED, false, false));
++  EXPECT_FALSE(IsSwitchableLinkClick(WindowOpenDisposition::NEW_FOREGROUND_TAB,
++                                     ui::PAGE_TRANSITION_AUTO_BOOKMARK, false, false));
++  // A form submission (POST), and a page script that keeps a handle on the
++  // window it opens (sign-in pop-ups opened as tabs).
++  EXPECT_FALSE(IsSwitchableLinkClick(WindowOpenDisposition::NEW_FOREGROUND_TAB,
++                                     ui::PAGE_TRANSITION_LINK, /*has_post_data=*/true, false));
++  EXPECT_FALSE(IsSwitchableLinkClick(WindowOpenDisposition::NEW_FOREGROUND_TAB,
++                                     ui::PAGE_TRANSITION_LINK, false, /*has_opener=*/true));
++}
++
++// "Same page": the same address, ignoring only the part after #.
++TEST(SwitchToOpenTabTest, SameLinkIgnoresOnlyTheFragment) {
++  const GURL page("https://news.example.in/budget-2026");
++  EXPECT_TRUE(IsSameLinkTarget(page, page));
++  EXPECT_TRUE(IsSameLinkTarget(GURL("https://news.example.in/budget-2026#taxes"), page));
++  EXPECT_TRUE(IsSameLinkTarget(page, GURL("https://news.example.in/budget-2026#top")));
++  EXPECT_FALSE(IsSameLinkTarget(GURL("https://news.example.in/budget-2026?page=2"), page));
++  EXPECT_FALSE(IsSameLinkTarget(GURL("https://news.example.in/budget-2025"), page));
++  EXPECT_FALSE(IsSameLinkTarget(GURL("http://news.example.in/budget-2026"), page));
++  // Nothing to compare: a blank or broken address never matches.
++  EXPECT_FALSE(IsSameLinkTarget(GURL(), GURL()));
++  EXPECT_FALSE(IsSameLinkTarget(GURL("about:blank"), GURL("about:blank")));
++}
++
++// "Open anyway" on the notice opens the link the click was for, once, in
++// the window it was clicked in.
++TEST(SwitchToOpenTabTest, OpenAnywayRunsOnceForItsWindow) {
++  int window_a = 0, window_b = 0;
++  int opened_a = 0, opened_b = 0;
++  SetOpenAnyway(&window_a, base::BindOnce([](int* n) { ++*n; }, &opened_a));
++  const uint64_t b = SetOpenAnyway(&window_b, base::BindOnce([](int* n) { ++*n; }, &opened_b));
++  RunOpenAnyway(&window_a);
++  RunOpenAnyway(&window_a);
++  EXPECT_EQ(opened_a, 1);
++  EXPECT_EQ(opened_b, 0);
++  ClearOpenAnyway(&window_b, b);
++  RunOpenAnyway(&window_b);
++  EXPECT_EQ(opened_b, 0);
++}
++
++// A newer switch in the same window replaces the older one's link.
++TEST(SwitchToOpenTabTest, OpenAnywayKeepsTheLatestLink) {
++  int window = 0;
++  int first = 0, second = 0;
++  const uint64_t old_id = SetOpenAnyway(&window, base::BindOnce([](int* n) { ++*n; }, &first));
++  SetOpenAnyway(&window, base::BindOnce([](int* n) { ++*n; }, &second));
++  // The older notice closes as the newer one replaces it: the newer link stays.
++  ClearOpenAnyway(&window, old_id);
++  RunOpenAnyway(&window);
++  EXPECT_EQ(first, 0);
++  EXPECT_EQ(second, 1);
++}
++
++}  // namespace
++}  // namespace tark
+--- /dev/null
++++ b/chrome/browser/ui/navigator/tark/switch_to_open_tab.h
+@@ -0,0 +1,20 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_NAVIGATOR_TARK_SWITCH_TO_OPEN_TAB_H_
++#define CHROME_BROWSER_UI_NAVIGATOR_TARK_SWITCH_TO_OPEN_TAB_H_
++
++struct NavigateParams;
++
++namespace tark {
++
++// Tark: a link that would open a new tab goes to the tab in the same window
++// already showing that page (ignoring the part after #), with a short notice
++// offering "Open anyway". Returns true when it switched, and the navigation
++// must not go on.
++bool MaybeSwitchToOpenTab(const NavigateParams& params);
++
++}  // namespace tark
++
++#endif  // CHROME_BROWSER_UI_NAVIGATOR_TARK_SWITCH_TO_OPEN_TAB_H_
+--- /dev/null
++++ b/chrome/browser/ui/navigator/tark/switch_to_open_tab.cc
+@@ -0,0 +1,140 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/ui/navigator/tark/switch_to_open_tab.h"
++
++#include <optional>
++#include <utility>
++
++#include "base/auto_reset.h"
++#include "base/functional/bind.h"
++#include "base/functional/callback_helpers.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/navigator/browser_navigator.h"
++#include "chrome/browser/ui/navigator/browser_navigator_params.h"
++#include "chrome/browser/ui/navigator/tark/switch_to_open_tab_rules.h"
++#include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "chrome/browser/ui/tabs/tab_strip_user_gesture_details.h"
++#include "chrome/browser/ui/toasts/api/toast_id.h"
++#include "chrome/browser/ui/toasts/toast_controller.h"
++#include "chrome/browser/ui/toasts/toast_service.h"
++#include "content/public/browser/child_process_host.h"
++#include "content/public/browser/site_instance.h"
++#include "content/public/browser/web_contents.h"
++#include "third_party/blink/public/common/tokens/tokens.h"
++#include "url/origin.h"
++
++namespace tark {
++namespace {
++
++// Set while "Open anyway" opens the link, which must not switch again.
++bool g_opening_anyway = false;
++
++// The skipped link click, as the page made it: "Open anyway" replays it with
++// the same initiator, so the site gets what a click from that page gives it
++// (SameSite cookies, Sec-Fetch-Site), not what a typed address would.
++struct SkippedClick {
++  GURL url;
++  content::Referrer referrer;
++  ui::PageTransition transition = ui::PAGE_TRANSITION_LINK;
++  WindowOpenDisposition disposition = WindowOpenDisposition::NEW_FOREGROUND_TAB;
++  std::optional<blink::LocalFrameToken> initiator_frame_token;
++  int initiator_process_id = content::ChildProcessHost::kInvalidUniqueID;
++  std::optional<url::Origin> initiator_origin;
++  std::optional<GURL> initiator_base_url;
++  bool is_renderer_initiated = false;
++  scoped_refptr<content::SiteInstance> source_site_instance;
++  base::WeakPtr<content::WebContents> source_contents;
++};
++
++void OpenAnyway(base::WeakPtr<BrowserWindowInterface> browser, SkippedClick click) {
++  if (!browser) {
++    return;
++  }
++  NavigateParams params(browser.get(), click.url, click.transition);
++  params.referrer = click.referrer;
++  params.disposition = click.disposition;
++  params.initiator_frame_token = click.initiator_frame_token;
++  params.initiator_process_id = click.initiator_process_id;
++  params.initiator_origin = click.initiator_origin;
++  params.initiator_base_url = click.initiator_base_url;
++  params.is_renderer_initiated = click.is_renderer_initiated;
++  params.source_site_instance = click.source_site_instance;
++  params.source_contents = click.source_contents.get();
++  base::AutoReset<bool> opening(&g_opening_anyway, true);
++  Navigate(&params);
++}
++
++}  // namespace
++
++bool MaybeSwitchToOpenTab(const NavigateParams& params) {
++  if (g_opening_anyway || !params.browser || !params.source_contents ||
++      !IsSwitchableLinkClick(params.disposition, params.transition, !!params.post_data,
++                             !!params.opener)) {
++    return false;
++  }
++  BrowserWindowInterface* browser = params.browser;
++  TabStripModel* tabs = browser->GetTabStripModel();
++  // This window's own tabs only (never another window, never private and
++  // normal together), and only for a click in one of them.
++  if (!tabs || tabs->GetIndexOfWebContents(params.source_contents) == TabStripModel::kNoTab) {
++    return false;
++  }
++  int open_index = TabStripModel::kNoTab;
++  for (int i = 0; i < tabs->count(); ++i) {
++    content::WebContents* contents = tabs->GetWebContentsAt(i);
++    // A link to the page you are on still opens a new tab.
++    if (contents != params.source_contents &&
++        IsSameLinkTarget(contents->GetVisibleURL(), params.url)) {
++      open_index = i;
++      break;
++    }
++  }
++  if (open_index == TabStripModel::kNoTab) {
++    return false;
++  }
++  tabs->ActivateTabAt(open_index, TabStripUserGestureDetails(
++                                      TabStripUserGestureDetails::GestureType::kOther));
++
++  // "Open anyway" opens the link as the click would have, while the notice
++  // shows.
++  const void* window = browser;
++  SkippedClick click;
++  click.url = params.url;
++  click.referrer = params.referrer;
++  click.transition = params.transition;
++  click.disposition = params.disposition;
++  click.initiator_frame_token = params.initiator_frame_token;
++  click.initiator_process_id = params.initiator_process_id;
++  click.initiator_origin = params.initiator_origin;
++  click.initiator_base_url = params.initiator_base_url;
++  click.is_renderer_initiated = params.is_renderer_initiated;
++  click.source_site_instance = params.source_site_instance;
++  click.source_contents = params.source_contents->GetWeakPtr();
++  if (!click.initiator_origin) {
++    // A target=_blank link arrives as the tab the page already made, its
++    // initiator inside that tab's pending navigation, which can't be read.
++    // That tab is dropped (nothing loads unseen), and "Open anyway" starts
++    // from an opaque origin: always cross-site to the site, never more
++    // trusted than the click itself.
++    click.initiator_origin = url::Origin();
++    click.is_renderer_initiated = true;
++    click.source_site_instance = nullptr;
++    click.initiator_frame_token.reset();
++    click.initiator_process_id = content::ChildProcessHost::kInvalidUniqueID;
++  }
++  const uint64_t id = SetOpenAnyway(
++      window, base::BindOnce(&OpenAnyway, browser->GetWeakPtr(), std::move(click)));
++  if (ToastService* toasts = ToastService::From(browser)) {
++    ToastParams toast(ToastId::kTarkSwitchedToOpenTab);
++    toast.toast_close_callback =
++        base::ScopedClosureRunner(base::BindOnce(&ClearOpenAnyway, window, id));
++    toasts->toast_controller()->MaybeShowToast(std::move(toast));
++  } else {
++    ClearOpenAnyway(window, id);
++  }
++  return true;
++}
++
++}  // namespace tark
+--- a/chrome/browser/ui/navigator/BUILD.gn
++++ b/chrome/browser/ui/navigator/BUILD.gn
+@@ -82,8 +82,14 @@
+       "browser_navigator_tab_modal.cc",
+     ]
+ 
++    sources += [
++      "tark/switch_to_open_tab.cc",
++      "tark/switch_to_open_tab.h",
++    ]
+     deps += [
+       "//chrome/browser/apps/app_service",
++      "//chrome/browser/ui/navigator/tark:rules",
++      "//chrome/browser/ui/toasts",
+       "//chrome/browser/apps/link_capturing",
+       "//chrome/browser/ui:browser_init_state",
+       "//chrome/browser/ui:status_bubble",
+--- a/chrome/browser/ui/navigator/browser_navigator.cc
++++ b/chrome/browser/ui/navigator/browser_navigator.cc
+@@ -38,6 +38,7 @@
+ #include "chrome/browser/ui/location_bar/location_bar.h"
+ #include "chrome/browser/ui/navigator/browser_navigator_params.h"
+ #include "chrome/browser/ui/navigator/browser_navigator_params_utils.h"
++#include "chrome/browser/ui/navigator/tark/switch_to_open_tab.h"
+ #include "chrome/browser/ui/singleton_tabs.h"
+ #include "chrome/browser/ui/status_bubble.h"
+ #include "chrome/browser/ui/tab_helpers.h"
+@@ -1120,6 +1121,11 @@
+ }  // namespace internal
+ 
+ base::WeakPtr<content::NavigationHandle> Navigate(NavigateParams* params) {
++  // Tark: a link that would open a new tab goes to the tab already showing
++  // that page.
++  if (tark::MaybeSwitchToOpenTab(*params)) {
++    return nullptr;
++  }
+   AdditionalParams additional_params;
+   return internal::NavigateImpl(params, additional_params);
+ }
+--- a/chrome/browser/ui/toasts/BUILD.gn
++++ b/chrome/browser/ui/toasts/BUILD.gn
+@@ -46,6 +46,7 @@
+   deps = [
+     ":toasts",
+     "//chrome/app:generated_resources",
++    "//chrome/browser/ui/navigator/tark:rules",
+     "//chrome/app:generated_resources_grit",
+     "//chrome/app/vector_icons",
+     "//chrome/browser:browser_process",
+--- a/chrome/browser/ui/toasts/toast_service.cc
++++ b/chrome/browser/ui/toasts/toast_service.cc
+@@ -32,6 +32,7 @@
+ #include "chrome/browser/ui/tabs/public/tab_features.h"
+ #include "chrome/browser/ui/tabs/saved_tab_groups/collaboration_messaging_observer.h"
+ #include "chrome/browser/ui/tabs/saved_tab_groups/collaboration_messaging_observer_factory.h"
++#include "chrome/browser/ui/navigator/tark/switch_to_open_tab_rules.h"
+ #include "chrome/browser/ui/toasts/api/toast_id.h"
+ #include "chrome/browser/ui/toasts/api/toast_registry.h"
+ #include "chrome/browser/ui/toasts/api/toast_specification.h"
+@@ -126,6 +127,20 @@
+                                   IDS_LINK_COPIED_TO_HIGHLIGHT_TOAST_BODY)
+           .Build());
+ 
++  // Tark: a link went to the tab already showing its page; "Open anyway"
++  // opens it in a new tab after all.
++  toast_registry_->RegisterToast(
++      ToastId::kTarkSwitchedToOpenTab,
++      ToastSpecification::Builder(kTabIcon, IDS_TARK_SWITCHED_TO_OPEN_TAB)
++          .AddActionButton(IDS_TARK_OPEN_ANYWAY,
++                           base::BindRepeating(
++                               [](BrowserWindowInterface* window) {
++                                 tark::RunOpenAnyway(window);
++                               },
++                               base::Unretained(browser_window_interface)))
++          .AddCloseButton()
++          .Build());
++
+   toast_registry_->RegisterToast(
+       ToastId::kAddedToReadingList,
+       ToastSpecification::Builder(features::IsRoundedIconsEnabled()
+--- a/chrome/browser/ui/toasts/api/toast_id.h
++++ b/chrome/browser/ui/toasts/api/toast_id.h
+@@ -79,7 +79,9 @@
+   kDictationNoMicrophoneError = 56,
+   kEmailVerificationLoading = 57,
+   kScheduledRestartOnIdle = 58,
+-  kMaxValue = kScheduledRestartOnIdle,
++  // Tark: a link went to the tab already showing its page.
++  kTarkSwitchedToOpenTab = 59,
++  kMaxValue = kTarkSwitchedToOpenTab,
+ };
+ // LINT.ThenChange(/tools/metrics/histograms/metadata/toasts/enums.xml:ToastId)
+ 
+--- a/chrome/browser/ui/toasts/api/toast_id.cc
++++ b/chrome/browser/ui/toasts/api/toast_id.cc
+@@ -123,6 +123,8 @@
+       return "EmailVerificationLoading";
+     case ToastId::kScheduledRestartOnIdle:
+       return "ScheduledRestartOnIdle";
++    case ToastId::kTarkSwitchedToOpenTab:
++      return "TarkSwitchedToOpenTab";
+   }
+ 
+   NOTREACHED();
+--- a/chrome/app/tark_pages_strings.grdp
++++ b/chrome/app/tark_pages_strings.grdp
+@@ -1,6 +1,12 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <!-- Tark (M3d): the sentences in Tark's own page headers. -->
+ <grit-part>
++  <message name="IDS_TARK_SWITCHED_TO_OPEN_TAB" desc="Notice over the page: a link the user clicked was already open in another tab of this window, so Tark switched to that tab instead of opening a new one.">
++    Already open · switched to that tab
++  </message>
++  <message name="IDS_TARK_OPEN_ANYWAY" desc="Button on the notice that Tark switched to an already-open tab: open the link in a new tab after all.">
++    Open anyway
++  </message>
+   <message name="IDS_TARK_PAGES_DOWNLOADS_SENTENCE" desc="Sentence under the Downloads page title. $1 is the name of the download folder.">
+     {COUNT, plural,
+       =0 {Saved to your <ph name="FOLDER">$1<ex>Downloads</ex></ph> folder}
