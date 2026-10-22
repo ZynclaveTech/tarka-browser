@@ -297,6 +297,12 @@ run ninja -k 0 -C "$_src_dir/out/Default" chrome_public_apk
 # A5: the app bundle Play takes, from the same build (debug-signed here; the
 # release key signs it on the Mac, android/release/sign.py).
 run ninja -k 0 -C "$_src_dir/out/Default" chrome_public_bundle
+# Live captions: Play installs need ONNX Runtime in the bundle's base module
+# too (the APK's loadable_modules do not reach it).
+run python3 -c 'import sys, zipfile
+names = zipfile.ZipFile(sys.argv[1]).namelist()
+sys.exit(0 if "base/lib/arm64-v8a/libonnxruntime.so" in names else "no ONNX Runtime in " + sys.argv[1])' \
+  "$_src_dir/out/Default/apks/ChromePublic.aab"
 # A2: the ad blocker's unit tests (list bundle, signature, update schedule),
 # built for this machine and run here.
 run ninja -C "$_src_dir/out/Default" chrome/browser/tark_adblock:host_unittests

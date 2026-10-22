@@ -102,6 +102,22 @@ class TestOnnxRuntime(unittest.TestCase):
         self.assertIn('third_party/tark_onnxruntime/arm64-v8a/libonnxruntime.so', patch)
         self.assertRegex(patch, r'library_always_compress = \[[^\]]*"libonnxruntime\.so"')
 
+    def test_ort_in_the_play_bundle(self):
+        # Play installs come from chrome_public_bundle, whose base module is
+        # a separate target from chrome_public_apk.
+        patch = (ANDROID / 'patches' / 'captions-ort.patch').read_text(encoding='utf-8')
+        hunks = re.split(r'(?m)^@@ ', patch)
+        base = [h for h in hunks if 'target_type = "android_app_bundle_module"' in h]
+        self.assertTrue(base, 'no hunk in the bundle base module')
+        self.assertTrue(any(
+            re.search(r'(?m)^\+\s*loadable_modules = \[.*libonnxruntime\.so', h) for h in base))
+
+    def test_build_sh_checks_the_bundle_has_ort(self):
+        text = (ANDROID / 'build.sh').read_text(encoding='utf-8')
+        check = text.index('base/lib/arm64-v8a/libonnxruntime.so')
+        self.assertLess(text.index('chrome_public_bundle'), check)
+        self.assertIn('ChromePublic.aab', text[check - 400:check + 400])
+
     def test_ort_credited(self):
         text = (ANDROID / 'captions' / 'ort.sh').read_text(encoding='utf-8')
         for name in ('README.chromium', 'LICENSE', 'ThirdPartyNotices.txt'):
