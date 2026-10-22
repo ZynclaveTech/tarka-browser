@@ -21,13 +21,20 @@ import hashlib
 import http.server
 import json
 import pathlib
+import re
 import socketserver
 import sys
 import threading
 import time
 
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / 'xlit' / 'e2e'))
-import run as xlit  # noqa: E402  (Device, tap_text)
+import importlib.util  # noqa: E402
+
+# xlit's e2e (Device, tap_text), loaded under its own name: both scripts are
+# called run.py.
+_spec = importlib.util.spec_from_file_location(
+    'xlit_e2e', pathlib.Path(__file__).resolve().parents[2] / 'xlit' / 'e2e' / 'run.py')
+xlit = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(xlit)
 
 PACKAGE = xlit.PACKAGE
 PORT = 8003
@@ -52,7 +59,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path == 'hi.wav':
             self.reply(SERVER['wav'], 'audio/wav')
             return
-        data = SERVER['files'].get(path)
+        data = SERVER['files'].get(path.removesuffix('.bin'))
         if data is None:
             self.send_response(404)
             self.end_headers()
@@ -89,8 +96,8 @@ class Device(xlit.Device):
         self.run('reverse', '--remove', f'tcp:{PORT}')
 
     def model_files(self, unit):
-        out = self.shell('ls', f'/data/user/0/{PACKAGE}/app_tark_captions/{unit}',
-                         f'/data/user/0/{PACKAGE}/captions/{unit}')
+        # base::DIR_ANDROID_APP_DATA is the app's app_chrome folder.
+        out = self.shell('ls', f'/data/user/0/{PACKAGE}/app_chrome/captions/{unit}')
         return sorted(l.strip() for l in out.splitlines()
                       if l.strip() and 'No such file' not in l and not l.endswith('.sha256'))
 
@@ -114,9 +121,15 @@ def open_page_and_play(dev):
     dev.shell('am', 'start', '-n', f'{PACKAGE}/com.google.android.apps.chrome.Main',
               '-a', 'android.intent.action.VIEW', '-d', f'http://127.0.0.1:{PORT}/page.html')
     time.sleep(5)
-    # The video's play button (a tap on the video starts it with the person's gesture).
-    xml = dev.screen()
-    xlit.tap_text(dev, 'play', tries=3, contains=True) or dev.shell('input', 'tap', '540', '400')
+    # The media controls' play button (its label is "play"): a tap is the
+    # person's gesture that starts it.
+    for _ in range(5):
+        m = re.search(r'content-desc="play"[^>]*bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"', dev.screen())
+        if m:
+            x1, y1, x2, y2 = map(int, m.groups())
+            dev.shell('input', 'tap', str((x1 + x2) // 2), str((y1 + y2) // 2))
+            break
+        time.sleep(2)
     time.sleep(3)
 
 
@@ -125,6 +138,12 @@ def bar_shown(dev):
 
 
 def captions_on(dev):
+    # The command-line flags' snackbar ("loading flags from a command-line
+    # file") covers the bar for its first seconds after a start.
+    for _ in range(15):
+        if 'command-line file' not in dev.screen():
+            break
+        time.sleep(2)
     return xlit.tap_text(dev, 'Captions', tries=3)
 
 
@@ -174,6 +193,10 @@ def case_caption(dev, golden):
     assert dev.logged('tark captions: ready hi', 300), 'Hindi never became ready'
     assert dev.logged('tark captions: engine started hi', 60), 'no captions process'
     assert dev.logged('tark captions: final ', 90), 'no caption'
+    # The clip loops (9 s): a full loop of captions, not only its tail.
+    end = time.time() + 60
+    while time.time() < end and dev.log().count('tark captions: final ') < 4:
+        time.sleep(3)
     finals = [l.split('tark captions: final ', 1)[1] for l in dev.log().splitlines()
               if 'tark captions: final ' in l]
     want = golden['ctc_text'].split()
@@ -201,7 +224,7 @@ def case_settings(dev):
               'org.chromium.chrome.browser.tark_captions.TarkLiveCaptionsSettings')
     time.sleep(4)
     screen = dev.screen()
-    assert 'Live captions' in screen and 'Phrase' in screen, 'no Live captions settings'
+    assert 'Live captions' in screen and 'phrase at a time' in screen, 'no Live captions settings'
     assert xlit.tap_text(dev, 'Hindi', tries=3), 'Hindi not listed'
     assert xlit.tap_text(dev, 'Delete', tries=3), 'no Delete'
     time.sleep(3)
@@ -232,6 +255,7 @@ def main(argv=None):
     if not args.serial.startswith('emulator-'):
         sys.exit('emulator only')
     golden = load(args.models_dir, args.testdata_dir)
+    socketserver.ThreadingTCPServer.allow_reuse_address = True
     server = socketserver.ThreadingTCPServer(('127.0.0.1', PORT), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     dev = Device(args.serial)
