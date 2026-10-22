@@ -194,7 +194,7 @@
 +#endif  // CHROME_BROWSER_TARK_CAPTIONS_ANDROID_ANDROID_TARK_CAPTIONS_BRIDGE_H_
 --- /dev/null
 +++ b/chrome/browser/tark_captions_android/tark_captions_tab.cc
-@@ -0,0 +1,319 @@
+@@ -0,0 +1,332 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -203,6 +203,7 @@
 +
 +#include <utility>
 +
++#include "base/command_line.h"
 +#include "base/files/file_util.h"
 +#include "base/functional/bind.h"
 +#include "base/logging.h"
@@ -222,6 +223,8 @@
 +
 +constexpr base::TimeDelta kTick = base::Seconds(1);
 +constexpr char kDefaultLanguage[] = "hi";
++// For android/captions/e2e/run.py only: log final captions' text.
++constexpr char kLogTextSwitch[] = "tark-captions-log-text";
 +
 +// The fastest core's top frequency (kHz), for the caption style.
 +int FastestCoreKhz() {
@@ -384,7 +387,11 @@
 +  if (!logic_.ShouldForwardAudio()) {
 +    return;
 +  }
++  const bool was_cant_caption = logic_.state().cant_caption;
 +  logic_.OnAudio(base::TimeTicks::Now());
++  if (was_cant_caption) {
++    Update();  // audio came back: captions start again
++  }
 +  if (service_.is_bound()) {
 +    service_->AddAudio(mono, sample_rate);
 +  }
@@ -399,7 +406,13 @@
 +  if (is_final) {
 +    final_text_ = text;
 +    draft_text_.clear();
-+    LOG(WARNING) << "tark captions: final " << text;
++    // What the person hears stays out of the log; android/captions/e2e/run.py
++    // passes --tark-captions-log-text (a debuggable device's command line).
++    if (base::CommandLine::ForCurrentProcess()->HasSwitch(kLogTextSwitch)) {
++      LOG(WARNING) << "tark captions: final " << text;
++    } else {
++      LOG(WARNING) << "tark captions: final (" << text.size() << " bytes)";
++    }
 +  } else {
 +    draft_text_ = text;
 +  }
