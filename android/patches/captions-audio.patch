@@ -1,0 +1,491 @@
+--- /dev/null
++++ b/chrome/common/tark_captions/BUILD.gn
+@@ -0,0 +1,10 @@
++# Copyright 2026 The Tark Authors
++# Use of this source code is governed by a BSD-style license that can be
++# found in the LICENSE file.
++
++import("//mojo/public/tools/bindings/mojom.gni")
++
++# Tark for Android's live captions: a frame's audio to its tab's captions.
++mojom("mojom") {
++  sources = [ "caption_audio.mojom" ]
++}
+--- /dev/null
++++ b/chrome/common/tark_captions/caption_audio.mojom
+@@ -0,0 +1,23 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// Tark for Android's live captions: a frame's media audio, from the
++// renderer to its tab's captions in the browser, only while the person has
++// captions on in that tab.
++module tark_captions.mojom;
++
++// The browser's side, one per frame.
++interface CaptionAudio {
++  // Mono audio at `sample_rate`, about 100 ms at a time.
++  Add(array<float> mono, int32 sample_rate);
++  // The renderer listens for whether to send audio at all.
++  Observe(pending_remote<CaptionAudioSwitch> audio_switch);
++};
++
++// The renderer's side.
++interface CaptionAudioSwitch {
++  // Captions on in this tab (and the model ready, the tab shown): send
++  // audio; off: send nothing.
++  SetOn(bool on);
++};
+--- a/chrome/renderer/BUILD.gn
++++ b/chrome/renderer/BUILD.gn
+@@ -340,11 +340,14 @@
+       "sandbox_status_extension_android.h",
+       "tark_adblock/tark_adblock_frame_observer.cc",
+       "tark_adblock/tark_adblock_frame_observer.h",
++      "tark_captions/tark_captions_audio_client.cc",
++      "tark_captions/tark_captions_audio_client.h",
+       "wallet/boarding_pass_extractor.cc",
+       "wallet/boarding_pass_extractor.h",
+     ]
+     deps += [
+       "//chrome/common/tark_adblock:mojom",
++      "//chrome/common/tark_captions:mojom",
+       "//chrome/common/wallet:mojo_bindings",
+     ]
+   } else {
+--- a/chrome/renderer/chrome_content_renderer_client.cc
++++ b/chrome/renderer/chrome_content_renderer_client.cc
+@@ -75,6 +75,7 @@
+ #include "chrome/renderer/websocket_handshake_throttle_provider_impl.h"
+ #include "chrome/renderer/webui_browser/webui_browser_renderer_extension.h"
+ #include "chrome/renderer/tark_adblock/tark_adblock_frame_observer.h"
++#include "chrome/renderer/tark_captions/tark_captions_audio_client.h"
+ #include "chrome/renderer/worker_content_settings_client.h"
+ #include "chrome/services/speech/buildflags/buildflags.h"
+ #include "components/autofill/content/renderer/autofill_agent.h"
+@@ -1457,6 +1458,13 @@
+     content::RenderFrame* render_frame) {
+   return std::make_unique<ChromeSpeechRecognitionClient>(render_frame);
+ }
++#elif BUILDFLAG(IS_ANDROID)
++// Tark: live captions' audio, sent to the browser only while captions are on.
++std::unique_ptr<media::SpeechRecognitionClient>
++ChromeContentRendererClient::CreateSpeechRecognitionClient(
++    content::RenderFrame* render_frame) {
++  return std::make_unique<tark_captions::TarkCaptionsAudioClient>(render_frame);
++}
+ #endif  // BUILDFLAG(ENABLE_SPEECH_SERVICE)
+ 
+ void ChromeContentRendererClient::RunScriptsAtDocumentStart(
+--- a/chrome/renderer/chrome_content_renderer_client.h
++++ b/chrome/renderer/chrome_content_renderer_client.h
+@@ -169,10 +169,10 @@
+   std::unique_ptr<blink::WebContentSettingsClient>
+   CreateWorkerContentSettingsClient(
+       content::RenderFrame* render_frame) override;
+-#if BUILDFLAG(ENABLE_SPEECH_SERVICE)
++#if BUILDFLAG(ENABLE_SPEECH_SERVICE) || BUILDFLAG(IS_ANDROID)
+   std::unique_ptr<media::SpeechRecognitionClient> CreateSpeechRecognitionClient(
+       content::RenderFrame* render_frame) override;
+-#endif  // BUILDFLAG(ENABLE_SPEECH_SERVICE)
++#endif  // BUILDFLAG(ENABLE_SPEECH_SERVICE) || BUILDFLAG(IS_ANDROID)
+   std::unique_ptr<media::KeySystemSupportRegistration> GetSupportedKeySystems(
+       content::RenderFrame* render_frame,
+       media::GetSupportedKeySystemsCB cb) override;
+--- /dev/null
++++ b/chrome/renderer/tark_captions/tark_captions_audio_client.cc
+@@ -0,0 +1,73 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/renderer/tark_captions/tark_captions_audio_client.h"
++
++#include <utility>
++
++#include "content/public/renderer/render_frame.h"
++#include "media/base/audio_buffer.h"
++#include "media/base/audio_bus.h"
++#include "third_party/blink/public/common/browser_interface_broker_proxy.h"
++
++namespace tark_captions {
++
++TarkCaptionsAudioClient::TarkCaptionsAudioClient(content::RenderFrame* render_frame) {
++  mojo::PendingRemote<mojom::CaptionAudio> audio;
++  render_frame->GetBrowserInterfaceBroker().GetInterface(
++      audio.InitWithNewPipeAndPassReceiver());
++  audio_ = mojo::SharedRemote<mojom::CaptionAudio>(std::move(audio));
++  audio_->Observe(switch_.BindNewPipeAndPassRemote());
++}
++
++TarkCaptionsAudioClient::~TarkCaptionsAudioClient() = default;
++
++void TarkCaptionsAudioClient::AddAudio(scoped_refptr<media::AudioBuffer> buffer,
++                                       std::optional<base::TimeDelta> media_start_pts) {
++  if (!on_.load(std::memory_order_relaxed) || !buffer || buffer->end_of_stream()) {
++    batch_.clear();
++    return;
++  }
++  const int rate = buffer->sample_rate();
++  if (rate != batch_rate_) {
++    batch_.clear();
++    batch_rate_ = rate;
++  }
++  const int channels = buffer->channel_count();
++  const int frames = buffer->frame_count();
++  std::unique_ptr<media::AudioBus> bus = media::AudioBus::Create(channels, frames);
++  buffer->ReadFrames(frames, 0, 0, bus.get());
++  for (int i = 0; i < frames; ++i) {
++    float sum = 0;
++    for (int c = 0; c < channels; ++c) {
++      sum += bus->channel_span(c)[i];
++    }
++    batch_.push_back(sum / channels);
++  }
++  if (static_cast<int>(batch_.size()) >= rate / 10) {
++    audio_->Add(std::move(batch_), rate);
++    batch_ = std::vector<float>();
++  }
++}
++
++void TarkCaptionsAudioClient::AddAudio(const media::AudioBus& audio_bus) {
++  // Web Audio and calls: Phase 2.
++}
++
++bool TarkCaptionsAudioClient::IsSpeechRecognitionAvailable() {
++  return true;
++}
++
++void TarkCaptionsAudioClient::SetOnReadyCallback(OnReadyCallback callback) {
++  // Ready at once: whether audio is sent is the browser's switch.
++  std::move(callback).Run();
++}
++
++void TarkCaptionsAudioClient::Reconfigure(const media::AudioParameters& audio_parameters) {}
++
++void TarkCaptionsAudioClient::SetOn(bool on) {
++  on_.store(on, std::memory_order_relaxed);
++}
++
++}  // namespace tark_captions
+--- /dev/null
++++ b/chrome/renderer/tark_captions/tark_captions_audio_client.h
+@@ -0,0 +1,57 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_RENDERER_TARK_CAPTIONS_TARK_CAPTIONS_AUDIO_CLIENT_H_
++#define CHROME_RENDERER_TARK_CAPTIONS_TARK_CAPTIONS_AUDIO_CLIENT_H_
++
++#include <atomic>
++#include <vector>
++
++#include "base/memory/scoped_refptr.h"
++#include "chrome/common/tark_captions/caption_audio.mojom.h"
++#include "media/base/speech_recognition_client.h"
++#include "mojo/public/cpp/bindings/receiver.h"
++#include "mojo/public/cpp/bindings/shared_remote.h"
++
++namespace content {
++class RenderFrame;
++}  // namespace content
++
++namespace tark_captions {
++
++// Tark for Android's live captions: Chromium's speech-recognition hook in
++// the media player (AudioRendererImpl) hands each decoded buffer here; it
++// goes to the browser as mono audio in ~100 ms batches, only while the
++// browser says captions are on in this tab. Nothing is recognised here.
++class TarkCaptionsAudioClient : public media::SpeechRecognitionClient,
++                                public mojom::CaptionAudioSwitch {
++ public:
++  explicit TarkCaptionsAudioClient(content::RenderFrame* render_frame);
++  TarkCaptionsAudioClient(const TarkCaptionsAudioClient&) = delete;
++  TarkCaptionsAudioClient& operator=(const TarkCaptionsAudioClient&) = delete;
++  ~TarkCaptionsAudioClient() override;
++
++  // media::SpeechRecognitionClient:
++  void AddAudio(scoped_refptr<media::AudioBuffer> buffer,
++                std::optional<base::TimeDelta> media_start_pts) override;
++  void AddAudio(const media::AudioBus& audio_bus) override;
++  bool IsSpeechRecognitionAvailable() override;
++  void SetOnReadyCallback(OnReadyCallback callback) override;
++  void Reconfigure(const media::AudioParameters& audio_parameters) override;
++
++  // mojom::CaptionAudioSwitch:
++  void SetOn(bool on) override;
++
++ private:
++  mojo::SharedRemote<mojom::CaptionAudio> audio_;
++  mojo::Receiver<mojom::CaptionAudioSwitch> switch_{this};
++  std::atomic<bool> on_{false};
++  // Buffered on the media thread (AddAudio's).
++  std::vector<float> batch_;
++  int batch_rate_ = 0;
++};
++
++}  // namespace tark_captions
++
++#endif  // CHROME_RENDERER_TARK_CAPTIONS_TARK_CAPTIONS_AUDIO_CLIENT_H_
+--- a/content/public/renderer/content_renderer_client.cc
++++ b/content/public/renderer/content_renderer_client.cc
+@@ -253,13 +253,11 @@
+   return nullptr;
+ }
+ 
+-#if !BUILDFLAG(IS_ANDROID)
+ std::unique_ptr<media::SpeechRecognitionClient>
+ ContentRendererClient::CreateSpeechRecognitionClient(
+     RenderFrame* render_frame) {
+   return nullptr;
+ }
+-#endif
+ 
+ bool ContentRendererClient::ShouldEnforceWebRTCRoutingPreferences() {
+   return true;
+--- a/content/public/renderer/content_renderer_client.h
++++ b/content/public/renderer/content_renderer_client.h
+@@ -335,11 +335,9 @@
+   virtual std::unique_ptr<blink::WebContentSettingsClient>
+   CreateWorkerContentSettingsClient(RenderFrame* render_frame);
+ 
+-#if !BUILDFLAG(IS_ANDROID)
+   // Creates a speech recognition client used to transcribe audio into captions.
+   virtual std::unique_ptr<media::SpeechRecognitionClient>
+   CreateSpeechRecognitionClient(RenderFrame* render_frame);
+-#endif
+ 
+   // Notifies that a document element has been inserted in the frame's document.
+   // This may be called multiple times for the same document. This method may
+--- a/content/renderer/media/media_factory.cc
++++ b/content/renderer/media/media_factory.cc
+@@ -239,19 +239,13 @@
+     media::DecoderFactory* decoder_factory,
+     content::RenderThreadImpl* render_thread,
+     content::RenderFrameImpl* render_frame) {
+-#if BUILDFLAG(IS_ANDROID)
+-  auto factory = std::make_unique<media::RendererImplFactory>(
+-      media_log, decoder_factory,
+-      base::BindRepeating(&content::RenderThreadImpl::GetGpuFactories,
+-                          base::Unretained(render_thread)),
+-      player_id);
+-#else
++  // Tark: Android's players get the frame's speech client too (live
++  // captions).
+   auto factory = std::make_unique<media::RendererImplFactory>(
+       media_log, decoder_factory,
+       base::BindRepeating(&content::RenderThreadImpl::GetGpuFactories,
+                           base::Unretained(render_thread)),
+       player_id, render_frame->CreateSpeechRecognitionClient());
+-#endif
+   return factory;
+ }
+ 
+--- a/content/renderer/render_frame_impl.cc
++++ b/content/renderer/render_frame_impl.cc
+@@ -3635,7 +3635,6 @@
+       this);
+ }
+ 
+-#if !BUILDFLAG(IS_ANDROID)
+ std::unique_ptr<media::SpeechRecognitionClient>
+ RenderFrameImpl::CreateSpeechRecognitionClient() {
+   if (!frame_ || !frame_->View()) {
+@@ -3643,7 +3642,6 @@
+   }
+   return GetContentClient()->renderer()->CreateSpeechRecognitionClient(this);
+ }
+-#endif
+ 
+ scoped_refptr<blink::WebWorkerFetchContext>
+ RenderFrameImpl::CreateWorkletFetchContext() {
+--- /dev/null
++++ b/content/renderer/render_frame_impl.h
+@@ -490,10 +490,8 @@
+       scoped_refptr<base::TaskRunner> compositor_worker_task_runner) override;
+   std::unique_ptr<blink::WebContentSettingsClient>
+   CreateWorkerContentSettingsClient() override;
+-#if !BUILDFLAG(IS_ANDROID)
+   std::unique_ptr<media::SpeechRecognitionClient>
+   CreateSpeechRecognitionClient() override;
+-#endif
+   scoped_refptr<blink::WebWorkerFetchContext> CreateWorkletFetchContext()
+       override;
+   scoped_refptr<blink::WebWorkerFetchContext> CreateWorkerFetchContext(
+--- a/media/renderers/audio_renderer_impl.cc
++++ b/media/renderers/audio_renderer_impl.cc
+@@ -81,12 +81,9 @@
+       received_end_of_stream_(false),
+       rendered_end_of_stream_(false),
+       is_suspending_(false),
+-#if BUILDFLAG(IS_ANDROID)
+-      is_passthrough_(false) {
+-#else
++      // Tark: the speech path on Android too (live captions).
+       is_passthrough_(false),
+       speech_recognition_client_(speech_recognition_client) {
+-#endif
+   DCHECK(create_audio_decoders_cb_);
+   // PowerObserver's must be added and removed from the same thread, but we
+   // won't remove the observer until we're destructed on |task_runner_| so we
+@@ -218,9 +215,7 @@
+   audio_clock_ =
+       std::make_unique<AudioClock>(time, audio_parameters_.sample_rate());
+ 
+-#if !BUILDFLAG(IS_ANDROID)
+   send_pts_for_transcription_ = true;
+-#endif
+ }
+ 
+ base::TimeDelta AudioRendererImpl::CurrentMediaTime() {
+@@ -419,14 +414,12 @@
+       base::BindOnce(&AudioRendererImpl::OnDeviceInfoReceived,
+                      weak_factory_.GetWeakPtr(), demuxer_stream_, cdm_context));
+ 
+-#if !BUILDFLAG(IS_ANDROID)
+   if (speech_recognition_client_) {
+     speech_recognition_client_->SetOnReadyCallback(
+         base::BindPostTaskToCurrentDefault(
+             base::BindOnce(&AudioRendererImpl::EnableSpeechRecognition,
+                            weak_factory_.GetWeakPtr())));
+   }
+-#endif
+ }
+ 
+ void AudioRendererImpl::InitializeSink() {
+@@ -1154,7 +1147,6 @@
+     if (first_packet_timestamp_ == kNoTimestamp)
+       first_packet_timestamp_ = buffer->timestamp();
+ 
+-#if !BUILDFLAG(IS_ANDROID)
+     // Do not transcribe muted streams initiated by autoplay if the stream was
+     // never unmuted.
+     if (transcribe_audio_callback_ &&
+@@ -1163,7 +1155,6 @@
+       task_runner_->PostTask(
+           FROM_HERE, base::BindOnce(transcribe_audio_callback_, buffer));
+     }
+-#endif
+ 
+     if (state_ != kUninitialized)
+       algorithm_->EnqueueBuffer(std::move(buffer));
+@@ -1619,17 +1610,14 @@
+ }
+ 
+ void AudioRendererImpl::EnableSpeechRecognition() {
+-#if !BUILDFLAG(IS_ANDROID)
+   DCHECK(task_runner_->RunsTasksInCurrentSequence());
+   MEDIA_LOG(INFO, media_log_) << "Enabling transcription.";
+   transcribe_audio_callback_ = base::BindRepeating(
+       &AudioRendererImpl::TranscribeAudio, weak_factory_.GetWeakPtr());
+-#endif
+ }
+ 
+ void AudioRendererImpl::TranscribeAudio(
+     scoped_refptr<media::AudioBuffer> buffer) {
+-#if !BUILDFLAG(IS_ANDROID)
+   DCHECK(task_runner_->RunsTasksInCurrentSequence());
+   if (speech_recognition_client_ && sink_->IsOptimizedForHardwareParameters()) {
+     // TODO(crbug.com/413823334): Resend a `new_timestamp` when large
+@@ -1641,7 +1629,6 @@
+     speech_recognition_client_->AddAudio(std::move(buffer),
+                                          std::move(new_timestamp));
+   }
+-#endif
+ }
+ 
+ void AudioRendererImpl::MaybeStartRealSink() {
+--- a/media/renderers/audio_renderer_impl.h
++++ b/media/renderers/audio_renderer_impl.h
+@@ -419,7 +419,6 @@
+ 
+   // End variables which must be accessed under |lock_|. ----------------------
+ 
+-#if !BUILDFLAG(IS_ANDROID)
+   raw_ptr<SpeechRecognitionClient, DanglingUntriaged>
+       speech_recognition_client_;
+   TranscribeAudioCallback transcribe_audio_callback_;
+@@ -427,7 +426,6 @@
+   // Whether there was a discontinuity in the audio's presentation timestamps,
+   // and we should send a new PTS to `speech_recognition_client_`.
+   bool send_pts_for_transcription_ = true;
+-#endif
+ 
+   // Ensures we don't issue log spam when absurd delay values are encountered.
+   int num_absurd_delay_warnings_ = 0;
+--- a/media/renderers/renderer_impl_factory.cc
++++ b/media/renderers/renderer_impl_factory.cc
+@@ -32,7 +32,8 @@
+       media_player_id_(media_player_id) {
+   DCHECK(decoder_factory_);
+ }
+-#else
++#endif
++// Tark: on Android too, for live captions.
+ RendererImplFactory::RendererImplFactory(
+     MediaLog* media_log,
+     DecoderFactory* decoder_factory,
+@@ -46,7 +47,6 @@
+       speech_recognition_client_(std::move(speech_recognition_client)) {
+   DCHECK(decoder_factory_);
+ }
+-#endif
+ 
+ RendererImplFactory::~RendererImplFactory() = default;
+ 
+@@ -96,13 +96,7 @@
+       // finishes.
+       base::BindRepeating(&RendererImplFactory::CreateAudioDecoders,
+                           base::Unretained(this), media_task_runner),
+-      media_log_.get(), media_player_id_
+-#if BUILDFLAG(IS_ANDROID)
+-      ));
+-#else
+-      ,
+-      speech_recognition_client_.get()));
+-#endif
++      media_log_.get(), media_player_id_, speech_recognition_client_.get()));
+ 
+   GpuVideoAcceleratorFactories* gpu_factories = nullptr;
+   if (get_gpu_factories_cb_)
+--- a/media/renderers/renderer_impl_factory.h
++++ b/media/renderers/renderer_impl_factory.h
+@@ -16,9 +16,7 @@
+ #include "media/base/media_player_logging_id.h"
+ #include "media/base/renderer_factory.h"
+ 
+-#if !BUILDFLAG(IS_ANDROID)
+ #include "media/base/speech_recognition_client.h"
+-#endif
+ 
+ namespace media {
+ 
+@@ -47,14 +45,14 @@
+                       DecoderFactory* decoder_factory,
+                       const GetGpuFactoriesCB& get_gpu_factories_cb,
+                       MediaPlayerLoggingID media_player_id);
+-#else
++#endif
++  // Tark: on Android too, for live captions.
+   RendererImplFactory(
+       MediaLog* media_log,
+       DecoderFactory* decoder_factory,
+       const GetGpuFactoriesCB& get_gpu_factories_cb,
+       MediaPlayerLoggingID media_player_id,
+       std::unique_ptr<SpeechRecognitionClient> speech_recognition_client);
+-#endif
+ 
+   RendererImplFactory(const RendererImplFactory&) = delete;
+   RendererImplFactory& operator=(const RendererImplFactory&) = delete;
+@@ -90,9 +88,7 @@
+   // WebMediaPlayerImpl id.
+   MediaPlayerLoggingID media_player_id_;
+ 
+-#if !BUILDFLAG(IS_ANDROID)
+   std::unique_ptr<SpeechRecognitionClient> speech_recognition_client_;
+-#endif
+ };
+ 
+ }  // namespace media

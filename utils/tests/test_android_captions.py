@@ -80,7 +80,7 @@ def hunk_count_errors(text):
 
 class TestPatchShapes(unittest.TestCase):
     def test_hunk_counts_match(self):
-        for name in ('captions-ort.patch', 'captions-engine.patch', 'captions-downloads.patch'):
+        for name in sorted(p.name for p in (ANDROID / 'patches').glob('captions-*.patch')):
             text = (ANDROID / 'patches' / name).read_text(encoding='utf-8')
             self.assertEqual(hunk_count_errors(text), [], name)
         conventions = ROOT / 'patches' / 'tarka' / 'captions' / 'engine-conventions.patch'
@@ -173,6 +173,70 @@ class TestModels(unittest.TestCase):
         text = (ANDROID / 'build.sh').read_text(encoding='utf-8')
         self.assertIn('android/captions/models.py" header', text)
         self.assertIn('chrome/browser/tark_captions_android/model_files.inc', text)
+
+
+
+def added_lines(patch, path):
+    text = (ANDROID / 'patches' / patch).read_text(encoding='utf-8')
+    for sec in re.split(r'(?m)^(?=--- )', text):
+        if sec.split('\n', 2)[1:2] == [f'+++ b/{path}']:
+            return [l[1:] for l in sec.splitlines() if l.startswith('+') and not l.startswith('+++')]
+    return []
+
+
+def grit_id(text):
+    import hashlib
+    fp = int(hashlib.md5(text.encode('utf-8')).hexdigest()[:16], 16)
+    if fp & 0x8000000000000000:
+        fp = -((~fp & 0xFFFFFFFFFFFFFFFF) + 1)
+    return str(fp & 0x7FFFFFFFFFFFFFFF)
+
+
+class TestCaptionsUi(unittest.TestCase):
+    GRD = 'chrome/browser/ui/android/strings/android_chrome_strings.grd'
+    XTB = 'chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb'
+
+    def messages(self):
+        lines = added_lines('captions-ui.patch', self.GRD)
+        text = '\n'.join(lines)
+        return re.findall(r'<message name="(IDS_TARK_[A-Z_]+)"[^>]*>\s*(.*?)\s*</message>', text, re.S)
+
+    def test_every_caption_string_has_hindi(self):
+        ui = (ANDROID / 'patches' / 'captions-ui.patch').read_text(encoding='utf-8')
+        # Translations already in the xtb (Download now, Try again, ...) are reused.
+        xtb_ids = set(re.findall(r'<translation id="(\d+)"', ui))
+        for name, en in self.messages():
+            fp = re.sub(r'<ph name="([A-Z_]+)">.*?</ph>', lambda m: m.group(1), en)
+            reused = name in ('IDS_TARK_CAPTIONS_WAITING_FOR_WIFI', 'IDS_TARK_CAPTIONS_DOWNLOAD_NOW',
+                              'IDS_TARK_CAPTIONS_TRY_AGAIN', 'IDS_TARK_CAPTIONS_STYLE_AUTOMATIC')
+            self.assertTrue(reused or grit_id(fp) in xtb_ids, name)
+
+    def test_no_duplicate_xtb_ids(self):
+        ids = re.findall(r'<translation id="(\d+)"', '\n'.join(added_lines('captions-ui.patch', self.XTB)))
+        self.assertEqual(len(ids), len(set(ids)))
+        self.assertGreaterEqual(len(ids), 19)
+
+    def test_xtb_keeps_no_trailing_newline(self):
+        text = (ANDROID / 'patches' / 'captions-ui.patch').read_text(encoding='utf-8')
+        for m in re.finditer(r'^ </translationbundle>\n(.*)$', text, re.M):
+            self.assertEqual(m.group(1), '\\ No newline at end of file')
+
+    def test_bar_has_no_translate_in_phase1(self):
+        bar = '\n'.join(added_lines('captions-ui.patch', 'chrome/android/java/res/layout/tark_caption_bar.xml'))
+        self.assertIn('tark_captions_chip', bar)
+        self.assertNotIn('translate', bar.lower())
+
+    def test_connects_row_names_model_downloads(self):
+        rows = '\n'.join(added_lines('captions-ui.patch', 'chrome/android/java/res/xml/privacy_preferences.xml'))
+        self.assertIn('tark_connects_captions', rows)
+        names = dict(self.messages())
+        self.assertIn('gettarka.com', names['IDS_TARK_CONNECTS_CAPTIONS'])
+
+    def test_settings_row_in_accessibility(self):
+        rows = '\n'.join(added_lines(
+            'captions-ui.patch',
+            'components/browser_ui/accessibility/android/java/res/xml/accessibility_preferences.xml'))
+        self.assertIn('org.chromium.chrome.browser.tark_captions.TarkLiveCaptionsSettings', rows)
 
 
 if __name__ == '__main__':

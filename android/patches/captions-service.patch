@@ -1,0 +1,536 @@
+--- a/BUILD.gn
++++ b/BUILD.gn
+@@ -104,6 +104,7 @@
+       "//components/gwp_asan:gwp_asan_unittests",
+       "//components/tark_captions:host_unittests",
+       "//chrome/browser/tark_captions_android:host_unittests",
++      "//chrome/services/tark_captions:host_unittests",
+       "//infra/orchestrator:orchestrator_all",
+       "//net:net_unittests",
+       "//sandbox:sandbox_unittests",
+--- /dev/null
++++ b/chrome/services/tark_captions/BUILD.gn
+@@ -0,0 +1,51 @@
++# Copyright 2026 The Tark Authors
++# Use of this source code is governed by a BSD-style license that can be
++# found in the LICENSE file.
++#
++# Tark for Android's live captions process: the caption engine on the model
++# files the browser hands over. CaptionSession has no mojo or engine
++# dependencies, so its tests build for the build machine.
++
++import("//testing/test.gni")
++
++source_set("session") {
++  sources = [
++    "caption_session.cc",
++    "caption_session.h",
++  ]
++  deps = [ "//base" ]
++}
++
++source_set("lib") {
++  sources = [
++    "caption_service_impl.cc",
++    "caption_service_impl.h",
++  ]
++  deps = [
++    ":session",
++    "//base",
++    "//components/tark_captions",
++    "//mojo/public/cpp/bindings",
++  ]
++  public_deps = [ "//chrome/services/tark_captions/public/mojom" ]
++}
++
++if (!is_android) {
++  test("tark_captions_session_unittests") {
++    sources = [ "caption_session_unittest.cc" ]
++    deps = [
++      ":session",
++      "//base",
++      "//base/test:run_all_unittests",
++      "//base/test:test_support",
++      "//testing/gtest",
++    ]
++  }
++}
++
++if (current_toolchain == default_toolchain) {
++  group("host_unittests") {
++    testonly = true
++    deps = [ ":tark_captions_session_unittests($host_toolchain)" ]
++  }
++}
+--- /dev/null
++++ b/chrome/services/tark_captions/caption_service_impl.cc
+@@ -0,0 +1,104 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/services/tark_captions/caption_service_impl.h"
++
++#include <map>
++#include <utility>
++
++#include "base/files/file_path.h"
++#include "base/functional/bind.h"
++#include "base/logging.h"
++#include "components/tark_captions/asr_model.h"
++#include "components/tark_captions/caption_engine.h"
++#include "components/tark_captions/model_source.h"
++
++namespace tark_captions {
++namespace {
++
++// ONNX Runtime's library, in the APK beside libchrome.so (extracted at
++// install), found by name.
++constexpr char kOrtLibrary[] = "libonnxruntime.so";
++
++class RealEngine : public SpeechEngine {
++ public:
++  RealEngine(std::unique_ptr<CaptionEngine> engine, CaptionCallback on_caption)
++      : engine_(std::move(engine)), on_caption_(std::move(on_caption)) {}
++
++  void AddAudio(base::span<const float> pcm, int sample_rate) override {
++    engine_->AddAudio(pcm, 1, sample_rate,
++                      base::BindRepeating(
++                          [](CaptionCallback* on_caption, CaptionEvent event) {
++                            on_caption->Run(event.is_final, std::move(event.text));
++                          },
++                          base::Unretained(&on_caption_)));
++  }
++
++ private:
++  std::unique_ptr<CaptionEngine> engine_;
++  CaptionCallback on_caption_;
++};
++
++std::unique_ptr<SpeechEngine> MakeEngine(std::map<std::string, base::File> files,
++                                         const EngineOptions& options,
++                                         CaptionCallback on_caption) {
++  CaptionEngine::Options engine_options;
++  engine_options.threads = options.threads;
++  engine_options.segmenter.phrase = options.phrase;
++  engine_options.segmenter.draft_every = options.draft_every;
++  engine_options.segmenter.max_segment = options.max_segment;
++  std::unique_ptr<CaptionEngine> engine = CaptionEngine::Create(
++      std::make_unique<MappedFilesSource>(std::move(files)), base::FilePath(kOrtLibrary),
++      engine_options);
++  if (!engine) {
++    LOG(WARNING) << "tark captions: the model did not load";
++    return nullptr;
++  }
++  if (std::optional<Language> language = LanguageFromCode(options.language)) {
++    engine->SetLanguage(*language);
++  }
++  return std::make_unique<RealEngine>(std::move(engine), std::move(on_caption));
++}
++
++}  // namespace
++
++CaptionServiceImpl::CaptionServiceImpl(mojo::PendingReceiver<mojom::CaptionService> receiver)
++    : receiver_(this, std::move(receiver)), session_(base::BindRepeating(&MakeEngine)) {}
++
++CaptionServiceImpl::~CaptionServiceImpl() = default;
++
++void CaptionServiceImpl::Start(base::flat_map<std::string, base::File> files,
++                               mojom::CaptionOptionsPtr options,
++                               mojo::PendingRemote<mojom::CaptionClient> client,
++                               StartCallback callback) {
++  client_.reset();
++  client_.Bind(std::move(client));
++  EngineOptions engine_options;
++  engine_options.language = options->language;
++  engine_options.threads = options->threads;
++  engine_options.phrase = options->phrase;
++  std::map<std::string, base::File> by_name;
++  for (auto& [name, file] : files) {
++    by_name.emplace(name, std::move(file));
++  }
++  std::move(callback).Run(session_.Start(
++      std::move(by_name), engine_options,
++      base::BindRepeating(
++          [](mojo::Remote<mojom::CaptionClient>* client, bool is_final, std::string text) {
++            if (client->is_bound()) {
++              (*client)->OnCaption(is_final, text);
++            }
++          },
++          base::Unretained(&client_))));
++}
++
++void CaptionServiceImpl::AddAudio(const std::vector<float>& pcm, int32_t sample_rate) {
++  session_.AddAudio(pcm, sample_rate);
++}
++
++void CaptionServiceImpl::Stop() {
++  session_.Stop();
++}
++
++}  // namespace tark_captions
+--- /dev/null
++++ b/chrome/services/tark_captions/caption_service_impl.h
+@@ -0,0 +1,41 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_SERVICES_TARK_CAPTIONS_CAPTION_SERVICE_IMPL_H_
++#define CHROME_SERVICES_TARK_CAPTIONS_CAPTION_SERVICE_IMPL_H_
++
++#include "chrome/services/tark_captions/caption_session.h"
++#include "chrome/services/tark_captions/public/mojom/tark_captions.mojom.h"
++#include "mojo/public/cpp/bindings/pending_receiver.h"
++#include "mojo/public/cpp/bindings/receiver.h"
++#include "mojo/public/cpp/bindings/remote.h"
++
++namespace tark_captions {
++
++// The captions process's service: a CaptionSession running Tark's caption
++// engine on the handed-over files.
++class CaptionServiceImpl : public mojom::CaptionService {
++ public:
++  explicit CaptionServiceImpl(mojo::PendingReceiver<mojom::CaptionService> receiver);
++  CaptionServiceImpl(const CaptionServiceImpl&) = delete;
++  CaptionServiceImpl& operator=(const CaptionServiceImpl&) = delete;
++  ~CaptionServiceImpl() override;
++
++  // mojom::CaptionService:
++  void Start(base::flat_map<std::string, base::File> files,
++             mojom::CaptionOptionsPtr options,
++             mojo::PendingRemote<mojom::CaptionClient> client,
++             StartCallback callback) override;
++  void AddAudio(const std::vector<float>& pcm, int32_t sample_rate) override;
++  void Stop() override;
++
++ private:
++  mojo::Receiver<mojom::CaptionService> receiver_;
++  mojo::Remote<mojom::CaptionClient> client_;
++  CaptionSession session_;
++};
++
++}  // namespace tark_captions
++
++#endif  // CHROME_SERVICES_TARK_CAPTIONS_CAPTION_SERVICE_IMPL_H_
+--- /dev/null
++++ b/chrome/services/tark_captions/caption_session.cc
+@@ -0,0 +1,31 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/services/tark_captions/caption_session.h"
++
++#include <utility>
++
++namespace tark_captions {
++
++CaptionSession::CaptionSession(EngineFactory factory) : factory_(std::move(factory)) {}
++CaptionSession::CaptionSession(CaptionSession&&) = default;
++CaptionSession& CaptionSession::operator=(CaptionSession&&) = default;
++CaptionSession::~CaptionSession() = default;
++
++// static
++std::vector<std::string> CaptionSession::RequiredFiles() {
++  return {};
++}
++
++bool CaptionSession::Start(std::map<std::string, base::File> files,
++                           const EngineOptions& options,
++                           CaptionCallback on_caption) {
++  return false;
++}
++
++void CaptionSession::AddAudio(base::span<const float> pcm, int sample_rate) {}
++
++void CaptionSession::Stop() {}
++
++}  // namespace tark_captions
+--- /dev/null
++++ b/chrome/services/tark_captions/caption_session.h
+@@ -0,0 +1,70 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_SERVICES_TARK_CAPTIONS_CAPTION_SESSION_H_
++#define CHROME_SERVICES_TARK_CAPTIONS_CAPTION_SESSION_H_
++
++#include <map>
++#include <memory>
++#include <string>
++#include <vector>
++
++#include "base/containers/span.h"
++#include "base/files/file.h"
++#include "base/functional/callback.h"
++
++namespace tark_captions {
++
++// What the captions process runs: Tark's caption engine (CaptionEngine), or
++// a fake in tests.
++class SpeechEngine {
++ public:
++  virtual ~SpeechEngine() = default;
++  // Interleaved-free mono audio at any rate; captions come through the
++  // callback the engine was made with.
++  virtual void AddAudio(base::span<const float> pcm, int sample_rate) = 0;
++};
++
++struct EngineOptions {
++  std::string language;  // "hi", "ta", "en", "es"
++  int threads = 2;
++  bool phrase = false;   // a phrase at a time: no drafts
++  double draft_every = 0.8;
++  double max_segment = 5.0;
++};
++
++using CaptionCallback = base::RepeatingCallback<void(bool is_final, std::string text)>;
++using EngineFactory = base::RepeatingCallback<std::unique_ptr<SpeechEngine>(
++    std::map<std::string, base::File> files,
++    const EngineOptions& options,
++    CaptionCallback on_caption)>;
++
++// Tark for Android's captions process, without mojo: one tab's captions.
++// The model arrives as file handles (the sandbox opens nothing); a session
++// missing a file refuses to start.
++class CaptionSession {
++ public:
++  explicit CaptionSession(EngineFactory factory);
++  CaptionSession(CaptionSession&&);
++  CaptionSession& operator=(CaptionSession&&);
++  ~CaptionSession();
++
++  // The model folder's files a session needs (a speech unit and Silero VAD).
++  static std::vector<std::string> RequiredFiles();
++
++  bool Start(std::map<std::string, base::File> files,
++             const EngineOptions& options,
++             CaptionCallback on_caption);
++  // Dropped unless started.
++  void AddAudio(base::span<const float> pcm, int sample_rate);
++  void Stop();
++
++ private:
++  EngineFactory factory_;
++  std::unique_ptr<SpeechEngine> engine_;
++};
++
++}  // namespace tark_captions
++
++#endif  // CHROME_SERVICES_TARK_CAPTIONS_CAPTION_SESSION_H_
+--- /dev/null
++++ b/chrome/services/tark_captions/caption_session_unittest.cc
+@@ -0,0 +1,108 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/services/tark_captions/caption_session.h"
++
++#include <map>
++#include <string>
++#include <vector>
++
++#include "base/files/file.h"
++#include "base/files/file_util.h"
++#include "base/files/scoped_temp_dir.h"
++#include "base/functional/bind.h"
++#include "base/functional/callback_helpers.h"
++#include "base/memory/raw_ptr.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace tark_captions {
++namespace {
++
++class FakeEngine : public SpeechEngine {
++ public:
++  explicit FakeEngine(std::vector<int>* fed) : fed_(fed) {}
++  void AddAudio(base::span<const float> pcm, int sample_rate) override {
++    fed_->push_back(static_cast<int>(pcm.size()));
++  }
++
++ private:
++  raw_ptr<std::vector<int>> fed_;
++};
++
++class CaptionSessionTest : public testing::Test {
++ protected:
++  void SetUp() override { ASSERT_TRUE(dir_.CreateUniqueTempDir()); }
++
++  std::map<std::string, base::File> Files(const std::vector<std::string>& names) {
++    std::map<std::string, base::File> files;
++    for (const std::string& name : names) {
++      const base::FilePath path = dir_.GetPath().AppendASCII(name);
++      EXPECT_TRUE(base::WriteFile(path, "x"));
++      files.emplace(name, base::File(path, base::File::FLAG_OPEN | base::File::FLAG_READ));
++    }
++    return files;
++  }
++
++  CaptionSession Session() {
++    return CaptionSession(base::BindRepeating(
++        [](CaptionSessionTest* self, std::map<std::string, base::File> files,
++           const EngineOptions& options, CaptionCallback) -> std::unique_ptr<SpeechEngine> {
++          ++self->engines_;
++          for (const auto& [name, file] : files) {
++            self->names_.push_back(name);
++          }
++          self->options_ = options;
++          return std::make_unique<FakeEngine>(&self->fed_);
++        },
++        base::Unretained(this)));
++  }
++
++  base::ScopedTempDir dir_;
++  int engines_ = 0;
++  std::vector<std::string> names_;
++  EngineOptions options_;
++  std::vector<int> fed_;
++};
++
++// The sandboxed process opens nothing itself: a model arrives as handles,
++// and a missing one refuses the session before any engine is built.
++TEST_F(CaptionSessionTest, StartsWithFilesNotPaths) {
++  CaptionSession session = Session();
++  std::vector<std::string> names = CaptionSession::RequiredFiles();
++  ASSERT_EQ(names.size(), 8u);
++  names.pop_back();
++  EXPECT_FALSE(session.Start(Files(names), EngineOptions(), base::DoNothing()));
++  EXPECT_EQ(engines_, 0);
++  EXPECT_TRUE(session.Start(Files(CaptionSession::RequiredFiles()), EngineOptions(),
++                            base::DoNothing()));
++  EXPECT_EQ(engines_, 1);
++  EXPECT_EQ(names_.size(), 8u);
++}
++
++TEST_F(CaptionSessionTest, PhraseStyleReachesTheEngine) {
++  CaptionSession session = Session();
++  EngineOptions options;
++  options.phrase = true;
++  options.threads = 1;
++  options.language = "ta";
++  ASSERT_TRUE(session.Start(Files(CaptionSession::RequiredFiles()), options, base::DoNothing()));
++  EXPECT_TRUE(options_.phrase);
++  EXPECT_EQ(options_.threads, 1);
++  EXPECT_EQ(options_.language, "ta");
++}
++
++TEST_F(CaptionSessionTest, AudioOnlyReachesAStartedEngine) {
++  CaptionSession session = Session();
++  const std::vector<float> pcm(160, 0.0f);
++  session.AddAudio(pcm, 16000);  // before Start: dropped
++  ASSERT_TRUE(session.Start(Files(CaptionSession::RequiredFiles()), EngineOptions(),
++                            base::DoNothing()));
++  session.AddAudio(pcm, 16000);
++  session.Stop();
++  session.AddAudio(pcm, 16000);  // after Stop: dropped
++  EXPECT_EQ(fed_, (std::vector<int>{160}));
++}
++
++}  // namespace
++}  // namespace tark_captions
+--- /dev/null
++++ b/chrome/services/tark_captions/public/mojom/BUILD.gn
+@@ -0,0 +1,13 @@
++# Copyright 2026 The Tark Authors
++# Use of this source code is governed by a BSD-style license that can be
++# found in the LICENSE file.
++
++import("//mojo/public/tools/bindings/mojom.gni")
++
++mojom("mojom") {
++  sources = [ "tark_captions.mojom" ]
++  public_deps = [
++    "//mojo/public/mojom/base",
++    "//sandbox/policy/mojom",
++  ]
++}
+--- /dev/null
++++ b/chrome/services/tark_captions/public/mojom/tark_captions.mojom
+@@ -0,0 +1,37 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// Tark for Android's live captions: one tab's captions, in a sandboxed
++// utility process ("Tark captions"). The browser hands it the language's
++// model files, already opened; the process opens nothing itself.
++module tark_captions.mojom;
++
++import "mojo/public/mojom/base/file.mojom";
++import "sandbox/policy/mojom/sandbox.mojom";
++
++struct CaptionOptions {
++  // "hi", "ta", "en", "es".
++  string language;
++  // ONNX Runtime's threads for the speech model.
++  int32 threads;
++  // A phrase at a time (no drafts), or word by word.
++  bool phrase;
++};
++
++interface CaptionClient {
++  // A draft of what is being said, or a segment's final text (UTF-8).
++  OnCaption(bool is_final, string text);
++};
++
++[ServiceSandbox=sandbox.mojom.Sandbox.kUtility]
++interface CaptionService {
++  // `files`: the model folder's files by name (CaptionSession's list).
++  // False if one is missing or the model does not load.
++  Start(map<string, mojo_base.mojom.ReadOnlyFile> files,
++        CaptionOptions options,
++        pending_remote<CaptionClient> client) => (bool ok);
++  // Mono audio at `sample_rate`, 100 ms at a time.
++  AddAudio(array<float> pcm, int32 sample_rate);
++  Stop();
++};
+--- a/chrome/utility/BUILD.gn
++++ b/chrome/utility/BUILD.gn
+@@ -267,7 +267,12 @@
+   }
+ 
+   if (is_android) {
+-    deps += [ "//chrome/services/readaloud" ]
++    deps += [
++      "//chrome/services/readaloud",
++
++      # Tark: live captions.
++      "//chrome/services/tark_captions:lib",
++    ]
+   }
+ }
+ 
+--- a/chrome/utility/services.cc
++++ b/chrome/utility/services.cc
+@@ -35,6 +35,7 @@
+ 
+ #if BUILDFLAG(IS_ANDROID)
+ #include "chrome/services/readaloud/read_aloud_playback_controller.h"  // nogncheck
++#include "chrome/services/tark_captions/caption_service_impl.h"  // nogncheck
+ #endif  // BUILDFLAG(IS_ANDROID)
+ 
+ #if BUILDFLAG(IS_WIN)
+@@ -452,6 +453,12 @@
+ #endif  // BUILDFLAG(IS_CHROMEOS)
+ 
+ #if BUILDFLAG(IS_ANDROID)
++// Tark: one tab's live captions, on the model files the browser hands over.
++auto RunTarkCaptionService(
++    mojo::PendingReceiver<tark_captions::mojom::CaptionService> receiver) {
++  return std::make_unique<tark_captions::CaptionServiceImpl>(std::move(receiver));
++}
++
+ std::unique_ptr<readaloud::ReadAloudPlaybackController>
+ RunReadAloudPlaybackControllerFactory(
+     mojo::PendingReceiver<
+@@ -485,6 +492,7 @@
+ 
+ #if BUILDFLAG(IS_ANDROID)
+   services.Add(RunReadAloudPlaybackControllerFactory);
++  services.Add(RunTarkCaptionService);
+ #endif  // BUILDFLAG(IS_ANDROID)
+ 
+ #if !BUILDFLAG(IS_ANDROID)
