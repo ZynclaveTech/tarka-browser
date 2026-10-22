@@ -57,6 +57,8 @@ python3 "$_main_repo/utils/domain_substitution.py" apply -r "$_main_repo/domain_
 # Tarka: product name in UI strings, and the app icon (binary, so not a patch).
 python3 "$_root_dir/utils/name_substitution.py" --sub -t "$_src_dir" --backup-path "$_root_dir/build/namesubs.tar"
 cp "$_root_dir/resources/branding/app.icns" "$_src_dir/chrome/app/theme/chromium/mac/app.icns"
+# Certificate trust data: CT log list, Chrome Root Store, CRLSet (resources/trust).
+python3 "$_root_dir/utils/trust_data.py" install "$_src_dir" --domain-regex "$_main_repo/domain_regex.list"
 # The three-dot mark over every Chromium logo file (M3b, spec 6.3).
 python3 "$_root_dir/utils/install_branding.py" "$_root_dir/resources/branding/mark" "$_src_dir"
 # Inter for WebUI pages (M3 Task 8), served as chrome://resources/fonts/.

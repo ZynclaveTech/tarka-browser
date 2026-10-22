@@ -1,0 +1,139 @@
+Tark: a CRLSet in every release (tarka-notes 2026-10-22-trust-data-updates).
+
+Tark's component updater fetches only Widevine, so Chrome's CRLSet never
+reached it: Chrome blocked the compromised eMudhra intermediates within
+hours on 17 October 2026, and Tark needed a hand-made release. Each release
+now carries the CRLSet Chrome had when it was made, which
+utils/trust_data.py fetches from the CRLSet component, checks against the
+key Chromium pins for it, and writes as tark_crl_set_data.inc. It is handed
+to the certificate verifier at startup, before any page loads. The verifier
+keeps the CRLSet with the higher sequence number, so a newer one delivered
+later wins and this one never replaces a newer one. The verifier parses
+CRLSets at USER_VISIBLE priority instead of BEST_EFFORT: BEST_EFFORT tasks
+wait until startup is over, and pages loaded in the first seconds (a
+restored session) were verified without the CRLSet.
+
+The CT log list and the Chrome Root Store come the same way, but need no
+code: trust_data.py install writes them over Chromium's files.
+
+--- a/chrome/browser/chrome_browser_main.cc
++++ b/chrome/browser/chrome_browser_main.cc
+@@ -53,6 +53,7 @@
+ #include "chrome/browser/metrics/expired_histograms_array.h"
+ #include "chrome/browser/metrics/shutdown_watcher_helper.h"
+ #include "chrome/browser/net/system_network_context_manager.h"
++#include "chrome/browser/net/tark_bundled_crl_set.h"
+ #include "chrome/browser/performance_manager/public/chrome_browser_main_extra_parts_performance_manager.h"
+ #include "chrome/browser/performance_monitor/chrome_browser_main_extra_parts_performance_monitor.h"
+ #include "chrome/browser/policy/chrome_browser_policy_connector.h"
+@@ -1963,6 +1964,10 @@
+     g_browser_process->CreateDevToolsAutoOpener();
+   }
+ 
++  // Tark: the CRLSet built into this release, before any page loads. Tark's
++  // component updater fetches none, so it does not wait on that.
++  tark::LoadBundledCRLSet();
++
+   // Needs to be done before PostProfileInit, since the SODA Installer setup is
+   // called inside PostProfileInit and depends on it.
+   if (!base::CommandLine::ForCurrentProcess()->HasSwitch(
+--- a/chrome/browser/net/BUILD.gn
++++ b/chrome/browser/net/BUILD.gn
+@@ -55,6 +55,7 @@
+     "secure_dns_util.h",
+     "stub_resolver_config_reader.h",
+     "system_network_context_manager.h",
++    "tark_bundled_crl_set.h",
+   ]
+ 
+   if (enable_device_bound_sessions) {
+@@ -154,6 +155,8 @@
+     "secure_dns_util.cc",
+     "stub_resolver_config_reader.cc",
+     "system_network_context_manager.cc",
++    "tark_bundled_crl_set.cc",
++    "tark_crl_set_data.inc",
+   ]
+ 
+   if (enable_device_bound_sessions) {
+--- /dev/null
++++ b/chrome/browser/net/tark_bundled_crl_set.cc
+@@ -0,0 +1,35 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/net/tark_bundled_crl_set.h"
++
++#include <cstdint>
++
++#include "base/functional/callback_helpers.h"
++#include "content/public/browser/browser_thread.h"
++#include "content/public/browser/network_service_instance.h"
++#include "services/cert_verifier/public/mojom/cert_verifier_service_factory.mojom.h"
++
++namespace tark {
++
++namespace {
++
++// Written by `utils/trust_data.py install` from resources/trust/crl-set.
++constexpr uint8_t kBundledCRLSet[] = {
++#include "chrome/browser/net/tark_crl_set_data.inc"
++};
++
++}  // namespace
++
++base::span<const uint8_t> BundledCRLSet() {
++  return kBundledCRLSet;
++}
++
++void LoadBundledCRLSet() {
++  DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
++  content::GetCertVerifierServiceFactory()->UpdateCRLSet(BundledCRLSet(),
++                                                         base::DoNothing());
++}
++
++}  // namespace tark
+--- /dev/null
++++ b/chrome/browser/net/tark_bundled_crl_set.h
+@@ -0,0 +1,24 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_NET_TARK_BUNDLED_CRL_SET_H_
++#define CHROME_BROWSER_NET_TARK_BUNDLED_CRL_SET_H_
++
++#include "base/containers/span.h"
++
++namespace tark {
++
++// The CRLSet built into this release: Chrome's, taken from its CRLSet
++// component when the release was made (utils/trust_data.py).
++base::span<const uint8_t> BundledCRLSet();
++
++// Hands BundledCRLSet() to the certificate verifier. Tark's component updater
++// fetches no CRLSets, so without this Tark would have none. The verifier keeps
++// whichever CRLSet has the higher sequence number, so a newer one delivered
++// later replaces this one, and this one never replaces a newer one.
++void LoadBundledCRLSet();
++
++}  // namespace tark
++
++#endif  // CHROME_BROWSER_NET_TARK_BUNDLED_CRL_SET_H_
+--- a/services/cert_verifier/cert_verifier_service_factory.cc
++++ b/services/cert_verifier/cert_verifier_service_factory.cc
+@@ -301,8 +301,12 @@
+   // boolean success value or something.)
+   callback = mojo::WrapCallbackWithDefaultInvokeIfNotRun(std::move(callback));
+ 
++  // Tark: USER_VISIBLE, not BEST_EFFORT. Tark's CRLSet is built in and sent
++  // at startup (tark_bundled_crl_set.cc), and BEST_EFFORT tasks wait until
++  // startup is over, so pages loaded in the first seconds were verified
++  // without it. Parsing it takes about a millisecond.
+   base::ThreadPool::PostTaskAndReplyWithResult(
+-      FROM_HERE, {base::TaskPriority::BEST_EFFORT},
++      FROM_HERE, {base::TaskPriority::USER_VISIBLE},
+       base::BindOnce(&ParseCRLSet, std::move(crl_set)),
+       base::BindOnce(&CertVerifierServiceFactoryImpl::OnCRLSetParsed,
+                      weak_factory_.GetWeakPtr())
