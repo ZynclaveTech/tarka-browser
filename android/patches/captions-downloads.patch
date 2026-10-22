@@ -1,0 +1,300 @@
+--- a/BUILD.gn
++++ b/BUILD.gn
+@@ -103,6 +103,7 @@
+       "//components:components_unittests",
+       "//components/gwp_asan:gwp_asan_unittests",
+       "//components/tark_captions:host_unittests",
++      "//chrome/browser/tark_captions_android:host_unittests",
+       "//infra/orchestrator:orchestrator_all",
+       "//net:net_unittests",
+       "//sandbox:sandbox_unittests",
+--- /dev/null
++++ b/chrome/browser/tark_captions_android/BUILD.gn
+@@ -0,0 +1,41 @@
++# Copyright 2026 The Tark Authors
++# Use of this source code is governed by a BSD-style license that can be
++# found in the LICENSE file.
++#
++# Tark for Android's live captions: the model files' rules (table, check,
++# scan, use), with no browser dependencies, so that their unit tests also
++# build for the build machine (android/build.sh runs them).
++
++import("//testing/test.gni")
++
++static_library("files") {
++  sources = [
++    "model_files.cc",
++    "model_files.h",
++    "model_files.inc",
++  ]
++  deps = [
++    "//base",
++    "//crypto",
++  ]
++}
++
++if (!is_android) {
++  test("tark_captions_files_unittests") {
++    sources = [ "model_files_unittest.cc" ]
++    deps = [
++      ":files",
++      "//base",
++      "//base/test:run_all_unittests",
++      "//base/test:test_support",
++      "//testing/gtest",
++    ]
++  }
++}
++
++if (current_toolchain == default_toolchain) {
++  group("host_unittests") {
++    testonly = true
++    deps = [ ":tark_captions_files_unittests($host_toolchain)" ]
++  }
++}
+--- /dev/null
++++ b/chrome/browser/tark_captions_android/model_files.cc
+@@ -0,0 +1,70 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/tark_captions_android/model_files.h"
++
++#include "base/files/file_path.h"
++
++namespace tark_captions {
++namespace {
++
++constexpr CaptionFile kFiles[] = {
++#include "chrome/browser/tark_captions_android/model_files.inc"
++};
++
++}  // namespace
++
++base::span<const CaptionFile> AllFiles() {
++  return kFiles;
++}
++
++std::vector<const CaptionFile*> FilesOf(std::string_view unit,
++                                        base::span<const CaptionFile> table) {
++  return {};
++}
++
++std::vector<std::string> UnitsToFetch(std::string_view unit) {
++  return {};
++}
++
++std::string FileUrl(const CaptionFile& file) {
++  return std::string();
++}
++
++bool VerifyFile(const base::FilePath& path, const CaptionFile& file) {
++  return false;
++}
++
++bool WriteRecord(const base::FilePath& path, const CaptionFile& file) {
++  return false;
++}
++
++std::string PartFileName(std::string_view name, uint64_t generation) {
++  return std::string();
++}
++
++std::vector<std::string> ScanUnit(const base::FilePath& unit_dir,
++                                  std::string_view unit,
++                                  base::span<const CaptionFile> table) {
++  return {};
++}
++
++bool UnitReady(std::string_view unit,
++               const std::vector<std::string>& present,
++               base::span<const CaptionFile> table) {
++  return false;
++}
++
++UnitUse::UnitUse() = default;
++UnitUse::~UnitUse() = default;
++
++bool UnitUse::SetInUse(std::string_view unit, bool in_use) {
++  return false;
++}
++
++bool UnitUse::RequestRemove(std::string_view unit) {
++  return false;
++}
++
++}  // namespace tark_captions
+--- /dev/null
++++ b/chrome/browser/tark_captions_android/model_files.h
+@@ -0,0 +1,86 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_TARK_CAPTIONS_ANDROID_MODEL_FILES_H_
++#define CHROME_BROWSER_TARK_CAPTIONS_ANDROID_MODEL_FILES_H_
++
++#include <cstdint>
++#include <map>
++#include <set>
++#include <string>
++#include <string_view>
++#include <vector>
++
++#include "base/containers/span.h"
++
++namespace base {
++class FilePath;
++}  // namespace base
++
++namespace tark_captions {
++
++// Tark for Android's live captions: the model files the phone downloads from
++// gettarka.com, by unit ("common", then one per language), each pinned in
++// the APK by size and sha256 (android/captions/models.py writes the table,
++// model_files.inc, from android/captions/files.json). Base-only, so the rules
++// build for the build machine's tests.
++struct CaptionFile {
++  std::string_view unit;
++  std::string_view name;
++  int64_t size;
++  std::string_view sha256;  // Lower-case hex.
++};
++
++// The APK's table.
++base::span<const CaptionFile> AllFiles();
++std::vector<const CaptionFile*> FilesOf(std::string_view unit,
++                                        base::span<const CaptionFile> table = AllFiles());
++
++// What turning `unit` on downloads: "common" (Silero VAD) and the unit.
++std::vector<std::string> UnitsToFetch(std::string_view unit);
++
++// Content-addressed: https://gettarka.com/models/android/v1/<sha256>.
++std::string FileUrl(const CaptionFile& file);
++
++// Whether `path` is `file` (size, then sha256); a file that is not is
++// deleted. Blocking.
++bool VerifyFile(const base::FilePath& path, const CaptionFile& file);
++// "<name>.sha256" beside a checked file, so that a start trusts it without
++// hashing 138 MB again. Blocking.
++bool WriteRecord(const base::FilePath& path, const CaptionFile& file);
++// A download attempt's own file: "<name>.<generation>.part".
++std::string PartFileName(std::string_view name, uint64_t generation);
++
++// The unit's files present in `unit_dir`, by name. Deletes unfinished
++// downloads (*.part), files of the wrong size or hash, and files the table
++// does not name. A file with no record is hashed once. Blocking.
++std::vector<std::string> ScanUnit(const base::FilePath& unit_dir,
++                                  std::string_view unit,
++                                  base::span<const CaptionFile> table = AllFiles());
++
++// Whether every file of `unit` is in `present` (and the unit is known).
++bool UnitReady(std::string_view unit,
++               const std::vector<std::string>& present,
++               base::span<const CaptionFile> table = AllFiles());
++
++// Which units are captioning. A unit deleted in Settings while it is in use
++// is removed when it is released, never under a running engine.
++class UnitUse {
++ public:
++  UnitUse();
++  ~UnitUse();
++
++  // True when releasing `unit` makes a pending removal due.
++  bool SetInUse(std::string_view unit, bool in_use);
++  // True when `unit` can be removed now; otherwise it is removed on release.
++  bool RequestRemove(std::string_view unit);
++
++ private:
++  std::map<std::string, int, std::less<>> in_use_;
++  std::set<std::string, std::less<>> pending_remove_;
++};
++
++}  // namespace tark_captions
++
++#endif  // CHROME_BROWSER_TARK_CAPTIONS_ANDROID_MODEL_FILES_H_
+--- /dev/null
++++ b/chrome/browser/tark_captions_android/model_files_unittest.cc
+@@ -0,0 +1,81 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/tark_captions_android/model_files.h"
++
++#include <string>
++#include <vector>
++
++#include "base/files/file_util.h"
++#include "base/files/scoped_temp_dir.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace tark_captions {
++namespace {
++
++// sha256("abc") and sha256("vad").
++constexpr char kAbc[] = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
++constexpr char kVad[] = "651bfad0aa5b42c5a5b8dad76f49c4a122fe1d1658fc55cfdd1ea9923fe3fd9e";
++
++constexpr CaptionFile kTable[] = {
++    {"common", "silero_vad.onnx", 3, kVad},
++    {"hi", "encoder.int8.onnx", 3, kAbc},
++    {"hi", "vocab.json", 3, kAbc},
++    {"ta", "vocab.json", 3, kAbc},
++};
++
++TEST(TarkCaptionFilesTest, UnitNeedsCommon) {
++  EXPECT_EQ(UnitsToFetch("hi"), (std::vector<std::string>{"common", "hi"}));
++  EXPECT_EQ(UnitsToFetch("common"), (std::vector<std::string>{"common"}));
++  // The APK's own table has the Phase 1 units.
++  for (const char* unit : {"common", "hi", "ta", "en", "es"}) {
++    EXPECT_FALSE(FilesOf(unit).empty()) << unit;
++  }
++}
++
++TEST(TarkCaptionFilesTest, MismatchDeletesFile) {
++  base::ScopedTempDir dir;
++  ASSERT_TRUE(dir.CreateUniqueTempDir());
++  const base::FilePath path = dir.GetPath().AppendASCII("vocab.json");
++  ASSERT_TRUE(base::WriteFile(path, "abd"));  // right size, wrong bytes
++  EXPECT_FALSE(VerifyFile(path, kTable[2]));
++  EXPECT_FALSE(base::PathExists(path));
++  ASSERT_TRUE(base::WriteFile(path, "abc"));
++  EXPECT_TRUE(VerifyFile(path, kTable[2]));
++  EXPECT_TRUE(base::PathExists(path));
++}
++
++TEST(TarkCaptionFilesTest, PartFilesRemovedAtStart) {
++  base::ScopedTempDir dir;
++  ASSERT_TRUE(dir.CreateUniqueTempDir());
++  ASSERT_TRUE(base::WriteFile(dir.GetPath().AppendASCII(PartFileName("vocab.json", 3)), "ab"));
++  ASSERT_TRUE(base::WriteFile(dir.GetPath().AppendASCII("vocab.json"), "abc"));
++  ASSERT_TRUE(base::WriteFile(dir.GetPath().AppendASCII("old-model.onnx"), "x"));
++  EXPECT_EQ(ScanUnit(dir.GetPath(), "hi", kTable), (std::vector<std::string>{"vocab.json"}));
++  EXPECT_FALSE(base::PathExists(dir.GetPath().AppendASCII(PartFileName("vocab.json", 3))));
++  // A file the table does not name (an older APK's) goes too.
++  EXPECT_FALSE(base::PathExists(dir.GetPath().AppendASCII("old-model.onnx")));
++}
++
++TEST(TarkCaptionFilesTest, ReadyNeedsEveryFileOfTheUnit) {
++  EXPECT_FALSE(UnitReady("hi", {"vocab.json"}, kTable));
++  EXPECT_TRUE(UnitReady("hi", {"encoder.int8.onnx", "vocab.json"}, kTable));
++  EXPECT_FALSE(UnitReady("bn", {}, kTable));  // not in the table: never ready
++}
++
++TEST(TarkCaptionFilesTest, RemoveInUseUnitWaitsForRelease) {
++  UnitUse use;
++  use.SetInUse("hi", true);
++  EXPECT_FALSE(use.RequestRemove("hi"));  // captioning: removed when released
++  EXPECT_TRUE(use.RequestRemove("ta"));   // not in use: now
++  EXPECT_TRUE(use.SetInUse("hi", false)); // released: the pending removal is due
++  EXPECT_FALSE(use.SetInUse("hi", false));
++}
++
++TEST(TarkCaptionFilesTest, UrlIsContentAddressed) {
++  EXPECT_EQ(FileUrl(kTable[1]), std::string("https://gettarka.com/models/android/v1/") + kAbc);
++}
++
++}  // namespace
++}  // namespace tark_captions

@@ -294,4 +294,6 @@ run "$_src_dir/out/Default/clang_x64/tark_update_unittests"
 run ninja -C "$_src_dir/out/Default" components/tark_captions:host_unittests
 run env TARK_CAPTIONS_TESTDATA="$_root_dir/resources/captions/testdata" \
   "$_src_dir/out/Default/clang_x64/tark_captions_engine_unittests"
+run ninja -C "$_src_dir/out/Default" chrome/browser/tark_captions_android:host_unittests
+run "$_src_dir/out/Default/clang_x64/tark_captions_files_unittests"
 log "built $_src_dir/out/Default/apks/ChromePublic.apk"

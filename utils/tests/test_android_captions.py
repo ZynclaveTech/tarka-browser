@@ -80,7 +80,7 @@ def hunk_count_errors(text):
 
 class TestPatchShapes(unittest.TestCase):
     def test_hunk_counts_match(self):
-        for name in ('captions-ort.patch', 'captions-engine.patch'):
+        for name in ('captions-ort.patch', 'captions-engine.patch', 'captions-downloads.patch'):
             text = (ANDROID / 'patches' / name).read_text(encoding='utf-8')
             self.assertEqual(hunk_count_errors(text), [], name)
         conventions = ROOT / 'patches' / 'tarka' / 'captions' / 'engine-conventions.patch'
