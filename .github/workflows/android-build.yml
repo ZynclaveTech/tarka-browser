@@ -1,0 +1,99 @@
+# Tark for Android: a build on the build machine (tark-android-builder, EC2,
+# ap-south-1), started from here instead of the Mac. This hosted job does what
+# android/aws/andbuild.sh does — the branch's archive to S3, the job over SSM,
+# then waits — and puts the build's results on the run's page. The machine
+# keeps its prepared Chromium base, so a patch-only build takes 15–30 minutes;
+# it powers itself off after the job.
+#
+# Started by hand only (workflow_dispatch): never by a push or a pull request.
+# Every run waits for approval in the android-build environment (required
+# reviewer: the user), and AWS trusts only jobs in that environment, through
+# the narrow role tark-android-builder-ci (start that one instance, run the
+# build job on it, read and write the bucket's jobs/ folder).
+#
+# The APK and AAB stay in S3 (andbuild.sh fetch PREFIX DIR): artifacts of a
+# public repository can be downloaded by anyone signed in to GitHub. Release
+# signing stays on the Mac (android/release/sign.py).
+name: Android build
+
+on:
+  workflow_dispatch:
+    inputs:
+      new_base:
+        description: Prepare Chromium from scratch if the base changed (about 2 hours, about $6)
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    environment: android-build
+    # A base build is about two hours; a patch-only one under an hour.
+    timeout-minutes: 330
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          persist-credentials: false
+          submodules: true
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd  # v6.3.0
+        with:
+          role-to-assume: arn:aws:iam::967555169405:role/tark-android-builder-ci
+          aws-region: ap-south-1
+          role-duration-seconds: 21600
+      - name: Install zsh
+        run: sudo apt-get install -y --no-install-recommends zsh
+      - name: Start the machine
+        run: android/aws/andbuild.sh start
+      - name: Build
+        id: build
+        run: |
+          args=()
+          [[ "${{ inputs.new_base }}" == true ]] && args+=(--new-base)
+          out=$(android/aws/andbuild.sh job "${args[@]}" android/aws/jobs/tark-build.sh)
+          echo "$out"
+          echo "command=$(sed -n 's/^command //p' <<<"$out")" >> "$GITHUB_OUTPUT"
+          echo "prefix=$(sed -n 's/^prefix //p' <<<"$out")" >> "$GITHUB_OUTPUT"
+      - name: Wait
+        id: wait
+        run: |
+          out=$(android/aws/andbuild.sh wait "${{ steps.build.outputs.command }}")
+          echo "$out"
+          grep -q '^status Success' <<<"$out"
+      - name: Results
+        if: always() && steps.build.outputs.prefix != ''
+        run: |
+          bucket=tark-android-builds-$(aws sts get-caller-identity --query Account --output text)
+          prefix="${{ steps.build.outputs.prefix }}"
+          aws s3 cp --quiet "s3://$bucket/$prefix/tark-build.log" tark-build.log || exit 0
+          {
+            echo "### Android build \`$prefix\`"
+            echo
+            echo '```'
+            grep -E '^tark: (run .*(unittests|ninja -k 0)|FAILED)|tests (passed|failed)|SUCCESS: all tests passed|^exit ' tark-build.log | tail -40
+            echo '```'
+            if grep -q 'error:' tark-build.log; then
+              echo
+              echo 'First compile errors:'
+              echo '```'
+              grep -m 20 'error:' tark-build.log | sed 's|^.*\.\./\.\./||'
+              echo '```'
+            fi
+            echo
+            echo "APK and AAB (if built): \`android/aws/andbuild.sh fetch $prefix DIR\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        if: always() && steps.build.outputs.prefix != ''
+        with:
+          name: tark-build-log
+          path: tark-build.log
+          if-no-files-found: ignore
