@@ -1,0 +1,34 @@
+# Tark for Android: the offline checks that guard Android patches (their
+# series, hunk counts, strings and Hindi ids, the build script's dry run, the
+# generated captions engine), on every push and pull request. They run in a
+# couple of minutes and catch, before the build machine starts, mistakes that
+# otherwise end a build at patch time.
+#
+# No secrets, no AWS, a read-only token: safe for pull requests from forks.
+name: Android checks
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-checks-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      # Actions pinned to commits.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          persist-credentials: false
+          submodules: true
+      - name: Android and patch tests
+        run: |
+          python3 -m unittest discover -s utils/tests -p 'test_android_*.py'
+          python3 -m unittest utils/tests/test_patch_series.py utils/tests/test_patch_context.py
