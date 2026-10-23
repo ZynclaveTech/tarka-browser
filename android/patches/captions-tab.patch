@@ -1,0 +1,714 @@
+--- a/chrome/browser/BUILD.gn
++++ b/chrome/browser/BUILD.gn
+@@ -1667,13 +1667,21 @@
+       "tark_update/update_check_service.cc",
+       "tark_update/update_check_service.h",
+ 
+-      # Live captions: the model downloads.
++      # Live captions: the model downloads, each tab's captions and the
++      # caption bar's bridge.
++      "tark_captions_android/android/tark_captions_bridge.cc",
++      "tark_captions_android/android/tark_captions_bridge.h",
+       "tark_captions_android/caption_downloads.cc",
+       "tark_captions_android/caption_downloads.h",
++      "tark_captions_android/tark_captions_tab.cc",
++      "tark_captions_android/tark_captions_tab.h",
+     ]
+     deps += [
+       "//chrome/browser/omaha/android:jni_headers",
+       "//chrome/browser/tark_captions_android:rules",
++      "//chrome/browser/tark_captions_android/android:jni_headers",
++      "//chrome/common/tark_captions:mojom",
++      "//chrome/services/tark_captions/public/mojom",
+       "//chrome/browser/tark_update:index",
+       "//chrome/browser/tark_xlit:files",
+       "//chrome/browser/tark_xlit/android:jni_headers",
+--- a/chrome/browser/chrome_browser_interface_binders.cc
++++ b/chrome/browser/chrome_browser_interface_binders.cc
+@@ -34,6 +34,7 @@
+ #include "chrome/browser/speech/on_device_speech_recognition_impl.h"
+ #include "chrome/browser/ssl/chrome_security_state_util.h"
+ #include "chrome/browser/tark_adblock/tark_adblock_cosmetic_resources.h"
++#include "chrome/browser/tark_captions_android/tark_captions_tab.h"
+ #include "chrome/browser/translate/translate_frame_binder.h"
+ #include "chrome/browser/ui/search_engines/search_engine_tab_helper.h"
+ #include "chrome/common/buildflags.h"
+@@ -440,6 +441,10 @@
+   map->Add<tark_adblock::mojom::CosmeticResources>(
+       &tark_adblock::BindCosmeticResources);
+ 
++  // Tark: live captions' audio from the frame's media, sent only while the
++  // person has captions on in the tab.
++  map->Add<tark_captions::mojom::CaptionAudio>(&tark_captions::TarkCaptionsTab::BindAudio);
++
+   map->Add<blink::mojom::ScriptToolHost>(
+       &actor::ActorScriptToolReceiver::Create);
+ 
+--- /dev/null
++++ b/chrome/browser/tark_captions_android/android/tark_captions_bridge.cc
+@@ -0,0 +1,122 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/tark_captions_android/android/tark_captions_bridge.h"
++
++#include <cstdint>
++#include <string>
++#include <vector>
++
++#include "base/android/jni_android.h"
++#include "base/android/jni_array.h"
++#include "base/android/jni_string.h"
++#include "chrome/browser/browser_process.h"
++#include "chrome/browser/tark_captions_android/caption_downloads.h"
++#include "chrome/browser/tark_captions_android/model_files.h"
++#include "chrome/browser/tark_captions_android/tark_captions_tab.h"
++#include "components/prefs/pref_service.h"
++#include "content/public/browser/web_contents.h"
++
++// Must come after all headers that specialize FromJniType() / ToJniType().
++#include "chrome/browser/tark_captions_android/android/jni_headers/TarkCaptionsBridge_jni.h"
++
++using base::android::JavaRef;
++using base::android::ScopedJavaLocalRef;
++
++namespace tark_captions {
++namespace {
++
++TarkCaptionsTab* TabFor(JNIEnv* env, const JavaRef<jobject>& jweb_contents) {
++  content::WebContents* web_contents = content::WebContents::FromJavaWebContents(jweb_contents);
++  if (!web_contents) {
++    return nullptr;
++  }
++  TarkCaptionsTab::CreateForWebContents(web_contents);
++  return TarkCaptionsTab::FromWebContents(web_contents);
++}
++
++}  // namespace
++
++void NotifyCaptionBar(content::WebContents* web_contents) {
++  JNIEnv* env = base::android::AttachCurrentThread();
++  Java_TarkCaptionsBridge_onStateChanged(env, web_contents->GetJavaWebContents());
++}
++
++static ScopedJavaLocalRef<jobject> JNI_TarkCaptionsBridge_GetState(
++    JNIEnv* env,
++    const JavaRef<jobject>& jweb_contents) {
++  TarkCaptionsTab* tab = TabFor(env, jweb_contents);
++  const TarkCaptionsTab::View view = tab ? tab->GetView() : TarkCaptionsTab::View();
++  return Java_TarkCaptionsBridge_createState(
++      env, view.bar_visible, view.captions_on, view.language,
++      static_cast<int32_t>(view.unit.state), view.unit.bytes, view.unit.total, view.cant_caption,
++      view.phrase, view.final_text, view.draft_text);
++}
++
++static void JNI_TarkCaptionsBridge_SetCaptionsOn(JNIEnv* env,
++                                                 const JavaRef<jobject>& jweb_contents,
++                                                 bool on) {
++  if (TarkCaptionsTab* tab = TabFor(env, jweb_contents)) {
++    tab->SetCaptionsOn(on);
++  }
++}
++
++static void JNI_TarkCaptionsBridge_ChooseLanguage(JNIEnv* env,
++                                                  const JavaRef<jobject>& jweb_contents,
++                                                  const std::string& language) {
++  if (TarkCaptionsTab* tab = TabFor(env, jweb_contents)) {
++    tab->ChooseLanguage(language);
++  }
++}
++
++static void JNI_TarkCaptionsBridge_RequestDownload(JNIEnv* env,
++                                                   const JavaRef<jobject>& jweb_contents,
++                                                   bool now) {
++  if (TarkCaptionsTab* tab = TabFor(env, jweb_contents)) {
++    tab->RequestDownload(now);
++  }
++}
++
++static void JNI_TarkCaptionsBridge_HideBar(JNIEnv* env,
++                                           const JavaRef<jobject>& jweb_contents) {
++  if (TarkCaptionsTab* tab = TabFor(env, jweb_contents)) {
++    tab->HideBarForPage();
++  }
++}
++
++static int32_t JNI_TarkCaptionsBridge_GetStyle(JNIEnv* env) {
++  return g_browser_process->local_state()->GetInteger(kStylePref);
++}
++
++static void JNI_TarkCaptionsBridge_SetStyle(JNIEnv* env, int32_t style) {
++  g_browser_process->local_state()->SetInteger(kStylePref, style);
++}
++
++static std::vector<std::string> JNI_TarkCaptionsBridge_GetReadyLanguages(JNIEnv* env) {
++  std::vector<std::string> languages;
++  for (const auto& [unit, size] : CaptionDownloads::Get().ReadyUnits()) {
++    languages.push_back(unit);
++  }
++  return languages;
++}
++
++static std::vector<int64_t> JNI_TarkCaptionsBridge_GetReadyLanguageSizes(JNIEnv* env) {
++  std::vector<int64_t> sizes;
++  for (const auto& [unit, size] : CaptionDownloads::Get().ReadyUnits()) {
++    sizes.push_back(size);
++  }
++  return sizes;
++}
++
++static void JNI_TarkCaptionsBridge_RemoveLanguage(JNIEnv* env, const std::string& language) {
++  CaptionDownloads::Get().Remove(language);
++}
++
++static int64_t JNI_TarkCaptionsBridge_GetDownloadSize(JNIEnv* env, const std::string& language) {
++  return CaptionDownloads::Get().State(language).total;
++}
++
++}  // namespace tark_captions
++
++DEFINE_JNI(TarkCaptionsBridge)
+--- /dev/null
++++ b/chrome/browser/tark_captions_android/android/tark_captions_bridge.h
+@@ -0,0 +1,20 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_TARK_CAPTIONS_ANDROID_ANDROID_TARK_CAPTIONS_BRIDGE_H_
++#define CHROME_BROWSER_TARK_CAPTIONS_ANDROID_ANDROID_TARK_CAPTIONS_BRIDGE_H_
++
++namespace content {
++class WebContents;
++}  // namespace content
++
++namespace tark_captions {
++
++// Tells the caption bar (TarkCaptionsBridge.java) that `web_contents`'s
++// captions changed.
++void NotifyCaptionBar(content::WebContents* web_contents);
++
++}  // namespace tark_captions
++
++#endif  // CHROME_BROWSER_TARK_CAPTIONS_ANDROID_ANDROID_TARK_CAPTIONS_BRIDGE_H_
+--- /dev/null
++++ b/chrome/browser/tark_captions_android/tark_captions_tab.cc
+@@ -0,0 +1,369 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/tark_captions_android/tark_captions_tab.h"
++
++#include <utility>
++
++#include "base/command_line.h"
++#include "base/files/file_util.h"
++#include "base/functional/bind.h"
++#include "base/logging.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/system/sys_info.h"
++#include "base/task/thread_pool.h"
++#include "chrome/browser/browser_process.h"
++#include "chrome/browser/tark_captions_android/android/tark_captions_bridge.h"
++#include "chrome/browser/tark_captions_android/model_files.h"
++#include "components/prefs/pref_service.h"
++#include "content/public/browser/render_frame_host.h"
++#include "content/public/browser/service_process_host.h"
++#include "content/public/browser/web_contents.h"
++
++namespace tark_captions {
++namespace {
++
++constexpr base::TimeDelta kTick = base::Seconds(1);
++constexpr char kDefaultLanguage[] = "hi";
++// For android/captions/e2e/run.py only: log final captions' text.
++constexpr char kLogTextSwitch[] = "tark-captions-log-text";
++
++// The fastest core's top frequency (kHz), for the caption style.
++int FastestCoreKhz() {
++  int fastest = 0;
++  for (int cpu = 0; cpu < base::SysInfo::NumberOfProcessors(); ++cpu) {
++    std::string text;
++    if (base::ReadFileToString(
++            base::FilePath("/sys/devices/system/cpu/cpu" + base::NumberToString(cpu) +
++                           "/cpufreq/cpuinfo_max_freq"),
++            &text)) {
++      int khz = 0;
++      if (base::StringToInt(base::TrimWhitespaceASCII(text, base::TRIM_ALL), &khz)) {
++        fastest = std::max(fastest, khz);
++      }
++    }
++  }
++  return fastest;
++}
++
++// The files a captions process needs: the language's and common's, opened
++// read-only. Blocking.
++std::map<std::string, base::File> OpenUnit(base::FilePath unit_dir, base::FilePath common_dir,
++                                           std::string unit) {
++  std::map<std::string, base::File> files;
++  for (const auto& [dir, name] : std::vector<std::pair<base::FilePath, std::string>>{
++           {common_dir, "common"}, {unit_dir, unit}}) {
++    for (const CaptionFile* file : FilesOf(name)) {
++      base::File opened(dir.AppendASCII(file->name),
++                        base::File::FLAG_OPEN | base::File::FLAG_READ);
++      if (opened.IsValid()) {
++        files.emplace(std::string(file->name), std::move(opened));
++      }
++    }
++  }
++  return files;
++}
++
++}  // namespace
++
++TarkCaptionsTab::TarkCaptionsTab(content::WebContents* web_contents)
++    : content::WebContentsObserver(web_contents),
++      content::WebContentsUserData<TarkCaptionsTab>(*web_contents) {
++  PrefService* local_state = g_browser_process->local_state();
++  const std::string language = local_state->GetString(kLanguagePref);
++  logic_.ChooseLanguage(language.empty() ? kDefaultLanguage : language);
++  CaptionDownloads::Get().AddObserver(this);
++  switches_.set_disconnect_handler(base::BindRepeating([](mojo::RemoteSetElementId) {}));
++  // A player's connection closing: captions may follow another one.
++  audio_receivers_.set_disconnect_handler(base::BindRepeating(
++      [](TarkCaptionsTab* self) {
++        self->logic_.ForgetSource(self->audio_receivers_.current_receiver());
++      },
++      base::Unretained(this)));
++}
++
++TarkCaptionsTab::~TarkCaptionsTab() {
++  CaptionDownloads::Get().RemoveObserver(this);
++  StopEngine();
++}
++
++// static
++void TarkCaptionsTab::BindAudio(content::RenderFrameHost* frame,
++                                mojo::PendingReceiver<mojom::CaptionAudio> receiver) {
++  content::WebContents* web_contents = content::WebContents::FromRenderFrameHost(frame);
++  if (!web_contents) {
++    return;
++  }
++  TarkCaptionsTab::CreateForWebContents(web_contents);
++  FromWebContents(web_contents)->audio_receivers_.Add(FromWebContents(web_contents),
++                                                      std::move(receiver));
++}
++
++void TarkCaptionsTab::SetCaptionsOn(bool on) {
++  logic_.SetCaptionsOn(on, base::TimeTicks::Now());
++  if (on && !UnitReady()) {
++    CaptionDownloads::Get().Request(logic_.state().language, /*now=*/false);
++  }
++  if (!on) {
++    CancelDownload();
++  }
++  Update();
++}
++
++void TarkCaptionsTab::CancelDownload() {
++  // Captions off before the language arrived: its download (and any "Download
++  // now" consent to mobile data) goes too.
++  if (!UnitReady()) {
++    CaptionDownloads::Get().Cancel(logic_.state().language);
++  }
++}
++
++void TarkCaptionsTab::ChooseLanguage(const std::string& language) {
++  if (FilesOf(language).empty() || language == logic_.state().language) {
++    return;
++  }
++  g_browser_process->local_state()->SetString(kLanguagePref, language);
++  CancelDownload();  // the language moved away from
++  StopEngine();  // a new language is a new model
++  final_text_.clear();
++  draft_text_.clear();
++  logic_.ChooseLanguage(language);
++  logic_.OnUnitReady(UnitReady(), base::TimeTicks::Now());
++  if (logic_.state().captions_on && !UnitReady()) {
++    CaptionDownloads::Get().Request(language, /*now=*/false);
++  }
++  Update();
++}
++
++void TarkCaptionsTab::RequestDownload(bool now) {
++  CaptionDownloads::Get().Request(logic_.state().language, now);
++  Update();
++}
++
++void TarkCaptionsTab::HideBarForPage() {
++  bar_hidden_for_page_ = true;
++  logic_.SetCaptionsOn(false, base::TimeTicks::Now());
++  CancelDownload();
++  Update();
++}
++
++TarkCaptionsTab::View TarkCaptionsTab::GetView() const {
++  View view;
++  const TabCaptions::State& state = logic_.state();
++  view.bar_visible = state.bar_visible && !bar_hidden_for_page_;
++  view.captions_on = state.captions_on;
++  view.language = state.language;
++  view.unit = CaptionDownloads::Get().State(state.language);
++  view.cant_caption = state.cant_caption;
++  view.phrase = style_ == Style::kPhrase;
++  view.final_text = final_text_;
++  view.draft_text = draft_text_;
++  return view;
++}
++
++void TarkCaptionsTab::MediaStartedPlaying(const MediaPlayerInfo& info,
++                                          const content::MediaPlayerId& id) {
++  playing_[id] = info.has_audio;
++  SetPlayerAudible(id, info.has_audio && !muted_[id]);
++}
++
++void TarkCaptionsTab::MediaStoppedPlaying(const MediaPlayerInfo& info,
++                                          const content::MediaPlayerId& id,
++                                          WebContentsObserver::MediaStoppedReason reason) {
++  playing_[id] = false;
++  SetPlayerAudible(id, false);
++}
++
++void TarkCaptionsTab::MediaMutedStatusChanged(const content::MediaPlayerId& id, bool muted) {
++  muted_[id] = muted;
++  SetPlayerAudible(id, playing_[id] && !muted);
++}
++
++void TarkCaptionsTab::MediaDestroyed(const content::MediaPlayerId& id) {
++  SetPlayerAudible(id, false);
++  playing_.erase(id);
++  muted_.erase(id);
++}
++
++void TarkCaptionsTab::OnVisibilityChanged(content::Visibility visibility) {
++  logic_.OnHidden(visibility == content::Visibility::HIDDEN, base::TimeTicks::Now());
++  Update();
++}
++
++void TarkCaptionsTab::PrimaryPageChanged(content::Page& page) {
++  bar_hidden_for_page_ = false;
++  final_text_.clear();
++  draft_text_.clear();
++  Update();
++}
++
++void TarkCaptionsTab::OnUnitChanged(const std::string& unit) {
++  // Captions on, the language never ready in this tab, and neither here nor
++  // coming (another tab cancelled it): ask again, on Wi-Fi. Not after a
++  // removal (it was ready: TabCaptions turns captions off) and not while one
++  // waits (Request would skip it and notify again).
++  if (unit == logic_.state().language && logic_.state().captions_on &&
++      !logic_.state().unit_ready && !CaptionDownloads::Get().Removing(unit) &&
++      CaptionDownloads::Get().State(unit).state == CaptionDownloads::State::kMissing) {
++    CaptionDownloads::Get().Request(unit, /*now=*/false);
++    return;  // Request notifies again
++  }
++  if (unit == logic_.state().language || unit == "common") {
++    logic_.OnUnitReady(UnitReady(), base::TimeTicks::Now());
++    Update();
++  }
++}
++
++void TarkCaptionsTab::Add(const std::vector<float>& mono, int32_t sample_rate) {
++  if (!logic_.ShouldForwardAudio()) {
++    return;
++  }
++  const bool was_cant_caption = logic_.state().cant_caption;
++  const bool was_wanted = logic_.WantsEngine();
++  // Each player has its own connection; captions follow one of them.
++  const bool captioned =
++      logic_.OnAudio(audio_receivers_.current_receiver(), base::TimeTicks::Now());
++  if (was_cant_caption || !was_wanted) {
++    Update();  // audio came back: captions (and the model, if unloaded) again
++  }
++  if (captioned && service_.is_bound()) {
++    service_->AddAudio(mono, sample_rate);
++  }
++}
++
++void TarkCaptionsTab::Observe(mojo::PendingRemote<mojom::CaptionAudioSwitch> audio_switch) {
++  const mojo::RemoteSetElementId id = switches_.Add(std::move(audio_switch));
++  switches_.Get(id)->SetOn(switches_on_);
++}
++
++void TarkCaptionsTab::OnCaption(bool is_final, const std::string& text) {
++  if (is_final) {
++    final_text_ = text;
++    draft_text_.clear();
++    // What the person hears stays out of the log; android/captions/e2e/run.py
++    // passes --tark-captions-log-text (a debuggable device's command line).
++    if (base::CommandLine::ForCurrentProcess()->HasSwitch(kLogTextSwitch)) {
++      LOG(WARNING) << "tark captions: final " << text;
++    } else {
++      LOG(WARNING) << "tark captions: final (" << text.size() << " bytes)";
++    }
++  } else {
++    draft_text_ = text;
++  }
++  NotifyCaptionBar(web_contents());
++}
++
++int TarkCaptionsTab::PlayerKey(const content::MediaPlayerId& id) {
++  auto [it, added] = player_keys_.emplace(id, static_cast<int>(player_keys_.size()));
++  return it->second;
++}
++
++void TarkCaptionsTab::SetPlayerAudible(const content::MediaPlayerId& id, bool audible) {
++  logic_.OnPlayerAudible(PlayerKey(id), audible, base::TimeTicks::Now());
++  Update();
++}
++
++bool TarkCaptionsTab::UnitReady() const {
++  return CaptionDownloads::Get().State(logic_.state().language).state ==
++         CaptionDownloads::State::kReady;
++}
++
++void TarkCaptionsTab::Update() {
++  logic_.OnUnitReady(UnitReady(), base::TimeTicks::Now());
++  // Renderers send audio only while it is wanted.
++  const bool on = logic_.ShouldForwardAudio();
++  if (on != switches_on_) {
++    switches_on_ = on;
++    for (auto& audio_switch : switches_) {
++      audio_switch->SetOn(on);
++    }
++  }
++  if (logic_.WantsEngine() && !service_.is_bound()) {
++    StartEngine();
++  } else if (!logic_.WantsEngine() && service_.is_bound()) {
++    StopEngine();
++  }
++  // The timer runs while captions are on, and while a hidden tab still holds
++  // its captions process (until TabCaptions lets it go).
++  const bool tick =
++      logic_.state().captions_on &&
++      (web_contents()->GetVisibility() != content::Visibility::HIDDEN || service_.is_bound());
++  if (tick && !tick_.IsRunning()) {
++    tick_.Start(FROM_HERE, kTick, base::BindRepeating(
++                                      [](TarkCaptionsTab* self) {
++                                        self->logic_.OnTick(base::TimeTicks::Now());
++                                        self->Update();
++                                      },
++                                      base::Unretained(this)));
++  } else if (!tick && tick_.IsRunning()) {
++    tick_.Stop();
++  }
++  NotifyCaptionBar(web_contents());
++}
++
++void TarkCaptionsTab::StartEngine() {
++  const std::string unit = logic_.state().language;
++  style_ = StyleForDevice(FastestCoreKhz(),
++                          static_cast<int>(base::SysInfo::AmountOfTotalPhysicalMemory().InMiB()),
++                          g_browser_process->local_state()->GetInteger(kStylePref));
++  content::ServiceProcessHost::Launch(
++      service_.BindNewPipeAndPassReceiver(),
++      content::ServiceProcessHost::Options().WithDisplayName("Tark captions").Pass());
++  service_.set_disconnect_handler(
++      base::BindOnce(&TarkCaptionsTab::OnServiceGone, weak_factory_.GetWeakPtr()));
++  engine_unit_ = unit;
++  CaptionDownloads::Get().SetInUse(unit, true);
++  CaptionDownloads::Get().SetInUse("common", true);
++  base::ThreadPool::PostTaskAndReplyWithResult(
++      FROM_HERE, {base::MayBlock(), base::TaskPriority::USER_VISIBLE},
++      base::BindOnce(&OpenUnit, CaptionDownloads::Get().UnitDir(unit),
++                     CaptionDownloads::Get().UnitDir("common"), unit),
++      base::BindOnce(&TarkCaptionsTab::OnFilesOpened, weak_factory_.GetWeakPtr(), unit));
++}
++
++void TarkCaptionsTab::OnFilesOpened(std::string unit, std::map<std::string, base::File> files) {
++  if (!service_.is_bound() || unit != engine_unit_) {
++    return;
++  }
++  base::flat_map<std::string, base::File> handles;
++  for (auto& [name, file] : files) {
++    handles.emplace(name, std::move(file));
++  }
++  auto options = mojom::CaptionOptions::New();
++  options->language = unit;
++  options->threads = 2;
++  options->phrase = style_ == Style::kPhrase;
++  client_.reset();
++  service_->Start(std::move(handles), std::move(options), client_.BindNewPipeAndPassRemote(),
++                  base::BindOnce(&TarkCaptionsTab::OnStarted, weak_factory_.GetWeakPtr()));
++}
++
++void TarkCaptionsTab::OnStarted(bool ok) {
++  LOG(WARNING) << "tark captions: engine " << (ok ? "started " : "failed ") << engine_unit_;
++  if (!ok) {
++    OnServiceGone();
++  }
++}
++
++void TarkCaptionsTab::StopEngine() {
++  if (!service_.is_bound()) {
++    return;
++  }
++  service_.reset();  // the process exits with its last remote
++  client_.reset();
++  draft_text_.clear();
++  CaptionDownloads::Get().SetInUse(engine_unit_, false);
++  CaptionDownloads::Get().SetInUse("common", false);
++  engine_unit_.clear();
++}
++
++void TarkCaptionsTab::OnServiceGone() {
++  StopEngine();
++  logic_.OnServiceGone();
++  Update();
++}
++
++WEB_CONTENTS_USER_DATA_KEY_IMPL(TarkCaptionsTab);
++
++}  // namespace tark_captions
+--- /dev/null
++++ b/chrome/browser/tark_captions_android/tark_captions_tab.h
+@@ -0,0 +1,126 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_TARK_CAPTIONS_ANDROID_TARK_CAPTIONS_TAB_H_
++#define CHROME_BROWSER_TARK_CAPTIONS_ANDROID_TARK_CAPTIONS_TAB_H_
++
++#include <map>
++#include <string>
++#include <vector>
++
++#include "base/files/file.h"
++#include "base/memory/weak_ptr.h"
++#include "base/timer/timer.h"
++#include "chrome/browser/tark_captions_android/caption_downloads.h"
++#include "chrome/browser/tark_captions_android/tab_captions.h"
++#include "chrome/common/tark_captions/caption_audio.mojom.h"
++#include "chrome/services/tark_captions/public/mojom/tark_captions.mojom.h"
++#include "content/public/browser/media_player_id.h"
++#include "content/public/browser/web_contents_observer.h"
++#include "content/public/browser/web_contents_user_data.h"
++#include "mojo/public/cpp/bindings/receiver.h"
++#include "mojo/public/cpp/bindings/receiver_set.h"
++#include "mojo/public/cpp/bindings/remote.h"
++#include "mojo/public/cpp/bindings/remote_set.h"
++
++namespace content {
++class RenderFrameHost;
++}  // namespace content
++
++namespace tark_captions {
++
++// Tark for Android's live captions in one tab: watches its players, takes
++// its frames' audio while captions are on, runs the captions process
++// ("Tark captions", one per captioning tab) and tells the caption bar
++// (Java, TarkCaptionsBridge) what to show. The decisions are TabCaptions'.
++class TarkCaptionsTab : public content::WebContentsObserver,
++                        public content::WebContentsUserData<TarkCaptionsTab>,
++                        public CaptionDownloads::Observer,
++                        public mojom::CaptionAudio,
++                        public mojom::CaptionClient {
++ public:
++  // What the caption bar shows.
++  struct View {
++    bool bar_visible = false;
++    bool captions_on = false;
++    std::string language;
++    CaptionDownloads::UnitState unit;
++    bool cant_caption = false;
++    bool phrase = false;      // the caption style in use
++    std::string final_text;   // the last final caption
++    std::string draft_text;   // what is being said (word by word)
++  };
++
++  ~TarkCaptionsTab() override;
++
++  // A frame's renderer asking to send audio (chrome_browser_interface_binders).
++  static void BindAudio(content::RenderFrameHost* frame,
++                        mojo::PendingReceiver<mojom::CaptionAudio> receiver);
++
++  void SetCaptionsOn(bool on);
++  void ChooseLanguage(const std::string& language);
++  // "Download now" on mobile data, or the bar's "Try again".
++  void RequestDownload(bool now);
++  // ✕: the bar goes for this page.
++  void HideBarForPage();
++  View GetView() const;
++
++ private:
++  explicit TarkCaptionsTab(content::WebContents* web_contents);
++  friend class content::WebContentsUserData<TarkCaptionsTab>;
++
++  // content::WebContentsObserver:
++  void MediaStartedPlaying(const MediaPlayerInfo& info, const content::MediaPlayerId& id) override;
++  void MediaStoppedPlaying(const MediaPlayerInfo& info,
++                           const content::MediaPlayerId& id,
++                           WebContentsObserver::MediaStoppedReason reason) override;
++  void MediaMutedStatusChanged(const content::MediaPlayerId& id, bool muted) override;
++  void MediaDestroyed(const content::MediaPlayerId& id) override;
++  void OnVisibilityChanged(content::Visibility visibility) override;
++  void PrimaryPageChanged(content::Page& page) override;
++
++  // CaptionDownloads::Observer:
++  void OnUnitChanged(const std::string& unit) override;
++
++  // mojom::CaptionAudio:
++  void Add(const std::vector<float>& mono, int32_t sample_rate) override;
++  void Observe(mojo::PendingRemote<mojom::CaptionAudioSwitch> audio_switch) override;
++
++  // mojom::CaptionClient:
++  void OnCaption(bool is_final, const std::string& text) override;
++
++  int PlayerKey(const content::MediaPlayerId& id);
++  void SetPlayerAudible(const content::MediaPlayerId& id, bool audible);
++  // Acts on TabCaptions after any event: the renderers' switches, the
++  // captions process, the timer, the bar.
++  void Update();
++  void StartEngine();
++  void OnFilesOpened(std::string unit, std::map<std::string, base::File> files);
++  void OnStarted(bool ok);
++  void StopEngine();
++  void OnServiceGone();
++  bool UnitReady() const;
++  void CancelDownload();
++
++  TabCaptions logic_;
++  Style style_ = Style::kPhrase;
++  std::map<content::MediaPlayerId, int> player_keys_;
++  std::map<content::MediaPlayerId, bool> playing_, muted_;
++  bool bar_hidden_for_page_ = false;
++  mojo::ReceiverSet<mojom::CaptionAudio> audio_receivers_;
++  mojo::RemoteSet<mojom::CaptionAudioSwitch> switches_;
++  bool switches_on_ = false;
++  mojo::Remote<mojom::CaptionService> service_;
++  mojo::Receiver<mojom::CaptionClient> client_{this};
++  std::string engine_unit_;  // the unit the running process holds
++  std::string final_text_, draft_text_;
++  base::RepeatingTimer tick_;
++  base::WeakPtrFactory<TarkCaptionsTab> weak_factory_{this};
++
++  WEB_CONTENTS_USER_DATA_KEY_DECL();
++};
++
++}  // namespace tark_captions
++
++#endif  // CHROME_BROWSER_TARK_CAPTIONS_ANDROID_TARK_CAPTIONS_TAB_H_
+--- a/chrome/browser/ui/tab_helpers.cc
++++ b/chrome/browser/ui/tab_helpers.cc
+@@ -160,6 +160,7 @@
+ 
+ #if BUILDFLAG(IS_ANDROID)
+ #include "base/android/android_info.h"
++#include "chrome/browser/tark_captions_android/tark_captions_tab.h"
+ #include "base/functional/bind.h"
+ #include "base/memory/ptr_util.h"
+ #include "chrome/browser/android/oom_intervention/oom_intervention_tab_helper.h"
+@@ -659,6 +660,8 @@
+ 
+ #if BUILDFLAG(IS_ANDROID)
+   webapps::MLInstallabilityPromoter::CreateForWebContents(web_contents);
++  // Tark: live captions (the bar shows when a video plays with sound).
++  tark_captions::TarkCaptionsTab::CreateForWebContents(web_contents);
+   {
+     // Remove after fixing https://crbug.com/41426655
+     TRACE_EVENT0("browser", "AppBannerManagerAndroid::CreateForWebContents");

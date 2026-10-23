@@ -1,0 +1,1599 @@
+--- a/BUILD.gn
++++ b/BUILD.gn
+@@ -103,6 +103,7 @@
+       "//components:components_unittests",
+       "//components/gwp_asan:gwp_asan_unittests",
+       "//components/tark_captions:host_unittests",
++      "//chrome/browser/tark_captions_android:host_unittests",
+       "//infra/orchestrator:orchestrator_all",
+       "//net:net_unittests",
+       "//sandbox:sandbox_unittests",
+--- a/chrome/browser/BUILD.gn
++++ b/chrome/browser/BUILD.gn
+@@ -1666,9 +1666,14 @@
+       # The direct APK's daily update check (A5).
+       "tark_update/update_check_service.cc",
+       "tark_update/update_check_service.h",
++
++      # Live captions: the model downloads.
++      "tark_captions_android/caption_downloads.cc",
++      "tark_captions_android/caption_downloads.h",
+     ]
+     deps += [
+       "//chrome/browser/omaha/android:jni_headers",
++      "//chrome/browser/tark_captions_android:rules",
+       "//chrome/browser/tark_update:index",
+       "//chrome/browser/tark_xlit:files",
+       "//chrome/browser/tark_xlit/android:jni_headers",
+--- a/chrome/browser/chrome_browser_main_android.cc
++++ b/chrome/browser/chrome_browser_main_android.cc
+@@ -20,6 +20,7 @@
+ #include "chrome/browser/data_saver/data_saver.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/tark_adblock/tark_adblock_service.h"
++#include "chrome/browser/tark_captions_android/caption_downloads.h"
+ #include "chrome/browser/tark_update/update_check_service.h"
+ #include "chrome/browser/tark_xlit/xlit_download_service.h"
+ #include "chrome/browser/webauthn/android/cable_module_android.h"
+@@ -125,6 +126,10 @@
+   // resumes a download the person said yes to. Fetches nothing otherwise.
+   tark_xlit::XlitDownloadService::Get();
+ 
++  // Tark: finds the live captions' downloaded models, and resumes a download
++  // the person asked for. Fetches nothing otherwise.
++  tark_captions::CaptionDownloads::Get();
++
+   // Tark (A5): the direct APK's check for a newer version, once a day; off
+   // when Google Play installed Tark.
+   tark_update::UpdateCheckService::Get();
+--- a/chrome/browser/prefs/browser_prefs.cc
++++ b/chrome/browser/prefs/browser_prefs.cc
+@@ -275,6 +275,7 @@
+ 
+ #if BUILDFLAG(IS_ANDROID)
+ #include "chrome/browser/accessibility/accessibility_prefs/android/accessibility_prefs_controller.h"
++#include "chrome/browser/tark_captions_android/caption_downloads.h"
+ #include "chrome/browser/tark_update/update_check_service.h"
+ #include "chrome/browser/tark_xlit/xlit_download_service.h"
+ #include "chrome/browser/android/ntp/recent_tabs_page_prefs.h"
+@@ -1420,6 +1421,7 @@
+   tark::RegisterWidevineLocalStatePrefs(registry);
+ #if BUILDFLAG(IS_ANDROID)
+   tark_xlit::XlitDownloadService::RegisterPrefs(registry);
++  tark_captions::CaptionDownloads::RegisterPrefs(registry);
+   tark_update::UpdateCheckService::RegisterPrefs(registry);
+   accessibility::AccessibilityPrefsController::RegisterLocalStatePrefs(
+       registry);
+--- /dev/null
++++ b/chrome/browser/tark_captions_android/BUILD.gn
+@@ -0,0 +1,47 @@
++# Copyright 2026 The Tark Authors
++# Use of this source code is governed by a BSD-style license that can be
++# found in the LICENSE file.
++#
++# Tark for Android's live captions: the model files' rules (table, check,
++# scan, use) and one tab's captions logic (TabCaptions), with no browser
++# dependencies, so that their unit tests also build for the build machine
++# (android/build.sh runs them).
++
++import("//testing/test.gni")
++
++static_library("rules") {
++  sources = [
++    "model_files.cc",
++    "model_files.h",
++    "model_files.inc",
++    "tab_captions.cc",
++    "tab_captions.h",
++  ]
++  deps = [
++    "//base",
++    "//crypto",
++  ]
++}
++
++if (!is_android) {
++  test("tark_captions_android_unittests") {
++    sources = [
++      "model_files_unittest.cc",
++      "tab_captions_unittest.cc",
++    ]
++    deps = [
++      ":rules",
++      "//base",
++      "//base/test:run_all_unittests",
++      "//base/test:test_support",
++      "//testing/gtest",
++    ]
++  }
++}
++
++if (current_toolchain == default_toolchain) {
++  group("host_unittests") {
++    testonly = true
++    deps = [ ":tark_captions_android_unittests($host_toolchain)" ]
++  }
++}
+--- /dev/null
++++ b/chrome/browser/tark_captions_android/caption_downloads.cc
+@@ -0,0 +1,460 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/tark_captions_android/caption_downloads.h"
++
++#include <algorithm>
++#include <utility>
++
++#include "base/command_line.h"
++#include "base/files/file_util.h"
++#include "base/functional/bind.h"
++#include "base/logging.h"
++#include "base/path_service.h"
++#include "base/strings/strcat.h"
++#include "base/task/thread_pool.h"
++#include "base/values.h"
++#include "chrome/browser/browser_process.h"
++#include "components/prefs/pref_registry_simple.h"
++#include "components/prefs/pref_service.h"
++#include "components/prefs/scoped_user_pref_update.h"
++#include "net/base/net_errors.h"
++#include "net/traffic_annotation/network_traffic_annotation.h"
++#include "services/network/public/cpp/resource_request.h"
++#include "services/network/public/cpp/shared_url_loader_factory.h"
++#include "services/network/public/cpp/simple_url_loader.h"
++#include "services/network/public/mojom/fetch_api.mojom-shared.h"
++#include "url/gurl.h"
++
++namespace tark_captions {
++namespace {
++
++using tark_xlit::Network;
++using tark_xlit::ShouldStartNow;
++
++constexpr base::TimeDelta kTimeout = base::Minutes(30);
++constexpr base::TimeDelta kRetryDelay = base::Seconds(30);
++// For android/captions/e2e/run.py only: where the files are served instead
++// of gettarka.com (read from the command-line file on a debuggable device).
++constexpr char kBaseUrlSwitch[] = "tark-captions-models-url";
++
++constexpr net::NetworkTrafficAnnotationTag kTrafficAnnotation =
++    net::DefineNetworkTrafficAnnotation("tark_captions_models", R"(
++      semantics {
++        sender: "Tark live captions"
++        description:
++          "Downloads the speech model of one language (AI4Bharat's "
++          "IndicConformer or NVIDIA's FastConformer) and Silero's speech "
++          "detector from gettarka.com, so that videos are captioned on the "
++          "phone. Nothing the person hears is sent anywhere."
++        trigger:
++          "The person turned on captions in a language whose model is not "
++          "on the phone yet. On Wi-Fi unless they chose to download now."
++        data: "None: no cookies, no identifiers, no query string."
++        destination: OTHER
++        destination_other: "gettarka.com"
++      }
++      policy {
++        cookies_allowed: NO
++        setting: "Settings > Accessibility > Live captions."
++        policy_exception_justification: "Tark has no enterprise policies."
++      })");
++
++Network CurrentNetwork() {
++  const auto type = net::NetworkChangeNotifier::GetConnectionType();
++  if (type == net::NetworkChangeNotifier::CONNECTION_NONE) {
++    return Network::kNone;
++  }
++  if (type == net::NetworkChangeNotifier::CONNECTION_WIFI ||
++      type == net::NetworkChangeNotifier::CONNECTION_ETHERNET) {
++    return Network::kUnmetered;
++  }
++  return Network::kMetered;
++}
++
++base::FilePath CaptionsDirectory() {
++  base::FilePath data;
++  base::PathService::Get(base::DIR_ANDROID_APP_DATA, &data);
++  return data.AppendASCII("captions");
++}
++
++std::vector<std::string> KnownUnits() {
++  std::vector<std::string> units;
++  for (const CaptionFile& file : AllFiles()) {
++    if (std::ranges::find(units, file.unit) == units.end()) {
++      units.emplace_back(file.unit);
++    }
++  }
++  return units;
++}
++
++bool CellularOk(std::string_view unit) {
++  const base::ListValue& units = g_browser_process->local_state()->GetList(kCellularOkPref);
++  return std::ranges::any_of(units, [&](const base::Value& v) {
++    return v.is_string() && v.GetString() == unit;
++  });
++}
++
++void SetCellularOk(std::string_view unit, bool ok) {
++  ScopedListPrefUpdate update(g_browser_process->local_state(), kCellularOkPref);
++  update->EraseValue(base::Value(unit));
++  if (ok) {
++    update->Append(unit);
++  }
++}
++
++// Checks a finished download, puts it in place and records its hash.
++bool VerifyAndPlace(const base::FilePath& part, const base::FilePath& target, CaptionFile file) {
++  return VerifyFile(part, file) && base::ReplaceFile(part, target, nullptr) &&
++         WriteRecord(target, file);
++}
++
++}  // namespace
++
++// static
++void CaptionDownloads::RegisterPrefs(PrefRegistrySimple* registry) {
++  registry->RegisterListPref(kCellularOkPref);
++  registry->RegisterIntegerPref(kStylePref, 0);
++  registry->RegisterStringPref(kLanguagePref, std::string());
++}
++
++// static
++CaptionDownloads& CaptionDownloads::Get() {
++  static base::NoDestructor<CaptionDownloads> downloads;
++  return *downloads;
++}
++
++CaptionDownloads::CaptionDownloads() : dir_(CaptionsDirectory()) {
++  net::NetworkChangeNotifier::AddNetworkChangeObserver(this);
++  base::ThreadPool::PostTaskAndReplyWithResult(
++      FROM_HERE, {base::MayBlock(), base::TaskPriority::USER_VISIBLE},
++      base::BindOnce(
++          [](base::FilePath dir) {
++            std::map<std::string, std::vector<std::string>> present;
++            base::CreateDirectory(dir);
++            for (const std::string& unit : KnownUnits()) {
++              const base::FilePath unit_dir = dir.AppendASCII(unit);
++              if (base::DirectoryExists(unit_dir)) {
++                present[unit] = ScanUnit(unit_dir, unit);
++              }
++            }
++            return present;
++          },
++          dir_),
++      base::BindOnce(&CaptionDownloads::OnScanned, weak_factory_.GetWeakPtr()));
++}
++
++CaptionDownloads::~CaptionDownloads() {
++  net::NetworkChangeNotifier::RemoveNetworkChangeObserver(this);
++}
++
++void CaptionDownloads::OnScanned(std::map<std::string, std::vector<std::string>> present) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  for (auto& [unit, files] : present) {
++    present_[unit] = std::move(files);
++    if (Ready(unit)) {
++      LOG(WARNING) << "tark captions: ready " << unit;
++    }
++  }
++  scanned_ = true;
++  // A "Download now" that was not finished resumes.
++  // Copied first: Request() rewrites this list (SetCellularOk).
++  std::vector<std::string> resume;
++  for (const base::Value& unit : g_browser_process->local_state()->GetList(kCellularOkPref)) {
++    if (unit.is_string()) {
++      resume.push_back(unit.GetString());
++    }
++  }
++  for (const std::string& unit : resume) {
++    Request(unit, /*now=*/true);
++  }
++  MaybeDownloadNext();
++}
++
++bool CaptionDownloads::Ready(std::string_view unit) const {
++  auto it = present_.find(unit);
++  // A removal waiting for the captions process is not ready: tabs turn
++  // captions off and let it go, and Settings drops the row.
++  return it != present_.end() && UnitReady(unit, it->second) && !use_.Removing(unit);
++}
++
++void CaptionDownloads::Request(std::string_view unit, bool now) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  if (FilesOf(unit).empty()) {
++    return;
++  }
++  for (const std::string& u : UnitsToFetch(unit)) {
++    if (now) {
++      SetCellularOk(u, true);
++    }
++    failed_.erase(u);
++    // Being removed (its files still on disk): requested again once gone.
++    if (!Ready(u) && !use_.Removing(u) && std::ranges::find(queue_, u) == queue_.end()) {
++      queue_.push_back(u);
++    }
++  }
++  g_browser_process->local_state()->CommitPendingWrite();
++  // The person asked again: a spent budget starts over.
++  attempts_.Reset();
++  retry_timer_.Stop();
++  Notify(std::string(unit));
++  MaybeDownloadNext();
++}
++
++void CaptionDownloads::Cancel(std::string_view unit) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  std::erase(queue_, std::string(unit));
++  SetCellularOk(unit, false);
++  if (current_ && current_->unit == unit) {
++    ++generation_;  // its .part file is removed at the next start
++    loader_.reset();
++    current_ = nullptr;
++  }
++  Notify(std::string(unit));
++  MaybeDownloadNext();
++}
++
++void CaptionDownloads::Remove(std::string_view unit) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  Cancel(unit);
++  if (use_.RequestRemove(unit)) {
++    DeleteUnit(std::string(unit));
++  } else {
++    Notify(std::string(unit));  // in use: tabs see it is no longer ready
++  }
++}
++
++void CaptionDownloads::SetInUse(std::string_view unit, bool in_use) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  if (use_.SetInUse(unit, in_use)) {
++    DeleteUnit(std::string(unit));
++  }
++}
++
++void CaptionDownloads::DeleteUnit(const std::string& unit) {
++  present_.erase(unit);
++  base::ThreadPool::PostTask(FROM_HERE, {base::MayBlock(), base::TaskPriority::USER_VISIBLE},
++                             base::GetDeletePathRecursivelyCallback(UnitDir(unit)));
++  Notify(unit);
++}
++
++CaptionDownloads::UnitState CaptionDownloads::State(std::string_view unit) const {
++  UnitState state;
++  for (const std::string& u : UnitsToFetch(unit)) {
++    if (Ready(u)) {
++      continue;
++    }
++    for (const CaptionFile* file : FilesOf(u)) {
++      state.total += file->size;
++    }
++  }
++  if (state.total == 0) {
++    state.state = State::kReady;
++    for (const CaptionFile* file : FilesOf(unit)) {
++      state.total += file->size;
++    }
++    return state;
++  }
++  auto present_bytes = [&](const std::string& u) {
++    int64_t bytes = 0;
++    auto it = present_.find(u);
++    for (const CaptionFile* file : FilesOf(u)) {
++      if (it != present_.end() && std::ranges::find(it->second, file->name) != it->second.end()) {
++        bytes += file->size;
++      }
++    }
++    return bytes;
++  };
++  const bool queued = std::ranges::any_of(UnitsToFetch(unit), [&](const std::string& u) {
++    return std::ranges::find(queue_, u) != queue_.end();
++  });
++  if (failed_.contains(unit) || failed_.contains("common")) {
++    state.state = State::kFailed;
++  } else if (queued && current_ && std::ranges::contains(UnitsToFetch(unit), current_->unit)) {
++    state.state = State::kDownloading;
++  } else if (queued) {
++    state.state = State::kWaitingForWifi;
++  }
++  for (const std::string& u : UnitsToFetch(unit)) {
++    if (!Ready(u)) {
++      state.bytes += present_bytes(u);
++    }
++  }
++  if (current_ && (current_->unit == unit || current_->unit == "common")) {
++    state.bytes += current_bytes_;
++  }
++  return state;
++}
++
++std::map<std::string, int64_t> CaptionDownloads::ReadyUnits() const {
++  std::map<std::string, int64_t> units;
++  for (const auto& [unit, files] : present_) {
++    if (unit != "common" && Ready(unit)) {
++      int64_t size = 0;
++      for (const CaptionFile* file : FilesOf(unit)) {
++        size += file->size;
++      }
++      units[unit] = size;
++    }
++  }
++  return units;
++}
++
++base::FilePath CaptionDownloads::UnitDir(std::string_view unit) const {
++  return dir_.AppendASCII(unit);
++}
++
++void CaptionDownloads::AddObserver(Observer* observer) {
++  observers_.AddObserver(observer);
++}
++
++void CaptionDownloads::RemoveObserver(Observer* observer) {
++  observers_.RemoveObserver(observer);
++}
++
++void CaptionDownloads::Notify(const std::string& unit) {
++  for (Observer& observer : observers_) {
++    observer.OnUnitChanged(unit);
++  }
++}
++
++void CaptionDownloads::OnNetworkChanged(net::NetworkChangeNotifier::ConnectionType type) {
++  MaybeDownloadNext();
++}
++
++void CaptionDownloads::MaybeDownloadNext() {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  if (!scanned_ || current_ || retry_timer_.IsRunning() || attempts_.exhausted()) {
++    return;
++  }
++  std::vector<std::string> done;
++  std::erase_if(queue_, [&](const std::string& unit) {
++    if (!Ready(unit)) {
++      return false;
++    }
++    done.push_back(unit);
++    return true;
++  });
++  for (const std::string& unit : done) {
++    SetCellularOk(unit, false);
++    LOG(WARNING) << "tark captions: ready " << unit;
++    Notify(unit);
++  }
++  if (current_) {
++    return;  // a Notify above may have started the next one
++  }
++  const std::optional<std::string> next = NextToFetch(queue_, [&](const std::string& unit) {
++    return !use_.Removing(unit) && ShouldStartNow(CurrentNetwork(), CellularOk(unit));
++  });
++  if (!next) {
++    return;
++  }
++  const std::string unit = *next;
++  const std::vector<std::string>& present = present_[unit];
++  for (const CaptionFile* file : FilesOf(unit)) {
++    if (std::ranges::find(present, file->name) == present.end()) {
++      current_ = file;
++      break;
++    }
++  }
++  if (!current_) {
++    // Nothing missing yet not ready: drop it rather than fetch nothing.
++    std::erase(queue_, unit);
++    Notify(unit);
++    return;
++  }
++  current_bytes_ = 0;
++  const uint64_t generation = ++generation_;
++  base::CreateDirectory(UnitDir(unit));
++  auto request = std::make_unique<network::ResourceRequest>();
++  const base::CommandLine& command_line = *base::CommandLine::ForCurrentProcess();
++  request->url = command_line.HasSwitch(kBaseUrlSwitch)
++                     ? GURL(base::StrCat({command_line.GetSwitchValueASCII(kBaseUrlSwitch),
++                                          current_->sha256, ".bin"}))
++                     : GURL(FileUrl(*current_));
++  LOG(WARNING) << "tark captions: downloading " << unit << "/" << current_->name;
++  request->method = "GET";
++  request->credentials_mode = network::mojom::CredentialsMode::kOmit;
++  loader_ = network::SimpleURLLoader::Create(std::move(request), kTrafficAnnotation);
++  loader_->SetTimeoutDuration(kTimeout);
++  // The files are served as they are; a redirect anywhere is refused.
++  loader_->SetOnRedirectCallback(base::BindRepeating(
++      [](base::WeakPtr<CaptionDownloads> self, const GURL&, const net::RedirectInfo&,
++         const network::mojom::URLResponseHead&, std::vector<std::string>*) {
++        if (self) {
++          self->loader_.reset();
++          if (self->current_) {
++            self->failed_[std::string(self->current_->unit)] = true;
++            self->Notify(std::string(self->current_->unit));
++          }
++          self->current_ = nullptr;
++          self->attempts_.Exhaust();
++        }
++      },
++      weak_factory_.GetWeakPtr()));
++  loader_->SetOnDownloadProgressCallback(
++      base::BindRepeating(&CaptionDownloads::OnProgress, weak_factory_.GetWeakPtr()));
++  loader_->DownloadToFile(
++      g_browser_process->shared_url_loader_factory().get(),
++      base::BindOnce(&CaptionDownloads::OnDownloaded, weak_factory_.GetWeakPtr(), generation,
++                     current_),
++      UnitDir(unit).AppendASCII(PartFileName(current_->name, generation)), current_->size);
++}
++
++void CaptionDownloads::OnProgress(uint64_t current) {
++  current_bytes_ = static_cast<int64_t>(current);
++  if (current_) {
++    Notify(std::string(current_->unit));
++  }
++}
++
++void CaptionDownloads::OnDownloaded(uint64_t generation,
++                                    const CaptionFile* file,
++                                    base::FilePath part) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  if (generation != generation_) {
++    return;
++  }
++  const int error = loader_ ? loader_->NetError() : net::ERR_ABORTED;
++  loader_.reset();
++  if (error != net::OK || part.empty()) {
++    LOG(WARNING) << "tark captions: " << file->name << " failed: " << net::ErrorToString(error);
++    OnVerified(generation, file, false);
++    return;
++  }
++  base::ThreadPool::PostTaskAndReplyWithResult(
++      FROM_HERE, {base::MayBlock(), base::TaskPriority::USER_VISIBLE},
++      base::BindOnce(&VerifyAndPlace, part,
++                     UnitDir(file->unit).AppendASCII(std::string(file->name)), *file),
++      base::BindOnce(&CaptionDownloads::OnVerified, weak_factory_.GetWeakPtr(), generation,
++                     file));
++}
++
++void CaptionDownloads::OnVerified(uint64_t generation, const CaptionFile* file, bool ok) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  if (generation != generation_) {
++    return;  // cancelled meanwhile
++  }
++  current_ = nullptr;
++  current_bytes_ = 0;
++  const std::string unit(file->unit);
++  if (ok) {
++    present_[unit].emplace_back(file->name);
++    std::ranges::sort(present_[unit]);
++    Notify(unit);
++    MaybeDownloadNext();
++    return;
++  }
++  LOG(WARNING) << "tark captions: " << file->name << " not accepted";
++  if (attempts_.TryAgain()) {
++    retry_timer_.Start(FROM_HERE, kRetryDelay,
++                       base::BindOnce(&CaptionDownloads::MaybeDownloadNext,
++                                      weak_factory_.GetWeakPtr()));
++  } else {
++    failed_[unit] = true;
++  }
++  Notify(unit);
++}
++
++}  // namespace tark_captions
+--- /dev/null
++++ b/chrome/browser/tark_captions_android/caption_downloads.h
+@@ -0,0 +1,126 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_TARK_CAPTIONS_ANDROID_CAPTION_DOWNLOADS_H_
++#define CHROME_BROWSER_TARK_CAPTIONS_ANDROID_CAPTION_DOWNLOADS_H_
++
++#include <cstdint>
++#include <deque>
++#include <map>
++#include <memory>
++#include <string>
++#include <string_view>
++#include <vector>
++
++#include "base/files/file_path.h"
++#include "base/memory/weak_ptr.h"
++#include "base/no_destructor.h"
++#include "base/observer_list.h"
++#include "base/sequence_checker.h"
++#include "base/timer/timer.h"
++#include "chrome/browser/tark_captions_android/model_files.h"
++#include "chrome/browser/tark_xlit/xlit_files.h"
++#include "net/base/network_change_notifier.h"
++
++class PrefRegistrySimple;
++
++namespace network {
++class SimpleURLLoader;
++}  // namespace network
++
++namespace tark_captions {
++
++// Local state: the units the person chose "Download now" for, until they
++// are in place.
++inline constexpr char kCellularOkPref[] = "tark.captions.cellular_ok";
++// Caption style: 0 Automatic, 1 word by word, 2 a phrase at a time.
++inline constexpr char kStylePref[] = "tark.captions.style";
++// The language last chosen in the caption bar ("hi", "ta", "en", "es").
++inline constexpr char kLanguagePref[] = "tark.captions.language";
++
++// Tark for Android's live captions: downloads a language's model files (and
++// "common", Silero VAD) into the app's data directory when the person turns
++// captions on for it, on Wi-Fi unless they chose "Download now"; three tries,
++// no redirects, a file that does not match is deleted. One per browser
++// process, on the UI thread. Nothing is fetched until the person asks.
++class CaptionDownloads : public net::NetworkChangeNotifier::NetworkChangeObserver {
++ public:
++  enum class State { kMissing, kWaitingForWifi, kDownloading, kReady, kFailed };
++  struct UnitState {
++    State state = State::kMissing;
++    int64_t bytes = 0;  // downloaded so far (kDownloading)
++    int64_t total = 0;  // the unit's size, "common" included while missing
++  };
++
++  class Observer : public base::CheckedObserver {
++   public:
++    virtual void OnUnitChanged(const std::string& unit) = 0;
++  };
++
++  static void RegisterPrefs(PrefRegistrySimple* registry);
++  // Created at browser start (chrome_browser_main_android.cc).
++  static CaptionDownloads& Get();
++
++  CaptionDownloads(const CaptionDownloads&) = delete;
++  CaptionDownloads& operator=(const CaptionDownloads&) = delete;
++
++  // The person turned captions on in `unit`'s language: its files (and
++  // common's), on Wi-Fi, or now on any network.
++  void Request(std::string_view unit, bool now);
++  void Cancel(std::string_view unit);
++  // Deletes the unit's files (Settings); while it is captioning, when it is
++  // released.
++  void Remove(std::string_view unit);
++  UnitState State(std::string_view unit) const;
++  // The units whose files are all in place (Settings), with their sizes.
++  std::map<std::string, int64_t> ReadyUnits() const;
++  // Engines hold their unit while they run.
++  void SetInUse(std::string_view unit, bool in_use);
++  // Whether `unit` waits to be removed (in use when Remove() was called).
++  bool Removing(std::string_view unit) const { return use_.Removing(unit); }
++  // Where a unit's files are: <app data>/captions/<unit>.
++  base::FilePath UnitDir(std::string_view unit) const;
++
++  void AddObserver(Observer* observer);
++  void RemoveObserver(Observer* observer);
++
++ private:
++  friend class base::NoDestructor<CaptionDownloads>;
++  CaptionDownloads();
++  ~CaptionDownloads() override;
++
++  // NetworkChangeObserver:
++  void OnNetworkChanged(net::NetworkChangeNotifier::ConnectionType type) override;
++
++  void OnScanned(std::map<std::string, std::vector<std::string>> present);
++  bool Ready(std::string_view unit) const;
++  // Starts the next missing file of the first queued unit if allowed.
++  void MaybeDownloadNext();
++  void OnProgress(uint64_t current);
++  void OnDownloaded(uint64_t generation, const CaptionFile* file, base::FilePath part);
++  void OnVerified(uint64_t generation, const CaptionFile* file, bool ok);
++  void DeleteUnit(const std::string& unit);
++  void Notify(const std::string& unit);
++
++  SEQUENCE_CHECKER(sequence_checker_);
++  const base::FilePath dir_;
++  bool scanned_ = false;
++  std::map<std::string, std::vector<std::string>, std::less<>> present_;
++  // Units asked for and not yet in place, oldest first.
++  std::deque<std::string> queue_;
++  std::map<std::string, bool, std::less<>> failed_;
++  std::unique_ptr<network::SimpleURLLoader> loader_;
++  const CaptionFile* current_ = nullptr;
++  int64_t current_bytes_ = 0;
++  uint64_t generation_ = 0;
++  tark_xlit::Attempts attempts_;
++  base::OneShotTimer retry_timer_;
++  UnitUse use_;
++  base::ObserverList<Observer> observers_;
++  base::WeakPtrFactory<CaptionDownloads> weak_factory_{this};
++};
++
++}  // namespace tark_captions
++
++#endif  // CHROME_BROWSER_TARK_CAPTIONS_ANDROID_CAPTION_DOWNLOADS_H_
+--- /dev/null
++++ b/chrome/browser/tark_captions_android/model_files.cc
+@@ -0,0 +1,211 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/tark_captions_android/model_files.h"
++
++#include <algorithm>
++#include <optional>
++
++#include "base/files/file_enumerator.h"
++#include "base/files/file_path.h"
++#include "base/files/file_util.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/strings/string_util.h"
++#include "base/strings/strcat.h"
++#include "crypto/hash.h"
++
++namespace tark_captions {
++namespace {
++
++constexpr CaptionFile kFiles[] = {
++#include "chrome/browser/tark_captions_android/model_files.inc"
++};
++
++constexpr char kCommon[] = "common";
++constexpr char kBaseUrl[] = "https://gettarka.com/models/android/v1/";
++constexpr char kRecordSuffix[] = ".sha256";
++constexpr char kPartSuffix[] = ".part";
++
++const CaptionFile* Find(base::span<const CaptionFile> table,
++                        std::string_view unit,
++                        std::string_view name) {
++  for (const CaptionFile& file : table) {
++    if (file.unit == unit && file.name == name) {
++      return &file;
++    }
++  }
++  return nullptr;
++}
++
++std::optional<std::string> HashOf(const base::FilePath& path) {
++  base::File file(path, base::File::FLAG_OPEN | base::File::FLAG_READ);
++  if (!file.IsValid()) {
++    return std::nullopt;
++  }
++  crypto::hash::Hasher hasher(crypto::hash::kSha256);
++  std::vector<uint8_t> buffer(1 << 20);
++  while (true) {
++    std::optional<size_t> read = file.ReadAtCurrentPos(buffer);
++    if (!read) {
++      return std::nullopt;
++    }
++    if (*read == 0) {
++      break;
++    }
++    hasher.Update(base::span(buffer).first(*read));
++  }
++  std::array<uint8_t, crypto::hash::kSha256Size> digest;
++  hasher.Finish(digest);
++  return base::ToLowerASCII(base::HexEncode(digest));
++}
++
++base::FilePath RecordPath(const base::FilePath& path) {
++  return path.AddExtensionASCII("sha256");
++}
++
++}  // namespace
++
++base::span<const CaptionFile> AllFiles() {
++  return kFiles;
++}
++
++std::vector<const CaptionFile*> FilesOf(std::string_view unit,
++                                        base::span<const CaptionFile> table) {
++  std::vector<const CaptionFile*> out;
++  for (const CaptionFile& file : table) {
++    if (file.unit == unit) {
++      out.push_back(&file);
++    }
++  }
++  return out;
++}
++
++std::vector<std::string> UnitsToFetch(std::string_view unit) {
++  std::vector<std::string> units = {kCommon};
++  if (unit != kCommon) {
++    units.emplace_back(unit);
++  }
++  return units;
++}
++
++std::string FileUrl(const CaptionFile& file) {
++  return base::StrCat({kBaseUrl, file.sha256, ".bin"});
++}
++
++bool VerifyFile(const base::FilePath& path, const CaptionFile& file) {
++  std::optional<int64_t> size = base::GetFileSize(path);
++  const bool ok = size && *size == file.size && HashOf(path) == file.sha256;
++  if (!ok) {
++    base::DeleteFile(path);
++    base::DeleteFile(RecordPath(path));
++  }
++  return ok;
++}
++
++bool WriteRecord(const base::FilePath& path, const CaptionFile& file) {
++  return base::WriteFile(RecordPath(path), file.sha256);
++}
++
++std::string PartFileName(std::string_view name, uint64_t generation) {
++  return base::StrCat({name, ".", base::NumberToString(generation), kPartSuffix});
++}
++
++std::vector<std::string> ScanUnit(const base::FilePath& unit_dir,
++                                  std::string_view unit,
++                                  base::span<const CaptionFile> table) {
++  std::vector<std::string> present;
++  base::FileEnumerator files(unit_dir, /*recursive=*/false, base::FileEnumerator::FILES);
++  for (base::FilePath path = files.Next(); !path.empty(); path = files.Next()) {
++    const std::string name = path.BaseName().AsUTF8Unsafe();
++    if (base::EndsWith(name, kRecordSuffix)) {
++      // Kept beside its file; removed with it.
++      const std::string data = name.substr(0, name.size() - strlen(kRecordSuffix));
++      if (!Find(table, unit, data) || !base::PathExists(unit_dir.AppendASCII(data))) {
++        base::DeleteFile(path);
++      }
++      continue;
++    }
++    const CaptionFile* file = Find(table, unit, name);
++    if (!file || base::EndsWith(name, kPartSuffix)) {
++      base::DeleteFile(path);
++      continue;
++    }
++    std::optional<int64_t> size = base::GetFileSize(path);
++    if (!size || *size != file->size) {
++      base::DeleteFile(path);
++      base::DeleteFile(RecordPath(path));
++      continue;
++    }
++    std::string record;
++    if (base::ReadFileToString(RecordPath(path), &record) && record == file->sha256) {
++      present.push_back(name);
++    } else if (VerifyFile(path, *file)) {
++      WriteRecord(path, *file);
++      present.push_back(name);
++    }
++  }
++  std::sort(present.begin(), present.end());
++  return present;
++}
++
++bool UnitReady(std::string_view unit,
++               const std::vector<std::string>& present,
++               base::span<const CaptionFile> table) {
++  std::vector<const CaptionFile*> files = FilesOf(unit, table);
++  return !files.empty() && std::ranges::all_of(files, [&](const CaptionFile* file) {
++    return std::ranges::find(present, file->name) != present.end();
++  });
++}
++
++std::optional<std::string> NextToFetch(const std::deque<std::string>& queue,
++                                       base::FunctionRef<bool(const std::string&)> can_start) {
++  for (const std::string& unit : queue) {
++    if (can_start(unit)) {
++      return unit;
++    }
++  }
++  return std::nullopt;
++}
++
++UnitUse::UnitUse() = default;
++UnitUse::~UnitUse() = default;
++
++bool UnitUse::SetInUse(std::string_view unit, bool in_use) {
++  auto it = in_use_.find(unit);
++  if (in_use) {
++    if (it == in_use_.end()) {
++      in_use_.emplace(std::string(unit), 1);
++    } else {
++      ++it->second;
++    }
++    return false;
++  }
++  if (it == in_use_.end()) {
++    return false;
++  }
++  if (--it->second > 0) {
++    return false;
++  }
++  in_use_.erase(it);
++  auto pending = pending_remove_.find(unit);
++  if (pending == pending_remove_.end()) {
++    return false;
++  }
++  pending_remove_.erase(pending);
++  return true;
++}
++
++bool UnitUse::RequestRemove(std::string_view unit) {
++  if (in_use_.find(unit) == in_use_.end()) {
++    return true;
++  }
++  pending_remove_.emplace(unit);
++  return false;
++}
++
++bool UnitUse::Removing(std::string_view unit) const {
++  return pending_remove_.contains(unit);
++}
++
++}  // namespace tark_captions
+--- /dev/null
++++ b/chrome/browser/tark_captions_android/model_files.h
+@@ -0,0 +1,97 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_TARK_CAPTIONS_ANDROID_MODEL_FILES_H_
++#define CHROME_BROWSER_TARK_CAPTIONS_ANDROID_MODEL_FILES_H_
++
++#include <cstdint>
++#include <deque>
++#include <map>
++#include <optional>
++#include <set>
++#include <string>
++#include <string_view>
++#include <vector>
++
++#include "base/containers/span.h"
++#include "base/functional/function_ref.h"
++
++namespace base {
++class FilePath;
++}  // namespace base
++
++namespace tark_captions {
++
++// Tark for Android's live captions: the model files the phone downloads from
++// gettarka.com, by unit ("common", then one per language), each pinned in
++// the APK by size and sha256 (android/captions/models.py writes the table,
++// model_files.inc, from android/captions/files.json). Base-only, so the rules
++// build for the build machine's tests.
++struct CaptionFile {
++  std::string_view unit;
++  std::string_view name;
++  int64_t size;
++  std::string_view sha256;  // Lower-case hex.
++};
++
++// The APK's table.
++base::span<const CaptionFile> AllFiles();
++std::vector<const CaptionFile*> FilesOf(std::string_view unit,
++                                        base::span<const CaptionFile> table = AllFiles());
++
++// What turning `unit` on downloads: "common" (Silero VAD) and the unit.
++std::vector<std::string> UnitsToFetch(std::string_view unit);
++
++// Content-addressed: https://gettarka.com/models/android/v1/<sha256>.bin (the
++// site serves extension-less paths as folders).
++std::string FileUrl(const CaptionFile& file);
++
++// Whether `path` is `file` (size, then sha256); a file that is not is
++// deleted. Blocking.
++bool VerifyFile(const base::FilePath& path, const CaptionFile& file);
++// "<name>.sha256" beside a checked file, so that a start trusts it without
++// hashing 138 MB again. Blocking.
++bool WriteRecord(const base::FilePath& path, const CaptionFile& file);
++// A download attempt's own file: "<name>.<generation>.part".
++std::string PartFileName(std::string_view name, uint64_t generation);
++
++// The unit's files present in `unit_dir`, by name. Deletes unfinished
++// downloads (*.part), files of the wrong size or hash, and files the table
++// does not name. A file with no record is hashed once. Blocking.
++std::vector<std::string> ScanUnit(const base::FilePath& unit_dir,
++                                  std::string_view unit,
++                                  base::span<const CaptionFile> table = AllFiles());
++
++// Whether every file of `unit` is in `present` (and the unit is known).
++bool UnitReady(std::string_view unit,
++               const std::vector<std::string>& present,
++               base::span<const CaptionFile> table = AllFiles());
++
++// Which units are captioning. A unit deleted in Settings while it is in use
++// is removed when it is released, never under a running engine.
++// The first unit in `queue` that `can_start` allows (the network, the
++// person's "Download now"), so one waiting for Wi-Fi blocks no other.
++std::optional<std::string> NextToFetch(const std::deque<std::string>& queue,
++                                       base::FunctionRef<bool(const std::string&)> can_start);
++
++class UnitUse {
++ public:
++  UnitUse();
++  ~UnitUse();
++
++  // True when releasing `unit` makes a pending removal due.
++  bool SetInUse(std::string_view unit, bool in_use);
++  // True when `unit` can be removed now; otherwise it is removed on release.
++  bool RequestRemove(std::string_view unit);
++  // Whether `unit` waits to be removed (no longer ready to the person).
++  bool Removing(std::string_view unit) const;
++
++ private:
++  std::map<std::string, int, std::less<>> in_use_;
++  std::set<std::string, std::less<>> pending_remove_;
++};
++
++}  // namespace tark_captions
++
++#endif  // CHROME_BROWSER_TARK_CAPTIONS_ANDROID_MODEL_FILES_H_
+--- /dev/null
++++ b/chrome/browser/tark_captions_android/model_files_unittest.cc
+@@ -0,0 +1,110 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/tark_captions_android/model_files.h"
++
++#include <deque>
++#include <optional>
++#include <string>
++#include <vector>
++
++#include "base/files/file_util.h"
++#include "base/files/scoped_temp_dir.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace tark_captions {
++namespace {
++
++// sha256("abc") and sha256("vad").
++constexpr char kAbc[] = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
++constexpr char kVad[] = "651bfad0aa5b42c5a5b8dad76f49c4a122fe1d1658fc55cfdd1ea9923fe3fd9e";
++
++constexpr CaptionFile kTable[] = {
++    {"common", "silero_vad.onnx", 3, kVad},
++    {"hi", "encoder.int8.onnx", 3, kAbc},
++    {"hi", "vocab.json", 3, kAbc},
++    {"ta", "vocab.json", 3, kAbc},
++};
++
++TEST(TarkCaptionFilesTest, UnitNeedsCommon) {
++  EXPECT_EQ(UnitsToFetch("hi"), (std::vector<std::string>{"common", "hi"}));
++  EXPECT_EQ(UnitsToFetch("common"), (std::vector<std::string>{"common"}));
++  // The APK's own table has the Phase 1 units.
++  for (const char* unit : {"common", "hi", "ta", "en", "es"}) {
++    EXPECT_FALSE(FilesOf(unit).empty()) << unit;
++  }
++}
++
++TEST(TarkCaptionFilesTest, MismatchDeletesFile) {
++  base::ScopedTempDir dir;
++  ASSERT_TRUE(dir.CreateUniqueTempDir());
++  const base::FilePath path = dir.GetPath().AppendASCII("vocab.json");
++  ASSERT_TRUE(base::WriteFile(path, "abd"));  // right size, wrong bytes
++  EXPECT_FALSE(VerifyFile(path, kTable[2]));
++  EXPECT_FALSE(base::PathExists(path));
++  ASSERT_TRUE(base::WriteFile(path, "abc"));
++  EXPECT_TRUE(VerifyFile(path, kTable[2]));
++  EXPECT_TRUE(base::PathExists(path));
++}
++
++TEST(TarkCaptionFilesTest, PartFilesRemovedAtStart) {
++  base::ScopedTempDir dir;
++  ASSERT_TRUE(dir.CreateUniqueTempDir());
++  ASSERT_TRUE(base::WriteFile(dir.GetPath().AppendASCII(PartFileName("vocab.json", 3)), "ab"));
++  ASSERT_TRUE(base::WriteFile(dir.GetPath().AppendASCII("vocab.json"), "abc"));
++  ASSERT_TRUE(base::WriteFile(dir.GetPath().AppendASCII("old-model.onnx"), "x"));
++  EXPECT_EQ(ScanUnit(dir.GetPath(), "hi", kTable), (std::vector<std::string>{"vocab.json"}));
++  EXPECT_FALSE(base::PathExists(dir.GetPath().AppendASCII(PartFileName("vocab.json", 3))));
++  // A file the table does not name (an older APK's) goes too.
++  EXPECT_FALSE(base::PathExists(dir.GetPath().AppendASCII("old-model.onnx")));
++}
++
++TEST(TarkCaptionFilesTest, ReadyNeedsEveryFileOfTheUnit) {
++  EXPECT_FALSE(UnitReady("hi", {"vocab.json"}, kTable));
++  EXPECT_TRUE(UnitReady("hi", {"encoder.int8.onnx", "vocab.json"}, kTable));
++  EXPECT_FALSE(UnitReady("bn", {}, kTable));  // not in the table: never ready
++}
++
++TEST(TarkCaptionFilesTest, RemoveInUseUnitWaitsForRelease) {
++  UnitUse use;
++  use.SetInUse("hi", true);
++  EXPECT_FALSE(use.RequestRemove("hi"));  // captioning: removed when released
++  EXPECT_TRUE(use.RequestRemove("ta"));   // not in use: now
++  EXPECT_TRUE(use.SetInUse("hi", false)); // released: the pending removal is due
++  EXPECT_FALSE(use.SetInUse("hi", false));
++}
++
++// Deleted in Settings while captioning: the language stops counting as
++// ready at once (captions go off, Settings drops the row), and the files go
++// when the captions process lets them go.
++TEST(TarkCaptionFilesTest, PendingRemovalIsNotReady) {
++  UnitUse use;
++  use.SetInUse("hi", true);
++  EXPECT_FALSE(use.Removing("hi"));
++  EXPECT_FALSE(use.RequestRemove("hi"));
++  EXPECT_TRUE(use.Removing("hi"));
++  EXPECT_FALSE(use.Removing("ta"));
++  EXPECT_TRUE(use.SetInUse("hi", false));
++  EXPECT_FALSE(use.Removing("hi"));  // removed: a new download may start
++}
++
++// On mobile data: Hindi waits for Wi-Fi; English, with "Download now",
++// starts although it was queued after Hindi.
++TEST(TarkCaptionFilesTest, QueueSkipsAUnitWaitingForWifi) {
++  const std::deque<std::string> queue = {"hi", "en"};
++  auto allowed = [](const std::string& unit) { return unit == "en"; };
++  EXPECT_EQ(NextToFetch(queue, allowed), "en");
++  EXPECT_EQ(NextToFetch(queue, [](const std::string&) { return true; }), "hi");
++  EXPECT_EQ(NextToFetch(queue, [](const std::string&) { return false; }), std::nullopt);
++}
++
++TEST(TarkCaptionFilesTest, UrlIsContentAddressed) {
++  // gettarka.com serves a path without an extension as a folder's
++  // index.html, so the files carry ".bin", as xlit's do.
++  EXPECT_EQ(FileUrl(kTable[1]),
++            std::string("https://gettarka.com/models/android/v1/") + kAbc + ".bin");
++}
++
++}  // namespace
++}  // namespace tark_captions
+--- /dev/null
++++ b/chrome/browser/tark_captions_android/tab_captions.cc
+@@ -0,0 +1,139 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/tark_captions_android/tab_captions.h"
++
++namespace tark_captions {
++namespace {
++
++// A flagship: a core of 2.8 GHz or more and about 8 GB or more (phones sold
++// as 8 GB report a little under 7.5 GB).
++constexpr int kFlagshipKhz = 2800000;
++constexpr int kFlagshipRamMb = 7000;
++
++}  // namespace
++
++Style StyleForDevice(int fastest_khz, int ram_mb, int pref) {
++  if (pref == 1) {
++    return Style::kWordByWord;
++  }
++  if (pref == 2) {
++    return Style::kPhrase;
++  }
++  return fastest_khz >= kFlagshipKhz && ram_mb >= kFlagshipRamMb ? Style::kWordByWord
++                                                                  : Style::kPhrase;
++}
++
++TabCaptions::TabCaptions() = default;
++TabCaptions::~TabCaptions() = default;
++
++void TabCaptions::OnPlayerAudible(int player_id, bool audible, base::TimeTicks now) {
++  if (audible) {
++    if (audible_.insert(player_id).second) {
++      waiting_since_ = now;  // a player (re)starting is a fresh wait
++    }
++  } else {
++    audible_.erase(player_id);
++  }
++  state_.bar_visible = !audible_.empty() || state_.captions_on;
++  Recompute(now);
++}
++
++void TabCaptions::OnHidden(bool hidden, base::TimeTicks now) {
++  if (hidden && !hidden_) {
++    hidden_since_ = now;
++  }
++  hidden_ = hidden;
++  Recompute(now);
++}
++
++void TabCaptions::SetCaptionsOn(bool on, base::TimeTicks now) {
++  state_.captions_on = on;
++  state_.cant_caption = false;
++  state_.bar_visible = !audible_.empty() || on;
++  Recompute(now);
++}
++
++void TabCaptions::ChooseLanguage(const std::string& language) {
++  if (language != state_.language) {
++    state_.language = language;
++    state_.unit_ready = false;
++    state_.cant_caption = false;
++  }
++}
++
++void TabCaptions::OnUnitReady(bool ready, base::TimeTicks now) {
++  if (state_.unit_ready && !ready) {
++    // Deleted (Settings): captions go off; the next tap downloads it again.
++    state_.captions_on = false;
++    state_.cant_caption = false;
++    state_.bar_visible = !audible_.empty();
++  }
++  state_.unit_ready = ready;
++  Recompute(now);
++}
++
++bool TabCaptions::OnAudio(uint64_t source, base::TimeTicks now) {
++  auto last = source_last_.find(source);
++  const bool starting = last == source_last_.end() || now - last->second > kSourceQuiet;
++  const bool current_quiet =
++      !source_ || (*source_ != source && now - source_last_[*source_] > kSourceQuiet);
++  if (starting || current_quiet) {
++    source_ = source;
++  }
++  source_last_[source] = now;
++  waiting_since_ = now;
++  state_.cant_caption = false;
++  Recompute(now);
++  return *source_ == source;
++}
++
++void TabCaptions::ForgetSource(uint64_t source) {
++  source_last_.erase(source);
++  if (source_ == source) {
++    source_.reset();
++  }
++}
++
++void TabCaptions::OnTick(base::TimeTicks now) {
++  if (forwarding_ && !audible_.empty() && !state_.cant_caption &&
++      now - waiting_since_ > kNoAudio) {
++    state_.cant_caption = true;
++  }
++  Recompute(now);
++}
++
++void TabCaptions::OnServiceGone() {
++  state_.captions_on = false;
++  state_.cant_caption = false;
++  Recompute(last_event_);
++}
++
++bool TabCaptions::ShouldForwardAudio() const {
++  return state_.captions_on && state_.unit_ready && !hidden_;
++}
++
++void TabCaptions::Recompute(base::TimeTicks now) {
++  last_event_ = now;
++  const bool forwarding = ShouldForwardAudio();
++  if (forwarding && !forwarding_) {
++    waiting_since_ = now;  // hidden or off time is not "no audio"
++  }
++  forwarding_ = forwarding;
++  // The process outlives a short hide and "can't caption" (a rebuffer), so
++  // that neither reloads the ~500 MB model; it goes after a long hide or a
++  // few minutes without audio.
++  bool wanted = state_.captions_on && state_.unit_ready;
++  if (hidden_) {
++    wanted = wanted && now - hidden_since_ < kHiddenGrace;
++  } else {
++    wanted = wanted && now - waiting_since_ < kIdleUnload;
++  }
++  if (wanted && !wanted_) {
++    ++engine_starts_;
++  }
++  wanted_ = wanted;
++}
++
++}  // namespace tark_captions
+--- /dev/null
++++ b/chrome/browser/tark_captions_android/tab_captions.h
+@@ -0,0 +1,99 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_TARK_CAPTIONS_ANDROID_TAB_CAPTIONS_H_
++#define CHROME_BROWSER_TARK_CAPTIONS_ANDROID_TAB_CAPTIONS_H_
++
++#include <stdint.h>
++
++#include <map>
++#include <optional>
++#include <set>
++#include <string>
++
++#include "base/time/time.h"
++
++namespace tark_captions {
++
++enum class Style { kWordByWord, kPhrase };
++
++// Caption style from the phone: `pref` 1 word by word, 2 a phrase at a time;
++// 0 (Automatic) is word by word only on a flagship (a core of 2.8 GHz or
++// more and 8 GB or more), a phrase at a time otherwise (the spike: 0.75 core
++// word by word on a Snapdragon 695, 0.32 a phrase at a time).
++Style StyleForDevice(int fastest_khz, int ram_mb, int pref);
++
++// One tab's live captions, without the browser: what the caption bar shows,
++// whether the tab's audio goes to the captions process, and when that
++// process is wanted. TarkCaptionsTab feeds it events and acts on it.
++class TabCaptions {
++ public:
++  struct State {
++    bool bar_visible = false;   // a player plays with sound
++    bool captions_on = false;   // the person turned captions on
++    std::string language;       // the chip: "hi", "ta", "en", "es"
++    bool unit_ready = false;    // the language's model is on the phone
++    bool cant_caption = false;  // on, ready, playing, but no audio arrives
++  };
++
++  // How long captions wait for the tab's audio before saying they can't
++  // caption this video.
++  static constexpr base::TimeDelta kNoAudio = base::Seconds(10);
++  // A tab hidden this long (Home, the lock screen, the tab switcher) lets
++  // its captions process go; back sooner, captions go on without reloading.
++  static constexpr base::TimeDelta kHiddenGrace = base::Seconds(60);
++  // Captions on but no audio this long (a paused video, a page without
++  // media): the model is unloaded; audio coming back loads it again.
++  static constexpr base::TimeDelta kIdleUnload = base::Minutes(3);
++  // A source silent this long hands captions to another one.
++  static constexpr base::TimeDelta kSourceQuiet = base::Seconds(1);
++
++  TabCaptions();
++  ~TabCaptions();
++
++  void OnPlayerAudible(int player_id, bool audible, base::TimeTicks now);
++  void OnHidden(bool hidden, base::TimeTicks now);
++  void SetCaptionsOn(bool on, base::TimeTicks now);
++  void ChooseLanguage(const std::string& language);
++  void OnUnitReady(bool ready, base::TimeTicks now);
++  // Audio from `source` (one player's connection). Captions follow one
++  // source at a time: the one that started most recently, or any once that
++  // one is quiet or gone. Returns whether this audio goes to the engine.
++  bool OnAudio(uint64_t source, base::TimeTicks now);
++  // `source`'s player went away.
++  void ForgetSource(uint64_t source);
++  void OnTick(base::TimeTicks now);
++  // The captions process died (Android reclaimed its memory).
++  void OnServiceGone();
++
++  const State& state() const { return state_; }
++  // Whether the tab's renderers send audio (captions on, the model ready,
++  // the tab shown). Audio still arrives while captions can't caption, so
++  // that audio coming back clears it.
++  bool ShouldForwardAudio() const;
++  // Whether the captions process should be running for this tab.
++  bool WantsEngine() const { return wanted_; }
++  // How many times WantsEngine() went from false to true (one process each).
++  int engine_starts() const { return engine_starts_; }
++
++ private:
++  // Updates what follows from the state after an event at `now`.
++  void Recompute(base::TimeTicks now);
++
++  State state_;
++  std::set<int> audible_;
++  bool hidden_ = false;
++  base::TimeTicks hidden_since_;
++  base::TimeTicks last_event_;
++  std::map<uint64_t, base::TimeTicks> source_last_;  // each source's last audio
++  std::optional<uint64_t> source_;                    // the one captioned
++  bool forwarding_ = false;
++  bool wanted_ = false;
++  base::TimeTicks waiting_since_;  // the last audio, or when forwarding began
++  int engine_starts_ = 0;
++};
++
++}  // namespace tark_captions
++
++#endif  // CHROME_BROWSER_TARK_CAPTIONS_ANDROID_TAB_CAPTIONS_H_
+--- /dev/null
++++ b/chrome/browser/tark_captions_android/tab_captions_unittest.cc
+@@ -0,0 +1,217 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/tark_captions_android/tab_captions.h"
++
++#include "base/time/time.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace tark_captions {
++namespace {
++
++class TabCaptionsTest : public testing::Test {
++ protected:
++  base::TimeTicks At(double seconds) { return start_ + base::Seconds(seconds); }
++
++  // A video plays with sound, captions are turned on, the model is ready.
++  void Captioning() {
++    tab_.OnPlayerAudible(1, true, At(0));
++    tab_.ChooseLanguage("hi");
++    tab_.SetCaptionsOn(true, At(1));
++    tab_.OnUnitReady(true, At(1));
++  }
++
++  const base::TimeTicks start_ = base::TimeTicks() + base::Seconds(100);
++  TabCaptions tab_;
++};
++
++TEST_F(TabCaptionsTest, BarShowsOnlyForAudiblePlayer) {
++  EXPECT_FALSE(tab_.state().bar_visible);
++  tab_.OnPlayerAudible(1, false, At(0));  // muted or silent
++  EXPECT_FALSE(tab_.state().bar_visible);
++  tab_.OnPlayerAudible(1, true, At(0));
++  EXPECT_TRUE(tab_.state().bar_visible);
++  // Nothing listens until a tap.
++  EXPECT_FALSE(tab_.ShouldForwardAudio());
++  EXPECT_FALSE(tab_.WantsEngine());
++}
++
++TEST_F(TabCaptionsTest, CaptionsOffForwardsNoAudio) {
++  Captioning();
++  EXPECT_TRUE(tab_.ShouldForwardAudio());
++  tab_.SetCaptionsOn(false, At(2));
++  EXPECT_FALSE(tab_.ShouldForwardAudio());
++  EXPECT_FALSE(tab_.WantsEngine());
++}
++
++TEST_F(TabCaptionsTest, CaptionsWaitForTheModel) {
++  tab_.OnPlayerAudible(1, true, At(0));
++  tab_.ChooseLanguage("ta");
++  tab_.SetCaptionsOn(true, At(1));
++  EXPECT_FALSE(tab_.ShouldForwardAudio());  // "Getting Tamil ready"
++  tab_.OnUnitReady(true, At(30));
++  EXPECT_TRUE(tab_.ShouldForwardAudio());
++}
++
++// Android's own player (HLS, a cast) never reaches the renderer's hook.
++TEST_F(TabCaptionsTest, NoAudioForTenSecondsShowsCantCaption) {
++  Captioning();
++  tab_.OnTick(At(10.5));
++  EXPECT_FALSE(tab_.state().cant_caption);
++  tab_.OnTick(At(11.5));
++  EXPECT_TRUE(tab_.state().cant_caption);
++  // The model stays loaded: a long rebuffer is no reason to reload it.
++  EXPECT_TRUE(tab_.WantsEngine());
++  // Audio after all (a seek, an ad ending) clears it.
++  tab_.OnAudio(1, At(12));
++  EXPECT_FALSE(tab_.state().cant_caption);
++  EXPECT_EQ(tab_.engine_starts(), 1);
++}
++
++TEST_F(TabCaptionsTest, AudioKeepsCantCaptionAway) {
++  Captioning();
++  for (double t = 1.5; t < 30; t += 1) {
++    tab_.OnAudio(1, At(t));
++    tab_.OnTick(At(t + 0.5));
++  }
++  EXPECT_FALSE(tab_.state().cant_caption);
++}
++
++TEST_F(TabCaptionsTest, SecondPlayerDoesNotLoadSecondEngine) {
++  Captioning();
++  EXPECT_EQ(tab_.engine_starts(), 1);
++  tab_.OnPlayerAudible(2, true, At(5));  // an ad, an iframe
++  tab_.OnPlayerAudible(1, false, At(6));
++  EXPECT_TRUE(tab_.WantsEngine());
++  EXPECT_EQ(tab_.engine_starts(), 1);
++}
++
++// Several players can send audio (an ad iframe and the video); captions
++// follow one, the most recently started, never a mix of both.
++TEST_F(TabCaptionsTest, OneSourceAtATime) {
++  Captioning();
++  EXPECT_TRUE(tab_.OnAudio(/*source=*/7, At(2)));
++  EXPECT_TRUE(tab_.OnAudio(7, At(2.1)));
++  EXPECT_TRUE(tab_.OnAudio(9, At(2.2)));   // a second player starts: it wins
++  EXPECT_FALSE(tab_.OnAudio(7, At(2.3)));  // the first keeps going: dropped
++  EXPECT_TRUE(tab_.OnAudio(9, At(2.4)));
++  EXPECT_FALSE(tab_.OnAudio(7, At(2.5)));
++}
++
++TEST_F(TabCaptionsTest, QuietSourceHandsOver) {
++  Captioning();
++  const double quiet = TabCaptions::kSourceQuiet.InSecondsF();
++  EXPECT_TRUE(tab_.OnAudio(7, At(2)));
++  EXPECT_TRUE(tab_.OnAudio(9, At(2.1)));
++  EXPECT_FALSE(tab_.OnAudio(7, At(2.2)));
++  // 9 stops (the ad ended); 7 still plays.
++  EXPECT_FALSE(tab_.OnAudio(7, At(2.1 + quiet / 2)));
++  EXPECT_TRUE(tab_.OnAudio(7, At(2.1 + quiet + 0.1)));
++}
++
++TEST_F(TabCaptionsTest, ForgottenSourceHandsOver) {
++  Captioning();
++  EXPECT_TRUE(tab_.OnAudio(7, At(2)));
++  EXPECT_TRUE(tab_.OnAudio(9, At(2.1)));
++  tab_.ForgetSource(9);  // its player went away
++  EXPECT_TRUE(tab_.OnAudio(7, At(2.2)));
++}
++
++TEST_F(TabCaptionsTest, HiddenTabForwardsNoAudio) {
++  Captioning();
++  tab_.OnHidden(true, At(3));
++  EXPECT_FALSE(tab_.ShouldForwardAudio());
++  tab_.OnTick(At(30));  // hidden time is not "no audio"
++  tab_.OnHidden(false, At(31));
++  EXPECT_TRUE(tab_.ShouldForwardAudio());
++  EXPECT_FALSE(tab_.state().cant_caption);
++}
++
++// Home, the lock screen, the tab switcher, Settings: back within a minute,
++// captions go on without reloading the model.
++TEST_F(TabCaptionsTest, BriefHideKeepsTheEngine) {
++  Captioning();
++  tab_.OnAudio(1, At(2));
++  tab_.OnHidden(true, At(3));
++  tab_.OnTick(At(3 + TabCaptions::kHiddenGrace.InSecondsF() - 1));
++  EXPECT_TRUE(tab_.WantsEngine());
++  tab_.OnHidden(false, At(3 + TabCaptions::kHiddenGrace.InSecondsF() - 0.5));
++  EXPECT_TRUE(tab_.WantsEngine());
++  EXPECT_EQ(tab_.engine_starts(), 1);
++}
++
++TEST_F(TabCaptionsTest, LongHideStopsTheEngine) {
++  Captioning();
++  tab_.OnHidden(true, At(3));
++  tab_.OnTick(At(3 + TabCaptions::kHiddenGrace.InSecondsF() + 1));
++  EXPECT_FALSE(tab_.WantsEngine());
++  tab_.OnHidden(false, At(200));  // back: a new process
++  EXPECT_TRUE(tab_.WantsEngine());
++  EXPECT_EQ(tab_.engine_starts(), 2);
++}
++
++// A paused video, or a page without media, with captions left on: the
++// ~500 MB model is unloaded after a few minutes without audio.
++TEST_F(TabCaptionsTest, IdleUnloadsTheEngine) {
++  Captioning();
++  tab_.OnAudio(1, At(2));
++  const double idle = TabCaptions::kIdleUnload.InSecondsF();
++  tab_.OnTick(At(2 + idle - 1));
++  EXPECT_TRUE(tab_.WantsEngine());
++  tab_.OnTick(At(2 + idle + 1));
++  EXPECT_FALSE(tab_.WantsEngine());
++  EXPECT_TRUE(tab_.ShouldForwardAudio());  // so that audio can bring it back
++  EXPECT_TRUE(tab_.state().captions_on);
++  tab_.OnAudio(1, At(2 + idle + 30));  // play again
++  EXPECT_TRUE(tab_.WantsEngine());
++  EXPECT_EQ(tab_.engine_starts(), 2);
++}
++
++// The language is deleted in Settings: captions go off, the chip stays, and
++// the next tap offers the download again (no card stuck without a button).
++TEST_F(TabCaptionsTest, UnitRemovedTurnsCaptionsOff) {
++  Captioning();
++  tab_.OnUnitReady(false, At(4));
++  EXPECT_FALSE(tab_.state().captions_on);
++  EXPECT_EQ(tab_.state().language, "hi");
++  EXPECT_FALSE(tab_.ShouldForwardAudio());
++  EXPECT_FALSE(tab_.WantsEngine());
++}
++
++// Choosing a language not yet on the phone is not a removal.
++TEST_F(TabCaptionsTest, NewLanguageIsNotARemoval) {
++  Captioning();
++  tab_.ChooseLanguage("ta");
++  tab_.OnUnitReady(false, At(5));
++  EXPECT_TRUE(tab_.state().captions_on);  // "Getting Tamil ready"
++  EXPECT_FALSE(tab_.WantsEngine());
++}
++
++TEST_F(TabCaptionsTest, ServiceDisconnectTurnsCaptionsOff) {
++  Captioning();
++  tab_.OnServiceGone();
++  EXPECT_FALSE(tab_.state().captions_on);
++  EXPECT_EQ(tab_.state().language, "hi");  // the chip stays
++  EXPECT_FALSE(tab_.WantsEngine());
++  tab_.SetCaptionsOn(true, At(9));  // the next tap starts a new process
++  EXPECT_TRUE(tab_.WantsEngine());
++  EXPECT_EQ(tab_.engine_starts(), 2);
++}
++
++TEST(CaptionStyleTest, AutomaticIsPhraseOnMidRange) {
++  // Snapdragon 695: 8 cores, the fastest at 2.2 GHz, 8 GB.
++  EXPECT_EQ(StyleForDevice(/*fastest_khz=*/2200000, /*ram_mb=*/7600, /*pref=*/0), Style::kPhrase);
++  // A recent flagship: 3.3 GHz, 12 GB.
++  EXPECT_EQ(StyleForDevice(3300000, 11500, 0), Style::kWordByWord);
++  // A budget phone: small cores only, 4 GB.
++  EXPECT_EQ(StyleForDevice(2000000, 3800, 0), Style::kPhrase);
++}
++
++TEST(CaptionStyleTest, PrefWins) {
++  EXPECT_EQ(StyleForDevice(2200000, 7600, /*pref=*/1), Style::kWordByWord);
++  EXPECT_EQ(StyleForDevice(3300000, 11500, /*pref=*/2), Style::kPhrase);
++}
++
++}  // namespace
++}  // namespace tark_captions

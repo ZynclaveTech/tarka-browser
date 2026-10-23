@@ -1,0 +1,1088 @@
+--- a/chrome/android/BUILD.gn
++++ b/chrome/android/BUILD.gn
+@@ -473,6 +473,7 @@
+       "//chrome/browser/ntp_customization:java",
+       "//chrome/browser/ntp_customization:public_java",
+       "//chrome/browser/omaha/android:java",
++      "//chrome/browser/tark_captions_android/android:java",
+       "//chrome/browser/open_in_app/android:java",
+       "//chrome/browser/optimization_guide/android:java",
+       "//chrome/browser/page_content_annotations:java",
+--- a/chrome/android/chrome_java_resources.gni
++++ b/chrome/android/chrome_java_resources.gni
+@@ -408,6 +408,9 @@
+   "java/res/drawable/tab_indicator.xml",
+   "java/res/drawable/tablet_black_24dp.xml",
+   "java/res/drawable/tablet_recent_tab_empty_state_illustration.xml",
++  "java/res/drawable/tark_caption_chip.xml",
++  "java/res/drawable/tark_caption_mark.xml",
++  "java/res/drawable/tark_caption_surface.xml",
+   "java/res/drawable/tark_ntp_mark.xml",
+   "java/res/drawable/task_spark_24dp.xml",
+   "java/res/drawable/text_cursor_lowend.xml",
+@@ -619,6 +622,7 @@
+   "java/res/layout/tab_switcher_action_menu_layout.xml",
+   "java/res/layout/tab_switcher_module_container.xml",
+   "java/res/layout/tab_switcher_view_holder.xml",
++  "java/res/layout/tark_caption_bar.xml",
+   "java/res/layout/tips_opt_in_bottom_sheet.xml",
+   "java/res/layout/tips_promo_bottom_sheet.xml",
+   "java/res/layout/tips_promo_detail_sheet.xml",
+--- a/chrome/android/chrome_java_sources.gni
++++ b/chrome/android/chrome_java_sources.gni
+@@ -979,6 +979,7 @@
+   "java/src/org/chromium/chrome/browser/page_info/PageInfoHistoryController.java",
+   "java/src/org/chromium/chrome/browser/page_info/SiteSettingsHelper.java",
+   "java/src/org/chromium/chrome/browser/page_info/TarkAdblockSiteSwitch.java",
++  "java/src/org/chromium/chrome/browser/tark_captions/TarkCaptionBarCoordinator.java",
+   "java/src/org/chromium/chrome/browser/paint_preview/StartupPaintPreviewHelper.java",
+   "java/src/org/chromium/chrome/browser/paint_preview/StartupPaintPreviewHelperSupplier.java",
+   "java/src/org/chromium/chrome/browser/password_manager/AccountChooserDialog.java",
+--- /dev/null
++++ b/chrome/android/java/res/drawable/tark_caption_chip.xml
+@@ -0,0 +1,20 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!-- Copyright 2026 The Tark Authors
++     Use of this source code is governed by a BSD-style license that can be
++     found in the LICENSE file. -->
++<!-- Tark's live captions: a chip of the bar; selected (captions on) in the
++     accent's container colour. -->
++<selector xmlns:android="http://schemas.android.com/apk/res/android">
++    <item android:state_selected="true">
++        <shape android:shape="rectangle">
++            <solid android:color="?attr/colorPrimaryContainer" />
++            <corners android:radius="18dp" />
++        </shape>
++    </item>
++    <item>
++        <shape android:shape="rectangle">
++            <stroke android:width="1dp" android:color="?attr/colorOutline" />
++            <corners android:radius="18dp" />
++        </shape>
++    </item>
++</selector>
+--- /dev/null
++++ b/chrome/android/java/res/drawable/tark_caption_mark.xml
+@@ -0,0 +1,14 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!-- Copyright 2026 The Tark Authors
++     Use of this source code is governed by a BSD-style license that can be
++     found in the LICENSE file. -->
++<!-- Tark's three-dot mark, small, in the text colour. -->
++<vector xmlns:android="http://schemas.android.com/apk/res/android"
++    android:width="24dp"
++    android:height="24dp"
++    android:viewportWidth="24"
++    android:viewportHeight="24"
++    android:tint="?attr/colorOnSurface">
++    <path android:fillColor="#FFFFFFFF"
++        android:pathData="M6,12m-2,0a2,2 0,1 1,4 0a2,2 0,1 1,-4 0M12,12m-2,0a2,2 0,1 1,4 0a2,2 0,1 1,-4 0M18,12m-2,0a2,2 0,1 1,4 0a2,2 0,1 1,-4 0" />
++</vector>
+--- /dev/null
++++ b/chrome/android/java/res/drawable/tark_caption_surface.xml
+@@ -0,0 +1,11 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!-- Copyright 2026 The Tark Authors
++     Use of this source code is governed by a BSD-style license that can be
++     found in the LICENSE file. -->
++<!-- Tark's live captions: raised paper with a hairline (A4's palette). -->
++<shape xmlns:android="http://schemas.android.com/apk/res/android"
++    android:shape="rectangle">
++    <solid android:color="?attr/colorSurfaceContainerHigh" />
++    <stroke android:width="1dp" android:color="?attr/colorOutlineVariant" />
++    <corners android:radius="16dp" />
++</shape>
+--- /dev/null
++++ b/chrome/android/java/res/layout/tark_caption_bar.xml
+@@ -0,0 +1,131 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!-- Copyright 2026 The Tark Authors
++     Use of this source code is governed by a BSD-style license that can be
++     found in the LICENSE file. -->
++<!-- Tark's live captions: the captions (or the first download of a language)
++     above the bar: the mark · Captions · the language · ✕. -->
++<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
++    android:layout_width="match_parent"
++    android:layout_height="wrap_content"
++    android:orientation="vertical"
++    android:paddingStart="12dp"
++    android:paddingEnd="12dp"
++    android:paddingBottom="8dp">
++
++    <LinearLayout
++        android:id="@+id/tark_captions_box"
++        android:layout_width="match_parent"
++        android:layout_height="wrap_content"
++        android:layout_marginBottom="8dp"
++        android:background="@drawable/tark_caption_surface"
++        android:orientation="vertical"
++        android:padding="12dp"
++        android:visibility="gone"
++        android:accessibilityLiveRegion="polite">
++        <TextView
++            android:id="@+id/tark_captions_final"
++            android:layout_width="match_parent"
++            android:layout_height="wrap_content"
++            android:textAppearance="@style/TextAppearance.TextSmall.Secondary" />
++        <TextView
++            android:id="@+id/tark_captions_draft"
++            android:layout_width="match_parent"
++            android:layout_height="wrap_content"
++            android:textAppearance="@style/TextAppearance.TextLarge.Primary" />
++    </LinearLayout>
++
++    <LinearLayout
++        android:id="@+id/tark_captions_download"
++        android:layout_width="match_parent"
++        android:layout_height="wrap_content"
++        android:layout_marginBottom="8dp"
++        android:background="@drawable/tark_caption_surface"
++        android:orientation="vertical"
++        android:padding="12dp"
++        android:visibility="gone">
++        <TextView
++            android:id="@+id/tark_captions_download_title"
++            android:layout_width="match_parent"
++            android:layout_height="wrap_content"
++            android:textAppearance="@style/TextAppearance.TextMediumThick.Primary" />
++        <ProgressBar
++            android:id="@+id/tark_captions_download_progress"
++            style="?android:attr/progressBarStyleHorizontal"
++            android:layout_width="match_parent"
++            android:layout_height="wrap_content"
++            android:layout_marginTop="6dp" />
++        <LinearLayout
++            android:layout_width="match_parent"
++            android:layout_height="wrap_content"
++            android:layout_marginTop="6dp"
++            android:gravity="center_vertical"
++            android:orientation="horizontal">
++            <TextView
++                android:id="@+id/tark_captions_download_line"
++                android:layout_width="0dp"
++                android:layout_height="wrap_content"
++                android:layout_weight="1"
++                android:textAppearance="@style/TextAppearance.TextSmall.Secondary" />
++            <TextView
++                android:id="@+id/tark_captions_download_action"
++                android:layout_width="wrap_content"
++                android:layout_height="wrap_content"
++                android:minHeight="48dp"
++                android:gravity="center"
++                android:paddingStart="8dp"
++                android:paddingEnd="8dp"
++                android:textAppearance="@style/TextAppearance.TextAccentMediumThick" />
++        </LinearLayout>
++    </LinearLayout>
++
++    <LinearLayout
++        android:layout_width="match_parent"
++        android:layout_height="wrap_content"
++        android:background="@drawable/tark_caption_surface"
++        android:gravity="center_vertical"
++        android:orientation="horizontal"
++        android:padding="6dp">
++        <ImageView
++            android:layout_width="24dp"
++            android:layout_height="24dp"
++            android:layout_marginStart="4dp"
++            android:layout_marginEnd="4dp"
++            android:importantForAccessibility="no"
++            android:src="@drawable/tark_caption_mark" />
++        <TextView
++            android:id="@+id/tark_captions_chip"
++            android:layout_width="wrap_content"
++            android:layout_height="wrap_content"
++            android:layout_marginEnd="6dp"
++            android:background="@drawable/tark_caption_chip"
++            android:minHeight="36dp"
++            android:gravity="center"
++            android:paddingStart="12dp"
++            android:paddingEnd="12dp"
++            android:text="@string/tark_captions_chip"
++            android:textAppearance="@style/TextAppearance.TextMedium.Primary" />
++        <TextView
++            android:id="@+id/tark_captions_language"
++            android:layout_width="wrap_content"
++            android:layout_height="wrap_content"
++            android:background="@drawable/tark_caption_chip"
++            android:minHeight="36dp"
++            android:gravity="center"
++            android:paddingStart="12dp"
++            android:paddingEnd="12dp"
++            android:textAppearance="@style/TextAppearance.TextMedium.Primary" />
++        <View
++            android:layout_width="0dp"
++            android:layout_height="1dp"
++            android:layout_weight="1" />
++        <ImageView
++            android:id="@+id/tark_captions_close"
++            android:layout_width="48dp"
++            android:layout_height="48dp"
++            android:background="?attr/selectableItemBackgroundBorderless"
++            android:contentDescription="@string/tark_captions_close"
++            android:scaleType="center"
++            android:src="@drawable/btn_close"
++            android:tint="?attr/colorOnSurfaceVariant" />
++    </LinearLayout>
++</LinearLayout>
+--- a/chrome/android/java/res/xml/privacy_preferences.xml
++++ b/chrome/android/java/res/xml/privacy_preferences.xml
+@@ -60,6 +60,9 @@
+         android:key="tark_connects_xlit"
+         android:summary="@string/tark_connects_xlit" />
+     <org.chromium.components.browser_ui.settings.TextMessagePreference
++        android:key="tark_connects_captions"
++        android:summary="@string/tark_connects_captions" />
++    <org.chromium.components.browser_ui.settings.TextMessagePreference
+         android:key="tark_connects_update"
+         android:summary="@string/tark_connects_update" />
+ 
+--- a/chrome/android/java/src/org/chromium/chrome/browser/app/ChromeActivity.java
++++ b/chrome/android/java/src/org/chromium/chrome/browser/app/ChromeActivity.java
+@@ -216,6 +216,7 @@
+ import org.chromium.chrome.browser.toolbar.ControlContainer;
+ import org.chromium.chrome.browser.toolbar.ToolbarManager;
+ import org.chromium.chrome.browser.translate.TranslateBridge;
++import org.chromium.chrome.browser.tark_captions.TarkCaptionBarCoordinator;
+ import org.chromium.chrome.browser.ui.BottomContainer;
+ import org.chromium.chrome.browser.ui.ChromeActivitySnackbarHelper;
+ import org.chromium.chrome.browser.ui.RootUiCoordinator;
+@@ -445,6 +446,8 @@
+     private DisplayAndroidObserver mDisplayAndroidObserver;
+ 
+     @Nullable private BottomContainer mBottomContainer;
++    // Tark: live captions' bar, in the bottom container.
++    @Nullable private TarkCaptionBarCoordinator mTarkCaptionBar;
+ 
+     private LaunchCauseMetrics mLaunchCauseMetrics;
+ 
+@@ -754,6 +757,8 @@
+                     getBrowserControlsManager(),
+                     getWindowAndroid().getApplicationBottomInsetTracker().getSupplier(),
+                     getEdgeToEdgeSupplier());
++            mTarkCaptionBar =
++                    new TarkCaptionBarCoordinator(this, mBottomContainer, mActivityTabProvider);
+ 
+             ShareDelegate shareDelegate =
+                     new ShareDelegateImpl(
+@@ -2052,6 +2057,10 @@
+         mTabModelSelectorSupplier.destroy();
+         EphemeralTabCoordinatorSupplier.destroy(mEphemeralTabCoordinatorSupplier);
+ 
++        if (mTarkCaptionBar != null) {
++            mTarkCaptionBar.destroy();
++            mTarkCaptionBar = null;
++        }
+         if (mBottomContainer != null) {
+             mBottomContainer.destroy();
+             mBottomContainer = null;
+--- /dev/null
++++ b/chrome/android/java/src/org/chromium/chrome/browser/tark_captions/TarkCaptionBarCoordinator.java
+@@ -0,0 +1,217 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++package org.chromium.chrome.browser.tark_captions;
++
++import android.app.Activity;
++import android.text.TextUtils;
++import android.text.format.Formatter;
++import android.view.Gravity;
++import android.view.LayoutInflater;
++import android.view.View;
++import android.view.ViewGroup;
++import android.widget.FrameLayout;
++import android.widget.PopupMenu;
++import android.widget.ProgressBar;
++import android.widget.TextView;
++
++import org.chromium.base.Callback;
++import org.chromium.build.annotations.NullMarked;
++import org.chromium.build.annotations.Nullable;
++import org.chromium.chrome.R;
++import org.chromium.chrome.browser.ActivityTabProvider;
++import org.chromium.chrome.browser.tab.Tab;
++import org.chromium.content_public.browser.WebContents;
++
++import java.util.Locale;
++
++/**
++ * Tark for Android's live captions: the caption bar at the bottom of the tab when a video plays
++ * with sound (Captions · the language · ✕), the first download of a language, and the captions
++ * themselves. Nothing listens until Captions is tapped. The state is the tab's
++ * (TarkCaptionsBridge).
++ */
++@NullMarked
++public final class TarkCaptionBarCoordinator implements TarkCaptionsBridge.Listener {
++    private final Activity mActivity;
++    private final ViewGroup mContainer;
++    private final ActivityTabProvider mTabProvider;
++    private final View mBar;
++    private final TextView mCaptionsChip;
++    private final TextView mLanguageChip;
++    private final View mCaptionBox;
++    private final TextView mFinalText;
++    private final TextView mDraftText;
++    private final View mDownloadCard;
++    private final TextView mDownloadTitle;
++    private final ProgressBar mDownloadProgress;
++    private final TextView mDownloadLine;
++    private final TextView mDownloadAction;
++    private @Nullable WebContents mWebContents;
++    private final Callback<@Nullable Tab> mTabObserver = this::onTabChanged;
++
++    public TarkCaptionBarCoordinator(
++            Activity activity, ViewGroup container, ActivityTabProvider tabProvider) {
++        mActivity = activity;
++        mContainer = container;
++        mTabProvider = tabProvider;
++        mBar = LayoutInflater.from(activity).inflate(R.layout.tark_caption_bar, container, false);
++        FrameLayout.LayoutParams params =
++                new FrameLayout.LayoutParams(
++                        ViewGroup.LayoutParams.MATCH_PARENT,
++                        ViewGroup.LayoutParams.WRAP_CONTENT,
++                        Gravity.BOTTOM);
++        container.addView(mBar, params);
++        mBar.setVisibility(View.GONE);
++        mCaptionsChip = mBar.findViewById(R.id.tark_captions_chip);
++        mLanguageChip = mBar.findViewById(R.id.tark_captions_language);
++        mCaptionBox = mBar.findViewById(R.id.tark_captions_box);
++        mFinalText = mBar.findViewById(R.id.tark_captions_final);
++        mDraftText = mBar.findViewById(R.id.tark_captions_draft);
++        mDownloadCard = mBar.findViewById(R.id.tark_captions_download);
++        mDownloadTitle = mBar.findViewById(R.id.tark_captions_download_title);
++        mDownloadProgress = mBar.findViewById(R.id.tark_captions_download_progress);
++        mDownloadLine = mBar.findViewById(R.id.tark_captions_download_line);
++        mDownloadAction = mBar.findViewById(R.id.tark_captions_download_action);
++
++        mCaptionsChip.setOnClickListener(
++                v -> {
++                    if (mWebContents == null) return;
++                    TarkCaptionsBridge.setCaptionsOn(
++                            mWebContents, !TarkCaptionsBridge.getState(mWebContents).captionsOn);
++                });
++        mLanguageChip.setOnClickListener(this::showLanguages);
++        mBar.findViewById(R.id.tark_captions_close)
++                .setOnClickListener(
++                        v -> {
++                            if (mWebContents != null) TarkCaptionsBridge.hideBar(mWebContents);
++                        });
++        mDownloadAction.setOnClickListener(
++                v -> {
++                    if (mWebContents == null) return;
++                    // Only "Download now" agrees to mobile data; "Try again" retries as
++                    // before (on Wi-Fi unless the person already said now).
++                    boolean now =
++                            TarkCaptionsBridge.getState(mWebContents).unitState
++                                    == TarkCaptionsBridge.UNIT_WAITING_FOR_WIFI;
++                    TarkCaptionsBridge.requestDownload(mWebContents, now);
++                });
++        TarkCaptionsBridge.addListener(this);
++        mTabProvider.asObservable().addSyncObserverAndCall(mTabObserver);
++    }
++
++    public void destroy() {
++        TarkCaptionsBridge.removeListener(this);
++        mTabProvider.asObservable().removeObserver(mTabObserver);
++        mContainer.removeView(mBar);
++    }
++
++    @Override
++    public void onStateChanged(WebContents webContents) {
++        if (webContents.equals(mWebContents)) render();
++    }
++
++    private void onTabChanged(@Nullable Tab tab) {
++        mWebContents = tab == null ? null : tab.getWebContents();
++        render();
++    }
++
++    private static String languageName(String code) {
++        String name = new Locale(code).getDisplayLanguage();
++        return name.isEmpty() ? code : name.substring(0, 1).toUpperCase(Locale.getDefault())
++                + name.substring(1);
++    }
++
++    private void showLanguages(View anchor) {
++        if (mWebContents == null) return;
++        WebContents webContents = mWebContents;
++        PopupMenu menu = new PopupMenu(mActivity, anchor);
++        for (int i = 0; i < TarkCaptionsBridge.LANGUAGES.length; i++) {
++            menu.getMenu().add(0, i, i, languageName(TarkCaptionsBridge.LANGUAGES[i]));
++        }
++        menu.setOnMenuItemClickListener(
++                item -> {
++                    TarkCaptionsBridge.chooseLanguage(
++                            webContents, TarkCaptionsBridge.LANGUAGES[item.getItemId()]);
++                    return true;
++                });
++        menu.show();
++    }
++
++    private void render() {
++        if (mWebContents == null || mWebContents.isDestroyed()) {
++            mBar.setVisibility(View.GONE);
++            return;
++        }
++        TarkCaptionsBridge.State state = TarkCaptionsBridge.getState(mWebContents);
++        mBar.setVisibility(state.barVisible ? View.VISIBLE : View.GONE);
++        if (!state.barVisible) return;
++
++        mCaptionsChip.setSelected(state.captionsOn);
++        setTextIfChanged(
++                mLanguageChip,
++                mActivity.getString(
++                        R.string.tark_captions_language_chip, languageName(state.language)));
++
++        boolean ready = state.unitState == TarkCaptionsBridge.UNIT_READY;
++        mDownloadCard.setVisibility(state.captionsOn && !ready ? View.VISIBLE : View.GONE);
++        mCaptionBox.setVisibility(state.captionsOn && ready ? View.VISIBLE : View.GONE);
++        if (state.captionsOn && !ready) renderDownload(state);
++        if (state.captionsOn && ready) renderCaptions(state);
++    }
++
++    private void renderDownload(TarkCaptionsBridge.State state) {
++        setTextIfChanged(
++                mDownloadTitle,
++                mActivity.getString(
++                        R.string.tark_captions_getting_ready,
++                        languageName(state.language),
++                        Formatter.formatShortFileSize(mActivity, state.total)));
++        mDownloadProgress.setMax(1000);
++        mDownloadProgress.setProgress(
++                state.total > 0 ? (int) (1000 * state.bytes / state.total) : 0);
++        int line = R.string.tark_captions_on_this_phone;
++        int action = 0;
++        switch (state.unitState) {
++            case TarkCaptionsBridge.UNIT_WAITING_FOR_WIFI:
++                line = R.string.tark_captions_waiting_for_wifi;
++                action = R.string.tark_captions_download_now;
++                break;
++            case TarkCaptionsBridge.UNIT_FAILED:
++                line = R.string.tark_captions_download_failed;
++                action = R.string.tark_captions_try_again;
++                break;
++            default:
++                break;
++        }
++        setTextIfChanged(mDownloadLine, mActivity.getString(line));
++        if (action != 0) setTextIfChanged(mDownloadAction, mActivity.getString(action));
++        // Hidden then shown again on every tick would be an accessibility event each second.
++        mDownloadAction.setVisibility(action != 0 ? View.VISIBLE : View.GONE);
++    }
++
++    private void renderCaptions(TarkCaptionsBridge.State state) {
++        if (state.cantCaption) {
++            setTextIfChanged(mFinalText, "");
++            setTextIfChanged(mDraftText, mActivity.getString(R.string.tark_captions_cant_caption));
++            return;
++        }
++        if (state.finalText.isEmpty() && state.draftText.isEmpty()) {
++            setTextIfChanged(mFinalText, "");
++            setTextIfChanged(mDraftText, mActivity.getString(R.string.tark_captions_listening));
++            return;
++        }
++        // Word by word: the last final line above what is being said; a phrase at a time: the
++        // last phrase.
++        setTextIfChanged(mFinalText, state.draftText.isEmpty() ? "" : state.finalText);
++        setTextIfChanged(mDraftText, state.draftText.isEmpty() ? state.finalText : state.draftText);
++    }
++
++    // The tab's state arrives every second (its tick); setting the same text
++    // again would still send an accessibility "content changed" event, so a
++    // screen reader would hear the caption again and the screen never settles.
++    private static void setTextIfChanged(TextView view, CharSequence text) {
++        if (!TextUtils.equals(view.getText(), text)) view.setText(text);
++    }
++}
+--- /dev/null
++++ b/chrome/browser/tark_captions_android/android/BUILD.gn
+@@ -0,0 +1,50 @@
++# Copyright 2026 The Tark Authors
++# Use of this source code is governed by a BSD-style license that can be
++# found in the LICENSE file.
++
++import("//build/config/android/rules.gni")
++import("//third_party/jni_zero/jni_zero.gni")
++
++# Tark for Android's live captions: the caption bar (chrome_java's
++# TarkCaptionBarCoordinator) and Settings › Live captions talk to
++# //chrome/browser/tark_captions_android through TarkCaptionsBridge.
++android_resources("java_resources") {
++  sources = [
++    "java/res/layout/tark_captions_check.xml",
++    "java/res/xml/tark_live_captions_preferences.xml",
++  ]
++  deps = [
++    "//chrome/browser/ui/android/strings:ui_strings_grd",
++    "//components/browser_ui/settings/android:java_resources",
++    "//components/browser_ui/strings/android:browser_ui_strings_grd",
++    "//components/browser_ui/styles/android:java_resources",
++    "//components/browser_ui/widget/android:java_resources",
++  ]
++}
++
++android_library("java") {
++  srcjar_deps = [ ":jni_headers" ]
++  sources = [
++    "java/src/org/chromium/chrome/browser/tark_captions/TarkCaptionStylePreference.java",
++    "java/src/org/chromium/chrome/browser/tark_captions/TarkCaptionsBridge.java",
++    "java/src/org/chromium/chrome/browser/tark_captions/TarkLiveCaptionsSettings.java",
++  ]
++  deps = [
++    ":java_resources",
++    "//base:base_java",
++    "//build/android:build_java",
++    "//chrome/browser/settings:java",
++    "//components/browser_ui/settings/android:java",
++    "//content/public/android:content_java",
++    "//third_party/androidx:androidx_appcompat_appcompat_java",
++    "//third_party/androidx:androidx_preference_preference_java",
++    "//third_party/jni_zero:jni_zero_java",
++  ]
++  resources_package = "org.chromium.chrome.browser.tark_captions"
++}
++
++generate_jni("jni_headers") {
++  sources = [
++    "java/src/org/chromium/chrome/browser/tark_captions/TarkCaptionsBridge.java",
++  ]
++}
+--- /dev/null
++++ b/chrome/browser/tark_captions_android/android/java/res/layout/tark_captions_check.xml
+@@ -0,0 +1,11 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!-- Copyright 2026 The Tark Authors
++     Use of this source code is governed by a BSD-style license that can be
++     found in the LICENSE file. -->
++<ImageView xmlns:android="http://schemas.android.com/apk/res/android"
++    android:id="@+id/tark_captions_check"
++    android:layout_width="24dp"
++    android:layout_height="24dp"
++    android:importantForAccessibility="no"
++    android:src="@drawable/ic_check_googblue_24dp"
++    android:tint="?attr/colorPrimary" />
+--- /dev/null
++++ b/chrome/browser/tark_captions_android/android/java/res/xml/tark_live_captions_preferences.xml
+@@ -0,0 +1,30 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!-- Copyright 2026 The Tark Authors
++     Use of this source code is governed by a BSD-style license that can be
++     found in the LICENSE file. -->
++<!-- Settings › Accessibility › Live captions (the mockup's fourth screen). -->
++<PreferenceScreen xmlns:android="http://schemas.android.com/apk/res/android">
++    <org.chromium.components.browser_ui.settings.TextMessagePreference
++        android:key="tark_captions_privacy"
++        android:summary="@string/tark_live_captions_summary" />
++
++    <PreferenceCategory
++        android:key="tark_captions_style"
++        android:title="@string/tark_captions_style">
++        <org.chromium.chrome.browser.tark_captions.TarkCaptionStylePreference
++            android:key="tark_captions_style_automatic"
++            android:title="@string/tark_captions_style_automatic" />
++        <org.chromium.chrome.browser.tark_captions.TarkCaptionStylePreference
++            android:key="tark_captions_style_word"
++            android:summary="@string/tark_captions_style_word_summary"
++            android:title="@string/tark_captions_style_word" />
++        <org.chromium.chrome.browser.tark_captions.TarkCaptionStylePreference
++            android:key="tark_captions_style_phrase"
++            android:summary="@string/tark_captions_style_phrase_summary"
++            android:title="@string/tark_captions_style_phrase" />
++    </PreferenceCategory>
++
++    <PreferenceCategory
++        android:key="tark_captions_languages"
++        android:title="@string/tark_captions_languages" />
++</PreferenceScreen>
+--- /dev/null
++++ b/chrome/browser/tark_captions_android/android/java/src/org/chromium/chrome/browser/tark_captions/TarkCaptionStylePreference.java
+@@ -0,0 +1,39 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++package org.chromium.chrome.browser.tark_captions;
++
++import android.content.Context;
++import android.util.AttributeSet;
++import android.view.View;
++
++import androidx.preference.Preference;
++import androidx.preference.PreferenceViewHolder;
++
++import org.chromium.build.annotations.NullMarked;
++import org.chromium.build.annotations.Nullable;
++
++/** A caption style row in Settings › Live captions, with a check when it is the chosen one. */
++@NullMarked
++public class TarkCaptionStylePreference extends Preference {
++    private boolean mChecked;
++
++    public TarkCaptionStylePreference(Context context, @Nullable AttributeSet attrs) {
++        super(context, attrs);
++        setWidgetLayoutResource(R.layout.tark_captions_check);
++    }
++
++    public void setChecked(boolean checked) {
++        if (mChecked == checked) return;
++        mChecked = checked;
++        notifyChanged();
++    }
++
++    @Override
++    public void onBindViewHolder(PreferenceViewHolder holder) {
++        super.onBindViewHolder(holder);
++        View check = holder.findViewById(R.id.tark_captions_check);
++        if (check != null) check.setVisibility(mChecked ? View.VISIBLE : View.INVISIBLE);
++    }
++}
+--- /dev/null
++++ b/chrome/browser/tark_captions_android/android/java/src/org/chromium/chrome/browser/tark_captions/TarkCaptionsBridge.java
+@@ -0,0 +1,175 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++package org.chromium.chrome.browser.tark_captions;
++
++import org.jni_zero.CalledByNative;
++import org.jni_zero.JNINamespace;
++import org.jni_zero.JniType;
++import org.jni_zero.NativeMethods;
++
++import org.chromium.base.ObserverList;
++import org.chromium.build.annotations.NullMarked;
++import org.chromium.content_public.browser.WebContents;
++
++/**
++ * Tark for Android's live captions: one tab's captions
++ * (chrome/browser/tark_captions_android/tark_captions_tab.h) for the caption bar, and the model
++ * downloads (caption_downloads.h) for Settings.
++ */
++@JNINamespace("tark_captions")
++@NullMarked
++public final class TarkCaptionsBridge {
++    /** CaptionDownloads::State. */
++    public static final int UNIT_MISSING = 0;
++
++    public static final int UNIT_WAITING_FOR_WIFI = 1;
++    public static final int UNIT_DOWNLOADING = 2;
++    public static final int UNIT_READY = 3;
++    public static final int UNIT_FAILED = 4;
++
++    /** The caption style pref: Automatic, word by word, a phrase at a time. */
++    public static final int STYLE_AUTOMATIC = 0;
++
++    public static final int STYLE_WORD_BY_WORD = 1;
++    public static final int STYLE_PHRASE = 2;
++
++    /** The languages of Phase 1, in the chip's order. */
++    public static final String[] LANGUAGES = {"hi", "ta", "en", "es"};
++
++    /** What the caption bar shows for a tab. */
++    public static final class State {
++        public final boolean barVisible;
++        public final boolean captionsOn;
++        public final String language;
++        public final int unitState;
++        public final long bytes;
++        public final long total;
++        public final boolean cantCaption;
++        public final boolean phrase;
++        public final String finalText;
++        public final String draftText;
++
++        State(boolean barVisible, boolean captionsOn, String language, int unitState, long bytes,
++                long total, boolean cantCaption, boolean phrase, String finalText,
++                String draftText) {
++            this.barVisible = barVisible;
++            this.captionsOn = captionsOn;
++            this.language = language;
++            this.unitState = unitState;
++            this.bytes = bytes;
++            this.total = total;
++            this.cantCaption = cantCaption;
++            this.phrase = phrase;
++            this.finalText = finalText;
++            this.draftText = draftText;
++        }
++    }
++
++    /** Told when a tab's captions change. */
++    public interface Listener {
++        void onStateChanged(WebContents webContents);
++    }
++
++    private static final ObserverList<Listener> sListeners = new ObserverList<>();
++
++    private TarkCaptionsBridge() {}
++
++    public static void addListener(Listener listener) {
++        sListeners.addObserver(listener);
++    }
++
++    public static void removeListener(Listener listener) {
++        sListeners.removeObserver(listener);
++    }
++
++    public static State getState(WebContents webContents) {
++        return TarkCaptionsBridgeJni.get().getState(webContents);
++    }
++
++    public static void setCaptionsOn(WebContents webContents, boolean on) {
++        TarkCaptionsBridgeJni.get().setCaptionsOn(webContents, on);
++    }
++
++    public static void chooseLanguage(WebContents webContents, String language) {
++        TarkCaptionsBridgeJni.get().chooseLanguage(webContents, language);
++    }
++
++    /** "Download now" (mobile data), or try a failed download again. */
++    public static void requestDownload(WebContents webContents, boolean now) {
++        TarkCaptionsBridgeJni.get().requestDownload(webContents, now);
++    }
++
++    /** ✕: the bar goes for this page. */
++    public static void hideBar(WebContents webContents) {
++        TarkCaptionsBridgeJni.get().hideBar(webContents);
++    }
++
++    public static int getStyle() {
++        return TarkCaptionsBridgeJni.get().getStyle();
++    }
++
++    public static void setStyle(int style) {
++        TarkCaptionsBridgeJni.get().setStyle(style);
++    }
++
++    /** The languages on the phone ("hi", ...), with their sizes in bytes. */
++    public static String[] getReadyLanguages() {
++        return TarkCaptionsBridgeJni.get().getReadyLanguages();
++    }
++
++    public static long[] getReadyLanguageSizes() {
++        return TarkCaptionsBridgeJni.get().getReadyLanguageSizes();
++    }
++
++    public static void removeLanguage(String language) {
++        TarkCaptionsBridgeJni.get().removeLanguage(language);
++    }
++
++    /** A language's download size in bytes (its model and, if missing, the common files). */
++    public static long getDownloadSize(String language) {
++        return TarkCaptionsBridgeJni.get().getDownloadSize(language);
++    }
++
++    @CalledByNative
++    private static State createState(boolean barVisible, boolean captionsOn,
++            @JniType("std::string") String language, int unitState, long bytes, long total,
++            boolean cantCaption, boolean phrase, @JniType("std::string") String finalText,
++            @JniType("std::string") String draftText) {
++        return new State(barVisible, captionsOn, language, unitState, bytes, total, cantCaption,
++                phrase, finalText, draftText);
++    }
++
++    @CalledByNative
++    private static void onStateChanged(WebContents webContents) {
++        for (Listener listener : sListeners) listener.onStateChanged(webContents);
++    }
++
++    @NativeMethods
++    interface Natives {
++        State getState(WebContents webContents);
++
++        void setCaptionsOn(WebContents webContents, boolean on);
++
++        void chooseLanguage(WebContents webContents, @JniType("std::string") String language);
++
++        void requestDownload(WebContents webContents, boolean now);
++
++        void hideBar(WebContents webContents);
++
++        int getStyle();
++
++        void setStyle(int style);
++
++        @JniType("std::vector<std::string>")
++        String[] getReadyLanguages();
++
++        @JniType("std::vector<int64_t>")
++        long[] getReadyLanguageSizes();
++
++        void removeLanguage(@JniType("std::string") String language);
++
++        long getDownloadSize(@JniType("std::string") String language);
++    }
++}
+--- /dev/null
++++ b/chrome/browser/tark_captions_android/android/java/src/org/chromium/chrome/browser/tark_captions/TarkLiveCaptionsSettings.java
+@@ -0,0 +1,123 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++package org.chromium.chrome.browser.tark_captions;
++
++import android.os.Bundle;
++import android.text.format.Formatter;
++
++import androidx.appcompat.app.AlertDialog;
++import androidx.preference.Preference;
++import androidx.preference.PreferenceCategory;
++
++import org.chromium.base.supplier.MonotonicObservableSupplier;
++import org.chromium.base.supplier.ObservableSuppliers;
++import org.chromium.base.supplier.SettableMonotonicObservableSupplier;
++import org.chromium.build.annotations.NullMarked;
++import org.chromium.build.annotations.Nullable;
++import org.chromium.chrome.browser.settings.ChromeBaseSettingsFragment;
++import org.chromium.components.browser_ui.settings.SettingsUtils;
++
++import java.util.Locale;
++
++/**
++ * Settings › Accessibility › Live captions: the caption style (Automatic, word by word, a phrase at
++ * a time) and the languages on the phone, with their sizes, to delete.
++ */
++@NullMarked
++public class TarkLiveCaptionsSettings extends ChromeBaseSettingsFragment {
++    private static final String[] STYLE_KEYS = {
++        "tark_captions_style_automatic", "tark_captions_style_word", "tark_captions_style_phrase"
++    };
++    private static final String LANGUAGES_KEY = "tark_captions_languages";
++
++    private final SettableMonotonicObservableSupplier<String> mPageTitle =
++            ObservableSuppliers.createMonotonic();
++
++    @Override
++    public void onCreatePreferences(@Nullable Bundle savedInstanceState, @Nullable String rootKey) {
++        mPageTitle.set(getString(R.string.tark_live_captions_title));
++        SettingsUtils.addPreferencesFromResource(this, R.xml.tark_live_captions_preferences);
++        for (int style = 0; style < STYLE_KEYS.length; style++) {
++            final int chosen = style;
++            Preference row = findPreference(STYLE_KEYS[style]);
++            if (row == null) continue;
++            row.setOnPreferenceClickListener(
++                    p -> {
++                        TarkCaptionsBridge.setStyle(chosen);
++                        updateStyle();
++                        return true;
++                    });
++        }
++    }
++
++    @Override
++    public MonotonicObservableSupplier<String> getPageTitle() {
++        return mPageTitle;
++    }
++
++    @Override
++    public @AnimationType int getAnimationType() {
++        return AnimationType.PROPERTY;
++    }
++
++    @Override
++    public void onResume() {
++        super.onResume();
++        updateStyle();
++        updateLanguages();
++    }
++
++    private void updateStyle() {
++        int style = TarkCaptionsBridge.getStyle();
++        for (int i = 0; i < STYLE_KEYS.length; i++) {
++            TarkCaptionStylePreference row = findPreference(STYLE_KEYS[i]);
++            if (row != null) row.setChecked(i == style);
++        }
++    }
++
++    private void updateLanguages() {
++        PreferenceCategory languages = findPreference(LANGUAGES_KEY);
++        if (languages == null) return;
++        languages.removeAll();
++        String[] codes = TarkCaptionsBridge.getReadyLanguages();
++        long[] sizes = TarkCaptionsBridge.getReadyLanguageSizes();
++        if (codes.length == 0) {
++            Preference none = new Preference(getStyledContext());
++            none.setSummary(R.string.tark_captions_no_languages);
++            none.setSelectable(false);
++            languages.addPreference(none);
++            return;
++        }
++        for (int i = 0; i < codes.length; i++) {
++            final String code = codes[i];
++            final String name = new Locale(code).getDisplayLanguage();
++            Preference row = new Preference(getStyledContext());
++            row.setTitle(name);
++            row.setSummary(Formatter.formatShortFileSize(getStyledContext(), sizes[i]));
++            row.setOnPreferenceClickListener(
++                    p -> {
++                        new AlertDialog.Builder(
++                                        getStyledContext(),
++                                        R.style.ThemeOverlay_BrowserUI_AlertDialog)
++                                .setMessage(getString(R.string.tark_captions_delete, name))
++                                .setPositiveButton(
++                                        R.string.delete,
++                                        (d, w) -> {
++                                            TarkCaptionsBridge.removeLanguage(code);
++                                            updateLanguages();
++                                        })
++                                .setNegativeButton(R.string.cancel, null)
++                                .show();
++                        return true;
++                    });
++            languages.addPreference(row);
++        }
++    }
++
++    /** The preferences' themed context (settings may be hosted in a tab). */
++    private android.content.Context getStyledContext() {
++        return getPreferenceManager().getContext();
++    }
++}
+--- a/chrome/browser/ui/android/strings/android_chrome_strings.grd
++++ b/chrome/browser/ui/android/strings/android_chrome_strings.grd
+@@ -844,6 +844,75 @@
+       <message name="IDS_TARK_XLIT_NO_THANKS" desc="Tark: button in the Indian-language suggestions dialog: do not download, and stop offering. [CHAR_LIMIT=24]">
+         No thanks
+       </message>
++      <message name="IDS_TARK_CAPTIONS_CHIP" desc="Tark: the caption bar's button that turns live captions on or off for the video. [CHAR_LIMIT=16]">
++        Captions
++      </message>
++      <message name="IDS_TARK_CAPTIONS_LANGUAGE_CHIP" desc="Tark: the caption bar's language button: the language being captioned, and a sign that it opens a list. LANGUAGE is a language name, such as Hindi.">
++        <ph name="LANGUAGE">%1$s<ex>Hindi</ex></ph> ▾
++      </message>
++      <message name="IDS_TARK_CAPTIONS_CLOSE" desc="Tark: accessibility label of the caption bar's close button, which hides the bar for this page.">
++        Close captions
++      </message>
++      <message name="IDS_TARK_CAPTIONS_GETTING_READY" desc="Tark: shown while a language's captions model downloads, the first time captions are turned on in it. LANGUAGE is a language name; SIZE is the download's size, such as 138 MB.">
++        Getting <ph name="LANGUAGE">%1$s<ex>Hindi</ex></ph> ready · <ph name="SIZE">%2$s<ex>138 MB</ex></ph>
++      </message>
++      <message name="IDS_TARK_CAPTIONS_ON_THIS_PHONE" desc="Tark: below a captions model's download progress: it downloads on Wi-Fi and stays on the phone (captions are made on the phone).">
++        On Wi-Fi · stays on this phone
++      </message>
++      <message name="IDS_TARK_CAPTIONS_WAITING_FOR_WIFI" desc="Tark: below a captions model's download: the phone is on mobile data, so the download waits for Wi-Fi.">
++        Waiting for Wi-Fi
++      </message>
++      <message name="IDS_TARK_CAPTIONS_DOWNLOAD_NOW" desc="Tark: button that downloads a captions model now, on mobile data. [CHAR_LIMIT=24]">
++        Download now
++      </message>
++      <message name="IDS_TARK_CAPTIONS_DOWNLOAD_FAILED" desc="Tark: below a captions model's download: it failed (three tries).">
++        Couldn't download
++      </message>
++      <message name="IDS_TARK_CAPTIONS_TRY_AGAIN" desc="Tark: button that tries a failed captions download again. [CHAR_LIMIT=24]">
++        Try again
++      </message>
++      <message name="IDS_TARK_CAPTIONS_CANT_CAPTION" desc="Tark: shown in place of captions when the video's sound cannot reach Tark's captions (some streams play outside the page).">
++        Tark can't caption this video
++      </message>
++      <message name="IDS_TARK_CAPTIONS_LISTENING" desc="Tark: shown in place of captions until the first words are recognised.">
++        Listening…
++      </message>
++      <message name="IDS_TARK_LIVE_CAPTIONS_TITLE" desc="Tark: title of the Live captions settings page.">
++        Live captions
++      </message>
++      <message name="IDS_TARK_LIVE_CAPTIONS_SUMMARY" desc="Tark: at the top of the Live captions settings: captions are made on the phone and nothing heard is sent anywhere.">
++        Captions are made on this phone. Nothing you hear leaves it.
++      </message>
++      <message name="IDS_TARK_CAPTIONS_STYLE" desc="Tark: heading of the caption style choices in the Live captions settings.">
++        Caption style
++      </message>
++      <message name="IDS_TARK_CAPTIONS_STYLE_AUTOMATIC" desc="Tark: caption style chosen by Tark for the phone (word by word on fast phones, a phrase at a time on others).">
++        Automatic
++      </message>
++      <message name="IDS_TARK_CAPTIONS_STYLE_WORD" desc="Tark: caption style: captions appear word by word as people speak.">
++        Word by word
++      </message>
++      <message name="IDS_TARK_CAPTIONS_STYLE_WORD_SUMMARY" desc="Tark: below the word-by-word caption style: quicker, and uses more battery.">
++        Faster, more battery
++      </message>
++      <message name="IDS_TARK_CAPTIONS_STYLE_PHRASE" desc="Tark: caption style: a whole phrase appears when the speaker pauses, like subtitles.">
++        A phrase at a time
++      </message>
++      <message name="IDS_TARK_CAPTIONS_STYLE_PHRASE_SUMMARY" desc="Tark: below the phrase-at-a-time caption style: lighter on the phone.">
++        Lighter on the phone
++      </message>
++      <message name="IDS_TARK_CAPTIONS_LANGUAGES" desc="Tark: heading of the list of caption languages downloaded to the phone, in the Live captions settings.">
++        Languages on this phone
++      </message>
++      <message name="IDS_TARK_CAPTIONS_NO_LANGUAGES" desc="Tark: in the Live captions settings when no caption language is downloaded yet.">
++        None yet. Turn on captions on a video to download a language.
++      </message>
++      <message name="IDS_TARK_CAPTIONS_DELETE" desc="Tark: confirmation before deleting a caption language's downloaded model. LANGUAGE is a language name.">
++        Delete <ph name="LANGUAGE">%1$s<ex>Hindi</ex></ph> captions from this phone?
++      </message>
++      <message name="IDS_TARK_CONNECTS_CAPTIONS" desc="Tark: item in the list of services Tark connects to: the live captions' models from Tark's site, only when the person turns captions on in a language, with its host name.">
++        Live caption models, downloaded when you turn captions on (gettarka.com)
++      </message>
+       <message name="IDS_TARK_CONNECTS_XLIT" desc="Tark: item in the list of services Tark connects to: the Indian-language suggestions' download from Tark's site, only when the person asks, with its host name.">
+         Indian-language suggestions, downloaded once when you ask (gettarka.com)
+       </message>
+--- a/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb
++++ b/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb
+@@ -1,6 +1,25 @@
+ <?xml version="1.0" ?>
+ <!DOCTYPE translationbundle>
+ <translationbundle lang="hi">
++<translation id="8284326494547611709">कैप्शन</translation>
++<translation id="2691364366292064518"><ph name="LANGUAGE" /> ▾</translation>
++<translation id="5387194694427445826">कैप्शन बंद करें</translation>
++<translation id="3164242376258537331"><ph name="LANGUAGE" /> तैयार हो रही है · <ph name="SIZE" /></translation>
++<translation id="3809677261464676762">वाई-फ़ाई पर · इसी फ़ोन पर रहता है</translation>
++<translation id="2096239473850415494">डाउनलोड नहीं हो सका</translation>
++<translation id="4252306153350939310">Tark इस वीडियो के कैप्शन नहीं दिखा सकता</translation>
++<translation id="5782486745736007002">सुन रहा है…</translation>
++<translation id="3385089776657648331">लाइव कैप्शन</translation>
++<translation id="8532391189057403277">कैप्शन इसी फ़ोन पर बनते हैं। आप जो सुनते हैं, वह फ़ोन से बाहर नहीं जाता।</translation>
++<translation id="7997810685648179569">कैप्शन का तरीका</translation>
++<translation id="7949922078480280799">शब्द-दर-शब्द</translation>
++<translation id="5528637739026681260">तेज़, ज़्यादा बैटरी</translation>
++<translation id="6995137924604866828">एक बार में एक वाक्यांश</translation>
++<translation id="6545945782952684242">फ़ोन पर हल्का</translation>
++<translation id="1604127529250647078">इस फ़ोन पर भाषाएँ</translation>
++<translation id="8267084811767025180">अभी कोई नहीं। भाषा डाउनलोड करने के लिए किसी वीडियो पर कैप्शन चालू करें।</translation>
++<translation id="3191958327489813178"><ph name="LANGUAGE" /> के कैप्शन इस फ़ोन से हटाएँ?</translation>
++<translation id="1167145792047177103">लाइव कैप्शन के मॉडल, जब आप कैप्शन चालू करते हैं तब डाउनलोड होते हैं (gettarka.com)</translation>
+ <translation id="1007349221964075684">खुली हुई गुप्त विंडो देखने के लिए, स्क्रीन लॉक का इस्तेमाल करें</translation>
+ <translation id="1010283278930414892">इस डिवाइस में कोई पासवर्ड सेव नहीं है</translation>
+ <translation id="1011749477052068769">यहां मूव करें</translation>
+--- a/components/browser_ui/accessibility/android/java/res/xml/accessibility_preferences.xml
++++ b/components/browser_ui/accessibility/android/java/res/xml/accessibility_preferences.xml
+@@ -49,6 +49,13 @@
+         android:key="captions"
+         android:title="@string/accessibility_captions_title"/>
+ 
++    <!-- Tark: captions made on the phone for videos (chrome's
++         TarkLiveCaptionsSettings, opened by name). -->
++    <org.chromium.components.browser_ui.settings.ChromeBasePreference
++        android:fragment="org.chromium.chrome.browser.tark_captions.TarkLiveCaptionsSettings"
++        android:key="tark_live_captions"
++        android:title="@string/tark_live_captions_preference_title" />
++
+     <org.chromium.components.browser_ui.settings.ChromeBasePreference
+         android:fragment="org.chromium.chrome.browser.image_descriptions.ImageDescriptionsSettings"
+         android:key="image_descriptions"
+--- a/components/browser_ui/strings/android/browser_ui_strings.grd
++++ b/components/browser_ui/strings/android/browser_ui_strings.grd
+@@ -1008,6 +1008,9 @@
+       <message name="IDS_ACCESSIBILITY_CAPTIONS_TITLE" desc="Title of the preference that allows the user to update caption settings.">
+         Captions
+       </message>
++      <message name="IDS_TARK_LIVE_CAPTIONS_PREFERENCE_TITLE" desc="Tark: title of the Accessibility settings row that opens Tark's Live captions settings (captions made on the phone for videos).">
++        Live captions
++      </message>
+       <message name="IDS_JUMP_START_OMNIBOX_TITLE" desc="When this preference is enabled, Chrome start-up time is reduced, and the user is taken directly to an active Omnibox">
+         Jump-start Omnibox
+       </message>
+--- a/components/browser_ui/strings/android/translations/browser_ui_strings_hi.xtb
++++ b/components/browser_ui/strings/android/translations/browser_ui_strings_hi.xtb
+@@ -796,4 +796,5 @@
+ <translation id="961930410699694996">इस बार जगह की जानकारी ऐक्सेस करने की अनुमति दी गई</translation>
+ <translation id="967624055006145463">सेव किया गया डेटा</translation>
+ <translation id="969975166333045662">साइट को V8 ऑप्टिमाइज़र का इस्तेमाल करने से रोकें.</translation>
++<translation id="3385089776657648331">लाइव कैप्शन</translation>
+ </translationbundle>
+\ No newline at end of file
