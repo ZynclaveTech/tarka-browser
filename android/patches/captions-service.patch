@@ -64,7 +64,7 @@
 +}
 --- /dev/null
 +++ b/chrome/services/tark_captions/caption_service_impl.cc
-@@ -0,0 +1,104 @@
+@@ -0,0 +1,176 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -80,6 +80,8 @@
 +#include "components/tark_captions/asr_model.h"
 +#include "components/tark_captions/caption_engine.h"
 +#include "components/tark_captions/model_source.h"
++#include "components/tark_captions/ort_runtime.h"
++#include "components/tark_captions/translation_engine.h"
 +
 +namespace tark_captions {
 +namespace {
@@ -128,10 +130,59 @@
 +  return std::make_unique<RealEngine>(std::move(engine), std::move(on_caption));
 +}
 +
++class RealTranslator : public Translator {
++ public:
++  explicit RealTranslator(std::unique_ptr<TranslationEngine> engine) : engine_(std::move(engine)) {}
++
++  std::optional<std::string> Translate(std::string_view caption,
++                                       std::string_view source,
++                                       std::string_view target) override {
++    const std::optional<Target> to = TargetFromCode(target);
++    if (!to) {
++      return std::nullopt;
++    }
++    return engine_->TranslateFrom(caption, source, *to);
++  }
++
++ private:
++  std::unique_ptr<TranslationEngine> engine_;
++};
++
++// The units' files ("tr_indic_en/model.SRC", ...) as one source per
++// direction; the models load on the translation sequence, on first use.
++std::unique_ptr<Translator> MakeTranslator(std::map<std::string, base::File> files) {
++  static constexpr std::pair<const char*, TranslationDirection> kUnits[] = {
++      {"tr_indic_en", TranslationDirection::kIndicToEnglish},
++      {"tr_en_indic", TranslationDirection::kEnglishToIndic},
++      {"tr_es_en", TranslationDirection::kSpanishToEnglish},
++  };
++  std::map<TranslationDirection, std::map<std::string, base::File>> by_direction;
++  for (auto& [name, file] : files) {
++    const size_t slash = name.find('/');
++    for (const auto& [unit, direction] : kUnits) {
++      if (name.substr(0, slash) == unit) {
++        by_direction[direction].emplace(name.substr(slash + 1), std::move(file));
++      }
++    }
++  }
++  std::map<TranslationDirection, std::unique_ptr<ModelSource>> sources;
++  for (auto& [direction, unit_files] : by_direction) {
++    sources[direction] = std::make_unique<MappedFilesSource>(std::move(unit_files));
++  }
++  std::unique_ptr<TranslationEngine> engine =
++      TranslationEngine::Create(OrtRuntime::Load(base::FilePath(kOrtLibrary)), std::move(sources));
++  if (!engine) {
++    LOG(WARNING) << "tark captions: no translation runtime";
++    return nullptr;
++  }
++  return std::make_unique<RealTranslator>(std::move(engine));
++}
++
 +}  // namespace
 +
 +CaptionServiceImpl::CaptionServiceImpl(mojo::PendingReceiver<mojom::CaptionService> receiver)
-+    : receiver_(this, std::move(receiver)), session_(base::BindRepeating(&MakeEngine)) {}
++    : receiver_(this, std::move(receiver)),
++      session_(base::BindRepeating(&MakeEngine), base::BindRepeating(&MakeTranslator)) {}
 +
 +CaptionServiceImpl::~CaptionServiceImpl() = default;
 +
@@ -152,12 +203,33 @@
 +  std::move(callback).Run(session_.Start(
 +      std::move(by_name), engine_options,
 +      base::BindRepeating(
-+          [](mojo::Remote<mojom::CaptionClient>* client, bool is_final, std::string text) {
++          [](mojo::Remote<mojom::CaptionClient>* client, bool is_final, std::string text,
++             uint32_t caption_id) {
 +            if (client->is_bound()) {
-+              (*client)->OnCaption(is_final, text);
++              (*client)->OnCaption(is_final, text, caption_id);
++            }
++          },
++          base::Unretained(&client_)),
++      base::BindRepeating(
++          [](mojo::Remote<mojom::CaptionClient>* client, uint32_t caption_id, std::string text) {
++            if (client->is_bound()) {
++              (*client)->OnTranslation(caption_id, text);
 +            }
 +          },
 +          base::Unretained(&client_))));
++}
++
++void CaptionServiceImpl::SetTarget(const std::string& target,
++                                   base::flat_map<std::string, base::File> files,
++                                   SetTargetCallback callback) {
++  std::map<std::string, base::File> by_name;
++  for (auto& [name, file] : files) {
++    by_name.emplace(name, std::move(file));
++  }
++  const bool ok = session_.SetTarget(target, std::move(by_name));
++  LOG(WARNING) << "tark captions: translation " << (target.empty() ? "off" : target)
++               << (ok ? "" : " (not loaded)");
++  std::move(callback).Run(ok);
 +}
 +
 +void CaptionServiceImpl::AddAudio(const std::vector<float>& pcm, int32_t sample_rate) {
@@ -171,7 +243,7 @@
 +}  // namespace tark_captions
 --- /dev/null
 +++ b/chrome/services/tark_captions/caption_service_impl.h
-@@ -0,0 +1,41 @@
+@@ -0,0 +1,44 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -202,6 +274,9 @@
 +             mojo::PendingRemote<mojom::CaptionClient> client,
 +             StartCallback callback) override;
 +  void AddAudio(const std::vector<float>& pcm, int32_t sample_rate) override;
++  void SetTarget(const std::string& target,
++                 base::flat_map<std::string, base::File> files,
++                 SetTargetCallback callback) override;
 +  void Stop() override;
 +
 + private:
@@ -215,20 +290,29 @@
 +#endif  // CHROME_SERVICES_TARK_CAPTIONS_CAPTION_SERVICE_IMPL_H_
 --- /dev/null
 +++ b/chrome/services/tark_captions/caption_session.cc
-@@ -0,0 +1,46 @@
+@@ -0,0 +1,130 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
 +
 +#include "chrome/services/tark_captions/caption_session.h"
 +
++#include <set>
 +#include <utility>
++
++#include "base/functional/bind.h"
++#include "base/task/task_traits.h"
++#include "base/task/thread_pool.h"
 +
 +namespace tark_captions {
 +
-+CaptionSession::CaptionSession(EngineFactory factory) : factory_(std::move(factory)) {}
-+CaptionSession::CaptionSession(CaptionSession&&) = default;
-+CaptionSession& CaptionSession::operator=(CaptionSession&&) = default;
++CaptionSession::CaptionSession(EngineFactory factory, TranslatorFactory translator_factory)
++    : factory_(std::move(factory)),
++      translator_factory_(std::move(translator_factory)),
++      translation_runner_(base::ThreadPool::CreateSequencedTaskRunner(
++          {base::MayBlock(), base::TaskPriority::USER_VISIBLE})),
++      translator_(nullptr, base::OnTaskRunnerDeleter(translation_runner_)) {}
++
 +CaptionSession::~CaptionSession() = default;
 +
 +// static
@@ -237,18 +321,92 @@
 +          "vocab.json",        "language_masks.json", "engine.json", "silero_vad.onnx"};
 +}
 +
++// static
++std::vector<std::string> CaptionSession::TranslationFiles() {
++  return {"config.json",       "dict.SRC.json",    "dict.TGT.json",
++          "model.SRC",         "encoder.int8.onnx", "decoder_step.int8.onnx"};
++}
++
 +bool CaptionSession::Start(std::map<std::string, base::File> files,
 +                           const EngineOptions& options,
-+                           CaptionCallback on_caption) {
++                           SessionCaptionCallback on_caption,
++                           TranslationCallback on_translation) {
 +  engine_.reset();
++  on_caption_ = std::move(on_caption);
++  on_translation_ = std::move(on_translation);
++  language_ = options.language;
 +  for (const std::string& name : RequiredFiles()) {
 +    auto it = files.find(name);
 +    if (it == files.end() || !it->second.IsValid()) {
 +      return false;
 +    }
 +  }
-+  engine_ = factory_.Run(std::move(files), options, std::move(on_caption));
++  engine_ = factory_.Run(std::move(files), options,
++                         base::BindRepeating(&CaptionSession::OnEngineCaption,
++                                             weak_factory_.GetWeakPtr()));
 +  return engine_ != nullptr;
++}
++
++void CaptionSession::OnEngineCaption(bool is_final, std::string text) {
++  const uint32_t id = is_final ? next_caption_id_++ : 0;
++  if (on_caption_) {
++    on_caption_.Run(is_final, text, id);
++  }
++  if (!is_final || !translator_ || target_.empty()) {
++    return;
++  }
++  // The translator is deleted on its own sequence, after any task posted
++  // before; so it outlives this one.
++  translation_runner_->PostTaskAndReplyWithResult(
++      FROM_HERE,
++      base::BindOnce(&Translator::Translate, base::Unretained(translator_.get()), std::move(text),
++                     language_, target_),
++      base::BindOnce(&CaptionSession::OnTranslated, weak_factory_.GetWeakPtr(), generation_, id));
++}
++
++void CaptionSession::OnTranslated(uint64_t generation,
++                                  uint32_t caption_id,
++                                  std::optional<std::string> text) {
++  if (generation != generation_ || !text || text->empty() || !on_translation_) {
++    return;
++  }
++  on_translation_.Run(caption_id, std::move(*text));
++}
++
++bool CaptionSession::SetTarget(const std::string& target, std::map<std::string, base::File> files) {
++  ++generation_;
++  target_.clear();
++  translator_.reset();  // deleted on the translation sequence
++  if (target.empty()) {
++    return true;
++  }
++  // Every unit named in `files` must be whole.
++  std::set<std::string> units;
++  for (const auto& [name, file] : files) {
++    const size_t slash = name.find('/');
++    if (slash == std::string::npos || !file.IsValid()) {
++      return false;
++    }
++    units.insert(name.substr(0, slash));
++  }
++  if (units.empty()) {
++    return false;
++  }
++  for (const std::string& unit : units) {
++    for (const std::string& name : TranslationFiles()) {
++      if (!files.contains(unit + "/" + name)) {
++        return false;
++      }
++    }
++  }
++  std::unique_ptr<Translator> translator = translator_factory_.Run(std::move(files));
++  if (!translator) {
++    return false;
++  }
++  translator_ = std::unique_ptr<Translator, base::OnTaskRunnerDeleter>(
++      translator.release(), base::OnTaskRunnerDeleter(translation_runner_));
++  target_ = target;
++  return true;
 +}
 +
 +void CaptionSession::AddAudio(base::span<const float> pcm, int sample_rate) {
@@ -259,12 +417,13 @@
 +
 +void CaptionSession::Stop() {
 +  engine_.reset();
++  SetTarget("", {});
 +}
 +
 +}  // namespace tark_captions
 --- /dev/null
 +++ b/chrome/services/tark_captions/caption_session.h
-@@ -0,0 +1,70 @@
+@@ -0,0 +1,119 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -272,14 +431,20 @@
 +#ifndef CHROME_SERVICES_TARK_CAPTIONS_CAPTION_SESSION_H_
 +#define CHROME_SERVICES_TARK_CAPTIONS_CAPTION_SESSION_H_
 +
++#include <stdint.h>
++
 +#include <map>
 +#include <memory>
++#include <optional>
 +#include <string>
++#include <string_view>
 +#include <vector>
 +
 +#include "base/containers/span.h"
 +#include "base/files/file.h"
 +#include "base/functional/callback.h"
++#include "base/memory/weak_ptr.h"
++#include "base/task/sequenced_task_runner.h"
 +
 +namespace tark_captions {
 +
@@ -307,29 +472,72 @@
 +    const EngineOptions& options,
 +    CaptionCallback on_caption)>;
 +
++// Translate (Phase 2a): Tark's TranslationEngine, or a fake in tests. Runs on
++// its own sequence and may block for a fraction of a second per caption.
++class Translator {
++ public:
++  virtual ~Translator() = default;
++  // `caption` in `source` ("hi", "ta", "en", "es") into `target` ("en",
++  // "hi", "ta"); nullopt or "" shows the caption alone.
++  virtual std::optional<std::string> Translate(std::string_view caption,
++                                               std::string_view source,
++                                               std::string_view target) = 0;
++};
++
++// The translation units' files, keyed "<unit>/<name>".
++using TranslatorFactory =
++    base::RepeatingCallback<std::unique_ptr<Translator>(std::map<std::string, base::File> files)>;
++// What the session tells its client: finals are numbered from 1, so that a
++// translation arriving later is paired with its caption.
++using SessionCaptionCallback =
++    base::RepeatingCallback<void(bool is_final, std::string text, uint32_t caption_id)>;
++using TranslationCallback = base::RepeatingCallback<void(uint32_t caption_id, std::string text)>;
++
 +// Tark for Android's captions process, without mojo: one tab's captions.
 +// The model arrives as file handles (the sandbox opens nothing); a session
 +// missing a file refuses to start.
 +class CaptionSession {
 + public:
-+  explicit CaptionSession(EngineFactory factory);
-+  CaptionSession(CaptionSession&&);
-+  CaptionSession& operator=(CaptionSession&&);
++  CaptionSession(EngineFactory factory, TranslatorFactory translator_factory);
++  CaptionSession(const CaptionSession&) = delete;
++  CaptionSession& operator=(const CaptionSession&) = delete;
 +  ~CaptionSession();
 +
 +  // The model folder's files a session needs (a speech unit and Silero VAD).
 +  static std::vector<std::string> RequiredFiles();
++  // Each translation unit's files (TranslationEngine's six).
++  static std::vector<std::string> TranslationFiles();
 +
 +  bool Start(std::map<std::string, base::File> files,
 +             const EngineOptions& options,
-+             CaptionCallback on_caption);
++             SessionCaptionCallback on_caption,
++             TranslationCallback on_translation);
 +  // Dropped unless started.
 +  void AddAudio(base::span<const float> pcm, int sample_rate);
++  // Translate finals into `target` with the units in `files`; "" turns it
++  // off and unloads the models. Speech goes on either way. False (and no
++  // translation) when a unit lacks one of its files.
++  bool SetTarget(const std::string& target, std::map<std::string, base::File> files);
 +  void Stop();
 +
 + private:
++  void OnEngineCaption(bool is_final, std::string text);
++  void OnTranslated(uint64_t generation, uint32_t caption_id, std::optional<std::string> text);
++
 +  EngineFactory factory_;
++  TranslatorFactory translator_factory_;
 +  std::unique_ptr<SpeechEngine> engine_;
++  SessionCaptionCallback on_caption_;
++  TranslationCallback on_translation_;
++  std::string language_;
++  uint32_t next_caption_id_ = 1;
++  // Finals are translated in order on this sequence; the translator lives
++  // and dies on it.
++  scoped_refptr<base::SequencedTaskRunner> translation_runner_;
++  std::unique_ptr<Translator, base::OnTaskRunnerDeleter> translator_;
++  std::string target_;
++  uint64_t generation_ = 0;  // a translation for an older target is dropped
++  base::WeakPtrFactory<CaptionSession> weak_factory_{this};
 +};
 +
 +}  // namespace tark_captions
@@ -337,7 +545,7 @@
 +#endif  // CHROME_SERVICES_TARK_CAPTIONS_CAPTION_SESSION_H_
 --- /dev/null
 +++ b/chrome/services/tark_captions/caption_session_unittest.cc
-@@ -0,0 +1,108 @@
+@@ -0,0 +1,258 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -354,6 +562,9 @@
 +#include "base/functional/bind.h"
 +#include "base/functional/callback_helpers.h"
 +#include "base/memory/raw_ptr.h"
++#include "base/synchronization/waitable_event.h"
++#include "base/test/task_environment.h"
++#include "base/threading/thread_restrictions.h"
 +#include "testing/gtest/include/gtest/gtest.h"
 +
 +namespace tark_captions {
@@ -368,6 +579,30 @@
 +
 + private:
 +  raw_ptr<std::vector<int>> fed_;
++};
++
++// Translates by tagging the caption; the first call can be held back.
++class FakeTranslator : public Translator {
++ public:
++  FakeTranslator(int* alive, base::WaitableEvent* hold) : alive_(alive), hold_(hold) {
++    ++*alive_;
++  }
++  ~FakeTranslator() override { --*alive_; }
++  std::optional<std::string> Translate(std::string_view caption,
++                                       std::string_view source,
++                                       std::string_view target) override {
++    if (hold_ && first_) {
++      first_ = false;
++      base::ScopedAllowBaseSyncPrimitivesForTesting allow;
++      hold_->Wait();
++    }
++    return std::string(target) + ":" + std::string(caption);
++  }
++
++ private:
++  raw_ptr<int> alive_;
++  raw_ptr<base::WaitableEvent> hold_;
++  bool first_ = true;
 +};
 +
 +class CaptionSessionTest : public testing::Test {
@@ -385,18 +620,70 @@
 +  }
 +
 +  CaptionSession Session() {
-+    return CaptionSession(base::BindRepeating(
-+        [](CaptionSessionTest* self, std::map<std::string, base::File> files,
-+           const EngineOptions& options, CaptionCallback) -> std::unique_ptr<SpeechEngine> {
-+          ++self->engines_;
++    return CaptionSession(
++        base::BindRepeating(
++            [](CaptionSessionTest* self, std::map<std::string, base::File> files,
++               const EngineOptions& options,
++               CaptionCallback on_caption) -> std::unique_ptr<SpeechEngine> {
++              ++self->engines_;
++              self->speak_ = on_caption;
 +          for (const auto& [name, file] : files) {
 +            self->names_.push_back(name);
 +          }
-+          self->options_ = options;
-+          return std::make_unique<FakeEngine>(&self->fed_);
-+        },
-+        base::Unretained(this)));
++              self->options_ = options;
++              return std::make_unique<FakeEngine>(&self->fed_);
++            },
++            base::Unretained(this)),
++        base::BindRepeating(
++            [](CaptionSessionTest* self,
++               std::map<std::string, base::File> files) -> std::unique_ptr<Translator> {
++              ++self->translators_made_;
++              return std::make_unique<FakeTranslator>(&self->translators_alive_, self->hold_);
++            },
++            base::Unretained(this)));
 +  }
++
++  // A started Hindi session that records captions and translations.
++  void Started(CaptionSession& session) {
++    EngineOptions options;
++    options.language = "hi";
++    ASSERT_TRUE(session.Start(
++        Files(CaptionSession::RequiredFiles()), options,
++        base::BindRepeating(
++            [](CaptionSessionTest* self, bool is_final, std::string text, uint32_t id) {
++              if (is_final) {
++                self->final_ids_.push_back(id);
++              }
++            },
++            base::Unretained(this)),
++        base::BindRepeating(
++            [](CaptionSessionTest* self, uint32_t id, std::string text) {
++              self->translations_.emplace_back(id, text);
++            },
++            base::Unretained(this))));
++  }
++
++  // The six files of each translation unit, keyed "<unit>/<name>".
++  std::map<std::string, base::File> TranslationFiles(const std::vector<std::string>& units) {
++    std::vector<std::string> names;
++    for (const std::string& unit : units) {
++      for (const std::string& name : CaptionSession::TranslationFiles()) {
++        names.push_back(unit + "/" + name);
++      }
++    }
++    for (const std::string& name : names) {
++      base::CreateDirectory(dir_.GetPath().AppendASCII(name).DirName());
++    }
++    return Files(names);
++  }
++
++  base::test::TaskEnvironment task_environment_;
++  CaptionCallback speak_;
++  int translators_made_ = 0;
++  int translators_alive_ = 0;
++  raw_ptr<base::WaitableEvent> hold_ = nullptr;
++  std::vector<uint32_t> final_ids_;
++  std::vector<std::pair<uint32_t, std::string>> translations_;
 +
 +  base::ScopedTempDir dir_;
 +  int engines_ = 0;
@@ -412,10 +699,10 @@
 +  std::vector<std::string> names = CaptionSession::RequiredFiles();
 +  ASSERT_EQ(names.size(), 8u);
 +  names.pop_back();
-+  EXPECT_FALSE(session.Start(Files(names), EngineOptions(), base::DoNothing()));
++  EXPECT_FALSE(session.Start(Files(names), EngineOptions(), base::DoNothing(), base::DoNothing()));
 +  EXPECT_EQ(engines_, 0);
 +  EXPECT_TRUE(session.Start(Files(CaptionSession::RequiredFiles()), EngineOptions(),
-+                            base::DoNothing()));
++                            base::DoNothing(), base::DoNothing()));
 +  EXPECT_EQ(engines_, 1);
 +  EXPECT_EQ(names_.size(), 8u);
 +}
@@ -426,7 +713,8 @@
 +  options.phrase = true;
 +  options.threads = 1;
 +  options.language = "ta";
-+  ASSERT_TRUE(session.Start(Files(CaptionSession::RequiredFiles()), options, base::DoNothing()));
++  ASSERT_TRUE(session.Start(Files(CaptionSession::RequiredFiles()), options, base::DoNothing(),
++                            base::DoNothing()));
 +  EXPECT_TRUE(options_.phrase);
 +  EXPECT_EQ(options_.threads, 1);
 +  EXPECT_EQ(options_.language, "ta");
@@ -437,11 +725,81 @@
 +  const std::vector<float> pcm(160, 0.0f);
 +  session.AddAudio(pcm, 16000);  // before Start: dropped
 +  ASSERT_TRUE(session.Start(Files(CaptionSession::RequiredFiles()), EngineOptions(),
-+                            base::DoNothing()));
++                            base::DoNothing(), base::DoNothing()));
 +  session.AddAudio(pcm, 16000);
 +  session.Stop();
 +  session.AddAudio(pcm, 16000);  // after Stop: dropped
 +  EXPECT_EQ(fed_, (std::vector<int>{160}));
++}
++
++// Translate on, another target, off: the speech model is never rebuilt.
++TEST_F(CaptionSessionTest, SetTargetDoesNotRestartSpeech) {
++  CaptionSession session = Session();
++  Started(session);
++  EXPECT_TRUE(session.SetTarget("en", TranslationFiles({"tr_indic_en"})));
++  EXPECT_TRUE(session.SetTarget("hi", TranslationFiles({"tr_indic_en", "tr_en_indic"})));
++  EXPECT_TRUE(session.SetTarget("", {}));
++  EXPECT_EQ(engines_, 1);
++}
++
++TEST_F(CaptionSessionTest, OnlyFinalsAreTranslated) {
++  CaptionSession session = Session();
++  Started(session);
++  ASSERT_TRUE(session.SetTarget("en", TranslationFiles({"tr_indic_en"})));
++  speak_.Run(false, "नम");
++  speak_.Run(false, "नमस्ते");
++  speak_.Run(false, "नमस्ते दु");
++  speak_.Run(true, "नमस्ते दुनिया");
++  task_environment_.RunUntilIdle();
++  EXPECT_EQ(final_ids_, (std::vector<uint32_t>{1}));
++  ASSERT_EQ(translations_.size(), 1u);
++  EXPECT_EQ(translations_[0], (std::pair<uint32_t, std::string>{1, "en:नमस्ते दुनिया"}));
++}
++
++// A slow translation and fast speech: each translation stays with its own
++// caption, in order.
++TEST_F(CaptionSessionTest, TranslationsKeepCaptionOrder) {
++  base::WaitableEvent hold;
++  hold_ = &hold;
++  CaptionSession session = Session();
++  Started(session);
++  ASSERT_TRUE(session.SetTarget("en", TranslationFiles({"tr_indic_en"})));
++  speak_.Run(true, "एक");
++  speak_.Run(true, "दो");  // queued behind the held first one
++  hold.Signal();
++  task_environment_.RunUntilIdle();
++  ASSERT_EQ(translations_.size(), 2u);
++  EXPECT_EQ(translations_[0], (std::pair<uint32_t, std::string>{1, "en:एक"}));
++  EXPECT_EQ(translations_[1], (std::pair<uint32_t, std::string>{2, "en:दो"}));
++}
++
++// Translate off: the translation models leave memory.
++TEST_F(CaptionSessionTest, TargetOffUnloadsTranslator) {
++  CaptionSession session = Session();
++  Started(session);
++  ASSERT_TRUE(session.SetTarget("ta", TranslationFiles({"tr_indic_en", "tr_en_indic"})));
++  task_environment_.RunUntilIdle();
++  EXPECT_EQ(translators_alive_, 1);
++  ASSERT_TRUE(session.SetTarget("", {}));
++  task_environment_.RunUntilIdle();
++  EXPECT_EQ(translators_alive_, 0);
++  speak_.Run(true, "कुछ");
++  task_environment_.RunUntilIdle();
++  EXPECT_TRUE(translations_.empty());
++}
++
++// A unit missing a file: no translator, captions go on untranslated.
++TEST_F(CaptionSessionTest, MissingFileRejectsTarget) {
++  CaptionSession session = Session();
++  Started(session);
++  std::map<std::string, base::File> files = TranslationFiles({"tr_indic_en"});
++  files.erase("tr_indic_en/model.SRC");
++  EXPECT_FALSE(session.SetTarget("en", std::move(files)));
++  EXPECT_EQ(translators_made_, 0);
++  speak_.Run(true, "फिर भी");
++  task_environment_.RunUntilIdle();
++  EXPECT_EQ(final_ids_, (std::vector<uint32_t>{1}));
++  EXPECT_TRUE(translations_.empty());
 +}
 +
 +}  // namespace
@@ -464,7 +822,7 @@
 +}
 --- /dev/null
 +++ b/chrome/services/tark_captions/public/mojom/tark_captions.mojom
-@@ -0,0 +1,37 @@
+@@ -0,0 +1,44 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -487,8 +845,11 @@
 +};
 +
 +interface CaptionClient {
-+  // A draft of what is being said, or a segment's final text (UTF-8).
-+  OnCaption(bool is_final, string text);
++  // A draft of what is being said, or a segment's final text (UTF-8); finals
++  // are numbered from 1 (`caption_id`; 0 for a draft).
++  OnCaption(bool is_final, string text, uint32 caption_id);
++  // Final `caption_id` translated (Translate on).
++  OnTranslation(uint32 caption_id, string text);
 +};
 +
 +[ServiceSandbox=sandbox.mojom.Sandbox.kUtility]
@@ -500,6 +861,10 @@
 +        pending_remote<CaptionClient> client) => (bool ok);
 +  // Mono audio at `sample_rate`, 100 ms at a time.
 +  AddAudio(array<float> pcm, int32 sample_rate);
++  // Translate finals into `target` ("en", "hi", "ta"; "" is off and unloads
++  // the models) with the translation units' files, keyed "<unit>/<name>".
++  // Speech goes on either way. False if a unit lacks a file.
++  SetTarget(string target, map<string, mojo_base.mojom.ReadOnlyFile> files) => (bool ok);
 +  Stop();
 +};
 --- a/chrome/utility/BUILD.gn
