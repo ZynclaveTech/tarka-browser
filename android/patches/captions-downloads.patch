@@ -116,7 +116,7 @@
 +}
 --- /dev/null
 +++ b/chrome/browser/tark_captions_android/caption_downloads.cc
-@@ -0,0 +1,460 @@
+@@ -0,0 +1,461 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -236,6 +236,7 @@
 +  registry->RegisterListPref(kCellularOkPref);
 +  registry->RegisterIntegerPref(kStylePref, 0);
 +  registry->RegisterStringPref(kLanguagePref, std::string());
++  registry->RegisterStringPref(kTargetPref, std::string());
 +}
 +
 +// static
@@ -579,7 +580,7 @@
 +}  // namespace tark_captions
 --- /dev/null
 +++ b/chrome/browser/tark_captions_android/caption_downloads.h
-@@ -0,0 +1,126 @@
+@@ -0,0 +1,128 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -620,6 +621,8 @@
 +inline constexpr char kStylePref[] = "tark.captions.style";
 +// The language last chosen in the caption bar ("hi", "ta", "en", "es").
 +inline constexpr char kLanguagePref[] = "tark.captions.language";
++// Translate's target: "" (off), "en", "hi", "ta".
++inline constexpr char kTargetPref[] = "tark.captions.target";
 +
 +// Tark for Android's live captions: downloads a language's model files (and
 +// "common", Silero VAD) into the app's data directory when the person turns
@@ -708,7 +711,7 @@
 +#endif  // CHROME_BROWSER_TARK_CAPTIONS_ANDROID_CAPTION_DOWNLOADS_H_
 --- /dev/null
 +++ b/chrome/browser/tark_captions_android/model_files.cc
-@@ -0,0 +1,211 @@
+@@ -0,0 +1,247 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -793,9 +796,33 @@
 +}
 +
 +std::vector<std::string> UnitsToFetch(std::string_view unit) {
++  // Translation models need no voice detector.
++  if (unit.starts_with("tr_")) {
++    return {std::string(unit)};
++  }
 +  std::vector<std::string> units = {kCommon};
 +  if (unit != kCommon) {
 +    units.emplace_back(unit);
++  }
++  return units;
++}
++
++std::vector<std::string> TranslationUnitsFor(std::string_view source, std::string_view target) {
++  const bool indian_source = source == "hi" || source == "ta";
++  const bool indian_target = target == "hi" || target == "ta";
++  if ((target != "en" && !indian_target) || source == target) {
++    return {};
++  }
++  std::vector<std::string> units;
++  if (indian_source) {
++    units.emplace_back("tr_indic_en");
++  } else if (source == "es") {
++    units.emplace_back("tr_es_en");
++  } else if (source != "en") {
++    return {};
++  }
++  if (indian_target) {
++    units.emplace_back("tr_en_indic");
 +  }
 +  return units;
 +}
@@ -879,6 +906,18 @@
 +  return std::nullopt;
 +}
 +
++std::vector<std::string> UnitsToRequest(const std::vector<std::string>& units,
++                                        base::FunctionRef<bool(const std::string&)> missing,
++                                        base::FunctionRef<bool(const std::string&)> removing) {
++  std::vector<std::string> again;
++  for (const std::string& unit : units) {
++    if (missing(unit) && !removing(unit)) {
++      again.push_back(unit);
++    }
++  }
++  return again;
++}
++
 +UnitUse::UnitUse() = default;
 +UnitUse::~UnitUse() = default;
 +
@@ -922,7 +961,7 @@
 +}  // namespace tark_captions
 --- /dev/null
 +++ b/chrome/browser/tark_captions_android/model_files.h
-@@ -0,0 +1,97 @@
+@@ -0,0 +1,109 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -968,6 +1007,12 @@
 +// What turning `unit` on downloads: "common" (Silero VAD) and the unit.
 +std::vector<std::string> UnitsToFetch(std::string_view unit);
 +
++// The translation units a caption in `source` ("hi", "ta", "en", "es") needs
++// to reach `target` ("en", "hi", "ta"; "" is Translate off), in order:
++// Indian and Spanish into Hindi or Tamil go through English. Empty when
++// nothing is translated.
++std::vector<std::string> TranslationUnitsFor(std::string_view source, std::string_view target);
++
 +// Content-addressed: https://gettarka.com/models/android/v1/<sha256>.bin (the
 +// site serves extension-less paths as folders).
 +std::string FileUrl(const CaptionFile& file);
@@ -1000,6 +1045,12 @@
 +std::optional<std::string> NextToFetch(const std::deque<std::string>& queue,
 +                                       base::FunctionRef<bool(const std::string&)> can_start);
 +
++// Of `units`, those to request again: missing (deleted, or cancelled by
++// another tab) and not waiting to be removed.
++std::vector<std::string> UnitsToRequest(const std::vector<std::string>& units,
++                                        base::FunctionRef<bool(const std::string&)> missing,
++                                        base::FunctionRef<bool(const std::string&)> removing);
++
 +class UnitUse {
 + public:
 +  UnitUse();
@@ -1022,7 +1073,7 @@
 +#endif  // CHROME_BROWSER_TARK_CAPTIONS_ANDROID_MODEL_FILES_H_
 --- /dev/null
 +++ b/chrome/browser/tark_captions_android/model_files_unittest.cc
-@@ -0,0 +1,110 @@
+@@ -0,0 +1,145 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -1124,6 +1175,41 @@
 +  EXPECT_EQ(NextToFetch(queue, [](const std::string&) { return false; }), std::nullopt);
 +}
 +
++// Translate (Phase 2a): the translation models a caption passes through,
++// each a download of its own; Indian and Spanish into an Indian language go
++// through English.
++TEST(TarkCaptionFilesTest, TranslationUnitsPivot) {
++  using V = std::vector<std::string>;
++  EXPECT_EQ(TranslationUnitsFor("ta", "hi"), (V{"tr_indic_en", "tr_en_indic"}));
++  EXPECT_EQ(TranslationUnitsFor("hi", "en"), (V{"tr_indic_en"}));
++  EXPECT_EQ(TranslationUnitsFor("en", "hi"), (V{"tr_en_indic"}));
++  EXPECT_EQ(TranslationUnitsFor("en", "ta"), (V{"tr_en_indic"}));
++  EXPECT_EQ(TranslationUnitsFor("es", "en"), (V{"tr_es_en"}));
++  EXPECT_EQ(TranslationUnitsFor("es", "ta"), (V{"tr_es_en", "tr_en_indic"}));
++  EXPECT_TRUE(TranslationUnitsFor("hi", "hi").empty());
++  EXPECT_TRUE(TranslationUnitsFor("en", "en").empty());
++  EXPECT_TRUE(TranslationUnitsFor("hi", "").empty());  // Translate off
++  EXPECT_TRUE(TranslationUnitsFor("hi", "fr").empty());  // not a target
++}
++
++// A translation model needs no voice detector: nothing else is fetched.
++TEST(TarkCaptionFilesTest, TranslationUnitsNeedNoCommon) {
++  EXPECT_EQ(UnitsToFetch("tr_es_en"), (std::vector<std::string>{"tr_es_en"}));
++  EXPECT_EQ(UnitsToFetch("hi"), (std::vector<std::string>{"common", "hi"}));
++}
++
++// A translation model deleted in Settings, or cancelled by another tab: the
++// card asks for it again (never stuck without a button); not while its
++// removal waits, and not when it is here or already coming.
++TEST(TarkCaptionFilesTest, TranslationUnitsToRequestAgain) {
++  const std::vector<std::string> units = {"tr_indic_en", "tr_en_indic"};
++  auto missing = [](const std::string& unit) { return unit == "tr_en_indic"; };
++  auto none = [](const std::string&) { return false; };
++  EXPECT_EQ(UnitsToRequest(units, missing, none), (std::vector<std::string>{"tr_en_indic"}));
++  EXPECT_TRUE(UnitsToRequest(units, missing, missing).empty());  // removal waits
++  EXPECT_TRUE(UnitsToRequest(units, none, none).empty());
++}
++
 +TEST(TarkCaptionFilesTest, UrlIsContentAddressed) {
 +  // gettarka.com serves a path without an extension as a folder's
 +  // index.html, so the files carry ".bin", as xlit's do.
@@ -1135,7 +1221,7 @@
 +}  // namespace tark_captions
 --- /dev/null
 +++ b/chrome/browser/tark_captions_android/tab_captions.cc
-@@ -0,0 +1,139 @@
+@@ -0,0 +1,159 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -1151,6 +1237,12 @@
 +constexpr int kFlagshipRamMb = 7000;
 +
 +}  // namespace
++
++bool TranslateAvailable(int ram_mb, const std::string& language, const std::string& target) {
++  // Phones sold as 6 GB report about 5.3–5.7 GiB; 4 GB phones about 3.7.
++  constexpr int kTranslateRamMb = 5120;
++  return ram_mb >= kTranslateRamMb && language != target;
++}
 +
 +Style StyleForDevice(int fastest_khz, int ram_mb, int pref) {
 +  if (pref == 1) {
@@ -1198,7 +1290,21 @@
 +    state_.language = language;
 +    state_.unit_ready = false;
 +    state_.cant_caption = false;
++    state_.translation_ready = false;  // another pair, other models
 +  }
++}
++
++void TabCaptions::SetTarget(const std::string& target, base::TimeTicks now) {
++  if (target != state_.target) {
++    state_.target = target;
++    state_.translation_ready = false;
++  }
++  Recompute(now);
++}
++
++void TabCaptions::OnTranslationReady(bool ready, base::TimeTicks now) {
++  state_.translation_ready = ready;
++  Recompute(now);
 +}
 +
 +void TabCaptions::OnUnitReady(bool ready, base::TimeTicks now) {
@@ -1277,7 +1383,7 @@
 +}  // namespace tark_captions
 --- /dev/null
 +++ b/chrome/browser/tark_captions_android/tab_captions.h
-@@ -0,0 +1,99 @@
+@@ -0,0 +1,113 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -1304,6 +1410,11 @@
 +// word by word on a Snapdragon 695, 0.32 a phrase at a time).
 +Style StyleForDevice(int fastest_khz, int ram_mb, int pref);
 +
++// Whether the bar offers Translate: phones sold as 6 GB or more (until
++// measured on smaller ones), and only into another language than the
++// captions'.
++bool TranslateAvailable(int ram_mb, const std::string& language, const std::string& target);
++
 +// One tab's live captions, without the browser: what the caption bar shows,
 +// whether the tab's audio goes to the captions process, and when that
 +// process is wanted. TarkCaptionsTab feeds it events and acts on it.
@@ -1315,6 +1426,8 @@
 +    std::string language;       // the chip: "hi", "ta", "en", "es"
 +    bool unit_ready = false;    // the language's model is on the phone
 +    bool cant_caption = false;  // on, ready, playing, but no audio arrives
++    std::string target;         // Translate: "" off, "en", "hi", "ta"
++    bool translation_ready = false;  // its translation models are on the phone
 +  };
 +
 +  // How long captions wait for the tab's audio before saying they can't
@@ -1336,6 +1449,9 @@
 +  void OnHidden(bool hidden, base::TimeTicks now);
 +  void SetCaptionsOn(bool on, base::TimeTicks now);
 +  void ChooseLanguage(const std::string& language);
++  // Translate's target ("" turns it off); kept across languages.
++  void SetTarget(const std::string& target, base::TimeTicks now);
++  void OnTranslationReady(bool ready, base::TimeTicks now);
 +  void OnUnitReady(bool ready, base::TimeTicks now);
 +  // Audio from `source` (one player's connection). Captions follow one
 +  // source at a time: the one that started most recently, or any once that
@@ -1354,6 +1470,10 @@
 +  bool ShouldForwardAudio() const;
 +  // Whether the captions process should be running for this tab.
 +  bool WantsEngine() const { return wanted_; }
++  // Whether the running captions process should translate.
++  bool WantsTranslation() const {
++    return wanted_ && !state_.target.empty() && state_.translation_ready;
++  }
 +  // How many times WantsEngine() went from false to true (one process each).
 +  int engine_starts() const { return engine_starts_; }
 +
@@ -1379,7 +1499,7 @@
 +#endif  // CHROME_BROWSER_TARK_CAPTIONS_ANDROID_TAB_CAPTIONS_H_
 --- /dev/null
 +++ b/chrome/browser/tark_captions_android/tab_captions_unittest.cc
-@@ -0,0 +1,217 @@
+@@ -0,0 +1,274 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -1579,6 +1699,63 @@
 +  tab_.SetCaptionsOn(true, At(9));  // the next tap starts a new process
 +  EXPECT_TRUE(tab_.WantsEngine());
 +  EXPECT_EQ(tab_.engine_starts(), 2);
++}
++
++// Translate on, the speech model here, the translation model not yet:
++// captions run untranslated; when it arrives, translation starts without a
++// new captions process.
++TEST_F(TabCaptionsTest, TranslationWaitsForItsUnit) {
++  Captioning();
++  tab_.SetTarget("en", At(2));
++  EXPECT_EQ(tab_.state().target, "en");
++  EXPECT_TRUE(tab_.WantsEngine());
++  EXPECT_FALSE(tab_.WantsTranslation());
++  tab_.OnTranslationReady(true, At(20));
++  EXPECT_TRUE(tab_.WantsTranslation());
++  EXPECT_EQ(tab_.engine_starts(), 1);
++}
++
++TEST(TranslateAvailableTest, HiddenUnder6GBAndForTheSameLanguage) {
++  EXPECT_FALSE(TranslateAvailable(5000, "hi", "en"));
++  EXPECT_TRUE(TranslateAvailable(7600, "hi", "en"));
++  EXPECT_FALSE(TranslateAvailable(7600, "hi", "hi"));
++  EXPECT_TRUE(TranslateAvailable(6144, "es", "ta"));
++  // Phones sold as 6 GB report about 5.3–5.7 GiB: they get Translate; 4 GB
++  // phones do not.
++  EXPECT_TRUE(TranslateAvailable(5600, "hi", "en"));
++  EXPECT_FALSE(TranslateAvailable(3800, "hi", "en"));
++}
++
++// The translation model deleted in Settings: captions go on, Translate
++// keeps its target and offers the download again.
++TEST_F(TabCaptionsTest, TranslationUnitRemovedKeepsCaptions) {
++  Captioning();
++  tab_.SetTarget("hi", At(2));
++  tab_.OnTranslationReady(true, At(3));
++  tab_.OnTranslationReady(false, At(4));
++  EXPECT_TRUE(tab_.state().captions_on);
++  EXPECT_EQ(tab_.state().target, "hi");
++  EXPECT_FALSE(tab_.WantsTranslation());
++  EXPECT_TRUE(tab_.WantsEngine());
++}
++
++TEST_F(TabCaptionsTest, TargetSurvivesLanguageChange) {
++  Captioning();
++  tab_.SetTarget("hi", At(2));
++  tab_.ChooseLanguage("ta");
++  EXPECT_EQ(tab_.state().target, "hi");
++  tab_.ChooseLanguage("en");
++  EXPECT_EQ(tab_.state().target, "hi");
++  EXPECT_FALSE(tab_.state().translation_ready);  // the units differ per pair
++}
++
++TEST_F(TabCaptionsTest, TranslateOffWantsNoTranslation) {
++  Captioning();
++  tab_.SetTarget("en", At(2));
++  tab_.OnTranslationReady(true, At(3));
++  tab_.SetTarget("", At(4));
++  EXPECT_FALSE(tab_.WantsTranslation());
++  EXPECT_TRUE(tab_.WantsEngine());
 +}
 +
 +TEST(CaptionStyleTest, AutomaticIsPhraseOnMidRange) {

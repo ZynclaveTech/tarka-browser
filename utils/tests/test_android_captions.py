@@ -149,17 +149,31 @@ def fake_export(folder, lang, blank):
         {'lang': lang, 'blank': blank, 'valid_frames': 'n/hop', 'pad': 'constant'}))
 
 
+def fake_translation_export(folder, language_tags):
+    folder.mkdir(parents=True)
+    for name in models.TRANSLATION_FILES:
+        (folder / name).write_bytes(name.encode())
+    config = {'decoder_layers': 6, 'decoder_attention_heads': 8, 'decoder_embed_dim': 512,
+              'decoder_start_token_id': 2, 'eos_token_id': 2}
+    if not language_tags:
+        config['language_tags'] = False
+    (folder / 'config.json').write_text(json.dumps(config))
+
+
 class TestModels(unittest.TestCase):
     def setUp(self):
         self.tmp = pathlib.Path(tempfile.mkdtemp())
         exports = self.tmp / 'exports'
         for unit, folder in models.SPEECH_UNITS.items():
             fake_export(exports / folder, unit, 1024 if unit in ('en', 'es') else 256)
+        for unit, folder in models.TRANSLATION_UNITS.items():
+            fake_translation_export(exports / folder, language_tags=unit != 'tr_es_en')
         (self.tmp / 'silero_vad.onnx').write_bytes(b'vad')
         self.files = models.build(exports, self.tmp / 'silero_vad.onnx', self.tmp / 'out')
 
     def test_units_files_have_engine_json(self):
-        self.assertEqual(set(models.units(self.files)), {'common', 'hi', 'ta', 'en', 'es'})
+        self.assertEqual(set(models.units(self.files)),
+                         {'common', 'hi', 'ta', 'en', 'es', 'tr_indic_en', 'tr_en_indic', 'tr_es_en'})
         for unit in models.SPEECH_UNITS:
             names = {n.split('/', 1)[1] for n, f in self.files.items() if f['unit'] == unit}
             self.assertEqual(names, set(models.SPEECH_FILES), unit)
@@ -176,6 +190,48 @@ class TestModels(unittest.TestCase):
         with self.assertRaises(SystemExit):
             models.build(exports, self.tmp / 'silero_vad.onnx', self.tmp / 'out2')
 
+    def test_translation_units_have_their_six_files(self):
+        self.assertEqual(models.TRANSLATION_UNITS,
+                         {'tr_indic_en': 'it2_indic_en', 'tr_en_indic': 'it2_en_indic', 'tr_es_en': 'opus_es_en'})
+        for unit in models.TRANSLATION_UNITS:
+            names = {n.split('/', 1)[1] for n, f in self.files.items() if f['unit'] == unit}
+            self.assertEqual(names, set(models.TRANSLATION_FILES), unit)
+
+    def test_marian_export_must_say_no_language_tags(self):
+        # IndicTrans2 prefixes language tags, opus-mt must not: a config that
+        # gets this wrong would translate garbage.
+        exports = self.tmp / 'bad'
+        for unit, folder in models.SPEECH_UNITS.items():
+            fake_export(exports / folder, unit, 1024 if unit in ('en', 'es') else 256)
+        for unit, folder in models.TRANSLATION_UNITS.items():
+            fake_translation_export(exports / folder, language_tags=True)
+        with self.assertRaises(SystemExit):
+            models.build(exports, self.tmp / 'silero_vad.onnx', self.tmp / 'out3')
+
+    def test_committed_files_json_pins_translation_units(self):
+        committed = json.loads((ANDROID / 'captions' / 'files.json').read_text(encoding='utf-8'))
+        total = {u: sum(f['size'] for f in committed.values() if f['unit'] == u)
+                 for u in models.TRANSLATION_UNITS}
+        self.assertTrue(200e6 <= total['tr_indic_en'] <= 240e6, total)
+        self.assertTrue(240e6 <= total['tr_en_indic'] <= 290e6, total)
+        self.assertTrue(60e6 <= total['tr_es_en'] <= 160e6, total)
+
+    def test_marian_licence_credited(self):
+        credits = ROOT / 'resources' / 'captions' / 'credits' / 'opus-mt-es-en'
+        readme = (credits / 'README.chromium').read_text(encoding='utf-8')
+        self.assertIn('Helsinki-NLP/opus-mt-es-en', readme)
+        self.assertIn('License: Apache-2.0', readme)
+        self.assertIn('Apache License', (credits / 'LICENSE').read_text(encoding='utf-8'))
+
+    def test_marian_export_refuses_another_pair(self):
+        sys.path.insert(0, str(ROOT / 'utils'))
+        import marian_export
+        folder = self.tmp / 'fr-en'
+        folder.mkdir()
+        (folder / 'metadata.json').write_text(json.dumps({'src_alpha2': 'fr', 'tgt_alpha2': 'en'}))
+        with self.assertRaises(SystemExit):
+            marian_export.check_checkpoint(folder)
+
     def test_table_matches_files_json(self):
         rows = models.header_rows(self.files)
         self.assertEqual(len(rows.splitlines()), len(self.files))
@@ -185,7 +241,7 @@ class TestModels(unittest.TestCase):
 
     def test_committed_files_json_pins_phase1_units(self):
         committed = json.loads((ANDROID / 'captions' / 'files.json').read_text(encoding='utf-8'))
-        self.assertEqual(set(models.units(committed)), {'common', 'hi', 'ta', 'en', 'es'})
+        self.assertLessEqual({'common', 'hi', 'ta', 'en', 'es'}, set(models.units(committed)))
         for name, f in committed.items():
             self.assertRegex(f['sha256'], r'^[0-9a-f]{64}$', name)
             self.assertGreater(f['size'], 0, name)
@@ -231,7 +287,8 @@ class TestCaptionsUi(unittest.TestCase):
         for name, en in self.messages():
             fp = re.sub(r'<ph name="([A-Z_]+)">.*?</ph>', lambda m: m.group(1), en)
             reused = name in ('IDS_TARK_CAPTIONS_WAITING_FOR_WIFI', 'IDS_TARK_CAPTIONS_DOWNLOAD_NOW',
-                              'IDS_TARK_CAPTIONS_TRY_AGAIN', 'IDS_TARK_CAPTIONS_STYLE_AUTOMATIC')
+                              'IDS_TARK_CAPTIONS_TRY_AGAIN', 'IDS_TARK_CAPTIONS_STYLE_AUTOMATIC',
+                              'IDS_TARK_CAPTIONS_TRANSLATE')
             self.assertTrue(reused or grit_id(fp) in xtb_ids, name)
 
     def test_no_duplicate_xtb_ids(self):
@@ -251,7 +308,7 @@ class TestCaptionsUi(unittest.TestCase):
             'chrome/android/java/src/org/chromium/chrome/browser/tark_captions/'
             'TarkCaptionBarCoordinator.java'))
         self.assertNotIn('requestDownload(mWebContents, /* now= */ true)', bar)
-        self.assertRegex(bar, r'unitState\s*==\s*TarkCaptionsBridge\.UNIT_WAITING_FOR_WIFI')
+        self.assertRegex(bar, r'[uU]nitState[^;]*==\s*TarkCaptionsBridge\.UNIT_WAITING_FOR_WIFI')
 
     def test_bar_updates_views_only_when_they_change(self):
         bar = '\n'.join(added_lines(
@@ -261,10 +318,40 @@ class TestCaptionsUi(unittest.TestCase):
         self.assertIn('setTextIfChanged', bar)
         self.assertNotRegex(bar, r'm(Final|Draft|Download\w*|LanguageChip)Text?\.setText\(')
 
-    def test_bar_has_no_translate_in_phase1(self):
-        bar = '\n'.join(added_lines('captions-ui.patch', 'chrome/android/java/res/layout/tark_caption_bar.xml'))
-        self.assertIn('tark_captions_chip', bar)
-        self.assertNotIn('translate', bar.lower())
+    BAR = 'chrome/android/java/res/layout/tark_caption_bar.xml'
+    COORDINATOR = ('chrome/android/java/src/org/chromium/chrome/browser/tark_captions/'
+                   'TarkCaptionBarCoordinator.java')
+
+    def test_bar_has_translate_chip(self):
+        bar = '\n'.join(added_lines('captions-ui.patch', self.BAR))
+        self.assertIn('tark_captions_translate', bar)
+        self.assertIn('tark_captions_target', bar)
+        # The translation sits in the caption box, larger than the original.
+        box = bar[bar.index('@+id/tark_captions_box'):bar.index('@+id/tark_captions_download"')]
+        self.assertIn('@+id/tark_captions_translation', box)
+        final = box[box.index('tark_captions_final'):]
+        self.assertIn('TextSmall', final[:final.index('/>')])
+        translation = box[box.index('tark_captions_translation'):]
+        self.assertIn('TextLarge', translation[:translation.index('/>')])
+
+    def test_translate_strings(self):
+        names = dict(self.messages())
+        self.assertEqual(names['IDS_TARK_CAPTIONS_TRANSLATE'], 'Translate')
+        self.assertTrue(names['IDS_TARK_CAPTIONS_TARGET_CHIP'].startswith('→ <ph name="LANGUAGE">%1$s'))
+        self.assertIn('Getting translation ready', names['IDS_TARK_CAPTIONS_GETTING_TRANSLATION_READY'])
+        self.assertIn('Translation', names['IDS_TARK_CAPTIONS_TRANSLATION_MODEL'])
+
+    def test_translation_text_set_only_when_changed(self):
+        bar = '\n'.join(added_lines('captions-ui.patch', self.COORDINATOR))
+        self.assertIn('mTranslationText', bar)
+        self.assertNotIn('mTranslationText.setText(', bar)
+
+    def test_settings_lists_translation_models(self):
+        settings = '\n'.join(added_lines(
+            'captions-ui.patch',
+            'chrome/browser/tark_captions_android/android/java/src/org/chromium/chrome/browser/'
+            'tark_captions/TarkLiveCaptionsSettings.java'))
+        self.assertIn('tark_captions_translation_model', settings)
 
     def test_connects_row_names_model_downloads(self):
         rows = '\n'.join(added_lines('captions-ui.patch', 'chrome/android/java/res/xml/privacy_preferences.xml'))

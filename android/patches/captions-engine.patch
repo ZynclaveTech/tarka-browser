@@ -10,7 +10,7 @@
        "//sandbox:sandbox_unittests",
 --- /dev/null
 +++ b/components/tark_captions/BUILD.gn
-@@ -0,0 +1,199 @@
+@@ -0,0 +1,208 @@
 +# Copyright 2026 The Tark Authors
 +# Use of this source code is governed by a BSD-style license that can be
 +# found in the LICENSE file.
@@ -168,7 +168,7 @@
 +}
 +
 +# Tark for Android: the engine's audio front end, speech model, segmenter,
-+# VAD and ONNX Runtime loader, built for the build machine with only what
++# VAD, ONNX Runtime loader and translation, built for the build machine with only what
 +# they compile against (android/build.sh runs them). Tests that need ONNX
 +# Runtime or the models skip without TARK_CAPTIONS_ORT / _MODELS.
 +if (!is_android) {
@@ -177,6 +177,10 @@
 +      "asr_model.cc",
 +      "asr_model.h",
 +      "asr_model_unittest.cc",
++      "english_text.cc",
++      "english_text.h",
++      "indic_text.cc",
++      "indic_text.h",
 +      "mel_frontend.cc",
 +      "mel_frontend.h",
 +      "mel_frontend_unittest.cc",
@@ -189,6 +193,9 @@
 +      "segmenter.cc",
 +      "segmenter.h",
 +      "segmenter_unittest.cc",
++      "translation_engine.cc",
++      "translation_engine.h",
++      "translation_engine_unittest.cc",
 +      "vad.cc",
 +      "vad.h",
 +    ]
@@ -199,7 +206,9 @@
 +      "//base/test:run_all_unittests",
 +      "//base/test:test_support",
 +      "//testing/gtest",
++      "//third_party/icu",
 +      "//third_party/pffft",
++      "//third_party/sentencepiece",
 +    ]
 +  }
 +}
@@ -9209,7 +9218,7 @@
 +}  // namespace tark_captions
 --- /dev/null
 +++ b/components/tark_captions/test_util.cc
-@@ -0,0 +1,128 @@
+@@ -0,0 +1,144 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -9221,7 +9230,9 @@
 +#include <utility>
 +
 +#include "base/environment.h"
++#include "base/files/file_enumerator.h"
 +#include "base/files/file_util.h"
++#include "components/tark_captions/model_source.h"
 +#include "base/json/json_reader.h"
 +#include "base/strings/cstring_view.h"
 +
@@ -9321,6 +9332,10 @@
 +  return ReadList(testdata.Append("mt_golden.json"), "cases");
 +}
 +
++base::ListValue EsMtGoldenCases(const base::FilePath& testdata) {
++  return ReadList(testdata.Append("es_mt_golden.json"), "cases");
++}
++
 +base::ListValue LidGoldenCases(const base::FilePath& testdata) {
 +  return ReadList(testdata.Append("lid_golden.json"), "cases");
 +}
@@ -9337,10 +9352,20 @@
 +  return std::move(value->GetDict());
 +}
 +
++std::unique_ptr<ModelSource> MappedFilesSourceFor(const base::FilePath& dir) {
++  std::map<std::string, base::File> files;
++  base::FileEnumerator it(dir, /*recursive=*/false, base::FileEnumerator::FILES);
++  for (base::FilePath path = it.Next(); !path.empty(); path = it.Next()) {
++    files.emplace(path.BaseName().MaybeAsASCII(),
++                  base::File(path, base::File::FLAG_OPEN | base::File::FLAG_READ));
++  }
++  return std::make_unique<MappedFilesSource>(std::move(files));
++}
++
 +}  // namespace tark_captions::test
 --- /dev/null
 +++ b/components/tark_captions/test_util.h
-@@ -0,0 +1,42 @@
+@@ -0,0 +1,54 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -9348,11 +9373,16 @@
 +#ifndef COMPONENTS_TARK_CAPTIONS_TEST_UTIL_H_
 +#define COMPONENTS_TARK_CAPTIONS_TEST_UTIL_H_
 +
++#include <memory>
 +#include <optional>
 +#include <vector>
 +
 +#include "base/files/file_path.h"
 +#include "base/values.h"
++
++namespace tark_captions {
++class ModelSource;
++}  // namespace tark_captions
 +
 +namespace tark_captions::test {
 +
@@ -9372,6 +9402,9 @@
 +// TESTDATA/mt_golden.json's "cases" list (utils/indictrans_export.py
 +// golden): per caption, every stage of the reference translation pipeline.
 +base::ListValue MtGoldenCases(const base::FilePath& testdata);
++// es_mt_golden.json's "cases" (utils/marian_export.py golden): Spanish
++// captions, the int8 model's ids and the English it gives.
++base::ListValue EsMtGoldenCases(const base::FilePath& testdata);
 +// lid_golden.json's cases: a clip, its language and the scores the language
 +// detector must give its first seconds (utils/lid_export.py golden).
 +base::ListValue LidGoldenCases(const base::FilePath& testdata);
@@ -9380,12 +9413,16 @@
 +// classes over the code point "ranges" ("classes"). Empty if unreadable.
 +base::DictValue EnMtGolden(const base::FilePath& testdata);
 +
++// Every file in `dir` opened read-only, as the Android captions process gets
++// them (by handle, no paths).
++std::unique_ptr<ModelSource> MappedFilesSourceFor(const base::FilePath& dir);
++
 +}  // namespace tark_captions::test
 +
 +#endif  // COMPONENTS_TARK_CAPTIONS_TEST_UTIL_H_
 --- /dev/null
 +++ b/components/tark_captions/translation_engine.cc
-@@ -0,0 +1,348 @@
+@@ -0,0 +1,445 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -9404,6 +9441,7 @@
 +#include "base/strings/utf_string_conversions.h"
 +#include "components/tark_captions/english_text.h"
 +#include "components/tark_captions/indic_text.h"
++#include "components/tark_captions/model_source.h"
 +#include "components/tark_captions/ort_runtime.h"
 +#include "third_party/sentencepiece/src/src/sentencepiece_processor.h"
 +
@@ -9413,7 +9451,6 @@
 +constexpr int kThreads = 2;
 +// IndicTrans2's model_max_length: 255 tokens and </s>.
 +constexpr size_t kMaxSourceTokens = 255;
-+constexpr int kMaxSteps = 256;
 +constexpr char kEnglishTag[] = "eng_Latn";
 +
 +const char* FloresTag(Language language) {
@@ -9441,19 +9478,49 @@
 +  }
 +}
 +
-+std::optional<base::DictValue> ReadJsonDict(const base::FilePath& file) {
-+  std::string json;
-+  if (!base::ReadFileToString(file, &json)) {
++std::optional<base::DictValue> ReadJsonDict(const ModelSource& source, std::string_view name) {
++  std::optional<base::span<const uint8_t>> bytes = source.Read(name);
++  if (!bytes) {
 +    return std::nullopt;
 +  }
-+  std::optional<base::Value> value = base::JSONReader::Read(json, base::JSON_PARSE_RFC);
++  std::optional<base::Value> value =
++      base::JSONReader::Read(base::as_string_view(*bytes), base::JSON_PARSE_RFC);
 +  if (!value || !value->is_dict()) {
 +    return std::nullopt;
 +  }
 +  return std::move(*value).TakeDict();
 +}
 +
++bool IsIndianCode(std::string_view code) {
++  return code == "hi" || code == "ta" || code == "bn";
++}
++
 +}  // namespace
++
++std::vector<TranslationDirection> DirectionsFor(std::string_view source_code, Target target) {
++  using D = TranslationDirection;
++  if (target == Target::kNone) {
++    return {};
++  }
++  const bool to_english = target == Target::kEnglish;
++  if (IsIndianCode(source_code)) {
++    if (to_english) {
++      return {D::kIndicToEnglish};
++    }
++    if (IndianLanguage(target) == LanguageFromCode(source_code)) {
++      return {};
++    }
++    return {D::kIndicToEnglish, D::kEnglishToIndic};
++  }
++  if (source_code == "en") {
++    return to_english ? std::vector<D>{} : std::vector<D>{D::kEnglishToIndic};
++  }
++  if (source_code == "es") {
++    return to_english ? std::vector<D>{D::kSpanishToEnglish}
++                      : std::vector<D>{D::kSpanishToEnglish, D::kEnglishToIndic};
++  }
++  return {};
++}
 +
 +std::optional<Target> TargetFromCode(std::string_view code) {
 +  if (code.empty()) {
@@ -9477,17 +9544,21 @@
 +// One translation direction: tokenizer, vocabularies and the two models.
 +class TranslationEngine::Direction {
 + public:
-+  static std::unique_ptr<Direction> Load(OrtRuntime* runtime, const base::FilePath& dir) {
++  // config.json, dict.SRC.json, dict.TGT.json, model.SRC (SentencePiece),
++  // encoder.int8.onnx and decoder_step.int8.onnx, from `source`.
++  static std::unique_ptr<Direction> Load(OrtRuntime* runtime, const ModelSource& source) {
 +    auto d = base::WrapUnique(new Direction());
-+    std::optional<base::DictValue> config = ReadJsonDict(dir.Append("config.json"));
-+    std::optional<base::DictValue> src = ReadJsonDict(dir.Append("dict.SRC.json"));
-+    std::optional<base::DictValue> tgt = ReadJsonDict(dir.Append("dict.TGT.json"));
-+    std::string spm;
-+    if (!config || !src || !tgt || !base::ReadFileToString(dir.Append("model.SRC"), &spm) ||
-+        !d->spm_.LoadFromSerializedProto(spm).ok()) {
-+      LOG(ERROR) << "Tark translation: model files missing in " << dir;
++    std::optional<base::DictValue> config = ReadJsonDict(source, "config.json");
++    std::optional<base::DictValue> src = ReadJsonDict(source, "dict.SRC.json");
++    std::optional<base::DictValue> tgt = ReadJsonDict(source, "dict.TGT.json");
++    std::optional<base::span<const uint8_t>> spm = source.Read("model.SRC");
++    if (!config || !src || !tgt || !spm ||
++        !d->spm_.LoadFromSerializedProto(base::as_string_view(*spm)).ok()) {
++      LOG(ERROR) << "Tark translation: model files missing";
 +      return nullptr;
 +    }
++    // IndicTrans2 starts the source with its language tags; opus-mt has none.
++    d->language_tags_ = config->FindBool("language_tags").value_or(true);
 +    std::optional<int> layers = config->FindInt("decoder_layers");
 +    std::optional<int> heads = config->FindInt("decoder_attention_heads");
 +    std::optional<int> dim = config->FindInt("decoder_embed_dim");
@@ -9525,10 +9596,10 @@
 +    }
 +    d->unk_ = unk->second;
 +    d->end_ = end->second;
-+    d->encoder_ = runtime->LoadModel(dir.Append("encoder.int8.onnx"), kThreads);
-+    d->decoder_ = runtime->LoadModel(dir.Append("decoder_step.int8.onnx"), kThreads);
++    d->encoder_ = runtime->LoadModel(source, "encoder.int8.onnx", kThreads);
++    d->decoder_ = runtime->LoadModel(source, "decoder_step.int8.onnx", kThreads);
 +    if (!d->encoder_ || !d->decoder_) {
-+      LOG(ERROR) << "Tark translation: models not loaded from " << dir;
++      LOG(ERROR) << "Tark translation: models not loaded";
 +      return nullptr;
 +    }
 +    return d;
@@ -9539,7 +9610,10 @@
 +  std::vector<int64_t> Encode(std::string_view src_tag,
 +                              std::string_view tgt_tag,
 +                              std::string_view body) const {
-+    std::vector<std::string> pieces = {std::string(src_tag), std::string(tgt_tag)};
++    std::vector<std::string> pieces;
++    if (language_tags_) {
++      pieces = {std::string(src_tag), std::string(tgt_tag)};
++    }
 +    std::vector<std::string> body_pieces;
 +    if (spm_.Encode(body, &body_pieces).ok()) {
 +      pieces.insert(pieces.end(), body_pieces.begin(), body_pieces.end());
@@ -9576,7 +9650,7 @@
 +    };
 +    std::vector<int64_t> out;
 +    std::vector<Tensor> step_out;
-+    for (int step = 0; step < kMaxSteps; ++step) {
++    for (int step = 0; step < kMaxOutputTokens; ++step) {
 +      inputs[1].i64[0] = step;
 +      if (!decoder_->Run(inputs, {"logits", "new_k", "new_v"}, &step_out) ||
 +          step_out[0].f32.empty()) {
@@ -9630,36 +9704,58 @@
 +  int64_t eos_ = 0;
 +  int64_t unk_ = 0;
 +  int64_t end_ = 0;
++  bool language_tags_ = true;
 +};
 +
 +// static
 +std::unique_ptr<TranslationEngine> TranslationEngine::Create(const base::FilePath& models_dir,
 +                                                             const base::FilePath& ort_dylib) {
-+  std::unique_ptr<OrtRuntime> runtime = OrtRuntime::Load(ort_dylib);
++  std::map<TranslationDirection, std::unique_ptr<ModelSource>> sources;
++  sources[TranslationDirection::kIndicToEnglish] =
++      std::make_unique<DirectorySource>(models_dir.Append("it2_indic_en"));
++  sources[TranslationDirection::kEnglishToIndic] =
++      std::make_unique<DirectorySource>(models_dir.Append("it2_en_indic"));
++  sources[TranslationDirection::kSpanishToEnglish] =
++      std::make_unique<DirectorySource>(models_dir.Append("opus_es_en"));
++  return Create(OrtRuntime::Load(ort_dylib), std::move(sources));
++}
++
++// static
++std::unique_ptr<TranslationEngine> TranslationEngine::Create(
++    std::unique_ptr<OrtRuntime> runtime,
++    std::map<TranslationDirection, std::unique_ptr<ModelSource>> sources) {
 +  if (!runtime) {
 +    return nullptr;
 +  }
-+  return base::WrapUnique(new TranslationEngine(std::move(runtime), models_dir));
++  return base::WrapUnique(new TranslationEngine(std::move(runtime), std::move(sources)));
 +}
 +
-+TranslationEngine::TranslationEngine(std::unique_ptr<OrtRuntime> runtime,
-+                                     const base::FilePath& models_dir)
-+    : runtime_(std::move(runtime)), models_dir_(models_dir) {}
++TranslationEngine::TranslationEngine(
++    std::unique_ptr<OrtRuntime> runtime,
++    std::map<TranslationDirection, std::unique_ptr<ModelSource>> sources)
++    : runtime_(std::move(runtime)), sources_(std::move(sources)) {}
 +
 +TranslationEngine::~TranslationEngine() {
 +  // The models before the runtime that loaded them.
-+  to_english_.reset();
-+  from_english_.reset();
++  loaded_.clear();
 +}
 +
-+TranslationEngine::Direction* TranslationEngine::Get(bool to_english) {
-+  std::unique_ptr<Direction>& direction = to_english ? to_english_ : from_english_;
-+  if (!direction) {
-+    // Not remembered when missing: the models may arrive later.
-+    direction = Direction::Load(runtime_.get(),
-+                                models_dir_.Append(to_english ? "it2_indic_en" : "it2_en_indic"));
++TranslationEngine::Direction* TranslationEngine::Get(TranslationDirection direction) {
++  auto loaded = loaded_.find(direction);
++  if (loaded != loaded_.end()) {
++    return loaded->second.get();
 +  }
-+  return direction.get();
++  auto source = sources_.find(direction);
++  if (source == sources_.end()) {
++    return nullptr;
++  }
++  // Not remembered when missing: the models may arrive later.
++  std::unique_ptr<Direction> d = Direction::Load(runtime_.get(), *source->second);
++  Direction* raw = d.get();
++  if (d) {
++    loaded_[direction] = std::move(d);
++  }
++  return raw;
 +}
 +
 +std::optional<std::string> TranslationEngine::Translate(std::string_view caption,
@@ -9670,7 +9766,7 @@
 +  if (target == Target::kNone || indian_target == source) {
 +    return std::string();
 +  }
-+  Direction* to_english = Get(/*to_english=*/true);
++  Direction* to_english = Get(TranslationDirection::kIndicToEnglish);
 +  if (!to_english) {
 +    return std::nullopt;
 +  }
@@ -9695,8 +9791,46 @@
 +                    trace ? &trace->pivot_out_ids : nullptr);
 +}
 +
++std::optional<std::string> TranslationEngine::TranslateFrom(std::string_view caption,
++                                                            std::string_view source_code,
++                                                            Target target,
++                                                            TranslationTrace* trace) {
++  if (base::TrimWhitespaceASCII(caption, base::TRIM_ALL).empty() ||
++      DirectionsFor(source_code, target).empty()) {
++    return std::string();
++  }
++  if (IsIndianCode(source_code)) {
++    return Translate(caption, *LanguageFromCode(source_code), target, trace);
++  }
++  if (source_code == "en") {
++    return TranslateEnglish(caption, target, trace);
++  }
++  // Spanish: opus-mt into English, then (an Indian target) English → Indian.
++  Direction* spanish = Get(TranslationDirection::kSpanishToEnglish);
++  if (!spanish) {
++    return std::nullopt;
++  }
++  const std::vector<int64_t> src_ids = spanish->Encode("", "", caption);
++  std::optional<std::vector<int64_t>> out_ids = spanish->Greedy(src_ids);
++  if (!out_ids) {
++    return std::nullopt;
++  }
++  if (trace) {
++    trace->src_ids = src_ids;
++    trace->out_ids = *out_ids;
++  }
++  const std::string english = spanish->Decode(*out_ids);
++  const std::optional<Language> indian_target = IndianLanguage(target);
++  if (!indian_target) {
++    return english;
++  }
++  return IntoIndian(EnglishModelInput(english), *indian_target,
++                    trace ? &trace->pivot_src_ids : nullptr,
++                    trace ? &trace->pivot_out_ids : nullptr);
++}
++
 +int TranslationEngine::LoadedDirectionsForTesting() const {
-+  return (to_english_ ? 1 : 0) + (from_english_ ? 1 : 0);
++  return static_cast<int>(loaded_.size());
 +}
 +
 +std::optional<std::string> TranslationEngine::TranslateEnglish(std::string_view text,
@@ -9714,7 +9848,7 @@
 +                                                         Language target,
 +                                                         std::vector<int64_t>* src_ids,
 +                                                         std::vector<int64_t>* out_ids) {
-+  Direction* from_english = Get(/*to_english=*/false);
++  Direction* from_english = Get(TranslationDirection::kEnglishToIndic);
 +  if (!from_english) {
 +    return std::nullopt;
 +  }
@@ -9736,7 +9870,7 @@
 +}  // namespace tark_captions
 --- /dev/null
 +++ b/components/tark_captions/translation_engine.h
-@@ -0,0 +1,91 @@
+@@ -0,0 +1,120 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -9745,6 +9879,7 @@
 +#define COMPONENTS_TARK_CAPTIONS_TRANSLATION_ENGINE_H_
 +
 +#include <cstdint>
++#include <map>
 +#include <memory>
 +#include <optional>
 +#include <string>
@@ -9756,6 +9891,7 @@
 +
 +namespace tark_captions {
 +
++class ModelSource;
 +class OrtRuntime;
 +
 +// What a caption is translated into (D4 Phase 2). English is the default;
@@ -9764,6 +9900,19 @@
 +
 +// "" (none), "en", "hi", "ta" or "bn".
 +std::optional<Target> TargetFromCode(std::string_view code);
++
++// One model: IndicTrans2 Indian → English and English → Indian (200M
++// distilled), and opus-mt Spanish → English (Tark for Android).
++enum class TranslationDirection { kIndicToEnglish, kEnglishToIndic, kSpanishToEnglish };
++
++// The models a caption in `source_code` ("hi", "ta", "bn", "en", "es")
++// passes through into `target`, in order: Indian and Spanish targets go
++// through English. Empty when nothing is translated (no target, the same
++// language, a source with no model).
++std::vector<TranslationDirection> DirectionsFor(std::string_view source_code, Target target);
++
++// A translation stops after this many tokens (a caption is a few seconds).
++inline constexpr int kMaxOutputTokens = 128;
 +
 +// The model's token ids, for tests: the first hop (to English) and, for an
 +// Indian target, the second.
@@ -9784,6 +9933,12 @@
 +  // Null if ONNX Runtime is missing; a missing model shows up in Translate().
 +  static std::unique_ptr<TranslationEngine> Create(const base::FilePath& models_dir,
 +                                                   const base::FilePath& ort_dylib);
++  // Tark for Android: each direction's files by handle (the sandboxed
++  // captions process opens nothing). A direction without a source fails
++  // in Translate(). Null if `runtime` is.
++  static std::unique_ptr<TranslationEngine> Create(
++      std::unique_ptr<OrtRuntime> runtime,
++      std::map<TranslationDirection, std::unique_ptr<ModelSource>> sources);
 +
 +  TranslationEngine(const TranslationEngine&) = delete;
 +  TranslationEngine& operator=(const TranslationEngine&) = delete;
@@ -9804,14 +9959,23 @@
 +                                              Target target,
 +                                              TranslationTrace* trace = nullptr);
 +
++  // `caption` in `source_code` ("hi", "ta", "bn", "en", "es") into
++  // `target` (DirectionsFor): "" when nothing is translated or the caption
++  // is blank, nullopt when a model it needs is missing or fails.
++  std::optional<std::string> TranslateFrom(std::string_view caption,
++                                           std::string_view source_code,
++                                           Target target,
++                                           TranslationTrace* trace = nullptr);
++
 +  int LoadedDirectionsForTesting() const;
 +
 + private:
 +  class Direction;
 +
-+  TranslationEngine(std::unique_ptr<OrtRuntime> runtime, const base::FilePath& models_dir);
++  TranslationEngine(std::unique_ptr<OrtRuntime> runtime,
++                    std::map<TranslationDirection, std::unique_ptr<ModelSource>> sources);
 +  // Loads the direction on first use; null if its files are missing or bad.
-+  Direction* Get(bool to_english);
++  Direction* Get(TranslationDirection direction);
 +  // English model input (tokens) into `target`; the ids go to `src_ids` and
 +  // `out_ids` when given.
 +  std::optional<std::string> IntoIndian(std::string_view model_input,
@@ -9820,9 +9984,8 @@
 +                                        std::vector<int64_t>* out_ids);
 +
 +  std::unique_ptr<OrtRuntime> runtime_;
-+  const base::FilePath models_dir_;
-+  std::unique_ptr<Direction> to_english_;
-+  std::unique_ptr<Direction> from_english_;
++  std::map<TranslationDirection, std::unique_ptr<ModelSource>> sources_;
++  std::map<TranslationDirection, std::unique_ptr<Direction>> loaded_;
 +};
 +
 +}  // namespace tark_captions
@@ -9830,18 +9993,22 @@
 +#endif  // COMPONENTS_TARK_CAPTIONS_TRANSLATION_ENGINE_H_
 --- /dev/null
 +++ b/components/tark_captions/translation_engine_unittest.cc
-@@ -0,0 +1,177 @@
+@@ -0,0 +1,258 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
 +
 +#include "components/tark_captions/translation_engine.h"
 +
++#include <map>
++#include <memory>
 +#include <string>
 +#include <vector>
 +
 +#include "base/files/file_util.h"
 +#include "base/files/scoped_temp_dir.h"
++#include "components/tark_captions/model_source.h"
++#include "components/tark_captions/ort_runtime.h"
 +#include "components/tark_captions/test_util.h"
 +#include "testing/gtest/include/gtest/gtest.h"
 +
@@ -9992,6 +10159,83 @@
 +  std::unique_ptr<TranslationEngine> engine = TranslationEngine::Create(dir.GetPath(), ort_);
 +  ASSERT_TRUE(engine);
 +  EXPECT_EQ(engine->Translate("नमस्ते", Language::kHindi, Target::kEnglish), std::nullopt);
++}
++
++// Every Indian pair, and Spanish into an Indian language, goes through
++// English (the spike: Tamil → Hindi chrF 47.0 through English, 43.1 direct).
++TEST(TranslationEngineNoRuntimeTest, DirectionsForPivotsThroughEnglish) {
++  using D = TranslationDirection;
++  EXPECT_EQ(DirectionsFor("ta", Target::kHindi),
++            (std::vector<D>{D::kIndicToEnglish, D::kEnglishToIndic}));
++  EXPECT_EQ(DirectionsFor("es", Target::kTamil),
++            (std::vector<D>{D::kSpanishToEnglish, D::kEnglishToIndic}));
++  EXPECT_EQ(DirectionsFor("es", Target::kEnglish), (std::vector<D>{D::kSpanishToEnglish}));
++  EXPECT_EQ(DirectionsFor("en", Target::kHindi), (std::vector<D>{D::kEnglishToIndic}));
++  EXPECT_EQ(DirectionsFor("hi", Target::kEnglish), (std::vector<D>{D::kIndicToEnglish}));
++  EXPECT_TRUE(DirectionsFor("en", Target::kEnglish).empty());
++  EXPECT_TRUE(DirectionsFor("hi", Target::kHindi).empty());
++  EXPECT_TRUE(DirectionsFor("hi", Target::kNone).empty());
++  EXPECT_TRUE(DirectionsFor("fr", Target::kEnglish).empty());  // not a source
++}
++
++// Loaded from handles (the Android captions process), a direction gives
++// the same ids as from its folder (the Mac).
++TEST_F(TranslationEngineTest, SourcesMatchPaths) {
++  std::map<TranslationDirection, std::unique_ptr<ModelSource>> sources;
++  sources[TranslationDirection::kIndicToEnglish] =
++      test::MappedFilesSourceFor(models_.Append("it2_indic_en"));
++  sources[TranslationDirection::kEnglishToIndic] =
++      test::MappedFilesSourceFor(models_.Append("it2_en_indic"));
++  std::unique_ptr<TranslationEngine> mapped =
++      TranslationEngine::Create(OrtRuntime::Load(ort_), std::move(sources));
++  ASSERT_TRUE(mapped);
++  for (const base::Value& v : cases_) {
++    const base::DictValue& c = v.GetDict();
++    TranslationTrace from_paths, from_sources;
++    engine_->Translate(*c.FindString("caption"), *LanguageFromCode(*c.FindString("lang")),
++                       Target::kHindi, &from_paths);
++    mapped->TranslateFrom(*c.FindString("caption"), *c.FindString("lang"), Target::kHindi,
++                          &from_sources);
++    EXPECT_EQ(from_sources.out_ids, from_paths.out_ids) << *c.FindString("id");
++    EXPECT_EQ(from_sources.pivot_out_ids, from_paths.pivot_out_ids) << *c.FindString("id");
++  }
++}
++
++// opus-mt-es-en, exported into the same layout (utils/marian_export.py).
++TEST_F(TranslationEngineTest, SpanishMatchesReference) {
++  std::map<TranslationDirection, std::unique_ptr<ModelSource>> sources;
++  sources[TranslationDirection::kSpanishToEnglish] =
++      test::MappedFilesSourceFor(models_.Append("opus_es_en"));
++  std::unique_ptr<TranslationEngine> spanish =
++      TranslationEngine::Create(OrtRuntime::Load(ort_), std::move(sources));
++  ASSERT_TRUE(spanish);
++  int checked = 0;
++  for (const base::Value& v : test::EsMtGoldenCases(*test::TestDataDir())) {
++    const base::DictValue& c = v.GetDict();
++    TranslationTrace trace;
++    std::optional<std::string> english =
++        spanish->TranslateFrom(*c.FindString("caption"), "es", Target::kEnglish, &trace);
++    EXPECT_EQ(trace.out_ids, Ids(c.FindList("out_ids"))) << *c.FindString("id");
++    EXPECT_EQ(english, *c.FindString("translation")) << *c.FindString("id");
++    ++checked;
++  }
++  EXPECT_GE(checked, 3);
++}
++
++TEST_F(TranslationEngineTest, LongInputStopsAtTheCap) {
++  std::string caption;
++  for (int i = 0; i < 60; ++i) {
++    caption += "नमस्ते दुनिया ";
++  }
++  TranslationTrace trace;
++  engine_->Translate(caption, Language::kHindi, Target::kEnglish, &trace);
++  EXPECT_LE(trace.out_ids.size(), static_cast<size_t>(kMaxOutputTokens));
++}
++
++TEST_F(TranslationEngineTest, EmptyTranslationShowsNothing) {
++  EXPECT_EQ(engine_->TranslateFrom("", "hi", Target::kEnglish), std::string());
++  EXPECT_EQ(engine_->TranslateFrom("   ", "es", Target::kHindi), std::string());
++  EXPECT_EQ(engine_->LoadedDirectionsForTesting(), 0);  // nothing loaded for it
 +}
 +
 +TEST(TranslationEngineNoRuntimeTest, CreateFailsWithoutRuntime) {
