@@ -94,7 +94,7 @@
 +</shape>
 --- /dev/null
 +++ b/chrome/android/java/res/layout/tark_caption_bar.xml
-@@ -0,0 +1,131 @@
+@@ -0,0 +1,164 @@
 +<?xml version="1.0" encoding="utf-8"?>
 +<!-- Copyright 2026 The Tark Authors
 +     Use of this source code is governed by a BSD-style license that can be
@@ -128,6 +128,14 @@
 +            android:id="@+id/tark_captions_draft"
 +            android:layout_width="match_parent"
 +            android:layout_height="wrap_content"
++            android:textAppearance="@style/TextAppearance.TextLarge.Primary" />
++        <!-- Translate on: the translation, larger, beneath the original. -->
++        <TextView
++            android:id="@+id/tark_captions_translation"
++            android:layout_width="match_parent"
++            android:layout_height="wrap_content"
++            android:layout_marginTop="4dp"
++            android:visibility="gone"
 +            android:textAppearance="@style/TextAppearance.TextLarge.Primary" />
 +    </LinearLayout>
 +
@@ -202,6 +210,19 @@
 +            android:text="@string/tark_captions_chip"
 +            android:textAppearance="@style/TextAppearance.TextMedium.Primary" />
 +        <TextView
++            android:id="@+id/tark_captions_translate"
++            android:layout_width="wrap_content"
++            android:layout_height="wrap_content"
++            android:layout_marginEnd="6dp"
++            android:background="@drawable/tark_caption_chip"
++            android:minHeight="36dp"
++            android:gravity="center"
++            android:paddingStart="12dp"
++            android:paddingEnd="12dp"
++            android:text="@string/tark_captions_translate"
++            android:visibility="gone"
++            android:textAppearance="@style/TextAppearance.TextMedium.Primary" />
++        <TextView
 +            android:id="@+id/tark_captions_language"
 +            android:layout_width="wrap_content"
 +            android:layout_height="wrap_content"
@@ -210,6 +231,18 @@
 +            android:gravity="center"
 +            android:paddingStart="12dp"
 +            android:paddingEnd="12dp"
++            android:textAppearance="@style/TextAppearance.TextMedium.Primary" />
++        <TextView
++            android:id="@+id/tark_captions_target"
++            android:layout_width="wrap_content"
++            android:layout_height="wrap_content"
++            android:layout_marginStart="6dp"
++            android:background="@drawable/tark_caption_chip"
++            android:minHeight="36dp"
++            android:gravity="center"
++            android:paddingStart="12dp"
++            android:paddingEnd="12dp"
++            android:visibility="gone"
 +            android:textAppearance="@style/TextAppearance.TextMedium.Primary" />
 +        <View
 +            android:layout_width="0dp"
@@ -279,7 +312,7 @@
              mBottomContainer = null;
 --- /dev/null
 +++ b/chrome/android/java/src/org/chromium/chrome/browser/tark_captions/TarkCaptionBarCoordinator.java
-@@ -0,0 +1,217 @@
+@@ -0,0 +1,300 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -322,9 +355,12 @@
 +    private final View mBar;
 +    private final TextView mCaptionsChip;
 +    private final TextView mLanguageChip;
++    private final TextView mTranslateChip;
++    private final TextView mTargetChip;
 +    private final View mCaptionBox;
 +    private final TextView mFinalText;
 +    private final TextView mDraftText;
++    private final TextView mTranslationText;
 +    private final View mDownloadCard;
 +    private final TextView mDownloadTitle;
 +    private final ProgressBar mDownloadProgress;
@@ -351,6 +387,9 @@
 +        mCaptionBox = mBar.findViewById(R.id.tark_captions_box);
 +        mFinalText = mBar.findViewById(R.id.tark_captions_final);
 +        mDraftText = mBar.findViewById(R.id.tark_captions_draft);
++        mTranslateChip = mBar.findViewById(R.id.tark_captions_translate);
++        mTargetChip = mBar.findViewById(R.id.tark_captions_target);
++        mTranslationText = mBar.findViewById(R.id.tark_captions_translation);
 +        mDownloadCard = mBar.findViewById(R.id.tark_captions_download);
 +        mDownloadTitle = mBar.findViewById(R.id.tark_captions_download_title);
 +        mDownloadProgress = mBar.findViewById(R.id.tark_captions_download_progress);
@@ -364,6 +403,14 @@
 +                            mWebContents, !TarkCaptionsBridge.getState(mWebContents).captionsOn);
 +                });
 +        mLanguageChip.setOnClickListener(this::showLanguages);
++        mTranslateChip.setOnClickListener(
++                v -> {
++                    if (mWebContents == null) return;
++                    TarkCaptionsBridge.State state = TarkCaptionsBridge.getState(mWebContents);
++                    TarkCaptionsBridge.setTarget(
++                            mWebContents, state.target.isEmpty() ? firstTarget(state) : "");
++                });
++        mTargetChip.setOnClickListener(this::showTargets);
 +        mBar.findViewById(R.id.tark_captions_close)
 +                .setOnClickListener(
 +                        v -> {
@@ -375,7 +422,7 @@
 +                    // Only "Download now" agrees to mobile data; "Try again" retries as
 +                    // before (on Wi-Fi unless the person already said now).
 +                    boolean now =
-+                            TarkCaptionsBridge.getState(mWebContents).unitState
++                            cardUnitState(TarkCaptionsBridge.getState(mWebContents))
 +                                    == TarkCaptionsBridge.UNIT_WAITING_FOR_WIFI;
 +                    TarkCaptionsBridge.requestDownload(mWebContents, now);
 +                });
@@ -421,6 +468,40 @@
 +        menu.show();
 +    }
 +
++    // Translate's first target: English, or Hindi for English captions.
++    private static String firstTarget(TarkCaptionsBridge.State state) {
++        return state.language.equals("en") ? "hi" : "en";
++    }
++
++    private void showTargets(View anchor) {
++        if (mWebContents == null) return;
++        WebContents webContents = mWebContents;
++        String language = TarkCaptionsBridge.getState(webContents).language;
++        PopupMenu menu = new PopupMenu(mActivity, anchor);
++        for (int i = 0; i < TarkCaptionsBridge.TARGETS.length; i++) {
++            if (TarkCaptionsBridge.TARGETS[i].equals(language)) continue;
++            menu.getMenu().add(0, i, i, languageName(TarkCaptionsBridge.TARGETS[i]));
++        }
++        menu.setOnMenuItemClickListener(
++                item -> {
++                    TarkCaptionsBridge.setTarget(
++                            webContents, TarkCaptionsBridge.TARGETS[item.getItemId()]);
++                    return true;
++                });
++        menu.show();
++    }
++
++    // The language is here but its translation is not: the card shows that.
++    private static boolean translationPending(TarkCaptionsBridge.State state) {
++        return state.unitState == TarkCaptionsBridge.UNIT_READY
++                && !state.target.isEmpty()
++                && state.translationUnitState != TarkCaptionsBridge.UNIT_READY;
++    }
++
++    private static int cardUnitState(TarkCaptionsBridge.State state) {
++        return translationPending(state) ? state.translationUnitState : state.unitState;
++    }
++
 +    private void render() {
 +        if (mWebContents == null || mWebContents.isDestroyed()) {
 +            mBar.setVisibility(View.GONE);
@@ -436,26 +517,45 @@
 +                mActivity.getString(
 +                        R.string.tark_captions_language_chip, languageName(state.language)));
 +
++        mTranslateChip.setVisibility(state.translateAvailable ? View.VISIBLE : View.GONE);
++        mTranslateChip.setSelected(!state.target.isEmpty());
++        mTargetChip.setVisibility(
++                state.translateAvailable && !state.target.isEmpty() ? View.VISIBLE : View.GONE);
++        if (!state.target.isEmpty()) {
++            setTextIfChanged(
++                    mTargetChip,
++                    mActivity.getString(
++                            R.string.tark_captions_target_chip, languageName(state.target)));
++        }
++
 +        boolean ready = state.unitState == TarkCaptionsBridge.UNIT_READY;
-+        mDownloadCard.setVisibility(state.captionsOn && !ready ? View.VISIBLE : View.GONE);
++        boolean pending = translationPending(state);
++        // Captions run untranslated while the translation downloads.
++        mDownloadCard.setVisibility(
++                state.captionsOn && (!ready || pending) ? View.VISIBLE : View.GONE);
 +        mCaptionBox.setVisibility(state.captionsOn && ready ? View.VISIBLE : View.GONE);
-+        if (state.captionsOn && !ready) renderDownload(state);
++        if (state.captionsOn && (!ready || pending)) renderDownload(state, pending);
 +        if (state.captionsOn && ready) renderCaptions(state);
 +    }
 +
-+    private void renderDownload(TarkCaptionsBridge.State state) {
++    private void renderDownload(TarkCaptionsBridge.State state, boolean translation) {
++        long total = translation ? state.translationTotal : state.total;
++        long bytes = translation ? state.translationBytes : state.bytes;
++        String size = Formatter.formatShortFileSize(mActivity, total);
 +        setTextIfChanged(
 +                mDownloadTitle,
-+                mActivity.getString(
-+                        R.string.tark_captions_getting_ready,
-+                        languageName(state.language),
-+                        Formatter.formatShortFileSize(mActivity, state.total)));
++                translation
++                        ? mActivity.getString(
++                                R.string.tark_captions_getting_translation_ready, size)
++                        : mActivity.getString(
++                                R.string.tark_captions_getting_ready,
++                                languageName(state.language),
++                                size));
 +        mDownloadProgress.setMax(1000);
-+        mDownloadProgress.setProgress(
-+                state.total > 0 ? (int) (1000 * state.bytes / state.total) : 0);
++        mDownloadProgress.setProgress(total > 0 ? (int) (1000 * bytes / total) : 0);
 +        int line = R.string.tark_captions_on_this_phone;
 +        int action = 0;
-+        switch (state.unitState) {
++        switch (cardUnitState(state)) {
 +            case TarkCaptionsBridge.UNIT_WAITING_FOR_WIFI:
 +                line = R.string.tark_captions_waiting_for_wifi;
 +                action = R.string.tark_captions_download_now;
@@ -474,6 +574,10 @@
 +    }
 +
 +    private void renderCaptions(TarkCaptionsBridge.State state) {
++        if (state.cantCaption || (state.finalText.isEmpty() && state.draftText.isEmpty())) {
++            mTranslationText.setVisibility(View.GONE);
++            mDraftText.setVisibility(View.VISIBLE);
++        }
 +        if (state.cantCaption) {
 +            setTextIfChanged(mFinalText, "");
 +            setTextIfChanged(mDraftText, mActivity.getString(R.string.tark_captions_cant_caption));
@@ -484,6 +588,18 @@
 +            setTextIfChanged(mDraftText, mActivity.getString(R.string.tark_captions_listening));
 +            return;
 +        }
++        boolean translated = !state.translationText.isEmpty();
++        // Translate: the original small, its translation larger beneath it (word by word, the
++        // translation of the last sentence while the next one is drafted).
++        mTranslationText.setVisibility(translated ? View.VISIBLE : View.GONE);
++        setTextIfChanged(mTranslationText, state.translationText);
++        if (translated && state.draftText.isEmpty()) {
++            setTextIfChanged(mFinalText, state.finalText);
++            setTextIfChanged(mDraftText, "");
++            mDraftText.setVisibility(View.GONE);
++            return;
++        }
++        mDraftText.setVisibility(View.VISIBLE);
 +        // Word by word: the last final line above what is being said; a phrase at a time: the
 +        // last phrase.
 +        setTextIfChanged(mFinalText, state.draftText.isEmpty() ? "" : state.finalText);
@@ -641,7 +757,7 @@
 +}
 --- /dev/null
 +++ b/chrome/browser/tark_captions_android/android/java/src/org/chromium/chrome/browser/tark_captions/TarkCaptionsBridge.java
-@@ -0,0 +1,175 @@
+@@ -0,0 +1,203 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -681,6 +797,8 @@
 +
 +    /** The languages of Phase 1, in the chip's order. */
 +    public static final String[] LANGUAGES = {"hi", "ta", "en", "es"};
++    /** Translate's targets. */
++    public static final String[] TARGETS = {"en", "hi", "ta"};
 +
 +    /** What the caption bar shows for a tab. */
 +    public static final class State {
@@ -694,10 +812,19 @@
 +        public final boolean phrase;
 +        public final String finalText;
 +        public final String draftText;
++        // Translate.
++        public final boolean translateAvailable;
++        public final String target; // "" off
++        public final int translationUnitState;
++        public final long translationBytes;
++        public final long translationTotal;
++        public final String translationText;
 +
 +        State(boolean barVisible, boolean captionsOn, String language, int unitState, long bytes,
 +                long total, boolean cantCaption, boolean phrase, String finalText,
-+                String draftText) {
++                String draftText, boolean translateAvailable, String target,
++                int translationUnitState, long translationBytes, long translationTotal,
++                String translationText) {
 +            this.barVisible = barVisible;
 +            this.captionsOn = captionsOn;
 +            this.language = language;
@@ -708,6 +835,12 @@
 +            this.phrase = phrase;
 +            this.finalText = finalText;
 +            this.draftText = draftText;
++            this.translateAvailable = translateAvailable;
++            this.target = target;
++            this.translationUnitState = translationUnitState;
++            this.translationBytes = translationBytes;
++            this.translationTotal = translationTotal;
++            this.translationText = translationText;
 +        }
 +    }
 +
@@ -738,6 +871,11 @@
 +
 +    public static void chooseLanguage(WebContents webContents, String language) {
 +        TarkCaptionsBridgeJni.get().chooseLanguage(webContents, language);
++    }
++
++    /** Translate's target ("" turns it off). */
++    public static void setTarget(WebContents webContents, String target) {
++        TarkCaptionsBridgeJni.get().setTarget(webContents, target);
 +    }
 +
 +    /** "Download now" (mobile data), or try a failed download again. */
@@ -780,9 +918,13 @@
 +    private static State createState(boolean barVisible, boolean captionsOn,
 +            @JniType("std::string") String language, int unitState, long bytes, long total,
 +            boolean cantCaption, boolean phrase, @JniType("std::string") String finalText,
-+            @JniType("std::string") String draftText) {
++            @JniType("std::string") String draftText, boolean translateAvailable,
++            @JniType("std::string") String target, int translationUnitState,
++            long translationBytes, long translationTotal,
++            @JniType("std::string") String translationText) {
 +        return new State(barVisible, captionsOn, language, unitState, bytes, total, cantCaption,
-+                phrase, finalText, draftText);
++                phrase, finalText, draftText, translateAvailable, target, translationUnitState,
++                translationBytes, translationTotal, translationText);
 +    }
 +
 +    @CalledByNative
@@ -797,6 +939,8 @@
 +        void setCaptionsOn(WebContents webContents, boolean on);
 +
 +        void chooseLanguage(WebContents webContents, @JniType("std::string") String language);
++
++        void setTarget(WebContents webContents, @JniType("std::string") String target);
 +
 +        void requestDownload(WebContents webContents, boolean now);
 +
@@ -819,7 +963,7 @@
 +}
 --- /dev/null
 +++ b/chrome/browser/tark_captions_android/android/java/src/org/chromium/chrome/browser/tark_captions/TarkLiveCaptionsSettings.java
-@@ -0,0 +1,123 @@
+@@ -0,0 +1,142 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -914,7 +1058,7 @@
 +        }
 +        for (int i = 0; i < codes.length; i++) {
 +            final String code = codes[i];
-+            final String name = new Locale(code).getDisplayLanguage();
++            final String name = unitName(code);
 +            Preference row = new Preference(getStyledContext());
 +            row.setTitle(name);
 +            row.setSummary(Formatter.formatShortFileSize(getStyledContext(), sizes[i]));
@@ -942,10 +1086,29 @@
 +    private android.content.Context getStyledContext() {
 +        return getPreferenceManager().getContext();
 +    }
++
++    // A language's name, or a translation model's ("Translation: Spanish → English").
++    private String unitName(String code) {
++        int direction = 0;
++        switch (code) {
++            case "tr_indic_en":
++                direction = R.string.tark_captions_direction_indic_en;
++                break;
++            case "tr_en_indic":
++                direction = R.string.tark_captions_direction_en_indic;
++                break;
++            case "tr_es_en":
++                direction = R.string.tark_captions_direction_es_en;
++                break;
++            default:
++                return new Locale(code).getDisplayLanguage();
++        }
++        return getString(R.string.tark_captions_translation_model, getString(direction));
++    }
 +}
 --- a/chrome/browser/ui/android/strings/android_chrome_strings.grd
 +++ b/chrome/browser/ui/android/strings/android_chrome_strings.grd
-@@ -844,6 +844,75 @@
+@@ -844,6 +844,96 @@
        <message name="IDS_TARK_XLIT_NO_THANKS" desc="Tark: button in the Indian-language suggestions dialog: do not download, and stop offering. [CHAR_LIMIT=24]">
          No thanks
        </message>
@@ -975,6 +1138,27 @@
 +      </message>
 +      <message name="IDS_TARK_CAPTIONS_TRY_AGAIN" desc="Tark: button that tries a failed captions download again. [CHAR_LIMIT=24]">
 +        Try again
++      </message>
++      <message name="IDS_TARK_CAPTIONS_TRANSLATE" desc="Tark: chip on the caption bar that turns translation of the captions on or off. [CHAR_LIMIT=16]">
++        Translate
++      </message>
++      <message name="IDS_TARK_CAPTIONS_TARGET_CHIP" desc="Tark: the caption bar's button for the language captions are translated into, which opens a list. LANGUAGE is a language name, such as English.">
++        → <ph name="LANGUAGE">%1$s<ex>English</ex></ph>
++      </message>
++      <message name="IDS_TARK_CAPTIONS_GETTING_TRANSLATION_READY" desc="Tark: shown while the translation models download, the first time a translation is turned on. SIZE is the download's size, such as 221 MB.">
++        Getting translation ready · <ph name="SIZE">%1$s<ex>221 MB</ex></ph>
++      </message>
++      <message name="IDS_TARK_CAPTIONS_TRANSLATION_MODEL" desc="Tark: a translation model in Settings › Live captions › On this phone. DIRECTION says what it translates, such as Spanish → English.">
++        Translation: <ph name="DIRECTION">%1$s<ex>Spanish → English</ex></ph>
++      </message>
++      <message name="IDS_TARK_CAPTIONS_DIRECTION_INDIC_EN" desc="Tark: what a translation model translates: Indian languages (Hindi, Tamil) into English.">
++        Indian languages → English
++      </message>
++      <message name="IDS_TARK_CAPTIONS_DIRECTION_EN_INDIC" desc="Tark: what a translation model translates: English into Indian languages (Hindi, Tamil).">
++        English → Indian languages
++      </message>
++      <message name="IDS_TARK_CAPTIONS_DIRECTION_ES_EN" desc="Tark: what a translation model translates: Spanish into English.">
++        Spanish → English
 +      </message>
 +      <message name="IDS_TARK_CAPTIONS_CANT_CAPTION" desc="Tark: shown in place of captions when the video's sound cannot reach Tark's captions (some streams play outside the page).">
 +        Tark can't caption this video
@@ -1023,7 +1207,7 @@
        </message>
 --- a/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb
 +++ b/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb
-@@ -1,6 +1,25 @@
+@@ -1,6 +1,31 @@
  <?xml version="1.0" ?>
  <!DOCTYPE translationbundle>
  <translationbundle lang="hi">
@@ -1046,6 +1230,12 @@
 +<translation id="8267084811767025180">अभी कोई नहीं। भाषा डाउनलोड करने के लिए किसी वीडियो पर कैप्शन चालू करें।</translation>
 +<translation id="3191958327489813178"><ph name="LANGUAGE" /> के कैप्शन इस फ़ोन से हटाएँ?</translation>
 +<translation id="1167145792047177103">लाइव कैप्शन के मॉडल, जब आप कैप्शन चालू करते हैं तब डाउनलोड होते हैं (gettarka.com)</translation>
++<translation id="567211582816327627">→ <ph name="LANGUAGE" /></translation>
++<translation id="4631874985997924612">अनुवाद तैयार हो रहा है · <ph name="SIZE" /></translation>
++<translation id="8719712412643450199">अनुवाद: <ph name="DIRECTION" /></translation>
++<translation id="195340938105802143">भारतीय भाषाएँ → अंग्रेज़ी</translation>
++<translation id="7368609417442888023">अंग्रेज़ी → भारतीय भाषाएँ</translation>
++<translation id="5215809917020953564">स्पैनिश → अंग्रेज़ी</translation>
  <translation id="1007349221964075684">खुली हुई गुप्त विंडो देखने के लिए, स्क्रीन लॉक का इस्तेमाल करें</translation>
  <translation id="1010283278930414892">इस डिवाइस में कोई पासवर्ड सेव नहीं है</translation>
  <translation id="1011749477052068769">यहां मूव करें</translation>

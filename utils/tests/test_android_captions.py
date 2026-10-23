@@ -287,7 +287,8 @@ class TestCaptionsUi(unittest.TestCase):
         for name, en in self.messages():
             fp = re.sub(r'<ph name="([A-Z_]+)">.*?</ph>', lambda m: m.group(1), en)
             reused = name in ('IDS_TARK_CAPTIONS_WAITING_FOR_WIFI', 'IDS_TARK_CAPTIONS_DOWNLOAD_NOW',
-                              'IDS_TARK_CAPTIONS_TRY_AGAIN', 'IDS_TARK_CAPTIONS_STYLE_AUTOMATIC')
+                              'IDS_TARK_CAPTIONS_TRY_AGAIN', 'IDS_TARK_CAPTIONS_STYLE_AUTOMATIC',
+                              'IDS_TARK_CAPTIONS_TRANSLATE')
             self.assertTrue(reused or grit_id(fp) in xtb_ids, name)
 
     def test_no_duplicate_xtb_ids(self):
@@ -307,7 +308,7 @@ class TestCaptionsUi(unittest.TestCase):
             'chrome/android/java/src/org/chromium/chrome/browser/tark_captions/'
             'TarkCaptionBarCoordinator.java'))
         self.assertNotIn('requestDownload(mWebContents, /* now= */ true)', bar)
-        self.assertRegex(bar, r'unitState\s*==\s*TarkCaptionsBridge\.UNIT_WAITING_FOR_WIFI')
+        self.assertRegex(bar, r'[uU]nitState[^;]*==\s*TarkCaptionsBridge\.UNIT_WAITING_FOR_WIFI')
 
     def test_bar_updates_views_only_when_they_change(self):
         bar = '\n'.join(added_lines(
@@ -317,10 +318,40 @@ class TestCaptionsUi(unittest.TestCase):
         self.assertIn('setTextIfChanged', bar)
         self.assertNotRegex(bar, r'm(Final|Draft|Download\w*|LanguageChip)Text?\.setText\(')
 
-    def test_bar_has_no_translate_in_phase1(self):
-        bar = '\n'.join(added_lines('captions-ui.patch', 'chrome/android/java/res/layout/tark_caption_bar.xml'))
-        self.assertIn('tark_captions_chip', bar)
-        self.assertNotIn('translate', bar.lower())
+    BAR = 'chrome/android/java/res/layout/tark_caption_bar.xml'
+    COORDINATOR = ('chrome/android/java/src/org/chromium/chrome/browser/tark_captions/'
+                   'TarkCaptionBarCoordinator.java')
+
+    def test_bar_has_translate_chip(self):
+        bar = '\n'.join(added_lines('captions-ui.patch', self.BAR))
+        self.assertIn('tark_captions_translate', bar)
+        self.assertIn('tark_captions_target', bar)
+        # The translation sits in the caption box, larger than the original.
+        box = bar[bar.index('@+id/tark_captions_box'):bar.index('@+id/tark_captions_download"')]
+        self.assertIn('@+id/tark_captions_translation', box)
+        final = box[box.index('tark_captions_final'):]
+        self.assertIn('TextSmall', final[:final.index('/>')])
+        translation = box[box.index('tark_captions_translation'):]
+        self.assertIn('TextLarge', translation[:translation.index('/>')])
+
+    def test_translate_strings(self):
+        names = dict(self.messages())
+        self.assertEqual(names['IDS_TARK_CAPTIONS_TRANSLATE'], 'Translate')
+        self.assertTrue(names['IDS_TARK_CAPTIONS_TARGET_CHIP'].startswith('→ <ph name="LANGUAGE">%1$s'))
+        self.assertIn('Getting translation ready', names['IDS_TARK_CAPTIONS_GETTING_TRANSLATION_READY'])
+        self.assertIn('Translation', names['IDS_TARK_CAPTIONS_TRANSLATION_MODEL'])
+
+    def test_translation_text_set_only_when_changed(self):
+        bar = '\n'.join(added_lines('captions-ui.patch', self.COORDINATOR))
+        self.assertIn('mTranslationText', bar)
+        self.assertNotIn('mTranslationText.setText(', bar)
+
+    def test_settings_lists_translation_models(self):
+        settings = '\n'.join(added_lines(
+            'captions-ui.patch',
+            'chrome/browser/tark_captions_android/android/java/src/org/chromium/chrome/browser/'
+            'tark_captions/TarkLiveCaptionsSettings.java'))
+        self.assertIn('tark_captions_translation_model', settings)
 
     def test_connects_row_names_model_downloads(self):
         rows = '\n'.join(added_lines('captions-ui.patch', 'chrome/android/java/res/xml/privacy_preferences.xml'))
