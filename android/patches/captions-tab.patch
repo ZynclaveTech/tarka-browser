@@ -204,7 +204,7 @@
 +#endif  // CHROME_BROWSER_TARK_CAPTIONS_ANDROID_ANDROID_TARK_CAPTIONS_BRIDGE_H_
 --- /dev/null
 +++ b/chrome/browser/tark_captions_android/tark_captions_tab.cc
-@@ -0,0 +1,583 @@
+@@ -0,0 +1,598 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -357,12 +357,27 @@
 +    return;
 +  }
 +  g_browser_process->local_state()->SetString(kLanguagePref, language);
-+  CancelDownload();               // the language moved away from
-+  CancelTranslationDownloads();   // and its translation models
++  const std::string old_language = logic_.state().language;
++  const std::vector<std::string> old_units = TranslationUnits();
 +  StopEngine();  // a new language is a new model
 +  final_text_.clear();
 +  draft_text_.clear();
++  translation_text_.clear();  // the old pair's
 +  logic_.ChooseLanguage(language);
++  // Only now cancel what the old language needed: a cancel notifies at once,
++  // and while the old language was current OnUnitChanged would ask for it
++  // again. Units the new pair shares are kept.
++  CaptionDownloads& downloads = CaptionDownloads::Get();
++  if (downloads.State(old_language).state != CaptionDownloads::State::kReady) {
++    downloads.Cancel(old_language);
++  }
++  const std::vector<std::string> new_units = TranslationUnits();
++  for (const std::string& unit : old_units) {
++    if (!std::ranges::contains(new_units, unit) &&
++        downloads.State(unit).state != CaptionDownloads::State::kReady) {
++      downloads.Cancel(unit);
++    }
++  }
 +  logic_.OnUnitReady(UnitReady(), base::TimeTicks::Now());
 +  if (logic_.state().captions_on && !UnitReady()) {
 +    CaptionDownloads::Get().Request(language, /*now=*/false);
