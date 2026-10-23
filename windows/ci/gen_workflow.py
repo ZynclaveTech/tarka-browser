@@ -17,6 +17,11 @@ with resume_run (the failed run's id) and resume_stage (the stage that
 failed). That stage takes the tree the stage before it handed on (kept
 3 days), applies windows/ci/resume.patch to it if there is one (the fix,
 since build.py --ci does not re-patch a tree it is handed), and builds on.
+
+The finishing stage keeps Tark (the zip and installer) and the test programs
+as artifacts, and a separate job checks them (windows/ci/verify.ps1). Run the
+workflow by hand with verify_run (a finished run's id) to check that run's
+build again, with changed checks, without building.
 """
 
 import pathlib
@@ -46,6 +51,10 @@ on:
         description: The stage to resume at, with the tree the stage before it handed on
         type: number
         default: 1
+      verify_run:
+        description: Only check this finished run's build again (its id); builds nothing
+        type: string
+        default: ''
   push:
     branches:
       - feat/w2-windows-parity
@@ -63,6 +72,7 @@ concurrency:
 jobs:
   onnxruntime:
     name: ONNX Runtime (static C runtime)
+    if: ${{{{ inputs.verify_run == '' }}}}
     runs-on: windows-2022
     timeout-minutes: 300
     steps:
@@ -175,16 +185,27 @@ STAGE = '''
           path: C:\\tw\\build\\Tark-*
           compression-level: 0
           retention-days: 14
-      - name: Check the build
+      - name: Gather the test programs
         if: steps.build.outputs.finished == 'true'
         shell: pwsh
-        run: windows\\ci\\verify.ps1 -Work C:\\tw -Report C:\\tw\\verify
-      - name: Upload the checks
-        if: always() && steps.build.outputs.finished == 'true'
+        run: |
+          # The unit tests, what they load, and their symbols, so the checks
+          # can run again later without a build (verify_run).
+          $out = 'C:\\tw\\build\\src\\out\\Default'
+          $kit = 'C:\\tw\\tests'
+          New-Item -ItemType Directory -Force $kit | Out-Null
+          foreach ($f in 'tark_captions_unittests.exe', 'tark_speech_unittests.exe', 'icudtl.dat', 'onnxruntime.dll') {{
+            Copy-Item "$out\\$f" $kit
+          }}
+          Get-ChildItem "$out\\tark_*_unittests*.pdb" -ErrorAction SilentlyContinue | Copy-Item -Destination $kit
+          Get-ChildItem "$out\\*.dll" | Where-Object Name -ne 'chrome.dll' | Copy-Item -Destination $kit
+          Get-ChildItem $kit | Format-Table Name, Length -AutoSize | Out-String -Width 200
+      - name: Keep the test programs
+        if: steps.build.outputs.finished == 'true'
         uses: {upload}
         with:
-          name: tark-windows-checks
-          path: C:\\tw\\verify
+          name: tark-windows-tests
+          path: C:\\tw\\tests
           retention-days: 14
 '''
 
@@ -222,7 +243,7 @@ COMPLETE = '''
   complete:
     name: Finished
     needs: [{needs}]
-    if: always()
+    if: ${{{{ always() && inputs.verify_run == '' }}}}
     runs-on: ubuntu-24.04
     steps:
       - name: A stage finished the build
@@ -233,6 +254,45 @@ COMPLETE = '''
             echo "No stage finished the build."
             exit 1
           fi
+
+  verify:
+    name: Check the build
+    needs: [complete]
+    if: ${{{{ !cancelled() && (needs.complete.result == 'success' || inputs.verify_run != '') }}}}
+    runs-on: windows-2022
+    timeout-minutes: 90
+    steps:
+      - name: Line endings as committed
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.eol lf
+      - uses: {checkout}
+        with:
+          persist-credentials: false
+      - name: Tark for Windows
+        uses: {download}
+        with:
+          name: tark-windows-x64
+          path: C:\\tw\\build
+          run-id: ${{{{ inputs.verify_run || github.run_id }}}}
+          github-token: ${{{{ github.token }}}}
+      - name: The test programs
+        uses: {download}
+        with:
+          name: tark-windows-tests
+          path: C:\\tw\\tests
+          run-id: ${{{{ inputs.verify_run || github.run_id }}}}
+          github-token: ${{{{ github.token }}}}
+      - name: Check the build
+        shell: pwsh
+        run: windows\\ci\\verify.ps1 -Work C:\\tw -Tests C:\\tw\\tests -Report C:\\tw\\verify
+      - name: Upload the checks
+        if: always()
+        uses: {upload}
+        with:
+          name: tark-windows-checks
+          path: C:\\tw\\verify
+          retention-days: 14
 '''
 
 
@@ -252,7 +312,8 @@ def main():
         text += STAGE.format(n=n, needs=prev, cond=cond, resume=resume, checkout=CHECKOUT,
                              hours='3.5',
                              setup_python=SETUP_PYTHON, download=DOWNLOAD, upload=UPLOAD)
-    text += COMPLETE.format(needs=', '.join(f'build-{n}' for n in range(1, STAGES + 1)))
+    text += COMPLETE.format(needs=', '.join(f'build-{n}' for n in range(1, STAGES + 1)),
+                            checkout=CHECKOUT, download=DOWNLOAD, upload=UPLOAD)
     out = pathlib.Path(__file__).resolve().parents[2] / '.github' / 'workflows' / 'windows.yml'
     out.write_text(text, encoding='utf-8')
     print(f'wrote {out}')

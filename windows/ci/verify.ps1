@@ -8,36 +8,112 @@
 # app holds; Tark rendering a page headless; and, best effort, a picture of
 # the real window. Exits non-zero when a check fails, after running them all.
 #
-#   windows\ci\verify.ps1 -Work C:\tw -Report C:\tw\verify
+# A test program that fails before any test runs is probed: listing its
+# tests, one test in one process, the same without strict handle checking,
+# and that one test under cdb (stack and the code around the stop), so one
+# run says why. Tark itself runs from its zip, as people get it.
+#
+#   windows\ci\verify.ps1 -Work C:\tw -Tests C:\tw\tests -Report C:\tw\verify
+#
+# WORK\build holds Tark-*.zip and Tark-*-setup.exe; TESTS the unit test
+# programs with what they load (the build's "Gather the test programs").
 
-param([Parameter(Mandatory)][string]$Work, [Parameter(Mandatory)][string]$Report)
+param(
+  [Parameter(Mandatory)][string]$Work,
+  [Parameter(Mandatory)][string]$Tests,
+  [Parameter(Mandatory)][string]$Report
+)
 $ErrorActionPreference = 'Stop'
-$out = "$Work\build\src\out\Default"
 New-Item -ItemType Directory -Force $Report | Out-Null
 $failed = [System.Collections.Generic.List[string]]::new()
+
+function Note([string]$Line) { $Line | Tee-Object -Append "$Report\summary.txt" }
 
 function Check([string]$Name, [scriptblock]$Body) {
   try {
     & $Body
-    "PASS $Name" | Tee-Object -Append "$Report\summary.txt"
+    Note "PASS $Name"
   } catch {
     $failed.Add($Name)
-    "FAIL $Name : $_" | Tee-Object -Append "$Report\summary.txt"
+    Note "FAIL $Name : $_"
   }
 }
 
-function Run-Test([string]$Exe, [string]$Log, [string[]]$Arguments) {
-  $p = Start-Process -FilePath "$out\$Exe" -ArgumentList $Arguments -NoNewWindow -Wait -PassThru `
+# Runs FILE with ARGS (one string, quoted by the caller), its output in
+# REPORT\LOG.txt and LOG.err.txt; returns the exit code, or 'timeout'.
+function Invoke-Logged([string]$File, [string]$Arguments, [string]$Log, [int]$Seconds = 600) {
+  $p = Start-Process -FilePath $File -ArgumentList $Arguments -NoNewWindow -PassThru `
     -RedirectStandardOutput "$Report\$Log.txt" -RedirectStandardError "$Report\$Log.err.txt"
-  if ($p.ExitCode -ne 0) { throw "$Exe exited $($p.ExitCode)" }
+  $null = $p.Handle  # Keeps the exit code readable after the process ends.
+  if (-not $p.WaitForExit($Seconds * 1000)) {
+    Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+    return 'timeout'
+  }
+  return $p.ExitCode
 }
+
+function Format-Code($Code) {
+  if ($Code -is [int]) { return '{0} (0x{1:X8})' -f $Code, $Code }
+  return "$Code"
+}
+
+# Why a test program stops before its tests: each probe's exit code goes to
+# REPORT\probe-TAG.txt, and cdb's view of the stop to TAG-cdb.txt.
+function Probe-TestProgram([string]$Exe, [string]$Tag, [string]$OneTest) {
+  $path = "$Tests\$Exe"
+  $one = "--single-process-tests --gtest_filter=$OneTest"
+  $probes = [ordered]@{
+    'list'              = '--gtest_list_tests'
+    'one'               = $one
+    'one-no-handle-check' = "$one --disable-strict-handle-checking-for-testing"
+  }
+  foreach ($name in $probes.Keys) {
+    $code = Invoke-Logged $path $probes[$name] "$Tag-$name" 120
+    "$name : $($probes[$name]) -> $(Format-Code $code)" | Out-File -Append "$Report\probe-$Tag.txt"
+  }
+  $cdb = "${env:ProgramFiles(x86)}\Windows Kits\10\Debuggers\x64\cdb.exe"
+  if (-not (Test-Path $cdb)) {
+    'cdb: not installed on this runner' | Out-File -Append "$Report\probe-$Tag.txt"
+    return
+  }
+  # At a breakpoint (a failed CHECK) or an access violation: the stack, what
+  # happened, and the instructions before the stop (symbol_level=0 has names,
+  # not lines, so the call just before the int3 says which CHECK).
+  @(
+    'sxe -c "kn 40; .lastevent; r; ub @rip L40; u @rip L6; q" bpe'
+    'sxe -c "kn 40; .lastevent; r; ub @rip L40; q" av'
+    'g'
+    'q'
+  ) | Out-File -Encoding ascii "$Report\cdb-commands.txt"
+  $code = Invoke-Logged $cdb ("-G -y `"$Tests`" -cf `"$Report\cdb-commands.txt`" `"$path`" $one") "$Tag-cdb" 300
+  "cdb : $one -> $(Format-Code $code)" | Out-File -Append "$Report\probe-$Tag.txt"
+}
+
+function Run-TestProgram([string]$Exe, [string]$Log, [string]$Arguments) {
+  $code = Invoke-Logged "$Tests\$Exe" $Arguments $Log
+  if ($code -ne 0) { throw "$Exe exited $(Format-Code $code)" }
+}
+
+Get-ChildItem $Tests | Format-Table Name, Length -AutoSize | Out-String -Width 200 |
+  Out-File "$Report\tests-folder.txt"
+[System.Environment]::OSVersion.VersionString | Out-File "$Report\runner.txt"
 
 # Unit tests that need no models (those that do skip themselves).
 Check 'tark_captions_unittests' {
-  Run-Test 'tark_captions_unittests.exe' 'captions' @("--gtest_output=xml:$Report\captions.xml")
+  try {
+    Run-TestProgram 'tark_captions_unittests.exe' 'captions' "--gtest_output=xml:`"$Report\captions.xml`""
+  } catch {
+    Probe-TestProgram 'tark_captions_unittests.exe' 'captions' 'RenderQueueTest.OneRequestInFlight'
+    throw
+  }
 }
 Check 'tark_speech_unittests' {
-  Run-Test 'tark_speech_unittests.exe' 'speech' @("--gtest_output=xml:$Report\speech.xml")
+  try {
+    Run-TestProgram 'tark_speech_unittests.exe' 'speech' "--gtest_output=xml:`"$Report\speech.xml`""
+  } catch {
+    Probe-TestProgram 'tark_speech_unittests.exe' 'speech' 'TarkCaptionRecognizerTest.ErrorWhenEngineMissing'
+    throw
+  }
 }
 
 # Tark's own ONNX Runtime build runs a real model on Windows.
@@ -50,11 +126,11 @@ Check 'onnxruntime runs Silero VAD' {
   if ($hash -ne '1A153A22F4509E292A94E67D6F9B85E8DEB25B4988682B7E174C65279D8788E3') {
     throw "silero_vad.onnx has sha256 $hash"
   }
-  $env:TARK_CAPTIONS_ORT = "$out\onnxruntime.dll"
+  $env:TARK_CAPTIONS_ORT = "$Tests\onnxruntime.dll"
   $env:TARK_CAPTIONS_MODELS = $models
   try {
     # One process, so gtest's own summary is printed (the launcher prints its own).
-    Run-Test 'tark_captions_unittests.exe' 'onnxruntime' @('--gtest_filter=OrtRuntimeTest.*', '--single-process-tests')
+    Run-TestProgram 'tark_captions_unittests.exe' 'onnxruntime' '--gtest_filter=OrtRuntimeTest.* --single-process-tests'
     $text = Get-Content "$Report\onnxruntime.txt" -Raw
     if ($text -match '\[  SKIPPED \]') { throw 'an ONNX Runtime test was skipped' }
     if (-not ($text -match '\[  PASSED  \] (\d+) tests?') -or [int]$Matches[1] -lt 3) {
@@ -66,9 +142,9 @@ Check 'onnxruntime runs Silero VAD' {
 }
 
 # The zip holds Tark, ONNX Runtime and the transliteration model.
+$zip = Get-ChildItem "$Work\build\Tark-*.zip" | Select-Object -First 1
 Check 'package contents' {
   Add-Type -AssemblyName System.IO.Compression.FileSystem
-  $zip = Get-ChildItem "$Work\build\Tark-*.zip" | Select-Object -First 1
   if (-not $zip) { throw 'no Tark-*.zip' }
   $entries = [System.IO.Compression.ZipFile]::OpenRead($zip.FullName).Entries | ForEach-Object FullName
   $entries | Out-File "$Report\zip-contents.txt"
@@ -78,21 +154,34 @@ Check 'package contents' {
   if (-not (Get-ChildItem "$Work\build\Tark-*-setup.exe")) { throw 'no Tark-*-setup.exe' }
 }
 
-# Tark renders a page (headless, its own profile).
+# Tark as people get it: unpacked from the zip.
+$chrome = $null
+if ($zip) {
+  Expand-Archive $zip.FullName -DestinationPath "$Work\tark" -Force
+  $chrome = Get-ChildItem "$Work\tark" -Recurse -Filter chrome.exe | Select-Object -First 1 -ExpandProperty FullName
+}
+
+# Tark renders a page (headless, its own profile). Started with its output
+# in files: chrome.exe is a GUI program, so PowerShell's own call operator
+# gives no reliable output from it.
 Check 'headless page' {
+  if (-not $chrome) { throw 'no chrome.exe in the zip' }
   $userData = "$env:RUNNER_TEMP\tark-profile"
-  $dom = & "$out\chrome.exe" --headless=new --user-data-dir=$userData --no-first-run `
-    --dump-dom 'https://gettarka.com/' 2>$null
-  $dom | Out-File "$Report\gettarka-dom.html"
-  if (($dom -join "`n") -notmatch 'Live captions') { throw 'gettarka.com did not render' }
-  & "$out\chrome.exe" --headless=new --user-data-dir=$userData --no-first-run --window-size=1280,800 `
-    --screenshot="$Report\gettarka-headless.png" 'https://gettarka.com/' 2>$null | Out-Null
+  $code = Invoke-Logged $chrome ("--headless=new --user-data-dir=`"$userData`" --no-first-run " +
+    '--enable-logging=stderr --v=0 --dump-dom https://gettarka.com/') 'headless-dom' 120
+  $dom = Get-Content "$Report\headless-dom.txt" -Raw -ErrorAction SilentlyContinue
+  $null = Invoke-Logged $chrome ("--headless=new --user-data-dir=`"$userData`" --no-first-run " +
+    "--window-size=1280,800 --screenshot=`"$Report\gettarka-headless.png`" https://gettarka.com/") 'headless-shot' 120
+  if ("$dom" -notmatch 'Live captions') {
+    throw "gettarka.com did not render: exit $(Format-Code $code), $("$dom".Length) characters of page (headless-dom.err.txt has the log)"
+  }
 }
 
 # Best effort: the real window (frame, one row), if the runner has a desktop.
 try {
+  if (-not $chrome) { throw 'no chrome.exe in the zip' }
   Add-Type -AssemblyName System.Windows.Forms, System.Drawing
-  $p = Start-Process "$out\chrome.exe" -ArgumentList @("--user-data-dir=$env:RUNNER_TEMP\tark-window",
+  $p = Start-Process $chrome -ArgumentList @("--user-data-dir=`"$env:RUNNER_TEMP\tark-window`"",
     '--no-first-run', '--window-size=1280,800', '--window-position=0,0', 'https://gettarka.com/') -PassThru
   Start-Sleep -Seconds 12
   $bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
@@ -101,9 +190,9 @@ try {
   $bitmap.Save("$Report\window.png")
   Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
   Get-Process chrome -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-  'INFO window screenshot saved' | Tee-Object -Append "$Report\summary.txt"
+  Note 'INFO window screenshot saved'
 } catch {
-  "INFO no window screenshot: $_" | Tee-Object -Append "$Report\summary.txt"
+  Note "INFO no window screenshot: $_"
 }
 
 if ($failed.Count) {
