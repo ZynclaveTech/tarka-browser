@@ -6,6 +6,7 @@
 
     run.py MODELS_DIR TESTDATA_DIR [--serial emulator-5554] [CASES...]
         cases: bar listens download wifi caption tamper settings background
+               translate_hi_en translate_waits_for_wifi translate_off_unloads
 
 MODELS_DIR is android/captions/models.py build's output (the units and
 files.json); this Mac serves its files under their sha256 names, as
@@ -44,6 +45,8 @@ PAGE = '''<!doctype html><meta name="viewport" content="width=device-width">
 '''
 REQUESTS = []
 SERVER = {'tamper': False, 'files': {}, 'page': b'', 'wav': b''}
+TRANSLATION_SHAS = set()  # the tr_* units' files
+MT_GOLDEN = {}            # mt_golden.json's cases by id
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -111,6 +114,10 @@ def load(models_dir, testdata_dir):
         data = (models_dir / name).read_bytes()
         assert hashlib.sha256(data).hexdigest() == entry['sha256'], name
         SERVER['files'][entry['sha256']] = data
+        if entry['unit'].startswith('tr_'):
+            TRANSLATION_SHAS.add(entry['sha256'])
+    for case in json.loads((testdata_dir / 'mt_golden.json').read_text())['cases']:
+        MT_GOLDEN[case['id']] = case
     SERVER['page'] = PAGE.encode()
     SERVER['wav'] = (testdata_dir / 'hi_1.wav').read_bytes()
     golden = json.loads((testdata_dir / 'golden.json').read_text())
@@ -251,7 +258,58 @@ def case_background(dev):
     assert after == before, f'{after - before} captions while Tark was in the background'
 
 
-CASES = ['bar', 'listens', 'download', 'wifi', 'caption', 'tamper', 'settings', 'background']
+def translations(dev):
+    return [l.split('tark captions: translation ', 1)[1] for l in dev.log().splitlines()
+            if 'tark captions: translation ' in l]
+
+
+def translating(dev):
+    """Hindi captions with Translate on (English): the first translation."""
+    dev.fresh()
+    open_page_and_play(dev)
+    assert captions_on(dev), 'no Captions chip'
+    assert dev.logged('tark captions: engine started hi', 300), 'no captions process'
+    assert xlit.tap_text(dev, 'Translate', tries=3), 'no Translate chip'
+    assert dev.logged('tark captions: target en', 300), 'translation never set up'
+    assert dev.logged('tark captions: translation ', 90), 'no translation'
+
+
+def case_translate_hi_en(dev):
+    translating(dev)
+    end = time.time() + 60
+    while time.time() < end and len(translations(dev)) < 3:
+        time.sleep(3)
+    want = [w.strip('.,?!').lower() for w in MT_GOLDEN['hi_1']['english'].split()]
+    got = {w.strip('.,?!').lower() for t in translations(dev) for w in t.split()}
+    share = sum(w in got for w in want) / len(want)
+    assert share >= 0.5, f'{share:.0%} of {want} in {translations(dev)[:3]}'
+
+
+def case_translate_waits_for_wifi(dev):
+    dev.fresh()
+    open_page_and_play(dev)
+    assert captions_on(dev), 'no Captions chip'
+    assert dev.logged('tark captions: ready hi', 300), 'Hindi never became ready'
+    dev.shell('svc', 'wifi', 'disable')
+    time.sleep(3)
+    assert xlit.tap_text(dev, 'Translate', tries=3), 'no Translate chip'
+    time.sleep(6)
+    pause(dev)
+    screen = dev.screen()
+    assert 'Getting translation ready' in screen and 'Waiting for Wi-Fi' in screen, \
+        'no "Waiting for Wi-Fi" for the translation'
+    assert not any(r.lstrip('/').removesuffix('.bin') in TRANSLATION_SHAS for r in REQUESTS), \
+        'a translation model downloaded on mobile data'
+
+
+def case_translate_off_unloads(dev):
+    translating(dev)
+    assert xlit.tap_text(dev, 'Translate', tries=3), 'no Translate chip'
+    assert dev.logged('tark captions: target off', 20), 'translation not unloaded'
+
+
+CASES = ['bar', 'listens', 'download', 'wifi', 'caption', 'tamper', 'settings', 'background',
+         'translate_hi_en', 'translate_waits_for_wifi', 'translate_off_unloads']
 
 
 def main(argv=None):
