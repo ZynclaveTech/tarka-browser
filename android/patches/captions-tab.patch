@@ -194,7 +194,7 @@
 +#endif  // CHROME_BROWSER_TARK_CAPTIONS_ANDROID_ANDROID_TARK_CAPTIONS_BRIDGE_H_
 --- /dev/null
 +++ b/chrome/browser/tark_captions_android/tark_captions_tab.cc
-@@ -0,0 +1,369 @@
+@@ -0,0 +1,538 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -213,6 +213,7 @@
 +#include "chrome/browser/browser_process.h"
 +#include "chrome/browser/tark_captions_android/android/tark_captions_bridge.h"
 +#include "chrome/browser/tark_captions_android/model_files.h"
++#include "chrome/browser/tark_captions_android/tab_captions.h"
 +#include "components/prefs/pref_service.h"
 +#include "content/public/browser/render_frame_host.h"
 +#include "content/public/browser/service_process_host.h"
@@ -262,6 +263,27 @@
 +  return files;
 +}
 +
++// The translation units' files, keyed "<unit>/<name>", opened read-only.
++// Blocking.
++std::map<std::string, base::File> OpenTranslationUnits(
++    std::vector<std::pair<std::string, base::FilePath>> units) {
++  std::map<std::string, base::File> files;
++  for (const auto& [unit, dir] : units) {
++    for (const CaptionFile* file : FilesOf(unit)) {
++      base::File opened(dir.AppendASCII(file->name),
++                        base::File::FLAG_OPEN | base::File::FLAG_READ);
++      if (opened.IsValid()) {
++        files.emplace(unit + "/" + std::string(file->name), std::move(opened));
++      }
++    }
++  }
++  return files;
++}
++
++int RamMb() {
++  return static_cast<int>(base::SysInfo::AmountOfTotalPhysicalMemory().InMiB());
++}
++
 +}  // namespace
 +
 +TarkCaptionsTab::TarkCaptionsTab(content::WebContents* web_contents)
@@ -270,6 +292,7 @@
 +  PrefService* local_state = g_browser_process->local_state();
 +  const std::string language = local_state->GetString(kLanguagePref);
 +  logic_.ChooseLanguage(language.empty() ? kDefaultLanguage : language);
++  logic_.SetTarget(local_state->GetString(kTargetPref), base::TimeTicks::Now());
 +  CaptionDownloads::Get().AddObserver(this);
 +  switches_.set_disconnect_handler(base::BindRepeating([](mojo::RemoteSetElementId) {}));
 +  // A player's connection closing: captions may follow another one.
@@ -304,6 +327,9 @@
 +  }
 +  if (!on) {
 +    CancelDownload();
++    CancelTranslationDownloads();
++  } else {
++    RequestTranslation();
 +  }
 +  Update();
 +}
@@ -330,11 +356,68 @@
 +  if (logic_.state().captions_on && !UnitReady()) {
 +    CaptionDownloads::Get().Request(language, /*now=*/false);
 +  }
++  RequestTranslation();  // the new pair's models
 +  Update();
 +}
 +
++void TarkCaptionsTab::SetTarget(const std::string& target) {
++  if (target == logic_.state().target) {
++    return;
++  }
++  CancelTranslationDownloads();  // the old pair's, if unfinished
++  g_browser_process->local_state()->SetString(kTargetPref, target);
++  logic_.SetTarget(target, base::TimeTicks::Now());
++  translation_text_.clear();
++  if (!target.empty() && !logic_.state().captions_on) {
++    // Translate turns captions on: a translation needs a caption.
++    SetCaptionsOn(true);
++  }
++  RequestTranslation();
++  Update();
++}
++
++std::vector<std::string> TarkCaptionsTab::TranslationUnits() const {
++  if (!TranslateAvailable(RamMb(), logic_.state().language, logic_.state().target)) {
++    return {};
++  }
++  return TranslationUnitsFor(logic_.state().language, logic_.state().target);
++}
++
++bool TarkCaptionsTab::TranslationReady() const {
++  const std::vector<std::string> units = TranslationUnits();
++  return !units.empty() && std::ranges::all_of(units, [](const std::string& unit) {
++    return CaptionDownloads::Get().State(unit).state == CaptionDownloads::State::kReady;
++  });
++}
++
++void TarkCaptionsTab::RequestTranslation() {
++  if (!logic_.state().captions_on) {
++    return;
++  }
++  for (const std::string& unit : TranslationUnits()) {
++    if (CaptionDownloads::Get().State(unit).state != CaptionDownloads::State::kReady) {
++      CaptionDownloads::Get().Request(unit, /*now=*/false);
++    }
++  }
++}
++
++void TarkCaptionsTab::CancelTranslationDownloads() {
++  for (const std::string& unit : TranslationUnits()) {
++    if (CaptionDownloads::Get().State(unit).state != CaptionDownloads::State::kReady) {
++      CaptionDownloads::Get().Cancel(unit);
++    }
++  }
++}
++
 +void TarkCaptionsTab::RequestDownload(bool now) {
-+  CaptionDownloads::Get().Request(logic_.state().language, now);
++  // The card shows the translation models once the language is here.
++  if (UnitReady() && !logic_.state().target.empty() && !TranslationReady()) {
++    for (const std::string& unit : TranslationUnits()) {
++      CaptionDownloads::Get().Request(unit, now);
++    }
++  } else {
++    CaptionDownloads::Get().Request(logic_.state().language, now);
++  }
 +  Update();
 +}
 +
@@ -356,6 +439,17 @@
 +  view.phrase = style_ == Style::kPhrase;
 +  view.final_text = final_text_;
 +  view.draft_text = draft_text_;
++  view.translate_available = TranslateAvailable(RamMb(), state.language, "");
++  view.target = state.target;
++  view.translation_unit.state = CaptionDownloads::State::kReady;
++  for (const std::string& unit : TranslationUnits()) {
++    CaptionDownloads::UnitState unit_state = CaptionDownloads::Get().State(unit);
++    if (unit_state.state != CaptionDownloads::State::kReady) {
++      view.translation_unit = unit_state;
++      break;
++    }
++  }
++  view.translation_text = translation_text_;
 +  return view;
 +}
 +
@@ -406,7 +500,7 @@
 +    CaptionDownloads::Get().Request(unit, /*now=*/false);
 +    return;  // Request notifies again
 +  }
-+  if (unit == logic_.state().language || unit == "common") {
++  if (unit == logic_.state().language || unit == "common" || unit.starts_with("tr_")) {
 +    logic_.OnUnitReady(UnitReady(), base::TimeTicks::Now());
 +    Update();
 +  }
@@ -434,9 +528,11 @@
 +  switches_.Get(id)->SetOn(switches_on_);
 +}
 +
-+void TarkCaptionsTab::OnCaption(bool is_final, const std::string& text) {
++void TarkCaptionsTab::OnCaption(bool is_final, const std::string& text, uint32_t caption_id) {
 +  if (is_final) {
 +    final_text_ = text;
++    final_id_ = caption_id;
++    translation_text_.clear();  // until this caption's translation arrives
 +    draft_text_.clear();
 +    // What the person hears stays out of the log; android/captions/e2e/run.py
 +    // passes --tark-captions-log-text (a debuggable device's command line).
@@ -447,6 +543,19 @@
 +    }
 +  } else {
 +    draft_text_ = text;
++  }
++  NotifyCaptionBar(web_contents());
++}
++
++void TarkCaptionsTab::OnTranslation(uint32_t caption_id, const std::string& text) {
++  if (caption_id != final_id_) {
++    return;  // a later caption is already shown
++  }
++  translation_text_ = text;
++  if (base::CommandLine::ForCurrentProcess()->HasSwitch(kLogTextSwitch)) {
++    LOG(WARNING) << "tark captions: translation " << text;
++  } else {
++    LOG(WARNING) << "tark captions: translation (" << text.size() << " bytes)";
 +  }
 +  NotifyCaptionBar(web_contents());
 +}
@@ -468,6 +577,7 @@
 +
 +void TarkCaptionsTab::Update() {
 +  logic_.OnUnitReady(UnitReady(), base::TimeTicks::Now());
++  logic_.OnTranslationReady(TranslationReady(), base::TimeTicks::Now());
 +  // Renderers send audio only while it is wanted.
 +  const bool on = logic_.ShouldForwardAudio();
 +  if (on != switches_on_) {
@@ -481,6 +591,7 @@
 +  } else if (!logic_.WantsEngine() && service_.is_bound()) {
 +    StopEngine();
 +  }
++  UpdateTranslation();
 +  // The timer runs while captions are on, and while a hidden tab still holds
 +  // its captions process (until TabCaptions lets it go).
 +  const bool tick =
@@ -540,7 +651,62 @@
 +  LOG(WARNING) << "tark captions: engine " << (ok ? "started " : "failed ") << engine_unit_;
 +  if (!ok) {
 +    OnServiceGone();
++    return;
 +  }
++  engine_started_ = true;
++  UpdateTranslation();
++}
++
++void TarkCaptionsTab::UpdateTranslation() {
++  if (!service_.is_bound() || !engine_started_) {
++    return;
++  }
++  const std::string want = logic_.WantsTranslation() ? logic_.state().target : std::string();
++  if (want == sent_target_) {
++    return;
++  }
++  sent_target_ = want;
++  if (want.empty()) {
++    service_->SetTarget(std::string(), {}, base::DoNothing());
++    ReleaseTranslationUnits();
++    translation_text_.clear();
++    return;
++  }
++  std::vector<std::string> units = TranslationUnits();
++  std::vector<std::pair<std::string, base::FilePath>> dirs;
++  for (const std::string& unit : units) {
++    dirs.emplace_back(unit, CaptionDownloads::Get().UnitDir(unit));
++  }
++  base::ThreadPool::PostTaskAndReplyWithResult(
++      FROM_HERE, {base::MayBlock(), base::TaskPriority::USER_VISIBLE},
++      base::BindOnce(&OpenTranslationUnits, std::move(dirs)),
++      base::BindOnce(&TarkCaptionsTab::OnTranslationFilesOpened, weak_factory_.GetWeakPtr(), want,
++                     std::move(units)));
++}
++
++void TarkCaptionsTab::OnTranslationFilesOpened(std::string target,
++                                               std::vector<std::string> units,
++                                               std::map<std::string, base::File> files) {
++  if (!service_.is_bound() || target != sent_target_) {
++    return;  // the target changed while the files were opened
++  }
++  ReleaseTranslationUnits();
++  for (const std::string& unit : units) {
++    CaptionDownloads::Get().SetInUse(unit, true);
++  }
++  translation_in_use_ = std::move(units);
++  base::flat_map<std::string, base::File> handles;
++  for (auto& [name, file] : files) {
++    handles.emplace(name, std::move(file));
++  }
++  service_->SetTarget(target, std::move(handles), base::DoNothing());
++}
++
++void TarkCaptionsTab::ReleaseTranslationUnits() {
++  for (const std::string& unit : translation_in_use_) {
++    CaptionDownloads::Get().SetInUse(unit, false);
++  }
++  translation_in_use_.clear();
 +}
 +
 +void TarkCaptionsTab::StopEngine() {
@@ -550,6 +716,9 @@
 +  service_.reset();  // the process exits with its last remote
 +  client_.reset();
 +  draft_text_.clear();
++  engine_started_ = false;
++  sent_target_.clear();
++  ReleaseTranslationUnits();
 +  CaptionDownloads::Get().SetInUse(engine_unit_, false);
 +  CaptionDownloads::Get().SetInUse("common", false);
 +  engine_unit_.clear();
@@ -566,7 +735,7 @@
 +}  // namespace tark_captions
 --- /dev/null
 +++ b/chrome/browser/tark_captions_android/tark_captions_tab.h
-@@ -0,0 +1,126 @@
+@@ -0,0 +1,151 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -619,6 +788,12 @@
 +    bool phrase = false;      // the caption style in use
 +    std::string final_text;   // the last final caption
 +    std::string draft_text;   // what is being said (word by word)
++    // Translate (Phase 2a).
++    bool translate_available = false;  // 6 GB or more, another language
++    std::string target;                // "" off, "en", "hi", "ta"
++    // The first translation unit not yet on the phone (kReady when all are).
++    CaptionDownloads::UnitState translation_unit;
++    std::string translation_text;  // the last final, translated
 +  };
 +
 +  ~TarkCaptionsTab() override;
@@ -629,6 +804,8 @@
 +
 +  void SetCaptionsOn(bool on);
 +  void ChooseLanguage(const std::string& language);
++  // Translate's target ("" off); remembered for every tab.
++  void SetTarget(const std::string& target);
 +  // "Download now" on mobile data, or the bar's "Try again".
 +  void RequestDownload(bool now);
 +  // ✕: the bar goes for this page.
@@ -657,7 +834,8 @@
 +  void Observe(mojo::PendingRemote<mojom::CaptionAudioSwitch> audio_switch) override;
 +
 +  // mojom::CaptionClient:
-+  void OnCaption(bool is_final, const std::string& text) override;
++  void OnCaption(bool is_final, const std::string& text, uint32_t caption_id) override;
++  void OnTranslation(uint32_t caption_id, const std::string& text) override;
 +
 +  int PlayerKey(const content::MediaPlayerId& id);
 +  void SetPlayerAudible(const content::MediaPlayerId& id, bool audible);
@@ -671,6 +849,17 @@
 +  void OnServiceGone();
 +  bool UnitReady() const;
 +  void CancelDownload();
++  // Translate: the units for this language and target, all on the phone.
++  std::vector<std::string> TranslationUnits() const;
++  bool TranslationReady() const;
++  void RequestTranslation();
++  void CancelTranslationDownloads();
++  // Sends the target to the running captions process when it changes.
++  void UpdateTranslation();
++  void OnTranslationFilesOpened(std::string target,
++                                std::vector<std::string> units,
++                                std::map<std::string, base::File> files);
++  void ReleaseTranslationUnits();
 +
 +  TabCaptions logic_;
 +  Style style_ = Style::kPhrase;
@@ -684,6 +873,11 @@
 +  mojo::Receiver<mojom::CaptionClient> client_{this};
 +  std::string engine_unit_;  // the unit the running process holds
 +  std::string final_text_, draft_text_;
++  bool engine_started_ = false;    // Start() answered true
++  std::string sent_target_;        // what the captions process translates into
++  std::vector<std::string> translation_in_use_;  // its units, held from deletion
++  uint32_t final_id_ = 0;
++  std::string translation_text_;
 +  base::RepeatingTimer tick_;
 +  base::WeakPtrFactory<TarkCaptionsTab> weak_factory_{this};
 +
