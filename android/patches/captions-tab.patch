@@ -204,7 +204,7 @@
 +#endif  // CHROME_BROWSER_TARK_CAPTIONS_ANDROID_ANDROID_TARK_CAPTIONS_BRIDGE_H_
 --- /dev/null
 +++ b/chrome/browser/tark_captions_android/tark_captions_tab.cc
-@@ -0,0 +1,538 @@
+@@ -0,0 +1,583 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -357,7 +357,8 @@
 +    return;
 +  }
 +  g_browser_process->local_state()->SetString(kLanguagePref, language);
-+  CancelDownload();  // the language moved away from
++  CancelDownload();               // the language moved away from
++  CancelTranslationDownloads();   // and its translation models
 +  StopEngine();  // a new language is a new model
 +  final_text_.clear();
 +  draft_text_.clear();
@@ -374,10 +375,20 @@
 +  if (target == logic_.state().target) {
 +    return;
 +  }
-+  CancelTranslationDownloads();  // the old pair's, if unfinished
++  const std::vector<std::string> old_units = TranslationUnits();
 +  g_browser_process->local_state()->SetString(kTargetPref, target);
 +  logic_.SetTarget(target, base::TimeTicks::Now());
++  // The old pair's unfinished models, except those the new target needs
++  // (a download in progress keeps its bytes and its "Download now").
++  const std::vector<std::string> new_units = TranslationUnits();
++  for (const std::string& unit : old_units) {
++    if (!std::ranges::contains(new_units, unit) &&
++        CaptionDownloads::Get().State(unit).state != CaptionDownloads::State::kReady) {
++      CaptionDownloads::Get().Cancel(unit);
++    }
++  }
 +  translation_text_.clear();
++  translation_failed_ = false;
 +  if (!target.empty() && !logic_.state().captions_on) {
 +    // Translate turns captions on: a translation needs a caption.
 +    SetCaptionsOn(true);
@@ -404,10 +415,14 @@
 +  if (!logic_.state().captions_on) {
 +    return;
 +  }
-+  for (const std::string& unit : TranslationUnits()) {
-+    if (CaptionDownloads::Get().State(unit).state != CaptionDownloads::State::kReady) {
-+      CaptionDownloads::Get().Request(unit, /*now=*/false);
-+    }
++  CaptionDownloads& downloads = CaptionDownloads::Get();
++  for (const std::string& unit : UnitsToRequest(
++           TranslationUnits(),
++           [&](const std::string& u) {
++             return downloads.State(u).state == CaptionDownloads::State::kMissing;
++           },
++           [&](const std::string& u) { return downloads.Removing(u); })) {
++    downloads.Request(unit, /*now=*/false);
 +  }
 +}
 +
@@ -420,6 +435,13 @@
 +}
 +
 +void TarkCaptionsTab::RequestDownload(bool now) {
++  if (translation_failed_) {
++    // "Try again" after a translation that did not load: send it again.
++    translation_failed_ = false;
++    sent_target_.clear();
++    Update();
++    return;
++  }
 +  // The card shows the translation models once the language is here.
 +  if (UnitReady() && !logic_.state().target.empty() && !TranslationReady()) {
 +    for (const std::string& unit : TranslationUnits()) {
@@ -435,6 +457,7 @@
 +  bar_hidden_for_page_ = true;
 +  logic_.SetCaptionsOn(false, base::TimeTicks::Now());
 +  CancelDownload();
++  CancelTranslationDownloads();
 +  Update();
 +}
 +
@@ -451,7 +474,8 @@
 +  view.draft_text = draft_text_;
 +  view.translate_available = TranslateAvailable(RamMb(), state.language, "");
 +  view.target = state.target;
-+  view.translation_unit.state = CaptionDownloads::State::kReady;
++  view.translation_unit.state = translation_failed_ ? CaptionDownloads::State::kFailed
++                                                   : CaptionDownloads::State::kReady;
 +  for (const std::string& unit : TranslationUnits()) {
 +    CaptionDownloads::UnitState unit_state = CaptionDownloads::Get().State(unit);
 +    if (unit_state.state != CaptionDownloads::State::kReady) {
@@ -509,6 +533,12 @@
 +      CaptionDownloads::Get().State(unit).state == CaptionDownloads::State::kMissing) {
 +    CaptionDownloads::Get().Request(unit, /*now=*/false);
 +    return;  // Request notifies again
++  }
++  // A translation model deleted in Settings or cancelled by another tab:
++  // asked for again on Wi-Fi, so the card never waits without a button.
++  if (unit.starts_with("tr_") && !logic_.state().target.empty() &&
++      std::ranges::contains(TranslationUnits(), unit)) {
++    RequestTranslation();
 +  }
 +  if (unit == logic_.state().language || unit == "common" || unit.starts_with("tr_")) {
 +    logic_.OnUnitReady(UnitReady(), base::TimeTicks::Now());
@@ -672,7 +702,7 @@
 +    return;
 +  }
 +  const std::string want = logic_.WantsTranslation() ? logic_.state().target : std::string();
-+  if (want == sent_target_) {
++  if (want == sent_target_ || (translation_failed_ && !want.empty())) {
 +    return;
 +  }
 +  sent_target_ = want;
@@ -709,7 +739,21 @@
 +  for (auto& [name, file] : files) {
 +    handles.emplace(name, std::move(file));
 +  }
-+  service_->SetTarget(target, std::move(handles), base::DoNothing());
++  service_->SetTarget(target, std::move(handles),
++                      base::BindOnce(&TarkCaptionsTab::OnTargetSet, weak_factory_.GetWeakPtr(),
++                                     target));
++}
++
++void TarkCaptionsTab::OnTargetSet(std::string target, bool ok) {
++  if (ok || target != sent_target_) {
++    return;
++  }
++  // The models did not load (a file gone or damaged): the card says the
++  // translation failed, and "Try again" sends it again.
++  LOG(WARNING) << "tark captions: translation failed to load";
++  translation_failed_ = true;
++  ReleaseTranslationUnits();
++  NotifyCaptionBar(web_contents());
 +}
 +
 +void TarkCaptionsTab::ReleaseTranslationUnits() {
@@ -728,6 +772,7 @@
 +  draft_text_.clear();
 +  engine_started_ = false;
 +  sent_target_.clear();
++  translation_failed_ = false;
 +  ReleaseTranslationUnits();
 +  CaptionDownloads::Get().SetInUse(engine_unit_, false);
 +  CaptionDownloads::Get().SetInUse("common", false);
@@ -745,7 +790,7 @@
 +}  // namespace tark_captions
 --- /dev/null
 +++ b/chrome/browser/tark_captions_android/tark_captions_tab.h
-@@ -0,0 +1,151 @@
+@@ -0,0 +1,153 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -870,6 +915,7 @@
 +                                std::vector<std::string> units,
 +                                std::map<std::string, base::File> files);
 +  void ReleaseTranslationUnits();
++  void OnTargetSet(std::string target, bool ok);
 +
 +  TabCaptions logic_;
 +  Style style_ = Style::kPhrase;
@@ -888,6 +934,7 @@
 +  std::vector<std::string> translation_in_use_;  // its units, held from deletion
 +  uint32_t final_id_ = 0;
 +  std::string translation_text_;
++  bool translation_failed_ = false;  // the process could not load the models
 +  base::RepeatingTimer tick_;
 +  base::WeakPtrFactory<TarkCaptionsTab> weak_factory_{this};
 +

@@ -711,7 +711,7 @@
 +#endif  // CHROME_BROWSER_TARK_CAPTIONS_ANDROID_CAPTION_DOWNLOADS_H_
 --- /dev/null
 +++ b/chrome/browser/tark_captions_android/model_files.cc
-@@ -0,0 +1,235 @@
+@@ -0,0 +1,247 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -906,6 +906,18 @@
 +  return std::nullopt;
 +}
 +
++std::vector<std::string> UnitsToRequest(const std::vector<std::string>& units,
++                                        base::FunctionRef<bool(const std::string&)> missing,
++                                        base::FunctionRef<bool(const std::string&)> removing) {
++  std::vector<std::string> again;
++  for (const std::string& unit : units) {
++    if (missing(unit) && !removing(unit)) {
++      again.push_back(unit);
++    }
++  }
++  return again;
++}
++
 +UnitUse::UnitUse() = default;
 +UnitUse::~UnitUse() = default;
 +
@@ -949,7 +961,7 @@
 +}  // namespace tark_captions
 --- /dev/null
 +++ b/chrome/browser/tark_captions_android/model_files.h
-@@ -0,0 +1,103 @@
+@@ -0,0 +1,109 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -1033,6 +1045,12 @@
 +std::optional<std::string> NextToFetch(const std::deque<std::string>& queue,
 +                                       base::FunctionRef<bool(const std::string&)> can_start);
 +
++// Of `units`, those to request again: missing (deleted, or cancelled by
++// another tab) and not waiting to be removed.
++std::vector<std::string> UnitsToRequest(const std::vector<std::string>& units,
++                                        base::FunctionRef<bool(const std::string&)> missing,
++                                        base::FunctionRef<bool(const std::string&)> removing);
++
 +class UnitUse {
 + public:
 +  UnitUse();
@@ -1055,7 +1073,7 @@
 +#endif  // CHROME_BROWSER_TARK_CAPTIONS_ANDROID_MODEL_FILES_H_
 --- /dev/null
 +++ b/chrome/browser/tark_captions_android/model_files_unittest.cc
-@@ -0,0 +1,133 @@
+@@ -0,0 +1,145 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -1180,6 +1198,18 @@
 +  EXPECT_EQ(UnitsToFetch("hi"), (std::vector<std::string>{"common", "hi"}));
 +}
 +
++// A translation model deleted in Settings, or cancelled by another tab: the
++// card asks for it again (never stuck without a button); not while its
++// removal waits, and not when it is here or already coming.
++TEST(TarkCaptionFilesTest, TranslationUnitsToRequestAgain) {
++  const std::vector<std::string> units = {"tr_indic_en", "tr_en_indic"};
++  auto missing = [](const std::string& unit) { return unit == "tr_en_indic"; };
++  auto none = [](const std::string&) { return false; };
++  EXPECT_EQ(UnitsToRequest(units, missing, none), (std::vector<std::string>{"tr_en_indic"}));
++  EXPECT_TRUE(UnitsToRequest(units, missing, missing).empty());  // removal waits
++  EXPECT_TRUE(UnitsToRequest(units, none, none).empty());
++}
++
 +TEST(TarkCaptionFilesTest, UrlIsContentAddressed) {
 +  // gettarka.com serves a path without an extension as a folder's
 +  // index.html, so the files carry ".bin", as xlit's do.
@@ -1191,7 +1221,7 @@
 +}  // namespace tark_captions
 --- /dev/null
 +++ b/chrome/browser/tark_captions_android/tab_captions.cc
-@@ -0,0 +1,157 @@
+@@ -0,0 +1,159 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -1209,7 +1239,9 @@
 +}  // namespace
 +
 +bool TranslateAvailable(int ram_mb, const std::string& language, const std::string& target) {
-+  return ram_mb >= 6144 && language != target;
++  // Phones sold as 6 GB report about 5.3–5.7 GiB; 4 GB phones about 3.7.
++  constexpr int kTranslateRamMb = 5120;
++  return ram_mb >= kTranslateRamMb && language != target;
 +}
 +
 +Style StyleForDevice(int fastest_khz, int ram_mb, int pref) {
@@ -1351,7 +1383,7 @@
 +}  // namespace tark_captions
 --- /dev/null
 +++ b/chrome/browser/tark_captions_android/tab_captions.h
-@@ -0,0 +1,112 @@
+@@ -0,0 +1,113 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -1378,8 +1410,9 @@
 +// word by word on a Snapdragon 695, 0.32 a phrase at a time).
 +Style StyleForDevice(int fastest_khz, int ram_mb, int pref);
 +
-+// Whether the bar offers Translate: phones of 6 GB or more (until measured on
-+// smaller ones), and only into another language than the captions'.
++// Whether the bar offers Translate: phones sold as 6 GB or more (until
++// measured on smaller ones), and only into another language than the
++// captions'.
 +bool TranslateAvailable(int ram_mb, const std::string& language, const std::string& target);
 +
 +// One tab's live captions, without the browser: what the caption bar shows,
@@ -1466,7 +1499,7 @@
 +#endif  // CHROME_BROWSER_TARK_CAPTIONS_ANDROID_TAB_CAPTIONS_H_
 --- /dev/null
 +++ b/chrome/browser/tark_captions_android/tab_captions_unittest.cc
-@@ -0,0 +1,270 @@
+@@ -0,0 +1,274 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -1683,10 +1716,14 @@
 +}
 +
 +TEST(TranslateAvailableTest, HiddenUnder6GBAndForTheSameLanguage) {
-+  EXPECT_FALSE(TranslateAvailable(5900, "hi", "en"));
++  EXPECT_FALSE(TranslateAvailable(5000, "hi", "en"));
 +  EXPECT_TRUE(TranslateAvailable(7600, "hi", "en"));
 +  EXPECT_FALSE(TranslateAvailable(7600, "hi", "hi"));
 +  EXPECT_TRUE(TranslateAvailable(6144, "es", "ta"));
++  // Phones sold as 6 GB report about 5.3–5.7 GiB: they get Translate; 4 GB
++  // phones do not.
++  EXPECT_TRUE(TranslateAvailable(5600, "hi", "en"));
++  EXPECT_FALSE(TranslateAvailable(3800, "hi", "en"));
 +}
 +
 +// The translation model deleted in Settings: captions go on, Translate
