@@ -9218,7 +9218,7 @@
 +}  // namespace tark_captions
 --- /dev/null
 +++ b/components/tark_captions/test_util.cc
-@@ -0,0 +1,140 @@
+@@ -0,0 +1,144 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -9332,6 +9332,10 @@
 +  return ReadList(testdata.Append("mt_golden.json"), "cases");
 +}
 +
++base::ListValue EsMtGoldenCases(const base::FilePath& testdata) {
++  return ReadList(testdata.Append("es_mt_golden.json"), "cases");
++}
++
 +base::ListValue LidGoldenCases(const base::FilePath& testdata) {
 +  return ReadList(testdata.Append("lid_golden.json"), "cases");
 +}
@@ -9361,7 +9365,7 @@
 +}  // namespace tark_captions::test
 --- /dev/null
 +++ b/components/tark_captions/test_util.h
-@@ -0,0 +1,51 @@
+@@ -0,0 +1,54 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -9398,6 +9402,9 @@
 +// TESTDATA/mt_golden.json's "cases" list (utils/indictrans_export.py
 +// golden): per caption, every stage of the reference translation pipeline.
 +base::ListValue MtGoldenCases(const base::FilePath& testdata);
++// es_mt_golden.json's "cases" (utils/marian_export.py golden): Spanish
++// captions, the int8 model's ids and the English it gives.
++base::ListValue EsMtGoldenCases(const base::FilePath& testdata);
 +// lid_golden.json's cases: a clip, its language and the scores the language
 +// detector must give its first seconds (utils/lid_export.py golden).
 +base::ListValue LidGoldenCases(const base::FilePath& testdata);
@@ -9986,7 +9993,7 @@
 +#endif  // COMPONENTS_TARK_CAPTIONS_TRANSLATION_ENGINE_H_
 --- /dev/null
 +++ b/components/tark_captions/translation_engine_unittest.cc
-@@ -0,0 +1,264 @@
+@@ -0,0 +1,258 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -10184,9 +10191,6 @@
 +  ASSERT_TRUE(mapped);
 +  for (const base::Value& v : cases_) {
 +    const base::DictValue& c = v.GetDict();
-+    if (*c.FindString("lang") == "es") {
-+      continue;
-+    }
 +    TranslationTrace from_paths, from_sources;
 +    engine_->Translate(*c.FindString("caption"), *LanguageFromCode(*c.FindString("lang")),
 +                       Target::kHindi, &from_paths);
@@ -10206,11 +10210,8 @@
 +      TranslationEngine::Create(OrtRuntime::Load(ort_), std::move(sources));
 +  ASSERT_TRUE(spanish);
 +  int checked = 0;
-+  for (const base::Value& v : cases_) {
++  for (const base::Value& v : test::EsMtGoldenCases(*test::TestDataDir())) {
 +    const base::DictValue& c = v.GetDict();
-+    if (*c.FindString("lang") != "es") {
-+      continue;
-+    }
 +    TranslationTrace trace;
 +    std::optional<std::string> english =
 +        spanish->TranslateFrom(*c.FindString("caption"), "es", Target::kEnglish, &trace);

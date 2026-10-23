@@ -52,7 +52,18 @@
  #include "base/json/json_reader.h"
  #include "base/strings/cstring_view.h"
  
-@@ -125,4 +127,14 @@
+@@ -109,6 +111,10 @@
+   return ReadList(testdata.Append("mt_golden.json"), "cases");
+ }
+ 
++base::ListValue EsMtGoldenCases(const base::FilePath& testdata) {
++  return ReadList(testdata.Append("es_mt_golden.json"), "cases");
++}
++
+ base::ListValue LidGoldenCases(const base::FilePath& testdata) {
+   return ReadList(testdata.Append("lid_golden.json"), "cases");
+ }
+@@ -125,4 +131,14 @@
    return std::move(value->GetDict());
  }
  
@@ -87,7 +98,17 @@
  namespace tark_captions::test {
  
  // Paths from TARK_CAPTIONS_ORT, TARK_CAPTIONS_MODELS, TARK_CAPTIONS_TESTDATA;
-@@ -37,6 +42,10 @@
+@@ -29,6 +34,9 @@
+ // TESTDATA/mt_golden.json's "cases" list (utils/indictrans_export.py
+ // golden): per caption, every stage of the reference translation pipeline.
+ base::ListValue MtGoldenCases(const base::FilePath& testdata);
++// es_mt_golden.json's "cases" (utils/marian_export.py golden): Spanish
++// captions, the int8 model's ids and the English it gives.
++base::ListValue EsMtGoldenCases(const base::FilePath& testdata);
+ // lid_golden.json's cases: a clip, its language and the scores the language
+ // detector must give its first seconds (utils/lid_export.py golden).
+ base::ListValue LidGoldenCases(const base::FilePath& testdata);
+@@ -37,6 +45,10 @@
  // classes over the code point "ranges" ("classes"). Empty if unreadable.
  base::DictValue EnMtGolden(const base::FilePath& testdata);
  
@@ -482,7 +503,7 @@
  #include "components/tark_captions/test_util.h"
  #include "testing/gtest/include/gtest/gtest.h"
  
-@@ -161,6 +165,89 @@
+@@ -161,6 +165,83 @@
    EXPECT_EQ(engine->Translate("नमस्ते", Language::kHindi, Target::kEnglish), std::nullopt);
  }
  
@@ -516,9 +537,6 @@
 +  ASSERT_TRUE(mapped);
 +  for (const base::Value& v : cases_) {
 +    const base::DictValue& c = v.GetDict();
-+    if (*c.FindString("lang") == "es") {
-+      continue;
-+    }
 +    TranslationTrace from_paths, from_sources;
 +    engine_->Translate(*c.FindString("caption"), *LanguageFromCode(*c.FindString("lang")),
 +                       Target::kHindi, &from_paths);
@@ -538,11 +556,8 @@
 +      TranslationEngine::Create(OrtRuntime::Load(ort_), std::move(sources));
 +  ASSERT_TRUE(spanish);
 +  int checked = 0;
-+  for (const base::Value& v : cases_) {
++  for (const base::Value& v : test::EsMtGoldenCases(*test::TestDataDir())) {
 +    const base::DictValue& c = v.GetDict();
-+    if (*c.FindString("lang") != "es") {
-+      continue;
-+    }
 +    TranslationTrace trace;
 +    std::optional<std::string> english =
 +        spanish->TranslateFrom(*c.FindString("caption"), "es", Target::kEnglish, &trace);
