@@ -708,7 +708,7 @@
 +#endif  // CHROME_BROWSER_TARK_CAPTIONS_ANDROID_CAPTION_DOWNLOADS_H_
 --- /dev/null
 +++ b/chrome/browser/tark_captions_android/model_files.cc
-@@ -0,0 +1,211 @@
+@@ -0,0 +1,235 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -793,9 +793,33 @@
 +}
 +
 +std::vector<std::string> UnitsToFetch(std::string_view unit) {
++  // Translation models need no voice detector.
++  if (unit.starts_with("tr_")) {
++    return {std::string(unit)};
++  }
 +  std::vector<std::string> units = {kCommon};
 +  if (unit != kCommon) {
 +    units.emplace_back(unit);
++  }
++  return units;
++}
++
++std::vector<std::string> TranslationUnitsFor(std::string_view source, std::string_view target) {
++  const bool indian_source = source == "hi" || source == "ta";
++  const bool indian_target = target == "hi" || target == "ta";
++  if ((target != "en" && !indian_target) || source == target) {
++    return {};
++  }
++  std::vector<std::string> units;
++  if (indian_source) {
++    units.emplace_back("tr_indic_en");
++  } else if (source == "es") {
++    units.emplace_back("tr_es_en");
++  } else if (source != "en") {
++    return {};
++  }
++  if (indian_target) {
++    units.emplace_back("tr_en_indic");
 +  }
 +  return units;
 +}
@@ -922,7 +946,7 @@
 +}  // namespace tark_captions
 --- /dev/null
 +++ b/chrome/browser/tark_captions_android/model_files.h
-@@ -0,0 +1,97 @@
+@@ -0,0 +1,103 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -967,6 +991,12 @@
 +
 +// What turning `unit` on downloads: "common" (Silero VAD) and the unit.
 +std::vector<std::string> UnitsToFetch(std::string_view unit);
++
++// The translation units a caption in `source` ("hi", "ta", "en", "es") needs
++// to reach `target` ("en", "hi", "ta"; "" is Translate off), in order:
++// Indian and Spanish into Hindi or Tamil go through English. Empty when
++// nothing is translated.
++std::vector<std::string> TranslationUnitsFor(std::string_view source, std::string_view target);
 +
 +// Content-addressed: https://gettarka.com/models/android/v1/<sha256>.bin (the
 +// site serves extension-less paths as folders).
@@ -1022,7 +1052,7 @@
 +#endif  // CHROME_BROWSER_TARK_CAPTIONS_ANDROID_MODEL_FILES_H_
 --- /dev/null
 +++ b/chrome/browser/tark_captions_android/model_files_unittest.cc
-@@ -0,0 +1,110 @@
+@@ -0,0 +1,133 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -1122,6 +1152,29 @@
 +  EXPECT_EQ(NextToFetch(queue, allowed), "en");
 +  EXPECT_EQ(NextToFetch(queue, [](const std::string&) { return true; }), "hi");
 +  EXPECT_EQ(NextToFetch(queue, [](const std::string&) { return false; }), std::nullopt);
++}
++
++// Translate (Phase 2a): the translation models a caption passes through,
++// each a download of its own; Indian and Spanish into an Indian language go
++// through English.
++TEST(TarkCaptionFilesTest, TranslationUnitsPivot) {
++  using V = std::vector<std::string>;
++  EXPECT_EQ(TranslationUnitsFor("ta", "hi"), (V{"tr_indic_en", "tr_en_indic"}));
++  EXPECT_EQ(TranslationUnitsFor("hi", "en"), (V{"tr_indic_en"}));
++  EXPECT_EQ(TranslationUnitsFor("en", "hi"), (V{"tr_en_indic"}));
++  EXPECT_EQ(TranslationUnitsFor("en", "ta"), (V{"tr_en_indic"}));
++  EXPECT_EQ(TranslationUnitsFor("es", "en"), (V{"tr_es_en"}));
++  EXPECT_EQ(TranslationUnitsFor("es", "ta"), (V{"tr_es_en", "tr_en_indic"}));
++  EXPECT_TRUE(TranslationUnitsFor("hi", "hi").empty());
++  EXPECT_TRUE(TranslationUnitsFor("en", "en").empty());
++  EXPECT_TRUE(TranslationUnitsFor("hi", "").empty());  // Translate off
++  EXPECT_TRUE(TranslationUnitsFor("hi", "fr").empty());  // not a target
++}
++
++// A translation model needs no voice detector: nothing else is fetched.
++TEST(TarkCaptionFilesTest, TranslationUnitsNeedNoCommon) {
++  EXPECT_EQ(UnitsToFetch("tr_es_en"), (std::vector<std::string>{"tr_es_en"}));
++  EXPECT_EQ(UnitsToFetch("hi"), (std::vector<std::string>{"common", "hi"}));
 +}
 +
 +TEST(TarkCaptionFilesTest, UrlIsContentAddressed) {
