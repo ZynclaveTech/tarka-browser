@@ -177,6 +177,22 @@ function Probe-TestProgram([string]$Exe, [string]$Tag, [string]$OneTest) {
   }
   "aedebug : $one -> $(Format-Code $code), log: $(if (Test-Path $log) { 'written' } else { 'none' })" |
     Out-File -Append "$Report\probe-$Tag.txt"
+
+  # Under cdb, but with the PEB's BeingDebugged flag cleared, log each step of
+  # the stack dumping setup: the dbghelp/msdia140 loads and SymInitialize, each
+  # with its result and last error.
+  $ret = 'bp /1 @$ra \"r rax; !gle; g\"; g'
+  @(
+    'eb @$peb+2 0'
+    'sxe -c "kn 40; !gle; q" bpe'
+    "bp KERNELBASE!LoadLibraryExW `".printf \`"LoadLibraryExW %mu\\n\`", @rcx; $ret`""
+    "bm dbghelp!SymInitialize* `".printf \`"SymInitialize\\n\`"; $ret`""
+    "bp $mod!base::debug::EnableInProcessStackDumping `".printf \`"EnableInProcessStackDumping\\n\`"; $ret`""
+    'g'
+    'q'
+  ) | Out-File -Encoding ascii "$Report\$Tag-steps-commands.txt"
+  $code = Invoke-Logged $cdb ("-y `"$Tests`" -cf `"$Report\$Tag-steps-commands.txt`" `"$path`" $one") "$Tag-steps" 300
+  "steps (cdb, BeingDebugged cleared) : $one -> $(Format-Code $code)" | Out-File -Append "$Report\probe-$Tag.txt"
 }
 
 function Run-TestProgram([string]$Exe, [string]$Log, [string]$Arguments) {
