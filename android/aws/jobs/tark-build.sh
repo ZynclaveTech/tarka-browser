@@ -95,12 +95,12 @@ if (( code == 0 )); then
     {
       ninja -C $o content_junit_tests chrome_junit_tests &&
       /tark/junit-venv/bin/python $o/bin/run_content_junit_tests --gtest_filter='*SpeechRecognitionImplTest*' &&
-      /tark/junit-venv/bin/python $o/bin/run_chrome_junit_tests --gtest_filter='*SpeechLanguageSnackbarTest*:*VoiceLanguagesTest*' &&
+      /tark/junit-venv/bin/python $o/bin/run_chrome_junit_tests --gtest_filter='*SpeechLanguageSnackbarTest*:*VoiceLanguagesTest*:*VoiceLanguageSignalsTest*:*VoiceLanguagesSettingsTest*' &&
       /tark/junit-venv/bin/python $o/bin/run_chrome_junit_tests --gtest_filter='*IncognitoTabSwitcherPaneUnitTest*'
     } > /tark/junit.log 2>&1
     code=$?
     # A filter that matches nothing "passes" with no test run.
-    for t in SpeechRecognitionImplTest SpeechLanguageSnackbarTest VoiceLanguagesTest IncognitoTabSwitcherPaneUnitTest; do
+    for t in SpeechRecognitionImplTest SpeechLanguageSnackbarTest VoiceLanguagesTest VoiceLanguageSignalsTest VoiceLanguagesSettingsTest IncognitoTabSwitcherPaneUnitTest; do
       grep -q "OK \] .*$t\." /tark/junit.log || { echo "junit: no $t test ran" >> $log; code=1; }
     done
     upload /tark/junit.log junit.log

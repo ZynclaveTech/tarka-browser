@@ -1,17 +1,300 @@
+diff '--color=never' -ruN a/chrome/android/chrome_java_resources.gni b/chrome/android/chrome_java_resources.gni
+--- a/chrome/android/chrome_java_resources.gni	2026-10-25 04:23:54.782084670 +0530
++++ b/chrome/android/chrome_java_resources.gni	2026-10-25 04:23:54.754552776 +0530
+@@ -688,4 +688,5 @@
+   "java/res/xml/tracing_preferences.xml",
+   "java/res/xml/unified_account_settings_preferences.xml",
+   "java/res/xml/universal_opt_out_preferences.xml",
++  "java/res/xml/voice_languages_preferences.xml",
+ ]
 diff '--color=never' -ruN a/chrome/android/chrome_java_sources.gni b/chrome/android/chrome_java_sources.gni
---- a/chrome/android/chrome_java_sources.gni	2026-10-25 02:36:40.586459348 +0530
-+++ b/chrome/android/chrome_java_sources.gni	2026-10-25 02:36:40.562180951 +0530
-@@ -1149,6 +1149,7 @@
+--- a/chrome/android/chrome_java_sources.gni	2026-10-25 04:23:54.816427069 +0530
++++ b/chrome/android/chrome_java_sources.gni	2026-10-25 04:23:54.788638880 +0530
+@@ -1149,6 +1149,10 @@
    "java/src/org/chromium/chrome/browser/site_settings/ChromeSiteSettingsDelegate.java",
    "java/src/org/chromium/chrome/browser/site_settings/ManageSpaceActivity.java",
    "java/src/org/chromium/chrome/browser/speech/SpeechLanguageSnackbar.java",
++  "java/src/org/chromium/chrome/browser/speech/VoiceLanguageSignals.java",
 +  "java/src/org/chromium/chrome/browser/speech/VoiceLanguages.java",
++  "java/src/org/chromium/chrome/browser/speech/VoiceLanguagesSettings.java",
++  "java/src/org/chromium/chrome/browser/speech/VoicePlatform.java",
    "java/src/org/chromium/chrome/browser/status_indicator/StatusIndicatorCoordinator.java",
    "java/src/org/chromium/chrome/browser/status_indicator/StatusIndicatorMediator.java",
    "java/src/org/chromium/chrome/browser/status_indicator/StatusIndicatorProperties.java",
+diff '--color=never' -ruN a/chrome/android/java/res/xml/voice_languages_preferences.xml b/chrome/android/java/res/xml/voice_languages_preferences.xml
+--- a/chrome/android/java/res/xml/voice_languages_preferences.xml	1970-01-01 05:30:00.000000000 +0530
++++ b/chrome/android/java/res/xml/voice_languages_preferences.xml	2026-10-25 04:23:54.823191406 +0530
+@@ -0,0 +1,35 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!-- Copyright 2026 The Tark Authors
++     Use of this source code is governed by a BSD-style license that can be
++     found in the LICENSE file. -->
++<!-- Settings › Languages › Voice languages (VoiceLanguagesSettings; the
++     mockups' first two screens). The rows are added in code. -->
++<PreferenceScreen xmlns:android="http://schemas.android.com/apk/res/android"
++    xmlns:app="http://schemas.android.com/apk/res-auto">
++    <org.chromium.components.browser_ui.settings.TextMessagePreference
++        android:key="voice_languages_intro"
++        android:summary="@string/tark_voice_languages_intro" />
++
++    <PreferenceCategory
++        android:key="voice_languages_on_phone"
++        android:title="@string/tark_voice_on_phone" />
++
++    <PreferenceCategory
++        android:key="voice_languages_suggested"
++        android:title="@string/tark_voice_suggested" />
++
++    <PreferenceCategory
++        android:key="voice_languages_more"
++        android:title="@string/tark_voice_more" />
++
++    <!-- Android 12: no list, Android's own settings instead. -->
++    <org.chromium.components.browser_ui.settings.TextMessagePreference
++        android:key="voice_languages_needs_android_13"
++        android:summary="@string/tark_voice_needs_android_13"
++        app:isPreferenceVisible="false" />
++
++    <org.chromium.components.browser_ui.settings.ButtonPreference
++        android:key="voice_languages_system_settings"
++        android:title="@string/tark_voice_open_system_settings"
++        app:isPreferenceVisible="false" />
++</PreferenceScreen>
+diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/speech/SpeechLanguageSnackbar.java b/chrome/android/java/src/org/chromium/chrome/browser/speech/SpeechLanguageSnackbar.java
+--- a/chrome/android/java/src/org/chromium/chrome/browser/speech/SpeechLanguageSnackbar.java	2026-10-25 04:23:54.871918239 +0530
++++ b/chrome/android/java/src/org/chromium/chrome/browser/speech/SpeechLanguageSnackbar.java	2026-10-25 04:23:54.842117565 +0530
+@@ -5,15 +5,10 @@
+ package org.chromium.chrome.browser.speech;
+ 
+ import android.app.Activity;
+-import android.content.ActivityNotFoundException;
+ import android.content.Context;
+ import android.content.Intent;
+ import android.os.Build;
+-import android.provider.Settings;
+ import android.speech.RecognitionSupport;
+-import android.speech.RecognitionSupportCallback;
+-import android.speech.RecognizerIntent;
+-import android.speech.SpeechRecognizer;
+ import android.text.TextUtils;
+ 
+ import androidx.annotation.RequiresApi;
+@@ -204,10 +199,8 @@
+         return false;
+     }
+ 
++    /** Android's pieces, through the {@link VoicePlatform} that Voice languages also uses. */
+     private static class AndroidPlatform implements Platform {
+-        // The recognizer that was asked for a download; Android keeps the request while it lives.
+-        private @Nullable SpeechRecognizer mDownloadRecognizer;
+-
+         @Override
+         public @Nullable SnackbarManager getSnackbarManager() {
+             Activity activity = ApplicationStatus.getLastTrackedFocusedActivity();
+@@ -219,78 +212,39 @@
+ 
+         @Override
+         public void isLanguageKnown(Context context, String bcp47, Callback<Boolean> callback) {
+-            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
+-                callback.onResult(false);
+-                return;
+-            }
+-            checkSupport(context, bcp47, callback);
+-        }
+-
+-        @RequiresApi(Build.VERSION_CODES.TIRAMISU)
+-        private static void checkSupport(
+-                Context context, String bcp47, Callback<Boolean> callback) {
+-            SpeechRecognizer recognizer = SpeechRecognizer.createOnDeviceSpeechRecognizer(context);
+-            recognizer.checkRecognitionSupport(
+-                    languageIntent(bcp47),
+-                    context.getMainExecutor(),
+-                    new RecognitionSupportCallback() {
+-                        @Override
+-                        public void onSupportResult(RecognitionSupport support) {
+-                            recognizer.destroy();
+-                            callback.onResult(
+-                                    listsLanguage(support.getInstalledOnDeviceLanguages(), bcp47)
+-                                            || listsLanguage(
+-                                                    support.getSupportedOnDeviceLanguages(),
+-                                                    bcp47));
+-                        }
+-
+-                        @Override
+-                        public void onError(int error) {
+-                            recognizer.destroy();
+-                            callback.onResult(false);
+-                        }
+-                    });
++            VoicePlatform.get()
++                    .support(
++                            context,
++                            support -> {
++                                boolean known =
++                                        support != null
++                                                && Build.VERSION.SDK_INT
++                                                        >= Build.VERSION_CODES.TIRAMISU
++                                                && supportListsLanguage(support, bcp47);
++                                callback.onResult(known);
++                            });
+         }
+ 
+         @Override
+         public void triggerModelDownload(Context context, String bcp47) {
+-            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return;
+-            if (mDownloadRecognizer != null) mDownloadRecognizer.destroy();
+-            mDownloadRecognizer = download(context, bcp47);
+-        }
+-
+-        @RequiresApi(Build.VERSION_CODES.TIRAMISU)
+-        private static SpeechRecognizer download(Context context, String bcp47) {
+-            SpeechRecognizer recognizer = SpeechRecognizer.createOnDeviceSpeechRecognizer(context);
+-            recognizer.triggerModelDownload(languageIntent(bcp47));
+-            return recognizer;
++            VoicePlatform.get().download(context, bcp47, null);
+         }
+ 
+         @Override
+         public void openLanguageSettings(Context context) {
+-            Activity activity = ApplicationStatus.getLastTrackedFocusedActivity();
+-            Context starter = activity != null ? activity : context;
+-            try {
+-                starter.startActivity(languageSettingsIntent(starter));
+-            } catch (ActivityNotFoundException e) {
+-                // Nothing on this phone opens voice input settings; the snackbar just closes.
+-            }
++            VoicePlatform.get().openSystemSettings(context);
+         }
+     }
+ 
++    @RequiresApi(Build.VERSION_CODES.TIRAMISU)
++    private static boolean supportListsLanguage(RecognitionSupport support, String bcp47) {
++        return listsLanguage(support.getInstalledOnDeviceLanguages(), bcp47)
++                || listsLanguage(support.getSupportedOnDeviceLanguages(), bcp47);
++    }
++
+     /** The intent that opens Android's voice input settings. */
+     @VisibleForTesting
+     static Intent languageSettingsIntent(Context context) {
+-        Intent intent = new Intent(Settings.ACTION_VOICE_INPUT_SETTINGS);
+-        if (!(context instanceof Activity)) intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+-        return intent;
+-    }
+-
+-    private static Intent languageIntent(String bcp47) {
+-        Intent intent = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
+-        intent.putExtra(
+-                RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM);
+-        intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE, bcp47);
+-        return intent;
++        return VoicePlatform.systemSettingsIntent(context);
+     }
+ }
+diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguageSignals.java b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguageSignals.java
+--- a/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguageSignals.java	1970-01-01 05:30:00.000000000 +0530
++++ b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguageSignals.java	2026-10-25 04:23:54.878193736 +0530
+@@ -0,0 +1,98 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++package org.chromium.chrome.browser.speech;
++
++import android.content.Context;
++import android.os.LocaleList;
++
++import androidx.annotation.VisibleForTesting;
++
++import org.chromium.base.library_loader.LibraryLoader;
++import org.chromium.build.annotations.NullMarked;
++import org.chromium.build.annotations.Nullable;
++import org.chromium.chrome.browser.preferences.Pref;
++import org.chromium.chrome.browser.profiles.ProfileManager;
++import org.chromium.chrome.browser.speech.VoiceLanguages.Reason;
++import org.chromium.chrome.browser.tark_captions.TarkCaptionsBridge;
++import org.chromium.components.user_prefs.UserPrefs;
++
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.LinkedHashMap;
++import java.util.List;
++import java.util.Locale;
++import java.util.Map;
++
++/**
++ * Tark: the languages the person already uses, for Voice languages' suggestions. They are read on
++ * the phone and never sent anywhere, and browsing is never one of them: the phone's languages,
++ * Tark's languages (the accept-languages list, which Tark's Indian-language typing suggestions
++ * use) and the languages whose captions model is downloaded.
++ */
++@NullMarked
++public final class VoiceLanguageSignals {
++    private VoiceLanguageSignals() {}
++
++    /** The signals by language subtag ("hi"), each with its first reason. */
++    public static Map<String, Reason> read(Context context) {
++        return merge(phoneLanguages(), tarkLanguages(), captionsLanguages());
++    }
++
++    /**
++     * Merges the three signals by language subtag. A language keeps its first reason, in the
++     * order phone, Tark's languages, captions. Tags that fail {@link
++     * SpeechLanguageSnackbar#isWellFormedTag} are dropped.
++     */
++    @VisibleForTesting
++    static Map<String, Reason> merge(
++            List<String> phone, List<String> tarkLanguages, List<String> captions) {
++        Map<String, Reason> signals = new LinkedHashMap<>();
++        add(signals, phone, Reason.PHONE);
++        add(signals, tarkLanguages, Reason.TARK_LANGUAGES);
++        add(signals, captions, Reason.CAPTIONS);
++        return signals;
++    }
++
++    private static void add(Map<String, Reason> signals, List<String> tags, Reason reason) {
++        for (String tag : tags) {
++            String trimmed = tag.trim();
++            if (!SpeechLanguageSnackbar.isWellFormedTag(trimmed)) continue;
++            String language = Locale.forLanguageTag(trimmed).getLanguage().toLowerCase(Locale.ROOT);
++            signals.putIfAbsent(language, reason);
++        }
++    }
++
++    /** The phone's languages ({@link LocaleList#getDefault()}), as tags. */
++    @VisibleForTesting
++    static List<String> phoneLanguages() {
++        LocaleList locales = LocaleList.getDefault();
++        List<String> tags = new ArrayList<>();
++        for (int i = 0; i < locales.size(); i++) tags.add(locales.get(i).toLanguageTag());
++        return tags;
++    }
++
++    /** The profile's accept languages, as Tark's typing suggestions read them. */
++    private static List<String> tarkLanguages() {
++        if (!LibraryLoader.getInstance().isInitialized() || !ProfileManager.isInitialized()) {
++            return List.of();
++        }
++        String accept =
++                UserPrefs.get(ProfileManager.getLastUsedRegularProfile())
++                        .getString(Pref.ACCEPT_LANGUAGES);
++        return splitList(accept);
++    }
++
++    /** The languages whose captions model is on the phone ("hi"; translation models aren't). */
++    private static List<String> captionsLanguages() {
++        if (!LibraryLoader.getInstance().isInitialized()) return List.of();
++        return Arrays.asList(TarkCaptionsBridge.getReadyLanguages());
++    }
++
++    @VisibleForTesting
++    static List<String> splitList(@Nullable String list) {
++        if (list == null || list.isEmpty()) return List.of();
++        return Arrays.asList(list.split(","));
++    }
++}
 diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguages.java b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguages.java
 --- a/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguages.java	1970-01-01 05:30:00.000000000 +0530
-+++ b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguages.java	2026-10-25 02:36:40.680428899 +0530
++++ b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguages.java	2026-10-25 04:23:54.896421428 +0530
 @@ -0,0 +1,217 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
@@ -230,10 +513,668 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
 +        return new Entry(tag, Locale.forLanguageTag(tag).getDisplayName(uiLocale), reason, state);
 +    }
 +}
+diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguagesSettings.java b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguagesSettings.java
+--- a/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguagesSettings.java	1970-01-01 05:30:00.000000000 +0530
++++ b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguagesSettings.java	2026-10-25 04:23:54.914475493 +0530
+@@ -0,0 +1,440 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++package org.chromium.chrome.browser.speech;
++
++import android.content.Context;
++import android.os.Build;
++import android.os.Bundle;
++import android.os.Handler;
++import android.os.Looper;
++import android.os.LocaleList;
++import android.speech.RecognitionSupport;
++import android.view.Gravity;
++import android.view.View;
++import android.view.ViewGroup;
++import android.widget.ProgressBar;
++import android.widget.TextView;
++
++import androidx.annotation.RequiresApi;
++import androidx.annotation.VisibleForTesting;
++import androidx.preference.Preference;
++import androidx.preference.PreferenceCategory;
++import androidx.preference.PreferenceViewHolder;
++
++import org.chromium.base.ResettersForTesting;
++import org.chromium.base.supplier.MonotonicObservableSupplier;
++import org.chromium.base.supplier.ObservableSuppliers;
++import org.chromium.base.supplier.SettableMonotonicObservableSupplier;
++import org.chromium.build.annotations.NullMarked;
++import org.chromium.build.annotations.Nullable;
++import org.chromium.chrome.R;
++import org.chromium.chrome.browser.settings.ChromeBaseSettingsFragment;
++import org.chromium.chrome.browser.speech.VoiceLanguages.Entry;
++import org.chromium.chrome.browser.speech.VoiceLanguages.Reason;
++import org.chromium.chrome.browser.speech.VoiceLanguages.Sections;
++import org.chromium.chrome.browser.speech.VoiceLanguages.State;
++import org.chromium.components.browser_ui.settings.SettingsUtils;
++import org.chromium.ui.widget.ButtonCompat;
++
++import java.util.ArrayList;
++import java.util.HashMap;
++import java.util.List;
++import java.util.Locale;
++import java.util.Map;
++
++/**
++ * Tark: Settings › Languages › Voice languages (spec §1, mockups 1 and 2). The languages Android's
++ * on-device recognizer has (the phone's default marked "Used when a site doesn't say"), the ones
++ * suggested from the person's own languages with the reason, and the rest; each downloads with
++ * one tap through Android. Android 12 can't list or download them, so there the page says so and
++ * opens Android's voice input settings instead.
++ *
++ * <p>The list is read again on resume and every few seconds while something downloads. Tark keeps
++ * no download logic of its own: progress where Android 14 reports it, "Downloading…" otherwise,
++ * and a failure offers Try again.
++ */
++@NullMarked
++public class VoiceLanguagesSettings extends ChromeBaseSettingsFragment {
++    static final String INTRO_KEY = "voice_languages_intro";
++    static final String ON_PHONE_KEY = "voice_languages_on_phone";
++    static final String SUGGESTED_KEY = "voice_languages_suggested";
++    static final String MORE_KEY = "voice_languages_more";
++    static final String NEEDS_ANDROID_13_KEY = "voice_languages_needs_android_13";
++    static final String SYSTEM_SETTINGS_KEY = "voice_languages_system_settings";
++    private static final String ROW_KEY_PREFIX = "voice_language_";
++
++    /** How often the list is read again while a language downloads. */
++    static final long REFRESH_INTERVAL_MS = 3000;
++
++    private static @Nullable Map<String, Reason> sSignalsForTesting;
++
++    /** A download Tark asked for, as far as Android has told (API 34) or not (API 33). */
++    private static final class Download {
++        /** 0-100, or -1 before (or without) any progress. */
++        int mPercent = -1;
++
++        boolean mWaiting;
++        boolean mFailed;
++    }
++
++    private final SettableMonotonicObservableSupplier<String> mPageTitle =
++            ObservableSuppliers.createMonotonic();
++    private final Handler mHandler = new Handler(Looper.getMainLooper());
++    private final Runnable mRefresh = this::refresh;
++    // Tags whose download was asked for here; kept until Android lists them as installed.
++    private final Map<String, Download> mDownloads = new HashMap<>();
++    private VoicePlatform mPlatform = VoicePlatform.get();
++    private @Nullable Map<String, Reason> mSignals;
++    private @Nullable RecognitionSupport mSupport;
++    private boolean mResumed;
++    // Ignores a support answer that a newer request overtook.
++    private int mRequest;
++
++    @Override
++    public void onCreatePreferences(@Nullable Bundle savedInstanceState, @Nullable String rootKey) {
++        mPageTitle.set(getString(R.string.tark_voice_languages_title));
++        SettingsUtils.addPreferencesFromResource(this, R.xml.voice_languages_preferences);
++        mPlatform = VoicePlatform.get();
++        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
++            // Android 12: no list, only Android's own settings.
++            for (String key : new String[] {INTRO_KEY, ON_PHONE_KEY, SUGGESTED_KEY, MORE_KEY}) {
++                Preference preference = findPreference(key);
++                if (preference != null) preference.setVisible(false);
++            }
++            Preference line = findPreference(NEEDS_ANDROID_13_KEY);
++            Preference button = findPreference(SYSTEM_SETTINGS_KEY);
++            if (line != null) line.setVisible(true);
++            if (button != null) {
++                button.setVisible(true);
++                button.setOnPreferenceClickListener(
++                        p -> {
++                            mPlatform.openSystemSettings(getContext());
++                            return true;
++                        });
++            }
++            return;
++        }
++        // Empty until Android answers.
++        for (String key : new String[] {ON_PHONE_KEY, SUGGESTED_KEY, MORE_KEY}) {
++            Preference section = findPreference(key);
++            if (section != null) section.setVisible(false);
++        }
++    }
++
++    @Override
++    public MonotonicObservableSupplier<String> getPageTitle() {
++        return mPageTitle;
++    }
++
++    @Override
++    public @AnimationType int getAnimationType() {
++        return AnimationType.PROPERTY;
++    }
++
++    @Override
++    public void onResume() {
++        super.onResume();
++        mResumed = true;
++        mSignals = null; // The person may have changed a language meanwhile.
++        refresh();
++    }
++
++    @Override
++    public void onPause() {
++        super.onPause();
++        mResumed = false;
++        mHandler.removeCallbacks(mRefresh);
++    }
++
++    @VisibleForTesting
++    static void setSignalsForTesting(@Nullable Map<String, Reason> signals) {
++        sSignalsForTesting = signals;
++        ResettersForTesting.register(() -> sSignalsForTesting = null);
++    }
++
++    /** Asks Android for its languages again. */
++    @VisibleForTesting
++    void refresh() {
++        mHandler.removeCallbacks(mRefresh);
++        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return;
++        int request = ++mRequest;
++        mPlatform.support(
++                getContext(),
++                support -> {
++                    if (request != mRequest || !isAdded()) return;
++                    mSupport = support;
++                    showSections(support);
++                });
++    }
++
++    private Map<String, Reason> signals() {
++        if (sSignalsForTesting != null) return sSignalsForTesting;
++        if (mSignals == null) mSignals = VoiceLanguageSignals.read(getContext());
++        return mSignals;
++    }
++
++    private void showSections(@Nullable RecognitionSupport support) {
++        List<String> installed = new ArrayList<>();
++        List<String> pending = new ArrayList<>();
++        List<String> supported = new ArrayList<>();
++        if (support != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
++            readSupport(support, installed, pending, supported);
++        }
++        // A download that Android has finished is Android's to show from now on.
++        for (String tag : installed) mDownloads.remove(tag);
++        for (Map.Entry<String, Download> download : mDownloads.entrySet()) {
++            if (!download.getValue().mFailed && !pending.contains(download.getKey())) {
++                pending.add(download.getKey());
++            }
++        }
++
++        Locale phone = LocaleList.getDefault().get(0);
++        Locale ui = getResources().getConfiguration().getLocales().get(0);
++        Sections sections =
++                VoiceLanguages.build(installed, pending, supported, signals(), phone, ui);
++        @Nullable String defaultTag = defaultLanguage(sections.onPhone(), phone);
++
++        boolean downloading = false;
++        downloading |= fill(ON_PHONE_KEY, sections.onPhone(), defaultTag);
++        downloading |= fill(SUGGESTED_KEY, sections.suggested(), null);
++        downloading |= fill(MORE_KEY, sections.more(), null);
++        if (downloading && mResumed) mHandler.postDelayed(mRefresh, REFRESH_INTERVAL_MS);
++    }
++
++    @RequiresApi(Build.VERSION_CODES.TIRAMISU)
++    private static void readSupport(
++            RecognitionSupport support,
++            List<String> installed,
++            List<String> pending,
++            List<String> supported) {
++        installed.addAll(support.getInstalledOnDeviceLanguages());
++        pending.addAll(support.getPendingOnDeviceLanguages());
++        supported.addAll(support.getSupportedOnDeviceLanguages());
++    }
++
++    /**
++     * The installed language the recognizer uses when a site names none: the phone's language,
++     * in its region if installed, else in the first installed region.
++     */
++    @VisibleForTesting
++    static @Nullable String defaultLanguage(List<Entry> onPhone, Locale phone) {
++        String phoneTag = phone.toLanguageTag();
++        @Nullable String sameLanguage = null;
++        for (Entry entry : onPhone) {
++            if (entry.state() != State.INSTALLED) continue;
++            if (entry.tag().equalsIgnoreCase(phoneTag)) return entry.tag();
++            String language = Locale.forLanguageTag(entry.tag()).getLanguage();
++            if (sameLanguage == null && language.equals(phone.getLanguage())) {
++                sameLanguage = entry.tag();
++            }
++        }
++        return sameLanguage;
++    }
++
++    /** Fills a section; returns whether one of its rows is downloading. */
++    private boolean fill(String key, List<Entry> entries, @Nullable String defaultTag) {
++        PreferenceCategory category = findPreference(key);
++        if (category == null) return false;
++        category.removeAll();
++        category.setVisible(!entries.isEmpty());
++        boolean downloading = false;
++        for (Entry entry : entries) {
++            LanguageRow row = new LanguageRow(getContext(), entry.tag());
++            row.setKey(ROW_KEY_PREFIX + entry.tag());
++            row.setTitle(entry.displayName());
++            Download download = mDownloads.get(entry.tag());
++            switch (entry.state()) {
++                case INSTALLED:
++                    row.setSummary(
++                            entry.tag().equals(defaultTag)
++                                    ? getString(R.string.tark_voice_default_language)
++                                    : null);
++                    row.show(LanguageRow.READY, -1, null);
++                    break;
++                case PENDING:
++                    downloading = true;
++                    boolean waiting = download != null && download.mWaiting;
++                    row.setSummary(
++                            getString(
++                                    waiting
++                                            ? R.string.tark_captions_waiting_for_wifi
++                                            : R.string.tark_voice_downloading));
++                    row.show(
++                            LanguageRow.DOWNLOADING,
++                            download != null && !waiting ? download.mPercent : -1,
++                            null);
++                    break;
++                case AVAILABLE:
++                    boolean failed = download != null && download.mFailed;
++                    row.setSummary(
++                            failed
++                                    ? getString(R.string.tark_captions_download_failed)
++                                    : entry.reason());
++                    row.show(
++                            failed ? LanguageRow.FAILED : LanguageRow.AVAILABLE,
++                            -1,
++                            () -> startDownload(entry.tag()));
++                    break;
++            }
++            category.addPreference(row);
++        }
++        return downloading;
++    }
++
++    /** Download (or Try again): Android downloads the language. */
++    @VisibleForTesting
++    void startDownload(String tag) {
++        Download download = new Download();
++        mDownloads.put(tag, download);
++        // Android 13 reports nothing; the list's pending languages tell instead.
++        VoicePlatform.DownloadListener listener =
++                Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE
++                        ? new VoicePlatform.DownloadListener() {
++                            @Override
++                            public void onProgress(int percent) {
++                                download.mPercent = percent;
++                                download.mWaiting = false;
++                                update(download);
++                            }
++
++                            @Override
++                            public void onSuccess() {
++                                // Kept as downloading until Android lists it as installed.
++                                download.mPercent = 100;
++                                download.mWaiting = false;
++                                if (isAdded() && mDownloads.get(tag) == download) refresh();
++                            }
++
++                            @Override
++                            public void onScheduled() {
++                                download.mWaiting = true;
++                                update(download);
++                            }
++
++                            @Override
++                            public void onError(int error) {
++                                download.mFailed = true;
++                                update(download);
++                            }
++                        }
++                        : null;
++        mPlatform.download(getContext(), tag, listener);
++        showSections(mSupport);
++    }
++
++    private void update(Download download) {
++        if (!isAdded() || !mDownloads.containsValue(download)) return;
++        showSections(mSupport);
++    }
++
++    /** A language: its name, a line below, and Ready, progress, or a Download button. */
++    @VisibleForTesting
++    static final class LanguageRow extends Preference {
++        static final int READY = 0;
++        static final int DOWNLOADING = 1;
++        static final int AVAILABLE = 2;
++        static final int FAILED = 3;
++
++        private final String mTag;
++        private int mStatus = READY;
++        private int mPercent = -1;
++        private @Nullable Runnable mAction;
++
++        LanguageRow(Context context, String tag) {
++            super(context);
++            mTag = tag;
++            setPersistent(false);
++        }
++
++        void show(int status, int percent, @Nullable Runnable action) {
++            mStatus = status;
++            mPercent = percent;
++            mAction = action;
++            setSelectable(action != null);
++            setOnPreferenceClickListener(
++                    action == null
++                            ? null
++                            : p -> {
++                                action.run();
++                                return true;
++                            });
++            notifyChanged();
++        }
++
++        String getLanguageTag() {
++            return mTag;
++        }
++
++        int getStatus() {
++            return mStatus;
++        }
++
++        /** Whether a progress bar shows (Android 14 reported progress). */
++        boolean showsProgress() {
++            return mStatus == DOWNLOADING && mPercent >= 0;
++        }
++
++        int getPercent() {
++            return mPercent;
++        }
++
++        /** Download, or Try again. */
++        void tapAction() {
++            if (mAction != null) mAction.run();
++        }
++
++        @Override
++        public void onBindViewHolder(PreferenceViewHolder holder) {
++            super.onBindViewHolder(holder);
++            View frame = holder.findViewById(android.R.id.widget_frame);
++            if (!(frame instanceof ViewGroup widgetFrame)) return;
++            widgetFrame.removeAllViews();
++            Context context = getContext();
++            View widget = null;
++            switch (mStatus) {
++                case READY:
++                    TextView ready = new TextView(context);
++                    ready.setTextAppearance(R.style.TextAppearance_TextMedium_Secondary);
++                    ready.setText(R.string.tark_voice_ready);
++                    widget = ready;
++                    break;
++                case DOWNLOADING:
++                    if (mPercent < 0) break;
++                    ProgressBar bar =
++                            new ProgressBar(
++                                    context, null, android.R.attr.progressBarStyleHorizontal);
++                    bar.setMax(100);
++                    bar.setProgress(mPercent);
++                    int width =
++                            context.getResources()
++                                    .getDimensionPixelSize(R.dimen.min_touch_target_size);
++                    bar.setLayoutParams(
++                            new ViewGroup.LayoutParams(
++                                    2 * width, ViewGroup.LayoutParams.WRAP_CONTENT));
++                    widget = bar;
++                    break;
++                case AVAILABLE:
++                case FAILED:
++                    ButtonCompat button = new ButtonCompat(context, R.style.TextButtonThemeOverlay);
++                    button.setText(
++                            mStatus == FAILED
++                                    ? R.string.tark_captions_try_again
++                                    : R.string.tark_speech_language_download);
++                    button.setOnClickListener(v -> tapAction());
++                    widget = button;
++                    break;
++            }
++            if (widget == null) {
++                widgetFrame.setVisibility(View.GONE);
++                return;
++            }
++            widgetFrame.setVisibility(View.VISIBLE);
++            if (widgetFrame instanceof android.widget.LinearLayout linear) {
++                linear.setGravity(Gravity.CENTER_VERTICAL | Gravity.END);
++            }
++            widgetFrame.addView(widget);
++        }
++    }
++}
+diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/speech/VoicePlatform.java b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoicePlatform.java
+--- a/chrome/android/java/src/org/chromium/chrome/browser/speech/VoicePlatform.java	1970-01-01 05:30:00.000000000 +0530
++++ b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoicePlatform.java	2026-10-25 04:23:54.933340026 +0530
+@@ -0,0 +1,210 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++package org.chromium.chrome.browser.speech;
++
++import android.app.Activity;
++import android.content.ActivityNotFoundException;
++import android.content.Context;
++import android.content.Intent;
++import android.os.Build;
++import android.provider.Settings;
++import android.speech.ModelDownloadListener;
++import android.speech.RecognitionSupport;
++import android.speech.RecognitionSupportCallback;
++import android.speech.RecognizerIntent;
++import android.speech.SpeechRecognizer;
++
++import androidx.annotation.RequiresApi;
++import androidx.annotation.VisibleForTesting;
++
++import org.chromium.base.ApplicationStatus;
++import org.chromium.base.Callback;
++import org.chromium.base.ResettersForTesting;
++import org.chromium.build.annotations.NullMarked;
++import org.chromium.build.annotations.Nullable;
++
++import java.util.HashMap;
++import java.util.Map;
++
++/**
++ * Tark: Android's on-device speech recognizer as voice's settings and snackbar use it: which
++ * languages it has, is downloading and can download (API 33+), asking it to download one (API
++ * 33+, with progress on API 34+), and Android's voice input settings. Replaced in tests.
++ */
++@NullMarked
++interface VoicePlatform {
++    /** A download's progress, as API 34's {@link ModelDownloadListener} reports it. */
++    interface DownloadListener {
++        /** 0-100. */
++        void onProgress(int percent);
++
++        void onSuccess();
++
++        /** Android will download it later (on an unmetered network, for example). */
++        void onScheduled();
++
++        void onError(int error);
++    }
++
++    /**
++     * The recognizer's languages, or null if Android can't say (below API 33, no on-device
++     * recognizer, an error). Called back on the main thread.
++     */
++    void support(Context context, Callback<@Nullable RecognitionSupport> callback);
++
++    /**
++     * Asks Android to download {@code tag}. The listener hears about it only on API 34+; on API
++     * 33 nothing is reported. Does nothing below API 33.
++     */
++    void download(Context context, String tag, @Nullable DownloadListener listener);
++
++    /** Opens Android's voice input settings (where Android 12 downloads languages). */
++    void openSystemSettings(Context context);
++
++    /** The platform in use. */
++    static VoicePlatform get() {
++        if (Holder.sForTesting != null) return Holder.sForTesting;
++        if (Holder.sAndroid == null) Holder.sAndroid = new AndroidVoicePlatform();
++        return Holder.sAndroid;
++    }
++
++    @VisibleForTesting
++    static void setForTesting(@Nullable VoicePlatform platform) {
++        Holder.sForTesting = platform;
++        ResettersForTesting.register(() -> Holder.sForTesting = null);
++    }
++
++    /** The intent that opens Android's voice input settings. */
++    static Intent systemSettingsIntent(Context context) {
++        Intent intent = new Intent(Settings.ACTION_VOICE_INPUT_SETTINGS);
++        if (!(context instanceof Activity)) intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
++        return intent;
++    }
++
++    /** A recognizer intent for {@code tag}, or for no particular language if it is null. */
++    static Intent recognizerIntent(@Nullable String tag) {
++        Intent intent = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
++        intent.putExtra(
++                RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM);
++        if (tag != null) intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE, tag);
++        return intent;
++    }
++
++    /** Static state of an interface. */
++    final class Holder {
++        private static @Nullable VoicePlatform sForTesting;
++        private static @Nullable VoicePlatform sAndroid;
++
++        private Holder() {}
++    }
++
++    /** The real one. */
++    final class AndroidVoicePlatform implements VoicePlatform {
++        // Recognizers asked for a download, by tag: Android keeps a request while its recognizer
++        // lives, so each stays until the download ends (API 34+) or the tag is asked for again.
++        private final Map<String, SpeechRecognizer> mDownloads = new HashMap<>();
++
++        @Override
++        public void support(Context context, Callback<@Nullable RecognitionSupport> callback) {
++            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU
++                    || !SpeechRecognizer.isOnDeviceRecognitionAvailable(context)) {
++                callback.onResult(null);
++                return;
++            }
++            checkSupport(context, callback);
++        }
++
++        @RequiresApi(Build.VERSION_CODES.TIRAMISU)
++        private static void checkSupport(
++                Context context, Callback<@Nullable RecognitionSupport> callback) {
++            SpeechRecognizer recognizer = SpeechRecognizer.createOnDeviceSpeechRecognizer(context);
++            recognizer.checkRecognitionSupport(
++                    recognizerIntent(null),
++                    context.getMainExecutor(),
++                    new RecognitionSupportCallback() {
++                        @Override
++                        public void onSupportResult(RecognitionSupport support) {
++                            recognizer.destroy();
++                            callback.onResult(support);
++                        }
++
++                        @Override
++                        public void onError(int error) {
++                            recognizer.destroy();
++                            callback.onResult(null);
++                        }
++                    });
++        }
++
++        @Override
++        public void download(Context context, String tag, @Nullable DownloadListener listener) {
++            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return;
++            SpeechRecognizer previous = mDownloads.remove(tag);
++            if (previous != null) previous.destroy();
++            SpeechRecognizer recognizer = SpeechRecognizer.createOnDeviceSpeechRecognizer(context);
++            mDownloads.put(tag, recognizer);
++            if (listener != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
++                downloadWithListener(context, recognizer, tag, listener);
++            } else {
++                triggerDownload(recognizer, tag);
++            }
++        }
++
++        @RequiresApi(Build.VERSION_CODES.TIRAMISU)
++        private static void triggerDownload(SpeechRecognizer recognizer, String tag) {
++            recognizer.triggerModelDownload(recognizerIntent(tag));
++        }
++
++        @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
++        private void downloadWithListener(
++                Context context,
++                SpeechRecognizer recognizer,
++                String tag,
++                DownloadListener listener) {
++            recognizer.triggerModelDownload(
++                    recognizerIntent(tag),
++                    context.getMainExecutor(),
++                    new ModelDownloadListener() {
++                        @Override
++                        public void onProgress(int completedPercent) {
++                            listener.onProgress(completedPercent);
++                        }
++
++                        @Override
++                        public void onSuccess() {
++                            finish(tag, recognizer);
++                            listener.onSuccess();
++                        }
++
++                        @Override
++                        public void onScheduled() {
++                            listener.onScheduled();
++                        }
++
++                        @Override
++                        public void onError(int error) {
++                            finish(tag, recognizer);
++                            listener.onError(error);
++                        }
++                    });
++        }
++
++        private void finish(String tag, SpeechRecognizer recognizer) {
++            if (mDownloads.get(tag) == recognizer) mDownloads.remove(tag);
++            recognizer.destroy();
++        }
++
++        @Override
++        public void openSystemSettings(Context context) {
++            Activity activity = ApplicationStatus.getLastTrackedFocusedActivity();
++            Context starter = context instanceof Activity || activity == null ? context : activity;
++            try {
++                starter.startActivity(systemSettingsIntent(starter));
++            } catch (ActivityNotFoundException e) {
++                // Nothing on this phone opens voice input settings.
++            }
++        }
++    }
++}
 diff '--color=never' -ruN a/chrome/android/junit/BUILD.gn b/chrome/android/junit/BUILD.gn
---- a/chrome/android/junit/BUILD.gn	2026-10-25 02:36:40.615550642 +0530
-+++ b/chrome/android/junit/BUILD.gn	2026-10-25 02:36:40.592803305 +0530
-@@ -1232,11 +1232,14 @@
+--- a/chrome/android/junit/BUILD.gn	2026-10-25 04:23:54.981204182 +0530
++++ b/chrome/android/junit/BUILD.gn	2026-10-25 04:23:54.952187018 +0530
+@@ -1232,11 +1232,16 @@
      ]
    }
  
@@ -245,14 +1186,436 @@ diff '--color=never' -ruN a/chrome/android/junit/BUILD.gn b/chrome/android/junit
 -    sources = [ "src/org/chromium/chrome/browser/speech/SpeechLanguageSnackbarTest.java" ]
 +    sources = [
 +      "src/org/chromium/chrome/browser/speech/SpeechLanguageSnackbarTest.java",
++      "src/org/chromium/chrome/browser/speech/VoiceLanguageSignalsTest.java",
++      "src/org/chromium/chrome/browser/speech/VoiceLanguagesSettingsTest.java",
 +      "src/org/chromium/chrome/browser/speech/VoiceLanguagesTest.java",
 +    ]
  
      deps = [
        ":chrome_junit_tests_helper",
+diff '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguageSignalsTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguageSignalsTest.java
+--- a/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguageSignalsTest.java	1970-01-01 05:30:00.000000000 +0530
++++ b/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguageSignalsTest.java	2026-10-25 04:23:54.987996477 +0530
+@@ -0,0 +1,79 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++package org.chromium.chrome.browser.speech;
++
++import static org.junit.Assert.assertEquals;
++
++import android.os.LocaleList;
++
++import org.junit.After;
++import org.junit.Test;
++import org.junit.runner.RunWith;
++import org.robolectric.annotation.Config;
++
++import org.chromium.base.test.BaseRobolectricTestRunner;
++import org.chromium.chrome.browser.speech.VoiceLanguages.Reason;
++
++import java.util.LinkedHashMap;
++import java.util.List;
++import java.util.Map;
++
++/** Tests for {@link VoiceLanguageSignals}. */
++@RunWith(BaseRobolectricTestRunner.class)
++@Config(qualifiers = "en-rUS")
++public class VoiceLanguageSignalsTest {
++    private final LocaleList mDefaultLocales = LocaleList.getDefault();
++
++    @After
++    public void tearDown() {
++        LocaleList.setDefault(mDefaultLocales);
++    }
++
++    @Test
++    public void testSignalsMerge() {
++        Map<String, Reason> signals =
++                VoiceLanguageSignals.merge(
++                        List.of("en-IN", "ta-IN"), List.of("en", "hi"), List.of("hi", "es"));
++
++        Map<String, Reason> expected = new LinkedHashMap<>();
++        expected.put("en", Reason.PHONE);
++        expected.put("ta", Reason.PHONE);
++        expected.put("hi", Reason.TARK_LANGUAGES);
++        expected.put("es", Reason.CAPTIONS);
++        assertEquals(expected, signals);
++        assertEquals(List.of("en", "ta", "hi", "es"), List.copyOf(signals.keySet()));
++    }
++
++    @Test
++    public void testMalformedAndModelUnitsDropped() {
++        // Captions' ready units include translation models and the detector.
++        Map<String, Reason> signals =
++                VoiceLanguageSignals.merge(
++                        List.of("en US"),
++                        List.of(""),
++                        List.of("tr_indic_en", "language_id", "ta"));
++
++        assertEquals(Map.of("ta", Reason.CAPTIONS), signals);
++    }
++
++    @Test
++    public void testPhoneLanguagesFromLocaleList() {
++        LocaleList.setDefault(LocaleList.forLanguageTags("en-IN,ta-IN"));
++        assertEquals(List.of("en-IN", "ta-IN"), VoiceLanguageSignals.phoneLanguages());
++    }
++
++    @Test
++    public void testAcceptLanguagesSplit() {
++        // The accept-languages pref, as the profile stores it.
++        assertEquals(List.of("en-US", "en", "hi"), VoiceLanguageSignals.splitList("en-US,en,hi"));
++        assertEquals(List.of(), VoiceLanguageSignals.splitList(""));
++        assertEquals(List.of(), VoiceLanguageSignals.splitList(null));
++
++        Map<String, Reason> signals =
++                VoiceLanguageSignals.merge(
++                        List.of(), VoiceLanguageSignals.splitList("en-US, hi"), List.of());
++        assertEquals(List.of("en", "hi"), List.copyOf(signals.keySet()));
++    }
++}
+diff '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguagesSettingsTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguagesSettingsTest.java
+--- a/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguagesSettingsTest.java	1970-01-01 05:30:00.000000000 +0530
++++ b/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguagesSettingsTest.java	2026-10-25 04:23:55.007073222 +0530
+@@ -0,0 +1,333 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++package org.chromium.chrome.browser.speech;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.assertNotNull;
++import static org.junit.Assert.assertNull;
++import static org.junit.Assert.assertTrue;
++
++import android.content.Context;
++import android.os.LocaleList;
++import android.speech.RecognitionSupport;
++
++import androidx.fragment.app.FragmentManager;
++import androidx.preference.Preference;
++import androidx.preference.PreferenceCategory;
++import androidx.test.ext.junit.rules.ActivityScenarioRule;
++
++import org.junit.After;
++import org.junit.Before;
++import org.junit.Rule;
++import org.junit.Test;
++import org.junit.runner.RunWith;
++import org.mockito.Mockito;
++import org.robolectric.annotation.Config;
++import org.robolectric.shadows.ShadowLooper;
++
++import org.chromium.base.Callback;
++import org.chromium.base.test.BaseRobolectricTestRunner;
++import org.chromium.build.annotations.Nullable;
++import org.chromium.chrome.R;
++import org.chromium.chrome.browser.profiles.Profile;
++import org.chromium.chrome.browser.speech.VoiceLanguages.Reason;
++import org.chromium.chrome.browser.speech.VoiceLanguagesSettings.LanguageRow;
++import org.chromium.ui.base.TestActivity;
++
++import java.util.ArrayList;
++import java.util.LinkedHashMap;
++import java.util.List;
++import java.util.Locale;
++import java.util.Map;
++import java.util.concurrent.TimeUnit;
++
++/** Tests for {@link VoiceLanguagesSettings}. */
++@RunWith(BaseRobolectricTestRunner.class)
++@Config(qualifiers = "en-rUS")
++public class VoiceLanguagesSettingsTest {
++    /** Android's recognizer, as lists. */
++    private static class FakePlatform implements VoicePlatform {
++        List<String> mInstalled = new ArrayList<>(List.of("en-IN", "en-US"));
++        List<String> mPending = new ArrayList<>();
++        List<String> mSupported =
++                new ArrayList<>(List.of("en-IN", "en-US", "hi-IN", "ta-IN", "bn-IN"));
++        int mSupportCalls;
++        final List<String> mDownloads = new ArrayList<>();
++        final List<@Nullable DownloadListener> mListeners = new ArrayList<>();
++        int mSystemSettingsOpened;
++
++        @Override
++        public void support(Context context, Callback<@Nullable RecognitionSupport> callback) {
++            mSupportCalls++;
++            callback.onResult(
++                    new RecognitionSupport.Builder()
++                            .setInstalledOnDeviceLanguages(new ArrayList<>(mInstalled))
++                            .setPendingOnDeviceLanguages(new ArrayList<>(mPending))
++                            .setSupportedOnDeviceLanguages(new ArrayList<>(mSupported))
++                            .build());
++        }
++
++        @Override
++        public void download(Context context, String tag, @Nullable DownloadListener listener) {
++            mDownloads.add(tag);
++            mListeners.add(listener);
++        }
++
++        @Override
++        public void openSystemSettings(Context context) {
++            mSystemSettingsOpened++;
++        }
++    }
++
++    @Rule
++    public ActivityScenarioRule<TestActivity> mActivityScenarioRule =
++            new ActivityScenarioRule<>(TestActivity.class);
++
++    private final LocaleList mDefaultLocales = LocaleList.getDefault();
++    private FakePlatform mPlatform;
++    private TestActivity mActivity;
++    private VoiceLanguagesSettings mSettings;
++
++    @Before
++    public void setUp() {
++        mPlatform = new FakePlatform();
++        VoicePlatform.setForTesting(mPlatform);
++        Map<String, Reason> signals = new LinkedHashMap<>();
++        signals.put("hi", Reason.TARK_LANGUAGES);
++        signals.put("ta", Reason.PHONE);
++        VoiceLanguagesSettings.setSignalsForTesting(signals);
++        LocaleList.setDefault(LocaleList.forLanguageTags("en-IN"));
++        mActivityScenarioRule
++                .getScenario()
++                .onActivity(
++                        activity -> {
++                            mActivity = activity;
++                            mActivity.setTheme(R.style.Theme_BrowserUI_DayNight);
++                        });
++    }
++
++    @After
++    public void tearDown() {
++        LocaleList.setDefault(mDefaultLocales);
++    }
++
++    private void launch() {
++        FragmentManager fragmentManager = mActivity.getSupportFragmentManager();
++        mSettings =
++                (VoiceLanguagesSettings)
++                        fragmentManager
++                                .getFragmentFactory()
++                                .instantiate(
++                                        VoiceLanguagesSettings.class.getClassLoader(),
++                                        VoiceLanguagesSettings.class.getName());
++        mSettings.setProfile(Mockito.mock(Profile.class));
++        fragmentManager.beginTransaction().replace(android.R.id.content, mSettings).commitNow();
++        ShadowLooper.idleMainLooper();
++    }
++
++    private PreferenceCategory section(String key) {
++        PreferenceCategory category = mSettings.findPreference(key);
++        assertNotNull(key, category);
++        return category;
++    }
++
++    private String title(String key) {
++        return String.valueOf(section(key).getTitle());
++    }
++
++    private List<String> rowTags(String key) {
++        PreferenceCategory category = section(key);
++        List<String> tags = new ArrayList<>();
++        for (int i = 0; i < category.getPreferenceCount(); i++) {
++            tags.add(((LanguageRow) category.getPreference(i)).getLanguageTag());
++        }
++        return tags;
++    }
++
++    private LanguageRow row(String tag) {
++        LanguageRow row = mSettings.findPreference("voice_language_" + tag);
++        assertNotNull(tag, row);
++        return row;
++    }
++
++    private static String summary(Preference preference) {
++        CharSequence summary = preference.getSummary();
++        return summary == null ? null : summary.toString();
++    }
++
++    @Test
++    public void testScreenSections() {
++        launch();
++
++        assertEquals("On this phone", title(VoiceLanguagesSettings.ON_PHONE_KEY));
++        assertEquals("Suggested for you", title(VoiceLanguagesSettings.SUGGESTED_KEY));
++        assertEquals("More languages", title(VoiceLanguagesSettings.MORE_KEY));
++        assertTrue(section(VoiceLanguagesSettings.ON_PHONE_KEY).isVisible());
++        assertTrue(section(VoiceLanguagesSettings.SUGGESTED_KEY).isVisible());
++        assertTrue(section(VoiceLanguagesSettings.MORE_KEY).isVisible());
++
++        assertEquals(List.of("en-IN", "en-US"), rowTags(VoiceLanguagesSettings.ON_PHONE_KEY));
++        assertEquals(List.of("hi-IN", "ta-IN"), rowTags(VoiceLanguagesSettings.SUGGESTED_KEY));
++        assertEquals(List.of("bn-IN"), rowTags(VoiceLanguagesSettings.MORE_KEY));
++        assertEquals("You type Hindi with Tark's keyboard", summary(row("hi-IN")));
++        assertEquals("One of your phone's languages", summary(row("ta-IN")));
++        assertEquals(LanguageRow.AVAILABLE, row("bn-IN").getStatus());
++        assertEquals(LanguageRow.READY, row("en-US").getStatus());
++
++        // Spoken-language detection comes with its own task; no placeholder until then.
++        assertNull(mSettings.findPreference("voice_languages_detection"));
++        Preference line = mSettings.findPreference(VoiceLanguagesSettings.NEEDS_ANDROID_13_KEY);
++        assertNotNull(line);
++        assertFalse(line.isVisible());
++    }
++
++    @Test
++    public void testEmptySectionHidden() {
++        mPlatform.mSupported = new ArrayList<>(List.of("en-IN", "en-US", "bn-IN"));
++        launch();
++
++        assertFalse(section(VoiceLanguagesSettings.SUGGESTED_KEY).isVisible());
++        assertTrue(section(VoiceLanguagesSettings.MORE_KEY).isVisible());
++    }
++
++    @Test
++    public void testDefaultLanguageLine() {
++        launch();
++
++        assertEquals("Used when a site doesn't say", summary(row("en-IN")));
++        assertNull(summary(row("en-US")));
++    }
++
++    @Test
++    public void testDefaultLanguageOtherRegion() {
++        LocaleList.setDefault(LocaleList.forLanguageTags("en-GB"));
++        launch();
++
++        // The phone's language in the first installed region.
++        assertEquals("Used when a site doesn't say", summary(row("en-IN")));
++        assertNull(summary(row("en-US")));
++    }
++
++    @Test
++    public void testDownloadTapCallsPlatform() {
++        launch();
++        row("hi-IN").tapAction();
++
++        assertEquals(List.of("hi-IN"), mPlatform.mDownloads);
++        VoicePlatform.DownloadListener listener = mPlatform.mListeners.get(0);
++        assertNotNull(listener);
++        assertEquals(
++                List.of("en-IN", "en-US", "hi-IN"), rowTags(VoiceLanguagesSettings.ON_PHONE_KEY));
++        assertEquals("Downloading…", summary(row("hi-IN")));
++        assertFalse(row("hi-IN").showsProgress());
++
++        listener.onProgress(40);
++        assertTrue(row("hi-IN").showsProgress());
++        assertEquals(40, row("hi-IN").getPercent());
++        assertEquals("Downloading…", summary(row("hi-IN")));
++    }
++
++    @Test
++    @Config(sdk = 33)
++    public void testDownloadOnApi33ReadsDownloading() {
++        launch();
++        row("hi-IN").tapAction();
++
++        assertEquals(List.of("hi-IN"), mPlatform.mDownloads);
++        assertNull(mPlatform.mListeners.get(0));
++        assertEquals(
++                List.of("en-IN", "en-US", "hi-IN"), rowTags(VoiceLanguagesSettings.ON_PHONE_KEY));
++        assertEquals("Downloading…", summary(row("hi-IN")));
++        assertFalse(row("hi-IN").showsProgress());
++    }
++
++    @Test
++    public void testDownloadFailedShowsTryAgain() {
++        launch();
++        row("ta-IN").tapAction();
++        mPlatform.mListeners.get(0).onError(0);
++
++        assertEquals(List.of("hi-IN", "ta-IN"), rowTags(VoiceLanguagesSettings.SUGGESTED_KEY));
++        assertEquals("Couldn't download", summary(row("ta-IN")));
++        assertEquals(LanguageRow.FAILED, row("ta-IN").getStatus());
++
++        row("ta-IN").tapAction();
++        assertEquals(List.of("ta-IN", "ta-IN"), mPlatform.mDownloads);
++        assertEquals("Downloading…", summary(row("ta-IN")));
++    }
++
++    @Test
++    public void testScheduledShowsWaitingForWifi() {
++        launch();
++        row("hi-IN").tapAction();
++        mPlatform.mListeners.get(0).onScheduled();
++
++        assertEquals("Waiting for Wi-Fi", summary(row("hi-IN")));
++        assertFalse(row("hi-IN").showsProgress());
++    }
++
++    @Test
++    public void testInstalledAfterRefresh() {
++        launch();
++        row("hi-IN").tapAction();
++        mPlatform.mListeners.get(0).onSuccess();
++        // Until Android lists it, it is still on its way.
++        assertEquals("Downloading…", summary(row("hi-IN")));
++
++        mPlatform.mInstalled.add("hi-IN");
++        mSettings.refresh();
++        assertEquals(LanguageRow.READY, row("hi-IN").getStatus());
++        assertNull(summary(row("hi-IN")));
++        assertFalse(section(VoiceLanguagesSettings.SUGGESTED_KEY).getPreferenceCount() > 1);
++    }
++
++    @Test
++    public void testAndroidPendingShownAndRefreshed() {
++        mPlatform.mPending.add("ta-IN");
++        launch();
++
++        assertEquals("Downloading…", summary(row("ta-IN")));
++        int calls = mPlatform.mSupportCalls;
++        ShadowLooper.idleMainLooper(
++                VoiceLanguagesSettings.REFRESH_INTERVAL_MS, TimeUnit.MILLISECONDS);
++        assertTrue(mPlatform.mSupportCalls > calls);
++    }
++
++    @Test
++    @Config(sdk = 32)
++    public void testApi32ShowsSystemSettingsLine() {
++        launch();
++
++        Preference line = mSettings.findPreference(VoiceLanguagesSettings.NEEDS_ANDROID_13_KEY);
++        Preference button = mSettings.findPreference(VoiceLanguagesSettings.SYSTEM_SETTINGS_KEY);
++        assertNotNull(line);
++        assertNotNull(button);
++        assertTrue(line.isVisible());
++        assertEquals("Android 13 or later can list and download voice languages", summary(line));
++        assertTrue(button.isVisible());
++        assertFalse(section(VoiceLanguagesSettings.ON_PHONE_KEY).isVisible());
++        assertFalse(section(VoiceLanguagesSettings.SUGGESTED_KEY).isVisible());
++        assertFalse(section(VoiceLanguagesSettings.MORE_KEY).isVisible());
++        assertEquals(0, mPlatform.mSupportCalls);
++
++        button.getOnPreferenceClickListener().onPreferenceClick(button);
++        assertEquals(1, mPlatform.mSystemSettingsOpened);
++    }
++
++    @Test
++    public void testDefaultLanguagePicksInstalledOnly() {
++        List<VoiceLanguages.Entry> onPhone =
++                List.of(
++                        new VoiceLanguages.Entry(
++                                "en-IN", "English (India)", null, VoiceLanguages.State.PENDING),
++                        new VoiceLanguages.Entry(
++                                "en-US", "English (US)", null, VoiceLanguages.State.INSTALLED));
++        assertEquals(
++                "en-US",
++                VoiceLanguagesSettings.defaultLanguage(onPhone, Locale.forLanguageTag("en-IN")));
++        assertNull(VoiceLanguagesSettings.defaultLanguage(onPhone, Locale.forLanguageTag("hi-IN")));
++    }
++}
 diff '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguagesTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguagesTest.java
 --- a/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguagesTest.java	1970-01-01 05:30:00.000000000 +0530
-+++ b/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguagesTest.java	2026-10-25 02:36:40.695121131 +0530
++++ b/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguagesTest.java	2026-10-25 04:23:55.025907672 +0530
 @@ -0,0 +1,216 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
@@ -470,10 +1833,61 @@ diff '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome/browser
 +        assertEquals(List.of("ta-IN"), tags(s.more()));
 +    }
 +}
+diff '--color=never' -ruN a/chrome/browser/language/android/java/src/org/chromium/chrome/browser/language/settings/LanguageSettings.java b/chrome/browser/language/android/java/src/org/chromium/chrome/browser/language/settings/LanguageSettings.java
+--- a/chrome/browser/language/android/java/src/org/chromium/chrome/browser/language/settings/LanguageSettings.java	2026-10-25 04:23:55.071761884 +0530
++++ b/chrome/browser/language/android/java/src/org/chromium/chrome/browser/language/settings/LanguageSettings.java	2026-10-25 04:23:55.044330616 +0530
+@@ -9,6 +9,7 @@
+ import android.app.Activity;
+ import android.content.Context;
+ import android.content.Intent;
++import android.os.Build;
+ import android.os.Bundle;
+ import android.text.TextUtils;
+ 
+@@ -65,6 +66,10 @@
+     static final String TRANSLATE_SWITCH_KEY = "translate_switch";
+     // Tark (A3): the address bar's Indian-language suggestions.
+     static final String TARK_XLIT_SWITCH_KEY = "tark_xlit_switch";
++    // Tark: Settings › Voice languages (chrome's VoiceLanguagesSettings, opened by name).
++    static final String TARK_VOICE_LANGUAGES_KEY = "tark_voice_languages";
++    private static final String TARK_VOICE_LANGUAGES_FRAGMENT =
++            "org.chromium.chrome.browser.speech.VoiceLanguagesSettings";
+ 
+     static final String TRANSLATION_ADVANCED_SECTION = "translation_advanced_settings_section";
+     static final String TARGET_LANGUAGE_KEY = "translate_settings_target_language";
+@@ -91,6 +96,7 @@
+             createBasicPreferences();
+         }
+         addTarkXlitSwitch();
++        addTarkVoiceLanguages();
+ 
+         LanguagesManager.recordImpression(LanguagesManager.LanguageSettingsPageType.PAGE_MAIN);
+     }
+@@ -142,6 +148,20 @@
+         updateTarkXlitSummary();
+     }
+ 
++    /**
++     * Tark: the languages voice search can use on this phone, beside the typing suggestions. Voice
++     * runs on Android's on-device recognizer, which Android 12 (API 31) introduced.
++     */
++    private void addTarkVoiceLanguages() {
++        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return;
++        Preference voice = new Preference(getPreferenceManager().getContext());
++        voice.setKey(TARK_VOICE_LANGUAGES_KEY);
++        voice.setTitle(R.string.tark_voice_languages_title);
++        voice.setFragment(TARK_VOICE_LANGUAGES_FRAGMENT);
++        voice.setPersistent(false);
++        getPreferenceScreen().addPreference(voice);
++    }
++
+     private void updateTarkXlitSummary() {
+         if (mTarkXlitSwitch == null) return;
+         String summary;
 diff '--color=never' -ruN a/chrome/browser/ui/android/strings/android_chrome_strings.grd b/chrome/browser/ui/android/strings/android_chrome_strings.grd
---- a/chrome/browser/ui/android/strings/android_chrome_strings.grd	2026-10-25 02:36:40.646574460 +0530
-+++ b/chrome/browser/ui/android/strings/android_chrome_strings.grd	2026-10-25 02:36:40.621047171 +0530
-@@ -994,6 +994,16 @@
+--- a/chrome/browser/ui/android/strings/android_chrome_strings.grd	2026-10-25 04:23:55.105403024 +0530
++++ b/chrome/browser/ui/android/strings/android_chrome_strings.grd	2026-10-25 04:23:55.077891505 +0530
+@@ -994,6 +994,46 @@
        <message name="IDS_TARK_SPEECH_LANGUAGE_DOWNLOAD" desc="Tark: action of the voice language snackbar: Android downloads the language (or opens its voice input settings).">
          Download
        </message>
@@ -487,18 +1901,56 @@ diff '--color=never' -ruN a/chrome/browser/ui/android/strings/android_chrome_str
 +      <message name="IDS_TARK_VOICE_REASON_CAPTIONS" desc="Tark: Settings > Voice languages: why a speech recognition language is suggested: live captions in that language are downloaded.">
 +        You watch captions in <ph name="LANGUAGE">%1$s<ex>Hindi</ex></ph>
 +      </message>
++      <message name="IDS_TARK_VOICE_LANGUAGES_TITLE" desc="Tark: title of Settings > Languages > Voice languages, and its entry: the speech recognition languages on the phone, for voice search.">
++        Voice languages
++      </message>
++      <message name="IDS_TARK_VOICE_LANGUAGES_INTRO" desc="Tark: top of Settings > Voice languages: voice search is recognized on the phone, and each language is a one-time download (Android downloads it).">
++        Voice search works on this phone, without sending what you say anywhere. Each language needs a one-time download.
++      </message>
++      <message name="IDS_TARK_VOICE_ON_PHONE" desc="Tark: Settings > Voice languages: heading of the speech recognition languages installed or downloading on the phone.">
++        On this phone
++      </message>
++      <message name="IDS_TARK_VOICE_SUGGESTED" desc="Tark: Settings > Voice languages: heading of the languages suggested from the person's own languages (each says why).">
++        Suggested for you
++      </message>
++      <message name="IDS_TARK_VOICE_MORE" desc="Tark: Settings > Voice languages: heading of the other languages Android can download.">
++        More languages
++      </message>
++      <message name="IDS_TARK_VOICE_DEFAULT_LANGUAGE" desc="Tark: Settings > Voice languages: below the installed language that voice search uses when the website does not name a language (the phone's language).">
++        Used when a site doesn't say
++      </message>
++      <message name="IDS_TARK_VOICE_DOWNLOADING" desc="Tark: Settings > Voice languages: below a language Android is downloading.">
++        Downloading…
++      </message>
++      <message name="IDS_TARK_VOICE_READY" desc="Tark: Settings > Voice languages: beside a language that is on the phone and ready for voice search. [CHAR_LIMIT=16]">
++        ✓ Ready
++      </message>
++      <message name="IDS_TARK_VOICE_NEEDS_ANDROID_13" desc="Tark: Settings > Voice languages on Android 12, which cannot list or download speech recognition languages for apps.">
++        Android 13 or later can list and download voice languages
++      </message>
++      <message name="IDS_TARK_VOICE_OPEN_SYSTEM_SETTINGS" desc="Tark: Settings > Voice languages on Android 12: button that opens Android's voice input settings, where languages are downloaded. [CHAR_LIMIT=32]">
++        Open Android's voice settings
++      </message>
        <message name="IDS_TARK_CONNECTS_UPDATE" desc="Tark: item in the list of services Tark connects to: the direct APK's daily check for a newer version, with its host name.">
          New versions of Tark, checked once a day unless Google Play installed it (gettarka.com)
        </message>
 diff '--color=never' -ruN a/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb b/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb
---- a/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb	2026-10-25 02:36:40.675467793 +0530
-+++ b/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb	2026-10-25 02:36:40.653195504 +0530
-@@ -2197,4 +2197,7 @@
+--- a/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb	2026-10-25 04:23:55.141663197 +0530
++++ b/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb	2026-10-25 04:23:55.113261542 +0530
+@@ -2197,4 +2197,15 @@
  <translation id="8955589894175271948">Tark के नए वर्शन, दिन में एक बार जांचे जाते हैं, जब तक इसे Google Play से इंस्टॉल न किया गया हो (gettarka.com)</translation>
  <translation id="1628159678930647766">इस फ़ोन पर वॉइस सर्च के लिए <ph name="LANGUAGE"/> चाहिए।</translation>
  <translation id="5742981176567952751">वॉइस के लिए एक भाषा डाउनलोड करनी होगी</translation>
 +<translation id="2909061206413994027">आपके फ़ोन की भाषाओं में से एक</translation>
 +<translation id="7725059829419187774">आप Tark के कीबोर्ड से <ph name="LANGUAGE"/> लिखते हैं</translation>
 +<translation id="2821218832459371654">आप <ph name="LANGUAGE"/> में कैप्शन देखते हैं</translation>
++<translation id="3393888652842526040">वॉइस की भाषाएं</translation>
++<translation id="8992569049556162632">वॉइस सर्च इसी फ़ोन पर काम करता है, आप जो बोलते हैं वह कहीं नहीं भेजा जाता। हर भाषा एक बार डाउनलोड करनी होती है।</translation>
++<translation id="6462259274816894448">इस फ़ोन पर</translation>
++<translation id="8157728322324420120">आपके लिए सुझाव</translation>
++<translation id="5347100073155226064">जब साइट भाषा न बताए, तब यही इस्तेमाल होती है</translation>
++<translation id="1130658841328970784">✓ तैयार</translation>
++<translation id="2542401797433880942">वॉइस की भाषाओं की सूची देखने और उन्हें डाउनलोड करने के लिए Android 13 या उसके बाद का वर्शन चाहिए</translation>
++<translation id="2215130718453107281">Android की वॉइस सेटिंग खोलें</translation>
  </translationbundle>
 \ No newline at end of file
