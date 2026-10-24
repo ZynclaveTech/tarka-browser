@@ -20,7 +20,10 @@ on-device pack must be installed on the emulator; ta-IN must not be.
 Each case starts from a cleared app with the microphone granted. With
 neither, no speech is fed and answers/offline report NOT RUN (with what
 silence gave). Prints "ok CASE", "FAIL CASE: why" or "NOT RUN CASE: why";
-exits 1 unless every case is ok. Emulator only.
+exits 1 unless every case is ok. Emulator only, unless --phone: then the
+phone's own Tark is used as installed (APK is not installed, the app is
+never cleared), cases that need root report NOT RUN, and the phone's
+airplane mode and Tark's microphone permission are put back as they were.
 """
 import argparse
 import functools
@@ -58,16 +61,52 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         pass
 
 
+MIC = 'android.permission.RECORD_AUDIO'
+
+
 class Device(xlit.Device):
+    def __init__(self, serial, phone=False):
+        super().__init__(serial)
+        # A phone holds its owner's Tark: never cleared, no root, no flags,
+        # and its settings go back as they were (remember_state, restore).
+        self.phone = phone
+        self.saved = {}
+
+    def remember_state(self):
+        self.saved = {
+            'airplane': self.shell('settings', 'get', 'global', 'airplane_mode_on').strip() == '1',
+            'mic': f'{MIC}: granted=true' in self.shell('dumpsys', 'package', PACKAGE),
+        }
+
+    def restore(self):
+        if not self.saved:
+            return
+        self.airplane(self.saved['airplane'])
+        self.shell('pm', 'grant' if self.saved['mic'] else 'revoke', PACKAGE, MIC)
+
+    def airplane(self, on):
+        self.shell('cmd', 'connectivity', 'airplane-mode', 'enable' if on else 'disable')
+
     def fresh(self, flags=(), mic=True):
-        """A cleared app, the microphone granted (or revoked), on Wi-Fi."""
+        """A cleared app (on a phone: the owner's, as it is), the microphone
+        granted (or revoked), on Wi-Fi."""
+        self.run('reverse', f'tcp:{PORT}', f'tcp:{PORT}')
+        self.shell('pm', 'grant' if mic else 'revoke', PACKAGE, MIC)
+        if self.phone:
+            if flags:
+                raise NotRun('needs command-line flags, which need root: emulator only')
+            self.airplane(self.saved['airplane'])
+            self.shell('am', 'force-stop', PACKAGE)
+            self.shell('am', 'start', '-n', f'{PACKAGE}/com.google.android.apps.chrome.Main')
+            time.sleep(6)
+            return
         self.run('root')
         self.run('wait-for-device')
         self.run('reverse', f'tcp:{PORT}', f'tcp:{PORT}')
-        self.shell('cmd', 'connectivity', 'airplane-mode', 'disable')
+        self.airplane(False)
         self.shell('svc', 'wifi', 'enable')
         self.shell('pm', 'clear', PACKAGE)
-        self.shell('pm', 'grant' if mic else 'revoke', PACKAGE, 'android.permission.RECORD_AUDIO')
+        self.shell('pm', 'grant' if mic else 'revoke', PACKAGE, MIC)
         # Flags only when a case needs them: their warning is a snackbar too,
         # and it would queue ahead of the one under test.
         if flags:
@@ -78,8 +117,11 @@ class Device(xlit.Device):
         self.start()
 
     def teardown(self):
-        self.shell('cmd', 'connectivity', 'airplane-mode', 'disable')
-        self.shell('rm', '-f', '/data/local/tmp/chrome-command-line')
+        if self.phone:
+            self.restore()
+        else:
+            self.airplane(False)
+            self.shell('rm', '-f', '/data/local/tmp/chrome-command-line')
         self.run('reverse', '--remove', f'tcp:{PORT}')
 
     def open(self, url):
@@ -266,12 +308,12 @@ def case_answers(dev):
 
 def case_offline(dev):
     dev.fresh()
-    dev.shell('cmd', 'connectivity', 'airplane-mode', 'enable')
+    dev.airplane(True)
     time.sleep(3)
     try:
         return answer(dev)
     finally:
-        dev.shell('cmd', 'connectivity', 'airplane-mode', 'disable')
+        dev.airplane(dev.saved.get('airplane', False))
 
 
 def case_missing_pack(dev):
@@ -426,26 +468,32 @@ def main(argv=None):
     feed.add_argument('--inject', dest='feed', action='store_const', const='inject',
                       help="feed speech through the emulator's gRPC injectAudio "
                       '(emulator 37.1.11 on an arm64 Mac crashes on it)')
+    parser.add_argument('--phone', action='store_true',
+                        help='SERIAL is a phone: its Tark (already installed, never '
+                        'cleared or reinstalled) is used as it is, and its airplane '
+                        'mode and microphone permission are put back afterwards')
     parser.add_argument('cases', nargs='*', default=list(CASES))
     args = parser.parse_args(argv)
-    if not args.serial.startswith('emulator-'):
-        print('emulator only', file=sys.stderr)
+    if not args.serial.startswith('emulator-') and not args.phone:
+        print(f'{args.serial} is not an emulator: pass --phone to use it as a phone', file=sys.stderr)
         return 2
     ARGS.update(serial=args.serial, apk=args.apk, feed=args.feed)
-    dev = Device(args.serial)
+    dev = Device(args.serial, phone=args.phone)
     # The microphone's plumbing first: a case must not find it broken
     # mid-listen.
     if args.feed == 'inject':
         emulator_grpc()
         phrase_pcm()
-    installed = subprocess.run(dev.adb + ['install', '-r', args.apk], capture_output=True, text=True)
-    if 'Success' not in installed.stdout:
+    installed = None if args.phone else subprocess.run(
+        dev.adb + ['install', '-r', args.apk], capture_output=True, text=True)
+    if installed and 'Success' not in installed.stdout:
         print(f'install failed: {installed.stdout}{installed.stderr}', file=sys.stderr)
         return 2
     socketserver.ThreadingTCPServer.allow_reuse_address = True
     server = socketserver.ThreadingTCPServer(('127.0.0.1', PORT), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     failed = 0
+    dev.remember_state()
     try:
         for name in args.cases:
             RESULTS.clear()
