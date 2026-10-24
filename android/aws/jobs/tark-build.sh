@@ -79,7 +79,11 @@ if (( code == 0 )); then
   # vpython also brings the runners' packages (protobuf: the tree's copy
   # lacks the generated well-known types; devil needs packaging): a venv of
   # their own, kept between runs.
-  { [[ -x /tark/junit-venv/bin/python ]] || python3 -m venv /tark/junit-venv; } >> $log 2>&1
+  # (Ubuntu's python3-venv brings pip into it; without it the venv has none.)
+  if [[ ! -x /tark/junit-venv/bin/pip ]]; then
+    { sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q python3-venv &&
+      rm -rf /tark/junit-venv && python3 -m venv /tark/junit-venv; } >> $log 2>&1
+  fi
   /tark/junit-venv/bin/pip -q install protobuf packaging psutil six >> $log 2>&1
   {
     ninja -C $o content_junit_tests chrome_junit_tests &&
