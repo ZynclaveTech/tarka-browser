@@ -68,7 +68,7 @@ if (( code == 0 )); then
 fi
 # Speech (voice input): the junit tests of the two speech patches, built and
 # run here on the same tree (the runners with a venv's Python: there is no
-# vpython3); a failure fails the job.
+# vpython3); a failure, or a filter that runs no test, fails the job.
 if (( code == 0 )); then
   o=/tark/work/src/out/Default
   # The runners' unittest_util.py subclasses unittest._TextTestResult, gone
@@ -78,20 +78,31 @@ if (( code == 0 )); then
   export PYTHONPATH=/tark/pyshim
   # vpython also brings the runners' packages (protobuf: the tree's copy
   # lacks the generated well-known types; devil needs packaging): a venv of
-  # their own, kept between runs.
-  # (Ubuntu's python3-venv brings pip into it; without it the venv has none.)
+  # their own, kept between runs, from pinned and hashed versions. Ubuntu's
+  # python3-venv brings pip into it; without it the venv has none.
+  venv_ok=1
   if [[ ! -x /tark/junit-venv/bin/pip ]]; then
     { sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q python3-venv &&
-      rm -rf /tark/junit-venv && python3 -m venv /tark/junit-venv; } >> $log 2>&1
+      rm -rf /tark/junit-venv && python3 -m venv /tark/junit-venv; } >> $log 2>&1 || venv_ok=0
   fi
-  /tark/junit-venv/bin/pip -q install protobuf packaging psutil six >> $log 2>&1
-  {
-    ninja -C $o content_junit_tests chrome_junit_tests &&
-    /tark/junit-venv/bin/python $o/bin/run_content_junit_tests --gtest_filter='*SpeechRecognitionImplTest*' &&
-    /tark/junit-venv/bin/python $o/bin/run_chrome_junit_tests --gtest_filter='*SpeechLanguageSnackbarTest*'
-  } > /tark/junit.log 2>&1
-  code=$?
+  (( venv_ok )) && /tark/junit-venv/bin/pip -q install --require-hashes \
+    -r $repo/android/aws/jobs/junit-requirements.txt >> $log 2>&1 || venv_ok=0
+  if (( ! venv_ok )); then
+    echo "junit: could not set up /tark/junit-venv" >> $log
+    code=1
+  else
+    {
+      ninja -C $o content_junit_tests chrome_junit_tests &&
+      /tark/junit-venv/bin/python $o/bin/run_content_junit_tests --gtest_filter='*SpeechRecognitionImplTest*' &&
+      /tark/junit-venv/bin/python $o/bin/run_chrome_junit_tests --gtest_filter='*SpeechLanguageSnackbarTest*'
+    } > /tark/junit.log 2>&1
+    code=$?
+    # A filter that matches nothing "passes" with no test run.
+    for t in SpeechRecognitionImplTest SpeechLanguageSnackbarTest; do
+      grep -q "OK \] .*$t\." /tark/junit.log || { echo "junit: no $t test ran" >> $log; code=1; }
+    done
+    upload /tark/junit.log junit.log
+  fi
   echo "junit exit $code" >> $log
-  upload /tark/junit.log junit.log
 fi
 exit $code

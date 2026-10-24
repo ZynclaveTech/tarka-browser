@@ -33,6 +33,7 @@ import json
 import os
 import pathlib
 import re
+import signal
 import socketserver
 import subprocess
 import sys
@@ -72,26 +73,40 @@ class Device(xlit.Device):
         self.phone = phone
         self.saved = {}
 
-    def remember_state(self):
-        self.saved = {
-            'airplane': self.shell('settings', 'get', 'global', 'airplane_mode_on').strip() == '1',
+    def current_state(self):
+        return {
+            'airplane': self.airplane_on(),
             'mic': f'{MIC}: granted=true' in self.shell('dumpsys', 'package', PACKAGE),
         }
 
+    def remember_state(self):
+        self.saved = self.current_state()
+
+    def airplane_on(self):
+        return self.shell('settings', 'get', 'global', 'airplane_mode_on').strip() == '1'
+
     def restore(self):
+        """Puts the remembered state back; returns what it could not (some
+        phones refuse the shell a revoke: REVOKE_RUNTIME_PERMISSIONS)."""
         if not self.saved:
-            return
-        self.airplane(self.saved['airplane'])
-        self.shell('pm', 'grant' if self.saved['mic'] else 'revoke', PACKAGE, MIC)
-        # Some phones refuse the shell a revoke (REVOKE_RUNTIME_PERMISSIONS):
-        # say so rather than leave the microphone granted unnoticed.
-        before = self.saved
-        self.remember_state()
-        for key, was in before.items():
-            if self.saved[key] != was:
-                print(f'WARNING: could not put back {key} (was {was}, now '
-                      f'{self.saved[key]}): do it by hand on the phone', file=sys.stderr)
-        self.saved = before
+            return []
+        steps = {
+            'airplane': lambda: self.airplane(self.saved['airplane']),
+            'mic': lambda: self.shell('pm', 'grant' if self.saved['mic'] else 'revoke', PACKAGE, MIC),
+        }
+        failed = []
+        for key, step in steps.items():
+            try:
+                step()
+            except Exception as e:  # noqa: BLE001 — every step is tried
+                failed.append(f'{key}: {type(e).__name__}: {e}')
+        try:
+            now = self.current_state()
+        except Exception as e:  # noqa: BLE001
+            return failed + [f'could not read the state back: {type(e).__name__}: {e}']
+        failed += [f'{key} (was {was}, now {now[key]})' for key, was in self.saved.items()
+                   if now[key] != was and not any(f.startswith(key) for f in failed)]
+        return failed
 
     def airplane(self, on):
         self.shell('cmd', 'connectivity', 'airplane-mode', 'enable' if on else 'disable')
@@ -126,12 +141,18 @@ class Device(xlit.Device):
         self.start()
 
     def teardown(self):
+        """Returns what could not be put back (a phone's state)."""
+        failed = []
         if self.phone:
-            self.restore()
+            try:
+                failed = self.restore()
+            except Exception as e:  # noqa: BLE001
+                failed = [f'restore: {type(e).__name__}: {e}']
         else:
             self.airplane(False)
             self.shell('rm', '-f', '/data/local/tmp/chrome-command-line')
         self.run('reverse', '--remove', f'tcp:{PORT}')
+        return failed
 
     def open(self, url):
         # The same application id: Chrome loads it in the app's own tab.
@@ -166,8 +187,11 @@ class Device(xlit.Device):
             quiet = quiet + 1 if state.startswith('listening') and 'Allow' not in xml else 0
             if quiet == 2:
                 return
-            # Chrome asks the site for the microphone once per profile.
-            for label in ('Allow this time', 'Allow while visiting the site', 'Allow'):
+            # Chrome asks the site for the microphone once per profile (on a
+            # phone, only ever for this time: the owner's profile keeps nothing).
+            labels = ('Allow this time',) if self.phone else (
+                'Allow this time', 'Allow while visiting the site', 'Allow')
+            for label in labels:
                 if self.tap_in(xml, label):
                     break
             else:
@@ -193,9 +217,18 @@ class Device(xlit.Device):
             time.sleep(1)
         return last
 
-    def fatal(self):
-        log = self.run('logcat', '-d')
-        return [l for l in log.splitlines() if 'FATAL EXCEPTION' in l or 'Fatal signal' in l]
+    def mark(self):
+        """The device's clock now, for logcat -T: what is logged from here on
+        (the log is never cleared: a phone's belongs to its owner)."""
+        return self.shell('date', "'+%m-%d %H:%M:%S.000'").strip()
+
+    def log_since(self, mark, *args):
+        return self.run('logcat', '-d', '-T', mark, *args)
+
+    def fatal(self, mark):
+        """Tark's crashes since `mark` (the crash buffer: Java and native)."""
+        log = self.log_since(mark, '-b', 'crash')
+        return [l for l in log.splitlines() if PACKAGE in l]
 
 
 # --- the emulator's microphone -----------------------------------------------
@@ -317,10 +350,14 @@ def case_answers(dev):
 
 
 def case_offline(dev):
+    if dev.phone and (':' in ARGS['serial'] or ARGS['serial'].startswith('adb-')):
+        raise NotRun('needs USB: airplane mode would cut a wireless adb connection')
     dev.fresh()
     dev.airplane(True)
     time.sleep(3)
     try:
+        if not dev.airplane_on():
+            raise NotRun('airplane mode did not turn on')
         return answer(dev)
     finally:
         dev.airplane(dev.saved.get('airplane', False))
@@ -403,12 +440,12 @@ def case_navigate_away(dev):
     time.sleep(4)
     if not xlit.tap_text(dev, 'Listen'):
         return 'no Listen button'
-    if not xlit.tap_text(dev, 'Allow while visiting the site'):
+    if not xlit.tap_text(dev, 'Allow this time' if dev.phone else 'Allow while visiting the site'):
         return 'no microphone prompt'
     first = dev.wait_out('error:', 25)
     if not first.startswith(('error:', 'result:')):
         return f'the first session did not end: "{first}"'
-    dev.run('logcat', '-c')
+    mark = dev.mark()
     m = re.search(r'text="Listen"[^>]*bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"', dev.screen())
     if not m:
         return 'no Listen button the second time'
@@ -419,9 +456,16 @@ def case_navigate_away(dev):
     dev.open('http://127.0.0.1:%d/page.html?lang=en-GB&away=1' % PORT)
     RESULTS['navigated after'] = f'{time.time() - started:.1f} s'
     time.sleep(8)
-    if 'SpeechRecog' not in dev.run('logcat', '-d') and 'AiAiSpeech' not in dev.run('logcat', '-d'):
-        RESULTS['note'] = 'no recognizer log line seen for the second session'
-    fatal = dev.fatal()
+    # The second session must have started, or nothing was navigated away
+    # from: the recognizer logs it (no screen read: it would take longer
+    # than the second this case allows).
+    log = dev.log_since(mark)
+    started_lines = [l for l in log.splitlines()
+                     if 'startListening' in l.replace('#', '') or 'onMicrophoneOpened' in l]
+    if not started_lines:
+        return 'no sign the second session started (no recognizer startListening logged)'
+    RESULTS['second session'] = started_lines[0].strip()[-120:]
+    fatal = dev.fatal(mark)
     if fatal:
         return f'crashed: {fatal[0]}'
     if not dev.shell('pidof', PACKAGE).strip():
@@ -469,7 +513,7 @@ CASES = {name[5:]: fn for name, fn in globals().items() if name.startswith('case
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument('apk')
+    parser.add_argument('apk', nargs='?', help='the build to install (not with --phone)')
     parser.add_argument('--serial', default='emulator-5554')
     feed = parser.add_mutually_exclusive_group()
     feed.add_argument('--speaker', dest='feed', action='store_const', const='speaker',
@@ -490,6 +534,8 @@ def main(argv=None):
     if not args.serial.startswith('emulator-') and not args.phone:
         print(f'{args.serial} is not an emulator: pass --phone to use it as a phone', file=sys.stderr)
         return 2
+    if not args.phone and not args.apk:
+        parser.error('APK is required (except with --phone)')
     ARGS.update(serial=args.serial, apk=args.apk, feed=args.feed,
                 speaker_device=args.speaker_device)
     dev = Device(args.serial, phone=args.phone)
@@ -508,6 +554,11 @@ def main(argv=None):
     threading.Thread(target=server.serve_forever, daemon=True).start()
     failed = 0
     dev.remember_state()
+
+    def stop(signum, _frame):
+        raise SystemExit(128 + signum)  # through `finally`: the state goes back
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, stop)
     try:
         for name in args.cases:
             RESULTS.clear()
@@ -526,9 +577,14 @@ def main(argv=None):
             for key, value in RESULTS.items():
                 print(f'    {key}: {value}', flush=True)
     finally:
-        dev.teardown()
+        try:
+            not_restored = dev.teardown()
+        except Exception as e:  # noqa: BLE001
+            not_restored = [f'teardown: {type(e).__name__}: {e}']
+        for what in not_restored:
+            print(f'NOT RESTORED: {what}', flush=True)
         server.shutdown()
-    return 1 if failed else 0
+    return 1 if failed or not_restored else 0
 
 
 if __name__ == '__main__':
