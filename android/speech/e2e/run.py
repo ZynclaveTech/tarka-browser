@@ -265,10 +265,11 @@ def say_aloud(stop):
     """Plays the phrase through the Mac's speakers, again and again until
     `stop`: the emulator hears it through the Mac's microphone (host audio),
     whenever its session starts listening."""
-    clip = pathlib.Path(tempfile.mkdtemp(prefix='tark-speech-')) / 'p.aiff'
-    subprocess.run(['say', '-v', 'Samantha', '-o', str(clip), PHRASE], check=True)
+    # `say -a`: a named output (--speaker-device), not whatever the Mac's
+    # default is (headphones would play it to nobody).
+    device = ['-a', ARGS['speaker_device']] if ARGS.get('speaker_device') else []
     while not stop.is_set():
-        subprocess.run(['afplay', '-v', '1', str(clip)])
+        subprocess.run(['say', '-v', 'Samantha', *device, PHRASE])
         stop.wait(1.5)
 
 
@@ -477,6 +478,9 @@ def main(argv=None):
     feed.add_argument('--inject', dest='feed', action='store_const', const='inject',
                       help="feed speech through the emulator's gRPC injectAudio "
                       '(emulator 37.1.11 on an arm64 Mac crashes on it)')
+    parser.add_argument('--speaker-device', metavar='NAME',
+                        help="with --speaker: the Mac's output to play on (`say -a '?'` "
+                        "lists them), e.g. 'MacBook Pro Speakers'")
     parser.add_argument('--phone', action='store_true',
                         help='SERIAL is a phone: its Tark (already installed, never '
                         'cleared or reinstalled) is used as it is, and its airplane '
@@ -486,7 +490,8 @@ def main(argv=None):
     if not args.serial.startswith('emulator-') and not args.phone:
         print(f'{args.serial} is not an emulator: pass --phone to use it as a phone', file=sys.stderr)
         return 2
-    ARGS.update(serial=args.serial, apk=args.apk, feed=args.feed)
+    ARGS.update(serial=args.serial, apk=args.apk, feed=args.feed,
+                speaker_device=args.speaker_device)
     dev = Device(args.serial, phone=args.phone)
     # The microphone's plumbing first: a case must not find it broken
     # mid-listen.
