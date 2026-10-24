@@ -67,20 +67,23 @@ if (( code == 0 )); then
   upload /tark/xlit-files.tgz xlit-files.tgz
 fi
 # Speech (voice input): the junit tests of the two speech patches, built and
-# run here on the same tree (the runners with the machine's python3: there
-# is no vpython3); a failure fails the job.
+# run here on the same tree (the runners with a venv's Python: there is no
+# vpython3); a failure fails the job.
 if (( code == 0 )); then
   o=/tark/work/src/out/Default
   # The runners' unittest_util.py subclasses unittest._TextTestResult, gone
   # from the machine's Python 3.12 (vpython brings 3.11): alias it back.
   mkdir -p /tark/pyshim
   echo 'import unittest; unittest._TextTestResult = unittest.TextTestResult' > /tark/pyshim/sitecustomize.py
-  # protobuf (google.protobuf) is vpython's too: the tree's copy.
-  export PYTHONPATH=/tark/pyshim:/tark/work/src/third_party/protobuf/python
+  export PYTHONPATH=/tark/pyshim
+  # protobuf is vpython's too (the tree's copy lacks the generated
+  # well-known types): a venv of its own, kept between runs.
+  [[ -x /tark/junit-venv/bin/python ]] ||
+    { python3 -m venv /tark/junit-venv && /tark/junit-venv/bin/pip -q install protobuf; } >> $log 2>&1
   {
     ninja -C $o content_junit_tests chrome_junit_tests &&
-    python3 $o/bin/run_content_junit_tests --gtest_filter='*SpeechRecognitionImplTest*' &&
-    python3 $o/bin/run_chrome_junit_tests --gtest_filter='*SpeechLanguageSnackbarTest*'
+    /tark/junit-venv/bin/python $o/bin/run_content_junit_tests --gtest_filter='*SpeechRecognitionImplTest*' &&
+    /tark/junit-venv/bin/python $o/bin/run_chrome_junit_tests --gtest_filter='*SpeechLanguageSnackbarTest*'
   } > /tark/junit.log 2>&1
   code=$?
   echo "junit exit $code" >> $log
