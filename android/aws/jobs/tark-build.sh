@@ -75,7 +75,8 @@ if (( code == 0 )); then
   # from the machine's Python 3.12 (vpython brings 3.11): alias it back.
   mkdir -p /tark/pyshim
   echo 'import unittest; unittest._TextTestResult = unittest.TextTestResult' > /tark/pyshim/sitecustomize.py
-  export PYTHONPATH=/tark/pyshim
+  # protobuf (google.protobuf) is vpython's too: the tree's copy.
+  export PYTHONPATH=/tark/pyshim:/tark/work/src/third_party/protobuf/python
   {
     ninja -C $o content_junit_tests chrome_junit_tests &&
     python3 $o/bin/run_content_junit_tests --gtest_filter='*SpeechRecognitionImplTest*' &&
