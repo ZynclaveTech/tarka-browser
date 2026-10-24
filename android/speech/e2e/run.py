@@ -9,14 +9,16 @@
                permission_denied
 
 Installs APK, serves page.html from this Mac (port 8005, through adb
-reverse) and reads the page's #out line from the screen. Speech goes into
-the emulator's virtual microphone through its gRPC injectAudio call: the
-emulator must run with `-grpc 8554 -grpc-use-token` and without -no-audio,
-and this script needs grpcio and grpcio-tools (stubs are generated from the
-SDK's emulator_controller.proto). The phrase is macOS `say` output. The
-en-US on-device pack must be installed on the emulator; ta-IN must not be.
-Each case starts from a cleared app with the microphone granted. Without
---inject no speech is fed and answers/offline report NOT RUN (with what
+reverse) and reads the page's #out line from the screen. Speech, the
+phrase as macOS `say` speaks it, reaches the emulator's microphone one of
+two ways: --speaker plays it through the Mac's speakers into the Mac's
+microphone, which the emulator takes as host audio (start it without
+-no-audio, with -allow-host-audio, then `adb emu avd hostmicon`); --inject
+streams it in through the emulator's gRPC injectAudio call (start it with
+`-grpc 8554 -grpc-use-token`; needs grpcio and grpcio-tools). The en-US
+on-device pack must be installed on the emulator; ta-IN must not be.
+Each case starts from a cleared app with the microphone granted. With
+neither, no speech is fed and answers/offline report NOT RUN (with what
 silence gave). Prints "ok CASE", "FAIL CASE: why" or "NOT RUN CASE: why";
 exits 1 unless every case is ok. Emulator only.
 """
@@ -208,22 +210,50 @@ class NotRun(Exception):
     """A case that could not be run here; never a pass."""
 
 
+def say_aloud(stop):
+    """Plays the phrase through the Mac's speakers, again and again until
+    `stop`: the emulator hears it through the Mac's microphone (host audio),
+    whenever its session starts listening."""
+    clip = pathlib.Path(tempfile.mkdtemp(prefix='tark-speech-')) / 'p.aiff'
+    subprocess.run(['say', '-v', 'Samantha', '-o', str(clip), PHRASE], check=True)
+    while not stop.is_set():
+        subprocess.run(['afplay', '-v', '1', str(clip)])
+        stop.wait(1.5)
+
+
 def answer(dev):
     """Listens for en-US while the phrase plays; returns '' or why not."""
-    dev.listen('en-US')
-    if not ARGS['inject']:
+    if ARGS['feed'] == 'speaker':
+        stop = threading.Event()
+        player = threading.Thread(target=say_aloud, args=(stop,))
+        # Playing from before the tap: the session hears the phrase however
+        # long the site's microphone prompt takes.
+        player.start()
+        try:
+            dev.listen('en-US')
+            got = dev.wait_out('result:', 25)
+        finally:
+            stop.set()
+            player.join()
+    elif ARGS['feed'] == 'inject':
+        dev.listen('en-US')
+        speaker = threading.Thread(target=speak)
+        speaker.start()
+        got = dev.wait_out('result:', 25)
+        speaker.join()
+    else:
+        dev.listen('en-US')
         # No speech can be fed: what silence gives still shows whether the
         # on-device recognizer took the session (no-speech) or refused it.
         RESULTS['silence'] = dev.wait_out('error:', 25)
-        raise NotRun('no speech fed (run with --inject on an emulator whose '
-                     'gRPC injectAudio works)')
-    speaker = threading.Thread(target=speak)
-    speaker.start()
-    got = dev.wait_out('result:', 25)
-    speaker.join()
+        raise NotRun('no speech fed (run with --speaker or --inject)')
     RESULTS['transcript'] = got
     if not got.startswith('result:'):
         return f'#out is "{got}"'
+    # Through a speaker and a microphone the words can come back a little
+    # different: the first word is the check.
+    if 'hello' not in got.lower():
+        return f'the transcript is not the phrase: "{got}"'
     return ''
 
 
@@ -389,19 +419,23 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument('apk')
     parser.add_argument('--serial', default='emulator-5554')
-    parser.add_argument('--inject', action='store_true',
-                        help="feed speech through the emulator's gRPC injectAudio "
-                        '(emulator 37.1.11 on an arm64 Mac crashes on it)')
+    feed = parser.add_mutually_exclusive_group()
+    feed.add_argument('--speaker', dest='feed', action='store_const', const='speaker',
+                      help="play the phrase through the Mac's speakers into the emulator's "
+                      'host microphone (-allow-host-audio, `adb emu avd hostmicon`)')
+    feed.add_argument('--inject', dest='feed', action='store_const', const='inject',
+                      help="feed speech through the emulator's gRPC injectAudio "
+                      '(emulator 37.1.11 on an arm64 Mac crashes on it)')
     parser.add_argument('cases', nargs='*', default=list(CASES))
     args = parser.parse_args(argv)
     if not args.serial.startswith('emulator-'):
         print('emulator only', file=sys.stderr)
         return 2
-    ARGS.update(serial=args.serial, apk=args.apk, inject=args.inject)
+    ARGS.update(serial=args.serial, apk=args.apk, feed=args.feed)
     dev = Device(args.serial)
     # The microphone's plumbing first: a case must not find it broken
     # mid-listen.
-    if args.inject:
+    if args.feed == 'inject':
         emulator_grpc()
         phrase_pcm()
     installed = subprocess.run(dev.adb + ['install', '-r', args.apk], capture_output=True, text=True)
