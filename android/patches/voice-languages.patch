@@ -1,6 +1,6 @@
 diff '--color=never' -ruN a/chrome/android/chrome_java_sources.gni b/chrome/android/chrome_java_sources.gni
---- a/chrome/android/chrome_java_sources.gni	2026-10-25 02:34:33.296683334 +0530
-+++ b/chrome/android/chrome_java_sources.gni	2026-10-25 02:34:33.271735886 +0530
+--- a/chrome/android/chrome_java_sources.gni	2026-10-25 02:36:40.586459348 +0530
++++ b/chrome/android/chrome_java_sources.gni	2026-10-25 02:36:40.562180951 +0530
 @@ -1149,6 +1149,7 @@
    "java/src/org/chromium/chrome/browser/site_settings/ChromeSiteSettingsDelegate.java",
    "java/src/org/chromium/chrome/browser/site_settings/ManageSpaceActivity.java",
@@ -11,8 +11,8 @@ diff '--color=never' -ruN a/chrome/android/chrome_java_sources.gni b/chrome/andr
    "java/src/org/chromium/chrome/browser/status_indicator/StatusIndicatorProperties.java",
 diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguages.java b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguages.java
 --- a/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguages.java	1970-01-01 05:30:00.000000000 +0530
-+++ b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguages.java	2026-10-25 02:34:33.384821309 +0530
-@@ -0,0 +1,165 @@
++++ b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguages.java	2026-10-25 02:36:40.680428899 +0530
+@@ -0,0 +1,217 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -75,20 +75,72 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
 +    }
 +
 +    /** One row: the BCP 47 tag, its name in the UI's language, the suggestion's reason, if any. */
-+    public record Entry(String tag, String displayName, @Nullable String reason, State state) {}
++    public static final class Entry {
++        private final String mTag;
++        private final String mDisplayName;
++        private final @Nullable String mReason;
++        private final State mState;
++
++        public Entry(String tag, String displayName, @Nullable String reason, State state) {
++            mTag = tag;
++            mDisplayName = displayName;
++            mReason = reason;
++            mState = state;
++        }
++
++        public String tag() {
++            return mTag;
++        }
++
++        public String displayName() {
++            return mDisplayName;
++        }
++
++        public @Nullable String reason() {
++            return mReason;
++        }
++
++        public State state() {
++            return mState;
++        }
++    }
 +
 +    /** The three sections, in display order. */
-+    public record Sections(List<Entry> onPhone, List<Entry> suggested, List<Entry> more) {}
++    public static final class Sections {
++        private final List<Entry> mOnPhone;
++        private final List<Entry> mSuggested;
++        private final List<Entry> mMore;
++
++        public Sections(List<Entry> onPhone, List<Entry> suggested, List<Entry> more) {
++            mOnPhone = onPhone;
++            mSuggested = suggested;
++            mMore = more;
++        }
++
++        public List<Entry> onPhone() {
++            return mOnPhone;
++        }
++
++        public List<Entry> suggested() {
++            return mSuggested;
++        }
++
++        public List<Entry> more() {
++            return mMore;
++        }
++    }
 +
 +    private VoiceLanguages() {}
 +
 +    /**
-+     * Builds the sections.
++     * Builds the sections. The lists and the map are non-null; a null tag in a list counts as
++     * malformed and is dropped.
 +     *
 +     * @param installed tags Android's on-device recognizer has.
 +     * @param pending tags it is downloading.
 +     * @param supported tags it can download, in Android's order.
 +     * @param signals the person's languages by language subtag ("hi"), with why each is one.
++     *     Keys are normalised like tags, so legacy codes match (he/iw, id/in).
 +     * @param phoneLocale the phone's locale; its region picks a suggestion's region.
 +     * @param uiLocale the locale names are shown in.
 +     */
@@ -125,7 +177,7 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
 +
 +        Map<String, Reason> wanted = new LinkedHashMap<>();
 +        for (Map.Entry<String, Reason> signal : signals.entrySet()) {
-+            wanted.put(signal.getKey().toLowerCase(Locale.ROOT), signal.getValue());
++            wanted.put(language(signal.getKey()), signal.getValue());
 +        }
 +
 +        List<Entry> suggested = new ArrayList<>();
@@ -157,10 +209,10 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
 +        return new Sections(onPhone, suggested, more);
 +    }
 +
-+    private static List<String> wellFormed(List<String> tags) {
++    private static List<String> wellFormed(List<@Nullable String> tags) {
 +        List<String> result = new ArrayList<>();
 +        for (String tag : tags) {
-+            if (SpeechLanguageSnackbar.isWellFormedTag(tag)) result.add(tag);
++            if (tag != null && SpeechLanguageSnackbar.isWellFormedTag(tag)) result.add(tag);
 +        }
 +        return result;
 +    }
@@ -179,8 +231,8 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
 +    }
 +}
 diff '--color=never' -ruN a/chrome/android/junit/BUILD.gn b/chrome/android/junit/BUILD.gn
---- a/chrome/android/junit/BUILD.gn	2026-10-25 02:34:33.324212357 +0530
-+++ b/chrome/android/junit/BUILD.gn	2026-10-25 02:34:33.302079821 +0530
+--- a/chrome/android/junit/BUILD.gn	2026-10-25 02:36:40.615550642 +0530
++++ b/chrome/android/junit/BUILD.gn	2026-10-25 02:36:40.592803305 +0530
 @@ -1232,11 +1232,14 @@
      ]
    }
@@ -200,8 +252,8 @@ diff '--color=never' -ruN a/chrome/android/junit/BUILD.gn b/chrome/android/junit
        ":chrome_junit_tests_helper",
 diff '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguagesTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguagesTest.java
 --- a/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguagesTest.java	1970-01-01 05:30:00.000000000 +0530
-+++ b/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguagesTest.java	2026-10-25 02:34:33.399126369 +0530
-@@ -0,0 +1,181 @@
++++ b/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguagesTest.java	2026-10-25 02:36:40.695121131 +0530
+@@ -0,0 +1,216 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -299,11 +351,32 @@ diff '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome/browser
 +                        signals(),
 +                        PHONE_IN,
 +                        UI);
-+        List<Entry> more = s.more();
-+        assertEquals(3, more.size());
-+        for (int i = 1; i < more.size(); i++) {
-+            assertTrue(more.get(i - 1).displayName().compareTo(more.get(i).displayName()) < 0);
-+        }
++        assertEquals(List.of("bn-IN", "hi-IN", "ta-IN"), tags(s.more()));
++    }
++
++    // A legacy code in a signal ("iw") matches the tag's language. ("iw-IL" itself fails
++    // isWellFormedTag's round trip, which turns it into "he-IL".)
++    @Test
++    public void testLegacyCodeSignalMatches() {
++        Sections s =
++                VoiceLanguages.build(
++                        List.of(),
++                        List.of(),
++                        List.of("he-IL", "en-US"),
++                        signals("iw", Reason.PHONE),
++                        PHONE_US,
++                        UI);
++        assertEquals(List.of("he-IL"), tags(s.suggested()));
++    }
++
++    @Test
++    public void testNullTagDropped() {
++        List<String> supported = new ArrayList<>();
++        supported.add(null);
++        supported.add("hi-IN");
++        Sections s =
++                VoiceLanguages.build(List.of(), List.of(), supported, signals(), PHONE_IN, UI);
++        assertEquals(List.of("hi-IN"), tags(s.more()));
 +    }
 +
 +    @Test
@@ -318,6 +391,20 @@ diff '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome/browser
 +                        UI);
 +        assertTrue(s.suggested().isEmpty());
 +        assertEquals(List.of("hi-IN"), tags(s.onPhone()));
++    }
++
++    @Test
++    public void testInstalledOtherRegionOnlyInMore() {
++        Sections s =
++                VoiceLanguages.build(
++                        List.of("hi-IN"),
++                        List.of(),
++                        List.of("hi-IN", "hi-US"),
++                        signals("hi", Reason.TARK_LANGUAGES),
++                        PHONE_US,
++                        UI);
++        assertTrue(s.suggested().isEmpty());
++        assertEquals(List.of("hi-US"), tags(s.more()));
 +    }
 +
 +    @Test
@@ -384,8 +471,8 @@ diff '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome/browser
 +    }
 +}
 diff '--color=never' -ruN a/chrome/browser/ui/android/strings/android_chrome_strings.grd b/chrome/browser/ui/android/strings/android_chrome_strings.grd
---- a/chrome/browser/ui/android/strings/android_chrome_strings.grd	2026-10-25 02:34:33.352365305 +0530
-+++ b/chrome/browser/ui/android/strings/android_chrome_strings.grd	2026-10-25 02:34:33.329626552 +0530
+--- a/chrome/browser/ui/android/strings/android_chrome_strings.grd	2026-10-25 02:36:40.646574460 +0530
++++ b/chrome/browser/ui/android/strings/android_chrome_strings.grd	2026-10-25 02:36:40.621047171 +0530
 @@ -994,6 +994,16 @@
        <message name="IDS_TARK_SPEECH_LANGUAGE_DOWNLOAD" desc="Tark: action of the voice language snackbar: Android downloads the language (or opens its voice input settings).">
          Download
@@ -404,8 +491,8 @@ diff '--color=never' -ruN a/chrome/browser/ui/android/strings/android_chrome_str
          New versions of Tark, checked once a day unless Google Play installed it (gettarka.com)
        </message>
 diff '--color=never' -ruN a/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb b/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb
---- a/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb	2026-10-25 02:34:33.379752827 +0530
-+++ b/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb	2026-10-25 02:34:33.357453871 +0530
+--- a/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb	2026-10-25 02:36:40.675467793 +0530
++++ b/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb	2026-10-25 02:36:40.653195504 +0530
 @@ -2197,4 +2197,7 @@
  <translation id="8955589894175271948">Tark के नए वर्शन, दिन में एक बार जांचे जाते हैं, जब तक इसे Google Play से इंस्टॉल न किया गया हो (gettarka.com)</translation>
  <translation id="1628159678930647766">इस फ़ोन पर वॉइस सर्च के लिए <ph name="LANGUAGE"/> चाहिए।</translation>
