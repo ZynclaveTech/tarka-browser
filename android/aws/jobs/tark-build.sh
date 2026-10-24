@@ -76,10 +76,11 @@ if (( code == 0 )); then
   mkdir -p /tark/pyshim
   echo 'import unittest; unittest._TextTestResult = unittest.TextTestResult' > /tark/pyshim/sitecustomize.py
   export PYTHONPATH=/tark/pyshim
-  # protobuf is vpython's too (the tree's copy lacks the generated
-  # well-known types): a venv of its own, kept between runs.
-  [[ -x /tark/junit-venv/bin/python ]] ||
-    { python3 -m venv /tark/junit-venv && /tark/junit-venv/bin/pip -q install protobuf; } >> $log 2>&1
+  # vpython also brings the runners' packages (protobuf: the tree's copy
+  # lacks the generated well-known types; devil needs packaging): a venv of
+  # their own, kept between runs.
+  { [[ -x /tark/junit-venv/bin/python ]] || python3 -m venv /tark/junit-venv; } >> $log 2>&1
+  /tark/junit-venv/bin/pip -q install protobuf packaging psutil six >> $log 2>&1
   {
     ninja -C $o content_junit_tests chrome_junit_tests &&
     /tark/junit-venv/bin/python $o/bin/run_content_junit_tests --gtest_filter='*SpeechRecognitionImplTest*' &&
