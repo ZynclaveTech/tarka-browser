@@ -66,8 +66,8 @@ if (( code == 0 )); then
   tar -czf /tark/xlit-files.tgz -C /tark/work/src/third_party/indicxlit android
   upload /tark/xlit-files.tgz xlit-files.tgz
 fi
-# The junit tests of the speech patches (voice input) and of the Private
-# button (private-tab-button.patch), built and
+# The junit tests of the speech and voice patches (voice input) and of the
+# Private button (private-tab-button.patch), built and
 # run here on the same tree (the runners with a venv's Python: there is no
 # vpython3); a failure, or a filter that runs no test, fails the job.
 if (( code == 0 )); then
@@ -95,12 +95,12 @@ if (( code == 0 )); then
     {
       ninja -C $o content_junit_tests chrome_junit_tests &&
       /tark/junit-venv/bin/python $o/bin/run_content_junit_tests --gtest_filter='*SpeechRecognitionImplTest*' &&
-      /tark/junit-venv/bin/python $o/bin/run_chrome_junit_tests --gtest_filter='*SpeechLanguageSnackbarTest*' &&
+      /tark/junit-venv/bin/python $o/bin/run_chrome_junit_tests --gtest_filter='*SpeechLanguageSnackbarTest*:*VoiceLanguagesTest*' &&
       /tark/junit-venv/bin/python $o/bin/run_chrome_junit_tests --gtest_filter='*IncognitoTabSwitcherPaneUnitTest*'
     } > /tark/junit.log 2>&1
     code=$?
     # A filter that matches nothing "passes" with no test run.
-    for t in SpeechRecognitionImplTest SpeechLanguageSnackbarTest IncognitoTabSwitcherPaneUnitTest; do
+    for t in SpeechRecognitionImplTest SpeechLanguageSnackbarTest VoiceLanguagesTest IncognitoTabSwitcherPaneUnitTest; do
       grep -q "OK \] .*$t\." /tark/junit.log || { echo "junit: no $t test ran" >> $log; code=1; }
     done
     upload /tark/junit.log junit.log

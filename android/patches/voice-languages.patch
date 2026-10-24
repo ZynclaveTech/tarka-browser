@@ -1,0 +1,417 @@
+diff '--color=never' -ruN a/chrome/android/chrome_java_sources.gni b/chrome/android/chrome_java_sources.gni
+--- a/chrome/android/chrome_java_sources.gni	2026-10-25 02:34:33.296683334 +0530
++++ b/chrome/android/chrome_java_sources.gni	2026-10-25 02:34:33.271735886 +0530
+@@ -1149,6 +1149,7 @@
+   "java/src/org/chromium/chrome/browser/site_settings/ChromeSiteSettingsDelegate.java",
+   "java/src/org/chromium/chrome/browser/site_settings/ManageSpaceActivity.java",
+   "java/src/org/chromium/chrome/browser/speech/SpeechLanguageSnackbar.java",
++  "java/src/org/chromium/chrome/browser/speech/VoiceLanguages.java",
+   "java/src/org/chromium/chrome/browser/status_indicator/StatusIndicatorCoordinator.java",
+   "java/src/org/chromium/chrome/browser/status_indicator/StatusIndicatorMediator.java",
+   "java/src/org/chromium/chrome/browser/status_indicator/StatusIndicatorProperties.java",
+diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguages.java b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguages.java
+--- a/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguages.java	1970-01-01 05:30:00.000000000 +0530
++++ b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguages.java	2026-10-25 02:34:33.384821309 +0530
+@@ -0,0 +1,165 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++package org.chromium.chrome.browser.speech;
++
++import androidx.annotation.StringRes;
++
++import org.chromium.base.ContextUtils;
++import org.chromium.build.annotations.NullMarked;
++import org.chromium.build.annotations.Nullable;
++import org.chromium.chrome.R;
++
++import java.text.Collator;
++import java.util.ArrayList;
++import java.util.Collections;
++import java.util.HashSet;
++import java.util.LinkedHashMap;
++import java.util.List;
++import java.util.Locale;
++import java.util.Map;
++import java.util.Set;
++
++/**
++ * Tark: the list behind Settings › Voice languages. From the languages Android's on-device
++ * recognizer has (installed), is downloading (pending) and can download (supported), and the
++ * person's signals (the phone's languages, Tark's languages, captions languages; never
++ * browsing), it builds three sections: on this phone, suggested (with the reason) and more.
++ *
++ * <p>Languages are matched on the language subtag: a language installed or pending in any region
++ * is never suggested again. A suggestion takes the supported region equal to the phone's, or else
++ * Android's first listed one. Tags that fail {@link SpeechLanguageSnackbar#isWellFormedTag} are
++ * dropped everywhere.
++ */
++@NullMarked
++public final class VoiceLanguages {
++    /** Whether a language is on the phone, on its way, or only offered. */
++    public enum State {
++        INSTALLED,
++        PENDING,
++        AVAILABLE
++    }
++
++    /** Why a language is suggested. */
++    public enum Reason {
++        PHONE(R.string.tark_voice_reason_phone),
++        TARK_LANGUAGES(R.string.tark_voice_reason_tark_languages),
++        CAPTIONS(R.string.tark_voice_reason_captions);
++
++        private final @StringRes int mText;
++
++        Reason(@StringRes int text) {
++            mText = text;
++        }
++
++        /** The user-facing text; {@code languageName} fills in where the string names one. */
++        public String text(String languageName) {
++            return ContextUtils.getApplicationContext().getString(mText, languageName);
++        }
++    }
++
++    /** One row: the BCP 47 tag, its name in the UI's language, the suggestion's reason, if any. */
++    public record Entry(String tag, String displayName, @Nullable String reason, State state) {}
++
++    /** The three sections, in display order. */
++    public record Sections(List<Entry> onPhone, List<Entry> suggested, List<Entry> more) {}
++
++    private VoiceLanguages() {}
++
++    /**
++     * Builds the sections.
++     *
++     * @param installed tags Android's on-device recognizer has.
++     * @param pending tags it is downloading.
++     * @param supported tags it can download, in Android's order.
++     * @param signals the person's languages by language subtag ("hi"), with why each is one.
++     * @param phoneLocale the phone's locale; its region picks a suggestion's region.
++     * @param uiLocale the locale names are shown in.
++     */
++    public static Sections build(
++            List<String> installed,
++            List<String> pending,
++            List<String> supported,
++            Map<String, Reason> signals,
++            Locale phoneLocale,
++            Locale uiLocale) {
++        List<Entry> onPhone = new ArrayList<>();
++        Set<String> onPhoneTags = new HashSet<>();
++        Set<String> onPhoneLanguages = new HashSet<>();
++        for (String tag : wellFormed(installed)) {
++            if (onPhoneTags.add(key(tag))) {
++                onPhone.add(entry(tag, null, State.INSTALLED, uiLocale));
++                onPhoneLanguages.add(language(tag));
++            }
++        }
++        for (String tag : wellFormed(pending)) {
++            if (onPhoneTags.add(key(tag))) {
++                onPhone.add(entry(tag, null, State.PENDING, uiLocale));
++                onPhoneLanguages.add(language(tag));
++            }
++        }
++
++        // Supported tags not on the phone, grouped by language in Android's order.
++        Map<String, List<String>> byLanguage = new LinkedHashMap<>();
++        Set<String> seen = new HashSet<>(onPhoneTags);
++        for (String tag : wellFormed(supported)) {
++            if (!seen.add(key(tag))) continue;
++            byLanguage.computeIfAbsent(language(tag), k -> new ArrayList<>()).add(tag);
++        }
++
++        Map<String, Reason> wanted = new LinkedHashMap<>();
++        for (Map.Entry<String, Reason> signal : signals.entrySet()) {
++            wanted.put(signal.getKey().toLowerCase(Locale.ROOT), signal.getValue());
++        }
++
++        List<Entry> suggested = new ArrayList<>();
++        List<Entry> more = new ArrayList<>();
++        String phoneRegion = phoneLocale.getCountry();
++        for (Map.Entry<String, List<String>> group : byLanguage.entrySet()) {
++            String language = group.getKey();
++            List<String> tags = group.getValue();
++            Reason reason = wanted.get(language);
++            @Nullable String pick = null;
++            if (reason != null && !onPhoneLanguages.contains(language)) {
++                pick = tags.get(0);
++                for (String tag : tags) {
++                    if (Locale.forLanguageTag(tag).getCountry().equalsIgnoreCase(phoneRegion)) {
++                        pick = tag;
++                        break;
++                    }
++                }
++                String languageName = Locale.forLanguageTag(pick).getDisplayLanguage(uiLocale);
++                suggested.add(entry(pick, reason.text(languageName), State.AVAILABLE, uiLocale));
++            }
++            for (String tag : tags) {
++                if (!tag.equals(pick)) more.add(entry(tag, null, State.AVAILABLE, uiLocale));
++            }
++        }
++        Collator collator = Collator.getInstance(uiLocale);
++        Collections.sort(more, (a, b) -> collator.compare(a.displayName(), b.displayName()));
++
++        return new Sections(onPhone, suggested, more);
++    }
++
++    private static List<String> wellFormed(List<String> tags) {
++        List<String> result = new ArrayList<>();
++        for (String tag : tags) {
++            if (SpeechLanguageSnackbar.isWellFormedTag(tag)) result.add(tag);
++        }
++        return result;
++    }
++
++    private static String key(String tag) {
++        return tag.toLowerCase(Locale.ROOT);
++    }
++
++    private static String language(String tag) {
++        return Locale.forLanguageTag(tag).getLanguage().toLowerCase(Locale.ROOT);
++    }
++
++    private static Entry entry(
++            String tag, @Nullable String reason, State state, Locale uiLocale) {
++        return new Entry(tag, Locale.forLanguageTag(tag).getDisplayName(uiLocale), reason, state);
++    }
++}
+diff '--color=never' -ruN a/chrome/android/junit/BUILD.gn b/chrome/android/junit/BUILD.gn
+--- a/chrome/android/junit/BUILD.gn	2026-10-25 02:34:33.324212357 +0530
++++ b/chrome/android/junit/BUILD.gn	2026-10-25 02:34:33.302079821 +0530
+@@ -1232,11 +1232,14 @@
+     ]
+   }
+ 
+-  # Tark: voice's missing-language snackbar.
++  # Tark: voice's missing-language snackbar and voice languages.
+   robolectric_library("chrome_junit_tests_org.chromium.chrome.browser.speech") {
+     resources_package = "org.chromium.chrome"
+ 
+-    sources = [ "src/org/chromium/chrome/browser/speech/SpeechLanguageSnackbarTest.java" ]
++    sources = [
++      "src/org/chromium/chrome/browser/speech/SpeechLanguageSnackbarTest.java",
++      "src/org/chromium/chrome/browser/speech/VoiceLanguagesTest.java",
++    ]
+ 
+     deps = [
+       ":chrome_junit_tests_helper",
+diff '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguagesTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguagesTest.java
+--- a/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguagesTest.java	1970-01-01 05:30:00.000000000 +0530
++++ b/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguagesTest.java	2026-10-25 02:34:33.399126369 +0530
+@@ -0,0 +1,181 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++package org.chromium.chrome.browser.speech;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertNull;
++import static org.junit.Assert.assertTrue;
++
++import org.junit.Test;
++import org.junit.runner.RunWith;
++import org.robolectric.annotation.Config;
++
++import org.chromium.base.test.BaseRobolectricTestRunner;
++import org.chromium.chrome.browser.speech.VoiceLanguages.Entry;
++import org.chromium.chrome.browser.speech.VoiceLanguages.Reason;
++import org.chromium.chrome.browser.speech.VoiceLanguages.Sections;
++import org.chromium.chrome.browser.speech.VoiceLanguages.State;
++
++import java.util.ArrayList;
++import java.util.LinkedHashMap;
++import java.util.List;
++import java.util.Locale;
++import java.util.Map;
++
++/** Tests for {@link VoiceLanguages}. */
++@RunWith(BaseRobolectricTestRunner.class)
++@Config(qualifiers = "en-rUS")
++public class VoiceLanguagesTest {
++    private static final Locale PHONE_IN = Locale.forLanguageTag("en-IN");
++    private static final Locale PHONE_US = Locale.US;
++    private static final Locale UI = Locale.US;
++
++    private static List<String> tags(List<Entry> entries) {
++        List<String> result = new ArrayList<>();
++        for (Entry e : entries) result.add(e.tag());
++        return result;
++    }
++
++    private static Map<String, Reason> signals(Object... pairs) {
++        Map<String, Reason> map = new LinkedHashMap<>();
++        for (int i = 0; i < pairs.length; i += 2) map.put((String) pairs[i], (Reason) pairs[i + 1]);
++        return map;
++    }
++
++    @Test
++    public void testSectionsFromSupport() {
++        Sections s =
++                VoiceLanguages.build(
++                        List.of("en-IN", "en-US"),
++                        List.of(),
++                        List.of("en-IN", "en-US", "hi-IN", "ta-IN", "bn-IN"),
++                        signals("hi", Reason.TARK_LANGUAGES, "ta", Reason.PHONE),
++                        PHONE_IN,
++                        UI);
++
++        assertEquals(List.of("en-IN", "en-US"), tags(s.onPhone()));
++        for (Entry e : s.onPhone()) {
++            assertEquals(State.INSTALLED, e.state());
++            assertNull(e.reason());
++        }
++
++        assertEquals(List.of("hi-IN", "ta-IN"), tags(s.suggested()));
++        assertEquals("You type Hindi with Tark's keyboard", s.suggested().get(0).reason());
++        assertEquals("One of your phone's languages", s.suggested().get(1).reason());
++        assertEquals(State.AVAILABLE, s.suggested().get(0).state());
++        assertEquals("Hindi (India)", s.suggested().get(0).displayName());
++
++        assertEquals(List.of("bn-IN"), tags(s.more()));
++        assertNull(s.more().get(0).reason());
++    }
++
++    @Test
++    public void testCaptionsReasonNamesLanguage() {
++        Sections s =
++                VoiceLanguages.build(
++                        List.of(),
++                        List.of(),
++                        List.of("bn-IN"),
++                        signals("bn", Reason.CAPTIONS),
++                        PHONE_IN,
++                        UI);
++        String bengali = Locale.forLanguageTag("bn").getDisplayLanguage(UI);
++        assertEquals("You watch captions in " + bengali, s.suggested().get(0).reason());
++    }
++
++    @Test
++    public void testMoreSortedByDisplayName() {
++        Sections s =
++                VoiceLanguages.build(
++                        List.of(),
++                        List.of(),
++                        List.of("ta-IN", "bn-IN", "hi-IN"),
++                        signals(),
++                        PHONE_IN,
++                        UI);
++        List<Entry> more = s.more();
++        assertEquals(3, more.size());
++        for (int i = 1; i < more.size(); i++) {
++            assertTrue(more.get(i - 1).displayName().compareTo(more.get(i).displayName()) < 0);
++        }
++    }
++
++    @Test
++    public void testInstalledOtherRegionNotSuggested() {
++        Sections s =
++                VoiceLanguages.build(
++                        List.of("hi-IN"),
++                        List.of(),
++                        List.of("hi-IN", "hi-Latn-IN", "en-US"),
++                        signals("hi", Reason.TARK_LANGUAGES),
++                        PHONE_US,
++                        UI);
++        assertTrue(s.suggested().isEmpty());
++        assertEquals(List.of("hi-IN"), tags(s.onPhone()));
++    }
++
++    @Test
++    public void testRegionPrefersPhoneRegion() {
++        Sections s =
++                VoiceLanguages.build(
++                        List.of(),
++                        List.of(),
++                        List.of("es-ES", "es-US"),
++                        signals("es", Reason.PHONE),
++                        PHONE_US,
++                        UI);
++        assertEquals(List.of("es-US"), tags(s.suggested()));
++        assertEquals(List.of("es-ES"), tags(s.more()));
++    }
++
++    @Test
++    public void testRegionFallsBackToFirstListed() {
++        Sections s =
++                VoiceLanguages.build(
++                        List.of(),
++                        List.of(),
++                        List.of("es-ES", "es-US"),
++                        signals("es", Reason.PHONE),
++                        PHONE_IN,
++                        UI);
++        assertEquals(List.of("es-ES"), tags(s.suggested()));
++        assertEquals(List.of("es-US"), tags(s.more()));
++    }
++
++    @Test
++    public void testMalformedTagsDropped() {
++        String longTag = "en-" + "a".repeat(37);
++        assertEquals(40, longTag.length());
++        Sections s =
++                VoiceLanguages.build(
++                        List.of("en US"),
++                        List.of(longTag),
++                        List.of("en US", longTag, "hi-IN"),
++                        signals("en", Reason.PHONE),
++                        PHONE_US,
++                        UI);
++        List<String> all = new ArrayList<>();
++        all.addAll(tags(s.onPhone()));
++        all.addAll(tags(s.suggested()));
++        all.addAll(tags(s.more()));
++        assertEquals(List.of("hi-IN"), all);
++    }
++
++    @Test
++    public void testPendingShownOnPhone() {
++        Sections s =
++                VoiceLanguages.build(
++                        List.of("en-US"),
++                        List.of("hi-IN"),
++                        List.of("en-US", "hi-IN", "ta-IN"),
++                        signals("hi", Reason.TARK_LANGUAGES),
++                        PHONE_IN,
++                        UI);
++        assertEquals(List.of("en-US", "hi-IN"), tags(s.onPhone()));
++        assertEquals(State.PENDING, s.onPhone().get(1).state());
++        assertTrue(s.suggested().isEmpty());
++        assertEquals(List.of("ta-IN"), tags(s.more()));
++    }
++}
+diff '--color=never' -ruN a/chrome/browser/ui/android/strings/android_chrome_strings.grd b/chrome/browser/ui/android/strings/android_chrome_strings.grd
+--- a/chrome/browser/ui/android/strings/android_chrome_strings.grd	2026-10-25 02:34:33.352365305 +0530
++++ b/chrome/browser/ui/android/strings/android_chrome_strings.grd	2026-10-25 02:34:33.329626552 +0530
+@@ -994,6 +994,16 @@
+       <message name="IDS_TARK_SPEECH_LANGUAGE_DOWNLOAD" desc="Tark: action of the voice language snackbar: Android downloads the language (or opens its voice input settings).">
+         Download
+       </message>
++      <!-- Tark: Settings > Voice languages. -->
++      <message name="IDS_TARK_VOICE_REASON_PHONE" desc="Tark: Settings > Voice languages: why a speech recognition language is suggested: it is one of the phone's languages.">
++        One of your phone's languages
++      </message>
++      <message name="IDS_TARK_VOICE_REASON_TARK_LANGUAGES" desc="Tark: Settings > Voice languages: why a speech recognition language is suggested: it is in Tark's languages list, which Tark's Indian-language typing suggestions use.">
++        You type <ph name="LANGUAGE">%1$s<ex>Hindi</ex></ph> with Tark's keyboard
++      </message>
++      <message name="IDS_TARK_VOICE_REASON_CAPTIONS" desc="Tark: Settings > Voice languages: why a speech recognition language is suggested: live captions in that language are downloaded.">
++        You watch captions in <ph name="LANGUAGE">%1$s<ex>Hindi</ex></ph>
++      </message>
+       <message name="IDS_TARK_CONNECTS_UPDATE" desc="Tark: item in the list of services Tark connects to: the direct APK's daily check for a newer version, with its host name.">
+         New versions of Tark, checked once a day unless Google Play installed it (gettarka.com)
+       </message>
+diff '--color=never' -ruN a/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb b/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb
+--- a/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb	2026-10-25 02:34:33.379752827 +0530
++++ b/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb	2026-10-25 02:34:33.357453871 +0530
+@@ -2197,4 +2197,7 @@
+ <translation id="8955589894175271948">Tark के नए वर्शन, दिन में एक बार जांचे जाते हैं, जब तक इसे Google Play से इंस्टॉल न किया गया हो (gettarka.com)</translation>
+ <translation id="1628159678930647766">इस फ़ोन पर वॉइस सर्च के लिए <ph name="LANGUAGE"/> चाहिए।</translation>
+ <translation id="5742981176567952751">वॉइस के लिए एक भाषा डाउनलोड करनी होगी</translation>
++<translation id="2909061206413994027">आपके फ़ोन की भाषाओं में से एक</translation>
++<translation id="7725059829419187774">आप Tark के कीबोर्ड से <ph name="LANGUAGE"/> लिखते हैं</translation>
++<translation id="2821218832459371654">आप <ph name="LANGUAGE"/> में कैप्शन देखते हैं</translation>
+ </translationbundle>
+\ No newline at end of file
