@@ -146,6 +146,37 @@ function Probe-TestProgram([string]$Exe, [string]$Tag, [string]$OneTest) {
     $code = Invoke-Logged $cdb ("-y `"$Tests`" -i `"$Tests`" -z `"$($dump.FullName)`" -cf `"$Report\$Tag-dump-commands.txt`"") "$Tag-dump" 300
     "dump read -> $(Format-Code $code)" | Out-File -Append "$Report\probe-$Tag.txt"
   }
+
+  # No dump came that way, so make cdb the postmortem debugger: the run is
+  # undebugged when the CHECK fails, and cdb attaches at the crash to print
+  # dbghelp's saved error (g_init_error), the last error and the stack.
+  $mod = [IO.Path]::GetFileNameWithoutExtension($Exe)
+  @(
+    '.symopt+ 0x40; .reload /f'
+    '.lastevent'
+    '.ecxr'
+    "x $mod!*g_init_error*"
+    ".foreach /pS 0 /ps 99 (a {x /0 $mod!*g_init_error*}) {dd a L1}"
+    '!gle -all'
+    'kn 40'
+    'qd'
+  ) | Out-File -Encoding ascii "$Report\$Tag-aedebug-commands.txt"
+  $log = "$Report\$Tag-aedebug.txt"
+  $aedebug = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\AeDebug'
+  $saved = Get-ItemProperty $aedebug -ErrorAction SilentlyContinue
+  Set-ItemProperty $aedebug Debugger "`"$cdb`" -p %ld -e %ld -g -y `"$Tests`" -logo `"$log`" -cf `"$Report\$Tag-aedebug-commands.txt`""
+  Set-ItemProperty $aedebug Auto '1'
+  try {
+    $code = Invoke-Logged $path $one "$Tag-aedebug-run" 180
+    Start-Sleep -Seconds 10  # cdb finishes its log after the process ends.
+  } finally {
+    foreach ($v in 'Debugger', 'Auto') {
+      if ($saved -and $null -ne $saved.$v) { Set-ItemProperty $aedebug $v $saved.$v }
+      else { Remove-ItemProperty $aedebug $v -ErrorAction SilentlyContinue }
+    }
+  }
+  "aedebug : $one -> $(Format-Code $code), log: $(if (Test-Path $log) { 'written' } else { 'none' })" |
+    Out-File -Append "$Report\probe-$Tag.txt"
 }
 
 function Run-TestProgram([string]$Exe, [string]$Log, [string]$Arguments) {
