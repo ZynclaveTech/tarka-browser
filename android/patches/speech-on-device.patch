@@ -12,7 +12,7 @@ diff --color -ruN a/content/public/android/BUILD.gn b/content/public/android/BUI
 diff --color -ruN a/content/public/android/java/src/org/chromium/content/browser/SpeechRecognitionImpl.java b/content/public/android/java/src/org/chromium/content/browser/SpeechRecognitionImpl.java
 --- a/content/public/android/java/src/org/chromium/content/browser/SpeechRecognitionImpl.java
 +++ b/content/public/android/java/src/org/chromium/content/browser/SpeechRecognitionImpl.java
-@@ -6,48 +6,85 @@
+@@ -6,48 +6,86 @@
  
  import static org.chromium.build.NullUtil.assumeNonNull;
  
@@ -107,6 +107,7 @@ diff --color -ruN a/content/public/android/java/src/org/chromium/content/browser
 +    private static final int ERROR_LANGUAGE_UNAVAILABLE = 13;
 +
 +    private static @Nullable RecognizerFactory sRecognizerFactoryForTesting;
++    private static @Nullable RecognizerFactory sPlatformRecognizerFactory;
 +    private static @Nullable LanguageDelegate sLanguageDelegate;
 +
 +    // The session whose recognizer is live, if any. Android runs one on-device session at a time.
@@ -114,7 +115,7 @@ diff --color -ruN a/content/public/android/java/src/org/chromium/content/browser
  
      // We track the recognition state to remember what events we need to send when recognition is
      // being aborted. Once Android's recognizer is cancelled, its listener won't yield any more
-@@ -58,10 +95,6 @@
+@@ -58,10 +96,6 @@
      private static final int STATE_CAPTURING_SPEECH = 2;
      private int mState;
  
@@ -125,7 +126,7 @@ diff --color -ruN a/content/public/android/java/src/org/chromium/content/browser
      private final Intent mIntent;
      private final RecognitionListener mListener;
      private @Nullable SpeechRecognizer mRecognizer;
-@@ -72,6 +105,9 @@
+@@ -72,6 +106,9 @@
      // Remember if we are using continuous recognition.
      private boolean mContinuous;
  
@@ -135,7 +136,7 @@ diff --color -ruN a/content/public/android/java/src/org/chromium/content/browser
      // Internal class to handle events from Android's SpeechRecognizer and route them to native.
      class Listener implements RecognitionListener {
  
-@@ -105,36 +141,15 @@
+@@ -105,36 +142,15 @@
  
          @Override
          public void onError(int error) {
@@ -179,7 +180,7 @@ diff --color -ruN a/content/public/android/java/src/org/chromium/content/browser
              terminate(code);
          }
  
-@@ -187,52 +202,86 @@
+@@ -187,52 +203,88 @@
      }
  
      /**
@@ -250,9 +251,11 @@ diff --color -ruN a/content/public/android/java/src/org/chromium/content/browser
 -            }
 +    @RequiresApi(Build.VERSION_CODES.S)
 +    private static RecognizerFactory getRecognizerFactory() {
-+        return sRecognizerFactoryForTesting != null
-+                ? sRecognizerFactoryForTesting
-+                : new PlatformRecognizerFactory();
++        if (sRecognizerFactoryForTesting != null) return sRecognizerFactoryForTesting;
++        if (sPlatformRecognizerFactory == null) {
++            sPlatformRecognizerFactory = new PlatformRecognizerFactory();
++        }
++        return sPlatformRecognizerFactory;
 +    }
  
 -            return new ComponentName(service.packageName, service.name);
@@ -302,7 +305,7 @@ diff --color -ruN a/content/public/android/java/src/org/chromium/content/browser
      }
  
      private SpeechRecognitionImpl(long nativeSpeechRecognizerImplAndroid) {
-@@ -240,21 +289,7 @@
+@@ -240,21 +292,7 @@
          mNativeSpeechRecognizerImplAndroid = nativeSpeechRecognizerImplAndroid;
          mListener = new Listener();
          mIntent = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
@@ -325,7 +328,7 @@ diff --color -ruN a/content/public/android/java/src/org/chromium/content/browser
      }
  
      // This function destroys everything when recognition is done, taking care to properly tear
-@@ -275,44 +310,71 @@
+@@ -275,44 +313,71 @@
                      .onRecognitionError(mNativeSpeechRecognizerImplAndroid, error);
          }
  
@@ -368,11 +371,11 @@ diff --color -ruN a/content/public/android/java/src/org/chromium/content/browser
 +    void startRecognition(String language, boolean continuous, boolean interimResults) {
 +        if (mNativeSpeechRecognizerImplAndroid == 0 || mRecognizer != null) return;
 +
-+        // Another session still holds the recognizer: this one ends, that one keeps working.
-+        if (sLiveSession != null && sLiveSession != this) {
-+            terminate(SpeechRecognitionErrorCode.ABORTED);
-+            return;
-+        }
++        // Android runs one on-device session at a time: the newer session wins and the older one
++        // ends aborted, as in Chrome (SpeechRecognitionManagerImpl::StartSession aborts the
++        // previous microphone session; this covers the case where that has not reached here yet).
++        SpeechRecognitionImpl older = sLiveSession;
++        if (older != null && older != this) older.abortRecognition();
 +
 +        SpeechRecognizer recognizer = createOnDeviceRecognizer();
 +        if (recognizer == null) {
@@ -418,7 +421,7 @@ diff --color -ruN a/content/public/android/java/src/org/chromium/content/browser
 diff --color -ruN a/content/public/android/junit/src/org/chromium/content/browser/SpeechRecognitionImplTest.java b/content/public/android/junit/src/org/chromium/content/browser/SpeechRecognitionImplTest.java
 --- /dev/null
 +++ b/content/public/android/junit/src/org/chromium/content/browser/SpeechRecognitionImplTest.java
-@@ -0,0 +1,260 @@
+@@ -0,0 +1,262 @@
 +// Copyright 2026 The Chromium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -652,30 +655,32 @@ diff --color -ruN a/content/public/android/junit/src/org/chromium/content/browse
 +
 +    @Test
 +    public void testSecondStartWhileLive() {
-+        SpeechRecognitionImpl first = start(NATIVE_1, "hi-IN");
-+        start(NATIVE_2, "hi-IN");
++        start(NATIVE_1, "hi-IN");
++        SpeechRecognizer olderRecognizer = mFactory.mCreated.get(0);
++        SpeechRecognitionImpl newer = start(NATIVE_2, "hi-IN");
 +
-+        // The second session ends at once and never gets a recognizer.
-+        verifyEndedWith(NATIVE_2, SpeechRecognitionErrorCode.ABORTED);
-+        assertEquals(1, mFactory.mCreated.size());
-+        SpeechRecognizer firstRecognizer = mFactory.mCreated.get(0);
-+        verify(firstRecognizer, never()).destroy();
-+        verify(mNatives, never()).onRecognitionError(eq(NATIVE_1), anyInt());
++        // The newer session wins: the older one ends aborted, its recognizer cancelled and
++        // destroyed exactly once.
++        verifyEndedWith(NATIVE_1, SpeechRecognitionErrorCode.ABORTED);
++        verify(olderRecognizer, times(1)).destroy();
 +
-+        // The first keeps working and ends normally; its recognizer is destroyed once.
++        // The newer one gets its own recognizer and starts listening.
++        assertEquals(2, mFactory.mCreated.size());
++        SpeechRecognizer newerRecognizer = mFactory.mCreated.get(1);
++        verify(newerRecognizer).startListening(any());
++        verify(newerRecognizer, never()).destroy();
++        verify(mNatives, never()).onRecognitionError(eq(NATIVE_2), anyInt());
++
++        // It works and ends normally; a late abort of the older one changes nothing.
 +        Bundle results = new Bundle();
 +        results.putStringArrayList(
 +                SpeechRecognizer.RESULTS_RECOGNITION, new ArrayList<>(Arrays.asList("नमस्ते")));
-+        first.getListenerForTesting().onResults(results);
-+        first.abortRecognition();
-+
-+        verify(mNatives).onRecognitionResults(eq(NATIVE_1), any(), any(), eq(false));
++        newer.getListenerForTesting().onResults(results);
++        verify(mNatives).onRecognitionResults(eq(NATIVE_2), any(), any(), eq(false));
++        verify(mNatives, times(1)).onRecognitionEnd(NATIVE_2);
++        verify(mNatives, never()).onRecognitionError(eq(NATIVE_2), anyInt());
++        verify(newerRecognizer, times(1)).destroy();
++        verify(olderRecognizer, times(1)).destroy();
 +        verify(mNatives, times(1)).onRecognitionEnd(NATIVE_1);
-+        verify(mNatives, never()).onRecognitionError(eq(NATIVE_1), anyInt());
-+        verify(firstRecognizer, times(1)).destroy();
-+
-+        // With the first gone, a new session gets the recognizer.
-+        start(3, "hi-IN");
-+        assertEquals(2, mFactory.mCreated.size());
 +    }
 +}
