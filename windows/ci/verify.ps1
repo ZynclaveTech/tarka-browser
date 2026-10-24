@@ -114,6 +114,38 @@ function Probe-TestProgram([string]$Exe, [string]$Tag, [string]$OneTest) {
   ) | Out-File -Encoding ascii "$Report\$Tag-disasm-commands.txt"
   $code = Invoke-Logged $cdb ("-y `"$Tests`" -z `"$path`" -cf `"$Report\$Tag-disasm-commands.txt`"") "$Tag-disasm" 300
   "disasm : $fn+0..0x6f0 -> $(Format-Code $code)" | Out-File -Append "$Report\probe-$Tag.txt"
+
+  # A debugger hides the stop, so let Windows Error Reporting write a full
+  # dump of an undebugged run, then read the thread's last error from it.
+  $dumps = "$env:RUNNER_TEMP\dumps-$Tag"
+  New-Item -ItemType Directory -Force $dumps | Out-Null
+  $wer = "HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\$Exe"
+  New-Item -Force $wer | Out-Null
+  Set-ItemProperty $wer DumpFolder $dumps -Type ExpandString
+  Set-ItemProperty $wer DumpType 2 -Type DWord
+  Set-ItemProperty $wer DumpCount 2 -Type DWord
+  try {
+    $code = Invoke-Logged $path $one "$Tag-wer" 120
+    Start-Sleep -Seconds 15  # WerFault writes the dump after the process ends.
+  } finally {
+    Remove-Item -Force -Recurse $wer
+  }
+  $dump = Get-ChildItem $dumps -Filter *.dmp | Select-Object -First 1
+  "wer : $one -> $(Format-Code $code), dump: $(if ($dump) { $dump.Name } else { 'none' })" |
+    Out-File -Append "$Report\probe-$Tag.txt"
+  if ($dump) {
+    @(
+      ".symopt+ 0x40; .reload /f"
+      '.ecxr'
+      '.lastevent'
+      '!gle -all'
+      'kn 40'
+      '~* kn 12'
+      'q'
+    ) | Out-File -Encoding ascii "$Report\$Tag-dump-commands.txt"
+    $code = Invoke-Logged $cdb ("-y `"$Tests`" -i `"$Tests`" -z `"$($dump.FullName)`" -cf `"$Report\$Tag-dump-commands.txt`"") "$Tag-dump" 300
+    "dump read -> $(Format-Code $code)" | Out-File -Append "$Report\probe-$Tag.txt"
+  }
 }
 
 function Run-TestProgram([string]$Exe, [string]$Log, [string]$Arguments) {
