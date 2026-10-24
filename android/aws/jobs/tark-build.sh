@@ -71,6 +71,11 @@ fi
 # is no vpython3); a failure fails the job.
 if (( code == 0 )); then
   o=/tark/work/src/out/Default
+  # The runners' unittest_util.py subclasses unittest._TextTestResult, gone
+  # from the machine's Python 3.12 (vpython brings 3.11): alias it back.
+  mkdir -p /tark/pyshim
+  echo 'import unittest; unittest._TextTestResult = unittest.TextTestResult' > /tark/pyshim/sitecustomize.py
+  export PYTHONPATH=/tark/pyshim
   {
     ninja -C $o content_junit_tests chrome_junit_tests &&
     python3 $o/bin/run_content_junit_tests --gtest_filter='*SpeechRecognitionImplTest*' &&
