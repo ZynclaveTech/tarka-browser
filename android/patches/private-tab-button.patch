@@ -1,0 +1,615 @@
+--- a/chrome/android/features/tab_ui/java/src/org/chromium/chrome/browser/tasks/tab_management/IncognitoTabSwitcherPane.java	2026-10-25 02:27:47
++++ b/chrome/android/features/tab_ui/java/src/org/chromium/chrome/browser/tasks/tab_management/IncognitoTabSwitcherPane.java	2026-10-25 02:57:49
+@@ -19,6 +19,8 @@
+ import org.chromium.base.supplier.OneshotSupplier;
+ import org.chromium.base.supplier.SettableNullableObservableSupplier;
+ import org.chromium.base.supplier.SupplierUtils;
++import org.chromium.base.task.PostTask;
++import org.chromium.base.task.TaskTraits;
+ import org.chromium.build.annotations.EnsuresNonNullIf;
+ import org.chromium.build.annotations.NullMarked;
+ import org.chromium.build.annotations.Nullable;
+@@ -28,8 +30,10 @@
+ import org.chromium.chrome.browser.hub.Pane;
+ import org.chromium.chrome.browser.hub.PaneHubController;
+ import org.chromium.chrome.browser.hub.PaneId;
++import org.chromium.chrome.browser.incognito.IncognitoUtils;
+ import org.chromium.chrome.browser.incognito.reauth.IncognitoReauthController;
+ import org.chromium.chrome.browser.incognito.reauth.IncognitoReauthManager.IncognitoReauthCallback;
++import org.chromium.chrome.browser.profiles.ProfileProvider;
+ import org.chromium.chrome.browser.tab.Tab;
+ import org.chromium.chrome.browser.tabmodel.IncognitoTabModel;
+ import org.chromium.chrome.browser.tabmodel.IncognitoTabModelObserver;
+@@ -49,6 +53,7 @@
+ import java.lang.annotation.Retention;
+ import java.lang.annotation.RetentionPolicy;
+ import java.util.List;
++import java.util.function.BooleanSupplier;
+ import java.util.function.DoubleConsumer;
+ import java.util.function.Supplier;
+ 
+@@ -124,11 +129,16 @@
+     /** Not safe to use until initWithNative. */
+     private final Supplier<TabModel> mIncognitoTabModelSupplier;
+ 
++    private final OneshotSupplier<ProfileProvider> mProfileProviderSupplier;
++
+     private final ResourceButtonData mReferenceButtonData;
+     private final FullButtonData mEnabledNewTabButtonData;
+     private final FullButtonData mDisabledNewTabButtonData;
+ 
+     private boolean mIsNativeInitialized;
++    // Tark: whether the profile allows private tabs; while it does, the Private button stays in
++    // the pane switcher with no private tabs open.
++    private boolean mIncognitoModeEnabled;
+     private int mLastClosedTabId;
+     private @Nullable IncognitoReauthController mIncognitoReauthController;
+     private @Nullable CallbackController mCallbackController;
+@@ -137,6 +147,7 @@
+      * @param context The activity context.
+      * @param factory The factory used to construct {@link TabSwitcherPaneCoordinator}s.
+      * @param incognitoTabModelSupplier The incognito tab model.
++     * @param profileProviderSupplier Supplies the profile, to check that incognito is allowed.
+      * @param newTabButtonClickListener The {@link OnClickListener} for the new tab button.
+      * @param incognitoReauthControllerSupplier Supplier for the incognito reauth controller.
+      * @param onToolbarAlphaChange Observer to notify when alpha changes during animations.
+@@ -151,6 +162,7 @@
+             Context context,
+             TabSwitcherPaneCoordinatorFactory factory,
+             Supplier<TabModel> incognitoTabModelSupplier,
++            OneshotSupplier<ProfileProvider> profileProviderSupplier,
+             OnClickListener newTabButtonClickListener,
+             @Nullable OneshotSupplier<IncognitoReauthController> incognitoReauthControllerSupplier,
+             DoubleConsumer onToolbarAlphaChange,
+@@ -174,6 +186,7 @@
+ 
+         mColorScheme = HubColorScheme.INCOGNITO;
+         mIncognitoTabModelSupplier = incognitoTabModelSupplier;
++        mProfileProviderSupplier = profileProviderSupplier;
+         mLastClosedTabId = Tab.INVALID_TAB_ID;
+ 
+         // TODO(crbug.com/40946413): Update this string to not be an a11y string and it should
+@@ -196,8 +209,8 @@
+                         .build();
+         mDisabledNewTabButtonData = new DelegateButtonData.Builder(newTabButtonData).build();
+ 
++        mCallbackController = new CallbackController();
+         if (incognitoReauthControllerSupplier != null) {
+-            mCallbackController = new CallbackController();
+             incognitoReauthControllerSupplier.onAvailable(
+                     mCallbackController.makeCancelable(
+                             incognitoReauthController -> {
+@@ -238,9 +251,56 @@
+         if (incognitoTabModel.getCount() > 0) {
+             mIncognitoTabModelObserver.wasFirstTabCreated();
+         }
++        // Tark: the Private button is in the pane switcher whenever the profile allows private
++        // tabs, not only while some are open; with none, its pane shows empty and its new tab
++        // button opens one. The profile is there by native initialization; if it is not, the
++        // button follows when it is.
++        ProfileProvider profileProvider = mProfileProviderSupplier.get();
++        if (profileProvider != null) {
++            onProfileProviderAvailable(profileProvider);
++        } else {
++            assumeNonNull(mCallbackController);
++            mProfileProviderSupplier.onAvailable(
++                    mCallbackController.makeCancelable(this::onProfileProviderAvailable));
++        }
+     }
+ 
++    private void onProfileProviderAvailable(ProfileProvider profileProvider) {
++        mIncognitoModeEnabled =
++                IncognitoUtils.isIncognitoModeEnabled(profileProvider.getOriginalProfile());
++        if (mIncognitoModeEnabled) {
++            mReferenceButtonDataSupplier.set(mReferenceButtonData);
++        }
++    }
++
+     @Override
++    public void setPaneHubController(@Nullable PaneHubController paneHubController) {
++        super.setPaneHubController(paneHubController);
++        if (paneHubController == null) return;
++        // Tark: the Private button outlives the private tabs, so incognito may have been turned
++        // off (policy) since it was shown. Focusing the empty pane then takes the button away and
++        // returns to the regular tabs; posted, as this runs inside the hub's focus change.
++        ProfileProvider profileProvider = mProfileProviderSupplier.get();
++        IncognitoTabModel incognitoTabModel = getIncognitoTabModel();
++        if (profileProvider == null
++                || incognitoTabModel == null
++                || incognitoTabModel.getCount() > 0
++                || IncognitoUtils.isIncognitoModeEnabled(profileProvider.getOriginalProfile())) {
++            return;
++        }
++        mIncognitoModeEnabled = false;
++        mReferenceButtonDataSupplier.set(null);
++        assumeNonNull(mCallbackController);
++        PostTask.postTask(
++                TaskTraits.UI_DEFAULT,
++                mCallbackController.makeCancelable(
++                        () -> {
++                            PaneHubController controller = getPaneHubController();
++                            if (controller != null) controller.focusPane(PaneId.TAB_SWITCHER);
++                        }));
++    }
++
++    @Override
+     public void showAllTabs() {
+         resetWithListOfTabs(mIncognitoTabModelSupplier.get().getRepresentativeTabList());
+     }
+@@ -252,7 +312,10 @@
+ 
+     @Override
+     public boolean shouldEagerlyCreateCoordinator() {
+-        return mReferenceButtonDataSupplier.get() != null;
++        // Tark: the Private button no longer means private tabs are open; the grid is only built
++        // ahead of time when there are some.
++        IncognitoTabModel incognitoTabModel = getIncognitoTabModel();
++        return incognitoTabModel != null && incognitoTabModel.getCount() > 0;
+     }
+ 
+     @Override
+@@ -261,7 +324,17 @@
+         if (coordinator == null) return;
+ 
+         @Nullable TabModel tabModel = mIncognitoTabModelSupplier.get();
+-        if (tabModel == null || !tabModel.isTabModelRestored()) {
++        // Tark: with no private tabs the incognito model's delegate is Chromium's EmptyTabModel,
++        // which never reports itself restored; the Private button can now show that empty pane,
++        // so it shows empty rather than waiting for a restore that does not come. The delegate
++        // is the EmptyTabModel exactly when the model has no profile (a real delegate has the
++        // off-the-record one); a real delegate still restoring waits as upstream.
++        boolean isEmptyDelegateModel =
++                tabModel != null
++                        && tabModel.isActiveModel()
++                        && tabModel.getCount() == 0
++                        && tabModel.getProfile() == null;
++        if (tabModel == null || (!tabModel.isTabModelRestored() && !isEmptyDelegateModel)) {
+             // The tab list is trying to show without the filter being ready. This happens when
+             // first trying to show a the pane. If this happens an attempt to show will be made
+             // when the filter's restoreCompleted() method is invoked in TabSwitcherPaneMediator.
+@@ -334,7 +407,11 @@
+         TabSwitcherPaneCoordinator paneCoordinator = getTabSwitcherPaneCoordinator();
+         if (paneCoordinator == null) {
+             IncognitoTabSwitcherPaneCleaner.cleanUp(
+-                    mReferenceButtonDataSupplier, isFocused(), getPaneHubController(), null);
++                    mReferenceButtonDataSupplier,
++                    () -> mIncognitoModeEnabled,
++                    isFocused(),
++                    getPaneHubController(),
++                    null);
+             return;
+         }
+ 
+@@ -358,6 +435,7 @@
+         return new IncognitoTabSwitcherPaneCleaner(
+                 isAnimatingSupplier,
+                 mReferenceButtonDataSupplier,
++                () -> mIncognitoModeEnabled,
+                 cleanUpRunnable,
+                 getPaneHubController(),
+                 isFocused(),
+@@ -406,6 +484,7 @@
+         private final Callback<Boolean> mOnAnimationStatusChange = this::onAnimationStatusChange;
+         private final SettableNullableObservableSupplier<DisplayButtonData>
+                 mReferenceButtonDataSupplier;
++        private final BooleanSupplier mKeepReferenceButton;
+         private final Runnable mCleanUpRunnable;
+         private final @Nullable PaneHubController mController;
+         private final boolean mIsFocused;
+@@ -416,6 +495,8 @@
+         /**
+          * @param isAnimatingSupplier Provides the animation status.
+          * @param referenceButtonDataSupplier Provides the reference button data.
++         * @param keepReferenceButton Whether the reference button stays (Tark: incognito allowed),
++         *     read at cleanup time.
+          * @param cleanUpRunnable Runnable to run when cleanup should occur.
+          * @param controller The controller to focus hub panes.
+          * @param isFocused Whether the pane is focused.
+@@ -424,12 +505,14 @@
+         public IncognitoTabSwitcherPaneCleaner(
+                 @Nullable NonNullObservableSupplier<Boolean> isAnimatingSupplier,
+                 SettableNullableObservableSupplier<DisplayButtonData> referenceButtonDataSupplier,
++                BooleanSupplier keepReferenceButton,
+                 Runnable cleanUpRunnable,
+                 @Nullable PaneHubController controller,
+                 boolean isFocused,
+                 @TabCloseMethod int finalTabCloseMethod) {
+             mIsAnimatingSupplier = isAnimatingSupplier;
+             mReferenceButtonDataSupplier = referenceButtonDataSupplier;
++            mKeepReferenceButton = keepReferenceButton;
+             mCleanUpRunnable = cleanUpRunnable;
+             mController = controller;
+             mIsFocused = isFocused;
+@@ -457,7 +540,12 @@
+                 mStartedAnimating = isAnimating;
+                 return;
+             }
+-            cleanUp(mReferenceButtonDataSupplier, mIsFocused, mController, mCleanUpRunnable);
++            cleanUp(
++                    mReferenceButtonDataSupplier,
++                    mKeepReferenceButton,
++                    mIsFocused,
++                    mController,
++                    mCleanUpRunnable);
+             if (mIsAnimatingSupplier != null) {
+                 mIsAnimatingSupplier.removeObserver(mOnAnimationStatusChange);
+             }
+@@ -502,16 +590,21 @@
+          * Performs the cleanup of the Incognito Tab Switcher pane.
+          *
+          * @param referenceButtonDataSupplier Provides the reference button data.
++         * @param keepReferenceButton Whether the reference button stays (Tark: incognito allowed),
++         *     read at cleanup time.
+          * @param isFocused Whether the pane is focused.
+          * @param controller The controller to focus hub panes.
+          * @param cleanUpRunnable Runnable to run when cleanup should occur.
+          */
+         public static void cleanUp(
+                 SettableNullableObservableSupplier<DisplayButtonData> referenceButtonDataSupplier,
++                BooleanSupplier keepReferenceButton,
+                 boolean isFocused,
+                 @Nullable PaneHubController controller,
+                 @Nullable Runnable cleanUpRunnable) {
+-            referenceButtonDataSupplier.set(null);
++            // Tark: the Private button stays after the last private tab closes; focus still goes
++            // back to the regular tabs.
++            if (!keepReferenceButton.getAsBoolean()) referenceButtonDataSupplier.set(null);
+             if (isFocused) {
+                 assert controller != null : "isFocused requires a non-null PaneHubController.";
+                 controller.focusPane(PaneId.TAB_SWITCHER);
+--- a/chrome/android/features/tab_ui/java/src/org/chromium/chrome/browser/tasks/tab_management/IncognitoTabSwitcherPaneUnitTest.java	2026-10-25 02:27:47
++++ b/chrome/android/features/tab_ui/java/src/org/chromium/chrome/browser/tasks/tab_management/IncognitoTabSwitcherPaneUnitTest.java	2026-10-25 02:58:17
+@@ -11,6 +11,7 @@
+ import static org.junit.Assert.assertTrue;
+ import static org.mockito.ArgumentMatchers.any;
+ import static org.mockito.ArgumentMatchers.anyBoolean;
++import static org.mockito.ArgumentMatchers.anyInt;
+ import static org.mockito.Mockito.atLeastOnce;
+ import static org.mockito.Mockito.doAnswer;
+ import static org.mockito.Mockito.mock;
+@@ -54,9 +55,11 @@
+ import org.chromium.chrome.browser.hub.LoadHint;
+ import org.chromium.chrome.browser.hub.PaneHubController;
+ import org.chromium.chrome.browser.hub.PaneId;
++import org.chromium.chrome.browser.incognito.IncognitoUtils;
+ import org.chromium.chrome.browser.incognito.reauth.IncognitoReauthController;
+ import org.chromium.chrome.browser.incognito.reauth.IncognitoReauthManager.IncognitoReauthCallback;
+ import org.chromium.chrome.browser.profiles.Profile;
++import org.chromium.chrome.browser.profiles.ProfileProvider;
+ import org.chromium.chrome.browser.tab.MockTab;
+ import org.chromium.chrome.browser.tab.Tab;
+ import org.chromium.chrome.browser.tabmodel.IncognitoTabModel;
+@@ -95,6 +98,7 @@
+     @Mock private DoubleConsumer mOnAlphaChange;
+     @Mock private UserEducationHelper mUserEducationHelper;
+     @Mock private Profile mProfile;
++    @Mock private ProfileProvider mProfileProvider;
+     @Mock private TabGroupCreationUiDelegate mUiFlow;
+ 
+     @Captor private ArgumentCaptor<IncognitoTabModelObserver> mIncognitoTabModelObserverCaptor;
+@@ -104,6 +108,8 @@
+ 
+     private final OneshotSupplierImpl<IncognitoReauthController>
+             mIncognitoReauthControllerSupplier = new OneshotSupplierImpl<>();
++    private final OneshotSupplierImpl<ProfileProvider> mProfileProviderSupplier =
++            new OneshotSupplierImpl<>();
+     private final SettableMonotonicObservableSupplier<EdgeToEdgeController> mEdgeToEdgeSupplier =
+             ObservableSuppliers.createMonotonic();
+     private final SettableMonotonicObservableSupplier<CompositorViewHolder>
+@@ -123,6 +129,9 @@
+     @Before
+     public void setUp() {
+         mContext = ApplicationProvider.getApplicationContext();
++        IncognitoUtils.setEnabledForTesting(true);
++        when(mProfileProvider.getOriginalProfile()).thenReturn(mProfile);
++        mProfileProviderSupplier.set(mProfileProvider);
+ 
+         doAnswer(
+                         invocation -> {
+@@ -152,21 +161,26 @@
+         when(mTabSwitcherPaneCoordinator.getTabGridDialogShowingOrAnimationSupplier())
+                 .thenReturn(mTabGridDialogShowingOrAnimationSupplier);
+ 
+-        mIncognitoTabSwitcherPane =
+-                new IncognitoTabSwitcherPane(
+-                        mContext,
+-                        mTabSwitcherPaneCoordinatorFactory,
+-                        () -> mIncognitoTabModel,
+-                        mNewTabButtonClickListener,
+-                        mIncognitoReauthControllerSupplier,
+-                        mOnAlphaChange,
+-                        mUserEducationHelper,
+-                        mEdgeToEdgeSupplier,
+-                        mCompositorViewHolderSupplier,
+-                        mUiFlow,
+-                        /* xrSpaceModeObservableSupplier= */ null);
++        mIncognitoTabSwitcherPane = createPane(mProfileProviderSupplier);
+     }
+ 
++    private IncognitoTabSwitcherPane createPane(
++            OneshotSupplierImpl<ProfileProvider> profileProviderSupplier) {
++        return new IncognitoTabSwitcherPane(
++                mContext,
++                mTabSwitcherPaneCoordinatorFactory,
++                () -> mIncognitoTabModel,
++                profileProviderSupplier,
++                mNewTabButtonClickListener,
++                mIncognitoReauthControllerSupplier,
++                mOnAlphaChange,
++                mUserEducationHelper,
++                mEdgeToEdgeSupplier,
++                mCompositorViewHolderSupplier,
++                mUiFlow,
++                /* xrSpaceModeObservableSupplier= */ null);
++    }
++
+     @After
+     public void tearDown() {
+         mIncognitoTabSwitcherPane.destroy();
+@@ -197,7 +211,8 @@
+         when(mIncognitoTabModel.getCount()).thenReturn(0);
+         mIncognitoTabSwitcherPane.initWithNative();
+         verify(mIncognitoTabModel).addIncognitoObserver(mIncognitoTabModelObserverCaptor.capture());
+-        assertNull(mIncognitoTabSwitcherPane.getReferenceButtonDataSupplier().get());
++        // Tark: the Private button shows with no private tabs.
++        assertNotNull(mIncognitoTabSwitcherPane.getReferenceButtonDataSupplier().get());
+ 
+         checkIncognitoTabModelObserverAndButtonData();
+     }
+@@ -337,6 +352,9 @@
+     public void testLoadHintColdHot_TabStateNotInitialized() {
+         when(mIncognitoTabModel.isActiveModel()).thenReturn(true);
+         when(mIncognitoTabModel.isTabModelRestored()).thenReturn(false);
++        // Tark: an empty active model shows at once (testEmptyPrivatePaneShowsEmpty); this test
++        // is about private tabs still being restored.
++        when(mIncognitoTabModel.getCount()).thenReturn(1);
+ 
+         mIncognitoTabSwitcherPane.notifyLoadHint(LoadHint.COLD);
+         RobolectricUtil.runAllBackgroundAndUiIncludingDelayed();
+@@ -489,6 +507,217 @@
+         assertNotNull(mIncognitoTabSwitcherPane.getTabSwitcherPaneCoordinator());
+     }
+ 
++    // Tark: the Private button in the pane switcher.
++
++    @Test
++    public void testPrivateButtonShownWithNoPrivateTabs() {
++        when(mIncognitoTabModel.getCount()).thenReturn(0);
++        mIncognitoTabSwitcherPane.initWithNative();
++        verify(mIncognitoTabModel).addIncognitoObserver(mIncognitoTabModelObserverCaptor.capture());
++
++        assertNotNull(mIncognitoTabSwitcherPane.getReferenceButtonDataSupplier().get());
++        // The button alone does not build the private grid ahead of time.
++        assertFalse(mIncognitoTabSwitcherPane.shouldEagerlyCreateCoordinator());
++        mIncognitoTabSwitcherPane.notifyLoadHint(LoadHint.WARM);
++        assertNull(mIncognitoTabSwitcherPane.getTabSwitcherPaneCoordinator());
++    }
++
++    @Test
++    public void testPrivateTabsStillCreateCoordinatorEagerly() {
++        when(mIncognitoTabModel.getCount()).thenReturn(2);
++        mIncognitoTabSwitcherPane.initWithNative();
++        verify(mIncognitoTabModel).addIncognitoObserver(mIncognitoTabModelObserverCaptor.capture());
++
++        assertTrue(mIncognitoTabSwitcherPane.shouldEagerlyCreateCoordinator());
++    }
++
++    @Test
++    public void testPrivateButtonStaysAfterLastPrivateTabCloses() {
++        when(mIncognitoTabModel.getCount()).thenReturn(1);
++        mIncognitoTabSwitcherPane.initWithNative();
++        verify(mIncognitoTabModel).addIncognitoObserver(mIncognitoTabModelObserverCaptor.capture());
++        IncognitoTabModelObserver observer = mIncognitoTabModelObserverCaptor.getValue();
++        mIncognitoTabSwitcherPane.createTabSwitcherPaneCoordinator();
++        mIncognitoTabSwitcherPane.setPaneHubController(mPaneHubController);
++
++        when(mIncognitoTabModel.getCount()).thenReturn(0);
++        observer.didBecomeEmpty();
++        mIsRecyclerViewAnimatorRunningSupplier.set(true);
++        mIsRecyclerViewAnimatorRunningSupplier.set(false);
++        RobolectricUtil.runAllBackgroundAndUi();
++
++        assertNotNull(mIncognitoTabSwitcherPane.getReferenceButtonDataSupplier().get());
++        // Focus still moves to the regular tabs, and the private grid is still torn down.
++        verify(mPaneHubController).focusPane(PaneId.TAB_SWITCHER);
++        assertNull(mIncognitoTabSwitcherPane.getTabSwitcherPaneCoordinator());
++        assertFalse(mIncognitoTabSwitcherPane.shouldEagerlyCreateCoordinator());
++    }
++
++    @Test
++    public void testPrivateButtonStaysAfterLastPrivateTabClosesWithoutCoordinator() {
++        when(mIncognitoTabModel.getCount()).thenReturn(1);
++        mIncognitoTabSwitcherPane.initWithNative();
++        verify(mIncognitoTabModel).addIncognitoObserver(mIncognitoTabModelObserverCaptor.capture());
++        mIncognitoTabSwitcherPane.setPaneHubController(mPaneHubController);
++
++        mIncognitoTabModelObserverCaptor.getValue().didBecomeEmpty();
++
++        assertNotNull(mIncognitoTabSwitcherPane.getReferenceButtonDataSupplier().get());
++        verify(mPaneHubController).focusPane(PaneId.TAB_SWITCHER);
++    }
++
++    @Test
++    public void testPrivateButtonAbsentWhenIncognitoDisabled() {
++        IncognitoUtils.setEnabledForTesting(false);
++        when(mIncognitoTabModel.getCount()).thenReturn(0);
++        mIncognitoTabSwitcherPane.initWithNative();
++        verify(mIncognitoTabModel).addIncognitoObserver(mIncognitoTabModelObserverCaptor.capture());
++        assertNull(mIncognitoTabSwitcherPane.getReferenceButtonDataSupplier().get());
++
++        // As upstream: a private tab that exists anyway brings the button, and it goes with
++        // the last one.
++        IncognitoTabModelObserver observer = mIncognitoTabModelObserverCaptor.getValue();
++        when(mIncognitoTabModel.getCount()).thenReturn(1);
++        observer.wasFirstTabCreated();
++        assertNotNull(mIncognitoTabSwitcherPane.getReferenceButtonDataSupplier().get());
++        mIncognitoTabSwitcherPane.setPaneHubController(mPaneHubController);
++        when(mIncognitoTabModel.getCount()).thenReturn(0);
++        observer.didBecomeEmpty();
++        assertNull(mIncognitoTabSwitcherPane.getReferenceButtonDataSupplier().get());
++        verify(mPaneHubController).focusPane(PaneId.TAB_SWITCHER);
++    }
++
++    @Test
++    public void testPrivateButtonFollowsLateProfile() {
++        OneshotSupplierImpl<ProfileProvider> profileProviderSupplier = new OneshotSupplierImpl<>();
++        IncognitoTabSwitcherPane pane = createPane(profileProviderSupplier);
++        try {
++            when(mIncognitoTabModel.getCount()).thenReturn(0);
++            pane.initWithNative();
++            verify(mIncognitoTabModel)
++                    .addIncognitoObserver(mIncognitoTabModelObserverCaptor.capture());
++            assertNull(pane.getReferenceButtonDataSupplier().get());
++
++            profileProviderSupplier.set(mProfileProvider);
++            RobolectricUtil.runAllBackgroundAndUi();
++            assertNotNull(pane.getReferenceButtonDataSupplier().get());
++        } finally {
++            pane.destroy();
++        }
++    }
++
++    @Test
++    public void testEmptyPrivatePaneShowsEmpty() {
++        // With no private tabs the model's delegate is Chromium's EmptyTabModel: no profile, never
++        // restored.
++        when(mIncognitoTabModel.getCount()).thenReturn(0);
++        when(mIncognitoTabModel.getProfile()).thenReturn(null);
++        when(mIncognitoTabModel.isTabModelRestored()).thenReturn(false);
++        when(mIncognitoTabModel.getRepresentativeTabList()).thenReturn(List.of());
++        mIncognitoTabSwitcherPane.initWithNative();
++        verify(mIncognitoTabModel).addIncognitoObserver(mIncognitoTabModelObserverCaptor.capture());
++
++        // Focusing the pane selects the private model, then the pane becomes visible.
++        when(mIncognitoTabModel.isActiveModel()).thenReturn(true);
++        mIncognitoTabSwitcherPane.notifyLoadHint(LoadHint.HOT);
++
++        TabSwitcherPaneCoordinator coordinator =
++                mIncognitoTabSwitcherPane.getTabSwitcherPaneCoordinator();
++        assertNotNull(coordinator);
++        verify(coordinator).resetWithListOfTabs(List.of());
++        // Its new tab button opens a private tab.
++        checkNewTabButton(/* enabled= */ true);
++    }
++
++    @Test
++    public void testRestoreInProgressStillWaits() {
++        // A real delegate (it has the off-the-record profile) with no tabs yet, still restoring.
++        when(mIncognitoTabModel.getCount()).thenReturn(0);
++        when(mIncognitoTabModel.isTabModelRestored()).thenReturn(false);
++        when(mIncognitoTabModel.getProfile()).thenReturn(mProfile);
++        mIncognitoTabSwitcherPane.initWithNative();
++        verify(mIncognitoTabModel).addIncognitoObserver(mIncognitoTabModelObserverCaptor.capture());
++        when(mIncognitoTabModel.isActiveModel()).thenReturn(true);
++
++        var noRecord =
++                HistogramWatcher.newBuilder()
++                        .expectNoRecords(
++                                "Android.GridTabSwitcher.TimeToTabStateInitializedFromShown")
++                        .build();
++        mIncognitoTabSwitcherPane.notifyLoadHint(LoadHint.HOT);
++        TabSwitcherPaneCoordinator coordinator =
++                mIncognitoTabSwitcherPane.getTabSwitcherPaneCoordinator();
++        assertNotNull(coordinator);
++        verify(coordinator, never()).resetWithListOfTabs(any());
++        noRecord.assertExpected();
++
++        // The restore finishing shows the tabs and finishes the timer, as upstream.
++        when(mIncognitoTabModel.isTabModelRestored()).thenReturn(true);
++        var watcher =
++                HistogramWatcher.newSingleRecordWatcher(
++                        "Android.GridTabSwitcher.TimeToTabStateInitializedFromShown");
++        mIncognitoTabSwitcherPane.showAllTabs();
++        verify(coordinator).resetWithListOfTabs(mTabList);
++        watcher.assertExpected();
++    }
++
++    @Test
++    public void testLateProfileHonouredOnCleanup() {
++        OneshotSupplierImpl<ProfileProvider> profileProviderSupplier = new OneshotSupplierImpl<>();
++        IncognitoTabSwitcherPane pane = createPane(profileProviderSupplier);
++        try {
++            when(mIncognitoTabModel.getCount()).thenReturn(1);
++            pane.initWithNative();
++            verify(mIncognitoTabModel)
++                    .addIncognitoObserver(mIncognitoTabModelObserverCaptor.capture());
++            pane.createTabSwitcherPaneCoordinator();
++            pane.setPaneHubController(mPaneHubController);
++
++            // The last private tab closes; the cleaner waits for the closing animation.
++            when(mIncognitoTabModel.getCount()).thenReturn(0);
++            mIncognitoTabModelObserverCaptor.getValue().didBecomeEmpty();
++            // The profile arrives before the cleanup runs, and is honoured by it.
++            profileProviderSupplier.set(mProfileProvider);
++            RobolectricUtil.runAllBackgroundAndUi();
++            mIsRecyclerViewAnimatorRunningSupplier.set(true);
++            mIsRecyclerViewAnimatorRunningSupplier.set(false);
++            RobolectricUtil.runAllBackgroundAndUi();
++
++            assertNotNull(pane.getReferenceButtonDataSupplier().get());
++            verify(mPaneHubController).focusPane(PaneId.TAB_SWITCHER);
++            assertNull(pane.getTabSwitcherPaneCoordinator());
++        } finally {
++            pane.destroy();
++        }
++    }
++
++    @Test
++    public void testFocusRechecksIncognitoAllowed() {
++        when(mIncognitoTabModel.getCount()).thenReturn(0);
++        mIncognitoTabSwitcherPane.initWithNative();
++        verify(mIncognitoTabModel).addIncognitoObserver(mIncognitoTabModelObserverCaptor.capture());
++        assertNotNull(mIncognitoTabSwitcherPane.getReferenceButtonDataSupplier().get());
++
++        // Incognito is turned off (policy) while the button is shown; focusing the pane drops it.
++        IncognitoUtils.setEnabledForTesting(false);
++        mIncognitoTabSwitcherPane.setPaneHubController(mPaneHubController);
++        assertNull(mIncognitoTabSwitcherPane.getReferenceButtonDataSupplier().get());
++        RobolectricUtil.runAllBackgroundAndUi();
++        verify(mPaneHubController).focusPane(PaneId.TAB_SWITCHER);
++    }
++
++    @Test
++    public void testFocusKeepsButtonWhenIncognitoAllowed() {
++        when(mIncognitoTabModel.getCount()).thenReturn(0);
++        mIncognitoTabSwitcherPane.initWithNative();
++        verify(mIncognitoTabModel).addIncognitoObserver(mIncognitoTabModelObserverCaptor.capture());
++
++        mIncognitoTabSwitcherPane.setPaneHubController(mPaneHubController);
++        RobolectricUtil.runAllBackgroundAndUi();
++        assertNotNull(mIncognitoTabSwitcherPane.getReferenceButtonDataSupplier().get());
++        verify(mPaneHubController, never()).focusPane(anyInt());
++    }
++
+     /**
+      * Verifies that the action button is in one of three states: Enabled (enabled = true) Disabled
+      * (enabled = false) Hidden (enabled = null)
+@@ -537,7 +766,8 @@
+         mIsRecyclerViewAnimatorRunningSupplier.set(false);
+         RobolectricUtil.runAllBackgroundAndUi();
+ 
+-        assertNull(mIncognitoTabSwitcherPane.getReferenceButtonDataSupplier().get());
++        // Tark: the Private button stays after the last private tab closes.
++        assertNotNull(mIncognitoTabSwitcherPane.getReferenceButtonDataSupplier().get());
+         verify(mPaneHubController).focusPane(PaneId.TAB_SWITCHER);
+         assertNull(mIncognitoTabSwitcherPane.getTabSwitcherPaneCoordinator());
+ 
+@@ -559,7 +789,7 @@
+         mIsRecyclerViewAnimatorRunningSupplier.set(false);
+         RobolectricUtil.runAllBackgroundAndUi();
+ 
+-        assertNull(mIncognitoTabSwitcherPane.getReferenceButtonDataSupplier().get());
++        assertNotNull(mIncognitoTabSwitcherPane.getReferenceButtonDataSupplier().get());
+         verify(mPaneHubController, times(2)).focusPane(PaneId.TAB_SWITCHER);
+         assertNull(mIncognitoTabSwitcherPane.getTabSwitcherPaneCoordinator());
+     }
+--- a/chrome/android/features/tab_ui/java/src/org/chromium/chrome/browser/tasks/tab_management/TabManagementDelegateImpl.java	2026-10-25 02:27:47
++++ b/chrome/android/features/tab_ui/java/src/org/chromium/chrome/browser/tasks/tab_management/TabManagementDelegateImpl.java	2026-10-25 02:28:31
+@@ -198,6 +198,7 @@
+                                 activity,
+                                 factory,
+                                 tabModelSupplier,
++                                profileProviderSupplier,
+                                 newTabButtonOnClickListener,
+                                 incognitoReauthControllerSupplier,
+                                 onToolbarAlphaChange,
