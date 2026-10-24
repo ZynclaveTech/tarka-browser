@@ -91,6 +91,17 @@ function Probe-TestProgram([string]$Exe, [string]$Tag, [string]$OneTest) {
   ) | Out-File -Encoding ascii "$Report\cdb-commands.txt"
   $code = Invoke-Logged $cdb ("-G -y `"$Tests`" -cf `"$Report\cdb-commands.txt`" `"$path`" $one") "$Tag-cdb" 300
   "cdb : $one -> $(Format-Code $code)" | Out-File -Append "$Report\probe-$Tag.txt"
+
+  # Under cdb the stop never happens, so read the code at the stop from the
+  # image itself: the calls before +0x6e2 say which check fails.
+  $fn = "$([IO.Path]::GetFileNameWithoutExtension($Exe))!base::TestSuite::Initialize"
+  @(
+    ".symopt+ 0x40; .reload /f"
+    "u $fn+0x5e0 $fn+0x6f0"
+    'q'
+  ) | Out-File -Encoding ascii "$Report\$Tag-disasm-commands.txt"
+  $code = Invoke-Logged $cdb ("-y `"$Tests`" -z `"$path`" -cf `"$Report\$Tag-disasm-commands.txt`"") "$Tag-disasm" 300
+  "disasm : $fn+0x5e0..0x6f0 -> $(Format-Code $code)" | Out-File -Append "$Report\probe-$Tag.txt"
 }
 
 function Run-TestProgram([string]$Exe, [string]$Log, [string]$Arguments) {
