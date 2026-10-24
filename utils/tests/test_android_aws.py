@@ -88,6 +88,13 @@ class TestJobResults(unittest.TestCase):
         upload = next(l for l in self.s.splitlines() if 'upload /tark/work/src/out/Default/apks' in l)
         self.assertIn('code == 0', upload)
 
+    def test_the_bundle_is_uploaded_with_the_apk(self):
+        # A5: Play takes the app bundle; it goes up only from a build that
+        # succeeded, like the APK.
+        line = next(l for l in self.s.splitlines() if 'upload' in l and 'apks/ChromePublic.aab' in l)
+        self.assertIn('code == 0', line)
+        self.assertIn('ChromePublic.aab', line.split()[-1])
+
     def test_one_job_at_a_time(self):
         self.assertIn('flock -n 9', self.s)
         self.assertLess(self.s.index('flock -n 9'), self.s.index('rm -rf $repo'))

@@ -1,0 +1,1388 @@
+--- a/components/tark_captions/BUILD.gn
++++ b/components/tark_captions/BUILD.gn
+@@ -45,6 +45,8 @@
+     "mel_frontend.h",
+     "model_manifest.cc",
+     "model_manifest.h",
++    "model_source.cc",
++    "model_source.h",
+     "model_units.cc",
+     "mono_resampler.cc",
+     "mono_resampler.h",
+@@ -89,50 +91,55 @@
+   deps = [ "//base" ]
+ }
+ 
+-test("tark_captions_unittests") {
+-  sources = [
+-    "asr_model_unittest.cc",
+-    "call_state_unittest.cc",
+-    "caption_choices_unittest.cc",
+-    "caption_engine_unittest.cc",
+-    "caption_model_store_unittest.cc",
+-    "caption_history_unittest.cc",
+-    "caption_text_unittest.cc",
+-    "client_language_unittest.cc",
+-    "detection_policy_unittest.cc",
+-    "english_text_unittest.cc",
+-    "indic_text_unittest.cc",
+-    "language_detector_unittest.cc",
+-    "language_gate_unittest.cc",
+-    "language_hint_unittest.cc",
+-    "media_players_unittest.cc",
+-    "mel_frontend_unittest.cc",
+-    "model_manifest_unittest.cc",
+-    "mono_resampler_unittest.cc",
+-    "ort_runtime_unittest.cc",
+-    "render_queue_unittest.cc",
+-    "romanize_unittest.cc",
+-    "segmenter_unittest.cc",
+-    "translation_engine_unittest.cc",
+-  ]
+-  deps = [
+-    ":tark_captions",
+-    ":test_support",
+-    "//base",
+-    "//mojo/core/test:run_all_unittests",
+-    "//base/test:test_support",
+-    "//components/prefs:test_support",
+-    "//crypto",
+-    "//media",
+-    "//net",
+-    "//net:test_support",
+-    "//services/network:test_support",
+-    "//services/network/public/cpp",
+-    "//testing/gtest",
+-    "//ui/gfx/geometry",
+-    "//ui/gfx:test_support",
+-    "//third_party/icu",
+-  ]
++# The Mac's whole suite. On Android a test() is an APK, and the build
++# machine runs the engine's own tests instead (below).
++if (!is_android) {
++  test("tark_captions_unittests") {
++    sources = [
++      "asr_model_unittest.cc",
++      "call_state_unittest.cc",
++      "caption_choices_unittest.cc",
++      "caption_engine_unittest.cc",
++      "caption_model_store_unittest.cc",
++      "caption_history_unittest.cc",
++      "caption_text_unittest.cc",
++      "client_language_unittest.cc",
++      "detection_policy_unittest.cc",
++      "english_text_unittest.cc",
++      "indic_text_unittest.cc",
++      "language_detector_unittest.cc",
++      "language_gate_unittest.cc",
++      "language_hint_unittest.cc",
++      "media_players_unittest.cc",
++      "mel_frontend_unittest.cc",
++      "model_manifest_unittest.cc",
++      "model_source_unittest.cc",
++      "mono_resampler_unittest.cc",
++      "ort_runtime_unittest.cc",
++      "render_queue_unittest.cc",
++      "romanize_unittest.cc",
++      "segmenter_unittest.cc",
++      "translation_engine_unittest.cc",
++    ]
++    deps = [
++      ":tark_captions",
++      ":test_support",
++      "//base",
++      "//mojo/core/test:run_all_unittests",
++      "//base/test:test_support",
++      "//components/prefs:test_support",
++      "//crypto",
++      "//media",
++      "//net",
++      "//net:test_support",
++      "//services/network:test_support",
++      "//services/network/public/cpp",
++      "//testing/gtest",
++      "//ui/gfx/geometry",
++      "//ui/gfx:test_support",
++      "//third_party/icu",
++    ]
++  }
+ }
+ 
+ # Cores used and draft lag on a 5-minute Hindi track (the D4 spike measured
+@@ -146,3 +153,47 @@
+     "//base",
+   ]
+ }
++
++# Tark for Android: the engine's audio front end, speech model, segmenter,
++# VAD and ONNX Runtime loader, built for the build machine with only what
++# they compile against (android/build.sh runs them). Tests that need ONNX
++# Runtime or the models skip without TARK_CAPTIONS_ORT / _MODELS.
++if (!is_android) {
++  test("tark_captions_engine_unittests") {
++    sources = [
++      "asr_model.cc",
++      "asr_model.h",
++      "asr_model_unittest.cc",
++      "mel_frontend.cc",
++      "mel_frontend.h",
++      "mel_frontend_unittest.cc",
++      "model_source.cc",
++      "model_source.h",
++      "model_source_unittest.cc",
++      "ort_runtime.cc",
++      "ort_runtime.h",
++      "ort_runtime_unittest.cc",
++      "segmenter.cc",
++      "segmenter.h",
++      "segmenter_unittest.cc",
++      "vad.cc",
++      "vad.h",
++    ]
++    include_dirs = [ "//third_party/tark_onnxruntime/include" ]
++    deps = [
++      ":test_support",
++      "//base",
++      "//base/test:run_all_unittests",
++      "//base/test:test_support",
++      "//testing/gtest",
++      "//third_party/pffft",
++    ]
++  }
++}
++
++if (current_toolchain == default_toolchain) {
++  group("host_unittests") {
++    testonly = true
++    deps = [ ":tark_captions_engine_unittests($host_toolchain)" ]
++  }
++}
+--- a/components/tark_captions/asr_model.cc
++++ b/components/tark_captions/asr_model.cc
+@@ -11,20 +11,22 @@
+ #include "base/memory/ptr_util.h"
+ #include "base/strings/string_util.h"
+ #include "components/tark_captions/mel_frontend.h"
++#include "components/tark_captions/model_source.h"
+ #include "components/tark_captions/ort_runtime.h"
+ 
+ namespace tark_captions {
+ namespace {
+ 
+-constexpr int kBlank = 256;
+ constexpr Language kLanguages[] = {Language::kHindi, Language::kTamil, Language::kBengali};
+ 
+-std::optional<base::Value> ReadJson(const base::FilePath& path) {
+-  std::string json;
+-  if (!base::ReadFileToString(path, &json)) {
++std::optional<base::Value> ReadJson(const ModelSource& source, std::string_view name) {
++  std::optional<base::span<const uint8_t>> bytes = source.Read(name);
++  if (!bytes) {
+     return std::nullopt;
+   }
+-  return base::JSONReader::Read(json, base::JSON_PARSE_RFC);
++  return base::JSONReader::Read(
++      std::string_view(reinterpret_cast<const char*>(bytes->data()), bytes->size()),
++      base::JSON_PARSE_RFC);
+ }
+ 
+ }  // namespace
+@@ -49,61 +51,94 @@
+   return std::nullopt;
+ }
+ 
+-// static
+-std::unique_ptr<AsrModel> AsrModel::Load(OrtRuntime* runtime,
+-                                         const base::FilePath& models_dir,
+-                                         int threads) {
+-  std::unique_ptr<MelFrontend> frontend = MelFrontend::Load(models_dir);
+-  std::unique_ptr<OrtModel> encoder =
+-      runtime->LoadModel(models_dir.Append("encoder.int8.onnx"), threads);
+-  std::unique_ptr<OrtModel> ctc = runtime->LoadModel(models_dir.Append("ctc_decoder.onnx"), threads);
+-  std::optional<base::Value> vocab = ReadJson(models_dir.Append("vocab.json"));
+-  std::optional<base::Value> masks = ReadJson(models_dir.Append("language_masks.json"));
+-  if (!frontend || !encoder || !ctc || !vocab || !vocab->is_dict() || !masks || !masks->is_dict()) {
+-    return nullptr;
++std::optional<std::map<std::string, AsrModel::Vocabulary>> ReadVocabularies(
++    const ModelSource& source,
++    int blank) {
++  std::optional<base::Value> vocab = ReadJson(source, "vocab.json");
++  std::optional<base::Value> masks = ReadJson(source, "language_masks.json");
++  if (!vocab || !vocab->is_dict() || !masks || !masks->is_dict() || vocab->GetDict().empty()) {
++    return std::nullopt;
+   }
+-  std::map<Language, Vocabulary> vocabularies;
+-  for (Language language : kLanguages) {
+-    const base::ListValue* tokens = vocab->GetDict().FindList(LanguageCode(language));
+-    const base::ListValue* mask = masks->GetDict().FindList(LanguageCode(language));
+-    if (!tokens || !mask) {
+-      return nullptr;
++  std::map<std::string, AsrModel::Vocabulary> vocabularies;
++  for (const auto [code, tokens] : vocab->GetDict()) {
++    const base::ListValue* mask = masks->GetDict().FindList(code);
++    if (!tokens.is_list() || !mask) {
++      return std::nullopt;
+     }
+-    Vocabulary v;
++    AsrModel::Vocabulary v;
+     for (size_t i = 0; i < mask->size(); ++i) {
+       if ((*mask)[i].is_bool() && (*mask)[i].GetBool()) {
+         v.logit_indices.push_back(static_cast<int>(i));
+       }
+     }
+-    for (const base::Value& token : *tokens) {
++    for (const base::Value& token : tokens.GetList()) {
+       v.tokens.push_back(token.is_string() ? token.GetString() : std::string());
+     }
+-    if (v.logit_indices.size() != v.tokens.size() || v.tokens.size() <= kBlank) {
+-      return nullptr;
++    if (v.logit_indices.size() != v.tokens.size() ||
++        v.tokens.size() <= static_cast<size_t>(blank)) {
++      return std::nullopt;
+     }
+-    vocabularies.emplace(language, std::move(v));
++    vocabularies.emplace(code, std::move(v));
++  }
++  return vocabularies;
++}
++
++// static
++std::unique_ptr<AsrModel> AsrModel::Load(OrtRuntime* runtime,
++                                         const base::FilePath& models_dir,
++                                         int threads) {
++  return Load(runtime, DirectorySource(models_dir), threads);
++}
++
++// static
++std::unique_ptr<AsrModel> AsrModel::Load(OrtRuntime* runtime,
++                                         const ModelSource& source,
++                                         int threads) {
++  std::optional<ModelConventions> conventions = ReadConventions(source);
++  if (!conventions) {
++    return nullptr;
++  }
++  std::unique_ptr<MelFrontend> frontend = MelFrontend::Load(source, *conventions);
++  std::unique_ptr<OrtModel> encoder = runtime->LoadModel(source, "encoder.int8.onnx", threads);
++  std::unique_ptr<OrtModel> ctc = runtime->LoadModel(source, "ctc_decoder.onnx", threads);
++  std::optional<std::map<std::string, Vocabulary>> vocabularies =
++      ReadVocabularies(source, conventions->blank);
++  if (!frontend || !encoder || !ctc || !vocabularies) {
++    return nullptr;
+   }
+   return base::WrapUnique(new AsrModel(std::move(frontend), std::move(encoder), std::move(ctc),
+-                                       std::move(vocabularies)));
++                                       std::move(*vocabularies), conventions->blank));
+ }
+ 
+ AsrModel::AsrModel(std::unique_ptr<MelFrontend> frontend,
+                    std::unique_ptr<OrtModel> encoder,
+                    std::unique_ptr<OrtModel> ctc,
+-                   std::map<Language, Vocabulary> vocabularies)
++                   std::map<std::string, Vocabulary> vocabularies,
++                   int blank)
+     : frontend_(std::move(frontend)),
+       encoder_(std::move(encoder)),
+       ctc_(std::move(ctc)),
+-      vocabularies_(std::move(vocabularies)) {}
++      vocabularies_(std::move(vocabularies)),
++      blank_(blank) {}
+ 
+ AsrModel::~AsrModel() = default;
+ 
+ std::string AsrModel::Decode(base::span<const float> pcm16k, Language language) {
++  // A one-language model captions its own language whatever is asked.
++  auto found = vocabularies_.find(LanguageCode(language));
++  if (found == vocabularies_.end() && vocabularies_.size() == 1) {
++    found = vocabularies_.begin();
++  }
++  if (found == vocabularies_.end()) {
++    return std::string();
++  }
++  const Vocabulary& v = found->second;
+   int frames = 0;
+-  std::vector<float> features = frontend_->Compute(pcm16k, &frames);
++  int valid = 0;
++  std::vector<float> features = frontend_->Compute(pcm16k, &frames, &valid);
+   std::vector<Tensor> inputs(2);
+   inputs[0] = {.name = "audio_signal", .shape = {1, MelFrontend::kMels, frames}, .f32 = std::move(features)};
+-  inputs[1] = {.name = "length", .shape = {1}, .i64 = {frames}};
++  inputs[1] = {.name = "length", .shape = {1}, .i64 = {valid}};
+   std::vector<Tensor> encoded;
+   if (!encoder_->Run(inputs, {"outputs"}, &encoded)) {
+     return std::string();
+@@ -113,7 +148,6 @@
+   if (!ctc_->Run(encoded, {"logprobs"}, &logits) || logits[0].shape.size() != 3) {
+     return std::string();
+   }
+-  const Vocabulary& v = vocabularies_.at(language);
+   const int64_t steps = logits[0].shape[1];
+   const int64_t width = logits[0].shape[2];
+   std::string text;
+@@ -126,7 +160,7 @@
+         best = static_cast<int>(i);
+       }
+     }
+-    if (best != previous && best != kBlank) {
++    if (best != previous && best != blank_) {
+       text += v.tokens[best];
+     }
+     previous = best;
+--- a/components/tark_captions/asr_model.h
++++ b/components/tark_captions/asr_model.h
+@@ -20,6 +20,7 @@
+ 
+ class MelFrontend;
+ class OrtModel;
++class ModelSource;
+ class OrtRuntime;
+ 
+ // The languages Phase 1 captions (measured in the D4 spike).
+@@ -37,6 +38,10 @@
+   static std::unique_ptr<AsrModel> Load(OrtRuntime* runtime,
+                                         const base::FilePath& models_dir,
+                                         int threads);
++  // The same from any source (Android's captions process gets files).
++  static std::unique_ptr<AsrModel> Load(OrtRuntime* runtime,
++                                        const ModelSource& source,
++                                        int threads);
+ 
+   AsrModel(const AsrModel&) = delete;
+   AsrModel& operator=(const AsrModel&) = delete;
+@@ -46,23 +51,34 @@
+   // the model failed.
+   std::string Decode(base::span<const float> pcm16k, Language language);
+ 
+- private:
+   struct Vocabulary {
+     std::vector<int> logit_indices;   // the language's columns of the logits
+     std::vector<std::string> tokens;  // token id -> piece
+   };
+ 
++ private:
++
+   AsrModel(std::unique_ptr<MelFrontend> frontend,
+            std::unique_ptr<OrtModel> encoder,
+            std::unique_ptr<OrtModel> ctc,
+-           std::map<Language, Vocabulary> vocabularies);
++           std::map<std::string, Vocabulary> vocabularies,
++           int blank);
+ 
+   std::unique_ptr<MelFrontend> frontend_;
+   std::unique_ptr<OrtModel> encoder_;
+   std::unique_ptr<OrtModel> ctc_;
+-  std::map<Language, Vocabulary> vocabularies_;
++  std::map<std::string, Vocabulary> vocabularies_;  // by language code
++  const int blank_;
+ };
+ 
++// vocab.json and language_masks.json: each language the model has, by code
++// ("hi", "en", ...). The 600M has 22; Android's per-language models one.
++// Nullopt if either file is missing or a language's vocabulary does not
++// reach past `blank`.
++std::optional<std::map<std::string, AsrModel::Vocabulary>> ReadVocabularies(
++    const ModelSource& source,
++    int blank);
++
+ }  // namespace tark_captions
+ 
+ #endif  // COMPONENTS_TARK_CAPTIONS_ASR_MODEL_H_
+--- a/components/tark_captions/asr_model_unittest.cc
++++ b/components/tark_captions/asr_model_unittest.cc
+@@ -4,6 +4,10 @@
+ 
+ #include "components/tark_captions/asr_model.h"
+ 
++#include "base/files/file_util.h"
++#include "base/files/scoped_temp_dir.h"
++#include "components/tark_captions/model_source.h"
++
+ #include "components/tark_captions/ort_runtime.h"
+ #include "components/tark_captions/test_util.h"
+ #include "testing/gtest/include/gtest/gtest.h"
+@@ -42,5 +46,41 @@
+   EXPECT_STREQ(LanguageCode(Language::kTamil), "ta");
+ }
+ 
++TEST(AsrModelTest, BlankFromEngineJson) {
++  base::ScopedTempDir dir;
++  ASSERT_TRUE(dir.CreateUniqueTempDir());
++  const base::FilePath json = dir.GetPath().AppendASCII("engine.json");
++  ASSERT_TRUE(base::WriteFile(
++      json, R"({"lang": "en", "blank": 1024, "valid_frames": "n/hop", "pad": "constant"})"));
++  std::optional<ModelConventions> conventions = ReadConventions(DirectorySource(dir.GetPath()));
++  ASSERT_TRUE(conventions);
++  EXPECT_EQ(conventions->blank, 1024);
++  EXPECT_EQ(conventions->frames, ModelConventions::Frames::kHop);
++  EXPECT_EQ(conventions->pad, ModelConventions::Pad::kZero);
++  // An engine.json the engine does not understand refuses the model rather
++  // than decoding it wrongly.
++  ASSERT_TRUE(base::WriteFile(json, R"({"blank": 1024, "pad": "wrap"})"));
++  EXPECT_FALSE(ReadConventions(DirectorySource(dir.GetPath())));
++}
++
++// Android's per-language models (one language each, FastConformer's
++// English and Spanish too) load with the languages they have.
++TEST(AsrModelTest, ReadsWhateverLanguagesTheModelHas) {
++  base::ScopedTempDir dir;
++  ASSERT_TRUE(dir.CreateUniqueTempDir());
++  ASSERT_TRUE(base::WriteFile(dir.GetPath().AppendASCII("vocab.json"),
++                              R"({"en": ["a", "b", "<blank>"]})"));
++  ASSERT_TRUE(base::WriteFile(dir.GetPath().AppendASCII("language_masks.json"),
++                              R"({"en": [true, true, true]})"));
++  std::optional<std::map<std::string, AsrModel::Vocabulary>> vocabularies =
++      ReadVocabularies(DirectorySource(dir.GetPath()), /*blank=*/2);
++  ASSERT_TRUE(vocabularies);
++  ASSERT_EQ(vocabularies->size(), 1u);
++  EXPECT_EQ(vocabularies->at("en").tokens.size(), 3u);
++  EXPECT_EQ(vocabularies->at("en").logit_indices, (std::vector<int>{0, 1, 2}));
++  // A vocabulary that does not reach past the blank is refused.
++  EXPECT_FALSE(ReadVocabularies(DirectorySource(dir.GetPath()), /*blank=*/3));
++}
++
+ }  // namespace
+ }  // namespace tark_captions
+--- a/components/tark_captions/caption_engine.cc
++++ b/components/tark_captions/caption_engine.cc
+@@ -13,6 +13,7 @@
+ #include "base/no_destructor.h"
+ #include "base/synchronization/lock.h"
+ #include "base/time/time.h"
++#include "components/tark_captions/model_source.h"
+ #include "components/tark_captions/ort_runtime.h"
+ #include "components/tark_captions/segmenter.h"
+ #include "components/tark_captions/vad.h"
+@@ -21,7 +22,6 @@
+ namespace {
+ 
+ constexpr int kRate = 16000;
+-constexpr int kThreads = 2;
+ // Audio kept for decoding: more than a 5 s segment plus its pre-roll.
+ constexpr int64_t kKeep = 12 * kRate;
+ 
+@@ -34,7 +34,9 @@
+ class SharedAsr {
+  public:
+   // Null if ONNX Runtime or the model is missing.
+-  static SharedAsr* Acquire(const base::FilePath& models_dir, const base::FilePath& ort_dylib) {
++  static SharedAsr* Acquire(const base::FilePath& models_dir,
++                            const base::FilePath& ort_dylib,
++                            int threads) {
+     base::AutoLock lock(RegistryLock());
+     auto key = std::make_pair(models_dir, ort_dylib);
+     auto it = Registry().find(key);
+@@ -46,17 +48,33 @@
+     if (!runtime) {
+       return nullptr;
+     }
+-    std::unique_ptr<AsrModel> asr = AsrModel::Load(runtime.get(), models_dir, kThreads);
++    std::unique_ptr<AsrModel> asr = AsrModel::Load(runtime.get(), models_dir, threads);
+     if (!asr) {
+       return nullptr;
+     }
+-    auto shared = base::WrapUnique(new SharedAsr(key, std::move(runtime), std::move(asr)));
++    auto shared = base::WrapUnique(new SharedAsr(key, std::move(runtime), std::move(asr), nullptr));
+     ++Loads();
+     SharedAsr* raw = shared.get();
+     Registry().emplace(key, std::move(shared));
+     return raw;
+   }
+ 
++  // A model of its own, outside the registry (Android: one per process).
++  static std::unique_ptr<SharedAsr> CreateOwned(std::unique_ptr<ModelSource> source,
++                                                const base::FilePath& ort_library,
++                                                int threads) {
++    std::unique_ptr<OrtRuntime> runtime = OrtRuntime::Load(ort_library);
++    if (!runtime) {
++      return nullptr;
++    }
++    std::unique_ptr<AsrModel> asr = AsrModel::Load(runtime.get(), *source, threads);
++    if (!asr) {
++      return nullptr;
++    }
++    return base::WrapUnique(
++        new SharedAsr(Key(), std::move(runtime), std::move(asr), std::move(source)));
++  }
++
+   static void Release(SharedAsr* shared) {
+     base::AutoLock lock(RegistryLock());
+     if (--shared->users_ == 0) {
+@@ -92,7 +110,7 @@
+   // front end are not made for concurrent use, so their uses take turns.
+   std::unique_ptr<Vad> LoadVad(const base::FilePath& models_dir) {
+     base::AutoLock lock(lock_);
+-    return Vad::Load(runtime_.get(), models_dir);
++    return source_ ? Vad::Load(runtime_.get(), *source_) : Vad::Load(runtime_.get(), models_dir);
+   }
+   std::string Decode(base::span<const float> pcm16k, Language language) {
+     base::AutoLock lock(lock_);
+@@ -111,20 +129,35 @@
+     return *registry;
+   }
+ 
+-  SharedAsr(Key key, std::unique_ptr<OrtRuntime> runtime, std::unique_ptr<AsrModel> asr)
+-      : key_(std::move(key)), runtime_(std::move(runtime)), asr_(std::move(asr)) {}
++  SharedAsr(Key key,
++            std::unique_ptr<OrtRuntime> runtime,
++            std::unique_ptr<AsrModel> asr,
++            std::unique_ptr<ModelSource> source)
++      : key_(std::move(key)),
++        runtime_(std::move(runtime)),
++        asr_(std::move(asr)),
++        source_(std::move(source)) {}
+ 
+   const Key key_;
+   int users_ = 1;  // Guarded by RegistryLock().
+   std::unique_ptr<OrtRuntime> runtime_;
+   std::unique_ptr<AsrModel> asr_;
++  // An owned model's files (its VAD loads from them too).
++  std::unique_ptr<ModelSource> source_;
+   base::Lock lock_;
+ };
+ 
+ // static
+ std::unique_ptr<CaptionEngine> CaptionEngine::Create(const base::FilePath& models_dir,
+                                                      const base::FilePath& ort_dylib) {
+-  SharedAsr* asr = SharedAsr::Acquire(models_dir, ort_dylib);
++  return Create(models_dir, ort_dylib, Options());
++}
++
++// static
++std::unique_ptr<CaptionEngine> CaptionEngine::Create(const base::FilePath& models_dir,
++                                                     const base::FilePath& ort_dylib,
++                                                     const Options& options) {
++  SharedAsr* asr = SharedAsr::Acquire(models_dir, ort_dylib, options.threads);
+   if (!asr) {
+     return nullptr;
+   }
+@@ -134,7 +167,25 @@
+     SharedAsr::Release(asr);
+     return nullptr;
+   }
+-  return base::WrapUnique(new CaptionEngine(asr, std::move(vad)));
++  return base::WrapUnique(new CaptionEngine(asr, nullptr, std::move(vad), options.segmenter));
++}
++
++// static
++std::unique_ptr<CaptionEngine> CaptionEngine::Create(std::unique_ptr<ModelSource> source,
++                                                     const base::FilePath& ort_library,
++                                                     const Options& options) {
++  std::unique_ptr<SharedAsr> owned =
++      SharedAsr::CreateOwned(std::move(source), ort_library, options.threads);
++  if (!owned) {
++    return nullptr;
++  }
++  std::unique_ptr<Vad> vad = owned->LoadVad(base::FilePath());
++  if (!vad) {
++    return nullptr;
++  }
++  SharedAsr* raw = owned.get();
++  return base::WrapUnique(
++      new CaptionEngine(raw, std::move(owned), std::move(vad), options.segmenter));
+ }
+ 
+ // static
+@@ -147,13 +198,24 @@
+   return SharedAsr::LoadCount();
+ }
+ 
+-CaptionEngine::CaptionEngine(SharedAsr* asr, std::unique_ptr<Vad> vad)
+-    : asr_(asr), vad_(std::move(vad)), segmenter_(std::make_unique<Segmenter>()) {}
++CaptionEngine::CaptionEngine(SharedAsr* asr,
++                             std::unique_ptr<SharedAsr> owned_asr,
++                             std::unique_ptr<Vad> vad,
++                             const Segmenter::Options& segmenter)
++    : asr_(asr),
++      owned_asr_(std::move(owned_asr)),
++      vad_(std::move(vad)),
++      segmenter_(std::make_unique<Segmenter>(segmenter)) {}
+ 
+ CaptionEngine::~CaptionEngine() {
+   // The VAD before the shared runtime that loaded it.
+   vad_.reset();
+-  SharedAsr::Release(asr_.ExtractAsDangling());
++  SharedAsr* asr = asr_.ExtractAsDangling();
++  if (owned_asr_) {
++    owned_asr_.reset();
++  } else {
++    SharedAsr::Release(asr);
++  }
+ }
+ 
+ void CaptionEngine::SetLanguage(Language language) {
+--- a/components/tark_captions/caption_engine.h
++++ b/components/tark_captions/caption_engine.h
+@@ -16,11 +16,12 @@
+ #include "base/memory/raw_ptr.h"
+ #include "components/tark_captions/asr_model.h"
+ #include "components/tark_captions/mono_resampler.h"
++#include "components/tark_captions/segmenter.h"
+ 
+ namespace tark_captions {
+ 
++class ModelSource;
+ class SharedAsr;
+-class Segmenter;
+ class Vad;
+ 
+ // A caption: a draft of what is being said, or the final text of a segment.
+@@ -46,6 +47,22 @@
+   // players, each with its own recognizer); it unloads with the last one.
+   static std::unique_ptr<CaptionEngine> Create(const base::FilePath& models_dir,
+                                                const base::FilePath& ort_dylib);
++
++  // What Android varies per phone; the defaults are the Mac's.
++  struct Options {
++    int threads = 2;  // ONNX Runtime's intra-op threads for the speech model
++    Segmenter::Options segmenter;
++  };
++  // The same with `options` (a model already loaded for the folder keeps
++  // the threads it was loaded with).
++  static std::unique_ptr<CaptionEngine> Create(const base::FilePath& models_dir,
++                                               const base::FilePath& ort_dylib,
++                                               const Options& options);
++  // Android's captions process: a speech model of its own (not shared),
++  // read from `source` (the files it was handed).
++  static std::unique_ptr<CaptionEngine> Create(std::unique_ptr<ModelSource> source,
++                                               const base::FilePath& ort_library,
++                                               const Options& options);
+   // How many speech models are loaded in this process.
+   static int LoadedModelsForTesting();
+   // How many times a speech model has been loaded in this process.
+@@ -68,13 +85,19 @@
+   const Stats& stats() const { return stats_; }
+ 
+  private:
+-  CaptionEngine(SharedAsr* asr, std::unique_ptr<Vad> vad);
++  CaptionEngine(SharedAsr* asr,
++                std::unique_ptr<SharedAsr> owned_asr,
++                std::unique_ptr<Vad> vad,
++                const Segmenter::Options& segmenter);
+ 
+   void AddMono16k(base::span<const float> pcm, const EventCallback& on_event);
+   void Decode(bool is_final, double start_s, double end_s, const EventCallback& on_event);
+ 
+   // Shared with other engines; released (not owned) on destruction.
++  // Shared with other engines and released on destruction, or (Android)
++  // this engine's own.
+   raw_ptr<SharedAsr> asr_;
++  std::unique_ptr<SharedAsr> owned_asr_;
+   std::unique_ptr<Vad> vad_;
+   std::unique_ptr<Segmenter> segmenter_;
+   Language language_ = Language::kHindi;
+--- a/components/tark_captions/mel_frontend.cc
++++ b/components/tark_captions/mel_frontend.cc
+@@ -25,13 +25,13 @@
+ constexpr float kLogGuard = 5.960464477539063e-08f;  // 2^-24
+ constexpr float kStdGuard = 1e-5f;
+ 
+-std::vector<float> ReadFloats(const base::FilePath& path, size_t count) {
+-  std::string bytes;
+-  if (!base::ReadFileToString(path, &bytes) || bytes.size() != count * sizeof(float)) {
++std::vector<float> ReadFloats(const ModelSource& source, std::string_view name, size_t count) {
++  std::optional<base::span<const uint8_t>> bytes = source.Read(name);
++  if (!bytes || bytes->size() != count * sizeof(float)) {
+     return {};
+   }
+   std::vector<float> out(count);
+-  memcpy(out.data(), bytes.data(), bytes.size());
++  memcpy(out.data(), bytes->data(), bytes->size());
+   return out;
+ }
+ 
+@@ -39,20 +39,31 @@
+ 
+ // static
+ std::unique_ptr<MelFrontend> MelFrontend::Load(const base::FilePath& models_dir) {
+-  std::vector<float> window = ReadFloats(models_dir.Append("window.f32"), kWindow);
+-  std::vector<float> mel_fb = ReadFloats(models_dir.Append("mel_fb.f32"), kBins * kMels);
++  DirectorySource source(models_dir);
++  std::optional<ModelConventions> conventions = ReadConventions(source);
++  return conventions ? Load(source, *conventions) : nullptr;
++}
++
++// static
++std::unique_ptr<MelFrontend> MelFrontend::Load(const ModelSource& source,
++                                               const ModelConventions& conventions) {
++  std::vector<float> window = ReadFloats(source, "window.f32", kWindow);
++  std::vector<float> mel_fb = ReadFloats(source, "mel_fb.f32", kBins * kMels);
+   if (window.empty() || mel_fb.empty()) {
+     return nullptr;
+   }
+   // torch.stft centres a shorter window in n_fft.
+   std::vector<float> window512(kFft, 0.0f);
+   std::copy(window.begin(), window.end(), window512.begin() + (kFft - kWindow) / 2);
+-  return base::WrapUnique(new MelFrontend(std::move(window512), std::move(mel_fb)));
++  return base::WrapUnique(new MelFrontend(std::move(window512), std::move(mel_fb), conventions));
+ }
+ 
+-MelFrontend::MelFrontend(std::vector<float> window512, std::vector<float> mel_fb)
++MelFrontend::MelFrontend(std::vector<float> window512,
++                         std::vector<float> mel_fb,
++                         const ModelConventions& conventions)
+     : window512_(std::move(window512)),
+       mel_fb_(std::move(mel_fb)),
++      conventions_(conventions),
+       fft_(pffft_new_setup(kFft, PFFFT_REAL)) {}
+ 
+ MelFrontend::~MelFrontend() {
+@@ -60,8 +71,18 @@
+ }
+ 
+ std::vector<float> MelFrontend::Compute(base::span<const float> pcm16k, int* frames) const {
++  int valid = 0;
++  return Compute(pcm16k, frames, &valid);
++}
++
++std::vector<float> MelFrontend::Compute(base::span<const float> pcm16k,
++                                        int* frames,
++                                        int* valid) const {
+   const int n = static_cast<int>(pcm16k.size());
+   *frames = n / kHop + 1;
++  // NeMo 3's models count samples / hop frames and zero the last one.
++  *valid = conventions_.frames == ModelConventions::Frames::kHop ? std::max(n / kHop, 1) : *frames;
++  const bool zero_pad = conventions_.pad == ModelConventions::Pad::kZero;
+   // Pre-emphasis, then reflect padding (the edge sample is not repeated).
+   std::vector<float> y(n);
+   for (int i = 0; i < n; ++i) {
+@@ -75,6 +96,9 @@
+     } else if (j >= n) {
+       j = 2 * (n - 1) - j;
+     }
++    if (zero_pad) {
++      j = i - kPad;
++    }
+     padded[i] = (n > 0 && j >= 0 && j < n) ? y[j] : 0.0f;
+   }
+ 
+@@ -107,22 +131,24 @@
+   pffft_aligned_free(out);
+   pffft_aligned_free(work);
+ 
+-  // Per band: mean and (n - 1) deviation over the frames.
++  // Per band: mean and (n - 1) deviation over the valid frames; the rest
++  // are zero.
++  const int used = *valid;
+   for (int m = 0; m < kMels; ++m) {
+     float* band = features.data() + m * *frames;
+     double mean = 0;
+-    for (int f = 0; f < *frames; ++f) {
++    for (int f = 0; f < used; ++f) {
+       mean += band[f];
+     }
+-    mean /= *frames;
++    mean /= used;
+     double var = 0;
+-    for (int f = 0; f < *frames; ++f) {
++    for (int f = 0; f < used; ++f) {
+       var += (band[f] - mean) * (band[f] - mean);
+     }
+-    var = std::max(var / std::max(*frames - 1, 1), static_cast<double>(kLogGuard));
++    var = std::max(var / std::max(used - 1, 1), static_cast<double>(kLogGuard));
+     const double scale = 1.0 / (std::sqrt(var) + kStdGuard);
+     for (int f = 0; f < *frames; ++f) {
+-      band[f] = static_cast<float>((band[f] - mean) * scale);
++      band[f] = f < used ? static_cast<float>((band[f] - mean) * scale) : 0.0f;
+     }
+   }
+   return features;
+--- a/components/tark_captions/mel_frontend.h
++++ b/components/tark_captions/mel_frontend.h
+@@ -10,6 +10,7 @@
+ 
+ #include "base/containers/span.h"
+ #include "base/files/file_path.h"
++#include "components/tark_captions/model_source.h"
+ 
+ struct PFFFT_Setup;
+ 
+@@ -27,6 +28,9 @@
+   // Reads window.f32 and mel_fb.f32 (utils/captions_export.py export) from
+   // `models_dir`; null if either is missing or the wrong size.
+   static std::unique_ptr<MelFrontend> Load(const base::FilePath& models_dir);
++  // The same from any source, with the model's conventions.
++  static std::unique_ptr<MelFrontend> Load(const ModelSource& source,
++                                           const ModelConventions& conventions);
+ 
+   MelFrontend(const MelFrontend&) = delete;
+   MelFrontend& operator=(const MelFrontend&) = delete;
+@@ -35,12 +39,18 @@
+   // Features of 16 kHz mono audio, [kMels x frames] row-major (the
+   // encoder's audio_signal); `frames` = samples / 160 + 1.
+   std::vector<float> Compute(base::span<const float> pcm16k, int* frames) const;
++  // The same, also giving the frames the model counts as valid (the
++  // encoder's `length`): all of them, or samples / 160 with the rest zero.
++  std::vector<float> Compute(base::span<const float> pcm16k, int* frames, int* valid) const;
+ 
+  private:
+-  MelFrontend(std::vector<float> window512, std::vector<float> mel_fb);
++  MelFrontend(std::vector<float> window512,
++              std::vector<float> mel_fb,
++              const ModelConventions& conventions);
+ 
+   std::vector<float> window512_;  // the 400-sample window, zero-padded to 512
+   std::vector<float> mel_fb_;     // 257 x 80
++  const ModelConventions conventions_;
+   PFFFT_Setup* fft_;
+ };
+ 
+--- a/components/tark_captions/mel_frontend_unittest.cc
++++ b/components/tark_captions/mel_frontend_unittest.cc
+@@ -5,6 +5,13 @@
+ #include "components/tark_captions/mel_frontend.h"
+ 
+ #include <cmath>
++#include <string>
++
++#include "base/files/file_util.h"
++#include "base/files/scoped_temp_dir.h"
++#include "base/json/json_reader.h"
++#include "components/tark_captions/asr_model.h"
++#include "components/tark_captions/model_source.h"
+ 
+ #include "components/tark_captions/test_util.h"
+ #include "testing/gtest/include/gtest/gtest.h"
+@@ -44,5 +51,58 @@
+   }
+ }
+ 
++// NeMo 3's per-language models (IndicConformer 130M, FastConformer): n/hop
++// valid frames normalised and the rest zeroed, the STFT padded with zeros.
++// The golden is the spike's reference (scripts/models.py engine_mel), which
++// matched NeMo's own preprocessor to 2.4e-4.
++TEST(MelFrontendTest, ZeroPadHopFramesMatchNemo) {
++  std::optional<base::FilePath> testdata = test::TestDataDir();
++  if (!testdata) {
++    GTEST_SKIP() << "set TARK_CAPTIONS_TESTDATA";
++  }
++  std::string json;
++  ASSERT_TRUE(base::ReadFileToString(testdata->AppendASCII("mel_golden.json"), &json));
++  std::optional<base::Value> golden = base::JSONReader::Read(json, base::JSON_PARSE_RFC);
++  ASSERT_TRUE(golden && golden->is_dict());
++  const base::DictValue& g = golden->GetDict();
++  DirectorySource source(testdata->AppendASCII(*g.FindString("models")));
++  std::optional<ModelConventions> conventions = ReadConventions(source);
++  ASSERT_TRUE(conventions);
++  EXPECT_EQ(conventions->frames, ModelConventions::Frames::kHop);
++  EXPECT_EQ(conventions->pad, ModelConventions::Pad::kZero);
++  std::unique_ptr<MelFrontend> frontend = MelFrontend::Load(source, *conventions);
++  ASSERT_TRUE(frontend);
++  int rate = 0;
++  std::vector<float> pcm = test::ReadWav(testdata->AppendASCII(*g.FindString("wav")), &rate);
++  int frames = 0;
++  int valid = 0;
++  std::vector<float> features = frontend->Compute(pcm, &frames, &valid);
++  ASSERT_EQ(frames, *g.FindInt("frames"));
++  ASSERT_EQ(valid, *g.FindInt("valid"));
++  float worst = 0;
++  auto compare = [&](const base::ListValue& rows, int first_frame) {
++    for (int m = 0; m < MelFrontend::kMels; ++m) {
++      const base::ListValue& row = rows[m].GetList();
++      for (size_t i = 0; i < row.size(); ++i) {
++        worst = std::max(worst, std::abs(features[m * frames + first_frame + i] -
++                                         static_cast<float>(row[i].GetDouble())));
++      }
++    }
++  };
++  compare(*g.FindList("head"), 0);
++  compare(*g.FindList("tail"), frames - 5);
++  EXPECT_LE(worst, 1e-3f);
++}
++
++TEST(MelFrontendTest, DefaultsAreTheMacs) {
++  base::ScopedTempDir dir;
++  ASSERT_TRUE(dir.CreateUniqueTempDir());
++  std::optional<ModelConventions> conventions = ReadConventions(DirectorySource(dir.GetPath()));
++  ASSERT_TRUE(conventions);
++  EXPECT_EQ(conventions->frames, ModelConventions::Frames::kHopPlusOne);
++  EXPECT_EQ(conventions->pad, ModelConventions::Pad::kReflect);
++  EXPECT_EQ(conventions->blank, 256);
++}
++
+ }  // namespace
+ }  // namespace tark_captions
+--- /dev/null
++++ b/components/tark_captions/model_source.cc
+@@ -0,0 +1,101 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/tark_captions/model_source.h"
++
++#include <utility>
++
++#include "base/files/file_util.h"
++#include "base/json/json_reader.h"
++#include "base/values.h"
++
++namespace tark_captions {
++
++ModelSource::~ModelSource() = default;
++
++std::optional<base::FilePath> ModelSource::PathOf(std::string_view name) const {
++  return std::nullopt;
++}
++
++std::optional<ModelConventions> ReadConventions(const ModelSource& source) {
++  ModelConventions conventions;
++  std::optional<base::span<const uint8_t>> bytes = source.Read("engine.json");
++  if (!bytes) {
++    return conventions;  // The Mac's 600M.
++  }
++  std::optional<base::Value> json = base::JSONReader::Read(
++      std::string_view(reinterpret_cast<const char*>(bytes->data()), bytes->size()),
++      base::JSON_PARSE_RFC);
++  if (!json || !json->is_dict()) {
++    return std::nullopt;
++  }
++  const base::DictValue& dict = json->GetDict();
++  if (const std::string* frames = dict.FindString("valid_frames")) {
++    if (*frames == "n/hop") {
++      conventions.frames = ModelConventions::Frames::kHop;
++    } else if (*frames != "n/hop+1") {
++      return std::nullopt;
++    }
++  }
++  if (const std::string* pad = dict.FindString("pad")) {
++    if (*pad == "constant") {
++      conventions.pad = ModelConventions::Pad::kZero;
++    } else if (*pad != "reflect") {
++      return std::nullopt;
++    }
++  }
++  if (const base::Value* blank = dict.Find("blank")) {
++    if (!blank->is_int() || blank->GetInt() < 0) {
++      return std::nullopt;
++    }
++    conventions.blank = blank->GetInt();
++  }
++  return conventions;
++}
++
++DirectorySource::DirectorySource(base::FilePath dir) : dir_(std::move(dir)) {}
++DirectorySource::~DirectorySource() = default;
++
++std::optional<base::span<const uint8_t>> DirectorySource::Read(std::string_view name) const {
++  auto it = cache_.find(name);
++  if (it == cache_.end()) {
++    std::optional<std::vector<uint8_t>> bytes = base::ReadFileToBytes(dir_.AppendASCII(name));
++    if (!bytes) {
++      return std::nullopt;
++    }
++    it = cache_.emplace(std::string(name), std::move(*bytes)).first;
++  }
++  return base::span<const uint8_t>(it->second);
++}
++
++std::optional<base::FilePath> DirectorySource::PathOf(std::string_view name) const {
++  const base::FilePath path = dir_.AppendASCII(name);
++  return base::PathExists(path) ? std::optional(path) : std::nullopt;
++}
++
++MappedFilesSource::MappedFilesSource(std::map<std::string, base::File> files) {
++  for (auto& [name, file] : files) {
++    files_.emplace(name, std::move(file));
++  }
++}
++MappedFilesSource::~MappedFilesSource() = default;
++
++std::optional<base::span<const uint8_t>> MappedFilesSource::Read(std::string_view name) const {
++  auto mapped = mapped_.find(name);
++  if (mapped == mapped_.end()) {
++    auto file = files_.find(name);
++    if (file == files_.end() || !file->second.IsValid()) {
++      return std::nullopt;
++    }
++    auto map = std::make_unique<base::MemoryMappedFile>();
++    if (!map->Initialize(std::move(file->second))) {
++      return std::nullopt;
++    }
++    files_.erase(file);
++    mapped = mapped_.emplace(std::string(name), std::move(map)).first;
++  }
++  return mapped->second->bytes();
++}
++
++}  // namespace tark_captions
+--- /dev/null
++++ b/components/tark_captions/model_source.h
+@@ -0,0 +1,83 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef COMPONENTS_TARK_CAPTIONS_MODEL_SOURCE_H_
++#define COMPONENTS_TARK_CAPTIONS_MODEL_SOURCE_H_
++
++#include <cstdint>
++#include <map>
++#include <memory>
++#include <optional>
++#include <string>
++#include <string_view>
++#include <vector>
++
++#include "base/containers/span.h"
++#include "base/files/file.h"
++#include "base/files/file_path.h"
++#include "base/files/memory_mapped_file.h"
++
++namespace tark_captions {
++
++// Where a model's files come from: a folder (the Mac, tests) or files
++// opened by someone else and handed over (Android's sandboxed captions
++// process, which may not open paths itself). Use on one sequence.
++class ModelSource {
++ public:
++  virtual ~ModelSource();
++
++  // The bytes of the model folder's file `name`; nullopt if it is missing.
++  // The span lives as long as the source.
++  virtual std::optional<base::span<const uint8_t>> Read(std::string_view name) const = 0;
++  // The file's path, when it has one (ONNX Runtime then maps the file
++  // itself instead of copying it).
++  virtual std::optional<base::FilePath> PathOf(std::string_view name) const;
++};
++
++// How a model's audio features and output are laid out (engine.json beside
++// the model). The Mac's 600M has no engine.json: its preprocessor counts
++// samples / hop + 1 frames and reflects at the edges, blank 256. NeMo 3's
++// per-language models count samples / hop valid frames (the rest zeroed)
++// and pad the STFT with zeros; FastConformer's blank is 1024.
++struct ModelConventions {
++  enum class Frames { kHopPlusOne, kHop };
++  enum class Pad { kReflect, kZero };
++  Frames frames = Frames::kHopPlusOne;
++  Pad pad = Pad::kReflect;
++  int blank = 256;
++};
++
++// engine.json's `valid_frames` ("n/hop+1" / "n/hop"), `pad` ("reflect" /
++// "constant") and `blank`; the defaults above without the file; nullopt
++// for a file the engine does not understand.
++std::optional<ModelConventions> ReadConventions(const ModelSource& source);
++
++class DirectorySource final : public ModelSource {
++ public:
++  explicit DirectorySource(base::FilePath dir);
++  ~DirectorySource() override;
++
++  std::optional<base::span<const uint8_t>> Read(std::string_view name) const override;
++  std::optional<base::FilePath> PathOf(std::string_view name) const override;
++
++ private:
++  const base::FilePath dir_;
++  mutable std::map<std::string, std::vector<uint8_t>, std::less<>> cache_;
++};
++
++class MappedFilesSource final : public ModelSource {
++ public:
++  explicit MappedFilesSource(std::map<std::string, base::File> files);
++  ~MappedFilesSource() override;
++
++  std::optional<base::span<const uint8_t>> Read(std::string_view name) const override;
++
++ private:
++  mutable std::map<std::string, base::File, std::less<>> files_;
++  mutable std::map<std::string, std::unique_ptr<base::MemoryMappedFile>, std::less<>> mapped_;
++};
++
++}  // namespace tark_captions
++
++#endif  // COMPONENTS_TARK_CAPTIONS_MODEL_SOURCE_H_
+--- /dev/null
++++ b/components/tark_captions/model_source_unittest.cc
+@@ -0,0 +1,51 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/tark_captions/model_source.h"
++
++#include <map>
++#include <string>
++
++#include "base/files/file.h"
++#include "base/files/file_util.h"
++#include "base/files/scoped_temp_dir.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace tark_captions {
++namespace {
++
++std::string AsString(base::span<const uint8_t> bytes) {
++  return std::string(bytes.begin(), bytes.end());
++}
++
++TEST(ModelSourceTest, DirectoryReadsFilesAndMissingIsNullopt) {
++  base::ScopedTempDir dir;
++  ASSERT_TRUE(dir.CreateUniqueTempDir());
++  ASSERT_TRUE(base::WriteFile(dir.GetPath().AppendASCII("vocab.json"), "{\"hi\":[]}"));
++  DirectorySource source(dir.GetPath());
++  std::optional<base::span<const uint8_t>> bytes = source.Read("vocab.json");
++  ASSERT_TRUE(bytes);
++  EXPECT_EQ(AsString(*bytes), "{\"hi\":[]}");
++  EXPECT_EQ(source.PathOf("vocab.json"), dir.GetPath().AppendASCII("vocab.json"));
++  EXPECT_FALSE(source.Read("missing.onnx"));
++  EXPECT_FALSE(source.PathOf("missing.onnx"));
++}
++
++TEST(ModelSourceTest, MappedFilesReadTheirBytesAndHaveNoPaths) {
++  base::ScopedTempDir dir;
++  ASSERT_TRUE(dir.CreateUniqueTempDir());
++  const base::FilePath path = dir.GetPath().AppendASCII("window.f32");
++  ASSERT_TRUE(base::WriteFile(path, "abcd"));
++  std::map<std::string, base::File> files;
++  files.emplace("window.f32", base::File(path, base::File::FLAG_OPEN | base::File::FLAG_READ));
++  MappedFilesSource source(std::move(files));
++  std::optional<base::span<const uint8_t>> bytes = source.Read("window.f32");
++  ASSERT_TRUE(bytes);
++  EXPECT_EQ(AsString(*bytes), "abcd");
++  EXPECT_FALSE(source.PathOf("window.f32"));
++  EXPECT_FALSE(source.Read("mel_fb.f32"));
++}
++
++}  // namespace
++}  // namespace tark_captions
+--- a/components/tark_captions/ort_runtime.cc
++++ b/components/tark_captions/ort_runtime.cc
+@@ -67,6 +67,31 @@
+ }
+ 
+ std::unique_ptr<OrtModel> OrtRuntime::LoadModel(const base::FilePath& onnx, int threads) {
++  return Load(threads, [&](OrtSessionOptions* options, OrtSession** session) {
++    return api_->CreateSession(env_, onnx.value().c_str(), options, session);
++  });
++}
++
++std::unique_ptr<OrtModel> OrtRuntime::LoadModelFromMemory(base::span<const uint8_t> onnx,
++                                                          int threads) {
++  return Load(threads, [&](OrtSessionOptions* options, OrtSession** session) {
++    return api_->CreateSessionFromArray(env_, onnx.data(), onnx.size(), options, session);
++  });
++}
++
++std::unique_ptr<OrtModel> OrtRuntime::LoadModel(const ModelSource& source,
++                                                std::string_view name,
++                                                int threads) {
++  if (std::optional<base::FilePath> path = source.PathOf(name)) {
++    return LoadModel(*path, threads);
++  }
++  std::optional<base::span<const uint8_t>> bytes = source.Read(name);
++  return bytes ? LoadModelFromMemory(*bytes, threads) : nullptr;
++}
++
++std::unique_ptr<OrtModel> OrtRuntime::Load(
++    int threads,
++    base::FunctionRef<OrtStatus*(OrtSessionOptions*, OrtSession**)> create) {
+   OrtSessionOptions* options = nullptr;
+   if (!Ok(api_, api_->CreateSessionOptions(&options))) {
+     return nullptr;
+@@ -75,7 +100,7 @@
+   const bool ok = Ok(api_, api_->SetIntraOpNumThreads(options, threads)) &&
+                   Ok(api_, api_->SetInterOpNumThreads(options, 1)) &&
+                   Ok(api_, api_->SetSessionGraphOptimizationLevel(options, ORT_ENABLE_ALL)) &&
+-                  Ok(api_, api_->CreateSession(env_, onnx.value().c_str(), options, &session));
++                  Ok(api_, create(options, &session));
+   api_->ReleaseSessionOptions(options);
+   if (!ok) {
+     return nullptr;
+--- a/components/tark_captions/ort_runtime.h
++++ b/components/tark_captions/ort_runtime.h
+@@ -8,15 +8,21 @@
+ #include <cstdint>
+ #include <memory>
+ #include <string>
++#include <string_view>
+ #include <vector>
+ 
++#include "base/containers/span.h"
+ #include "base/files/file_path.h"
++#include "base/functional/function_ref.h"
+ #include "base/memory/raw_ptr.h"
+ #include "base/native_library.h"
++#include "components/tark_captions/model_source.h"
+ 
+ struct OrtApi;
+ struct OrtEnv;
+ struct OrtSession;
++struct OrtSessionOptions;
++struct OrtStatus;
+ 
+ namespace tark_captions {
+ 
+@@ -47,10 +53,22 @@
+   // Null if the model is missing or invalid. `threads` is ONNX Runtime's
+   // intra-op thread count.
+   std::unique_ptr<OrtModel> LoadModel(const base::FilePath& onnx, int threads);
++  // The same from the model's bytes (Android's captions process gets files,
++  // not paths). ONNX Runtime copies what it needs.
++  std::unique_ptr<OrtModel> LoadModelFromMemory(base::span<const uint8_t> onnx, int threads);
++  // The model file `name` of `source`: by path when it has one, else from
++  // its bytes.
++  std::unique_ptr<OrtModel> LoadModel(const ModelSource& source, std::string_view name, int threads);
+ 
+  private:
+   OrtRuntime(base::NativeLibrary library, const OrtApi* api, OrtEnv* env);
+ 
++  // A session from `create`, with Tark's options (threads, full graph
++  // optimisation).
++  std::unique_ptr<OrtModel> Load(
++      int threads,
++      base::FunctionRef<OrtStatus*(OrtSessionOptions*, OrtSession**)> create);
++
+   base::NativeLibrary library_;
+   raw_ptr<const OrtApi> api_;
+   raw_ptr<OrtEnv> env_;
+--- a/components/tark_captions/ort_runtime_unittest.cc
++++ b/components/tark_captions/ort_runtime_unittest.cc
+@@ -9,6 +9,7 @@
+ 
+ #include "base/environment.h"
+ #include "base/files/file_path.h"
++#include "base/files/file_util.h"
+ #include "base/strings/cstring_view.h"
+ #include "testing/gtest/include/gtest/gtest.h"
+ 
+@@ -74,6 +75,17 @@
+   EXPECT_EQ(outputs[1].shape, (std::vector<int64_t>{2, 1, 128}));
+ }
+ 
++// Android's captions process gets model files as handles, not paths.
++TEST_F(OrtRuntimeTest, LoadsModelFromMemory) {
++  std::unique_ptr<OrtRuntime> runtime = OrtRuntime::Load(ort_path_);
++  ASSERT_TRUE(runtime);
++  std::string bytes;
++  ASSERT_TRUE(base::ReadFileToString(models_.Append("silero_vad.onnx"), &bytes));
++  EXPECT_TRUE(runtime->LoadModelFromMemory(base::as_byte_span(bytes), /*threads=*/1));
++  const std::string junk = "not onnx";
++  EXPECT_FALSE(runtime->LoadModelFromMemory(base::as_byte_span(junk), /*threads=*/1));
++}
++
+ TEST_F(OrtRuntimeTest, MissingModelFails) {
+   std::unique_ptr<OrtRuntime> runtime = OrtRuntime::Load(ort_path_);
+   ASSERT_TRUE(runtime);
+--- a/components/tark_captions/segmenter.cc
++++ b/components/tark_captions/segmenter.cc
+@@ -8,7 +8,8 @@
+ 
+ namespace tark_captions {
+ 
+-Segmenter::Segmenter() = default;
++Segmenter::Segmenter() : Segmenter(Options()) {}
++Segmenter::Segmenter(Options options) : options_(options) {}
+ Segmenter::~Segmenter() = default;
+ 
+ SegmenterAction Segmenter::Make(SegmenterAction::Kind kind, double start_s, double end_s) const {
+@@ -36,11 +37,11 @@
+     speaking_ = false;
+     return Make(SegmenterAction::kFinal, segment_start_, last_speech_ + kPostRoll);
+   }
+-  if (now - segment_start_ >= kMaxSegment) {
++  if (now - segment_start_ >= options_.max_segment) {
+     double cut = now;
+     float lowest = 2.0f;
+     for (const auto& [t, p] : probs_) {
+-      if (t >= now - kMaxSegment / 2 && t >= segment_start_ + 1.0 && p < lowest) {
++      if (t >= now - options_.max_segment / 2 && t >= segment_start_ + 1.0 && p < lowest) {
+         cut = t;
+         lowest = p;
+       }
+@@ -50,7 +51,7 @@
+     std::erase_if(probs_, [cut](const auto& tp) { return tp.first <= cut; });
+     return Make(SegmenterAction::kFinal, start, cut);
+   }
+-  if (now - last_draft_ >= kDraftEvery) {
++  if (!options_.phrase && now - last_draft_ >= options_.draft_every) {
+     last_draft_ = now;
+     return Make(SegmenterAction::kDraft, segment_start_, now);
+   }
+--- a/components/tark_captions/segmenter.h
++++ b/components/tark_captions/segmenter.h
+@@ -35,7 +35,16 @@
+   static constexpr double kMaxSegment = 5.0;
+   static constexpr double kMinSegment = 0.3;
+ 
++  // The knobs Android varies per phone; the defaults are the Mac's.
++  struct Options {
++    double draft_every = kDraftEvery;
++    double max_segment = kMaxSegment;
++    // Phrase at a time: no drafts, only each segment's final.
++    bool phrase = false;
++  };
++
+   Segmenter();
++  explicit Segmenter(Options options);
+   ~Segmenter();
+ 
+   // `chunk_end_s`: the end of the chunk `speech_prob` describes.
+@@ -46,6 +55,7 @@
+  private:
+   SegmenterAction Make(SegmenterAction::Kind kind, double start_s, double end_s) const;
+ 
++  const Options options_;
+   bool speaking_ = false;
+   double segment_start_ = 0;
+   double last_speech_ = 0;
+--- a/components/tark_captions/segmenter_unittest.cc
++++ b/components/tark_captions/segmenter_unittest.cc
+@@ -93,6 +93,17 @@
+   EXPECT_TRUE(Feed(segmenter, 2, [](double t) { return t <= kChunk ? 0.9f : 0.05f; }).empty());
+ }
+ 
++TEST(SegmenterTest, PhraseModeEmitsOnlyFinals) {
++  // Phrase at a time (Android's mid-range default): with drafts off, a 3 s
++  // utterance then 0.6 s of silence is decoded once, as its final.
++  Segmenter segmenter({.phrase = true});
++  std::vector<SegmenterAction> actions =
++      Feed(segmenter, 3.6, [](double t) { return t <= 3.0 ? 0.9f : 0.05f; });
++  ASSERT_EQ(actions.size(), 1u);
++  EXPECT_EQ(actions[0].kind, SegmenterAction::kFinal);
++  EXPECT_NEAR(actions[0].start_s, 0.0, 1e-9);
++}
++
+ TEST(VadTest, VadMatchesGolden) {
+   std::optional<base::FilePath> ort = test::OrtPath();
+   std::optional<base::FilePath> models = test::ModelsDir();
+--- a/components/tark_captions/vad.cc
++++ b/components/tark_captions/vad.cc
+@@ -7,6 +7,7 @@
+ #include <utility>
+ 
+ #include "base/memory/ptr_util.h"
++#include "components/tark_captions/model_source.h"
+ #include "components/tark_captions/ort_runtime.h"
+ 
+ namespace tark_captions {
+@@ -19,7 +20,12 @@
+ 
+ // static
+ std::unique_ptr<Vad> Vad::Load(OrtRuntime* runtime, const base::FilePath& models_dir) {
+-  std::unique_ptr<OrtModel> model = runtime->LoadModel(models_dir.Append("silero_vad.onnx"), 1);
++  return Load(runtime, DirectorySource(models_dir));
++}
++
++// static
++std::unique_ptr<Vad> Vad::Load(OrtRuntime* runtime, const ModelSource& source) {
++  std::unique_ptr<OrtModel> model = runtime->LoadModel(source, "silero_vad.onnx", 1);
+   return model ? base::WrapUnique(new Vad(std::move(model))) : nullptr;
+ }
+ 
+--- a/components/tark_captions/vad.h
++++ b/components/tark_captions/vad.h
+@@ -14,6 +14,7 @@
+ namespace tark_captions {
+ 
+ class OrtModel;
++class ModelSource;
+ class OrtRuntime;
+ 
+ // Silero VAD (MIT): the probability that a 32 ms chunk of 16 kHz audio is
+@@ -25,6 +26,7 @@
+ 
+   // Reads silero_vad.onnx from `models_dir`; null if missing or invalid.
+   static std::unique_ptr<Vad> Load(OrtRuntime* runtime, const base::FilePath& models_dir);
++  static std::unique_ptr<Vad> Load(OrtRuntime* runtime, const ModelSource& source);
+ 
+   Vad(const Vad&) = delete;
+   Vad& operator=(const Vad&) = delete;

@@ -183,6 +183,8 @@ else
   #    A2's engine-level blocker removes them), IndicXlit (D1).
   run python3 "$_root_dir/utils/install_branding.py" "$_root_dir/resources/branding/mark" "$_src_dir" \
     install.txt install-android.txt
+  # Certificate trust data: CT log list, Chrome Root Store, CRLSet (resources/trust).
+  run python3 "$_root_dir/utils/trust_data.py" install "$_src_dir" --domain-regex "$_main_repo/domain_regex.list"
   run mkdir -p "$_src_dir/ui/webui/resources/fonts"
   run cp "$_root_dir"/resources/fonts/inter-latin.woff2 "$_root_dir"/resources/fonts/inter-latin-ext.woff2 \
     "$_src_dir/ui/webui/resources/fonts/"
@@ -252,18 +254,57 @@ fi
 
 # 6. gn and ninja, with the clang and Rust fetched while preparing; gn is
 #    bootstrapped from source as on the Mac.
+# Live captions: the model files the APK pins (android/captions/files.json,
+# built on the Mac by models.py; the files themselves are on gettarka.com).
+run python3 "$_root_dir/android/captions/models.py" header "$_root_dir/android/captions/files.json" \
+  "$_src_dir/chrome/browser/tark_captions_android/model_files.inc"
+# Live captions: ONNX Runtime's headers and its arm64 .so, pinned
+# (android/captions/ort.sh).
+run bash "$_root_dir/android/captions/ort.sh" "$_src_dir/third_party/tark_onnxruntime"
 mkdir -p "$_src_dir/out/Default"
 # Chromium's own clang (fetched while preparing) builds gn and everything else.
 export PATH="$_src_dir/third_party/llvm-build/Release+Asserts/bin:$PATH"
 export CC=clang CXX=clang++ AR=llvm-ar
 cat "$_main_repo/flags.gn" "$_root_dir/android/args.gn" > "$_src_dir/out/Default/args.gn"
+# A5: Tark's own version name and code (android/release/version.py), which
+# Play and the direct APK's update check compare.
+read -r _version_name _version_code < <(python3 "$_root_dir/android/release/version.py" "$_root_dir")
+printf 'android_override_version_name = "%s"\nandroid_override_version_code = "%s"\n' \
+  "$_version_name" "$_version_code" >> "$_src_dir/out/Default/args.gn"
 run python3 "$_src_dir/tools/gn/bootstrap/bootstrap.py" -o "$_src_dir/out/Default/gn" --skip-generate-buildfiles
 # Scripts run with the machine's python3, as in Chromium's source tarball (a
 # git checkout's .gn names a bundled Python the Android tree does not have).
 run sed -i "s|^script_executable = .*|script_executable = \"python3\"|" "$_src_dir/.gn"
 run "$_src_dir/out/Default/gn" gen "$_src_dir/out/Default" --root="$_src_dir" --fail-on-unused-args
+# Live captions' test binaries, before the APK (a build whose APK does not
+# compile still reports them): each runs even when an earlier one failed;
+# the build fails after the APK if any did.
+test_failures=0
+run_test() {
+  echo "tark: run $*"
+  if [[ "$dryrun" != 1 ]] && ! "$@"; then
+    echo "tark: FAILED $*"
+    test_failures=$((test_failures + 1))
+  fi
+}
+run ninja -C "$_src_dir/out/Default" components/tark_captions:host_unittests
+run_test env TARK_CAPTIONS_TESTDATA="$_root_dir/resources/captions/testdata" \
+  "$_src_dir/out/Default/clang_x64/tark_captions_engine_unittests"
+run ninja -C "$_src_dir/out/Default" chrome/browser/tark_captions_android:host_unittests
+run_test "$_src_dir/out/Default/clang_x64/tark_captions_android_unittests"
+run ninja -C "$_src_dir/out/Default" chrome/services/tark_captions:host_unittests
+run_test "$_src_dir/out/Default/clang_x64/tark_captions_session_unittests"
 # -k 0: one run reports every failing step, not only the first.
 run ninja -k 0 -C "$_src_dir/out/Default" chrome_public_apk
+# A5: the app bundle Play takes, from the same build (debug-signed here; the
+# release key signs it on the Mac, android/release/sign.py).
+run ninja -k 0 -C "$_src_dir/out/Default" chrome_public_bundle
+# Live captions: Play installs need ONNX Runtime in the bundle's base module
+# too (the APK's loadable_modules do not reach it).
+run python3 -c 'import sys, zipfile
+names = zipfile.ZipFile(sys.argv[1]).namelist()
+sys.exit(0 if "base/lib/arm64-v8a/libonnxruntime.so" in names else "no ONNX Runtime in " + sys.argv[1])' \
+  "$_src_dir/out/Default/apks/ChromePublic.aab"
 # A2: the ad blocker's unit tests (list bundle, signature, update schedule),
 # built for this machine and run here.
 run ninja -C "$_src_dir/out/Default" chrome/browser/tark_adblock:host_unittests
@@ -272,4 +313,9 @@ run ninja -C "$_src_dir/out/Default" components/tark_xlit:host_unittests
 run env CR_SOURCE_ROOT="$_src_dir" "$_src_dir/out/Default/clang_x64/tark_xlit_unittests"
 run ninja -C "$_src_dir/out/Default" chrome/browser/tark_xlit:host_unittests
 run "$_src_dir/out/Default/clang_x64/tark_xlit_files_unittests"
+run ninja -C "$_src_dir/out/Default" chrome/browser/tark_update:host_unittests
+run "$_src_dir/out/Default/clang_x64/tark_update_unittests"
+# Live captions: the engine's own tests (front end, speech model, segmenter,
+# VAD, ONNX Runtime loader), built for this machine.
+(( test_failures == 0 )) || { log "$test_failures test binaries failed"; exit 1; }
 log "built $_src_dir/out/Default/apks/ChromePublic.apk"

@@ -1,0 +1,112 @@
+--- a/components/remote_cocoa/app_shim/native_widget_ns_window_bridge.h
++++ b/components/remote_cocoa/app_shim/native_widget_ns_window_bridge.h
+@@ -139,6 +139,11 @@
+ 
+   // Called by the NSWindowDelegate when the size of the window changes.
+   void OnSizeChanged();
++  // Tark: gives the capture exclusion again, if it is still wanted; and
++  // once more shortly after (macOS ignores a shape given before the window's
++  // content reaches the window server).
++  void ReapplyCaptureExclusion();
++  void ReapplyCaptureExclusionSoon();
+ 
+   // Called once by the NSWindowDelegate when the position of the window is
+   // about to change.
+--- a/components/remote_cocoa/app_shim/native_widget_ns_window_bridge.mm
++++ b/components/remote_cocoa/app_shim/native_widget_ns_window_bridge.mm
+@@ -1467,6 +1467,24 @@
+   // Note: |this| and its host will be deleted here.
+ }
+ 
++void NativeWidgetNSWindowBridge::ReapplyCaptureExclusion() {
++  if (!allow_screenshots_) {
++    SetAllowScreenshots(false);
++  }
++}
++
++void NativeWidgetNSWindowBridge::ReapplyCaptureExclusionSoon() {
++  if (allow_screenshots_) {
++    return;
++  }
++  SetAllowScreenshots(false);
++  base::SingleThreadTaskRunner::GetCurrentDefault()->PostDelayedTask(
++      FROM_HERE,
++      base::BindOnce(&NativeWidgetNSWindowBridge::ReapplyCaptureExclusion,
++                     factory_.GetWeakPtr()),
++      base::Milliseconds(100));
++}
++
+ void NativeWidgetNSWindowBridge::OnSizeChanged() {
+   UpdateWindowGeometry();
+   if (!allow_screenshots_) {
+@@ -1509,6 +1527,10 @@
+     wants_to_be_visible_ = true;
+     if (parent_ && !window_visible_)
+       parent_->OrderChildren();
++    // Tark: macOS drops a capture-exclusion shape given while the window
++    // wasn't on screen; give it again now it is, and just after, on every
++    // show (the bar and the history panel hide and show again).
++    ReapplyCaptureExclusionSoon();
+   } else {
+     ReleaseCapture();  // Capture on hidden windows is not permitted.
+ 
+@@ -2019,6 +2041,10 @@
+   if (pending_alpha_value_.has_value()) {
+     window_.alphaValue = pending_alpha_value_.value();
+     pending_alpha_value_ = std::nullopt;
++    // Tark: an exclusion given while the window was held invisible (alpha 0)
++    // doesn't hold, nor one given before its first frame reaches the window
++    // server: give it again now, and once more just after.
++    ReapplyCaptureExclusionSoon();
+   }
+ 
+   if (invalidate_shadow_on_frame_swap_) {
+--- a/ui/views/widget/native_widget_mac_unittest.mm
++++ b/ui/views/widget/native_widget_mac_unittest.mm
+@@ -370,6 +370,46 @@
+   raw_ptr<base::RunLoop> run_loop_ = nullptr;
+ };
+ 
++// Tark: macOS drops a capture-exclusion shape given to a window that isn't on
++// screen yet, so a window excluded while hidden showed in screen captures
++// until it was next resized. The exclusion is given again when it shows.
++TEST_F(NativeWidgetMacTest, ScreenshotProtectionReappliedWhenShown) {
++  NativeWidgetMacTestWindow* window;
++  Widget::InitParams params =
++      CreateParams(Widget::InitParams::TYPE_WINDOW_FRAMELESS);
++  params.bounds = gfx::Rect(100, 100, 200, 150);
++  Widget* widget = CreateWidgetWithTestWindow(std::move(params), &window);
++
++  std::vector<bool> calls;
++  BridgedNativeWidgetTestApi(widget).SetCaptureExclusionApplier(
++      base::BindRepeating(
++          [](std::vector<bool>* calls, NSWindow* window, bool allow) {
++            calls->push_back(allow);
++          },
++          &calls));
++
++  widget->SetAllowScreenshots(false);
++  ASSERT_EQ(1u, calls.size());
++
++  WidgetChangeObserver observer(widget);
++  widget->ShowInactive();
++  observer.WaitForVisibleCounts(1, 0);
++  // Given again on show (and on the first frame, if it has come by now).
++  ASSERT_GE(calls.size(), 2u);
++  EXPECT_FALSE(calls.back());
++
++  // A window that allows captures is left alone when it shows.
++  widget->Hide();
++  observer.WaitForVisibleCounts(1, 1);
++  widget->SetAllowScreenshots(true);
++  const size_t before = calls.size();
++  widget->ShowInactive();
++  observer.WaitForVisibleCounts(2, 1);
++  EXPECT_EQ(before, calls.size());
++
++  widget->CloseNow();
++}
++
+ class WorkspaceChangeTestWidget : public Widget {
+  public:
+   WorkspaceChangeTestWidget() = default;

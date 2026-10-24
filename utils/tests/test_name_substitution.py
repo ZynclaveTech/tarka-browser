@@ -164,7 +164,9 @@ def test_plain_word_renames_have_hindi():
                                          'IDS_SITE_SETTINGS_PAGE_INTRUSIVE_ALLOWED_SUB_LABEL',
                                          'IDS_SITE_SETTINGS_PAGE_INTRUSIVE_BLOCKED_SUB_LABEL',
                                          'IDS_SITE_SETTINGS_PAGE_INTRUSIVE_ADS_A11Y',
-                                         'IDS_WEBSITE_SETTINGS_ADS_PAGE_DESCRIPTION'}
+                                         'IDS_WEBSITE_SETTINGS_ADS_PAGE_DESCRIPTION',
+                                         # A5: the menu's update item names Tark.
+                                         'IDS_MENU_UPDATE'}
     for english, old_id, new_id, by_lang in util.MESSAGE_RENAMES.values():
         assert english and old_id != new_id and 'hi' in by_lang
 
@@ -265,3 +267,9 @@ def test_other_translations_still_keep_incognito():
 def test_which_languages_are_english():
     assert util.is_english('en-GB') and util.is_english('en') and util.is_english('en-US')
     assert not util.is_english('hi') and not util.is_english('es-419') and not util.is_english('')
+
+
+def test_the_update_item_names_tark_in_hindi_too():
+    # A5: the app menu's "Update Chrome" (the direct APK's update check).
+    out = util.replace_xtb_tree(_xtb('hi', ('1553358976309200471', 'Chrome अपडेट करें')), {}, android=True)
+    assert '<translation id="8033778296507731171">Tark अपडेट करें</translation>' in out

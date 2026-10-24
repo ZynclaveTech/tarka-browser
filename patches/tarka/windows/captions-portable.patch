@@ -1,15 +1,6 @@
 --- a/chrome/services/speech/tark_caption_recognizer_unittest.cc
 +++ b/chrome/services/speech/tark_caption_recognizer_unittest.cc
-@@ -148,7 +148,7 @@
-   }
-   Bind(*ort, *models, "hi-IN");
-   int rate = 0;
--  std::vector<float> pcm = tark_captions::test::ReadWav(testdata->Append("hi_1.wav"), &rate);
-+  std::vector<float> pcm = tark_captions::test::ReadWav(testdata->AppendASCII("hi_1.wav"), &rate);
-   pcm.insert(pcm.end(), 16000, 0.0f);
-   for (size_t i = 0; i < pcm.size(); i += 160) {
-     auto buffer = media::mojom::AudioDataS16::New();
-@@ -159,7 +159,7 @@
+@@ -177,7 +177,7 @@
  }
  
  TEST_F(TarkCaptionRecognizerTest, ErrorWhenEngineMissing) {
@@ -60,23 +51,6 @@
    mojo::Remote<media::mojom::SpeechRecognitionContext> context;
    service->BindSpeechRecognitionContext(context.BindNewPipeAndPassReceiver());
  
---- a/components/tark_captions/asr_model.cc
-+++ b/components/tark_captions/asr_model.cc
-@@ -55,10 +55,10 @@
-                                          int threads) {
-   std::unique_ptr<MelFrontend> frontend = MelFrontend::Load(models_dir);
-   std::unique_ptr<OrtModel> encoder =
--      runtime->LoadModel(models_dir.Append("encoder.int8.onnx"), threads);
--  std::unique_ptr<OrtModel> ctc = runtime->LoadModel(models_dir.Append("ctc_decoder.onnx"), threads);
--  std::optional<base::Value> vocab = ReadJson(models_dir.Append("vocab.json"));
--  std::optional<base::Value> masks = ReadJson(models_dir.Append("language_masks.json"));
-+      runtime->LoadModel(models_dir.AppendASCII("encoder.int8.onnx"), threads);
-+  std::unique_ptr<OrtModel> ctc = runtime->LoadModel(models_dir.AppendASCII("ctc_decoder.onnx"), threads);
-+  std::optional<base::Value> vocab = ReadJson(models_dir.AppendASCII("vocab.json"));
-+  std::optional<base::Value> masks = ReadJson(models_dir.AppendASCII("language_masks.json"));
-   if (!frontend || !encoder || !ctc || !vocab || !vocab->is_dict() || !masks || !masks->is_dict()) {
-     return nullptr;
-   }
 --- a/components/tark_captions/caption_engine_unittest.cc
 +++ b/components/tark_captions/caption_engine_unittest.cc
 @@ -144,7 +144,7 @@
@@ -118,7 +92,7 @@
  }  // namespace
 --- a/components/tark_captions/language_gate_unittest.cc
 +++ b/components/tark_captions/language_gate_unittest.cc
-@@ -81,7 +81,7 @@
+@@ -123,7 +123,7 @@
  }
  
  TEST_F(LanguageGateTest, MissingDetectorIsNull) {
@@ -127,19 +101,6 @@
  }
  
  }  // namespace
---- a/components/tark_captions/mel_frontend.cc
-+++ b/components/tark_captions/mel_frontend.cc
-@@ -39,8 +39,8 @@
- 
- // static
- std::unique_ptr<MelFrontend> MelFrontend::Load(const base::FilePath& models_dir) {
--  std::vector<float> window = ReadFloats(models_dir.Append("window.f32"), kWindow);
--  std::vector<float> mel_fb = ReadFloats(models_dir.Append("mel_fb.f32"), kBins * kMels);
-+  std::vector<float> window = ReadFloats(models_dir.AppendASCII("window.f32"), kWindow);
-+  std::vector<float> mel_fb = ReadFloats(models_dir.AppendASCII("mel_fb.f32"), kBins * kMels);
-   if (window.empty() || mel_fb.empty()) {
-     return nullptr;
-   }
 --- a/components/tark_captions/mono_resampler_unittest.cc
 +++ b/components/tark_captions/mono_resampler_unittest.cc
 @@ -5,6 +5,7 @@
@@ -161,7 +122,7 @@
    }
 --- a/components/tark_captions/ort_runtime_unittest.cc
 +++ b/components/tark_captions/ort_runtime_unittest.cc
-@@ -20,7 +20,7 @@
+@@ -21,7 +21,7 @@
    if (!value || value->empty()) {
      return std::nullopt;
    }
@@ -170,7 +131,7 @@
  }
  
  class OrtRuntimeTest : public testing::Test {
-@@ -53,14 +53,14 @@
+@@ -54,14 +54,14 @@
  }
  
  TEST_F(OrtRuntimeTest, MissingRuntimeFails) {
@@ -187,7 +148,16 @@
    ASSERT_TRUE(vad);
    std::vector<Tensor> inputs(3);
    inputs[0] = {.name = "input", .shape = {1, 576}, .f32 = std::vector<float>(576)};
-@@ -77,7 +77,7 @@
+@@ -80,7 +80,7 @@
+   std::unique_ptr<OrtRuntime> runtime = OrtRuntime::Load(ort_path_);
+   ASSERT_TRUE(runtime);
+   std::string bytes;
+-  ASSERT_TRUE(base::ReadFileToString(models_.Append("silero_vad.onnx"), &bytes));
++  ASSERT_TRUE(base::ReadFileToString(models_.AppendASCII("silero_vad.onnx"), &bytes));
+   EXPECT_TRUE(runtime->LoadModelFromMemory(base::as_byte_span(bytes), /*threads=*/1));
+   const std::string junk = "not onnx";
+   EXPECT_FALSE(runtime->LoadModelFromMemory(base::as_byte_span(junk), /*threads=*/1));
+@@ -89,7 +89,7 @@
  TEST_F(OrtRuntimeTest, MissingModelFails) {
    std::unique_ptr<OrtRuntime> runtime = OrtRuntime::Load(ort_path_);
    ASSERT_TRUE(runtime);
@@ -198,7 +168,7 @@
  }  // namespace
 --- a/components/tark_captions/test_util.cc
 +++ b/components/tark_captions/test_util.cc
-@@ -21,7 +21,7 @@
+@@ -23,7 +23,7 @@
    if (!value || value->empty()) {
      return std::nullopt;
    }
@@ -207,7 +177,7 @@
  }
  
  uint32_t U32(const std::string& s, size_t at) {
-@@ -102,20 +102,20 @@
+@@ -104,24 +104,24 @@
  }  // namespace
  
  base::ListValue GoldenClips(const base::FilePath& testdata) {
@@ -218,6 +188,11 @@
  base::ListValue MtGoldenCases(const base::FilePath& testdata) {
 -  return ReadList(testdata.Append("mt_golden.json"), "cases");
 +  return ReadList(testdata.AppendASCII("mt_golden.json"), "cases");
+ }
+ 
+ base::ListValue EsMtGoldenCases(const base::FilePath& testdata) {
+-  return ReadList(testdata.Append("es_mt_golden.json"), "cases");
++  return ReadList(testdata.AppendASCII("es_mt_golden.json"), "cases");
  }
  
  base::ListValue LidGoldenCases(const base::FilePath& testdata) {
@@ -234,45 +209,24 @@
    std::optional<base::Value> value = base::JSONReader::Read(json, base::JSON_PARSE_RFC);
 --- a/components/tark_captions/translation_engine.cc
 +++ b/components/tark_captions/translation_engine.cc
-@@ -91,11 +91,11 @@
-  public:
-   static std::unique_ptr<Direction> Load(OrtRuntime* runtime, const base::FilePath& dir) {
-     auto d = base::WrapUnique(new Direction());
--    std::optional<base::DictValue> config = ReadJsonDict(dir.Append("config.json"));
--    std::optional<base::DictValue> src = ReadJsonDict(dir.Append("dict.SRC.json"));
--    std::optional<base::DictValue> tgt = ReadJsonDict(dir.Append("dict.TGT.json"));
-+    std::optional<base::DictValue> config = ReadJsonDict(dir.AppendASCII("config.json"));
-+    std::optional<base::DictValue> src = ReadJsonDict(dir.AppendASCII("dict.SRC.json"));
-+    std::optional<base::DictValue> tgt = ReadJsonDict(dir.AppendASCII("dict.TGT.json"));
-     std::string spm;
--    if (!config || !src || !tgt || !base::ReadFileToString(dir.Append("model.SRC"), &spm) ||
-+    if (!config || !src || !tgt || !base::ReadFileToString(dir.AppendASCII("model.SRC"), &spm) ||
-         !d->spm_.LoadFromSerializedProto(spm).ok()) {
-       LOG(ERROR) << "Tark translation: model files missing in " << dir;
-       return nullptr;
-@@ -137,8 +137,8 @@
-     }
-     d->unk_ = unk->second;
-     d->end_ = end->second;
--    d->encoder_ = runtime->LoadModel(dir.Append("encoder.int8.onnx"), kThreads);
--    d->decoder_ = runtime->LoadModel(dir.Append("decoder_step.int8.onnx"), kThreads);
-+    d->encoder_ = runtime->LoadModel(dir.AppendASCII("encoder.int8.onnx"), kThreads);
-+    d->decoder_ = runtime->LoadModel(dir.AppendASCII("decoder_step.int8.onnx"), kThreads);
-     if (!d->encoder_ || !d->decoder_) {
-       LOG(ERROR) << "Tark translation: models not loaded from " << dir;
-       return nullptr;
-@@ -269,7 +269,7 @@
-   if (!direction) {
-     // Not remembered when missing: the models may arrive later.
-     direction = Direction::Load(runtime_.get(),
--                                models_dir_.Append(to_english ? "it2_indic_en" : "it2_en_indic"));
-+                                models_dir_.AppendASCII(to_english ? "it2_indic_en" : "it2_en_indic"));
-   }
-   return direction.get();
+@@ -287,11 +287,11 @@
+                                                              const base::FilePath& ort_dylib) {
+   std::map<TranslationDirection, std::unique_ptr<ModelSource>> sources;
+   sources[TranslationDirection::kIndicToEnglish] =
+-      std::make_unique<DirectorySource>(models_dir.Append("it2_indic_en"));
++      std::make_unique<DirectorySource>(models_dir.AppendASCII("it2_indic_en"));
+   sources[TranslationDirection::kEnglishToIndic] =
+-      std::make_unique<DirectorySource>(models_dir.Append("it2_en_indic"));
++      std::make_unique<DirectorySource>(models_dir.AppendASCII("it2_en_indic"));
+   sources[TranslationDirection::kSpanishToEnglish] =
+-      std::make_unique<DirectorySource>(models_dir.Append("opus_es_en"));
++      std::make_unique<DirectorySource>(models_dir.AppendASCII("opus_es_en"));
+   return Create(OrtRuntime::Load(ort_dylib), std::move(sources));
  }
+ 
 --- a/components/tark_captions/translation_engine_unittest.cc
 +++ b/components/tark_captions/translation_engine_unittest.cc
-@@ -148,22 +148,22 @@
+@@ -152,14 +152,14 @@
  TEST_F(TranslationEngineTest, TruncatedModelFails) {
    base::ScopedTempDir dir;
    ASSERT_TRUE(dir.CreateUniqueTempDir());
@@ -291,6 +245,28 @@
    std::unique_ptr<TranslationEngine> engine = TranslationEngine::Create(dir.GetPath(), ort_);
    ASSERT_TRUE(engine);
    EXPECT_EQ(engine->Translate("नमस्ते", Language::kHindi, Target::kEnglish), std::nullopt);
+@@ -187,9 +187,9 @@
+ TEST_F(TranslationEngineTest, SourcesMatchPaths) {
+   std::map<TranslationDirection, std::unique_ptr<ModelSource>> sources;
+   sources[TranslationDirection::kIndicToEnglish] =
+-      test::MappedFilesSourceFor(models_.Append("it2_indic_en"));
++      test::MappedFilesSourceFor(models_.AppendASCII("it2_indic_en"));
+   sources[TranslationDirection::kEnglishToIndic] =
+-      test::MappedFilesSourceFor(models_.Append("it2_en_indic"));
++      test::MappedFilesSourceFor(models_.AppendASCII("it2_en_indic"));
+   std::unique_ptr<TranslationEngine> mapped =
+       TranslationEngine::Create(OrtRuntime::Load(ort_), std::move(sources));
+   ASSERT_TRUE(mapped);
+@@ -209,7 +209,7 @@
+ TEST_F(TranslationEngineTest, SpanishMatchesReference) {
+   std::map<TranslationDirection, std::unique_ptr<ModelSource>> sources;
+   sources[TranslationDirection::kSpanishToEnglish] =
+-      test::MappedFilesSourceFor(models_.Append("opus_es_en"));
++      test::MappedFilesSourceFor(models_.AppendASCII("opus_es_en"));
+   std::unique_ptr<TranslationEngine> spanish =
+       TranslationEngine::Create(OrtRuntime::Load(ort_), std::move(sources));
+   ASSERT_TRUE(spanish);
+@@ -243,8 +243,8 @@
  }
  
  TEST(TranslationEngineNoRuntimeTest, CreateFailsWithoutRuntime) {
@@ -301,14 +277,3 @@
  }
  
  TEST(TranslationEngineNoRuntimeTest, TargetCodes) {
---- a/components/tark_captions/vad.cc
-+++ b/components/tark_captions/vad.cc
-@@ -19,7 +19,7 @@
- 
- // static
- std::unique_ptr<Vad> Vad::Load(OrtRuntime* runtime, const base::FilePath& models_dir) {
--  std::unique_ptr<OrtModel> model = runtime->LoadModel(models_dir.Append("silero_vad.onnx"), 1);
-+  std::unique_ptr<OrtModel> model = runtime->LoadModel(models_dir.AppendASCII("silero_vad.onnx"), 1);
-   return model ? base::WrapUnique(new Vad(std::move(model))) : nullptr;
- }
- 

@@ -1,0 +1,117 @@
+#!/usr/bin/env python3
+# Copyright 2026 The Tark Authors
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+"""Tark for Android's live caption models: the download units and the table
+the APK pins.
+
+    python3 android/captions/models.py build EXPORTS SILERO_VAD OUT_DIR
+    python3 android/captions/models.py header FILES_JSON OUT.inc
+
+`build` runs on the Mac (the exports come from gated checkpoints and never go
+to the build machine): EXPORTS holds the measuring spike's int8 exports
+(ic130m-hi, ic130m-ta, fc-en, fc-es); OUT_DIR gets one folder per unit, the
+files published on gettarka.com by sha256, and files.json
+{"<unit>/<file>": {unit, size, sha256}}, which is committed as
+android/captions/files.json. `header` (android/build.sh) writes the C++ rows
+{"unit", "file", size, "sha256"}, compiled into the APK.
+"""
+
+import hashlib
+import json
+import pathlib
+import shutil
+import sys
+
+# Unit -> its export folder. `common` (Silero VAD) comes with any language.
+SPEECH_UNITS = {'hi': 'ic130m-hi', 'ta': 'ic130m-ta', 'en': 'fc-en', 'es': 'fc-es'}
+SPEECH_FILES = ('encoder.int8.onnx', 'ctc_decoder.onnx', 'window.f32', 'mel_fb.f32',
+                'vocab.json', 'language_masks.json', 'engine.json')
+# Translation (Phase 2a): IndicTrans2 distilled 200M both ways
+# (utils/indictrans_export.py) and opus-mt Spanish -> English
+# (utils/marian_export.py), each a download of its own.
+TRANSLATION_UNITS = {'tr_indic_en': 'it2_indic_en', 'tr_en_indic': 'it2_en_indic', 'tr_es_en': 'opus_es_en'}
+TRANSLATION_FILES = ('config.json', 'dict.SRC.json', 'dict.TGT.json', 'model.SRC',
+                     'encoder.int8.onnx', 'decoder_step.int8.onnx')
+
+
+def sha256(path):
+    h = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for block in iter(lambda: f.read(1 << 20), b''):
+            h.update(block)
+    return h.hexdigest()
+
+
+def check_export(unit, folder):
+    engine = json.loads((folder / 'engine.json').read_text(encoding='utf-8'))
+    for name in ('vocab.json', 'language_masks.json'):
+        keys = list(json.loads((folder / name).read_text(encoding='utf-8')))
+        if keys != [unit]:
+            sys.exit(f'{folder / name}: languages {keys}, expected [{unit!r}]')
+    if engine.get('lang') != unit or engine.get('valid_frames') not in ('n/hop', 'n/hop+1') \
+            or engine.get('pad') not in ('constant', 'reflect') or not isinstance(engine.get('blank'), int):
+        sys.exit(f'{folder / "engine.json"}: {engine}')
+
+
+def check_translation(unit, folder):
+    # Tark's TranslationEngine prefixes language tags unless config.json says
+    # "language_tags": false; only opus-mt has none.
+    config = json.loads((folder / 'config.json').read_text(encoding='utf-8'))
+    tags = config.get('language_tags', True)
+    if tags != (unit != 'tr_es_en'):
+        sys.exit(f'{folder / "config.json"}: language_tags {tags} for {unit}')
+    for key in ('decoder_layers', 'decoder_attention_heads', 'decoder_embed_dim',
+                'decoder_start_token_id', 'eos_token_id'):
+        if not isinstance(config.get(key), int):
+            sys.exit(f'{folder / "config.json"}: no {key}')
+
+
+def build(exports, silero_vad, out_dir):
+    exports, out_dir = pathlib.Path(exports), pathlib.Path(out_dir)
+    if out_dir.exists():
+        shutil.rmtree(out_dir)
+    sources = {'common/silero_vad.onnx': pathlib.Path(silero_vad)}
+    for unit, folder in SPEECH_UNITS.items():
+        check_export(unit, exports / folder)
+        for name in SPEECH_FILES:
+            sources[f'{unit}/{name}'] = exports / folder / name
+    for unit, folder in TRANSLATION_UNITS.items():
+        check_translation(unit, exports / folder)
+        for name in TRANSLATION_FILES:
+            sources[f'{unit}/{name}'] = exports / folder / name
+    files = {}
+    for name, source in sources.items():
+        dest = out_dir / name
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, dest)
+        files[name] = {'unit': name.split('/', 1)[0], 'size': dest.stat().st_size, 'sha256': sha256(dest)}
+    (out_dir / 'files.json').write_text(json.dumps(files, indent=1, sort_keys=True) + '\n', encoding='utf-8')
+    return files
+
+
+def units(files):
+    return sorted({f['unit'] for f in files.values()})
+
+
+def header_rows(files):
+    return ''.join(f'{{"{f["unit"]}", "{name.split("/", 1)[1]}", {f["size"]}, "{f["sha256"]}"}},\n'
+                   for name, f in sorted(files.items()))
+
+
+def main():
+    if len(sys.argv) == 5 and sys.argv[1] == 'build':
+        files = build(*sys.argv[2:5])
+        print(f'{len(files)} files in {len(units(files))} units')
+    elif len(sys.argv) == 4 and sys.argv[1] == 'header':
+        files = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding='utf-8'))
+        out = pathlib.Path(sys.argv[3])
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text('// Generated by android/captions/models.py from android/captions/files.json.\n'
+                       + header_rows(files), encoding='utf-8')
+    else:
+        sys.exit(__doc__)
+
+
+if __name__ == '__main__':
+    main()

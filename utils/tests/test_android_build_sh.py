@@ -246,6 +246,24 @@ class TestAndroidBuildSh(unittest.TestCase):
         self.assertLess(index_of(runs, '_install_xlit'), gn)
         self.assertLess(gn, ninja)
 
+    def test_release_identity_and_bundle(self):
+        # A5: Tark's own version name and code, and the app bundle for Play.
+        result, runs, files, tmp = dryrun()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        sys.path.insert(0, str(REPO / 'android' / 'release'))
+        import version
+        import json
+        chromium = (REPO / 'ungoogled-chromium' / 'chromium_version.txt').read_text().strip()
+        revision = json.loads((REPO / 'android' / 'release.json').read_text())['revision']
+        self.assertIn(f'android_override_version_code = "{version.version_code(chromium, revision)}"',
+                      files['args'])
+        self.assertIn(f'android_override_version_name = "{version.version_name(chromium, revision)}"',
+                      files['args'])
+        self.assertLess(index_of(runs, 'chrome_public_apk'), index_of(runs, 'chrome_public_bundle'))
+        # Outside the preparation: a new revision never re-prepares.
+        import prep_hash
+        self.assertNotIn('version.py', prep_hash.prep_section(SCRIPT.read_text()))
+
     def test_ninja_keeps_going_past_failures(self):
         # A build is ~an hour on the machine: one run reports every failing
         # step, not just the first.
