@@ -87,7 +87,8 @@ class TestMediaNotificationMark(unittest.TestCase):
 
 class TestRevision(unittest.TestCase):
     def test_r2(self):
-        self.assertEqual(json.loads((ROOT / 'android' / 'release.json').read_text())['revision'], 2)
+        # r2's changes are in every later revision; release.json only counts up.
+        self.assertGreaterEqual(json.loads((ROOT / 'android' / 'release.json').read_text())['revision'], 2)
 
 
 if __name__ == '__main__':
