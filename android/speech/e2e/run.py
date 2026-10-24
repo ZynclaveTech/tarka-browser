@@ -83,6 +83,15 @@ class Device(xlit.Device):
             return
         self.airplane(self.saved['airplane'])
         self.shell('pm', 'grant' if self.saved['mic'] else 'revoke', PACKAGE, MIC)
+        # Some phones refuse the shell a revoke (REVOKE_RUNTIME_PERMISSIONS):
+        # say so rather than leave the microphone granted unnoticed.
+        before = self.saved
+        self.remember_state()
+        for key, was in before.items():
+            if self.saved[key] != was:
+                print(f'WARNING: could not put back {key} (was {was}, now '
+                      f'{self.saved[key]}): do it by hand on the phone', file=sys.stderr)
+        self.saved = before
 
     def airplane(self, on):
         self.shell('cmd', 'connectivity', 'airplane-mode', 'enable' if on else 'disable')
