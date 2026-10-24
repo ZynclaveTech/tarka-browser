@@ -27,6 +27,14 @@ $ErrorActionPreference = 'Stop'
 New-Item -ItemType Directory -Force $Report | Out-Null
 $failed = [System.Collections.Generic.List[string]]::new()
 
+# The runner starts steps below normal priority, and Chromium's test suite
+# CHECKs at startup that it is not backgrounded (CheckProcessPriority), so
+# every test program stopped before its tests. Programs started from here
+# inherit this process's priority class.
+$self = Get-Process -Id $PID
+"priority class at start: $($self.PriorityClass)" | Out-File "$Report\priority.txt"
+$self.PriorityClass = 'Normal'
+
 function Note([string]$Line) { $Line | Tee-Object -Append "$Report\summary.txt" }
 
 function Check([string]$Name, [scriptblock]$Body) {
