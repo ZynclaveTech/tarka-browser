@@ -66,6 +66,10 @@ function Probe-TestProgram([string]$Exe, [string]$Tag, [string]$OneTest) {
     'list'              = '--gtest_list_tests'
     'one'               = $one
     'one-no-handle-check' = "$one --disable-strict-handle-checking-for-testing"
+    # A debugger skips TestSuite's in-process stack dumping; without one the
+    # suite stops in Initialize, so check that setup on its own.
+    'list-no-stack-traces' = '--gtest_list_tests --disable-in-process-stack-traces'
+    'one-no-stack-traces' = "$one --disable-in-process-stack-traces"
   }
   foreach ($name in $probes.Keys) {
     $code = Invoke-Logged $path $probes[$name] "$Tag-$name" 120
