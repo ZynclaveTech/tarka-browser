@@ -75,6 +75,18 @@ function Probe-TestProgram([string]$Exe, [string]$Tag, [string]$OneTest) {
     $code = Invoke-Logged $path $probes[$name] "$Tag-$name" 120
     "$name : $($probes[$name]) -> $(Format-Code $code)" | Out-File -Append "$Report\probe-$Tag.txt"
   }
+  # The same, with the dbghelp.dll and symsrv.dll beside the program moved
+  # aside so Windows' own dbghelp loads for the stack dumping setup.
+  $aside = @('dbghelp.dll', 'symsrv.dll') | Where-Object { Test-Path "$Tests\$_" }
+  foreach ($dll in $aside) { Rename-Item "$Tests\$dll" "$dll.aside" }
+  try {
+    foreach ($name in 'list', 'one') {
+      $code = Invoke-Logged $path $probes[$name] "$Tag-$name-system-dbghelp" 120
+      "$name-system-dbghelp : $($probes[$name]) -> $(Format-Code $code)" | Out-File -Append "$Report\probe-$Tag.txt"
+    }
+  } finally {
+    foreach ($dll in $aside) { Rename-Item "$Tests\$dll.aside" $dll }
+  }
   $cdb = "${env:ProgramFiles(x86)}\Windows Kits\10\Debuggers\x64\cdb.exe"
   if (-not (Test-Path $cdb)) {
     'cdb: not installed on this runner' | Out-File -Append "$Report\probe-$Tag.txt"
