@@ -74,26 +74,10 @@ function Probe-TestProgram([string]$Exe, [string]$Tag, [string]$OneTest) {
     'list'              = '--gtest_list_tests'
     'one'               = $one
     'one-no-handle-check' = "$one --disable-strict-handle-checking-for-testing"
-    # A debugger skips TestSuite's in-process stack dumping; without one the
-    # suite stops in Initialize, so check that setup on its own.
-    'list-no-stack-traces' = '--gtest_list_tests --disable-in-process-stack-traces'
-    'one-no-stack-traces' = "$one --disable-in-process-stack-traces"
   }
   foreach ($name in $probes.Keys) {
     $code = Invoke-Logged $path $probes[$name] "$Tag-$name" 120
     "$name : $($probes[$name]) -> $(Format-Code $code)" | Out-File -Append "$Report\probe-$Tag.txt"
-  }
-  # The same, with the dbghelp.dll and symsrv.dll beside the program moved
-  # aside so Windows' own dbghelp loads for the stack dumping setup.
-  $aside = @('dbghelp.dll', 'symsrv.dll') | Where-Object { Test-Path "$Tests\$_" }
-  foreach ($dll in $aside) { Rename-Item "$Tests\$dll" "$dll.aside" }
-  try {
-    foreach ($name in 'list', 'one') {
-      $code = Invoke-Logged $path $probes[$name] "$Tag-$name-system-dbghelp" 120
-      "$name-system-dbghelp : $($probes[$name]) -> $(Format-Code $code)" | Out-File -Append "$Report\probe-$Tag.txt"
-    }
-  } finally {
-    foreach ($dll in $aside) { Rename-Item "$Tests\$dll.aside" $dll }
   }
   $cdb = "${env:ProgramFiles(x86)}\Windows Kits\10\Debuggers\x64\cdb.exe"
   if (-not (Test-Path $cdb)) {
@@ -111,96 +95,6 @@ function Probe-TestProgram([string]$Exe, [string]$Tag, [string]$OneTest) {
   ) | Out-File -Encoding ascii "$Report\cdb-commands.txt"
   $code = Invoke-Logged $cdb ("-G -y `"$Tests`" -cf `"$Report\cdb-commands.txt`" `"$path`" $one") "$Tag-cdb" 300
   "cdb : $one -> $(Format-Code $code)" | Out-File -Append "$Report\probe-$Tag.txt"
-
-  # Under cdb the stop never happens, so read the code at the stop from the
-  # image itself: the branch to the CHECK block before +0x6e2 says which check fails.
-  $fn = "$([IO.Path]::GetFileNameWithoutExtension($Exe))!base::TestSuite::Initialize"
-  @(
-    ".symopt+ 0x40; .reload /f"
-    "u $fn $fn+0x6f0"
-    'q'
-  ) | Out-File -Encoding ascii "$Report\$Tag-disasm-commands.txt"
-  $code = Invoke-Logged $cdb ("-y `"$Tests`" -z `"$path`" -cf `"$Report\$Tag-disasm-commands.txt`"") "$Tag-disasm" 300
-  "disasm : $fn+0..0x6f0 -> $(Format-Code $code)" | Out-File -Append "$Report\probe-$Tag.txt"
-
-  # A debugger hides the stop, so let Windows Error Reporting write a full
-  # dump of an undebugged run, then read the thread's last error from it.
-  $dumps = "$env:RUNNER_TEMP\dumps-$Tag"
-  New-Item -ItemType Directory -Force $dumps | Out-Null
-  $wer = "HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\$Exe"
-  New-Item -Force $wer | Out-Null
-  Set-ItemProperty $wer DumpFolder $dumps -Type ExpandString
-  Set-ItemProperty $wer DumpType 2 -Type DWord
-  Set-ItemProperty $wer DumpCount 2 -Type DWord
-  try {
-    $code = Invoke-Logged $path $one "$Tag-wer" 120
-    Start-Sleep -Seconds 15  # WerFault writes the dump after the process ends.
-  } finally {
-    Remove-Item -Force -Recurse $wer
-  }
-  $dump = Get-ChildItem $dumps -Filter *.dmp | Select-Object -First 1
-  "wer : $one -> $(Format-Code $code), dump: $(if ($dump) { $dump.Name } else { 'none' })" |
-    Out-File -Append "$Report\probe-$Tag.txt"
-  if ($dump) {
-    @(
-      ".symopt+ 0x40; .reload /f"
-      '.ecxr'
-      '.lastevent'
-      '!gle -all'
-      'kn 40'
-      '~* kn 12'
-      'q'
-    ) | Out-File -Encoding ascii "$Report\$Tag-dump-commands.txt"
-    $code = Invoke-Logged $cdb ("-y `"$Tests`" -i `"$Tests`" -z `"$($dump.FullName)`" -cf `"$Report\$Tag-dump-commands.txt`"") "$Tag-dump" 300
-    "dump read -> $(Format-Code $code)" | Out-File -Append "$Report\probe-$Tag.txt"
-  }
-
-  # No dump came that way, so make cdb the postmortem debugger: the run is
-  # undebugged when the CHECK fails, and cdb attaches at the crash to print
-  # dbghelp's saved error (g_init_error), the last error and the stack.
-  $mod = [IO.Path]::GetFileNameWithoutExtension($Exe)
-  @(
-    '.symopt+ 0x40; .reload /f'
-    '.lastevent'
-    '.ecxr'
-    "x $mod!*g_init_error*"
-    ".foreach /pS 0 /ps 99 (a {x /0 $mod!*g_init_error*}) {dd a L1}"
-    '!gle -all'
-    'kn 40'
-    'qd'
-  ) | Out-File -Encoding ascii "$Report\$Tag-aedebug-commands.txt"
-  $log = "$Report\$Tag-aedebug.txt"
-  $aedebug = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\AeDebug'
-  $saved = Get-ItemProperty $aedebug -ErrorAction SilentlyContinue
-  Set-ItemProperty $aedebug Debugger "`"$cdb`" -p %ld -e %ld -g -y `"$Tests`" -logo `"$log`" -cf `"$Report\$Tag-aedebug-commands.txt`""
-  Set-ItemProperty $aedebug Auto '1'
-  try {
-    $code = Invoke-Logged $path $one "$Tag-aedebug-run" 180
-    Start-Sleep -Seconds 10  # cdb finishes its log after the process ends.
-  } finally {
-    foreach ($v in 'Debugger', 'Auto') {
-      if ($saved -and $null -ne $saved.$v) { Set-ItemProperty $aedebug $v $saved.$v }
-      else { Remove-ItemProperty $aedebug $v -ErrorAction SilentlyContinue }
-    }
-  }
-  "aedebug : $one -> $(Format-Code $code), log: $(if (Test-Path $log) { 'written' } else { 'none' })" |
-    Out-File -Append "$Report\probe-$Tag.txt"
-
-  # Under cdb, but with the PEB's BeingDebugged flag cleared, log each step of
-  # the stack dumping setup: the dbghelp/msdia140 loads and SymInitialize, each
-  # with its result and last error.
-  $ret = 'bp /1 @$ra \"r rax; !gle; g\"; g'
-  @(
-    'eb @$peb+2 0'
-    'sxe -c "kn 40; !gle; q" bpe'
-    "bp KERNELBASE!LoadLibraryExW `".printf \`"LoadLibraryExW %mu\\n\`", @rcx; $ret`""
-    "bm dbghelp!SymInitialize* `".printf \`"SymInitialize\\n\`"; $ret`""
-    "bp $mod!base::debug::EnableInProcessStackDumping `".printf \`"EnableInProcessStackDumping\\n\`"; $ret`""
-    'g'
-    'q'
-  ) | Out-File -Encoding ascii "$Report\$Tag-steps-commands.txt"
-  $code = Invoke-Logged $cdb ("-y `"$Tests`" -cf `"$Report\$Tag-steps-commands.txt`" `"$path`" $one") "$Tag-steps" 300
-  "steps (cdb, BeingDebugged cleared) : $one -> $(Format-Code $code)" | Out-File -Append "$Report\probe-$Tag.txt"
 }
 
 function Run-TestProgram([string]$Exe, [string]$Log, [string]$Arguments) {
