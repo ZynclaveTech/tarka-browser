@@ -100,6 +100,10 @@ class Device(xlit.Device):
                 step()
             except Exception as e:  # noqa: BLE001 — every step is tried
                 failed.append(f'{key}: {type(e).__name__}: {e}')
+        # An unplugged phone answers every shell call with nothing: that must
+        # never read as "put back".
+        if self.run('get-state').strip() != 'device':
+            return failed + ['phone disconnected: state not verified']
         try:
             now = self.current_state()
         except Exception as e:  # noqa: BLE001
@@ -577,6 +581,9 @@ def main(argv=None):
             for key, value in RESULTS.items():
                 print(f'    {key}: {value}', flush=True)
     finally:
+        # A second signal must not cut the restore short.
+        for sig in (signal.SIGTERM, signal.SIGHUP):
+            signal.signal(sig, signal.SIG_IGN)
         try:
             not_restored = dev.teardown()
         except Exception as e:  # noqa: BLE001
