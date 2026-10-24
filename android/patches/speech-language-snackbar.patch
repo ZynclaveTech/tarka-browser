@@ -1,0 +1,616 @@
+diff -ruN a/chrome/android/BUILD.gn b/chrome/android/BUILD.gn
+--- a/chrome/android/BUILD.gn	2026-10-24 18:48:02.249539280 +0530
++++ b/chrome/android/BUILD.gn	2026-10-24 18:48:02.322803775 +0530
+@@ -1160,6 +1160,7 @@
+       "junit:chrome_junit_tests_org.chromium.chrome.browser.share",
+       "junit:chrome_junit_tests_org.chromium.chrome.browser.sharing",
+       "junit:chrome_junit_tests_org.chromium.chrome.browser.signin",
++      "junit:chrome_junit_tests_org.chromium.chrome.browser.speech",
+       "junit:chrome_junit_tests_org.chromium.chrome.browser.suggestions",
+       "junit:chrome_junit_tests_org.chromium.chrome.browser.sync",
+       "junit:chrome_junit_tests_org.chromium.chrome.browser.sync.synced_set_up",
+diff -ruN a/chrome/android/chrome_java_sources.gni b/chrome/android/chrome_java_sources.gni
+--- a/chrome/android/chrome_java_sources.gni	2026-10-24 18:48:02.254099594 +0530
++++ b/chrome/android/chrome_java_sources.gni	2026-10-24 19:00:22.398842557 +0530
+@@ -1148,6 +1148,7 @@
+   "java/src/org/chromium/chrome/browser/signin/WebSigninRedirectCoordinatorSupplier.java",
+   "java/src/org/chromium/chrome/browser/site_settings/ChromeSiteSettingsDelegate.java",
+   "java/src/org/chromium/chrome/browser/site_settings/ManageSpaceActivity.java",
++  "java/src/org/chromium/chrome/browser/speech/SpeechLanguageSnackbar.java",
+   "java/src/org/chromium/chrome/browser/status_indicator/StatusIndicatorCoordinator.java",
+   "java/src/org/chromium/chrome/browser/status_indicator/StatusIndicatorMediator.java",
+   "java/src/org/chromium/chrome/browser/status_indicator/StatusIndicatorProperties.java",
+diff -ruN a/chrome/android/java/src/org/chromium/chrome/browser/app/ChromeActivity.java b/chrome/android/java/src/org/chromium/chrome/browser/app/ChromeActivity.java
+--- a/chrome/android/java/src/org/chromium/chrome/browser/app/ChromeActivity.java	2026-10-24 18:48:02.262461921 +0530
++++ b/chrome/android/java/src/org/chromium/chrome/browser/app/ChromeActivity.java	2026-10-24 19:00:15.120000069 +0530
+@@ -189,6 +189,7 @@
+ import org.chromium.chrome.browser.share.ShareDelegateImpl;
+ import org.chromium.chrome.browser.share.ShareDelegateSupplier;
+ import org.chromium.chrome.browser.signin.SigninAndHistorySyncActivityLauncherImpl;
++import org.chromium.chrome.browser.speech.SpeechLanguageSnackbar;
+ import org.chromium.chrome.browser.stylus_handwriting.StylusWritingCoordinator;
+ import org.chromium.chrome.browser.tab.RequestDesktopUtils;
+ import org.chromium.chrome.browser.tab.Tab;
+@@ -759,6 +760,8 @@
+                     getEdgeToEdgeSupplier());
+             mTarkCaptionBar =
+                     new TarkCaptionBarCoordinator(this, mBottomContainer, mActivityTabProvider);
++            // Tark: voice's missing-language snackbar (once per process).
++            SpeechLanguageSnackbar.register(this);
+ 
+             ShareDelegate shareDelegate =
+                     new ShareDelegateImpl(
+diff -ruN a/chrome/android/java/src/org/chromium/chrome/browser/speech/SpeechLanguageSnackbar.java b/chrome/android/java/src/org/chromium/chrome/browser/speech/SpeechLanguageSnackbar.java
+--- a/chrome/android/java/src/org/chromium/chrome/browser/speech/SpeechLanguageSnackbar.java	1970-01-01 05:30:00.000000000 +0530
++++ b/chrome/android/java/src/org/chromium/chrome/browser/speech/SpeechLanguageSnackbar.java	2026-10-24 19:00:43.925650233 +0530
+@@ -0,0 +1,296 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++package org.chromium.chrome.browser.speech;
++
++import android.app.Activity;
++import android.content.ActivityNotFoundException;
++import android.content.Context;
++import android.content.Intent;
++import android.os.Build;
++import android.provider.Settings;
++import android.speech.RecognitionSupport;
++import android.speech.RecognitionSupportCallback;
++import android.speech.RecognizerIntent;
++import android.speech.SpeechRecognizer;
++import android.text.TextUtils;
++
++import androidx.annotation.RequiresApi;
++import androidx.annotation.VisibleForTesting;
++
++import org.chromium.base.ApplicationStatus;
++import org.chromium.base.Callback;
++import org.chromium.base.ResettersForTesting;
++import org.chromium.build.annotations.NullMarked;
++import org.chromium.build.annotations.Nullable;
++import org.chromium.chrome.R;
++import org.chromium.chrome.browser.ui.messages.snackbar.Snackbar;
++import org.chromium.chrome.browser.ui.messages.snackbar.SnackbarManager;
++import org.chromium.content_public.browser.SpeechRecognition;
++
++import java.util.List;
++import java.util.Locale;
++
++/**
++ * Tark: when on-device speech recognition fails for a language the phone lacks, a snackbar says
++ * so and offers Android's own download. On Android 13+ it names the language, and Download asks
++ * Android's recognizer to download it (only if Android lists it as one it can get); on Android
++ * 12 it says a language is needed, and Download opens Android's voice input settings. Nothing is
++ * downloaded until the person taps Download.
++ */
++@NullMarked
++public class SpeechLanguageSnackbar implements SpeechRecognition.LanguageDelegate {
++    /** Android's pieces; replaced in tests. */
++    @VisibleForTesting
++    interface Platform {
++        /** The snackbar manager of the activity in front, if it has one. */
++        @Nullable SnackbarManager getSnackbarManager();
++
++        /**
++         * Tells whether Android's on-device recognizer has or can download the language (API 33+).
++         */
++        void isLanguageKnown(Context context, String bcp47, Callback<Boolean> callback);
++
++        /** Asks Android's on-device recognizer to download the language (API 33+). */
++        void triggerModelDownload(Context context, String bcp47);
++
++        /** Opens Android's voice input settings, where Android 12 downloads languages. */
++        void openLanguageSettings(Context context);
++    }
++
++    private static @Nullable SpeechLanguageSnackbar sInstance;
++    private static @Nullable Platform sPlatformForTesting;
++
++    private final Context mContext;
++    private final Platform mPlatform;
++
++    @VisibleForTesting
++    SpeechLanguageSnackbar(Context context, Platform platform) {
++        mContext = context;
++        mPlatform = platform;
++    }
++
++    /**
++     * Makes this the speech recognizer's language delegate. Called at each activity's start;
++     * only the first call does anything.
++     */
++    public static void register(Context context) {
++        if (sInstance != null) return;
++        Platform platform =
++                sPlatformForTesting != null ? sPlatformForTesting : new AndroidPlatform();
++        sInstance = new SpeechLanguageSnackbar(context.getApplicationContext(), platform);
++        SpeechRecognition.setLanguageDelegate(sInstance);
++    }
++
++    @VisibleForTesting
++    static void setPlatformForTesting(@Nullable Platform platform) {
++        sPlatformForTesting = platform;
++        ResettersForTesting.register(
++                () -> {
++                    sPlatformForTesting = null;
++                    sInstance = null;
++                    SpeechRecognition.setLanguageDelegate(null);
++                });
++    }
++
++    @Override
++    public void onLanguageMissing(String bcp47, boolean canDownload) {
++        if (!canDownload) {
++            // Android 12: no API to name or download the language; its settings can.
++            show(
++                    mContext.getString(R.string.tark_speech_language_needed),
++                    () -> mPlatform.openLanguageSettings(mContext));
++            return;
++        }
++        // The tag comes from the page: it never reaches the snackbar text itself.
++        boolean wellFormed = TextUtils.isEmpty(bcp47) || isWellFormedTag(bcp47);
++        String name = wellFormed ? displayName(bcp47) : null;
++        String text =
++                name == null
++                        ? mContext.getString(R.string.tark_speech_language_needed)
++                        : mContext.getString(R.string.tark_speech_language_missing, name);
++        if (!wellFormed) {
++            show(text, null);
++            return;
++        }
++        mPlatform.isLanguageKnown(
++                mContext,
++                bcp47,
++                known ->
++                        show(
++                                text,
++                                known
++                                        ? () -> mPlatform.triggerModelDownload(mContext, bcp47)
++                                        : null));
++    }
++
++    static final int MAX_TAG_LENGTH = 35;
++
++    /**
++     * Whether a page-supplied tag is a plain BCP 47 tag: ASCII letters, digits and hyphens, at
++     * most {@link #MAX_TAG_LENGTH} chars, a 2-3 letter language subtag, and unchanged by a
++     * Locale round trip (case aside).
++     */
++    static boolean isWellFormedTag(String bcp47) {
++        if (bcp47.isEmpty() || bcp47.length() > MAX_TAG_LENGTH) return false;
++        for (int i = 0; i < bcp47.length(); i++) {
++            char c = bcp47.charAt(i);
++            boolean ok =
++                    (c >= 'a' && c <= 'z')
++                            || (c >= 'A' && c <= 'Z')
++                            || (c >= '0' && c <= '9')
++                            || c == '-';
++            if (!ok) return false;
++        }
++        Locale locale = Locale.forLanguageTag(bcp47);
++        String language = locale.getLanguage();
++        if (language.length() < 2 || language.length() > 3) return false;
++        for (int i = 0; i < language.length(); i++) {
++            char c = language.charAt(i);
++            if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'))) return false;
++        }
++        return locale.toLanguageTag().equalsIgnoreCase(bcp47);
++    }
++
++    /**
++     * The language's name in the UI's language ("Hindi"), or null if Android has no name for it
++     * (it then returns the bare code, which is page-chosen text and never shown).
++     */
++    private @Nullable String displayName(String bcp47) {
++        Locale language =
++                TextUtils.isEmpty(bcp47) ? Locale.getDefault() : Locale.forLanguageTag(bcp47);
++        Locale ui = mContext.getResources().getConfiguration().getLocales().get(0);
++        String name = language.getDisplayLanguage(ui);
++        if (TextUtils.isEmpty(name) || name.equalsIgnoreCase(language.getLanguage())) return null;
++        return name;
++    }
++
++    private void show(String text, @Nullable Runnable download) {
++        SnackbarManager manager = mPlatform.getSnackbarManager();
++        if (manager == null) return;
++        SnackbarManager.SnackbarController controller =
++                new SnackbarManager.SnackbarController() {
++                    @Override
++                    public void onAction(@Nullable Object actionData) {
++                        if (download != null) download.run();
++                    }
++                };
++        Snackbar snackbar =
++                Snackbar.make(
++                        text,
++                        download != null ? controller : null,
++                        download != null ? Snackbar.TYPE_ACTION : Snackbar.TYPE_NOTIFICATION,
++                        Snackbar.UMA_UNKNOWN);
++        if (download != null) {
++            snackbar.setAction(mContext.getString(R.string.tark_speech_language_download), null);
++        }
++        manager.showSnackbar(snackbar);
++    }
++
++    /** Whether a recognizer language list names the language (exactly, or by language alone). */
++    @VisibleForTesting
++    static boolean listsLanguage(List<String> languages, String bcp47) {
++        String wanted = Locale.forLanguageTag(bcp47).getLanguage();
++        for (String tag : languages) {
++            if (tag.equalsIgnoreCase(bcp47)) return true;
++            Locale locale = Locale.forLanguageTag(tag);
++            if (!wanted.isEmpty()
++                    && locale.getLanguage().equals(wanted)
++                    && locale.getCountry().isEmpty()) {
++                return true;
++            }
++        }
++        return false;
++    }
++
++    private static class AndroidPlatform implements Platform {
++        // The recognizer that was asked for a download; Android keeps the request while it lives.
++        private @Nullable SpeechRecognizer mDownloadRecognizer;
++
++        @Override
++        public @Nullable SnackbarManager getSnackbarManager() {
++            Activity activity = ApplicationStatus.getLastTrackedFocusedActivity();
++            if (activity instanceof SnackbarManager.SnackbarManageable manageable) {
++                return manageable.getSnackbarManager();
++            }
++            return null;
++        }
++
++        @Override
++        public void isLanguageKnown(Context context, String bcp47, Callback<Boolean> callback) {
++            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
++                callback.onResult(false);
++                return;
++            }
++            checkSupport(context, bcp47, callback);
++        }
++
++        @RequiresApi(Build.VERSION_CODES.TIRAMISU)
++        private static void checkSupport(
++                Context context, String bcp47, Callback<Boolean> callback) {
++            SpeechRecognizer recognizer = SpeechRecognizer.createOnDeviceSpeechRecognizer(context);
++            recognizer.checkRecognitionSupport(
++                    languageIntent(bcp47),
++                    context.getMainExecutor(),
++                    new RecognitionSupportCallback() {
++                        @Override
++                        public void onSupportResult(RecognitionSupport support) {
++                            recognizer.destroy();
++                            callback.onResult(
++                                    listsLanguage(support.getInstalledOnDeviceLanguages(), bcp47)
++                                            || listsLanguage(
++                                                    support.getSupportedOnDeviceLanguages(),
++                                                    bcp47));
++                        }
++
++                        @Override
++                        public void onError(int error) {
++                            recognizer.destroy();
++                            callback.onResult(false);
++                        }
++                    });
++        }
++
++        @Override
++        public void triggerModelDownload(Context context, String bcp47) {
++            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return;
++            if (mDownloadRecognizer != null) mDownloadRecognizer.destroy();
++            mDownloadRecognizer = download(context, bcp47);
++        }
++
++        @RequiresApi(Build.VERSION_CODES.TIRAMISU)
++        private static SpeechRecognizer download(Context context, String bcp47) {
++            SpeechRecognizer recognizer = SpeechRecognizer.createOnDeviceSpeechRecognizer(context);
++            recognizer.triggerModelDownload(languageIntent(bcp47));
++            return recognizer;
++        }
++
++        @Override
++        public void openLanguageSettings(Context context) {
++            Activity activity = ApplicationStatus.getLastTrackedFocusedActivity();
++            Context starter = activity != null ? activity : context;
++            try {
++                starter.startActivity(languageSettingsIntent(starter));
++            } catch (ActivityNotFoundException e) {
++                // Nothing on this phone opens voice input settings; the snackbar just closes.
++            }
++        }
++    }
++
++    /** The intent that opens Android's voice input settings. */
++    @VisibleForTesting
++    static Intent languageSettingsIntent(Context context) {
++        Intent intent = new Intent(Settings.ACTION_VOICE_INPUT_SETTINGS);
++        if (!(context instanceof Activity)) intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
++        return intent;
++    }
++
++    private static Intent languageIntent(String bcp47) {
++        Intent intent = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
++        intent.putExtra(
++                RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM);
++        intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE, bcp47);
++        return intent;
++    }
++}
+diff -ruN a/chrome/android/junit/BUILD.gn b/chrome/android/junit/BUILD.gn
+--- a/chrome/android/junit/BUILD.gn	2026-10-24 18:48:02.250816131 +0530
++++ b/chrome/android/junit/BUILD.gn	2026-10-24 19:00:15.120319199 +0530
+@@ -1232,6 +1232,19 @@
+     ]
+   }
+ 
++  # Tark: voice's missing-language snackbar.
++  robolectric_library("chrome_junit_tests_org.chromium.chrome.browser.speech") {
++    resources_package = "org.chromium.chrome"
++
++    sources = [ "src/org/chromium/chrome/browser/speech/SpeechLanguageSnackbarTest.java" ]
++
++    deps = [
++      ":chrome_junit_tests_helper",
++      "//chrome/browser/ui/messages/android:java",
++      "//content/public/android:content_java",
++    ]
++  }
++
+   robolectric_library(
+       "chrome_junit_tests_org.chromium.chrome.browser.suggestions") {
+     sources = [
+diff -ruN a/chrome/android/junit/src/org/chromium/chrome/browser/speech/SpeechLanguageSnackbarTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/speech/SpeechLanguageSnackbarTest.java
+--- a/chrome/android/junit/src/org/chromium/chrome/browser/speech/SpeechLanguageSnackbarTest.java	1970-01-01 05:30:00.000000000 +0530
++++ b/chrome/android/junit/src/org/chromium/chrome/browser/speech/SpeechLanguageSnackbarTest.java	2026-10-24 19:00:43.926228783 +0530
+@@ -0,0 +1,179 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++package org.chromium.chrome.browser.speech;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.assertNotNull;
++import static org.junit.Assert.assertNull;
++import static org.junit.Assert.assertTrue;
++import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.verify;
++
++import android.content.Context;
++import android.content.Intent;
++import android.provider.Settings;
++
++import androidx.test.core.app.ApplicationProvider;
++
++import org.junit.Before;
++import org.junit.Test;
++import org.junit.runner.RunWith;
++import org.mockito.ArgumentCaptor;
++import org.robolectric.annotation.Config;
++
++import org.chromium.base.Callback;
++import org.chromium.base.test.BaseRobolectricTestRunner;
++import org.chromium.build.annotations.Nullable;
++import org.chromium.chrome.browser.ui.messages.snackbar.Snackbar;
++import org.chromium.chrome.browser.ui.messages.snackbar.SnackbarManager;
++
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.List;
++
++/** Tests for {@link SpeechLanguageSnackbar}. */
++@RunWith(BaseRobolectricTestRunner.class)
++@Config(qualifiers = "en-rUS")
++public class SpeechLanguageSnackbarTest {
++    private static class FakePlatform implements SpeechLanguageSnackbar.Platform {
++        final SnackbarManager mManager = mock(SnackbarManager.class);
++        final List<String> mKnown = new ArrayList<>(Arrays.asList("hi-IN", "en-US"));
++        final List<String> mDownloads = new ArrayList<>();
++        int mSettingsOpened;
++
++        @Override
++        public @Nullable SnackbarManager getSnackbarManager() {
++            return mManager;
++        }
++
++        @Override
++        public void isLanguageKnown(Context context, String bcp47, Callback<Boolean> callback) {
++            callback.onResult(SpeechLanguageSnackbar.listsLanguage(mKnown, bcp47));
++        }
++
++        @Override
++        public void triggerModelDownload(Context context, String bcp47) {
++            mDownloads.add(bcp47);
++        }
++
++        @Override
++        public void openLanguageSettings(Context context) {
++            mSettingsOpened++;
++        }
++    }
++
++    private Context mContext;
++    private FakePlatform mPlatform;
++    private SpeechLanguageSnackbar mSnackbar;
++
++    @Before
++    public void setUp() {
++        mContext = ApplicationProvider.getApplicationContext();
++        mPlatform = new FakePlatform();
++        mSnackbar = new SpeechLanguageSnackbar(mContext, mPlatform);
++    }
++
++    private Snackbar shown() {
++        ArgumentCaptor<Snackbar> captor = ArgumentCaptor.forClass(Snackbar.class);
++        verify(mPlatform.mManager).showSnackbar(captor.capture());
++        return captor.getValue();
++    }
++
++    private static void tap(Snackbar snackbar) {
++        assertNotNull(snackbar.getController());
++        snackbar.getController().onAction(snackbar.getActionData());
++    }
++
++    @Test
++    public void testNamesLanguageOn33() {
++        mSnackbar.onLanguageMissing("hi-IN", true);
++
++        Snackbar snackbar = shown();
++        assertEquals(
++                "Voice search needs Hindi on this phone.",
++                snackbar.getTextForTesting().toString());
++        assertEquals("Download", snackbar.getActionText());
++    }
++
++    @Test
++    public void testGenericOn31() {
++        mSnackbar.onLanguageMissing("hi-IN", false);
++
++        Snackbar snackbar = shown();
++        assertEquals("Voice needs a language downloaded", snackbar.getTextForTesting().toString());
++        assertEquals("Download", snackbar.getActionText());
++        assertEquals(0, mPlatform.mSettingsOpened);
++        tap(snackbar);
++        assertEquals(1, mPlatform.mSettingsOpened);
++        assertTrue(mPlatform.mDownloads.isEmpty());
++
++        Intent intent = SpeechLanguageSnackbar.languageSettingsIntent(mContext);
++        assertEquals(Settings.ACTION_VOICE_INPUT_SETTINGS, intent.getAction());
++    }
++
++    @Test
++    public void testDownloadOnlyOnTap() {
++        mSnackbar.onLanguageMissing("hi-IN", true);
++
++        Snackbar snackbar = shown();
++        assertTrue(mPlatform.mDownloads.isEmpty());
++        tap(snackbar);
++        assertEquals(Arrays.asList("hi-IN"), mPlatform.mDownloads);
++    }
++
++    @Test
++    public void testUnknownLanguageNoDownload() {
++        mSnackbar.onLanguageMissing("xx-YY", true);
++
++        Snackbar snackbar = shown();
++        assertEquals("Voice needs a language downloaded", snackbar.getTextForTesting().toString());
++        assertNull(snackbar.getActionText());
++        assertNull(snackbar.getController());
++        assertTrue(mPlatform.mDownloads.isEmpty());
++    }
++
++    @Test
++    public void testHostileTagNeverShown() {
++        String words = "Tark is updating, tap Download";
++        String longTag = "hi-" + "a".repeat(40);
++        for (String tag :
++                Arrays.asList(words, "en-US Tark is updating", longTag, "hi_IN", "\u202Ehi")) {
++            FakePlatform platform = new FakePlatform();
++            platform.mKnown.add(tag);
++            new SpeechLanguageSnackbar(mContext, platform).onLanguageMissing(tag, true);
++
++            ArgumentCaptor<Snackbar> captor = ArgumentCaptor.forClass(Snackbar.class);
++            verify(platform.mManager).showSnackbar(captor.capture());
++            Snackbar snackbar = captor.getValue();
++            String text = snackbar.getTextForTesting().toString();
++            assertEquals(tag, "Voice needs a language downloaded", text);
++            assertFalse(tag, text.contains("Tark is updating"));
++            assertFalse(tag, text.contains(longTag));
++            assertNull(tag, snackbar.getActionText());
++            assertTrue(tag, platform.mDownloads.isEmpty());
++        }
++    }
++
++    @Test
++    public void testIsWellFormedTag() {
++        assertTrue(SpeechLanguageSnackbar.isWellFormedTag("hi-IN"));
++        assertTrue(SpeechLanguageSnackbar.isWellFormedTag("en"));
++        assertTrue(SpeechLanguageSnackbar.isWellFormedTag("yue-Hant-HK"));
++        assertFalse(SpeechLanguageSnackbar.isWellFormedTag("Tark is updating, tap Download"));
++        assertFalse(SpeechLanguageSnackbar.isWellFormedTag("hi-" + "a".repeat(40)));
++        assertFalse(SpeechLanguageSnackbar.isWellFormedTag("x"));
++        assertFalse(SpeechLanguageSnackbar.isWellFormedTag("hi_IN"));
++        assertFalse(SpeechLanguageSnackbar.isWellFormedTag("12-IN"));
++    }
++
++    @Test
++    public void testListsLanguage() {
++        assertTrue(SpeechLanguageSnackbar.listsLanguage(Arrays.asList("hi-in"), "hi-IN"));
++        assertTrue(SpeechLanguageSnackbar.listsLanguage(Arrays.asList("hi"), "hi-IN"));
++        assertFalse(SpeechLanguageSnackbar.listsLanguage(Arrays.asList("hi-IN"), "ta-IN"));
++        assertFalse(SpeechLanguageSnackbar.listsLanguage(Arrays.asList("en-US"), "en-GB"));
++    }
++}
+diff -ruN a/chrome/browser/ui/android/strings/android_chrome_strings.grd b/chrome/browser/ui/android/strings/android_chrome_strings.grd
+--- a/chrome/browser/ui/android/strings/android_chrome_strings.grd	2026-10-24 18:48:02.232342619 +0530
++++ b/chrome/browser/ui/android/strings/android_chrome_strings.grd	2026-10-24 18:48:02.332974211 +0530
+@@ -984,6 +984,16 @@
+       <message name="IDS_TARK_XLIT_SWITCH_DOWNLOADED" desc="Tark: summary of the Indian-language suggestions switch: on, with the languages whose suggestions are downloaded, in their own names.">
+         Downloaded: <ph name="LANGUAGES">%1$s<ex>हिन्दी, தமிழ்</ex></ph>
+       </message>
++      <!-- Tark: voice's missing-language snackbar. -->
++      <message name="IDS_TARK_SPEECH_LANGUAGE_MISSING" desc="Tark: snackbar when voice search failed because the phone has not downloaded the speech recognition language (Android 13+), naming the language. Offers Download.">
++        Voice search needs <ph name="LANGUAGE">%1$s<ex>Hindi</ex></ph> on this phone.
++      </message>
++      <message name="IDS_TARK_SPEECH_LANGUAGE_NEEDED" desc="Tark: snackbar when voice search failed because the phone has not downloaded a speech recognition language (Android 12, which cannot say which). Download opens Android's voice input settings.">
++        Voice needs a language downloaded
++      </message>
++      <message name="IDS_TARK_SPEECH_LANGUAGE_DOWNLOAD" desc="Tark: action of the voice language snackbar: Android downloads the language (or opens its voice input settings).">
++        Download
++      </message>
+       <message name="IDS_TARK_CONNECTS_UPDATE" desc="Tark: item in the list of services Tark connects to: the direct APK's daily check for a newer version, with its host name.">
+         New versions of Tark, checked once a day unless Google Play installed it (gettarka.com)
+       </message>
+diff -ruN a/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb b/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb
+--- a/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb	2026-10-24 18:48:02.244053119 +0530
++++ b/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb	2026-10-24 18:48:02.333452176 +0530
+@@ -2195,4 +2195,6 @@
+ <translation id="8304126055697421220">Wi-Fi का इंतज़ार है</translation>
+ <translation id="9054517922063697959">डाउनलोड हो गए: <ph name="LANGUAGES"/></translation>
+ <translation id="8955589894175271948">Tark के नए वर्शन, दिन में एक बार जांचे जाते हैं, जब तक इसे Google Play से इंस्टॉल न किया गया हो (gettarka.com)</translation>
++<translation id="1628159678930647766">इस फ़ोन पर वॉइस सर्च के लिए <ph name="LANGUAGE"/> चाहिए।</translation>
++<translation id="5742981176567952751">वॉइस के लिए एक भाषा डाउनलोड करनी होगी</translation>
+ </translationbundle>
+\ No newline at end of file
+diff -ruN a/content/public/android/java/src/org/chromium/content_public/browser/SpeechRecognition.java b/content/public/android/java/src/org/chromium/content_public/browser/SpeechRecognition.java
+--- a/content/public/android/java/src/org/chromium/content_public/browser/SpeechRecognition.java	2026-10-24 18:48:02.224116628 +0530
++++ b/content/public/android/java/src/org/chromium/content_public/browser/SpeechRecognition.java	2026-10-24 18:48:02.333600095 +0530
+@@ -5,6 +5,7 @@
+ package org.chromium.content_public.browser;
+ 
+ import org.chromium.build.annotations.NullMarked;
++import org.chromium.build.annotations.Nullable;
+ import org.chromium.content.browser.SpeechRecognitionImpl;
+ 
+ /**
+@@ -24,4 +25,25 @@
+     public static boolean initialize() {
+         return SpeechRecognitionImpl.initialize();
+     }
++
++    /** Tark: told when recognition failed because the device lacks the session's language. */
++    public interface LanguageDelegate {
++        /**
++         * Called on the UI thread.
++         *
++         * @param bcp47 The language the session asked for (the page's, else the phone's).
++         * @param canDownload Whether Android can download it on request (API 33+).
++         */
++        void onLanguageMissing(String bcp47, boolean canDownload);
++    }
++
++    /**
++     * Tark: sets the delegate told when a session fails for a language the device lacks.
++     *
++     * @param delegate The delegate, or null for none.
++     */
++    public static void setLanguageDelegate(@Nullable LanguageDelegate delegate) {
++        SpeechRecognitionImpl.setLanguageDelegate(
++                delegate == null ? null : delegate::onLanguageMissing);
++    }
+ }

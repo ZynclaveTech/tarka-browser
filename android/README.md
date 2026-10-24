@@ -20,3 +20,13 @@ itself. Everything else (patches, scripts, fixes) is done on the Mac.
   (package `com.gettarka.tarka`, arm64, official build, no PGO).
 - `gclient.android` — the core gclient config with Android added; `UC_OUT`
   is filled in by `build.sh` (ungoogled's `clone.py -c` does not).
+- End-to-end checks on the emulator (`emulator-5554` only), each printing
+  `ok CASE` / `FAIL CASE: why`: `adblock/e2e/run.py`, `captions/e2e/run.py`,
+  `xlit/e2e/run.py`, `update/e2e/run.py`, and `speech/e2e/run.py` (voice
+  input on Android's on-device recognizer; `--speaker` (with
+  `--speaker-device NAME` to pick the Mac output, e.g. `'MacBook Pro
+  Speakers'`) or `--inject` feed speech, see its docstring). `speech` alone
+  also takes `--phone --serial SERIAL`: it then uses the phone's own Tark
+  as installed, never clears or reinstalls it, and puts the phone's airplane
+  mode and Tark's microphone permission back afterwards (printing
+  `NOT RESTORED: …` and exiting 1 if it cannot).

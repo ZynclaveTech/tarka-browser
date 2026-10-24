@@ -1,0 +1,686 @@
+diff --color -ruN a/content/public/android/BUILD.gn b/content/public/android/BUILD.gn
+--- a/content/public/android/BUILD.gn
++++ b/content/public/android/BUILD.gn
+@@ -752,6 +752,7 @@
+     "junit/src/org/chromium/content/browser/GestureListenerManagerImplUnitTest.java",
+     "junit/src/org/chromium/content/browser/ScreenOrientationProviderImplTest.java",
+     "junit/src/org/chromium/content/browser/SpareChildConnectionTest.java",
++    "junit/src/org/chromium/content/browser/SpeechRecognitionImplTest.java",
+     "junit/src/org/chromium/content/browser/WindowEventObserverManagerTest.java",
+     "junit/src/org/chromium/content/browser/accessibility/AccessibilityNodeInfoBuilderTest.java",
+     "junit/src/org/chromium/content/browser/androidoverlay/DialogOverlayCoreTest.java",
+diff --color -ruN a/content/public/android/java/src/org/chromium/content/browser/SpeechRecognitionImpl.java b/content/public/android/java/src/org/chromium/content/browser/SpeechRecognitionImpl.java
+--- a/content/public/android/java/src/org/chromium/content/browser/SpeechRecognitionImpl.java
++++ b/content/public/android/java/src/org/chromium/content/browser/SpeechRecognitionImpl.java
+@@ -6,48 +6,86 @@
+ 
+ import static org.chromium.build.NullUtil.assumeNonNull;
+ 
+-import android.annotation.SuppressLint;
+-import android.content.ComponentName;
+ import android.content.Context;
+ import android.content.Intent;
+-import android.content.pm.PackageManager;
+-import android.content.pm.ResolveInfo;
+-import android.content.pm.ServiceInfo;
+ import android.os.Build;
+ import android.os.Bundle;
+ import android.speech.RecognitionListener;
+-import android.speech.RecognitionService;
+ import android.speech.RecognizerIntent;
+ import android.speech.SpeechRecognizer;
++import android.text.TextUtils;
++
++import androidx.annotation.RequiresApi;
++import androidx.annotation.VisibleForTesting;
+ 
+ import org.jni_zero.CalledByNative;
+ import org.jni_zero.JNINamespace;
+ import org.jni_zero.NativeMethods;
+ 
+ import org.chromium.base.ContextUtils;
+-import org.chromium.base.DeviceInfo;
+ import org.chromium.base.Log;
+-import org.chromium.base.PackageUtils;
++import org.chromium.base.ResettersForTesting;
+ import org.chromium.build.annotations.NullMarked;
+ import org.chromium.build.annotations.Nullable;
+-import org.chromium.content.R;
+ import org.chromium.content_public.browser.SpeechRecognition;
+ import org.chromium.media.mojom.SpeechRecognitionErrorCode;
+-import org.chromium.ui.widget.Toast;
+ 
+ import java.util.ArrayList;
+-import java.util.List;
++import java.util.Locale;
+ 
+-/** Implementation of {@link SpeechRecognition}. */
++/**
++ * Implementation of {@link SpeechRecognition}.
++ *
++ * <p>Tark: recognition runs on the device only (Android 12+), through Android's on-device
++ * recognizer; there is no path to an online recognizer, not even as a fallback. Below Android 12,
++ * or with no on-device recognizer, start() ends with service-not-allowed.
++ */
+ @JNINamespace("content")
+ @NullMarked
+ public class SpeechRecognitionImpl {
+     private static final String TAG = "SpeechRecog";
+ 
+-    // Constants describing the speech recognition provider we depend on.
+-    private static final String AGSA_PACKAGE_NAME = "com.google.android.googlequicksearchbox";
+-    private static final int AGSA_MIN_VERSION = 300207030;
+-    private static final String SSBG_PACKAGE_NAME = "com.google.android.tts";
++    /** Told when recognition failed because the device lacks the session's language. */
++    public interface LanguageDelegate {
++        /**
++         * @param bcp47 The language the session asked for (the page's, else the phone's).
++         * @param canDownload Whether Android can download it on request (API 33+).
++         */
++        void onLanguageMissing(String bcp47, boolean canDownload);
++    }
++
++    /** Creates Android's on-device recognizer; replaced in tests. */
++    @VisibleForTesting
++    interface RecognizerFactory {
++        boolean isOnDeviceRecognitionAvailable(Context context);
++
++        SpeechRecognizer createOnDeviceSpeechRecognizer(Context context);
++    }
++
++    @RequiresApi(Build.VERSION_CODES.S)
++    private static class PlatformRecognizerFactory implements RecognizerFactory {
++        @Override
++        public boolean isOnDeviceRecognitionAvailable(Context context) {
++            return SpeechRecognizer.isOnDeviceRecognitionAvailable(context);
++        }
++
++        @Override
++        public SpeechRecognizer createOnDeviceSpeechRecognizer(Context context) {
++            return SpeechRecognizer.createOnDeviceSpeechRecognizer(context);
++        }
++    }
++
++    // SpeechRecognizer.ERROR_LANGUAGE_NOT_SUPPORTED and ERROR_LANGUAGE_UNAVAILABLE (API 31),
++    // spelled out so that lint (minSdk 29) does not flag them as inlined newer API.
++    private static final int ERROR_LANGUAGE_NOT_SUPPORTED = 12;
++    private static final int ERROR_LANGUAGE_UNAVAILABLE = 13;
++
++    private static @Nullable RecognizerFactory sRecognizerFactoryForTesting;
++    private static @Nullable RecognizerFactory sPlatformRecognizerFactory;
++    private static @Nullable LanguageDelegate sLanguageDelegate;
++
++    // The session whose recognizer is live, if any. Android runs one on-device session at a time.
++    private static @Nullable SpeechRecognitionImpl sLiveSession;
+ 
+     // We track the recognition state to remember what events we need to send when recognition is
+     // being aborted. Once Android's recognizer is cancelled, its listener won't yield any more
+@@ -58,10 +96,6 @@
+     private static final int STATE_CAPTURING_SPEECH = 2;
+     private int mState;
+ 
+-    // The speech recognition provider (if any) matching PROVIDER_PACKAGE_NAME and
+-    // PROVIDER_MIN_VERSION as selected by initialize().
+-    private static @Nullable ComponentName sRecognitionProvider;
+-
+     private final Intent mIntent;
+     private final RecognitionListener mListener;
+     private @Nullable SpeechRecognizer mRecognizer;
+@@ -72,6 +106,9 @@
+     // Remember if we are using continuous recognition.
+     private boolean mContinuous;
+ 
++    // The language this session asked for (BCP 47).
++    private String mLanguage = "";
++
+     // Internal class to handle events from Android's SpeechRecognizer and route them to native.
+     class Listener implements RecognitionListener {
+ 
+@@ -105,36 +142,15 @@
+ 
+         @Override
+         public void onError(int error) {
+-            int code = SpeechRecognitionErrorCode.NONE;
++            if (mNativeSpeechRecognizerImplAndroid == 0) return;
+ 
+-            // Translate Android SpeechRecognizer errors to Web Speech API errors.
+-            switch (error) {
+-                case SpeechRecognizer.ERROR_AUDIO:
+-                    code = SpeechRecognitionErrorCode.AUDIO_CAPTURE;
+-                    break;
+-                case SpeechRecognizer.ERROR_CLIENT:
+-                    code = SpeechRecognitionErrorCode.ABORTED;
+-                    break;
+-                case SpeechRecognizer.ERROR_RECOGNIZER_BUSY:
+-                case SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS:
+-                    code = SpeechRecognitionErrorCode.NOT_ALLOWED;
+-                    break;
+-                case SpeechRecognizer.ERROR_NETWORK_TIMEOUT:
+-                case SpeechRecognizer.ERROR_NETWORK:
+-                case SpeechRecognizer.ERROR_SERVER:
+-                    code = SpeechRecognitionErrorCode.NETWORK;
+-                    break;
+-                case SpeechRecognizer.ERROR_NO_MATCH:
+-                    code = SpeechRecognitionErrorCode.NO_MATCH;
+-                    break;
+-                case SpeechRecognizer.ERROR_SPEECH_TIMEOUT:
+-                    code = SpeechRecognitionErrorCode.NO_SPEECH;
+-                    break;
+-                default:
+-                    assert false;
+-                    return;
++            int code = mapError(error);
++            LanguageDelegate delegate = sLanguageDelegate;
++            if (code == SpeechRecognitionErrorCode.LANGUAGE_NOT_SUPPORTED && delegate != null) {
++                delegate.onLanguageMissing(
++                        mLanguage, Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU);
+             }
+-
++            // Every error ends the session, so the page never waits on one that Android dropped.
+             terminate(code);
+         }
+ 
+@@ -187,52 +203,88 @@
+     }
+ 
+     /**
+-     * This method must be called before any instance of SpeechRecognition can be created. It will
+-     * query Android's package manager to find a suitable speech recognition provider that supports
+-     * continuous recognition.
++     * Whether speech recognition can run: Android 12+ with an on-device recognizer. Nothing
++     * needs to call this before creating a session; a session that cannot run ends with
++     * service-not-allowed.
+      */
+-    // TODO(crbug.com/40479664): Fix this properly.
+     public static boolean initialize() {
+-        Context context = ContextUtils.getApplicationContext();
+-        if (!SpeechRecognizer.isRecognitionAvailable(context)) return false;
++        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return false;
++        return getRecognizerFactory()
++                .isOnDeviceRecognitionAvailable(ContextUtils.getApplicationContext());
++    }
++
++    /**
++     * Sets the delegate told when a session fails for a language the device lacks.
++     *
++     * @param delegate The delegate, or null for none.
++     */
++    public static void setLanguageDelegate(@Nullable LanguageDelegate delegate) {
++        sLanguageDelegate = delegate;
++    }
+ 
+-        sRecognitionProvider = createRecognitionProvider();
+-        if (sRecognitionProvider == null) return false;
+-        return true;
++    @VisibleForTesting
++    static void setRecognizerFactoryForTesting(@Nullable RecognizerFactory factory) {
++        sRecognizerFactoryForTesting = factory;
++        ResettersForTesting.register(() -> sRecognizerFactoryForTesting = null);
+     }
+ 
+-    /** Returns null if there is no Google LLC provided RecognitionService available on device. */
+-    private static @Nullable ComponentName createRecognitionProvider() {
+-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S || DeviceInfo.isAutomotive()) {
+-            return getComponent(SSBG_PACKAGE_NAME, -1);
+-        } else {
+-            return getComponent(AGSA_PACKAGE_NAME, AGSA_MIN_VERSION);
+-        }
++    @VisibleForTesting
++    static void resetForTesting() {
++        sLiveSession = null;
++        sLanguageDelegate = null;
+     }
+ 
+-    @SuppressLint("WrongConstant")
+-    private static @Nullable ComponentName getComponent(String packageName, int packageMinVersion) {
+-        Context context = ContextUtils.getApplicationContext();
+-        PackageManager pm = context.getPackageManager();
+-        Intent intent = new Intent(RecognitionService.SERVICE_INTERFACE);
+-        final List<ResolveInfo> list = pm.queryIntentServices(intent, PackageManager.GET_SERVICES);
+-
+-        for (ResolveInfo resolve : list) {
+-            ServiceInfo service = resolve.serviceInfo;
+-
+-            if (!service.packageName.equals(packageName)) continue;
+-
+-            // No need to verify package version if packageMinVersion != -1.
+-            if (packageMinVersion != -1) {
+-                if (PackageUtils.getPackageVersion(service.packageName) < packageMinVersion) {
+-                    continue;
+-                }
+-            }
++    @RequiresApi(Build.VERSION_CODES.S)
++    private static RecognizerFactory getRecognizerFactory() {
++        if (sRecognizerFactoryForTesting != null) return sRecognizerFactoryForTesting;
++        if (sPlatformRecognizerFactory == null) {
++            sPlatformRecognizerFactory = new PlatformRecognizerFactory();
++        }
++        return sPlatformRecognizerFactory;
++    }
+ 
+-            return new ComponentName(service.packageName, service.name);
++    /**
++     * Translates an Android {@link SpeechRecognizer} error to a Web Speech API error. Covers every
++     * code, including ones newer than this file: unknown codes are service-not-allowed. Never
++     * network: recognition does not use the network.
++     *
++     * @param androidError A {@code SpeechRecognizer.ERROR_*} code.
++     * @return A {@link SpeechRecognitionErrorCode}.
++     */
++    public static int mapError(int androidError) {
++        switch (androidError) {
++            case SpeechRecognizer.ERROR_NO_MATCH:
++            case SpeechRecognizer.ERROR_SPEECH_TIMEOUT:
++                return SpeechRecognitionErrorCode.NO_SPEECH;
++            case SpeechRecognizer.ERROR_AUDIO:
++                return SpeechRecognitionErrorCode.AUDIO_CAPTURE;
++            case SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS:
++                return SpeechRecognitionErrorCode.NOT_ALLOWED;
++            case SpeechRecognizer.ERROR_CLIENT:
++            case SpeechRecognizer.ERROR_RECOGNIZER_BUSY:
++                return SpeechRecognitionErrorCode.ABORTED;
++            case ERROR_LANGUAGE_NOT_SUPPORTED:
++            case ERROR_LANGUAGE_UNAVAILABLE:
++                return SpeechRecognitionErrorCode.LANGUAGE_NOT_SUPPORTED;
++            default:
++                // ERROR_NETWORK, ERROR_NETWORK_TIMEOUT, ERROR_SERVER, ERROR_TOO_MANY_REQUESTS,
++                // ERROR_SERVER_DISCONNECTED, ERROR_CANNOT_CHECK_SUPPORT,
++                // ERROR_CANNOT_LISTEN_TO_DOWNLOAD_EVENTS and anything newer.
++                return SpeechRecognitionErrorCode.SERVICE_NOT_ALLOWED;
+         }
++    }
+ 
+-        return null;
++    private static @Nullable SpeechRecognizer createOnDeviceRecognizer() {
++        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return null;
++        Context context = ContextUtils.getApplicationContext();
++        RecognizerFactory factory = getRecognizerFactory();
++        if (!factory.isOnDeviceRecognitionAvailable(context)) return null;
++        try {
++            return factory.createOnDeviceSpeechRecognizer(context);
++        } catch (UnsupportedOperationException e) {
++            Log.w(TAG, "No on-device recognizer", e);
++            return null;
++        }
+     }
+ 
+     private SpeechRecognitionImpl(long nativeSpeechRecognizerImplAndroid) {
+@@ -240,21 +292,7 @@
+         mNativeSpeechRecognizerImplAndroid = nativeSpeechRecognizerImplAndroid;
+         mListener = new Listener();
+         mIntent = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
+-
+-        if (sRecognitionProvider != null) {
+-            mRecognizer =
+-                    SpeechRecognizer.createSpeechRecognizer(
+-                            ContextUtils.getApplicationContext(), sRecognitionProvider);
+-        } else {
+-            // It is possible to force-enable the speech recognition web platform feature (using a
+-            // command-line flag) even if initialize() failed to find the PROVIDER_PACKAGE_NAME
+-            // provider, in which case the first available speech recognition provider is used.
+-            // Caveat: Continuous mode may not work as expected with a different provider.
+-            mRecognizer =
+-                    SpeechRecognizer.createSpeechRecognizer(ContextUtils.getApplicationContext());
+-        }
+-
+-        mRecognizer.setRecognitionListener(mListener);
++        // The recognizer is created in startRecognition(), once this session may have one.
+     }
+ 
+     // This function destroys everything when recognition is done, taking care to properly tear
+@@ -275,44 +313,71 @@
+                     .onRecognitionError(mNativeSpeechRecognizerImplAndroid, error);
+         }
+ 
+-        try {
+-            assumeNonNull(mRecognizer);
+-            mRecognizer.destroy();
+-        } catch (IllegalArgumentException e) {
+-            // Intentionally swallow exception. This incorrectly throws exception on some samsung
+-            // devices, causing crashes.
+-            Log.w(TAG, "Destroy threw exception " + mRecognizer, e);
++        if (mRecognizer != null) {
++            try {
++                mRecognizer.destroy();
++            } catch (IllegalArgumentException e) {
++                // Intentionally swallow exception. This incorrectly throws exception on some
++                // samsung devices, causing crashes.
++                Log.w(TAG, "Destroy threw exception " + mRecognizer, e);
++            }
++            mRecognizer = null;
+         }
+-        mRecognizer = null;
++        if (sLiveSession == this) sLiveSession = null;
+         SpeechRecognitionImplJni.get().onRecognitionEnd(mNativeSpeechRecognizerImplAndroid);
+         mNativeSpeechRecognizerImplAndroid = 0;
+     }
+ 
+     @CalledByNative
+-    private static SpeechRecognitionImpl createSpeechRecognition(
++    @VisibleForTesting
++    static SpeechRecognitionImpl createSpeechRecognition(
+             long nativeSpeechRecognizerImplAndroid) {
+         return new SpeechRecognitionImpl(nativeSpeechRecognizerImplAndroid);
+     }
+ 
+     @CalledByNative
+-    private void startRecognition(String language, boolean continuous, boolean interimResults) {
+-        if (mRecognizer == null) return;
+-
++    @VisibleForTesting
++    void startRecognition(String language, boolean continuous, boolean interimResults) {
++        if (mNativeSpeechRecognizerImplAndroid == 0 || mRecognizer != null) return;
++
++        // Android runs one on-device session at a time: the newer session wins and the older one
++        // ends aborted, as in Chrome (SpeechRecognitionManagerImpl::StartSession aborts the
++        // previous microphone session; this covers the case where that has not reached here yet).
++        SpeechRecognitionImpl older = sLiveSession;
++        if (older != null && older != this) older.abortRecognition();
++
++        SpeechRecognizer recognizer = createOnDeviceRecognizer();
++        if (recognizer == null) {
++            terminate(SpeechRecognitionErrorCode.SERVICE_NOT_ALLOWED);
++            return;
++        }
++        mRecognizer = recognizer;
++        sLiveSession = this;
++        recognizer.setRecognitionListener(mListener);
++
++        // The page's lang, else the phone's.
++        mLanguage =
++                TextUtils.isEmpty(language) ? Locale.getDefault().toLanguageTag() : language;
+         mContinuous = continuous;
+         mIntent.putExtra("android.speech.extra.DICTATION_MODE", continuous);
+-        mIntent.putExtra(RecognizerIntent.EXTRA_LANGUAGE, language);
++        mIntent.putExtra(RecognizerIntent.EXTRA_LANGUAGE, mLanguage);
+         mIntent.putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, interimResults);
+         try {
+-            mRecognizer.startListening(mIntent);
++            recognizer.startListening(mIntent);
+         } catch (SecurityException e) {
+-            Context context = ContextUtils.getApplicationContext();
+-            String msg = context.getString(R.string.speech_recognition_service_not_found);
+-            Toast.makeText(context, msg, Toast.LENGTH_SHORT).show();
++            Log.w(TAG, "startListening refused", e);
++            terminate(SpeechRecognitionErrorCode.NOT_ALLOWED);
+         }
+     }
+ 
++    @VisibleForTesting
++    RecognitionListener getListenerForTesting() {
++        return mListener;
++    }
++
+     @CalledByNative
+-    private void abortRecognition() {
++    @VisibleForTesting
++    void abortRecognition() {
+         if (mRecognizer == null) return;
+ 
+         mRecognizer.cancel();
+diff --color -ruN a/content/public/android/junit/src/org/chromium/content/browser/SpeechRecognitionImplTest.java b/content/public/android/junit/src/org/chromium/content/browser/SpeechRecognitionImplTest.java
+--- /dev/null
++++ b/content/public/android/junit/src/org/chromium/content/browser/SpeechRecognitionImplTest.java
+@@ -0,0 +1,262 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++package org.chromium.content.browser;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.assertTrue;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.ArgumentMatchers.anyBoolean;
++import static org.mockito.ArgumentMatchers.anyInt;
++import static org.mockito.ArgumentMatchers.anyLong;
++import static org.mockito.ArgumentMatchers.anyString;
++import static org.mockito.ArgumentMatchers.eq;
++import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.never;
++import static org.mockito.Mockito.times;
++import static org.mockito.Mockito.verify;
++
++import android.content.Context;
++import android.content.Intent;
++import android.os.Bundle;
++import android.speech.RecognizerIntent;
++import android.speech.SpeechRecognizer;
++
++import org.junit.After;
++import org.junit.Before;
++import org.junit.Rule;
++import org.junit.Test;
++import org.junit.runner.RunWith;
++import org.mockito.ArgumentCaptor;
++import org.mockito.Mock;
++import org.mockito.junit.MockitoJUnit;
++import org.mockito.junit.MockitoRule;
++import org.robolectric.annotation.Config;
++
++import org.chromium.base.test.BaseRobolectricTestRunner;
++import org.chromium.media.mojom.SpeechRecognitionErrorCode;
++
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.List;
++import java.util.Locale;
++
++/** Tark: speech recognition runs on the device only, and every error ends the session. */
++@RunWith(BaseRobolectricTestRunner.class)
++@Config(manifest = Config.NONE, sdk = 31)
++public class SpeechRecognitionImplTest {
++    private static final long NATIVE_1 = 1;
++    private static final long NATIVE_2 = 2;
++
++    @Rule public final MockitoRule mMockitoRule = MockitoJUnit.rule();
++
++    @Mock private SpeechRecognitionImpl.Natives mNatives;
++    @Mock private SpeechRecognitionImpl.LanguageDelegate mLanguageDelegate;
++
++    /** Stands in for Android: only on-device recognizers exist here. */
++    private static class FakeFactory implements SpeechRecognitionImpl.RecognizerFactory {
++        boolean mAvailable = true;
++        final List<SpeechRecognizer> mCreated = new ArrayList<>();
++
++        @Override
++        public boolean isOnDeviceRecognitionAvailable(Context context) {
++            return mAvailable;
++        }
++
++        @Override
++        public SpeechRecognizer createOnDeviceSpeechRecognizer(Context context) {
++            SpeechRecognizer recognizer = mock(SpeechRecognizer.class);
++            mCreated.add(recognizer);
++            return recognizer;
++        }
++    }
++
++    private final FakeFactory mFactory = new FakeFactory();
++
++    @Before
++    public void setUp() {
++        SpeechRecognitionImplJni.setInstanceForTesting(mNatives);
++        SpeechRecognitionImpl.setRecognizerFactoryForTesting(mFactory);
++    }
++
++    @After
++    public void tearDown() {
++        SpeechRecognitionImpl.resetForTesting();
++    }
++
++    private static SpeechRecognitionImpl start(long nativePtr, String language) {
++        SpeechRecognitionImpl session = SpeechRecognitionImpl.createSpeechRecognition(nativePtr);
++        session.startRecognition(language, false, true);
++        return session;
++    }
++
++    private void verifyEndedWith(long nativePtr, int code) {
++        verify(mNatives).onRecognitionError(nativePtr, code);
++        verify(mNatives).onRecognitionEnd(nativePtr);
++    }
++
++    @Test
++    public void testUsesOnDeviceRecognizer() {
++        assertTrue(SpeechRecognitionImpl.initialize());
++        start(NATIVE_1, "hi-IN");
++
++        // The only recognizer comes from the on-device factory, which is the only way
++        // SpeechRecognitionImpl creates one (it never calls createSpeechRecognizer).
++        assertEquals(1, mFactory.mCreated.size());
++        ArgumentCaptor<Intent> intent = ArgumentCaptor.forClass(Intent.class);
++        verify(mFactory.mCreated.get(0)).startListening(intent.capture());
++        assertEquals("hi-IN", intent.getValue().getStringExtra(RecognizerIntent.EXTRA_LANGUAGE));
++        verify(mNatives, never()).onRecognitionError(anyLong(), anyInt());
++    }
++
++    @Test
++    public void testEmptyLanguageIsThePhones() {
++        Locale saved = Locale.getDefault();
++        Locale.setDefault(Locale.forLanguageTag("ta-IN"));
++        try {
++            start(NATIVE_1, "");
++        } finally {
++            Locale.setDefault(saved);
++        }
++        ArgumentCaptor<Intent> intent = ArgumentCaptor.forClass(Intent.class);
++        verify(mFactory.mCreated.get(0)).startListening(intent.capture());
++        assertEquals("ta-IN", intent.getValue().getStringExtra(RecognizerIntent.EXTRA_LANGUAGE));
++    }
++
++    @Test
++    @Config(sdk = 30)
++    public void testBelow31IsServiceNotAllowed() {
++        assertFalse(SpeechRecognitionImpl.initialize());
++        start(NATIVE_1, "hi-IN");
++
++        assertEquals(0, mFactory.mCreated.size());
++        verifyEndedWith(NATIVE_1, SpeechRecognitionErrorCode.SERVICE_NOT_ALLOWED);
++    }
++
++    @Test
++    public void testNoOnDeviceIsServiceNotAllowed() {
++        mFactory.mAvailable = false;
++        assertFalse(SpeechRecognitionImpl.initialize());
++        start(NATIVE_1, "hi-IN");
++
++        assertEquals(0, mFactory.mCreated.size());
++        verifyEndedWith(NATIVE_1, SpeechRecognitionErrorCode.SERVICE_NOT_ALLOWED);
++    }
++
++    @Test
++    public void testErrorNames() {
++        assertEquals(
++                SpeechRecognitionErrorCode.NO_SPEECH,
++                SpeechRecognitionImpl.mapError(SpeechRecognizer.ERROR_NO_MATCH));
++        assertEquals(
++                SpeechRecognitionErrorCode.NO_SPEECH,
++                SpeechRecognitionImpl.mapError(SpeechRecognizer.ERROR_SPEECH_TIMEOUT));
++        assertEquals(
++                SpeechRecognitionErrorCode.AUDIO_CAPTURE,
++                SpeechRecognitionImpl.mapError(SpeechRecognizer.ERROR_AUDIO));
++        assertEquals(
++                SpeechRecognitionErrorCode.NOT_ALLOWED,
++                SpeechRecognitionImpl.mapError(SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS));
++        assertEquals(
++                SpeechRecognitionErrorCode.LANGUAGE_NOT_SUPPORTED,
++                SpeechRecognitionImpl.mapError(SpeechRecognizer.ERROR_LANGUAGE_NOT_SUPPORTED));
++        assertEquals(
++                SpeechRecognitionErrorCode.LANGUAGE_NOT_SUPPORTED,
++                SpeechRecognitionImpl.mapError(SpeechRecognizer.ERROR_LANGUAGE_UNAVAILABLE));
++        for (int error :
++                Arrays.asList(
++                        SpeechRecognizer.ERROR_NETWORK,
++                        SpeechRecognizer.ERROR_NETWORK_TIMEOUT,
++                        SpeechRecognizer.ERROR_SERVER,
++                        SpeechRecognizer.ERROR_TOO_MANY_REQUESTS,
++                        SpeechRecognizer.ERROR_SERVER_DISCONNECTED,
++                        14, // ERROR_CANNOT_CHECK_SUPPORT (API 33)
++                        15, // ERROR_CANNOT_LISTEN_TO_DOWNLOAD_EVENTS (API 33)
++                        999)) {
++            assertEquals(
++                    "error " + error,
++                    SpeechRecognitionErrorCode.SERVICE_NOT_ALLOWED,
++                    SpeechRecognitionImpl.mapError(error));
++        }
++        // No Android error is ever reported as network.
++        for (int error = -1; error <= 100; error++) {
++            assertTrue(
++                    "error " + error,
++                    SpeechRecognitionImpl.mapError(error) != SpeechRecognitionErrorCode.NETWORK);
++        }
++    }
++
++    @Test
++    public void testUnknownErrorEndsTheSession() {
++        SpeechRecognitionImpl session = start(NATIVE_1, "hi-IN");
++        session.getListenerForTesting().onError(999);
++
++        verifyEndedWith(NATIVE_1, SpeechRecognitionErrorCode.SERVICE_NOT_ALLOWED);
++        verify(mFactory.mCreated.get(0), times(1)).destroy();
++    }
++
++    @Test
++    @Config(sdk = 33)
++    public void testMissingLanguageTellsDelegate() {
++        SpeechRecognitionImpl.setLanguageDelegate(mLanguageDelegate);
++        SpeechRecognitionImpl session = start(NATIVE_1, "hi-IN");
++        session.getListenerForTesting().onError(SpeechRecognizer.ERROR_LANGUAGE_UNAVAILABLE);
++        // A late second error from Android neither reaches the page nor the delegate.
++        session.getListenerForTesting().onError(SpeechRecognizer.ERROR_LANGUAGE_NOT_SUPPORTED);
++
++        verify(mLanguageDelegate, times(1)).onLanguageMissing("hi-IN", true);
++        verifyEndedWith(NATIVE_1, SpeechRecognitionErrorCode.LANGUAGE_NOT_SUPPORTED);
++    }
++
++    @Test
++    public void testMissingLanguageBelow33CannotDownload() {
++        SpeechRecognitionImpl.setLanguageDelegate(mLanguageDelegate);
++        SpeechRecognitionImpl session = start(NATIVE_1, "hi-IN");
++        session.getListenerForTesting().onError(SpeechRecognizer.ERROR_LANGUAGE_NOT_SUPPORTED);
++
++        verify(mLanguageDelegate, times(1)).onLanguageMissing("hi-IN", false);
++    }
++
++    @Test
++    public void testOtherErrorsDoNotTellDelegate() {
++        SpeechRecognitionImpl.setLanguageDelegate(mLanguageDelegate);
++        SpeechRecognitionImpl session = start(NATIVE_1, "hi-IN");
++        session.getListenerForTesting().onError(SpeechRecognizer.ERROR_NO_MATCH);
++
++        verify(mLanguageDelegate, never()).onLanguageMissing(anyString(), anyBoolean());
++        verifyEndedWith(NATIVE_1, SpeechRecognitionErrorCode.NO_SPEECH);
++    }
++
++    @Test
++    public void testSecondStartWhileLive() {
++        start(NATIVE_1, "hi-IN");
++        SpeechRecognizer olderRecognizer = mFactory.mCreated.get(0);
++        SpeechRecognitionImpl newer = start(NATIVE_2, "hi-IN");
++
++        // The newer session wins: the older one ends aborted, its recognizer cancelled and
++        // destroyed exactly once.
++        verifyEndedWith(NATIVE_1, SpeechRecognitionErrorCode.ABORTED);
++        verify(olderRecognizer, times(1)).destroy();
++
++        // The newer one gets its own recognizer and starts listening.
++        assertEquals(2, mFactory.mCreated.size());
++        SpeechRecognizer newerRecognizer = mFactory.mCreated.get(1);
++        verify(newerRecognizer).startListening(any());
++        verify(newerRecognizer, never()).destroy();
++        verify(mNatives, never()).onRecognitionError(eq(NATIVE_2), anyInt());
++
++        // It works and ends normally; a late abort of the older one changes nothing.
++        Bundle results = new Bundle();
++        results.putStringArrayList(
++                SpeechRecognizer.RESULTS_RECOGNITION, new ArrayList<>(Arrays.asList("नमस्ते")));
++        newer.getListenerForTesting().onResults(results);
++        verify(mNatives).onRecognitionResults(eq(NATIVE_2), any(), any(), eq(false));
++        verify(mNatives, times(1)).onRecognitionEnd(NATIVE_2);
++        verify(mNatives, never()).onRecognitionError(eq(NATIVE_2), anyInt());
++        verify(newerRecognizer, times(1)).destroy();
++        verify(olderRecognizer, times(1)).destroy();
++        verify(mNatives, times(1)).onRecognitionEnd(NATIVE_1);
++    }
++}
