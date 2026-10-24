@@ -67,13 +67,14 @@ if (( code == 0 )); then
   upload /tark/xlit-files.tgz xlit-files.tgz
 fi
 # Speech (voice input): the junit tests of the two speech patches, built and
-# run here on the same tree; a failure fails the job.
+# run here on the same tree (the runners with the machine's python3: there
+# is no vpython3); a failure fails the job.
 if (( code == 0 )); then
   o=/tark/work/src/out/Default
   {
     ninja -C $o content_junit_tests chrome_junit_tests &&
-    $o/bin/run_content_junit_tests --gtest_filter='*SpeechRecognitionImplTest*' &&
-    $o/bin/run_chrome_junit_tests --gtest_filter='*SpeechLanguageSnackbarTest*'
+    python3 $o/bin/run_content_junit_tests --gtest_filter='*SpeechRecognitionImplTest*' &&
+    python3 $o/bin/run_chrome_junit_tests --gtest_filter='*SpeechLanguageSnackbarTest*'
   } > /tark/junit.log 2>&1
   code=$?
   echo "junit exit $code" >> $log
