@@ -302,8 +302,8 @@ diff --color '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/
 +}
 diff --color '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAccountSettings.java b/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAccountSettings.java
 --- a/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAccountSettings.java	1970-01-01 05:30:00.000000000 +0530
-+++ b/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAccountSettings.java	2026-10-26 03:31:31.483959454 +0530
-@@ -0,0 +1,141 @@
++++ b/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAccountSettings.java	2026-10-26 03:36:29.021607363 +0530
+@@ -0,0 +1,165 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -312,7 +312,10 @@ diff --color '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/
 +
 +import android.app.Activity;
 +import android.os.Bundle;
++import android.os.Handler;
++import android.os.Looper;
 +
++import androidx.activity.ComponentActivity;
 +import androidx.annotation.VisibleForTesting;
 +import androidx.appcompat.app.AlertDialog;
 +import androidx.preference.Preference;
@@ -342,6 +345,7 @@ diff --color '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/
 +    private final SettableMonotonicObservableSupplier<String> mPageTitle =
 +            ObservableSuppliers.createMonotonic();
 +    private final Runnable mObserver = this::onAccountChanged;
++    private boolean mLeaving;
 +
 +    @Override
 +    public void onCreatePreferences(@Nullable Bundle savedInstanceState, @Nullable String rootKey) {
@@ -356,6 +360,9 @@ diff --color '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/
 +                    });
 +        }
 +        ZynclaveAccount.get().addObserver(mObserver);
++        // A page restored after the process died may find the account gone. The account is
++        // SIGNED_OUT until its file is read, so no check here: reading it (showAccount asks for
++        // the name) ends in one observer call, and onAccountChanged leaves if it isn't signed in.
 +        showAccount();
 +    }
 +
@@ -398,8 +405,25 @@ diff --color '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/
 +            return;
 +        }
 +        // Signed out here, or the account needs signing in again: nothing is left to show.
-+        Activity activity = getActivity();
-+        if (activity != null) activity.finish();
++        leave();
++    }
++
++    /**
++     * Goes back one page, as Back does: the Settings list stays, and the activity stays alive
++     * (the end-session Custom Tab may still be opened from it). Posted, as this can run while
++     * the page is still being created.
++     */
++    private void leave() {
++        if (mLeaving) return;
++        mLeaving = true;
++        new Handler(Looper.getMainLooper())
++                .post(
++                        () -> {
++                            Activity activity = getActivity();
++                            if (activity instanceof ComponentActivity component && isAdded()) {
++                                component.getOnBackPressedDispatcher().onBackPressed();
++                            }
++                        });
 +    }
 +
 +    /**
@@ -471,8 +495,8 @@ diff --color '--color=never' -ruN a/chrome/android/junit/BUILD.gn b/chrome/andro
    }
 diff --color '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAccountRowTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAccountRowTest.java
 --- a/chrome/android/junit/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAccountRowTest.java	1970-01-01 05:30:00.000000000 +0530
-+++ b/chrome/android/junit/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAccountRowTest.java	2026-10-26 03:29:42.200214131 +0530
-@@ -0,0 +1,393 @@
++++ b/chrome/android/junit/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAccountRowTest.java	2026-10-26 03:34:54.417905311 +0530
+@@ -0,0 +1,451 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -492,6 +516,8 @@ diff --color '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome
 +
 +import androidx.appcompat.app.AlertDialog;
 +import androidx.appcompat.app.AppCompatActivity;
++import androidx.fragment.app.Fragment;
++import androidx.fragment.app.FragmentManager;
 +
 +import net.openid.appauth.AuthorizationException;
 +import net.openid.appauth.AuthorizationRequest;
@@ -864,6 +890,62 @@ diff --color '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome
 +        ShadowLooper.idleMainLooper();
 +
 +        assertNull(ShadowToast.getLatestToast());
++    }
++
++    /** The account page on top of a Settings list, as SettingsActivity stacks pages. */
++    private ZynclaveAccountSettings openAccountPage() {
++        FragmentManager manager = mActivity.getSupportFragmentManager();
++        manager.beginTransaction().replace(android.R.id.content, new Fragment()).commitNow();
++        ZynclaveAccountSettings page = new ZynclaveAccountSettings();
++        manager.beginTransaction()
++                .replace(android.R.id.content, page)
++                .addToBackStack(null)
++                .commit();
++        manager.executePendingTransactions();
++        ShadowLooper.idleMainLooper();
++        return page;
++    }
++
++    @Test
++    public void testSignOutPopsThePageNotTheActivity() {
++        signIn();
++        ZynclaveAccountSettings page = openAccountPage();
++        FragmentManager manager = mActivity.getSupportFragmentManager();
++        assertTrue(page.isAdded());
++        assertEquals(1, manager.getBackStackEntryCount());
++
++        mAccount.signOut(false, null);
++        ShadowLooper.idleMainLooper();
++        manager.executePendingTransactions();
++
++        assertFalse("the page is gone", page.isAdded());
++        assertEquals(0, manager.getBackStackEntryCount());
++        assertFalse("Settings stays open", mActivity.isFinishing());
++    }
++
++    @Test
++    public void testSignOutEverywhereOpensTabFromALiveActivity() {
++        signIn();
++        ZynclaveAccountSettings page = openAccountPage();
++
++        mAccount.signOut(true, mActivity);
++        ShadowLooper.idleMainLooper();
++        mActivity.getSupportFragmentManager().executePendingTransactions();
++
++        assertEquals(1, mBackend.mOpened.size());
++        assertFalse(page.isAdded());
++        assertFalse(mActivity.isFinishing());
++    }
++
++    @Test
++    public void testStalePageForSignedOutAccountPopsItself() {
++        // The process died while signed in; the account is gone when the page comes back.
++        ZynclaveAccountSettings page = openAccountPage();
++        mActivity.getSupportFragmentManager().executePendingTransactions();
++
++        assertFalse(page.isAdded());
++        assertEquals(0, mActivity.getSupportFragmentManager().getBackStackEntryCount());
++        assertFalse(mActivity.isFinishing());
 +    }
 +}
 diff --color '--color=never' -ruN a/chrome/browser/ui/android/strings/android_chrome_strings.grd b/chrome/browser/ui/android/strings/android_chrome_strings.grd
