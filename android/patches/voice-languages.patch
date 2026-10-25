@@ -1,6 +1,6 @@
 diff '--color=never' -ruN a/chrome/android/chrome_java_resources.gni b/chrome/android/chrome_java_resources.gni
---- a/chrome/android/chrome_java_resources.gni	2026-10-25 08:28:13.246761004 +0530
-+++ b/chrome/android/chrome_java_resources.gni	2026-10-25 08:28:13.223676821 +0530
+--- a/chrome/android/chrome_java_resources.gni	2026-10-25 08:51:52.928232094 +0530
++++ b/chrome/android/chrome_java_resources.gni	2026-10-25 08:51:52.902876729 +0530
 @@ -688,4 +688,5 @@
    "java/res/xml/tracing_preferences.xml",
    "java/res/xml/unified_account_settings_preferences.xml",
@@ -8,8 +8,8 @@ diff '--color=never' -ruN a/chrome/android/chrome_java_resources.gni b/chrome/an
 +  "java/res/xml/voice_languages_preferences.xml",
  ]
 diff '--color=never' -ruN a/chrome/android/chrome_java_sources.gni b/chrome/android/chrome_java_sources.gni
---- a/chrome/android/chrome_java_sources.gni	2026-10-25 08:28:13.275860922 +0530
-+++ b/chrome/android/chrome_java_sources.gni	2026-10-25 08:28:13.252134857 +0530
+--- a/chrome/android/chrome_java_sources.gni	2026-10-25 08:51:52.959302157 +0530
++++ b/chrome/android/chrome_java_sources.gni	2026-10-25 08:51:52.933403618 +0530
 @@ -1149,6 +1149,12 @@
    "java/src/org/chromium/chrome/browser/site_settings/ChromeSiteSettingsDelegate.java",
    "java/src/org/chromium/chrome/browser/site_settings/ManageSpaceActivity.java",
@@ -25,7 +25,7 @@ diff '--color=never' -ruN a/chrome/android/chrome_java_sources.gni b/chrome/andr
    "java/src/org/chromium/chrome/browser/status_indicator/StatusIndicatorProperties.java",
 diff '--color=never' -ruN a/chrome/android/java/res/xml/voice_languages_preferences.xml b/chrome/android/java/res/xml/voice_languages_preferences.xml
 --- a/chrome/android/java/res/xml/voice_languages_preferences.xml	1970-01-01 05:30:00.000000000 +0530
-+++ b/chrome/android/java/res/xml/voice_languages_preferences.xml	2026-10-25 08:28:13.280835521 +0530
++++ b/chrome/android/java/res/xml/voice_languages_preferences.xml	2026-10-25 08:51:52.965568862 +0530
 @@ -0,0 +1,41 @@
 +<?xml version="1.0" encoding="utf-8"?>
 +<!-- Copyright 2026 The Tark Authors
@@ -69,8 +69,8 @@ diff '--color=never' -ruN a/chrome/android/java/res/xml/voice_languages_preferen
 +        app:isPreferenceVisible="false" />
 +</PreferenceScreen>
 diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/speech/SpeechLanguageSnackbar.java b/chrome/android/java/src/org/chromium/chrome/browser/speech/SpeechLanguageSnackbar.java
---- a/chrome/android/java/src/org/chromium/chrome/browser/speech/SpeechLanguageSnackbar.java	2026-10-25 08:28:13.319141922 +0530
-+++ b/chrome/android/java/src/org/chromium/chrome/browser/speech/SpeechLanguageSnackbar.java	2026-10-25 08:28:13.296156823 +0530
+--- a/chrome/android/java/src/org/chromium/chrome/browser/speech/SpeechLanguageSnackbar.java	2026-10-25 08:51:53.008134238 +0530
++++ b/chrome/android/java/src/org/chromium/chrome/browser/speech/SpeechLanguageSnackbar.java	2026-10-25 08:51:52.981982530 +0530
 @@ -5,15 +5,10 @@
  package org.chromium.chrome.browser.speech;
  
@@ -87,22 +87,12 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
  import android.text.TextUtils;
  
  import androidx.annotation.RequiresApi;
-@@ -96,6 +91,7 @@
- 
-     @Override
-     public void onLanguageMissing(String bcp47, boolean canDownload) {
-+        VoiceLanguageOffer.onSessionActivity();
-         if (!canDownload) {
-             // Android 12: no API to name or download the language; its settings can.
-             show(
-@@ -125,6 +121,27 @@
+@@ -125,6 +120,30 @@
                                          : null));
      }
  
 +    @Override
 +    public @Nullable String languageFor(String origin) {
-+        // Asked as each session with an origin starts.
-+        VoiceLanguageOffer.onSessionActivity();
 +        return VoiceSiteLanguages.get(origin);
 +    }
 +
@@ -115,15 +105,20 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
 +    public void onSessionEnded(String origin, String bcp47) {
 +        // Checked lazily, only for a site with a remembered language, and after its session
 +        // (the recognizer is already destroyed), so the check never runs beside a session.
-+        if (VoiceSiteLanguages.get(origin) != null) VoiceSiteLanguages.refreshInstalled(mContext);
-+        // The one-time offer of the person's languages (M3), only ever after a session.
-+        VoiceLanguageOffer.onSessionEnded(mContext, origin);
++        // A newer session may already be live (it aborted this one): then nothing is asked.
++        if (VoiceLanguageOffer.isSessionLive()) return;
++        // One question to Android: the one-time offer's (M3), whose answer also refreshes the
++        // site languages' list, or else the site languages' own.
++        boolean asked = VoiceLanguageOffer.onSessionEnded(mContext, origin);
++        if (!asked && VoiceSiteLanguages.get(origin) != null) {
++            VoiceSiteLanguages.refreshInstalled(mContext);
++        }
 +    }
 +
      static final int MAX_TAG_LENGTH = 35;
  
      /**
-@@ -204,10 +221,8 @@
+@@ -204,10 +223,8 @@
          return false;
      }
  
@@ -135,7 +130,7 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
          @Override
          public @Nullable SnackbarManager getSnackbarManager() {
              Activity activity = ApplicationStatus.getLastTrackedFocusedActivity();
-@@ -219,78 +234,43 @@
+@@ -219,78 +236,43 @@
  
          @Override
          public void isLanguageKnown(Context context, String bcp47, Callback<Boolean> callback) {
@@ -241,8 +236,8 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
  }
 diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguageOffer.java b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguageOffer.java
 --- a/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguageOffer.java	1970-01-01 05:30:00.000000000 +0530
-+++ b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguageOffer.java	2026-10-25 08:28:13.650351532 +0530
-@@ -0,0 +1,305 @@
++++ b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguageOffer.java	2026-10-25 08:51:53.388465299 +0530
+@@ -0,0 +1,356 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -271,7 +266,9 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
 +import androidx.appcompat.app.AlertDialog;
 +import androidx.appcompat.app.AppCompatActivity;
 +
++import org.chromium.base.ActivityState;
 +import org.chromium.base.ApplicationStatus;
++import org.chromium.base.ApplicationStatus.ActivityStateListener;
 +import org.chromium.base.ContextUtils;
 +import org.chromium.base.ResettersForTesting;
 +import org.chromium.base.StrictModeContext;
@@ -285,6 +282,7 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
 +import org.chromium.chrome.browser.profiles.ProfileManager;
 +import org.chromium.chrome.browser.speech.VoiceLanguages.Entry;
 +import org.chromium.chrome.browser.speech.VoiceLanguages.Reason;
++import org.chromium.content_public.browser.SpeechRecognition;
 +
 +import java.util.ArrayList;
 +import java.util.List;
@@ -305,7 +303,7 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
 +    @VisibleForTesting static final String UNSEEN = "unseen";
 +    @VisibleForTesting static final String DONE = "done";
 +
-+    /** An answer later than this, or after another session started, is not acted on. */
++    /** An answer later than this is not acted on. */
 +    @VisibleForTesting static final long ANSWER_LIMIT_MS = 10_000;
 +
 +    /** Where the offer shows and whose languages it offers; replaced in tests. */
@@ -316,6 +314,9 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
 +
 +        /** The person's languages by language subtag, with why each is one. */
 +        Map<String, Reason> signals(Context context);
++
++        /** Whether a voice session (any tab's, private ones too) is starting or running. */
++        boolean sessionLive();
 +    }
 +
 +    private static @Nullable Host sHostForTesting;
@@ -324,31 +325,33 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
 +    // The question to Android in flight (0: none), and the last one asked.
 +    private static int sAsking;
 +    private static int sLastAsk;
-+    // Counts sessions starting; an answer asked for before a session started is dropped.
-+    private static int sSessions;
++    // The offer on screen, and the listener that closes it if its activity goes.
 +    private static @Nullable AlertDialog sDialog;
++    private static @Nullable ActivityStateListener sDialogActivityListener;
 +
 +    private VoiceLanguageOffer() {}
 +
-+    /** A voice session is starting or running: the offer waits until it ends. */
++    /** Whether a voice session is live: then nothing may ask Android anything. */
 +    @MainThread
-+    static void onSessionActivity() {
-+        ThreadUtils.assertOnUiThread();
-+        sSessions++;
++    static boolean isSessionLive() {
++        return host().sessionLive();
 +    }
 +
 +    /**
-+     * A voice session for {@code origin} ended: offers the person's languages if this is the
-+     * first time, Android lists some of them, and nothing else is going on.
++     * A voice session for {@code origin} ended, and none is live: asks Android which languages
++     * it has and can get, to offer the person's languages if this is the first time. The answer
++     * (null included) also goes to {@link VoiceSiteLanguages#onSupport}, so callers ask nothing
++     * more.
++     *
++     * @return whether Android was asked.
 +     */
 +    @MainThread
-+    static void onSessionEnded(Context context, String origin) {
++    static boolean onSessionEnded(Context context, String origin) {
 +        ThreadUtils.assertOnUiThread();
-+        if (origin.isEmpty() || Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return;
-+        if (sShownThisRun || sAsking != 0 || isDone()) return;
++        if (origin.isEmpty() || Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return false;
++        if (sShownThisRun || sAsking != 0 || isDone() || isSessionLive()) return false;
 +        int ask = ++sLastAsk;
 +        sAsking = ask;
-+        int sessions = sSessions;
 +        Context appContext = context.getApplicationContext();
 +        PostTask.postDelayedTask(
 +                TaskTraits.UI_DEFAULT,
@@ -364,15 +367,16 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
 +                            support -> {
 +                                if (sAsking != ask) return; // Too late; asked again next time.
 +                                sAsking = 0;
-+                                if (support == null) return; // Android didn't say: not done.
 +                                VoiceSiteLanguages.onSupport(support);
-+                                if (sessions != sSessions) return; // A session started since.
++                                if (support == null) return; // Android didn't say: not done.
 +                                offer(appContext, support);
 +                            });
 +        } catch (RuntimeException e) {
 +            // No recognizer to ask: ask again after the next session.
 +            if (sAsking == ask) sAsking = 0;
++            return false;
 +        }
++        return true;
 +    }
 +
 +    private static void offer(Context appContext, RecognitionSupport support) {
@@ -382,8 +386,16 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
 +        if (activity == null || activity.isFinishing() || activity.isDestroyed()) return;
 +        List<Entry> suggested = suggestions(support, host.signals(activity), activity);
 +        if (suggested.isEmpty()) return; // Nothing to offer yet: a later session may have some.
++        // A session started (perhaps a private one) while Android answered: not beside it.
++        if (host.sessionLive()) return;
 +        sShownThisRun = true;
-+        show(activity, appContext, suggested);
++        try {
++            show(activity, appContext, suggested);
++        } catch (RuntimeException e) {
++            // The window went away under us: offer again after a later session.
++            closeDialog();
++            sShownThisRun = false;
++        }
 +    }
 +
 +    private static List<Entry> suggestions(
@@ -469,14 +481,39 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
 +        // Back or a tap outside: not answered, so a later run may offer again.
 +        dialog.setOnDismissListener(
 +                d -> {
-+                    if (sDialog == d) sDialog = null;
++                    if (sDialog == d) forgetDialog();
 +                });
 +        dialog.setOnShowListener(d -> updateDownloadButton(dialog, boxes));
 +        for (CheckBox box : boxes) {
 +            box.setOnCheckedChangeListener((b, checked) -> updateDownloadButton(dialog, boxes));
 +        }
 +        sDialog = dialog;
++        // Closed with its activity, so nothing here outlives (or leaks) it.
++        ActivityStateListener listener =
++                (changed, state) -> {
++                    if (changed == activity && state == ActivityState.DESTROYED) closeDialog();
++                };
++        sDialogActivityListener = listener;
++        ApplicationStatus.registerStateListenerForAllActivities(listener);
 +        dialog.show();
++    }
++
++    private static void closeDialog() {
++        AlertDialog dialog = sDialog;
++        forgetDialog();
++        if (dialog == null) return;
++        try {
++            dialog.dismiss();
++        } catch (RuntimeException e) {
++            // Its window is already gone.
++        }
++    }
++
++    private static void forgetDialog() {
++        sDialog = null;
++        ActivityStateListener listener = sDialogActivityListener;
++        sDialogActivityListener = null;
++        if (listener != null) ApplicationStatus.unregisterActivityStateListener(listener);
 +    }
 +
 +    // Download needs at least one language ticked.
@@ -494,6 +531,11 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
 +            public @Nullable AppCompatActivity activity() {
 +                Activity activity = ApplicationStatus.getLastTrackedFocusedActivity();
 +                if (!(activity instanceof AppCompatActivity appCompat)) return null;
++                // In front and focused: not behind another window, not on its way out.
++                if (ApplicationStatus.getStateForActivity(activity) != ActivityState.RESUMED
++                        || !activity.hasWindowFocus()) {
++                    return null;
++                }
 +                if (activity instanceof ChromeActivity chrome
 +                        && (!chrome.areTabModelsInitialized()
 +                                || chrome.getTabModelSelector().isIncognitoSelected())) {
@@ -507,6 +549,11 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
 +                if (!ProfileManager.isInitialized()) return Map.of();
 +                return VoiceLanguageSignals.read(
 +                        context, ProfileManager.getLastUsedRegularProfile());
++            }
++
++            @Override
++            public boolean sessionLive() {
++                return SpeechRecognition.hasLiveSession();
 +            }
 +        };
 +    }
@@ -537,8 +584,7 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
 +                    sHostForTesting = null;
 +                    sShownThisRun = false;
 +                    sAsking = 0;
-+                    sSessions = 0;
-+                    sDialog = null;
++                    forgetDialog();
 +                });
 +    }
 +
@@ -550,7 +596,7 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
 +}
 diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguageSignals.java b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguageSignals.java
 --- a/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguageSignals.java	1970-01-01 05:30:00.000000000 +0530
-+++ b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguageSignals.java	2026-10-25 08:28:13.339336737 +0530
++++ b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguageSignals.java	2026-10-25 08:51:53.029315300 +0530
 @@ -0,0 +1,106 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
@@ -660,7 +706,7 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
 +}
 diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguages.java b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguages.java
 --- a/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguages.java	1970-01-01 05:30:00.000000000 +0530
-+++ b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguages.java	2026-10-25 08:28:13.354087533 +0530
++++ b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguages.java	2026-10-25 08:51:53.045685718 +0530
 @@ -0,0 +1,282 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
@@ -946,7 +992,7 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
 +}
 diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguagesSettings.java b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguagesSettings.java
 --- a/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguagesSettings.java	1970-01-01 05:30:00.000000000 +0530
-+++ b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguagesSettings.java	2026-10-25 08:28:13.368632950 +0530
++++ b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguagesSettings.java	2026-10-25 08:51:53.062170595 +0530
 @@ -0,0 +1,647 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
@@ -1597,7 +1643,7 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
 +}
 diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/speech/VoicePlatform.java b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoicePlatform.java
 --- a/chrome/android/java/src/org/chromium/chrome/browser/speech/VoicePlatform.java	1970-01-01 05:30:00.000000000 +0530
-+++ b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoicePlatform.java	2026-10-25 08:28:13.383792583 +0530
++++ b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoicePlatform.java	2026-10-25 08:51:53.078447011 +0530
 @@ -0,0 +1,310 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
@@ -1911,7 +1957,7 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
 +}
 diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceSiteLanguages.java b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceSiteLanguages.java
 --- a/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceSiteLanguages.java	1970-01-01 05:30:00.000000000 +0530
-+++ b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceSiteLanguages.java	2026-10-25 08:28:13.620678356 +0530
++++ b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceSiteLanguages.java	2026-10-25 08:51:53.357619656 +0530
 @@ -0,0 +1,222 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
@@ -2136,8 +2182,8 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
 +    }
 +}
 diff '--color=never' -ruN a/chrome/android/junit/BUILD.gn b/chrome/android/junit/BUILD.gn
---- a/chrome/android/junit/BUILD.gn	2026-10-25 08:28:13.436710193 +0530
-+++ b/chrome/android/junit/BUILD.gn	2026-10-25 08:28:13.413754179 +0530
+--- a/chrome/android/junit/BUILD.gn	2026-10-25 08:51:53.136062454 +0530
++++ b/chrome/android/junit/BUILD.gn	2026-10-25 08:51:53.110358751 +0530
 @@ -1232,11 +1232,19 @@
      ]
    }
@@ -2162,7 +2208,7 @@ diff '--color=never' -ruN a/chrome/android/junit/BUILD.gn b/chrome/android/junit
        ":chrome_junit_tests_helper",
 diff '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome/browser/speech/AndroidVoicePlatformTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/speech/AndroidVoicePlatformTest.java
 --- a/chrome/android/junit/src/org/chromium/chrome/browser/speech/AndroidVoicePlatformTest.java	1970-01-01 05:30:00.000000000 +0530
-+++ b/chrome/android/junit/src/org/chromium/chrome/browser/speech/AndroidVoicePlatformTest.java	2026-10-25 08:28:13.442226257 +0530
++++ b/chrome/android/junit/src/org/chromium/chrome/browser/speech/AndroidVoicePlatformTest.java	2026-10-25 08:51:53.141793902 +0530
 @@ -0,0 +1,234 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
@@ -2400,8 +2446,8 @@ diff '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome/browser
 +}
 diff '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguageOfferTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguageOfferTest.java
 --- a/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguageOfferTest.java	1970-01-01 05:30:00.000000000 +0530
-+++ b/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguageOfferTest.java	2026-10-25 08:28:13.664909824 +0530
-@@ -0,0 +1,356 @@
++++ b/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguageOfferTest.java	2026-10-25 08:51:53.405561893 +0530
+@@ -0,0 +1,417 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -2431,6 +2477,8 @@ diff '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome/browser
 +import org.junit.Rule;
 +import org.junit.Test;
 +import org.junit.runner.RunWith;
++import org.robolectric.Robolectric;
++import org.robolectric.android.controller.ActivityController;
 +import org.robolectric.annotation.Config;
 +import org.robolectric.shadows.ShadowLooper;
 +
@@ -2502,6 +2550,7 @@ diff '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome/browser
 +
 +    private final LocaleList mDefaultLocales = LocaleList.getDefault();
 +    private final Map<String, Reason> mSignals = new LinkedHashMap<>();
++    private boolean mLive;
 +    private FakePlatform mPlatform;
 +    private TestActivity mActivity;
 +    private SpeechLanguageSnackbar mDelegate;
@@ -2532,6 +2581,11 @@ diff '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome/browser
 +                    @Override
 +                    public Map<String, Reason> signals(Context context) {
 +                        return mSignals;
++                    }
++
++                    @Override
++                    public boolean sessionLive() {
++                        return mLive;
 +                    }
 +                });
 +        mDelegate =
@@ -2677,16 +2731,17 @@ diff '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome/browser
 +        assertNull(shown());
 +        assertEquals(0, mPlatform.mSupportCalls);
 +
-+        // Android answers only after the next session has started: that answer is dropped.
++        // Android answers only after a private session (no origin) has started: no sheet.
 +        mPlatform.mDefer = true;
 +        mDelegate.onSessionEnded(ORIGIN, "en-IN");
-+        mDelegate.languageFor(ORIGIN);
++        mLive = true;
 +        mPlatform.mDeferred.get(0).onResult(mPlatform.current());
 +        ShadowLooper.idleMainLooper();
 +        assertNull(shown());
 +        assertEquals(VoiceLanguageOffer.UNSEEN, pref());
 +
 +        // After that session, it is offered.
++        mLive = false;
 +        mPlatform.mDefer = false;
 +        session(ORIGIN);
 +        assertNotNull(shown());
@@ -2757,10 +2812,62 @@ diff '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome/browser
 +        assertNull(shown());
 +        assertEquals(0, mPlatform.mSupportCalls);
 +    }
++
++    @Test
++    @Config(minSdk = Build.VERSION_CODES.TIRAMISU)
++    public void testAbortedByNewerSessionAsksNothing() {
++        // A newer session aborted this one and is already live.
++        VoiceSiteLanguages.set(ORIGIN, "hi-IN");
++        mLive = true;
++        mDelegate.onSessionEnded(ORIGIN, "en-IN");
++        ShadowLooper.idleMainLooper();
++        assertEquals("neither the offer nor the site languages ask", 0, mPlatform.mSupportCalls);
++        assertNull(shown());
++    }
++
++    @Test
++    @Config(minSdk = Build.VERSION_CODES.TIRAMISU)
++    public void testOneQueryPerSessionEnd() {
++        // A remembered site, the offer still unseen, nothing to suggest: one shared question.
++        VoiceSiteLanguages.set(ORIGIN, "hi-IN");
++        mSignals.clear();
++        session(ORIGIN);
++        assertEquals(1, mPlatform.mSupportCalls);
++        assertTrue("the answer refreshed the site list", mDelegate.isLanguageMissing("hi-IN"));
++        session(ORIGIN);
++        assertEquals(2, mPlatform.mSupportCalls);
++
++        // Once the offer is done, the site languages ask on their own, still once.
++        ContextUtils.getAppSharedPreferences()
++                .edit()
++                .putString(VoiceLanguageOffer.PREF, VoiceLanguageOffer.DONE)
++                .commit();
++        session(ORIGIN);
++        assertEquals(3, mPlatform.mSupportCalls);
++    }
++
++    @Test
++    @Config(minSdk = Build.VERSION_CODES.TIRAMISU)
++    public void testClosedWithItsActivity() {
++        ActivityController<TestActivity> controller =
++                Robolectric.buildActivity(TestActivity.class).setup();
++        mActivity = controller.get();
++        mActivity.setTheme(R.style.Theme_BrowserUI_DayNight);
++        session(ORIGIN);
++        AlertDialog dialog = shown();
++        assertNotNull(dialog);
++
++        // Its activity going closes it, and nothing holds the dialog after.
++        controller.pause().stop().destroy();
++
++        assertNull(VoiceLanguageOffer.getDialogForTesting());
++        assertFalse(dialog.isShowing());
++        assertEquals(VoiceLanguageOffer.UNSEEN, pref());
++    }
 +}
 diff '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguageSignalsTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguageSignalsTest.java
 --- a/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguageSignalsTest.java	1970-01-01 05:30:00.000000000 +0530
-+++ b/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguageSignalsTest.java	2026-10-25 08:28:13.471131299 +0530
++++ b/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguageSignalsTest.java	2026-10-25 08:51:53.181326324 +0530
 @@ -0,0 +1,79 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
@@ -2843,7 +2950,7 @@ diff '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome/browser
 +}
 diff '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguagesSettingsTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguagesSettingsTest.java
 --- a/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguagesSettingsTest.java	1970-01-01 05:30:00.000000000 +0530
-+++ b/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguagesSettingsTest.java	2026-10-25 08:28:13.485844885 +0530
++++ b/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguagesSettingsTest.java	2026-10-25 08:51:53.198387500 +0530
 @@ -0,0 +1,550 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
@@ -3397,7 +3504,7 @@ diff '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome/browser
 +}
 diff '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguagesTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguagesTest.java
 --- a/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguagesTest.java	1970-01-01 05:30:00.000000000 +0530
-+++ b/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguagesTest.java	2026-10-25 08:28:13.500625847 +0530
++++ b/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguagesTest.java	2026-10-25 08:51:53.215741930 +0530
 @@ -0,0 +1,243 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
@@ -3644,7 +3751,7 @@ diff '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome/browser
 +}
 diff '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceSiteLanguagesTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceSiteLanguagesTest.java
 --- a/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceSiteLanguagesTest.java	1970-01-01 05:30:00.000000000 +0530
-+++ b/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceSiteLanguagesTest.java	2026-10-25 08:28:13.635279983 +0530
++++ b/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceSiteLanguagesTest.java	2026-10-25 08:51:53.372845808 +0530
 @@ -0,0 +1,247 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
@@ -3894,8 +4001,8 @@ diff '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome/browser
 +    }
 +}
 diff '--color=never' -ruN a/chrome/browser/language/android/java/src/org/chromium/chrome/browser/language/settings/LanguageSettings.java b/chrome/browser/language/android/java/src/org/chromium/chrome/browser/language/settings/LanguageSettings.java
---- a/chrome/browser/language/android/java/src/org/chromium/chrome/browser/language/settings/LanguageSettings.java	2026-10-25 08:28:13.554147547 +0530
-+++ b/chrome/browser/language/android/java/src/org/chromium/chrome/browser/language/settings/LanguageSettings.java	2026-10-25 08:28:13.530592401 +0530
+--- a/chrome/browser/language/android/java/src/org/chromium/chrome/browser/language/settings/LanguageSettings.java	2026-10-25 08:51:53.285029022 +0530
++++ b/chrome/browser/language/android/java/src/org/chromium/chrome/browser/language/settings/LanguageSettings.java	2026-10-25 08:51:53.252225145 +0530
 @@ -9,6 +9,7 @@
  import android.app.Activity;
  import android.content.Context;
@@ -3947,8 +4054,8 @@ diff '--color=never' -ruN a/chrome/browser/language/android/java/src/org/chromiu
          if (mTarkXlitSwitch == null) return;
          String summary;
 diff '--color=never' -ruN a/chrome/browser/ui/android/strings/android_chrome_strings.grd b/chrome/browser/ui/android/strings/android_chrome_strings.grd
---- a/chrome/browser/ui/android/strings/android_chrome_strings.grd	2026-10-25 08:28:13.584257978 +0530
-+++ b/chrome/browser/ui/android/strings/android_chrome_strings.grd	2026-10-25 08:28:13.560217409 +0530
+--- a/chrome/browser/ui/android/strings/android_chrome_strings.grd	2026-10-25 08:51:53.319287418 +0530
++++ b/chrome/browser/ui/android/strings/android_chrome_strings.grd	2026-10-25 08:51:53.292158071 +0530
 @@ -994,6 +994,62 @@
        <message name="IDS_TARK_SPEECH_LANGUAGE_DOWNLOAD" desc="Tark: action of the voice language snackbar: Android downloads the language (or opens its voice input settings).">
          Download
@@ -4013,8 +4120,8 @@ diff '--color=never' -ruN a/chrome/browser/ui/android/strings/android_chrome_str
          New versions of Tark, checked once a day unless Google Play installed it (gettarka.com)
        </message>
 diff '--color=never' -ruN a/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb b/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb
---- a/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb	2026-10-25 08:28:13.615263335 +0530
-+++ b/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb	2026-10-25 08:28:13.590566092 +0530
+--- a/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb	2026-10-25 08:51:53.351391160 +0530
++++ b/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb	2026-10-25 08:51:53.325503622 +0530
 @@ -2197,4 +2197,18 @@
  <translation id="8955589894175271948">Tark के नए वर्शन, दिन में एक बार जांचे जाते हैं, जब तक इसे Google Play से इंस्टॉल न किया गया हो (gettarka.com)</translation>
  <translation id="1628159678930647766">इस फ़ोन पर वॉइस सर्च के लिए <ph name="LANGUAGE"/> चाहिए।</translation>

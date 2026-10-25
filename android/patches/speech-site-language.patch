@@ -1,6 +1,6 @@
 diff '--color=never' -ruN a/content/browser/speech/speech_recognizer_impl_android.cc b/content/browser/speech/speech_recognizer_impl_android.cc
---- a/content/browser/speech/speech_recognizer_impl_android.cc	2026-10-25 06:32:07.644768465 +0530
-+++ b/content/browser/speech/speech_recognizer_impl_android.cc	2026-10-25 06:32:07.619310571 +0530
+--- a/content/browser/speech/speech_recognizer_impl_android.cc	2026-10-25 08:51:52.754860215 +0530
++++ b/content/browser/speech/speech_recognizer_impl_android.cc	2026-10-25 08:51:52.730296734 +0530
 @@ -6,18 +6,24 @@
  
  #include <stddef.h>
@@ -86,8 +86,8 @@ diff '--color=never' -ruN a/content/browser/speech/speech_recognizer_impl_androi
  
  void SpeechRecognizerImplAndroid::AbortRecognition() {
 diff '--color=never' -ruN a/content/browser/speech/speech_recognizer_impl_android.h b/content/browser/speech/speech_recognizer_impl_android.h
---- a/content/browser/speech/speech_recognizer_impl_android.h	2026-10-25 06:32:07.674920942 +0530
-+++ b/content/browser/speech/speech_recognizer_impl_android.h	2026-10-25 06:32:07.650422723 +0530
+--- a/content/browser/speech/speech_recognizer_impl_android.h	2026-10-25 08:51:52.783318661 +0530
++++ b/content/browser/speech/speech_recognizer_impl_android.h	2026-10-25 08:51:52.759644067 +0530
 @@ -8,10 +8,12 @@
  #include <jni.h>
  
@@ -113,8 +113,8 @@ diff '--color=never' -ruN a/content/browser/speech/speech_recognizer_impl_androi
        std::vector<media::mojom::WebSpeechRecognitionResultPtr> results);
  
 diff '--color=never' -ruN a/content/public/android/java/src/org/chromium/content/browser/SpeechRecognitionImpl.java b/content/public/android/java/src/org/chromium/content/browser/SpeechRecognitionImpl.java
---- a/content/public/android/java/src/org/chromium/content/browser/SpeechRecognitionImpl.java	2026-10-25 06:32:07.705334296 +0530
-+++ b/content/public/android/java/src/org/chromium/content/browser/SpeechRecognitionImpl.java	2026-10-25 06:32:07.680136113 +0530
+--- a/content/public/android/java/src/org/chromium/content/browser/SpeechRecognitionImpl.java	2026-10-25 08:51:52.814178888 +0530
++++ b/content/public/android/java/src/org/chromium/content/browser/SpeechRecognitionImpl.java	2026-10-25 08:51:52.788916941 +0530
 @@ -45,13 +45,43 @@
  public class SpeechRecognitionImpl {
      private static final String TAG = "SpeechRecog";
@@ -266,7 +266,19 @@ diff '--color=never' -ruN a/content/public/android/java/src/org/chromium/content
              handleResults(bundle, false);
              // We assume that onResults is called only once, at the end of a session, thus we
              // terminate. If one day the recognition provider changes dictation mode behavior to
-@@ -326,6 +388,12 @@
+@@ -222,6 +284,11 @@
+         sLanguageDelegate = delegate;
+     }
+ 
++    /** Whether a session (from any tab, private ones too) is starting or running. */
++    public static boolean hasLiveSession() {
++        return sLiveSession != null;
++    }
++
+     @VisibleForTesting
+     static void setRecognizerFactoryForTesting(@Nullable RecognizerFactory factory) {
+         sRecognizerFactoryForTesting = factory;
+@@ -326,6 +393,12 @@
          if (sLiveSession == this) sLiveSession = null;
          SpeechRecognitionImplJni.get().onRecognitionEnd(mNativeSpeechRecognizerImplAndroid);
          mNativeSpeechRecognizerImplAndroid = 0;
@@ -279,7 +291,7 @@ diff '--color=never' -ruN a/content/public/android/java/src/org/chromium/content
      }
  
      @CalledByNative
-@@ -337,7 +405,8 @@
+@@ -337,13 +410,17 @@
  
      @CalledByNative
      @VisibleForTesting
@@ -289,8 +301,20 @@ diff '--color=never' -ruN a/content/public/android/java/src/org/chromium/content
          if (mNativeSpeechRecognizerImplAndroid == 0 || mRecognizer != null) return;
  
          // Android runs one on-device session at a time: the newer session wins and the older one
-@@ -355,13 +424,31 @@
-         sLiveSession = this;
+         // ends aborted, as in Chrome (SpeechRecognitionManagerImpl::StartSession aborts the
+         // previous microphone session; this covers the case where that has not reached here yet).
++        // This session is live from here, so the older one's end already sees a live session
++        // (nothing may then ask Android anything beside it).
+         SpeechRecognitionImpl older = sLiveSession;
++        sLiveSession = this;
+         if (older != null && older != this) older.abortRecognition();
+ 
+         SpeechRecognizer recognizer = createOnDeviceRecognizer();
+@@ -352,16 +429,33 @@
+             return;
+         }
+         mRecognizer = recognizer;
+-        sLiveSession = this;
          recognizer.setRecognitionListener(mListener);
  
 -        // The page's lang, else the phone's.
@@ -324,7 +348,7 @@ diff '--color=never' -ruN a/content/public/android/java/src/org/chromium/content
          try {
              recognizer.startListening(mIntent);
          } catch (SecurityException e) {
-@@ -370,6 +457,45 @@
+@@ -370,6 +464,45 @@
          }
      }
  
@@ -370,7 +394,7 @@ diff '--color=never' -ruN a/content/public/android/java/src/org/chromium/content
      @VisibleForTesting
      RecognitionListener getListenerForTesting() {
          return mListener;
-@@ -389,6 +515,7 @@
+@@ -389,6 +522,7 @@
          if (mRecognizer == null) return;
  
          mContinuous = false;
@@ -379,9 +403,9 @@ diff '--color=never' -ruN a/content/public/android/java/src/org/chromium/content
      }
  
 diff '--color=never' -ruN a/content/public/android/java/src/org/chromium/content_public/browser/SpeechRecognition.java b/content/public/android/java/src/org/chromium/content_public/browser/SpeechRecognition.java
---- a/content/public/android/java/src/org/chromium/content_public/browser/SpeechRecognition.java	2026-10-25 06:32:07.735896027 +0530
-+++ b/content/public/android/java/src/org/chromium/content_public/browser/SpeechRecognition.java	2026-10-25 06:32:07.710831345 +0530
-@@ -26,15 +26,34 @@
+--- a/content/public/android/java/src/org/chromium/content_public/browser/SpeechRecognition.java	2026-10-25 08:51:52.843099091 +0530
++++ b/content/public/android/java/src/org/chromium/content_public/browser/SpeechRecognition.java	2026-10-25 08:51:52.819043992 +0530
+@@ -26,15 +26,39 @@
          return SpeechRecognitionImpl.initialize();
      }
  
@@ -417,10 +441,15 @@ diff '--color=never' -ruN a/content/public/android/java/src/org/chromium/content
 +
 +        /** A session for the origin ended, having run in {@code bcp47}. */
 +        default void onSessionEnded(String origin, String bcp47) {}
++    }
++
++    /** Tark: whether a speech recognition session (any tab's, private ones too) is live. */
++    public static boolean hasLiveSession() {
++        return SpeechRecognitionImpl.hasLiveSession();
      }
  
      /**
-@@ -44,6 +63,28 @@
+@@ -44,6 +68,28 @@
       */
      public static void setLanguageDelegate(@Nullable LanguageDelegate delegate) {
          SpeechRecognitionImpl.setLanguageDelegate(
@@ -451,9 +480,14 @@ diff '--color=never' -ruN a/content/public/android/java/src/org/chromium/content
      }
  }
 diff '--color=never' -ruN a/content/public/android/junit/src/org/chromium/content/browser/SpeechRecognitionImplTest.java b/content/public/android/junit/src/org/chromium/content/browser/SpeechRecognitionImplTest.java
---- a/content/public/android/junit/src/org/chromium/content/browser/SpeechRecognitionImplTest.java	2026-10-25 06:32:07.766041880 +0530
-+++ b/content/public/android/junit/src/org/chromium/content/browser/SpeechRecognitionImplTest.java	2026-10-25 06:32:07.741712704 +0530
-@@ -17,10 +17,13 @@
+--- a/content/public/android/junit/src/org/chromium/content/browser/SpeechRecognitionImplTest.java	2026-10-25 08:51:52.873729648 +0530
++++ b/content/public/android/junit/src/org/chromium/content/browser/SpeechRecognitionImplTest.java	2026-10-25 08:51:52.848922957 +0530
+@@ -13,14 +13,18 @@
+ import static org.mockito.ArgumentMatchers.anyLong;
+ import static org.mockito.ArgumentMatchers.anyString;
+ import static org.mockito.ArgumentMatchers.eq;
++import static org.mockito.Mockito.doAnswer;
+ import static org.mockito.Mockito.mock;
  import static org.mockito.Mockito.never;
  import static org.mockito.Mockito.times;
  import static org.mockito.Mockito.verify;
@@ -467,7 +501,7 @@ diff '--color=never' -ruN a/content/public/android/junit/src/org/chromium/conten
  import android.speech.RecognizerIntent;
  import android.speech.SpeechRecognizer;
  
-@@ -86,12 +89,24 @@
+@@ -86,12 +90,24 @@
          SpeechRecognitionImpl.resetForTesting();
      }
  
@@ -493,7 +527,7 @@ diff '--color=never' -ruN a/content/public/android/junit/src/org/chromium/conten
      private void verifyEndedWith(long nativePtr, int code) {
          verify(mNatives).onRecognitionError(nativePtr, code);
          verify(mNatives).onRecognitionEnd(nativePtr);
-@@ -259,4 +274,134 @@
+@@ -259,4 +275,163 @@
          verify(olderRecognizer, times(1)).destroy();
          verify(mNatives, times(1)).onRecognitionEnd(NATIVE_1);
      }
@@ -626,5 +660,34 @@ diff '--color=never' -ruN a/content/public/android/junit/src/org/chromium/conten
 +
 +        verify(mLanguageDelegate, times(1)).onSessionEnded(SITE, "hi-IN");
 +        verifyEndedWith(NATIVE_1, SpeechRecognitionErrorCode.ABORTED);
++    }
++
++    @Test
++    public void testLiveSessionTracked() {
++        assertFalse(SpeechRecognitionImpl.hasLiveSession());
++        SpeechRecognitionImpl session = start(NATIVE_1, "en-US", "");
++        assertTrue("a private session counts", SpeechRecognitionImpl.hasLiveSession());
++        session.abortRecognition();
++        assertFalse(SpeechRecognitionImpl.hasLiveSession());
++    }
++
++    @Test
++    public void testNewerSessionLiveWhenOlderEnds() {
++        SpeechRecognitionImpl.setLanguageDelegate(mLanguageDelegate);
++        List<Boolean> liveAtEnd = new ArrayList<>();
++        doAnswer(
++                        invocation -> {
++                            liveAtEnd.add(SpeechRecognitionImpl.hasLiveSession());
++                            return null;
++                        })
++                .when(mLanguageDelegate)
++                .onSessionEnded(anyString(), anyString());
++        start(NATIVE_1, "en-US");
++        start(NATIVE_2, "hi-IN", "");
++
++        // The older one ended aborted while the newer (private) one was already live.
++        verifyEndedWith(NATIVE_1, SpeechRecognitionErrorCode.ABORTED);
++        assertEquals(List.of(true), liveAtEnd);
++        assertTrue(SpeechRecognitionImpl.hasLiveSession());
 +    }
  }
