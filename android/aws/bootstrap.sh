@@ -11,7 +11,7 @@
 set -euxo pipefail
 exec > >(tee -a /var/log/tark-bootstrap.log) 2>&1
 export DEBIAN_FRONTEND=noninteractive
-VERSION=155.0.8059.39
+VERSION=156.0.8078.47
 
 # A setup step that fails powers the machine off rather than leave it billing.
 trap 'poweroff' ERR
