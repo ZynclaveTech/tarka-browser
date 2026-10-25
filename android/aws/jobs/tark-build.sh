@@ -68,7 +68,8 @@ if (( code == 0 )); then
     grep -qE "CaptionDownloadsTest\.$t.*(SKIPPED|FAILED)|(SKIPPED|FAILED).*CaptionDownloadsTest\.$t" $log && { echo "CaptionDownloadsTest.$t did not pass" >> $log; code=1; }
   done
   # Voice search's detector: its 15 s ring of audio (voice-language-detect.patch).
-  for t in RingBufferKeeps15s RingBufferHoldsLessWhenShorter RingBufferDropsAtSessionEnd NoModelsDecidesNothing; do
+  for t in RingBufferKeeps15s RingBufferHoldsLessWhenShorter RingBufferDropsAtSessionEnd NoModelsDecidesNothing \
+      SharedModelsWaitForAttachedSessions UnattachedDetectorLeavesSharedUseAlone; do
     grep -qE "^\[[0-9]+/[0-9]+\] VoiceLanguageDetectorTest\.$t \([0-9]+ ms\)$" $log || { echo "no VoiceLanguageDetectorTest.$t test ran" >> $log; code=1; }
     grep -qE "VoiceLanguageDetectorTest\.$t.*(SKIPPED|FAILED)|(SKIPPED|FAILED).*VoiceLanguageDetectorTest\.$t" $log && { echo "VoiceLanguageDetectorTest.$t did not pass" >> $log; code=1; }
   done

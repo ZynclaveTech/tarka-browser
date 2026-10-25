@@ -1,6 +1,6 @@
 diff '--color=never' -ruN a/chrome/android/BUILD.gn b/chrome/android/BUILD.gn
---- a/chrome/android/BUILD.gn	2026-10-25 18:32:18.143223164 +0530
-+++ b/chrome/android/BUILD.gn	2026-10-25 18:32:18.109335161 +0530
+--- a/chrome/android/BUILD.gn	2026-10-25 18:57:41.487281604 +0530
++++ b/chrome/android/BUILD.gn	2026-10-25 18:57:41.459676106 +0530
 @@ -474,6 +474,7 @@
        "//chrome/browser/ntp_customization:public_java",
        "//chrome/browser/omaha/android:java",
@@ -10,8 +10,8 @@ diff '--color=never' -ruN a/chrome/android/BUILD.gn b/chrome/android/BUILD.gn
        "//chrome/browser/optimization_guide/android:java",
        "//chrome/browser/page_content_annotations:java",
 diff '--color=never' -ruN a/chrome/android/chrome_java_sources.gni b/chrome/android/chrome_java_sources.gni
---- a/chrome/android/chrome_java_sources.gni	2026-10-25 18:32:18.182587568 +0530
-+++ b/chrome/android/chrome_java_sources.gni	2026-10-25 18:32:18.151147845 +0530
+--- a/chrome/android/chrome_java_sources.gni	2026-10-25 18:57:41.520106016 +0530
++++ b/chrome/android/chrome_java_sources.gni	2026-10-25 18:57:41.493568568 +0530
 @@ -1149,6 +1149,7 @@
    "java/src/org/chromium/chrome/browser/site_settings/ChromeSiteSettingsDelegate.java",
    "java/src/org/chromium/chrome/browser/site_settings/ManageSpaceActivity.java",
@@ -21,8 +21,8 @@ diff '--color=never' -ruN a/chrome/android/chrome_java_sources.gni b/chrome/andr
    "java/src/org/chromium/chrome/browser/speech/VoiceLanguageOffer.java",
    "java/src/org/chromium/chrome/browser/speech/VoiceLanguageSignals.java",
 diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/speech/SpeechLanguageSnackbar.java b/chrome/android/java/src/org/chromium/chrome/browser/speech/SpeechLanguageSnackbar.java
---- a/chrome/android/java/src/org/chromium/chrome/browser/speech/SpeechLanguageSnackbar.java	2026-10-25 18:32:18.219340940 +0530
-+++ b/chrome/android/java/src/org/chromium/chrome/browser/speech/SpeechLanguageSnackbar.java	2026-10-25 18:32:18.189467987 +0530
+--- a/chrome/android/java/src/org/chromium/chrome/browser/speech/SpeechLanguageSnackbar.java	2026-10-25 18:57:41.553239305 +0530
++++ b/chrome/android/java/src/org/chromium/chrome/browser/speech/SpeechLanguageSnackbar.java	2026-10-25 18:57:41.525929851 +0530
 @@ -23,6 +23,7 @@
  import org.chromium.chrome.browser.ui.messages.snackbar.Snackbar;
  import org.chromium.chrome.browser.ui.messages.snackbar.SnackbarManager;
@@ -104,8 +104,8 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
      /** Whether a recognizer language list names the language (exactly, or by language alone). */
 diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceDetection.java b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceDetection.java
 --- a/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceDetection.java	1970-01-01 05:30:00.000000000 +0530
-+++ b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceDetection.java	2026-10-25 18:32:18.225916146 +0530
-@@ -0,0 +1,1236 @@
++++ b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceDetection.java	2026-10-25 18:57:41.558738805 +0530
+@@ -0,0 +1,1266 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -226,7 +226,9 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
 +    // The capture's silence: chunks below this level (PCM16 RMS) for QUIET_MS after speech end
 +    // an utterance for recognizers that never say so.
 +    @VisibleForTesting static final double QUIET_RMS = 300;
-+    @VisibleForTesting static final long QUIET_MS = 700;
++    // Longer cuts fewer pauses (a 700 ms pause after the first word ended en-IN sessions) but
++    // ends later after the last word; Task 8 tunes it on the phone.
++    @VisibleForTesting static final long QUIET_MS = 1000;
 +    // A session the recognizer never ended (SpeechRecognitionImpl caps piped sessions at 20 s)
 +    // stops capturing here anyway.
 +    @VisibleForTesting static final long WATCHDOG_MS = 25_000;
@@ -450,6 +452,17 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
 +    }
 +
 +    /**
++     * How long a replay of {@code heldMs} of audio takes to catch up with the live audio: its first
++     * {@link #REPLAY_BURST_MS} at once, then {@link #REPLAY_SPEEDUP} times real time while the
++     * live audio keeps coming.
++     */
++    @VisibleForTesting
++    static long catchUpMs(long heldMs) {
++        long paced = Math.max(0, heldMs - REPLAY_BURST_MS);
++        return (long) Math.ceil(paced / (REPLAY_SPEEDUP - 1));
++    }
++
++    /**
 +     * The shared models' lifetime (UI thread): loaded for the first session, kept between
 +     * sessions, freed after {@link #MODELS_IDLE_MS} without one, under memory pressure, in the
 +     * background, or when voice turns detection off (once no session runs). The language_id unit
@@ -522,10 +535,9 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
 +                        if (sLoaded) host.unloadModels();
 +                        sLoaded = false;
 +                        // Released only once the files are no longer read.
-+                        host.runOnUiThread(
-+                                () -> {
-+                                    if (!sHeld) host.setUnitInUse(false);
-+                                });
++                        // Pairs the setUnitInUse(true) of this loaded period exactly
++                        // (CaptionDownloads counts holds).
++                        host.runOnUiThread(() -> host.setUnitInUse(false));
 +                    });
 +        }
 +
@@ -651,6 +663,7 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
 +        private @Nullable SnackbarManager mChipManager;
 +        private SnackbarManager.@Nullable SnackbarController mChip;
 +        private volatile @Nullable Runnable mOnQuiet;
++        private long mCatchUpMs;
 +        // Touched only on the detector's sequence.
 +        private boolean mLoaded;
 +
@@ -692,7 +705,16 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
 +            Pipe pipe = mHost.createPipe();
 +            if (pipe == null) return null;
 +            capture.replayInto(new Writer(pipe.writeEnd));
++            mCatchUpMs = catchUpMs(Math.min(mHost.now() - mStartMs, CHIP_WINDOW_MS));
++            // The capture outlives the replay's catch-up.
++            mHost.cancelOnUi(mWatchdog);
++            mHost.postDelayedOnUi(mWatchdog, mCatchUpMs + WATCHDOG_MS);
 +            return pipe.readEnd;
++        }
++
++        @Override
++        public long replayCatchUpMs() {
++            return mCatchUpMs;
 +        }
 +
 +        @Override
@@ -891,6 +913,7 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
 +            private final Mic mMic;
 +            private final AtomicReference<@Nullable Writer> mReplay = new AtomicReference<>();
 +            private volatile boolean mStopped;
++            private volatile boolean mResetQuiet;
 +            // Capture thread only.
 +            private Writer mWriter;
 +            private boolean mHeardSound;
@@ -902,6 +925,8 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
 +            }
 +
 +            void replayInto(Writer writer) {
++                // Silence heard so far was before the switch.
++                mResetQuiet = true;
 +                Writer previous = mReplay.getAndSet(writer);
 +                if (previous != null) previous.close();
 +                if (mStopped) {
@@ -950,6 +975,11 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
 +            }
 +
 +            private void listenForQuiet(short[] pcm, int count) {
++                if (mResetQuiet) {
++                    mResetQuiet = false;
++                    mHeardSound = false;
++                    mQuietSamples = 0;
++                }
 +                double sum = 0;
 +                for (int i = 0; i < count; i++) sum += (double) pcm[i] * pcm[i];
 +                boolean quiet = count == 0 || Math.sqrt(sum / count) < QUIET_RMS;
@@ -1343,8 +1373,8 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
 +    }
 +}
 diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceDetector.java b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceDetector.java
---- a/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceDetector.java	2026-10-25 18:32:18.277162489 +0530
-+++ b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceDetector.java	2026-10-25 18:32:18.245957602 +0530
+--- a/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceDetector.java	2026-10-25 18:57:41.601122663 +0530
++++ b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceDetector.java	2026-10-25 18:57:41.575164053 +0530
 @@ -112,6 +112,8 @@
  
      /** Turns detection off; the model goes unless captions still want it. */
@@ -1355,8 +1385,8 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
      }
  }
 diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguageOffer.java b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguageOffer.java
---- a/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguageOffer.java	2026-10-25 18:32:18.316915648 +0530
-+++ b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguageOffer.java	2026-10-25 18:32:18.285624927 +0530
+--- a/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguageOffer.java	2026-10-25 18:57:41.633237403 +0530
++++ b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguageOffer.java	2026-10-25 18:57:41.606993665 +0530
 @@ -148,6 +148,8 @@
          if (suggested.isEmpty()) return; // Nothing to offer yet: a later session may have some.
          // A session started (perhaps a private one) while Android answered: not beside it.
@@ -1367,8 +1397,8 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
          try {
              show(activity, appContext, suggested);
 diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguagesSettings.java b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguagesSettings.java
---- a/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguagesSettings.java	2026-10-25 18:32:18.355225081 +0530
-+++ b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguagesSettings.java	2026-10-25 18:32:18.324976456 +0530
+--- a/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguagesSettings.java	2026-10-25 18:57:41.666195941 +0530
++++ b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguagesSettings.java	2026-10-25 18:57:41.639351574 +0530
 @@ -167,7 +167,10 @@
              if (section != null) section.setVisible(false);
          }
@@ -1382,8 +1412,8 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
              row.setKey(DETECTION_ROW_KEY);
              row.setTitle(R.string.tark_voice_detection_title);
 diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceSiteLanguages.java b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceSiteLanguages.java
---- a/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceSiteLanguages.java	2026-10-25 18:32:18.392400499 +0530
-+++ b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceSiteLanguages.java	2026-10-25 18:32:18.361871080 +0530
+--- a/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceSiteLanguages.java	2026-10-25 18:57:41.700134070 +0530
++++ b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceSiteLanguages.java	2026-10-25 18:57:41.672200319 +0530
 @@ -203,6 +203,8 @@
      @MainThread
      static void onSupport(@Nullable RecognitionSupport support) {
@@ -1394,8 +1424,8 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
              sInstalled = null;
              return;
 diff '--color=never' -ruN a/chrome/android/junit/BUILD.gn b/chrome/android/junit/BUILD.gn
---- a/chrome/android/junit/BUILD.gn	2026-10-25 18:32:18.430032673 +0530
-+++ b/chrome/android/junit/BUILD.gn	2026-10-25 18:32:18.399715006 +0530
+--- a/chrome/android/junit/BUILD.gn	2026-10-25 18:57:41.733951823 +0530
++++ b/chrome/android/junit/BUILD.gn	2026-10-25 18:57:41.706512243 +0530
 @@ -1239,6 +1239,7 @@
      sources = [
        "src/org/chromium/chrome/browser/speech/AndroidVoicePlatformTest.java",
@@ -1406,8 +1436,8 @@ diff '--color=never' -ruN a/chrome/android/junit/BUILD.gn b/chrome/android/junit
        "src/org/chromium/chrome/browser/speech/VoiceLanguagesSettingsTest.java",
 diff '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceDetectionTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceDetectionTest.java
 --- a/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceDetectionTest.java	1970-01-01 05:30:00.000000000 +0530
-+++ b/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceDetectionTest.java	2026-10-25 18:32:18.437704643 +0530
-@@ -0,0 +1,824 @@
++++ b/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceDetectionTest.java	2026-10-25 18:57:41.740241494 +0530
+@@ -0,0 +1,858 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -2231,10 +2261,44 @@ diff '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome/browser
 +        assertNull(VoiceDetection.tagFor("ta", android, "en-IN"));
 +        assertFalse(VoiceDetection.sameLanguage("en-IN", "hi"));
 +    }
++
++    @Test
++    public void testReplayCatchUp() {
++        assertEquals(0, VoiceDetection.catchUpMs(800));
++        // 4 s held: 1 s at once, then 3 s more at 1.5x while live audio comes: 6 s.
++        assertEquals(6000, VoiceDetection.catchUpMs(4000));
++    }
++
++    @Test
++    public void testReplayReportsCatchUpAndMovesWatchdog() {
++        VoiceDetection.Session session = open(SITE, "en-IN");
++        mHost.mNow = 4000;
++        assertNotNull(session.replay());
++        assertEquals(6000, session.replayCatchUpMs());
++        assertTrue(mHost.mDelays.contains(6000 + VoiceDetection.WATCHDOG_MS));
++        assertFalse(mHost.mDelays.contains(VoiceDetection.WATCHDOG_MS));
++    }
++
++    @Test
++    public void testUnloadThenNewSessionPairsHolds() {
++        giveChunks(3);
++        VoiceDetection.Session first = open(SITE, "en-IN");
++        mHost.runCapture();
++        first.close();
++        mHost.runDetector();
++        // Removed, and a new session starts before the unload ran.
++        VoiceDetection.onDetectorRemoved();
++        open(SITE, "en-IN");
++        mHost.runDetector();
++        // Every hold is released exactly once: one stays, for the new session.
++        assertEquals(List.of(true, true, false), mHost.mInUse);
++        assertEquals(2, mHost.mModelLoads);
++        assertEquals(1, mHost.mModelUnloads);
++    }
 +}
 diff '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguagesSettingsTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguagesSettingsTest.java
---- a/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguagesSettingsTest.java	2026-10-25 18:32:18.493434458 +0530
-+++ b/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguagesSettingsTest.java	2026-10-25 18:32:18.460470134 +0530
+--- a/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguagesSettingsTest.java	2026-10-25 18:57:41.785702251 +0530
++++ b/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguagesSettingsTest.java	2026-10-25 18:57:41.758915051 +0530
 @@ -438,6 +438,18 @@
  
      @Test
@@ -2255,8 +2319,8 @@ diff '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome/browser
          launch();
          detection().tapAction();
 diff '--color=never' -ruN a/chrome/browser/tark_captions_android/BUILD.gn b/chrome/browser/tark_captions_android/BUILD.gn
---- a/chrome/browser/tark_captions_android/BUILD.gn	2026-10-25 18:32:18.535732232 +0530
-+++ b/chrome/browser/tark_captions_android/BUILD.gn	2026-10-25 18:32:18.502893326 +0530
+--- a/chrome/browser/tark_captions_android/BUILD.gn	2026-10-25 18:57:41.819417170 +0530
++++ b/chrome/browser/tark_captions_android/BUILD.gn	2026-10-25 18:57:41.791955131 +0530
 @@ -21,6 +21,11 @@
      "//base",
      "//crypto",
@@ -2284,8 +2348,8 @@ diff '--color=never' -ruN a/chrome/browser/tark_captions_android/BUILD.gn b/chro
        "//base/test:run_all_unittests",
        "//base/test:test_support",
 diff '--color=never' -ruN a/chrome/browser/tark_captions_android/android/java/src/org/chromium/chrome/browser/tark_captions/TarkCaptionsBridge.java b/chrome/browser/tark_captions_android/android/java/src/org/chromium/chrome/browser/tark_captions/TarkCaptionsBridge.java
---- a/chrome/browser/tark_captions_android/android/java/src/org/chromium/chrome/browser/tark_captions/TarkCaptionsBridge.java	2026-10-25 18:32:18.587669334 +0530
-+++ b/chrome/browser/tark_captions_android/android/java/src/org/chromium/chrome/browser/tark_captions/TarkCaptionsBridge.java	2026-10-25 18:32:18.543835666 +0530
+--- a/chrome/browser/tark_captions_android/android/java/src/org/chromium/chrome/browser/tark_captions/TarkCaptionsBridge.java	2026-10-25 18:57:41.855095353 +0530
++++ b/chrome/browser/tark_captions_android/android/java/src/org/chromium/chrome/browser/tark_captions/TarkCaptionsBridge.java	2026-10-25 18:57:41.825679758 +0530
 @@ -180,6 +180,19 @@
          TarkCaptionsBridgeJni.get().removeUnit(unit, owner);
      }
@@ -2318,8 +2382,8 @@ diff '--color=never' -ruN a/chrome/browser/tark_captions_android/android/java/sr
      }
  }
 diff '--color=never' -ruN a/chrome/browser/tark_captions_android/android/tark_captions_bridge.cc b/chrome/browser/tark_captions_android/android/tark_captions_bridge.cc
---- a/chrome/browser/tark_captions_android/android/tark_captions_bridge.cc	2026-10-25 18:32:18.629137680 +0530
-+++ b/chrome/browser/tark_captions_android/android/tark_captions_bridge.cc	2026-10-25 18:32:18.594478668 +0530
+--- a/chrome/browser/tark_captions_android/android/tark_captions_bridge.cc	2026-10-25 18:57:41.888649520 +0530
++++ b/chrome/browser/tark_captions_android/android/tark_captions_bridge.cc	2026-10-25 18:57:41.861055147 +0530
 @@ -156,6 +156,16 @@
    CaptionDownloads::Get().Remove(unit);
  }
@@ -2339,7 +2403,7 @@ diff '--color=never' -ruN a/chrome/browser/tark_captions_android/android/tark_ca
  }
 diff '--color=never' -ruN a/chrome/browser/tark_voice_android/BUILD.gn b/chrome/browser/tark_voice_android/BUILD.gn
 --- a/chrome/browser/tark_voice_android/BUILD.gn	1970-01-01 05:30:00.000000000 +0530
-+++ b/chrome/browser/tark_voice_android/BUILD.gn	2026-10-25 18:32:18.636709691 +0530
++++ b/chrome/browser/tark_voice_android/BUILD.gn	2026-10-25 18:57:41.894001894 +0530
 @@ -0,0 +1,50 @@
 +# Copyright 2026 The Tark Authors
 +# Use of this source code is governed by a BSD-style license that can be
@@ -2393,7 +2457,7 @@ diff '--color=never' -ruN a/chrome/browser/tark_voice_android/BUILD.gn b/chrome/
 +}
 diff '--color=never' -ruN a/chrome/browser/tark_voice_android/android/BUILD.gn b/chrome/browser/tark_voice_android/android/BUILD.gn
 --- a/chrome/browser/tark_voice_android/android/BUILD.gn	1970-01-01 05:30:00.000000000 +0530
-+++ b/chrome/browser/tark_voice_android/android/BUILD.gn	2026-10-25 18:32:18.656014263 +0530
++++ b/chrome/browser/tark_voice_android/android/BUILD.gn	2026-10-25 18:57:41.911963195 +0530
 @@ -0,0 +1,21 @@
 +# Copyright 2026 The Tark Authors
 +# Use of this source code is governed by a BSD-style license that can be
@@ -2418,7 +2482,7 @@ diff '--color=never' -ruN a/chrome/browser/tark_voice_android/android/BUILD.gn b
 +}
 diff '--color=never' -ruN a/chrome/browser/tark_voice_android/android/java/src/org/chromium/chrome/browser/tark_voice/VoiceLanguageDetector.java b/chrome/browser/tark_voice_android/android/java/src/org/chromium/chrome/browser/tark_voice/VoiceLanguageDetector.java
 --- a/chrome/browser/tark_voice_android/android/java/src/org/chromium/chrome/browser/tark_voice/VoiceLanguageDetector.java	1970-01-01 05:30:00.000000000 +0530
-+++ b/chrome/browser/tark_voice_android/android/java/src/org/chromium/chrome/browser/tark_voice/VoiceLanguageDetector.java	2026-10-25 18:32:18.678011494 +0530
++++ b/chrome/browser/tark_voice_android/android/java/src/org/chromium/chrome/browser/tark_voice/VoiceLanguageDetector.java	2026-10-25 18:57:41.929349449 +0530
 @@ -0,0 +1,110 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
@@ -2532,7 +2596,7 @@ diff '--color=never' -ruN a/chrome/browser/tark_voice_android/android/java/src/o
 +}
 diff '--color=never' -ruN a/chrome/browser/tark_voice_android/android/voice_language_detector_android.cc b/chrome/browser/tark_voice_android/android/voice_language_detector_android.cc
 --- a/chrome/browser/tark_voice_android/android/voice_language_detector_android.cc	1970-01-01 05:30:00.000000000 +0530
-+++ b/chrome/browser/tark_voice_android/android/voice_language_detector_android.cc	2026-10-25 18:32:18.703286099 +0530
++++ b/chrome/browser/tark_voice_android/android/voice_language_detector_android.cc	2026-10-25 18:57:41.946637579 +0530
 @@ -0,0 +1,89 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
@@ -2625,8 +2689,8 @@ diff '--color=never' -ruN a/chrome/browser/tark_voice_android/android/voice_lang
 +DEFINE_JNI(VoiceLanguageDetector)
 diff '--color=never' -ruN a/chrome/browser/tark_voice_android/voice_language_detector.cc b/chrome/browser/tark_voice_android/voice_language_detector.cc
 --- a/chrome/browser/tark_voice_android/voice_language_detector.cc	1970-01-01 05:30:00.000000000 +0530
-+++ b/chrome/browser/tark_voice_android/voice_language_detector.cc	2026-10-25 18:32:18.723957729 +0530
-@@ -0,0 +1,270 @@
++++ b/chrome/browser/tark_voice_android/voice_language_detector.cc	2026-10-25 18:57:41.964249335 +0530
+@@ -0,0 +1,313 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -2658,7 +2722,15 @@ diff '--color=never' -ruN a/chrome/browser/tark_voice_android/voice_language_det
 +  std::unique_ptr<tark_captions::OrtRuntime> runtime;
 +  std::unique_ptr<tark_captions::LanguageDetector> detector;
 +  base::FilePath dir;
++  SharedUse use;
 +};
++
++void FreeShared(SharedModels& shared) {
++  // The detector's model before the runtime it runs on.
++  shared.detector.reset();
++  shared.runtime.reset();
++  shared.dir.clear();
++}
 +
 +SharedModels& Shared() {
 +  static base::NoDestructor<SharedModels> shared;
@@ -2666,6 +2738,26 @@ diff '--color=never' -ruN a/chrome/browser/tark_voice_android/voice_language_det
 +}
 +
 +}  // namespace
++
++bool SharedUse::Detach() {
++  if (attached_ > 0) {
++    --attached_;
++  }
++  if (attached_ == 0 && unload_pending_) {
++    unload_pending_ = false;
++    return true;
++  }
++  return false;
++}
++
++bool SharedUse::RequestUnload() {
++  if (attached_ > 0) {
++    unload_pending_ = true;
++    return false;
++  }
++  unload_pending_ = false;
++  return true;
++}
 +
 +AudioRing::AudioRing() = default;
 +AudioRing::~AudioRing() = default;
@@ -2738,7 +2830,13 @@ diff '--color=never' -ruN a/chrome/browser/tark_voice_android/voice_language_det
 +  EndSession();
 +  // The VAD runs on the shared runtime: it goes first.
 +  vad_.reset();
-+  detector_ = nullptr;
++  if (detector_) {
++    detector_ = nullptr;
++    SharedModels& shared = Shared();
++    if (shared.use.Detach()) {
++      FreeShared(shared);
++    }
++  }
 +}
 +
 +// static
@@ -2748,7 +2846,11 @@ diff '--color=never' -ruN a/chrome/browser/tark_voice_android/voice_language_det
 +  if (shared.detector && shared.dir == models_dir) {
 +    return true;
 +  }
-+  UnloadShared();
++  // Never under an attached session's feet: another folder waits.
++  if (!shared.use.CanReplace()) {
++    return false;
++  }
++  FreeShared(shared);
 +  std::unique_ptr<tark_captions::OrtRuntime> runtime =
 +      tark_captions::OrtRuntime::Load(ort_library);
 +  if (!runtime) {
@@ -2768,10 +2870,14 @@ diff '--color=never' -ruN a/chrome/browser/tark_voice_android/voice_language_det
 +// static
 +void VoiceLanguageDetector::UnloadShared() {
 +  SharedModels& shared = Shared();
-+  // The detector's model before the runtime it runs on.
-+  shared.detector.reset();
-+  shared.runtime.reset();
-+  shared.dir.clear();
++  if (shared.use.RequestUnload()) {
++    FreeShared(shared);
++  }
++}
++
++// static
++int VoiceLanguageDetector::SharedAttachedForTesting() {
++  return Shared().use.attached();
 +}
 +
 +// static
@@ -2790,6 +2896,7 @@ diff '--color=never' -ruN a/chrome/browser/tark_voice_android/voice_language_det
 +    return false;
 +  }
 +  detector_ = shared.detector.get();
++  shared.use.Attach();
 +  next_check_ = tark_captions::kFirstDecision;
 +  return true;
 +}
@@ -2899,8 +3006,8 @@ diff '--color=never' -ruN a/chrome/browser/tark_voice_android/voice_language_det
 +}  // namespace tark_voice
 diff '--color=never' -ruN a/chrome/browser/tark_voice_android/voice_language_detector.h b/chrome/browser/tark_voice_android/voice_language_detector.h
 --- a/chrome/browser/tark_voice_android/voice_language_detector.h	1970-01-01 05:30:00.000000000 +0530
-+++ b/chrome/browser/tark_voice_android/voice_language_detector.h	2026-10-25 18:32:18.742959715 +0530
-@@ -0,0 +1,139 @@
++++ b/chrome/browser/tark_voice_android/voice_language_detector.h	2026-10-25 18:57:41.981428255 +0530
+@@ -0,0 +1,159 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -2964,6 +3071,25 @@ diff '--color=never' -ruN a/chrome/browser/tark_voice_android/voice_language_det
 +  int64_t total_ GUARDED_BY(lock_) = 0;
 +};
 +
++// Who uses the shared models: they are never freed or replaced while a
++// session's detector is attached. An unload asked for meanwhile happens when
++// the last one detaches; a load from another folder is refused until then.
++class SharedUse {
++ public:
++  void Attach() { ++attached_; }
++  // True when a deferred unload is due now.
++  bool Detach();
++  // True when the models may be freed now; else freed at the last Detach().
++  bool RequestUnload();
++  // Whether the models may be replaced (loaded from another folder).
++  bool CanReplace() const { return attached_ == 0; }
++  int attached() const { return attached_; }
++
++ private:
++  int attached_ = 0;
++  bool unload_pending_ = false;
++};
++
 +// Voice search's spoken-language detection (spec §3): Silero VAD finds the
 +// speech in a session's audio, and captions' detector (VoxLingua107 ECAPA,
 +// the language_id unit) names its language with captions' policy
@@ -2999,6 +3125,7 @@ diff '--color=never' -ruN a/chrome/browser/tark_voice_android/voice_language_det
 +  // Frees them. No session may be attached.
 +  static void UnloadShared();
 +  static bool SharedLoadedForTesting();
++  static int SharedAttachedForTesting();
 +
 +  // Uses the shared models, and loads this session's VAD from `models_dir`.
 +  // False if they aren't loaded; nothing is detected then.
@@ -3042,8 +3169,8 @@ diff '--color=never' -ruN a/chrome/browser/tark_voice_android/voice_language_det
 +#endif  // CHROME_BROWSER_TARK_VOICE_ANDROID_VOICE_LANGUAGE_DETECTOR_H_
 diff '--color=never' -ruN a/chrome/browser/tark_voice_android/voice_language_detector_unittest.cc b/chrome/browser/tark_voice_android/voice_language_detector_unittest.cc
 --- a/chrome/browser/tark_voice_android/voice_language_detector_unittest.cc	1970-01-01 05:30:00.000000000 +0530
-+++ b/chrome/browser/tark_voice_android/voice_language_detector_unittest.cc	2026-10-25 18:32:18.766304795 +0530
-@@ -0,0 +1,78 @@
++++ b/chrome/browser/tark_voice_android/voice_language_detector_unittest.cc	2026-10-25 18:57:41.998097963 +0530
+@@ -0,0 +1,105 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -3120,11 +3247,38 @@ diff '--color=never' -ruN a/chrome/browser/tark_voice_android/voice_language_det
 +  EXPECT_EQ(detector.ring().size(), 0u);
 +}
 +
++TEST(VoiceLanguageDetectorTest, SharedModelsWaitForAttachedSessions) {
++  SharedUse use;
++  EXPECT_TRUE(use.RequestUnload());
++  EXPECT_TRUE(use.CanReplace());
++  use.Attach();
++  use.Attach();
++  // Neither freed nor replaced while a session is attached.
++  EXPECT_FALSE(use.CanReplace());
++  EXPECT_FALSE(use.RequestUnload());
++  EXPECT_FALSE(use.Detach());
++  EXPECT_FALSE(use.CanReplace());
++  // The last one out frees them.
++  EXPECT_TRUE(use.Detach());
++  EXPECT_TRUE(use.CanReplace());
++  // No unload was asked for: the next detach frees nothing.
++  use.Attach();
++  EXPECT_FALSE(use.Detach());
++}
++
++TEST(VoiceLanguageDetectorTest, UnattachedDetectorLeavesSharedUseAlone) {
++  {
++    VoiceLanguageDetector detector;
++    EXPECT_FALSE(detector.Attach(base::FilePath(FILE_PATH_LITERAL("/nonexistent"))));
++  }
++  EXPECT_EQ(VoiceLanguageDetector::SharedAttachedForTesting(), 0);
++}
++
 +}  // namespace
 +}  // namespace tark_voice
 diff '--color=never' -ruN a/chrome/browser/ui/android/strings/android_chrome_strings.grd b/chrome/browser/ui/android/strings/android_chrome_strings.grd
---- a/chrome/browser/ui/android/strings/android_chrome_strings.grd	2026-10-25 18:32:18.821846400 +0530
-+++ b/chrome/browser/ui/android/strings/android_chrome_strings.grd	2026-10-25 18:32:18.788766948 +0530
+--- a/chrome/browser/ui/android/strings/android_chrome_strings.grd	2026-10-25 18:57:42.045551068 +0530
++++ b/chrome/browser/ui/android/strings/android_chrome_strings.grd	2026-10-25 18:57:42.016200057 +0530
 @@ -1064,6 +1064,22 @@
        <message name="IDS_TARK_VOICE_DETECTION_REMOVE" desc="Tark: Settings > Voice languages > Spoken-language detection: button that turns detection off and deletes the model from the phone (unless live captions still use it). [CHAR_LIMIT=20]">
          Remove
@@ -3149,8 +3303,8 @@ diff '--color=never' -ruN a/chrome/browser/ui/android/strings/android_chrome_str
        <message name="IDS_TARK_VOICE_OFFER_TITLE" desc="Tark: title of the dialog shown once after a voice search, offering to download speech recognition for the languages the person uses (each listed with a checkbox).">
          Speak in your languages
 diff '--color=never' -ruN a/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb b/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb
---- a/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb	2026-10-25 18:32:18.863404873 +0530
-+++ b/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb	2026-10-25 18:32:18.829486578 +0530
+--- a/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb	2026-10-25 18:57:42.089249270 +0530
++++ b/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb	2026-10-25 18:57:42.051920324 +0530
 @@ -2216,4 +2216,9 @@
  <translation id="3168162253316954087">इस फ़ोन पर एक मॉडल · <ph name="SIZE"/>, वाई-फ़ाई पर · सिर्फ़ तब सुनता है जब आप वॉइस सर्च इस्तेमाल करते हैं</translation>
  <translation id="1072845305096600654">इस फ़ोन पर है · सिर्फ़ तब सुनता है जब आप वॉइस सर्च इस्तेमाल करते हैं</translation>
@@ -3163,8 +3317,8 @@ diff '--color=never' -ruN a/chrome/browser/ui/android/strings/translations/andro
  </translationbundle>
 \ No newline at end of file
 diff '--color=never' -ruN a/content/browser/speech/speech_recognizer_impl_android.cc b/content/browser/speech/speech_recognizer_impl_android.cc
---- a/content/browser/speech/speech_recognizer_impl_android.cc	2026-10-25 18:32:18.902317604 +0530
-+++ b/content/browser/speech/speech_recognizer_impl_android.cc	2026-10-25 18:32:18.871059676 +0530
+--- a/content/browser/speech/speech_recognizer_impl_android.cc	2026-10-25 18:57:42.121645387 +0530
++++ b/content/browser/speech/speech_recognizer_impl_android.cc	2026-10-25 18:57:42.095314565 +0530
 @@ -22,6 +22,7 @@
  #include "content/public/browser/speech_recognition_event_listener.h"
  #include "content/public/browser/speech_recognition_manager.h"
@@ -3200,19 +3354,20 @@ diff '--color=never' -ruN a/content/browser/speech/speech_recognizer_impl_androi
  
  void SpeechRecognizerImplAndroid::AbortRecognition() {
 diff '--color=never' -ruN a/content/public/android/java/src/org/chromium/content/browser/SpeechRecognitionImpl.java b/content/public/android/java/src/org/chromium/content/browser/SpeechRecognitionImpl.java
---- a/content/public/android/java/src/org/chromium/content/browser/SpeechRecognitionImpl.java	2026-10-25 18:32:18.940773581 +0530
-+++ b/content/public/android/java/src/org/chromium/content/browser/SpeechRecognitionImpl.java	2026-10-25 18:32:18.910381663 +0530
-@@ -10,6 +10,9 @@
+--- a/content/public/android/java/src/org/chromium/content/browser/SpeechRecognitionImpl.java	2026-10-25 18:57:42.155217179 +0530
++++ b/content/public/android/java/src/org/chromium/content/browser/SpeechRecognitionImpl.java	2026-10-25 18:57:42.127690973 +0530
+@@ -10,6 +10,10 @@
  import android.content.Intent;
  import android.os.Build;
  import android.os.Bundle;
 +import android.os.Handler;
 +import android.os.Looper;
 +import android.os.ParcelFileDescriptor;
++import android.os.SystemClock;
  import android.speech.RecognitionListener;
  import android.speech.RecognizerIntent;
  import android.speech.SpeechRecognizer;
-@@ -28,9 +31,12 @@
+@@ -28,9 +32,12 @@
  import org.chromium.build.annotations.NullMarked;
  import org.chromium.build.annotations.Nullable;
  import org.chromium.content_public.browser.SpeechRecognition;
@@ -3225,7 +3380,7 @@ diff '--color=never' -ruN a/content/public/android/java/src/org/chromium/content
  import java.util.Locale;
  
  /**
-@@ -39,6 +45,25 @@
+@@ -39,6 +46,25 @@
   * <p>Tark: recognition runs on the device only (Android 12+), through Android's on-device
   * recognizer; there is no path to an online recognizer, not even as a fallback. Below Android 12,
   * or with no on-device recognizer, start() ends with service-not-allowed.
@@ -3251,7 +3406,7 @@ diff '--color=never' -ruN a/content/public/android/java/src/org/chromium/content
   */
  @JNINamespace("content")
  @NullMarked
-@@ -82,6 +107,19 @@
+@@ -82,6 +108,19 @@
           * @param bcp47 The language the session ran in.
           */
          default void onSessionEnded(String origin, String bcp47) {}
@@ -3271,7 +3426,7 @@ diff '--color=never' -ruN a/content/public/android/java/src/org/chromium/content
      }
  
      /** Creates Android's on-device recognizer; replaced in tests. */
-@@ -110,6 +148,30 @@
+@@ -110,6 +149,36 @@
      private static final int ERROR_LANGUAGE_NOT_SUPPORTED = 12;
      private static final int ERROR_LANGUAGE_UNAVAILABLE = 13;
  
@@ -3295,14 +3450,20 @@ diff '--color=never' -ruN a/content/public/android/java/src/org/chromium/content
 +    // Piped sessions end here (the recognizer listens on), for recognizers that never say the
 +    // speech ended: this long after the text last changed, or, with no text at all, after the
 +    // start. Whatever happens, a piped session ends PIPE_MAX_MS after it started listening.
-+    @VisibleForTesting static final long PIPE_END_AFTER_TEXT_MS = 800;
++    // Longer ends sooner after the last word but cuts fewer pauses; Task 8 tunes it on the phone.
++    @VisibleForTesting static final long PIPE_END_AFTER_TEXT_MS = 1200;
 +    @VisibleForTesting static final long PIPE_NO_SPEECH_MS = 8000;
 +    @VisibleForTesting static final long PIPE_MAX_MS = 20_000;
++    // An end of speech with no text, followed this soon by the capture's silence, is no match,
++    // as the microphone path ends it.
++    @VisibleForTesting static final long PIPE_NO_MATCH_AFTER_EOS_MS = 1000;
++    // A switch extends the cap, once, to the replay's catch-up plus this.
++    @VisibleForTesting static final long PIPE_AFTER_CATCH_UP_MS = 10_000;
 +
      private static @Nullable RecognizerFactory sRecognizerFactoryForTesting;
      private static @Nullable RecognizerFactory sPlatformRecognizerFactory;
      private static @Nullable LanguageDelegate sLanguageDelegate;
-@@ -158,6 +220,24 @@
+@@ -158,6 +227,35 @@
      private boolean mLanguageMissingTold;
      private boolean mAudioStartSent;
  
@@ -3320,6 +3481,17 @@ diff '--color=never' -ruN a/content/public/android/java/src/org/chromium/content
 +    private String mTextBeforeSwitch = "";
 +    private boolean mFinishing;
 +    private boolean mCapped;
++    private boolean mCapExtended;
++    private long mCapAt;
++    // While a replay hasn't caught up with the live audio (uptime), ends of speech and silence
++    // are the replay's pauses, not the person's.
++    private long mReplayUntil;
++    // An end of speech with no text: silence until then is no match.
++    private long mNoMatchUntil;
++    private final Runnable mCaughtUp =
++            () -> {
++                if (!pipedText().isEmpty()) scheduleEnd(PIPE_END_AFTER_TEXT_MS);
++            };
 +    private final Handler mHandler = new Handler(Looper.getMainLooper());
 +    private final Runnable mPipeEnd = this::finishPiped;
 +    private final Runnable mPipeCap = this::finishPiped;
@@ -3327,21 +3499,25 @@ diff '--color=never' -ruN a/content/public/android/java/src/org/chromium/content
      // Internal class to handle events from Android's SpeechRecognizer and route them to native.
      class Listener implements RecognitionListener {
          /** Whether this listener's events should be dropped. */
-@@ -178,6 +258,13 @@
+@@ -178,6 +276,17 @@
  
          @Override
          public void onEndOfSpeech() {
 +            if (mAudio != null) {
 +                // A piped recognizer listens on, but its last partial came before this: with
 +                // text, the utterance is over now, as without the pipe. Without, it listens on.
-+                if (isStale()) return;
-+                if (!pipedText().isEmpty()) finishPiped();
++                if (isStale() || replaying()) return;
++                if (!pipedText().isEmpty()) {
++                    finishPiped();
++                } else {
++                    mNoMatchUntil = SystemClock.uptimeMillis() + PIPE_NO_MATCH_AFTER_EOS_MS;
++                }
 +                return;
 +            }
              // Ignore onEndOfSpeech in continuous mode to let terminate() take care of ending
              // events. The Android API documentation is vague as to when onEndOfSpeech is called in
              // continuous mode, whereas the Web Speech API defines a stronger semantic on the
-@@ -196,6 +283,15 @@
+@@ -196,6 +305,15 @@
          @Override
          public void onError(int error) {
              if (isStale()) return;
@@ -3357,7 +3533,7 @@ diff '--color=never' -ruN a/content/public/android/java/src/org/chromium/content
  
              int code = mapError(error);
              if (code == SpeechRecognitionErrorCode.LANGUAGE_NOT_SUPPORTED) {
-@@ -217,6 +313,10 @@
+@@ -217,6 +335,10 @@
          @Override
          public void onPartialResults(Bundle bundle) {
              if (isStale()) return;
@@ -3368,7 +3544,7 @@ diff '--color=never' -ruN a/content/public/android/java/src/org/chromium/content
              handleResults(bundle, true);
          }
  
-@@ -234,6 +334,13 @@
+@@ -234,6 +356,13 @@
          @Override
          public void onResults(Bundle bundle) {
              if (isStale()) return;
@@ -3382,7 +3558,7 @@ diff '--color=never' -ruN a/content/public/android/java/src/org/chromium/content
              handleResults(bundle, false);
              // We assume that onResults is called only once, at the end of a session, thus we
              // terminate. If one day the recognition provider changes dictation mode behavior to
-@@ -393,6 +500,8 @@
+@@ -393,6 +522,8 @@
              mRecognizer = null;
          }
          if (sLiveSession == this) sLiveSession = null;
@@ -3391,7 +3567,7 @@ diff '--color=never' -ruN a/content/public/android/java/src/org/chromium/content
          SpeechRecognitionImplJni.get().onRecognitionEnd(mNativeSpeechRecognizerImplAndroid);
          mNativeSpeechRecognizerImplAndroid = 0;
  
-@@ -413,7 +522,11 @@
+@@ -413,7 +544,11 @@
      @CalledByNative
      @VisibleForTesting
      void startRecognition(
@@ -3404,7 +3580,7 @@ diff '--color=never' -ruN a/content/public/android/java/src/org/chromium/content
          if (mNativeSpeechRecognizerImplAndroid == 0 || mRecognizer != null) return;
  
          // Android runs one on-device session at a time: the newer session wins and the older one
-@@ -451,13 +564,47 @@
+@@ -451,13 +586,48 @@
              }
          }
          mContinuous = continuous;
@@ -3446,15 +3622,16 @@ diff '--color=never' -ruN a/content/public/android/java/src/org/chromium/content
 +            mIntent.putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true);
 +            scheduleEnd(PIPE_NO_SPEECH_MS);
 +            if (!mCapped) {
-+                // From the first listen, never re-armed: a switch doesn't extend it.
++                // From the first listen; only a switch's replay extends it, once.
 +                mCapped = true;
++                mCapAt = SystemClock.uptimeMillis() + PIPE_MAX_MS;
 +                mHandler.postDelayed(mPipeCap, PIPE_MAX_MS);
 +            }
 +        }
          try {
              recognizer.startListening(mIntent);
          } catch (SecurityException e) {
-@@ -502,7 +649,177 @@
+@@ -502,7 +672,215 @@
          mListener = new Listener();
          recognizer.setRecognitionListener(mListener);
          mLanguage = mPageLanguage;
@@ -3465,6 +3642,7 @@ diff '--color=never' -ruN a/content/public/android/java/src/org/chromium/content
 +        }
 +        // The new recognizer hears the session's audio from its start.
 +        @Nullable ParcelFileDescriptor pipe = mAudio.replay();
++        long catchUp = mAudio.replayCatchUpMs();
 +        if (pipe == null) {
 +            terminate(SpeechRecognitionErrorCode.LANGUAGE_NOT_SUPPORTED);
 +            return;
@@ -3472,6 +3650,8 @@ diff '--color=never' -ruN a/content/public/android/java/src/org/chromium/content
 +        mSegments.clear();
 +        mSegment = "";
 +        listen(recognizer, pipe);
++        // listen() may have ended the session (startListening refused).
++        if (mAudio != null) onReplayStarted(catchUp);
 +    }
 +
 +    /**
@@ -3494,6 +3674,7 @@ diff '--color=never' -ruN a/content/public/android/java/src/org/chromium/content
 +            return false;
 +        }
 +        @Nullable ParcelFileDescriptor pipe = mAudio.replay();
++        long catchUp = mAudio.replayCatchUpMs();
 +        if (pipe == null) return false;
 +        SpeechRecognizer old = mRecognizer;
 +        mRecognizer = null;
@@ -3520,6 +3701,8 @@ diff '--color=never' -ruN a/content/public/android/java/src/org/chromium/content
 +        mSegment = "";
 +        mLanguage = bcp47;
 +        listen(recognizer, pipe);
++        // listen() may have ended the session (startListening refused).
++        if (mAudio != null) onReplayStarted(catchUp);
 +        return true;
 +    }
 +
@@ -3569,14 +3752,44 @@ diff '--color=never' -ruN a/content/public/android/java/src/org/chromium/content
 +
 +    /** Tark's capture heard silence after speech: with text, the utterance is over. */
 +    private void onCaptureQuiet() {
-+        if (mAudio == null || mFinishing || pipedText().isEmpty()) return;
++        if (mAudio == null || mFinishing || replaying()) return;
++        // With no text: no match only right after the recognizer's end of speech, as on the
++        // microphone path; otherwise it listens on.
++        if (pipedText().isEmpty() && SystemClock.uptimeMillis() > mNoMatchUntil) return;
 +        finishPiped();
++    }
++
++    private boolean replaying() {
++        return SystemClock.uptimeMillis() < mReplayUntil;
++    }
++
++    /**
++     * A new recognizer hears a replay: until it has caught up with the live audio its pauses
++     * end nothing, and the cap is extended once so the replay can finish.
++     */
++    private void onReplayStarted(long catchUpMs) {
++        long now = SystemClock.uptimeMillis();
++        mReplayUntil = now + catchUpMs;
++        mNoMatchUntil = 0;
++        mHandler.removeCallbacks(mCaughtUp);
++        mHandler.postDelayed(mCaughtUp, catchUpMs);
++        if (!mCapExtended) {
++            mCapExtended = true;
++            long capAt = Math.max(mCapAt, now + catchUpMs + PIPE_AFTER_CATCH_UP_MS);
++            if (capAt != mCapAt) {
++                mCapAt = capAt;
++                mHandler.removeCallbacks(mPipeCap);
++                mHandler.postDelayed(mPipeCap, capAt - now);
++            }
++        }
 +    }
 +
 +    private void scheduleEnd(long delayMs) {
 +        if (mAudio == null || mFinishing) return;
 +        mHandler.removeCallbacks(mPipeEnd);
-+        mHandler.postDelayed(mPipeEnd, delayMs);
++        // Counted from the replay's catch-up.
++        long replayLeft = Math.max(0, mReplayUntil - SystemClock.uptimeMillis());
++        mHandler.postDelayed(mPipeEnd, replayLeft + delayMs);
 +    }
 +
 +    /**
@@ -3588,6 +3801,7 @@ diff '--color=never' -ruN a/content/public/android/java/src/org/chromium/content
 +        mFinishing = true;
 +        mHandler.removeCallbacks(mPipeEnd);
 +        mHandler.removeCallbacks(mPipeCap);
++        mHandler.removeCallbacks(mCaughtUp);
 +        commitSegment();
 +        String text = pipedText();
 +        if (text.isEmpty()) text = mTextBeforeSwitch;
@@ -3612,6 +3826,7 @@ diff '--color=never' -ruN a/content/public/android/java/src/org/chromium/content
 +    private void closeAudio() {
 +        mHandler.removeCallbacks(mPipeEnd);
 +        mHandler.removeCallbacks(mPipeCap);
++        mHandler.removeCallbacks(mCaughtUp);
 +        closePipe();
 +        SpeechRecognition.@Nullable AudioSource audio = mAudio;
 +        mAudio = null;
@@ -3633,7 +3848,7 @@ diff '--color=never' -ruN a/content/public/android/java/src/org/chromium/content
      }
  
      @VisibleForTesting
-@@ -525,9 +842,25 @@
+@@ -525,9 +903,25 @@
  
          mContinuous = false;
          mStopRequested = true;
@@ -3660,8 +3875,8 @@ diff '--color=never' -ruN a/content/public/android/java/src/org/chromium/content
      interface Natives {
          // Native JNI calls to content/browser/speech/speech_recognizer_impl_android.cc
 diff '--color=never' -ruN a/content/public/android/java/src/org/chromium/content_public/browser/SpeechRecognition.java b/content/public/android/java/src/org/chromium/content_public/browser/SpeechRecognition.java
---- a/content/public/android/java/src/org/chromium/content_public/browser/SpeechRecognition.java	2026-10-25 18:32:18.976575482 +0530
-+++ b/content/public/android/java/src/org/chromium/content_public/browser/SpeechRecognition.java	2026-10-25 18:32:18.947551456 +0530
+--- a/content/public/android/java/src/org/chromium/content_public/browser/SpeechRecognition.java	2026-10-25 18:57:42.188042508 +0530
++++ b/content/public/android/java/src/org/chromium/content_public/browser/SpeechRecognition.java	2026-10-25 18:57:42.160819096 +0530
 @@ -4,6 +4,8 @@
  
  package org.chromium.content_public.browser;
@@ -3671,7 +3886,7 @@ diff '--color=never' -ruN a/content/public/android/java/src/org/chromium/content
  import org.chromium.build.annotations.NullMarked;
  import org.chromium.build.annotations.Nullable;
  import org.chromium.content.browser.SpeechRecognitionImpl;
-@@ -54,6 +56,49 @@
+@@ -54,6 +56,57 @@
  
          /** A session for the origin ended, having run in {@code bcp47}. */
          default void onSessionEnded(String origin, String bcp47) {}
@@ -3714,6 +3929,14 @@ diff '--color=never' -ruN a/content/public/android/java/src/org/chromium/content
 +        default void setQuietListener(Runnable onQuiet) {}
 +
 +        /**
++         * How long the last {@link #replay()} takes to catch up with the live audio: until
++         * then, pauses the new recognizer hears are the replay's.
++         */
++        default long replayCatchUpMs() {
++            return 0;
++        }
++
++        /**
 +         * The session ended (results, error or abort), after its recognizer is gone: the capture
 +         * stops and the audio held is dropped. Called once.
 +         */
@@ -3721,7 +3944,7 @@ diff '--color=never' -ruN a/content/public/android/java/src/org/chromium/content
      }
  
      /** Tark: whether a speech recognition session (any tab's, private ones too) is live. */
-@@ -62,6 +107,18 @@
+@@ -62,6 +115,18 @@
      }
  
      /**
@@ -3740,7 +3963,7 @@ diff '--color=never' -ruN a/content/public/android/java/src/org/chromium/content
       * Tark: sets the delegate told when a session fails for a language the device lacks.
       *
       * @param delegate The delegate, or null for none.
-@@ -90,6 +147,14 @@
+@@ -90,6 +155,14 @@
                              public void onSessionEnded(String origin, String bcp47) {
                                  delegate.onSessionEnded(origin, bcp47);
                              }
@@ -3756,8 +3979,8 @@ diff '--color=never' -ruN a/content/public/android/java/src/org/chromium/content
      }
  }
 diff '--color=never' -ruN a/content/public/android/junit/src/org/chromium/content/browser/SpeechRecognitionImplTest.java b/content/public/android/junit/src/org/chromium/content/browser/SpeechRecognitionImplTest.java
---- a/content/public/android/junit/src/org/chromium/content/browser/SpeechRecognitionImplTest.java	2026-10-25 18:32:19.018700837 +0530
-+++ b/content/public/android/junit/src/org/chromium/content/browser/SpeechRecognitionImplTest.java	2026-10-25 18:32:18.986187977 +0530
+--- a/content/public/android/junit/src/org/chromium/content/browser/SpeechRecognitionImplTest.java	2026-10-25 18:57:42.222108387 +0530
++++ b/content/public/android/junit/src/org/chromium/content/browser/SpeechRecognitionImplTest.java	2026-10-25 18:57:42.193806176 +0530
 @@ -4,8 +4,11 @@
  
  package org.chromium.content.browser;
@@ -3794,7 +4017,7 @@ diff '--color=never' -ruN a/content/public/android/junit/src/org/chromium/conten
  import java.util.ArrayList;
  import java.util.Arrays;
  import java.util.List;
-@@ -446,4 +454,323 @@
+@@ -446,4 +454,408 @@
          verifyEndedWith(NATIVE_1, SpeechRecognitionErrorCode.SERVICE_NOT_ALLOWED);
          assertFalse(SpeechRecognitionImpl.hasLiveSession());
      }
@@ -3808,6 +4031,12 @@ diff '--color=never' -ruN a/content/public/android/junit/src/org/chromium/conten
 +        int mCloses;
 +        boolean mFail;
 +        @Nullable Runnable mOnQuiet;
++        long mCatchUpMs;
++
++        @Override
++        public long replayCatchUpMs() {
++            return mCatchUpMs;
++        }
 +
 +        @Override
 +        public void setQuietListener(Runnable onQuiet) {
@@ -4116,5 +4345,84 @@ diff '--color=never' -ruN a/content/public/android/junit/src/org/chromium/conten
 +        start(NATIVE_1, "en-US");
 +        assertFalse(SpeechRecognition.switchLanguage("hi-IN"));
 +        assertEquals(1, mFactory.mCreated.size());
++    }
++
++    @Test
++    @Config(sdk = 33)
++    public void testSwitchWithPauseInReplayKeepsFullText() {
++        mAudio.mCatchUpMs = 6000;
++        SpeechRecognitionImpl session = startPiped("en-IN");
++        session.getListenerForTesting().onPartialResults(results("mosam"));
++        assertTrue(SpeechRecognition.switchLanguage("hi-IN"));
++        RecognitionListener listener = session.getListenerForTesting();
++        listener.onPartialResults(results("मौसम"));
++        // The replay's own pause: an end of speech and the capture's silence, mid-replay.
++        listener.onEndOfSpeech();
++        assertNotNull(mAudio.mOnQuiet);
++        mAudio.mOnQuiet.run();
++        ShadowLooper.idleMainLooper(2000, MILLISECONDS);
++        verify(mNatives, never()).onRecognitionEnd(anyLong());
++        listener.onBeginningOfSpeech();
++        listener.onPartialResults(results("मौसम कैसा है"));
++        ShadowLooper.idleMainLooper(3000, MILLISECONDS);
++        verify(mNatives, never()).onRecognitionEnd(anyLong());
++        // Caught up, then the usual quiet after the text.
++        ShadowLooper.idleMainLooper(
++                1000 + SpeechRecognitionImpl.PIPE_END_AFTER_TEXT_MS, MILLISECONDS);
++        verify(mNatives).onRecognitionResults(NATIVE_1, new String[] {"मौसम कैसा है"}, null, false);
++        verify(mNatives).onRecognitionEnd(NATIVE_1);
++    }
++
++    @Test
++    @Config(sdk = 33)
++    public void testLateSwitchExtendsTheCapOnce() {
++        // A switch at 14 s whose replay takes 26 s to catch up: the cap moves to after it.
++        mAudio.mCatchUpMs = 26_000;
++        SpeechRecognitionImpl session = startPiped("en-IN");
++        int word = 0;
++        for (long t = 0; t < 14_000; t += 500) {
++            session.getListenerForTesting().onPartialResults(results("word " + word++));
++            ShadowLooper.idleMainLooper(500, MILLISECONDS);
++        }
++        assertTrue(SpeechRecognition.switchLanguage("hi-IN"));
++        long cap = 26_000 + SpeechRecognitionImpl.PIPE_AFTER_CATCH_UP_MS;
++        for (long t = 0; t < cap - 500; t += 500) {
++            session.getListenerForTesting().onPartialResults(results("shabd " + word++));
++            ShadowLooper.idleMainLooper(500, MILLISECONDS);
++        }
++        verify(mNatives, never()).onRecognitionEnd(anyLong());
++        session.getListenerForTesting().onPartialResults(results("ant"));
++        ShadowLooper.idleMainLooper(500, MILLISECONDS);
++        verify(mNatives).onRecognitionResults(NATIVE_1, new String[] {"ant"}, null, false);
++        verify(mNatives).onRecognitionEnd(NATIVE_1);
++    }
++
++    @Test
++    @Config(sdk = 33)
++    public void testEndOfSpeechWithoutTextThenQuietIsNoMatch() {
++        SpeechRecognitionImpl session = startPiped("en-US");
++        RecognitionListener listener = session.getListenerForTesting();
++        listener.onBeginningOfSpeech();
++        listener.onEndOfSpeech();
++        ShadowLooper.idleMainLooper(400, MILLISECONDS);
++        assertNotNull(mAudio.mOnQuiet);
++        mAudio.mOnQuiet.run();
++        verifyEndedWith(NATIVE_1, SpeechRecognitionErrorCode.NO_SPEECH);
++    }
++
++    @Test
++    @Config(sdk = 33)
++    public void testLateQuietAfterEmptyEndOfSpeechListensOn() {
++        SpeechRecognitionImpl session = startPiped("en-US");
++        RecognitionListener listener = session.getListenerForTesting();
++        listener.onEndOfSpeech();
++        ShadowLooper.idleMainLooper(
++                SpeechRecognitionImpl.PIPE_NO_MATCH_AFTER_EOS_MS + 100, MILLISECONDS);
++        assertNotNull(mAudio.mOnQuiet);
++        mAudio.mOnQuiet.run();
++        verify(mNatives, never()).onRecognitionEnd(anyLong());
++        listener.onPartialResults(results("namaste"));
++        listener.onEndOfSpeech();
++        verify(mNatives).onRecognitionResults(NATIVE_1, new String[] {"namaste"}, null, false);
 +    }
  }
