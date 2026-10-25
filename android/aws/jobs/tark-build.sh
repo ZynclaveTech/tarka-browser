@@ -118,12 +118,12 @@ if (( code == 0 )); then
       /tark/junit-venv/bin/python $o/bin/run_content_junit_tests --gtest_filter='*SpeechRecognitionImplTest*' &&
       /tark/junit-venv/bin/python $o/bin/run_chrome_junit_tests --gtest_filter='*SpeechLanguageSnackbarTest*:*VoiceDetectionTest*:*VoiceLanguagesTest*:*VoiceLanguageSignalsTest*:*VoiceLanguagesSettingsTest*:*AndroidVoicePlatformTest*:*VoiceSiteLanguagesTest*:*VoiceLanguageOfferTest*' &&
       /tark/junit-venv/bin/python $o/bin/run_chrome_junit_tests --gtest_filter='*IncognitoTabSwitcherPaneUnitTest*' &&
-      /tark/junit-venv/bin/python $o/bin/run_chrome_junit_tests --gtest_filter='*ZynclaveAuthFlowTest*:*AuthStateStoreTest*:*ZynclaveAccountTest*:*ZynclaveAccountRowTest*:*ZynclaveNoTokenLogsTest*:*ZynclaveRedirectTest*'
+      /tark/junit-venv/bin/python $o/bin/run_chrome_junit_tests --gtest_filter='*ZynclaveAuthFlowTest*:*AuthStateStoreTest*:*ZynclaveAccountTest*:*ZynclaveAccountRowTest*:*ZynclaveNoTokenLogsTest*:*ZynclaveRedirectTest*:*ZynclaveWebOfferTest*'
     } > /tark/junit.log 2>&1
     code=$?
     # A filter that matches nothing "passes" with no test run.
     for t in SpeechRecognitionImplTest SpeechLanguageSnackbarTest VoiceDetectionTest VoiceLanguagesTest VoiceLanguageSignalsTest VoiceLanguagesSettingsTest AndroidVoicePlatformTest VoiceSiteLanguagesTest VoiceLanguageOfferTest IncognitoTabSwitcherPaneUnitTest \
-        ZynclaveAuthFlowTest AuthStateStoreTest ZynclaveAccountTest ZynclaveAccountRowTest ZynclaveNoTokenLogsTest ZynclaveRedirectTest; do
+        ZynclaveAuthFlowTest AuthStateStoreTest ZynclaveAccountTest ZynclaveAccountRowTest ZynclaveNoTokenLogsTest ZynclaveRedirectTest ZynclaveWebOfferTest; do
       grep -q "OK \] .*$t\." /tark/junit.log || { echo "junit: no $t test ran" >> $log; code=1; }
     done
     upload /tark/junit.log junit.log

@@ -1,0 +1,1634 @@
+diff --color '--color=never' -ruN a/chrome/android/BUILD.gn b/chrome/android/BUILD.gn
+--- a/chrome/android/BUILD.gn	2026-10-26 03:42:55.089401582 +0530
++++ b/chrome/android/BUILD.gn	2026-10-26 03:46:56.406917811 +0530
+@@ -483,6 +483,7 @@
+       "//chrome/browser/omaha/android:java",
+       "//chrome/browser/tark_captions_android/android:java",
+       "//chrome/browser/tark_voice_android/android:java",
++      "//chrome/browser/tark_zynclave/android:java",
+       "//chrome/browser/open_in_app/android:java",
+       "//chrome/browser/optimization_guide/android:java",
+       "//chrome/browser/page_content_annotations:java",
+diff --color '--color=never' -ruN a/chrome/android/chrome_java_resources.gni b/chrome/android/chrome_java_resources.gni
+--- a/chrome/android/chrome_java_resources.gni	2026-10-26 03:42:54.132275074 +0530
++++ b/chrome/android/chrome_java_resources.gni	2026-10-26 03:48:29.990325968 +0530
+@@ -633,6 +633,7 @@
+   "java/res/layout/virtual_card_enrollment_dialog.xml",
+   "java/res/layout/webapk_icon_name_update_dialog.xml",
+   "java/res/layout/webapk_update_report_abuse_custom_view.xml",
++  "java/res/layout/zynclave_offer_sheet.xml",
+   "java/res/menu/app_specific_history_manager_menu.xml",
+   "java/res/menu/bookmark_folder_picker_menu.xml",
+   "java/res/menu/bookmark_toolbar_menu_improved.xml",
+diff --color '--color=never' -ruN a/chrome/android/chrome_java_sources.gni b/chrome/android/chrome_java_sources.gni
+--- a/chrome/android/chrome_java_sources.gni	2026-10-26 03:42:54.127488594 +0530
++++ b/chrome/android/chrome_java_sources.gni	2026-10-26 03:48:29.989916463 +0530
+@@ -987,7 +987,9 @@
+   "java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAuthActivity.java",
+   "java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAuthFlow.java",
+   "java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveConfig.java",
++  "java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveOfferSheet.java",
+   "java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveRedirect.java",
++  "java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveWebOffer.java",
+   "java/src/org/chromium/chrome/browser/paint_preview/StartupPaintPreviewHelper.java",
+   "java/src/org/chromium/chrome/browser/paint_preview/StartupPaintPreviewHelperSupplier.java",
+   "java/src/org/chromium/chrome/browser/password_manager/AccountChooserDialog.java",
+diff --color '--color=never' -ruN a/chrome/android/java/res/layout/zynclave_offer_sheet.xml b/chrome/android/java/res/layout/zynclave_offer_sheet.xml
+--- a/chrome/android/java/res/layout/zynclave_offer_sheet.xml	1970-01-01 05:30:00.000000000 +0530
++++ b/chrome/android/java/res/layout/zynclave_offer_sheet.xml	2026-10-26 03:48:29.960547618 +0530
+@@ -0,0 +1,52 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!-- Copyright 2026 The Tark Authors
++     Use of this source code is governed by a BSD-style license that can be
++     found in the LICENSE file. -->
++<!-- Sign in with Zynclave: "Sign in to Tark as X?" (ZynclaveOfferSheet). -->
++<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
++    android:layout_width="match_parent"
++    android:layout_height="wrap_content"
++    android:orientation="vertical"
++    android:paddingStart="24dp"
++    android:paddingEnd="24dp"
++    android:paddingTop="24dp"
++    android:paddingBottom="16dp">
++
++    <TextView
++        android:id="@+id/zynclave_offer_title"
++        android:layout_width="match_parent"
++        android:layout_height="wrap_content"
++        android:accessibilityHeading="true"
++        android:textAppearance="@style/TextAppearance.TextLarge.Primary" />
++
++    <TextView
++        android:id="@+id/zynclave_offer_body"
++        android:layout_width="match_parent"
++        android:layout_height="wrap_content"
++        android:layout_marginTop="8dp"
++        android:text="@string/tark_zynclave_offer_body"
++        android:textAppearance="@style/TextAppearance.TextMedium.Secondary" />
++
++    <LinearLayout
++        android:layout_width="match_parent"
++        android:layout_height="wrap_content"
++        android:layout_marginTop="24dp"
++        android:gravity="end"
++        android:orientation="horizontal">
++
++        <org.chromium.ui.widget.ButtonCompat
++            android:id="@+id/zynclave_offer_no_thanks"
++            style="@style/TextButton"
++            android:layout_width="wrap_content"
++            android:layout_height="wrap_content"
++            android:layout_marginEnd="8dp"
++            android:text="@string/tark_xlit_no_thanks" />
++
++        <org.chromium.ui.widget.ButtonCompat
++            android:id="@+id/zynclave_offer_sign_in"
++            style="@style/FilledButton"
++            android:layout_width="wrap_content"
++            android:layout_height="wrap_content"
++            android:text="@string/tark_zynclave_offer_sign_in" />
++    </LinearLayout>
++</LinearLayout>
+diff --color '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/tab/TabHelpers.java b/chrome/android/java/src/org/chromium/chrome/browser/tab/TabHelpers.java
+--- a/chrome/android/java/src/org/chromium/chrome/browser/tab/TabHelpers.java	2026-10-26 03:42:57.967391232 +0530
++++ b/chrome/android/java/src/org/chromium/chrome/browser/tab/TabHelpers.java	2026-10-26 03:48:45.493638495 +0530
+@@ -20,6 +20,7 @@
+ import org.chromium.chrome.browser.price_tracking.PriceTrackingFeatures;
+ import org.chromium.chrome.browser.tab.state.ShoppingPersistedTabData;
+ import org.chromium.chrome.browser.tabmodel.TabPersistentStoreImpl;
++import org.chromium.chrome.browser.tark.zynclave.ZynclaveWebOffer;
+ import org.chromium.chrome.browser.ui.edge_to_edge.EdgeToEdgeUtils;
+ 
+ /** Helper class that initializes various tab UserData objects. */
+@@ -53,6 +54,10 @@
+             ShoppingPersistedTabData.initialize(tab);
+         }
+         RedirectHandlerTabHelper.getOrCreateHandlerFor(tab);
++
++        // Tark: "Sign in to Tark as X?" after a normal tab visits the Zynclave Account's pages;
++        // private tabs get nothing (no observer, no whoami).
++        if (!tab.isOffTheRecord()) ZynclaveWebOffer.attach(tab);
+     }
+ 
+     /**
+diff --color '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveOfferSheet.java b/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveOfferSheet.java
+--- a/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveOfferSheet.java	1970-01-01 05:30:00.000000000 +0530
++++ b/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveOfferSheet.java	2026-10-26 03:52:02.007752568 +0530
+@@ -0,0 +1,157 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++package org.chromium.chrome.browser.tark.zynclave;
++
++import android.app.Activity;
++import android.view.LayoutInflater;
++import android.view.View;
++import android.widget.TextView;
++
++import org.chromium.build.annotations.NullMarked;
++import org.chromium.build.annotations.Nullable;
++import org.chromium.chrome.R;
++import org.chromium.chrome.browser.tab.Tab;
++import org.chromium.chrome.browser.tark.zynclave.ZynclaveWebOffer.Choice;
++import org.chromium.components.browser_ui.bottomsheet.BottomSheetContent;
++import org.chromium.components.browser_ui.bottomsheet.BottomSheetController;
++import org.chromium.components.browser_ui.bottomsheet.BottomSheetControllerProvider;
++import org.chromium.ui.base.WindowAndroid;
++
++/**
++ * Sign in with Zynclave: the "Sign in to Tark as X?" sheet (spec §5.6). [Sign in] [No thanks];
++ * swiping it away or Back answers neither. The name and email live only as long as the sheet.
++ */
++@NullMarked
++final class ZynclaveOfferSheet implements BottomSheetContent {
++    private final BottomSheetController mController;
++    private final Activity mActivity;
++    private final View mView;
++    private @Nullable Choice mChoice;
++
++    private ZynclaveOfferSheet(
++            Activity activity,
++            BottomSheetController controller,
++            @Nullable String name,
++            @Nullable String email,
++            Choice choice) {
++        mActivity = activity;
++        mController = controller;
++        mChoice = choice;
++        mView = LayoutInflater.from(activity).inflate(R.layout.zynclave_offer_sheet, null);
++        TextView title = mView.findViewById(R.id.zynclave_offer_title);
++        title.setText(ZynclaveWebOffer.title(activity.getResources(), name, email));
++        mView.findViewById(R.id.zynclave_offer_sign_in)
++                .setOnClickListener(
++                        v -> {
++                            Choice c = mChoice;
++                            hide();
++                            if (c != null) c.onSignIn(mActivity);
++                        });
++        mView.findViewById(R.id.zynclave_offer_no_thanks)
++                .setOnClickListener(
++                        v -> {
++                            Choice c = mChoice;
++                            hide();
++                            if (c != null) c.onNoThanks();
++                        });
++    }
++
++    private void hide() {
++        mChoice = null;
++        mController.hideContent(this, /* animate= */ true);
++    }
++
++    /** Shows the sheet in a tab's activity, only while the tab is the one on screen. */
++    static final class TabPresenter implements ZynclaveWebOffer.Presenter {
++        private final Tab mTab;
++
++        TabPresenter(Tab tab) {
++            mTab = tab;
++        }
++
++        @Override
++        public boolean show(
++                @Nullable String name, @Nullable String email, Choice choice) {
++            // The tab on screen and taking input: not a background tab, not one being closed.
++            if (!mTab.isUserInteractable()) return false;
++            WindowAndroid window = mTab.getWindowAndroid();
++            if (window == null) return false;
++            Activity activity = window.getActivity().get();
++            if (activity == null || activity.isFinishing() || activity.isDestroyed()) return false;
++            BottomSheetController controller = BottomSheetControllerProvider.from(window);
++            if (controller == null
++                    || controller.getCurrentSheetContent() != null
++                    || controller.isSheetOpen()) {
++                return false;
++            }
++            return controller.requestShowContent(
++                    new ZynclaveOfferSheet(activity, controller, name, email, choice),
++                    /* animate= */ true);
++        }
++    }
++
++    @Override
++    public View getContentView() {
++        return mView;
++    }
++
++    @Override
++    public @Nullable View getToolbarView() {
++        return null;
++    }
++
++    @Override
++    public int getVerticalScrollOffset() {
++        return 0;
++    }
++
++    @Override
++    public void destroy() {
++        // Drop the name and email with the sheet.
++        mChoice = null;
++        TextView title = mView.findViewById(R.id.zynclave_offer_title);
++        title.setText(null);
++    }
++
++    @Override
++    public @ContentPriority int getPriority() {
++        return ContentPriority.LOW;
++    }
++
++    @Override
++    public boolean swipeToDismissEnabled() {
++        return true;
++    }
++
++    @Override
++    public int getPeekHeight() {
++        return HeightMode.DISABLED;
++    }
++
++    @Override
++    public float getHalfHeightRatio() {
++        return HeightMode.DISABLED;
++    }
++
++    @Override
++    public float getFullHeightRatio() {
++        return HeightMode.WRAP_CONTENT;
++    }
++
++    @Override
++    public int getSheetHalfHeightAccessibilityStringId() {
++        return R.string.tark_zynclave_offer_title_generic;
++    }
++
++    @Override
++    public int getSheetFullHeightAccessibilityStringId() {
++        return R.string.tark_zynclave_offer_title_generic;
++    }
++
++    @Override
++    public int getSheetClosedAccessibilityStringId() {
++        return R.string.tark_zynclave_offer_closed;
++    }
++}
+diff --color '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveWebOffer.java b/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveWebOffer.java
+--- a/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveWebOffer.java	1970-01-01 05:30:00.000000000 +0530
++++ b/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveWebOffer.java	2026-10-26 03:53:33.941245899 +0530
+@@ -0,0 +1,364 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++package org.chromium.chrome.browser.tark.zynclave;
++
++import android.app.Activity;
++import android.content.res.Resources;
++import android.os.Handler;
++import android.os.Looper;
++import android.text.TextUtils;
++import android.util.Base64;
++
++import androidx.annotation.VisibleForTesting;
++
++import org.chromium.base.ResettersForTesting;
++import org.chromium.base.ThreadUtils;
++import org.chromium.base.shared_preferences.SharedPreferencesManager;
++import org.chromium.build.annotations.NullMarked;
++import org.chromium.build.annotations.Nullable;
++import org.chromium.chrome.R;
++import org.chromium.chrome.browser.preferences.ChromePreferenceKeys;
++import org.chromium.chrome.browser.preferences.ChromeSharedPreferences;
++import org.chromium.chrome.browser.tab.Tab;
++import org.chromium.chrome.browser.tab.TabObserver;
++import org.chromium.chrome.browser.tark_zynclave.ZynclaveWhoami;
++import org.chromium.content_public.browser.NavigationHandle;
++import org.chromium.url.GURL;
++
++import java.nio.charset.StandardCharsets;
++import java.security.MessageDigest;
++import java.security.NoSuchAlgorithmException;
++import java.security.SecureRandom;
++import java.util.HashSet;
++import java.util.Set;
++
++/**
++ * Sign in with Zynclave (spec §5.6, handoff §2a B): "Sign in to Tark as X?" after a normal tab went
++ * through the Zynclave Account's pages.
++ *
++ * <p>Any committed navigation (or redirect) in the tab's main frame on the accounts host marks the
++ * tab. When the marked tab then finishes loading a page that is not a sign-in screen and stays on
++ * it for 3 s, the mark is cleared and the profile's web session is asked once (whoami, native, the
++ * profile's cookies). A new navigation or closing the tab cancels the wait; at most one check is in
++ * flight; nothing runs while Tark is signed in or signing in. A session shows the sheet once per
++ * account per process, never for an account the person said No thanks to, and Sign in runs the
++ * normal sign-in with prompt=none. Private tabs get no observer (TabHelpers) and the policy and
++ * native fetch refuse them as well.
++ */
++@NullMarked
++public final class ZynclaveWebOffer {
++    /** How long the page has to stay before the check. */
++    @VisibleForTesting static final long IDLE_MS = 3000;
++
++    /** The person's answer on the sheet. */
++    interface Choice {
++        void onSignIn(Activity activity);
++
++        void onNoThanks();
++    }
++
++    /** Asks the tab profile's web session once (ZynclaveWhoami in the browser). */
++    interface Fetcher {
++        void fetch(ZynclaveWhoami.Callback callback);
++    }
++
++    /** Shows the sheet; false when it can't now (another sheet, tab not current, …). */
++    interface Presenter {
++        boolean show(@Nullable String name, @Nullable String email, Choice choice);
++    }
++
++    /** The parts of ZynclaveAccount the offer uses. */
++    interface Account {
++        /** SIGNED_IN or SIGNING_IN: no check, no sheet. */
++        boolean isSignedInOrSigningIn();
++
++        void signIn(Activity activity, boolean promptNone);
++    }
++
++    /** The declined accounts (salted hashes only) and the salt. */
++    interface Store {
++        byte[] salt();
++
++        boolean isDeclined(String key);
++
++        void decline(String key);
++    }
++
++    private static final String[] SIGN_IN_PATHS = {
++        "/login", "/registration", "/recovery", "/verification", "/error"
++    };
++
++    /** Accounts (declined keys) offered in this process: once per account per process. */
++    private static final Set<String> sShownThisProcess = new HashSet<>();
++
++    private final boolean mOffTheRecord;
++    private final String mAccountsHost;
++    private final Fetcher mFetcher;
++    private final Presenter mPresenter;
++    private final Account mAccount;
++    private final Store mStore;
++    private final Handler mHandler = new Handler(Looper.getMainLooper());
++    private final Runnable mCheck = this::check;
++
++    private boolean mMarked;
++    private boolean mWaiting;
++    private boolean mInFlight;
++    private boolean mDestroyed;
++
++    @VisibleForTesting
++    ZynclaveWebOffer(
++            boolean offTheRecord,
++            String accountsHost,
++            Fetcher fetcher,
++            Presenter presenter,
++            Account account,
++            Store store) {
++        mOffTheRecord = offTheRecord;
++        mAccountsHost = accountsHost;
++        mFetcher = fetcher;
++        mPresenter = presenter;
++        mAccount = account;
++        mStore = store;
++    }
++
++    /**
++     * Called by TabHelpers for every new tab: attaches the offer's observer to a normal tab, and
++     * nothing to a private one.
++     */
++    public static void attach(Tab tab) {
++        if (!shouldAttach(tab.isOffTheRecord())) return;
++        String host = ZynclaveConfig.get().accountsHost();
++        ZynclaveWebOffer offer =
++                new ZynclaveWebOffer(
++                        tab.isOffTheRecord(),
++                        host,
++                        callback ->
++                                ZynclaveWhoami.fetch(tab.getProfile(), "https://" + host, callback),
++                        new ZynclaveOfferSheet.TabPresenter(tab),
++                        new RealAccount(),
++                        new PrefsStore());
++        tab.addObserver(offer.new Observer());
++    }
++
++    /** Whether a tab gets the observer at all: never a private (off-the-record) one. */
++    @VisibleForTesting
++    static boolean shouldAttach(boolean offTheRecord) {
++        return !offTheRecord;
++    }
++
++    /** A sign-in screen of the Zynclave Account: the sheet never shows over one. */
++    public static boolean isSignInScreen(GURL url, String accountsHost) {
++        if (!isAccountsPage(url, accountsHost)) return false;
++        String path = url.getPath();
++        if (path.equals("/oauth") || path.startsWith("/oauth/")) return true;
++        for (String screen : SIGN_IN_PATHS) {
++            if (path.equals(screen) || path.startsWith(screen + "/")) return true;
++        }
++        return false;
++    }
++
++    private static boolean isAccountsPage(GURL url, String accountsHost) {
++        return url.isValid()
++                && "https".equals(url.getScheme())
++                && accountsHost.equalsIgnoreCase(url.getHost());
++    }
++
++    /**
++     * The key kept for "No thanks": hex SHA-256 of the per-install salt and the identity id, so the
++     * id itself is never stored and the prefs can't be matched across installs.
++     */
++    public static String declinedKey(String identityId, byte[] salt) {
++        try {
++            MessageDigest digest = MessageDigest.getInstance("SHA-256");
++            digest.update(salt);
++            digest.update(identityId.getBytes(StandardCharsets.UTF_8));
++            StringBuilder hex = new StringBuilder();
++            for (byte b : digest.digest()) hex.append(String.format("%02x", b & 0xff));
++            return hex.toString();
++        } catch (NoSuchAlgorithmException e) {
++            throw new IllegalStateException(e);
++        }
++    }
++
++    /** The sheet's title: the name, else the email, else the generic question. */
++    public static String title(Resources res, @Nullable String name, @Nullable String email) {
++        if (!TextUtils.isEmpty(name)) {
++            return res.getString(R.string.tark_zynclave_offer_title, name);
++        }
++        if (!TextUtils.isEmpty(email)) {
++            return res.getString(R.string.tark_zynclave_offer_title, email);
++        }
++        return res.getString(R.string.tark_zynclave_offer_title_generic);
++    }
++
++    /** A main-frame navigation to a new document started: the wait ends. */
++    public void onNavigationStarted() {
++        cancelWait();
++    }
++
++    /** A main-frame redirect: a hop through the accounts host marks the tab too. */
++    public void onNavigationRedirected(GURL url) {
++        if (isAccountsPage(url, mAccountsHost)) mMarked = true;
++    }
++
++    /** A committed main-frame navigation: on the accounts host, it marks the tab. */
++    public void onNavigationCommitted(GURL url) {
++        cancelWait();
++        if (isAccountsPage(url, mAccountsHost)) mMarked = true;
++    }
++
++    /**
++     * The page {@code url} finished loading: a marked tab checks once if it stays idle for {@link
++     * #IDLE_MS}, unless the page is a sign-in screen (a later page then starts the wait).
++     */
++    public void onLoadFinishedIdle(GURL url) {
++        cancelWait();
++        if (mOffTheRecord || mDestroyed || !mMarked || mInFlight) return;
++        if (isSignInScreen(url, mAccountsHost)) return;
++        if (mAccount.isSignedInOrSigningIn()) return;
++        mWaiting = true;
++        mHandler.postDelayed(mCheck, IDLE_MS);
++    }
++
++    /** The tab closed. */
++    public void destroy() {
++        mDestroyed = true;
++        cancelWait();
++    }
++
++    private void cancelWait() {
++        if (!mWaiting) return;
++        mWaiting = false;
++        mHandler.removeCallbacks(mCheck);
++    }
++
++    private void check() {
++        mWaiting = false;
++        if (mOffTheRecord || mDestroyed || !mMarked || mInFlight) return;
++        if (mAccount.isSignedInOrSigningIn()) return;
++        mMarked = false;
++        mInFlight = true;
++        mFetcher.fetch(
++                session -> {
++                    ThreadUtils.assertOnUiThread();
++                    mInFlight = false;
++                    if (session != null && !mDestroyed) offer(session);
++                });
++    }
++
++    private void offer(ZynclaveWhoami.Session session) {
++        if (mAccount.isSignedInOrSigningIn()) return;
++        String key = declinedKey(session.id, mStore.salt());
++        if (sShownThisProcess.contains(key) || mStore.isDeclined(key)) return;
++        boolean shown =
++                mPresenter.show(
++                        session.name,
++                        session.email,
++                        new Choice() {
++                            @Override
++                            public void onSignIn(Activity activity) {
++                                mAccount.signIn(activity, /* promptNone= */ true);
++                            }
++
++                            @Override
++                            public void onNoThanks() {
++                                mStore.decline(key);
++                            }
++                        });
++        if (shown) sShownThisProcess.add(key);
++    }
++
++    @VisibleForTesting
++    static void resetShownForTesting() {
++        sShownThisProcess.clear();
++        ResettersForTesting.register(sShownThisProcess::clear);
++    }
++
++    /** The tab's events, as the policy above takes them. */
++    private final class Observer implements TabObserver {
++        @Override
++        public void onDidStartNavigationInPrimaryMainFrame(Tab tab, NavigationHandle navigation) {
++            if (!navigation.isSameDocument()) onNavigationStarted();
++        }
++
++        @Override
++        public void onDidRedirectNavigation(Tab tab, NavigationHandle navigation) {
++            if (navigation.isInPrimaryMainFrame()) onNavigationRedirected(navigation.getUrl());
++        }
++
++        @Override
++        public void onDidFinishNavigationInPrimaryMainFrame(Tab tab, NavigationHandle navigation) {
++            if (!navigation.hasCommitted()) return;
++            onNavigationCommitted(navigation.getUrl());
++            // A same-document navigation (the accounts pages are a single-page app) loads
++            // nothing more: the page is already there.
++            if (navigation.isSameDocument()) onLoadFinishedIdle(navigation.getUrl());
++        }
++
++        @Override
++        public void onPageLoadFinished(Tab tab, GURL url) {
++            onLoadFinishedIdle(url);
++        }
++
++        @Override
++        public void onDestroyed(Tab tab) {
++            destroy();
++            tab.removeObserver(this);
++        }
++    }
++
++    private static final class RealAccount implements Account {
++        @Override
++        public boolean isSignedInOrSigningIn() {
++            ZynclaveAccount.State state = ZynclaveAccount.get().state();
++            return state == ZynclaveAccount.State.SIGNED_IN
++                    || state == ZynclaveAccount.State.SIGNING_IN;
++        }
++
++        @Override
++        public void signIn(Activity activity, boolean promptNone) {
++            ZynclaveAccount.get().signIn(activity, promptNone);
++        }
++    }
++
++    /** ChromeSharedPreferences: tark.zynclave.salt and tark.zynclave.declined (hashes only). */
++    @VisibleForTesting
++    static final class PrefsStore implements Store {
++        private static final int SALT_BYTES = 16;
++
++        @Override
++        public byte[] salt() {
++            SharedPreferencesManager prefs = ChromeSharedPreferences.getInstance();
++            @Nullable String saved = prefs.readString(ChromePreferenceKeys.TARK_ZYNCLAVE_SALT, null);
++            if (saved != null) {
++                try {
++                    byte[] salt = Base64.decode(saved, Base64.NO_WRAP);
++                    if (salt.length == SALT_BYTES) return salt;
++                } catch (IllegalArgumentException e) {
++                    // A damaged salt is replaced; earlier No thanks answers no longer match.
++                }
++            }
++            byte[] salt = new byte[SALT_BYTES];
++            new SecureRandom().nextBytes(salt);
++            prefs.writeString(
++                    ChromePreferenceKeys.TARK_ZYNCLAVE_SALT,
++                    Base64.encodeToString(salt, Base64.NO_WRAP));
++            return salt;
++        }
++
++        @Override
++        public boolean isDeclined(String key) {
++            return ChromeSharedPreferences.getInstance()
++                    .readStringSet(ChromePreferenceKeys.TARK_ZYNCLAVE_DECLINED)
++                    .contains(key);
++        }
++
++        @Override
++        public void decline(String key) {
++            ChromeSharedPreferences.getInstance()
++                    .addToStringSet(ChromePreferenceKeys.TARK_ZYNCLAVE_DECLINED, key);
++        }
++    }
++}
+diff --color '--color=never' -ruN a/chrome/android/junit/BUILD.gn b/chrome/android/junit/BUILD.gn
+--- a/chrome/android/junit/BUILD.gn	2026-10-26 03:42:54.136975428 +0530
++++ b/chrome/android/junit/BUILD.gn	2026-10-26 03:48:45.493383742 +0530
+@@ -1406,10 +1406,12 @@
+       "src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAccountTest.java",
+       "src/org/chromium/chrome/browser/tark/zynclave/ZynclaveNoTokenLogsTest.java",
+       "src/org/chromium/chrome/browser/tark/zynclave/ZynclaveRedirectTest.java",
++      "src/org/chromium/chrome/browser/tark/zynclave/ZynclaveWebOfferTest.java",
+     ]
+ 
+     deps = [
+       ":chrome_junit_tests_helper",
++      "//chrome/browser/tark_zynclave/android:java",
+       "//chrome/browser/ui/messages/android:java",
+       "//third_party/appauth:appauth_java",
+     ]
+diff --color '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveWebOfferTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveWebOfferTest.java
+--- a/chrome/android/junit/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveWebOfferTest.java	1970-01-01 05:30:00.000000000 +0530
++++ b/chrome/android/junit/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveWebOfferTest.java	2026-10-26 03:50:36.865662787 +0530
+@@ -0,0 +1,424 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++package org.chromium.chrome.browser.tark.zynclave;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.assertNotEquals;
++import static org.junit.Assert.assertSame;
++import static org.junit.Assert.assertTrue;
++
++import android.app.Activity;
++import android.content.SharedPreferences;
++
++import org.junit.Before;
++import org.junit.Test;
++import org.junit.runner.RunWith;
++import org.robolectric.Robolectric;
++import org.robolectric.RuntimeEnvironment;
++import org.robolectric.annotation.Config;
++import org.robolectric.shadows.ShadowLooper;
++
++import org.chromium.base.ContextUtils;
++import org.chromium.base.test.BaseRobolectricTestRunner;
++import org.chromium.build.annotations.Nullable;
++import org.chromium.chrome.browser.tark_zynclave.ZynclaveWhoami;
++import org.chromium.chrome.browser.tark_zynclave.ZynclaveWhoami.Session;
++import org.chromium.url.GURL;
++
++import java.nio.charset.StandardCharsets;
++import java.util.ArrayList;
++import java.util.HashSet;
++import java.util.List;
++import java.util.Map;
++import java.util.Set;
++import java.util.concurrent.TimeUnit;
++
++/** "Sign in to Tark as X?": when Tark checks the web session, and what the sheet does. */
++@RunWith(BaseRobolectricTestRunner.class)
++@Config(qualifiers = "en-rUS")
++public class ZynclaveWebOfferTest {
++    private static final String HOST = "accounts.zynclave.com";
++    private static final String ID = "4b7e3c1a-identity-SOORAJ";
++    private static final GURL SHODHYA = new GURL("https://shodhya.com/");
++    private static final GURL LOGIN = new GURL("https://accounts.zynclave.com/login?flow=1");
++    private static final GURL OAUTH_CONTINUE =
++            new GURL("https://accounts.zynclave.com/oauth/continue?login_challenge=2");
++    private static final GURL ACCOUNTS_HOME = new GURL("https://accounts.zynclave.com/settings");
++
++    private final FakeFetcher mFetcher = new FakeFetcher();
++    private final FakePresenter mPresenter = new FakePresenter();
++    private final FakeAccount mAccount = new FakeAccount();
++    private final FakeStore mStore = new FakeStore();
++
++    @Before
++    public void setUp() {
++        ZynclaveWebOffer.resetShownForTesting();
++    }
++
++    private ZynclaveWebOffer newOffer() {
++        return newOffer(false, mStore);
++    }
++
++    private ZynclaveWebOffer newOffer(boolean offTheRecord, ZynclaveWebOffer.Store store) {
++        return new ZynclaveWebOffer(offTheRecord, HOST, mFetcher, mPresenter, mAccount, store);
++    }
++
++    /** A page committed and finished loading. */
++    private static void visit(ZynclaveWebOffer offer, GURL url) {
++        offer.onNavigationStarted();
++        offer.onNavigationCommitted(url);
++        offer.onLoadFinishedIdle(url);
++    }
++
++    private static void idle(long ms) {
++        ShadowLooper.idleMainLooper(ms, TimeUnit.MILLISECONDS);
++    }
++
++    /** Through the accounts host and back to Shodhya, then 3 s on Shodhya. */
++    private void roundTrip(ZynclaveWebOffer offer) {
++        visit(offer, SHODHYA);
++        visit(offer, LOGIN);
++        visit(offer, OAUTH_CONTINUE);
++        visit(offer, SHODHYA);
++        idle(ZynclaveWebOffer.IDLE_MS);
++    }
++
++    @Test
++    public void testIncognitoNeverFetches() {
++        assertFalse(ZynclaveWebOffer.shouldAttach(/* offTheRecord= */ true));
++        assertTrue(ZynclaveWebOffer.shouldAttach(/* offTheRecord= */ false));
++
++        // Even driven directly, as if an observer were there.
++        ZynclaveWebOffer offer = newOffer(/* offTheRecord= */ true, mStore);
++        roundTrip(offer);
++        visit(offer, ACCOUNTS_HOME);
++        idle(10_000);
++        assertEquals(0, mFetcher.calls.size());
++        assertEquals(0, mPresenter.shown.size());
++    }
++
++    @Test
++    public void testShodhyaRoundTripPromptsOnce() {
++        ZynclaveWebOffer offer = newOffer();
++        visit(offer, SHODHYA);
++        visit(offer, LOGIN);
++        visit(offer, OAUTH_CONTINUE);
++        visit(offer, SHODHYA);
++        idle(ZynclaveWebOffer.IDLE_MS - 100);
++        assertEquals(0, mFetcher.calls.size());
++        idle(100);
++        assertEquals(1, mFetcher.calls.size());
++
++        mFetcher.answer(0, new Session(ID, "Sooraj Pandey", "s@example.com"));
++        assertEquals(1, mPresenter.shown.size());
++        assertEquals("Sign in to Tark as Sooraj Pandey?", mPresenter.shown.get(0).title);
++
++        // The mark is gone: another page on Shodhya asks nothing.
++        visit(offer, SHODHYA);
++        idle(10_000);
++        assertEquals(1, mFetcher.calls.size());
++
++        // Once per account per process: another round trip asks, but shows nothing.
++        roundTrip(offer);
++        assertEquals(2, mFetcher.calls.size());
++        mFetcher.answer(1, new Session(ID, "Sooraj Pandey", "s@example.com"));
++        assertEquals(1, mPresenter.shown.size());
++    }
++
++    @Test
++    public void testSignInScreenNoFetch() {
++        ZynclaveWebOffer offer = newOffer();
++        visit(offer, SHODHYA);
++        visit(offer, LOGIN);
++        idle(10_000);
++        visit(offer, new GURL("https://accounts.zynclave.com/registration"));
++        visit(offer, new GURL("https://accounts.zynclave.com/oauth/consent"));
++        idle(10_000);
++        assertEquals(0, mFetcher.calls.size());
++
++        assertTrue(ZynclaveWebOffer.isSignInScreen(LOGIN, HOST));
++        assertTrue(ZynclaveWebOffer.isSignInScreen(OAUTH_CONTINUE, HOST));
++        assertTrue(
++                ZynclaveWebOffer.isSignInScreen(
++                        new GURL("https://accounts.zynclave.com/recovery"), HOST));
++        assertTrue(
++                ZynclaveWebOffer.isSignInScreen(
++                        new GURL("https://accounts.zynclave.com/verification"), HOST));
++        assertTrue(
++                ZynclaveWebOffer.isSignInScreen(
++                        new GURL("https://accounts.zynclave.com/error?id=3"), HOST));
++        assertFalse(ZynclaveWebOffer.isSignInScreen(ACCOUNTS_HOME, HOST));
++        assertFalse(
++                ZynclaveWebOffer.isSignInScreen(
++                        new GURL("https://accounts.zynclave.com/loginhelp"), HOST));
++        assertFalse(ZynclaveWebOffer.isSignInScreen(new GURL("https://shodhya.com/login"), HOST));
++
++        // The accounts home page after signing in does ask.
++        visit(offer, ACCOUNTS_HOME);
++        idle(ZynclaveWebOffer.IDLE_MS);
++        assertEquals(1, mFetcher.calls.size());
++    }
++
++    @Test
++    public void testNoAccountsVisitNoFetch() {
++        ZynclaveWebOffer offer = newOffer();
++        visit(offer, SHODHYA);
++        idle(10_000);
++        visit(offer, new GURL("https://example.com/accounts.zynclave.com"));
++        idle(10_000);
++        visit(offer, new GURL("http://accounts.zynclave.com/settings"));
++        visit(offer, SHODHYA);
++        idle(10_000);
++        assertEquals(0, mFetcher.calls.size());
++    }
++
++    @Test
++    public void testNavigationCancelsTimer() {
++        ZynclaveWebOffer offer = newOffer();
++        visit(offer, LOGIN);
++        visit(offer, SHODHYA);
++        idle(2000);
++        offer.onNavigationStarted();
++        idle(10_000);
++        assertEquals(0, mFetcher.calls.size());
++
++        // A closed tab never asks.
++        visit(offer, SHODHYA);
++        offer.destroy();
++        idle(10_000);
++        assertEquals(0, mFetcher.calls.size());
++
++        // The mark survives a cancelled wait: the next settled page asks.
++        ZynclaveWebOffer other = newOffer();
++        visit(other, LOGIN);
++        visit(other, SHODHYA);
++        idle(1000);
++        visit(other, new GURL("https://shodhya.com/search?q=tark"));
++        idle(ZynclaveWebOffer.IDLE_MS - 1);
++        assertEquals(0, mFetcher.calls.size());
++        idle(1);
++        assertEquals(1, mFetcher.calls.size());
++    }
++
++    @Test
++    public void testRedirectThroughAccountsMarks() {
++        ZynclaveWebOffer offer = newOffer();
++        offer.onNavigationStarted();
++        offer.onNavigationRedirected(new GURL("https://accounts.zynclave.com/oauth/continue"));
++        offer.onNavigationCommitted(SHODHYA);
++        offer.onLoadFinishedIdle(SHODHYA);
++        idle(ZynclaveWebOffer.IDLE_MS);
++        assertEquals(1, mFetcher.calls.size());
++    }
++
++    @Test
++    public void testOneCheckInFlight() {
++        ZynclaveWebOffer offer = newOffer();
++        roundTrip(offer);
++        assertEquals(1, mFetcher.calls.size());
++        roundTrip(offer);
++        assertEquals(1, mFetcher.calls.size());
++    }
++
++    @Test
++    public void testSignedInNoFetch() {
++        mAccount.signedInOrSigningIn = true;
++        ZynclaveWebOffer offer = newOffer();
++        roundTrip(offer);
++        idle(10_000);
++        assertEquals(0, mFetcher.calls.size());
++
++        // Signed in while the check was out: no sheet.
++        mAccount.signedInOrSigningIn = false;
++        roundTrip(offer);
++        assertEquals(1, mFetcher.calls.size());
++        mAccount.signedInOrSigningIn = true;
++        mFetcher.answer(0, new Session(ID, "Sooraj Pandey", ""));
++        assertEquals(0, mPresenter.shown.size());
++    }
++
++    @Test
++    public void test401Nothing() {
++        ZynclaveWebOffer offer = newOffer();
++        roundTrip(offer);
++        assertEquals(1, mFetcher.calls.size());
++        mFetcher.answer(0, null);
++        assertEquals(0, mPresenter.shown.size());
++        assertTrue(mStore.declined.isEmpty());
++    }
++
++    @Test
++    public void testDeclinedAccountNoSheet() {
++        ZynclaveWebOffer offer = newOffer();
++        roundTrip(offer);
++        mFetcher.answer(0, new Session(ID, "Sooraj Pandey", ""));
++        assertEquals(1, mPresenter.shown.size());
++        mPresenter.shown.get(0).choice.onNoThanks();
++        assertEquals(1, mStore.declined.size());
++
++        // A later run (a new process): the same account is asked about but not offered.
++        ZynclaveWebOffer.resetShownForTesting();
++        ZynclaveWebOffer next = newOffer();
++        roundTrip(next);
++        assertEquals(2, mFetcher.calls.size());
++        mFetcher.answer(1, new Session(ID, "Sooraj Pandey", ""));
++        assertEquals(1, mPresenter.shown.size());
++
++        // Another account is.
++        roundTrip(next);
++        mFetcher.answer(2, new Session("other-identity", "Asha", ""));
++        assertEquals(2, mPresenter.shown.size());
++        assertEquals("Sign in to Tark as Asha?", mPresenter.shown.get(1).title);
++    }
++
++    @Test
++    public void testPhoneOnlyTitle() {
++        ZynclaveWebOffer offer = newOffer();
++        roundTrip(offer);
++        mFetcher.answer(0, new Session(ID, "", ""));
++        assertEquals(1, mPresenter.shown.size());
++        assertEquals(
++                "Sign in to Tark with your Zynclave account?", mPresenter.shown.get(0).title);
++
++        assertEquals(
++                "Sign in to Tark as s@example.com?",
++                ZynclaveWebOffer.title(
++                        RuntimeEnvironment.getApplication().getResources(), "", "s@example.com"));
++    }
++
++    @Test
++    public void testSignInTapRunsPromptNone() {
++        ZynclaveWebOffer offer = newOffer();
++        roundTrip(offer);
++        mFetcher.answer(0, new Session(ID, "Sooraj Pandey", ""));
++        Activity activity = Robolectric.buildActivity(Activity.class).get();
++        assertEquals(0, mAccount.signIns.size());
++        mPresenter.shown.get(0).choice.onSignIn(activity);
++        assertEquals(1, mAccount.signIns.size());
++        assertSame(activity, mAccount.signInActivity);
++        assertTrue(mAccount.signIns.get(0));
++        assertTrue(mStore.declined.isEmpty());
++    }
++
++    @Test
++    public void testDeclinedKeySalted() {
++        byte[] saltA = "0123456789abcdef".getBytes(StandardCharsets.US_ASCII);
++        byte[] saltB = "fedcba9876543210".getBytes(StandardCharsets.US_ASCII);
++        String a = ZynclaveWebOffer.declinedKey(ID, saltA);
++        String b = ZynclaveWebOffer.declinedKey(ID, saltB);
++        assertNotEquals(a, b);
++        assertEquals(a, ZynclaveWebOffer.declinedKey(ID, saltA));
++        assertEquals(64, a.length());
++        assertTrue(a.matches("[0-9a-f]{64}"));
++        assertFalse(a.contains(ID));
++        assertFalse(b.contains(ID));
++        assertNotEquals(a, ZynclaveWebOffer.declinedKey("other-identity", saltA));
++    }
++
++    @Test
++    public void testNoIdentityIdInPrefs() {
++        ZynclaveWebOffer.PrefsStore store = new ZynclaveWebOffer.PrefsStore();
++        ZynclaveWebOffer offer = newOffer(false, store);
++        roundTrip(offer);
++        mFetcher.answer(0, new Session(ID, "Sooraj Pandey", "s@example.com"));
++        mPresenter.shown.get(0).choice.onNoThanks();
++
++        byte[] salt = store.salt();
++        assertEquals(16, salt.length);
++        // The salt is made once and kept.
++        assertEquals(
++                new String(salt, StandardCharsets.ISO_8859_1),
++                new String(store.salt(), StandardCharsets.ISO_8859_1));
++        assertTrue(store.isDeclined(ZynclaveWebOffer.declinedKey(ID, salt)));
++
++        SharedPreferences prefs = ContextUtils.getAppSharedPreferences();
++        boolean sawDeclined = false;
++        for (Map.Entry<String, ?> entry : prefs.getAll().entrySet()) {
++            String value = String.valueOf(entry.getValue());
++            assertFalse(entry.getKey(), value.contains(ID));
++            assertFalse(entry.getKey(), value.contains("Sooraj"));
++            assertFalse(entry.getKey(), value.contains("s@example.com"));
++            if (entry.getKey().equals("tark.zynclave.declined")) sawDeclined = true;
++        }
++        assertTrue(sawDeclined);
++    }
++
++    private static final class FakeFetcher implements ZynclaveWebOffer.Fetcher {
++        final List<ZynclaveWhoami.Callback> calls = new ArrayList<>();
++
++        @Override
++        public void fetch(ZynclaveWhoami.Callback callback) {
++            calls.add(callback);
++        }
++
++        void answer(int call, @Nullable Session session) {
++            calls.get(call).onResult(session);
++        }
++    }
++
++    private static final class Shown {
++        final String title;
++        final ZynclaveWebOffer.Choice choice;
++
++        Shown(String title, ZynclaveWebOffer.Choice choice) {
++            this.title = title;
++            this.choice = choice;
++        }
++    }
++
++    private static final class FakePresenter implements ZynclaveWebOffer.Presenter {
++        final List<Shown> shown = new ArrayList<>();
++
++        @Override
++        public boolean show(
++                @Nullable String name, @Nullable String email, ZynclaveWebOffer.Choice choice) {
++            shown.add(
++                    new Shown(
++                            ZynclaveWebOffer.title(
++                                    RuntimeEnvironment.getApplication().getResources(),
++                                    name,
++                                    email),
++                            choice));
++            return true;
++        }
++    }
++
++    private static final class FakeAccount implements ZynclaveWebOffer.Account {
++        boolean signedInOrSigningIn;
++        final List<Boolean> signIns = new ArrayList<>();
++        @Nullable Activity signInActivity;
++
++        @Override
++        public boolean isSignedInOrSigningIn() {
++            return signedInOrSigningIn;
++        }
++
++        @Override
++        public void signIn(Activity activity, boolean promptNone) {
++            signInActivity = activity;
++            signIns.add(promptNone);
++        }
++    }
++
++    private static final class FakeStore implements ZynclaveWebOffer.Store {
++        final Set<String> declined = new HashSet<>();
++
++        @Override
++        public byte[] salt() {
++            return "0123456789abcdef".getBytes(StandardCharsets.US_ASCII);
++        }
++
++        @Override
++        public boolean isDeclined(String key) {
++            return declined.contains(key);
++        }
++
++        @Override
++        public void decline(String key) {
++            declined.add(key);
++        }
++    }
++}
+diff --color '--color=never' -ruN a/chrome/browser/BUILD.gn b/chrome/browser/BUILD.gn
+--- a/chrome/browser/BUILD.gn	2026-10-26 03:42:57.309530412 +0530
++++ b/chrome/browser/BUILD.gn	2026-10-26 03:46:56.406711975 +0530
+@@ -1675,6 +1675,12 @@
+       "tark_captions_android/caption_downloads.h",
+       "tark_captions_android/tark_captions_tab.cc",
+       "tark_captions_android/tark_captions_tab.h",
++
++      # Sign in with Zynclave: the whoami check behind "Sign in to Tark as
++      # X?".
++      "tark_zynclave/whoami_fetcher.cc",
++      "tark_zynclave/whoami_fetcher.h",
++      "tark_zynclave/whoami_fetcher_android.cc",
+     ]
+     deps += [
+       "//chrome/browser/omaha/android:jni_headers",
+@@ -1685,6 +1691,8 @@
+       "//chrome/browser/tark_update:index",
+       "//chrome/browser/tark_xlit:files",
+       "//chrome/browser/tark_xlit/android:jni_headers",
++      "//chrome/browser/tark_zynclave:whoami_response",
++      "//chrome/browser/tark_zynclave/android:jni_headers",
+     ]
+   }
+ 
+diff --color '--color=never' -ruN a/chrome/browser/preferences/android/java/src/org/chromium/chrome/browser/preferences/ChromePreferenceKeys.java b/chrome/browser/preferences/android/java/src/org/chromium/chrome/browser/preferences/ChromePreferenceKeys.java
+--- a/chrome/browser/preferences/android/java/src/org/chromium/chrome/browser/preferences/ChromePreferenceKeys.java	2026-10-26 03:42:59.007826877 +0530
++++ b/chrome/browser/preferences/android/java/src/org/chromium/chrome/browser/preferences/ChromePreferenceKeys.java	2026-10-26 03:48:52.860532739 +0530
+@@ -1055,6 +1055,11 @@
+     public static final String TAB_OR_GROUP_TEARING_MAX_INSTANCES_FAILURE_COUNT =
+             "Chrome.TabOrGroupTearing.MaxInstancesFailureCount";
+ 
++    // Tark: Sign in with Zynclave's declined web accounts, as salted SHA-256 hashes of the
++    // identity id (never the id), and the per-install salt (16 bytes, base64).
++    public static final String TARK_ZYNCLAVE_DECLINED = "tark.zynclave.declined";
++    public static final String TARK_ZYNCLAVE_SALT = "tark.zynclave.salt";
++
+     // Whether the Tips Notifications Opt In promo has been accepted.
+     public static final String TIPS_NOTIFICATIONS_OPT_IN_PROMO_ACCEPTED =
+             "Chrome.TipsNotifications.OptInAccepted";
+diff --color '--color=never' -ruN a/chrome/browser/preferences/android/java/src/org/chromium/chrome/browser/preferences/LegacyChromePreferenceKeys.java b/chrome/browser/preferences/android/java/src/org/chromium/chrome/browser/preferences/LegacyChromePreferenceKeys.java
+--- a/chrome/browser/preferences/android/java/src/org/chromium/chrome/browser/preferences/LegacyChromePreferenceKeys.java	2026-10-26 03:42:59.532612906 +0530
++++ b/chrome/browser/preferences/android/java/src/org/chromium/chrome/browser/preferences/LegacyChromePreferenceKeys.java	2026-10-26 03:48:45.494232045 +0530
+@@ -38,6 +38,9 @@
+                 ChromePreferenceKeys.CONTEXTUAL_SEARCH_TAP_TRIGGERED_PROMO_COUNT,
+                 ChromePreferenceKeys.CRASH_UPLOAD_FAILURE_BROWSER,
+                 ChromePreferenceKeys.CRASH_UPLOAD_FAILURE_GPU,
++                // Tark's keys keep Tark's "tark." naming (Sign in with Zynclave).
++                ChromePreferenceKeys.TARK_ZYNCLAVE_DECLINED,
++                ChromePreferenceKeys.TARK_ZYNCLAVE_SALT,
+                 ChromePreferenceKeys.CRASH_UPLOAD_FAILURE_OTHER,
+                 ChromePreferenceKeys.CRASH_UPLOAD_FAILURE_RENDERER,
+                 ChromePreferenceKeys.CRASH_UPLOAD_SUCCESS_BROWSER,
+diff --color '--color=never' -ruN a/chrome/browser/tark_zynclave/BUILD.gn b/chrome/browser/tark_zynclave/BUILD.gn
+--- a/chrome/browser/tark_zynclave/BUILD.gn	1970-01-01 05:30:00.000000000 +0530
++++ b/chrome/browser/tark_zynclave/BUILD.gn	2026-10-26 03:45:41.428355943 +0530
+@@ -0,0 +1,15 @@
++# Copyright 2026 The Tark Authors
++# Use of this source code is governed by a BSD-style license that can be
++# found in the LICENSE file.
++#
++# Sign in with Zynclave ("Sign in to Tark as X?"): the whoami check builds as
++# part of //chrome/browser on Android (whoami_fetcher*.cc); reading its answer
++# has no browser dependencies and is kept here.
++
++static_library("whoami_response") {
++  sources = [
++    "whoami_response.cc",
++    "whoami_response.h",
++  ]
++  deps = [ "//base" ]
++}
+diff --color '--color=never' -ruN a/chrome/browser/tark_zynclave/DEPS b/chrome/browser/tark_zynclave/DEPS
+--- a/chrome/browser/tark_zynclave/DEPS	1970-01-01 05:30:00.000000000 +0530
++++ b/chrome/browser/tark_zynclave/DEPS	2026-10-26 03:45:41.430497221 +0530
+@@ -0,0 +1,3 @@
++include_rules = [
++  "+services/network/public",
++]
+diff --color '--color=never' -ruN a/chrome/browser/tark_zynclave/android/BUILD.gn b/chrome/browser/tark_zynclave/android/BUILD.gn
+--- a/chrome/browser/tark_zynclave/android/BUILD.gn	1970-01-01 05:30:00.000000000 +0530
++++ b/chrome/browser/tark_zynclave/android/BUILD.gn	2026-10-26 03:46:47.262451642 +0530
+@@ -0,0 +1,23 @@
++# Copyright 2026 The Tark Authors
++# Use of this source code is governed by a BSD-style license that can be
++# found in the LICENSE file.
++
++import("//build/config/android/rules.gni")
++import("//third_party/jni_zero/jni_zero.gni")
++
++# Sign in with Zynclave: chrome_java's ZynclaveWebOffer asks
++# //chrome/browser/tark_zynclave's whoami check through ZynclaveWhoami.
++android_library("java") {
++  srcjar_deps = [ ":jni_headers" ]
++  sources = [ "java/src/org/chromium/chrome/browser/tark_zynclave/ZynclaveWhoami.java" ]
++  deps = [
++    "//base:base_java",
++    "//build/android:build_java",
++    "//chrome/browser/profiles/android:java",
++    "//third_party/jni_zero:jni_zero_java",
++  ]
++}
++
++generate_jni("jni_headers") {
++  sources = [ "java/src/org/chromium/chrome/browser/tark_zynclave/ZynclaveWhoami.java" ]
++}
+diff --color '--color=never' -ruN a/chrome/browser/tark_zynclave/android/java/src/org/chromium/chrome/browser/tark_zynclave/ZynclaveWhoami.java b/chrome/browser/tark_zynclave/android/java/src/org/chromium/chrome/browser/tark_zynclave/ZynclaveWhoami.java
+--- a/chrome/browser/tark_zynclave/android/java/src/org/chromium/chrome/browser/tark_zynclave/ZynclaveWhoami.java	1970-01-01 05:30:00.000000000 +0530
++++ b/chrome/browser/tark_zynclave/android/java/src/org/chromium/chrome/browser/tark_zynclave/ZynclaveWhoami.java	2026-10-26 03:46:47.264903008 +0530
+@@ -0,0 +1,78 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++package org.chromium.chrome.browser.tark_zynclave;
++
++import org.jni_zero.CalledByNative;
++import org.jni_zero.JNINamespace;
++import org.jni_zero.JniType;
++import org.jni_zero.NativeMethods;
++
++import org.chromium.base.ThreadUtils;
++import org.chromium.build.annotations.NullMarked;
++import org.chromium.build.annotations.Nullable;
++import org.chromium.chrome.browser.profiles.Profile;
++
++/**
++ * Sign in with Zynclave: whether the Zynclave Account has a web session in a profile, from the
++ * native GET /sessions/whoami in that profile's own network context (the browser sends its
++ * cookies; Tark never reads them). An off-the-record profile makes no request.
++ */
++@NullMarked
++@JNINamespace("tark_zynclave")
++public final class ZynclaveWhoami {
++    /** The web session's account, for the offer only: never stored or logged. */
++    public static final class Session {
++        public final String id;
++        public final String name;
++        public final String email;
++
++        public Session(String id, String name, String email) {
++            this.id = id;
++            this.name = name;
++            this.email = email;
++        }
++    }
++
++    /** Called on the UI thread with the session, or null when there is none. */
++    public interface Callback {
++        void onResult(@Nullable Session session);
++    }
++
++    private final Callback mCallback;
++
++    private ZynclaveWhoami(Callback callback) {
++        mCallback = callback;
++    }
++
++    /**
++     * Asks once. {@code accountsOrigin} is https://host of the Zynclave Account's pages. An
++     * off-the-record profile answers null at once, with no request (native checks again).
++     */
++    public static void fetch(Profile profile, String accountsOrigin, Callback callback) {
++        ThreadUtils.assertOnUiThread();
++        if (profile.isOffTheRecord()) {
++            callback.onResult(null);
++            return;
++        }
++        ZynclaveWhoamiJni.get().fetch(profile, accountsOrigin, new ZynclaveWhoami(callback));
++    }
++
++    @CalledByNative
++    private void onResult(
++            boolean signedIn,
++            @JniType("std::string") String id,
++            @JniType("std::string") String name,
++            @JniType("std::string") String email) {
++        mCallback.onResult(signedIn ? new Session(id, name, email) : null);
++    }
++
++    @NativeMethods
++    interface Natives {
++        void fetch(
++                @JniType("Profile*") Profile profile,
++                @JniType("std::string") String accountsOrigin,
++                ZynclaveWhoami request);
++    }
++}
+diff --color '--color=never' -ruN a/chrome/browser/tark_zynclave/whoami_fetcher.cc b/chrome/browser/tark_zynclave/whoami_fetcher.cc
+--- a/chrome/browser/tark_zynclave/whoami_fetcher.cc	1970-01-01 05:30:00.000000000 +0530
++++ b/chrome/browser/tark_zynclave/whoami_fetcher.cc	2026-10-26 03:46:28.509287032 +0530
+@@ -0,0 +1,125 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/tark_zynclave/whoami_fetcher.h"
++
++#include <memory>
++#include <optional>
++#include <string>
++#include <utility>
++
++#include "base/functional/bind.h"
++#include "base/functional/callback.h"
++#include "base/location.h"
++#include "base/task/sequenced_task_runner.h"
++#include "base/time/time.h"
++#include "chrome/browser/profiles/profile.h"
++#include "content/public/browser/browser_thread.h"
++#include "content/public/browser/storage_partition.h"
++#include "net/base/isolation_info.h"
++#include "net/cookies/site_for_cookies.h"
++#include "net/http/http_request_headers.h"
++#include "net/http/http_response_headers.h"
++#include "net/traffic_annotation/network_traffic_annotation.h"
++#include "services/network/public/cpp/resource_request.h"
++#include "services/network/public/cpp/shared_url_loader_factory.h"
++#include "services/network/public/cpp/simple_url_loader.h"
++#include "services/network/public/mojom/fetch_api.mojom-shared.h"
++#include "services/network/public/mojom/url_response_head.mojom.h"
++#include "url/gurl.h"
++#include "url/origin.h"
++#include "url/url_constants.h"
++
++namespace tark_zynclave {
++
++namespace {
++
++constexpr base::TimeDelta kTimeout = base::Seconds(10);
++constexpr char kWhoamiPath[] = "/sessions/whoami";
++
++constexpr net::NetworkTrafficAnnotationTag kTrafficAnnotation =
++    net::DefineNetworkTrafficAnnotation("tark_zynclave_whoami", R"(
++      semantics {
++        sender: "Tark: Sign in with Zynclave"
++        description:
++          "Asks the Zynclave Account whether the person is signed in to it on "
++          "the web in this profile, so that Tark can offer \"Sign in to Tark "
++          "as <name>?\". The name and email in the answer are shown on that "
++          "offer only; nothing is stored."
++        trigger: "Once, after a normal (not private) tab went through the "
++          "Zynclave Account's pages and then stayed on a page that is not a "
++          "sign-in screen for 3 seconds, while Tark is not signed in. Never "
++          "in private tabs, never polled."
++        data: "The profile's cookies for the Zynclave Account, sent by the "
++          "browser as for any request to that site."
++        destination: OTHER
++      }
++      policy {
++        cookies_allowed: YES
++        cookies_store: "user"
++        setting: "Choosing No thanks stops the offer for that account; "
++          "private tabs never make this request."
++        policy_exception_justification: "Tark has no enterprise policies."
++      })");
++
++void OnDownloaded(std::unique_ptr<network::SimpleURLLoader> loader,
++                  WhoamiCallback callback,
++                  std::optional<std::string> body) {
++  const network::mojom::URLResponseHead* head = loader->ResponseInfo();
++  const int status =
++      head && head->headers ? head->headers->response_code() : 0;
++  if (status != 200 || !body) {
++    std::move(callback).Run(WhoamiResult());
++    return;
++  }
++  std::move(callback).Run(ParseWhoami(*body));
++}
++
++}  // namespace
++
++void FetchWhoami(Profile* profile,
++                 const GURL& accounts_origin,
++                 WhoamiCallback callback) {
++  DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
++  // Private tabs: no request at all (handoff §2a). Java attaches no observer
++  // to them either; this is the second check.
++  if (!profile || profile->IsOffTheRecord() || !accounts_origin.is_valid() ||
++      !accounts_origin.SchemeIs(url::kHttpsScheme)) {
++    base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++        FROM_HERE, base::BindOnce(std::move(callback), WhoamiResult()));
++    return;
++  }
++  const url::Origin origin = url::Origin::Create(accounts_origin);
++  auto request = std::make_unique<network::ResourceRequest>();
++  request->url = origin.GetURL().Resolve(kWhoamiPath);
++  request->method = "GET";
++  // The browser attaches the profile's cookies for the accounts site, as a
++  // first-party request from that site would get them.
++  request->credentials_mode = network::mojom::CredentialsMode::kInclude;
++  request->site_for_cookies = net::SiteForCookies::FromOrigin(origin);
++  request->request_initiator = origin;
++  request->trusted_params = network::ResourceRequest::TrustedParams();
++  request->trusted_params->isolation_info = net::IsolationInfo::Create(
++      net::IsolationInfo::RequestType::kOther, origin, origin,
++      net::SiteForCookies::FromOrigin(origin));
++  // whoami answers in place; a redirect is not a session.
++  request->redirect_mode = network::mojom::RedirectMode::kError;
++  request->headers.SetHeader(net::HttpRequestHeaders::kAccept,
++                             "application/json");
++
++  std::unique_ptr<network::SimpleURLLoader> loader =
++      network::SimpleURLLoader::Create(std::move(request), kTrafficAnnotation);
++  loader->SetTimeoutDuration(kTimeout);
++  // A 401 is an answer, not an error to retry; its body is not read.
++  network::SimpleURLLoader* raw_loader = loader.get();
++  scoped_refptr<network::SharedURLLoaderFactory> factory =
++      profile->GetDefaultStoragePartition()
++          ->GetURLLoaderFactoryForBrowserProcess();
++  raw_loader->DownloadToString(
++      factory.get(),
++      base::BindOnce(&OnDownloaded, std::move(loader), std::move(callback)),
++      kMaxWhoamiBytes);
++}
++
++}  // namespace tark_zynclave
+diff --color '--color=never' -ruN a/chrome/browser/tark_zynclave/whoami_fetcher.h b/chrome/browser/tark_zynclave/whoami_fetcher.h
+--- a/chrome/browser/tark_zynclave/whoami_fetcher.h	1970-01-01 05:30:00.000000000 +0530
++++ b/chrome/browser/tark_zynclave/whoami_fetcher.h	2026-10-26 03:46:28.506868708 +0530
+@@ -0,0 +1,31 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_TARK_ZYNCLAVE_WHOAMI_FETCHER_H_
++#define CHROME_BROWSER_TARK_ZYNCLAVE_WHOAMI_FETCHER_H_
++
++#include "base/functional/callback_forward.h"
++#include "chrome/browser/tark_zynclave/whoami_response.h"
++
++class GURL;
++class Profile;
++
++namespace tark_zynclave {
++
++using WhoamiCallback = base::OnceCallback<void(WhoamiResult)>;
++
++// "Sign in to Tark as X?" (spec §5.6): whether the Zynclave Account has a web
++// session in `profile`, from GET <accounts_origin>/sessions/whoami in that
++// profile's own network context, so the browser sends the profile's cookies
++// (Tark never reads them). An off-the-record profile makes no request and
++// answers not signed in. Anything but a 200 with a session (401, an error, a
++// redirect, a timeout after 10 s, a body over 64 KB) is not signed in.
++// `callback` runs on the UI thread, never synchronously.
++void FetchWhoami(Profile* profile,
++                 const GURL& accounts_origin,
++                 WhoamiCallback callback);
++
++}  // namespace tark_zynclave
++
++#endif  // CHROME_BROWSER_TARK_ZYNCLAVE_WHOAMI_FETCHER_H_
+diff --color '--color=never' -ruN a/chrome/browser/tark_zynclave/whoami_fetcher_android.cc b/chrome/browser/tark_zynclave/whoami_fetcher_android.cc
+--- a/chrome/browser/tark_zynclave/whoami_fetcher_android.cc	1970-01-01 05:30:00.000000000 +0530
++++ b/chrome/browser/tark_zynclave/whoami_fetcher_android.cc	2026-10-26 03:46:47.259698773 +0530
+@@ -0,0 +1,40 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include <string>
++
++#include "base/android/jni_android.h"
++#include "base/android/scoped_java_ref.h"
++#include "base/functional/bind.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/tark_zynclave/whoami_fetcher.h"
++#include "url/gurl.h"
++
++// Must come after all headers that specialize FromJniType() / ToJniType().
++#include "chrome/browser/tark_zynclave/android/jni_headers/ZynclaveWhoami_jni.h"
++
++using base::android::JavaRef;
++using base::android::ScopedJavaGlobalRef;
++
++namespace tark_zynclave {
++
++namespace {
++
++void Reply(const ScopedJavaGlobalRef<jobject>& request, WhoamiResult result) {
++  Java_ZynclaveWhoami_onResult(base::android::AttachCurrentThread(), request,
++                               result.signed_in, result.id, result.name,
++                               result.email);
++}
++
++}  // namespace
++
++static void JNI_ZynclaveWhoami_Fetch(JNIEnv* env,
++                                     Profile* profile,
++                                     const std::string& accounts_origin,
++                                     const JavaRef<jobject>& request) {
++  FetchWhoami(profile, GURL(accounts_origin),
++              base::BindOnce(&Reply, ScopedJavaGlobalRef<jobject>(request)));
++}
++
++}  // namespace tark_zynclave
+diff --color '--color=never' -ruN a/chrome/browser/tark_zynclave/whoami_response.cc b/chrome/browser/tark_zynclave/whoami_response.cc
+--- a/chrome/browser/tark_zynclave/whoami_response.cc	1970-01-01 05:30:00.000000000 +0530
++++ b/chrome/browser/tark_zynclave/whoami_response.cc	2026-10-26 03:45:41.434627192 +0530
+@@ -0,0 +1,72 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/tark_zynclave/whoami_response.h"
++
++#include <optional>
++
++#include "base/json/json_reader.h"
++#include "base/strings/string_util.h"
++#include "base/values.h"
++
++namespace tark_zynclave {
++
++namespace {
++
++std::string NameFrom(const base::DictValue& traits) {
++  if (const std::string* name = traits.FindString("name")) {
++    return *name;
++  }
++  const base::DictValue* parts = traits.FindDict("name");
++  if (!parts) {
++    return std::string();
++  }
++  const std::string* first = parts->FindString("first");
++  const std::string* last = parts->FindString("last");
++  std::string name = first ? *first : std::string();
++  if (last && !last->empty()) {
++    if (!name.empty()) {
++      name += " ";
++    }
++    name += *last;
++  }
++  return name;
++}
++
++}  // namespace
++
++WhoamiResult ParseWhoami(std::string_view body) {
++  WhoamiResult result;
++  if (body.size() > kMaxWhoamiBytes) {
++    return result;
++  }
++  std::optional<base::DictValue> session =
++      base::JSONReader::ReadDict(body, base::JSON_PARSE_RFC);
++  if (!session) {
++    return result;
++  }
++  // Kratos answers 401 for no session; an inactive one is not a session
++  // either.
++  const std::optional<bool> active = session->FindBool("active");
++  if (active.has_value() && !*active) {
++    return result;
++  }
++  const base::DictValue* identity = session->FindDict("identity");
++  const std::string* id = identity ? identity->FindString("id") : nullptr;
++  if (!id || id->empty()) {
++    return result;
++  }
++  result.signed_in = true;
++  result.id = *id;
++  if (const base::DictValue* traits = identity->FindDict("traits")) {
++    result.name = std::string(base::TrimWhitespaceASCII(NameFrom(*traits),
++                                                        base::TRIM_ALL));
++    if (const std::string* email = traits->FindString("email")) {
++      result.email = *email;
++    }
++  }
++  return result;
++}
++
++}  // namespace tark_zynclave
+diff --color '--color=never' -ruN a/chrome/browser/tark_zynclave/whoami_response.h b/chrome/browser/tark_zynclave/whoami_response.h
+--- a/chrome/browser/tark_zynclave/whoami_response.h	1970-01-01 05:30:00.000000000 +0530
++++ b/chrome/browser/tark_zynclave/whoami_response.h	2026-10-26 03:45:41.432606915 +0530
+@@ -0,0 +1,34 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_TARK_ZYNCLAVE_WHOAMI_RESPONSE_H_
++#define CHROME_BROWSER_TARK_ZYNCLAVE_WHOAMI_RESPONSE_H_
++
++#include <cstddef>
++#include <string>
++#include <string_view>
++
++namespace tark_zynclave {
++
++// The largest whoami body read; a bigger one is not a session.
++inline constexpr size_t kMaxWhoamiBytes = 64 * 1024;
++
++// What "Sign in to Tark as X?" needs from the Zynclave Account's web session:
++// the identity id (only ever hashed, for "No thanks") and the name and email
++// (only shown on the sheet). Nothing here is stored or logged.
++struct WhoamiResult {
++  bool signed_in = false;
++  std::string id;
++  std::string name;
++  std::string email;
++};
++
++// Reads a 200 response of GET /sessions/whoami (Ory Kratos): an active session
++// with identity.id, and identity.traits.name (a string, or first and last) and
++// identity.traits.email when present. Anything else is not signed in.
++WhoamiResult ParseWhoami(std::string_view body);
++
++}  // namespace tark_zynclave
++
++#endif  // CHROME_BROWSER_TARK_ZYNCLAVE_WHOAMI_RESPONSE_H_
+diff --color '--color=never' -ruN a/chrome/browser/ui/android/strings/android_chrome_strings.grd b/chrome/browser/ui/android/strings/android_chrome_strings.grd
+--- a/chrome/browser/ui/android/strings/android_chrome_strings.grd	2026-10-26 03:42:54.141907617 +0530
++++ b/chrome/browser/ui/android/strings/android_chrome_strings.grd	2026-10-26 03:49:16.819970964 +0530
+@@ -1126,6 +1126,21 @@
+       <message name="IDS_TARK_ZYNCLAVE_SIGN_OUT_EVERYWHERE" desc="Tark: sign-out dialog button: sign out of Tark and of Zynclave's websites in Tark.">
+         Sign out everywhere
+       </message>
++      <message name="IDS_TARK_ZYNCLAVE_OFFER_TITLE" desc="Tark: title of the sheet offering to sign in to Tark with the Zynclave account the person is signed in to on the web; the placeholder is that account's name, or its email when it has no name.">
++        Sign in to Tark as <ph name="NAME">%1$s<ex>Sooraj Pandey</ex></ph>?
++      </message>
++      <message name="IDS_TARK_ZYNCLAVE_OFFER_TITLE_GENERIC" desc="Tark: title of the sheet offering to sign in to Tark with the person's Zynclave account, when the account has neither a name nor an email (for example a phone-only account).">
++        Sign in to Tark with your Zynclave account?
++      </message>
++      <message name="IDS_TARK_ZYNCLAVE_OFFER_BODY" desc="Tark: the line under the sheet's title offering to sign in to Tark with the Zynclave account.">
++        Use your Zynclave account in Tark to sync bookmarks and settings.
++      </message>
++      <message name="IDS_TARK_ZYNCLAVE_OFFER_SIGN_IN" desc="Tark: the sheet's button that signs in to Tark with the Zynclave account. [CHAR_LIMIT=24]">
++        Sign in
++      </message>
++      <message name="IDS_TARK_ZYNCLAVE_OFFER_CLOSED" desc="Tark: spoken by screen readers when the sheet offering to sign in to Tark with the Zynclave account closes.">
++        Sign-in offer closed
++      </message>
+       <message name="IDS_PASSWORD_MANAGER_SETTINGS_TITLE" desc="Title for the settings menu item leading to the Password Manager UI surface. This allows users to e.g. manage their saved passwords, toggle saving and auto-sign-in on/off, etc. [CHAR_LIMIT=32]">
+         Google Password Manager
+       </message>
+diff --color '--color=never' -ruN a/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb b/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb
+--- a/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb	2026-10-26 03:42:54.146472761 +0530
++++ b/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb	2026-10-26 03:49:16.822278994 +0530
+@@ -2232,4 +2232,8 @@
+ <translation id="4833913037077569769">क्या Tark में Zynclave वेबसाइटों से भी साइन आउट करें?</translation>
+ <translation id="3812160069211634854">सिर्फ़ Tark से साइन आउट करें</translation>
+ <translation id="3134662555841684297">हर जगह से साइन आउट करें</translation>
++<translation id="8937102590040616171">क्या Tark में <ph name="NAME"/> के रूप में साइन इन करें?</translation>
++<translation id="5161658736143099157">क्या Tark में अपने Zynclave खाते से साइन इन करें?</translation>
++<translation id="664694320964506959">बुकमार्क और सेटिंग सिंक करने के लिए Tark में अपना Zynclave खाता इस्तेमाल करें।</translation>
++<translation id="8998913419965535255">साइन इन का सुझाव बंद हुआ</translation>
+ </translationbundle>
+\ No newline at end of file
