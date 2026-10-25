@@ -1,0 +1,923 @@
+diff --color '--color=never' -ruN a/chrome/android/chrome_java_resources.gni b/chrome/android/chrome_java_resources.gni
+--- a/chrome/android/chrome_java_resources.gni	2026-10-26 03:25:49.323999925 +0530
++++ b/chrome/android/chrome_java_resources.gni	2026-10-26 03:27:17.991368883 +0530
+@@ -691,4 +691,5 @@
+   "java/res/xml/unified_account_settings_preferences.xml",
+   "java/res/xml/universal_opt_out_preferences.xml",
+   "java/res/xml/voice_languages_preferences.xml",
++  "java/res/xml/zynclave_account_preferences.xml",
+ ]
+diff --color '--color=never' -ruN a/chrome/android/chrome_java_sources.gni b/chrome/android/chrome_java_sources.gni
+--- a/chrome/android/chrome_java_sources.gni	2026-10-26 03:25:49.326211871 +0530
++++ b/chrome/android/chrome_java_sources.gni	2026-10-26 03:27:17.991702971 +0530
+@@ -982,6 +982,8 @@
+   "java/src/org/chromium/chrome/browser/tark_captions/TarkCaptionBarCoordinator.java",
+   "java/src/org/chromium/chrome/browser/tark/zynclave/AuthStateStore.java",
+   "java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAccount.java",
++  "java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAccountPreference.java",
++  "java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAccountSettings.java",
+   "java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAuthActivity.java",
+   "java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAuthFlow.java",
+   "java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveConfig.java",
+diff --color '--color=never' -ruN a/chrome/android/java/res/xml/main_preferences.xml b/chrome/android/java/res/xml/main_preferences.xml
+--- a/chrome/android/java/res/xml/main_preferences.xml	2026-10-26 03:21:01.506722343 +0530
++++ b/chrome/android/java/res/xml/main_preferences.xml	2026-10-26 03:27:17.991125796 +0530
+@@ -8,6 +8,13 @@
+ <PreferenceScreen xmlns:android="http://schemas.android.com/apk/res/android"
+     xmlns:app="http://schemas.android.com/apk/res-auto"
+     android:orderingFromXml="false">
++    <!-- Tark: Sign in with Zynclave (optional); under the header MainSettings adds
++         (order -1). -->
++    <org.chromium.chrome.browser.tark.zynclave.ZynclaveAccountPreference
++        android:key="tark_zynclave_account"
++        android:order="0"
++        android:title="@string/tark_zynclave_sign_in"
++        android:summary="@string/tark_zynclave_sign_in_summary" />
+     <org.chromium.chrome.browser.ui.settings_promo_card.SettingsPromoCardPreference
+         android:key="settings_promo_card"
+         android:order="0" />
+diff --color '--color=never' -ruN a/chrome/android/java/res/xml/zynclave_account_preferences.xml b/chrome/android/java/res/xml/zynclave_account_preferences.xml
+--- a/chrome/android/java/res/xml/zynclave_account_preferences.xml	1970-01-01 05:30:00.000000000 +0530
++++ b/chrome/android/java/res/xml/zynclave_account_preferences.xml	2026-10-26 03:26:58.532216357 +0530
+@@ -0,0 +1,14 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!-- Copyright 2026 The Tark Authors
++     Use of this source code is governed by a BSD-style license that can be
++     found in the LICENSE file. -->
++<!-- Settings › Zynclave Account (ZynclaveAccountSettings): who is signed in,
++     and Sign out. The summary is set in code. -->
++<PreferenceScreen xmlns:android="http://schemas.android.com/apk/res/android">
++    <org.chromium.components.browser_ui.settings.TextMessagePreference
++        android:key="zynclave_account_summary" />
++
++    <org.chromium.components.browser_ui.settings.ChromeBasePreference
++        android:key="zynclave_account_sign_out"
++        android:title="@string/tark_zynclave_sign_out" />
++</PreferenceScreen>
+diff --color '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAccountPreference.java b/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAccountPreference.java
+--- a/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAccountPreference.java	1970-01-01 05:30:00.000000000 +0530
++++ b/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAccountPreference.java	2026-10-26 03:32:04.957278408 +0530
+@@ -0,0 +1,242 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++package org.chromium.chrome.browser.tark.zynclave;
++
++import android.app.Activity;
++import android.content.Context;
++import android.content.ContextWrapper;
++import android.graphics.Typeface;
++import android.graphics.drawable.GradientDrawable;
++import android.text.TextUtils;
++import android.util.AttributeSet;
++import android.util.TypedValue;
++import android.view.Gravity;
++import android.view.ViewGroup;
++import android.widget.LinearLayout;
++import android.widget.TextView;
++import android.widget.Toast;
++
++import androidx.annotation.VisibleForTesting;
++import androidx.preference.Preference;
++import androidx.preference.PreferenceViewHolder;
++
++import com.google.android.material.color.MaterialColors;
++
++import org.chromium.build.annotations.NullMarked;
++import org.chromium.build.annotations.Nullable;
++import org.chromium.chrome.R;
++import org.chromium.chrome.browser.tark.zynclave.ZynclaveAccount.State;
++import org.chromium.chrome.browser.ui.messages.snackbar.Snackbar;
++import org.chromium.chrome.browser.ui.messages.snackbar.SnackbarManager;
++
++/**
++ * Tark: the Settings account row (spec §5.5), the first row under the header look-settings.patch
++ * adds. Signed out it says "Sign in with Zynclave" and a tap starts sign-in; signed in it shows
++ * the name and email and a tap opens {@link ZynclaveAccountSettings}. It follows {@link
++ * ZynclaveAccount} while it is attached to a Settings page.
++ *
++ * <p>{@link ZynclaveAccount} shows no message of its own: when a sign-in fails, this row says so,
++ * in the Settings snackbar (SettingsActivity is a SnackbarManageable) or, where an activity has
++ * none, in a toast.
++ */
++@NullMarked
++public class ZynclaveAccountPreference extends Preference {
++    /** What the row shows. */
++    @VisibleForTesting
++    record Content(CharSequence title, @Nullable CharSequence summary) {}
++
++    private final Runnable mStateObserver = this::refresh;
++    private final Runnable mFailureObserver = this::onSignInFailed;
++    private boolean mObserving;
++
++    public ZynclaveAccountPreference(Context context, @Nullable AttributeSet attrs) {
++        super(context, attrs);
++        setPersistent(false);
++        setOnPreferenceClickListener(p -> onRowClicked());
++        refresh();
++    }
++
++    @Override
++    public void onAttached() {
++        super.onAttached();
++        startObserving();
++    }
++
++    @Override
++    public void onDetached() {
++        stopObserving();
++        super.onDetached();
++    }
++
++    @VisibleForTesting
++    void startObserving() {
++        if (mObserving) return;
++        mObserving = true;
++        ZynclaveAccount account = ZynclaveAccount.get();
++        account.addObserver(mStateObserver);
++        account.addSignInFailureObserver(mFailureObserver);
++        refresh();
++    }
++
++    @VisibleForTesting
++    void stopObserving() {
++        if (!mObserving) return;
++        mObserving = false;
++        ZynclaveAccount account = ZynclaveAccount.get();
++        account.removeObserver(mStateObserver);
++        account.removeSignInFailureObserver(mFailureObserver);
++    }
++
++    /**
++     * What the row shows for an account in {@code state}. The environment's label goes on the end
++     * of the summary in a test APK (staging); never in a published one.
++     */
++    @VisibleForTesting
++    static Content content(
++            Context context,
++            State state,
++            @Nullable String name,
++            @Nullable String email,
++            boolean staging) {
++        CharSequence title;
++        @Nullable String summary;
++        if (state == State.SIGNED_IN) {
++            if (name != null && !name.isEmpty()) {
++                title = name;
++                summary = email;
++            } else if (email != null && !email.isEmpty()) {
++                title = email;
++                summary = null;
++            } else {
++                title = context.getString(R.string.tark_zynclave_account_fallback);
++                summary = null;
++            }
++        } else if (state == State.NEEDS_SIGN_IN_AGAIN) {
++            title = context.getString(R.string.tark_zynclave_sign_in_again);
++            summary = name != null && !name.isEmpty() ? name : email;
++        } else {
++            // Signed out, or the sign-in page is open.
++            title = context.getString(R.string.tark_zynclave_sign_in);
++            summary = context.getString(R.string.tark_zynclave_sign_in_summary);
++        }
++        if (staging) {
++            String label = context.getString(R.string.tark_zynclave_staging);
++            summary = summary == null || summary.isEmpty() ? label : summary + " · " + label;
++        }
++        return new Content(title, summary == null || summary.isEmpty() ? null : summary);
++    }
++
++    private void refresh() {
++        ZynclaveAccount account = ZynclaveAccount.get();
++        State state = account.state();
++        Content content =
++                content(
++                        getContext(),
++                        state,
++                        account.name(),
++                        account.email(),
++                        ZynclaveConfig.get().isStaging());
++        setTitle(content.title());
++        setSummary(content.summary());
++        // Signed in, a tap opens the account page, as a Settings row with a fragment does.
++        setFragment(state == State.SIGNED_IN ? ZynclaveAccountSettings.class.getName() : null);
++        // The sign-in page is already open (or opening): a second tap has nothing to do.
++        setEnabled(state != State.SIGNING_IN);
++    }
++
++    /** Returns true when the tap was the row's own (a sign-in); false lets the fragment open. */
++    private boolean onRowClicked() {
++        State state = ZynclaveAccount.get().state();
++        if (state == State.SIGNED_IN || state == State.SIGNING_IN) return false;
++        Activity activity = activityOf(getContext());
++        if (activity == null) return true;
++        ZynclaveAccount.get().signIn(activity, false);
++        return true;
++    }
++
++    private void onSignInFailed() {
++        showSignInFailed(getContext());
++    }
++
++    /** Says that sign-in failed: in the activity's snackbar if it has one, else a toast. */
++    @VisibleForTesting
++    static void showSignInFailed(Context context) {
++        CharSequence text = context.getString(R.string.tark_zynclave_sign_in_failed);
++        Activity activity = activityOf(context);
++        if (activity instanceof SnackbarManager.SnackbarManageable manageable) {
++            SnackbarManager manager = manageable.getSnackbarManager();
++            if (manager != null) {
++                manager.showSnackbar(
++                        Snackbar.make(
++                                text, null, Snackbar.TYPE_NOTIFICATION, Snackbar.UMA_UNKNOWN));
++                return;
++            }
++        }
++        Toast.makeText(context.getApplicationContext(), text, Toast.LENGTH_LONG).show();
++    }
++
++    private static @Nullable Activity activityOf(Context context) {
++        while (context instanceof ContextWrapper wrapper) {
++            if (context instanceof Activity activity) return activity;
++            context = wrapper.getBaseContext();
++        }
++        return null;
++    }
++
++    // Tark's tile (as the Settings header's): a rounded surface, bold title, small summary.
++    @Override
++    public void onBindViewHolder(PreferenceViewHolder holder) {
++        super.onBindViewHolder(holder);
++        if (!(holder.itemView instanceof ViewGroup root)) return;
++        Context context = root.getContext();
++        root.removeAllViews();
++        root.setPaddingRelative(dp(context, 12), dp(context, 4), dp(context, 12), dp(context, 4));
++
++        LinearLayout tile = new LinearLayout(context);
++        tile.setOrientation(LinearLayout.VERTICAL);
++        tile.setPadding(dp(context, 12), dp(context, 10), dp(context, 12), dp(context, 10));
++        tile.setMinimumHeight(dp(context, 64));
++        tile.setGravity(Gravity.CENTER_VERTICAL);
++        GradientDrawable background = new GradientDrawable();
++        background.setCornerRadius(dp(context, 14));
++        background.setColor(MaterialColors.getColor(context, R.attr.colorSurfaceContainerHigh, 0));
++        background.setStroke(
++                dp(context, 1), MaterialColors.getColor(context, R.attr.colorOutlineVariant, 0));
++        tile.setBackground(background);
++
++        CharSequence title = getTitle();
++        TextView titleView = new TextView(context);
++        titleView.setText(title);
++        titleView.setTextColor(MaterialColors.getColor(context, R.attr.colorOnSurface, 0));
++        titleView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
++        titleView.setTypeface(Typeface.DEFAULT_BOLD);
++        titleView.setMaxLines(1);
++        titleView.setEllipsize(TextUtils.TruncateAt.END);
++        tile.addView(titleView);
++        CharSequence summary = getSummary();
++        if (!TextUtils.isEmpty(summary)) {
++            TextView summaryView = new TextView(context);
++            summaryView.setText(summary);
++            summaryView.setTextColor(
++                    MaterialColors.getColor(context, R.attr.colorOnSurfaceVariant, 0));
++            summaryView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
++            summaryView.setMaxLines(2);
++            summaryView.setEllipsize(TextUtils.TruncateAt.END);
++            tile.addView(summaryView);
++        }
++        // The tile has no click of its own: the row's item view handles it.
++        tile.setContentDescription(
++                TextUtils.isEmpty(summary) ? title : title + ". " + summary);
++        root.addView(
++                tile,
++                new ViewGroup.LayoutParams(
++                        ViewGroup.LayoutParams.MATCH_PARENT,
++                        ViewGroup.LayoutParams.WRAP_CONTENT));
++    }
++
++    private static int dp(Context context, int dp) {
++        return Math.round(dp * context.getResources().getDisplayMetrics().density);
++    }
++}
+diff --color '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAccountSettings.java b/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAccountSettings.java
+--- a/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAccountSettings.java	1970-01-01 05:30:00.000000000 +0530
++++ b/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAccountSettings.java	2026-10-26 03:31:31.483959454 +0530
+@@ -0,0 +1,141 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++package org.chromium.chrome.browser.tark.zynclave;
++
++import android.app.Activity;
++import android.os.Bundle;
++
++import androidx.annotation.VisibleForTesting;
++import androidx.appcompat.app.AlertDialog;
++import androidx.preference.Preference;
++
++import org.chromium.base.supplier.MonotonicObservableSupplier;
++import org.chromium.base.supplier.ObservableSuppliers;
++import org.chromium.base.supplier.SettableMonotonicObservableSupplier;
++import org.chromium.build.annotations.NullMarked;
++import org.chromium.build.annotations.Nullable;
++import org.chromium.chrome.R;
++import org.chromium.chrome.browser.settings.ChromeBaseSettingsFragment;
++import org.chromium.chrome.browser.tark.zynclave.ZynclaveAccount.State;
++import org.chromium.components.browser_ui.settings.SettingsUtils;
++
++/**
++ * Tark: Settings › Zynclave Account (spec §5.5), opened from {@link ZynclaveAccountPreference}
++ * while signed in. It names the account and offers Sign out, which asks whether to sign out of
++ * Zynclave's websites in Tark too. When the account is no longer signed in, the page closes.
++ */
++@NullMarked
++public class ZynclaveAccountSettings extends ChromeBaseSettingsFragment {
++    static final String SUMMARY_KEY = "zynclave_account_summary";
++    static final String SIGN_OUT_KEY = "zynclave_account_sign_out";
++
++    private static @Nullable AlertDialog sDialog;
++
++    private final SettableMonotonicObservableSupplier<String> mPageTitle =
++            ObservableSuppliers.createMonotonic();
++    private final Runnable mObserver = this::onAccountChanged;
++
++    @Override
++    public void onCreatePreferences(@Nullable Bundle savedInstanceState, @Nullable String rootKey) {
++        mPageTitle.set(getString(R.string.tark_zynclave_account_fallback));
++        SettingsUtils.addPreferencesFromResource(this, R.xml.zynclave_account_preferences);
++        Preference signOut = findPreference(SIGN_OUT_KEY);
++        if (signOut != null) {
++            signOut.setOnPreferenceClickListener(
++                    p -> {
++                        showSignOutDialog(requireActivity());
++                        return true;
++                    });
++        }
++        ZynclaveAccount.get().addObserver(mObserver);
++        showAccount();
++    }
++
++    @Override
++    public MonotonicObservableSupplier<String> getPageTitle() {
++        return mPageTitle;
++    }
++
++    @Override
++    public @AnimationType int getAnimationType() {
++        return AnimationType.PROPERTY;
++    }
++
++    @Override
++    public void onDestroy() {
++        ZynclaveAccount.get().removeObserver(mObserver);
++        dismissDialog();
++        super.onDestroy();
++    }
++
++    private void showAccount() {
++        Preference summary = findPreference(SUMMARY_KEY);
++        if (summary == null) return;
++        ZynclaveAccount account = ZynclaveAccount.get();
++        ZynclaveAccountPreference.Content content =
++                ZynclaveAccountPreference.content(
++                        requireContext(),
++                        State.SIGNED_IN,
++                        account.name(),
++                        account.email(),
++                        ZynclaveConfig.get().isStaging());
++        CharSequence summaryText = content.summary();
++        summary.setSummary(
++                summaryText == null ? content.title() : content.title() + "\n" + summaryText);
++    }
++
++    private void onAccountChanged() {
++        if (ZynclaveAccount.get().state() == State.SIGNED_IN) {
++            showAccount();
++            return;
++        }
++        // Signed out here, or the account needs signing in again: nothing is left to show.
++        Activity activity = getActivity();
++        if (activity != null) activity.finish();
++    }
++
++    /**
++     * Asks whether to sign out of Zynclave's websites in Tark too. Either way the account is
++     * signed out at once and the token revoked; "everywhere" then also opens the Zynclave
++     * Account's own sign-out page in Tark's Custom Tab.
++     */
++    @VisibleForTesting
++    static AlertDialog showSignOutDialog(Activity activity) {
++        dismissDialog();
++        AlertDialog dialog =
++                new AlertDialog.Builder(activity, R.style.ThemeOverlay_BrowserUI_AlertDialog)
++                        .setTitle(R.string.tark_zynclave_sign_out_title)
++                        .setNegativeButton(
++                                R.string.tark_zynclave_sign_out_tark_only,
++                                (d, which) -> ZynclaveAccount.get().signOut(false, null))
++                        .setPositiveButton(
++                                R.string.tark_zynclave_sign_out_everywhere,
++                                (d, which) -> ZynclaveAccount.get().signOut(true, activity))
++                        .create();
++        dialog.setOnDismissListener(
++                d -> {
++                    if (sDialog == d) sDialog = null;
++                });
++        sDialog = dialog;
++        dialog.show();
++        return dialog;
++    }
++
++    private static void dismissDialog() {
++        AlertDialog dialog = sDialog;
++        sDialog = null;
++        if (dialog == null) return;
++        try {
++            dialog.dismiss();
++        } catch (RuntimeException e) {
++            // Its window is already gone.
++        }
++    }
++
++    @VisibleForTesting
++    static @Nullable AlertDialog getDialogForTesting() {
++        return sDialog;
++    }
++}
+diff --color '--color=never' -ruN a/chrome/android/junit/BUILD.gn b/chrome/android/junit/BUILD.gn
+--- a/chrome/android/junit/BUILD.gn	2026-10-26 03:25:49.329980379 +0530
++++ b/chrome/android/junit/BUILD.gn	2026-10-26 03:27:17.992133268 +0530
+@@ -1397,9 +1397,12 @@
+   # Tark: Sign in with Zynclave.
+   robolectric_library(
+       "chrome_junit_tests_org.chromium.chrome.browser.tark.zynclave") {
++    resources_package = "org.chromium.chrome"
++
+     sources = [
+       "src/org/chromium/chrome/browser/tark/zynclave/AuthStateStoreTest.java",
+       "src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAuthFlowTest.java",
++      "src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAccountRowTest.java",
+       "src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAccountTest.java",
+       "src/org/chromium/chrome/browser/tark/zynclave/ZynclaveNoTokenLogsTest.java",
+       "src/org/chromium/chrome/browser/tark/zynclave/ZynclaveRedirectTest.java",
+@@ -1407,6 +1410,7 @@
+ 
+     deps = [
+       ":chrome_junit_tests_helper",
++      "//chrome/browser/ui/messages/android:java",
+       "//third_party/appauth:appauth_java",
+     ]
+   }
+diff --color '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAccountRowTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAccountRowTest.java
+--- a/chrome/android/junit/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAccountRowTest.java	1970-01-01 05:30:00.000000000 +0530
++++ b/chrome/android/junit/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAccountRowTest.java	2026-10-26 03:29:42.200214131 +0530
+@@ -0,0 +1,393 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++package org.chromium.chrome.browser.tark.zynclave;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.assertNotNull;
++import static org.junit.Assert.assertNull;
++import static org.junit.Assert.assertTrue;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.Mockito.never;
++import static org.mockito.Mockito.verify;
++
++import android.os.Bundle;
++
++import androidx.appcompat.app.AlertDialog;
++import androidx.appcompat.app.AppCompatActivity;
++
++import net.openid.appauth.AuthorizationException;
++import net.openid.appauth.AuthorizationRequest;
++
++import org.junit.After;
++import org.junit.Before;
++import org.junit.Rule;
++import org.junit.Test;
++import org.junit.rules.TemporaryFolder;
++import org.junit.runner.RunWith;
++import org.mockito.ArgumentCaptor;
++import org.mockito.Mockito;
++import org.robolectric.Robolectric;
++import org.robolectric.annotation.Config;
++import org.robolectric.shadows.ShadowLooper;
++import org.robolectric.shadows.ShadowToast;
++
++import org.chromium.base.test.BaseRobolectricTestRunner;
++import org.chromium.chrome.R;
++import org.chromium.chrome.browser.tark.zynclave.ZynclaveAccount.State;
++import org.chromium.chrome.browser.tark.zynclave.ZynclaveAccountTest.CountingStore;
++import org.chromium.chrome.browser.tark.zynclave.ZynclaveAccountTest.FakeBackend;
++import org.chromium.chrome.browser.ui.messages.snackbar.Snackbar;
++import org.chromium.chrome.browser.ui.messages.snackbar.SnackbarManager;
++import org.chromium.ui.base.TestActivity;
++
++import java.io.File;
++
++/**
++ * Tests for {@link ZynclaveAccountPreference} (the Settings row) and the sign-out dialog of {@link
++ * ZynclaveAccountSettings}, on a fake backend: the row's clicks reach {@link ZynclaveAccount}, and
++ * its text follows the account's state.
++ */
++@RunWith(BaseRobolectricTestRunner.class)
++@Config(qualifiers = "en-rUS")
++public class ZynclaveAccountRowTest {
++    private static final String SIGN_IN_FAILED = "Couldn't sign in. Try again.";
++
++    /** An activity with a Settings-style snackbar manager, as SettingsActivity has. */
++    public static class ManageableActivity extends AppCompatActivity
++            implements SnackbarManager.SnackbarManageable {
++        final SnackbarManager mManager = Mockito.mock(SnackbarManager.class);
++
++        @Override
++        protected void onCreate(Bundle savedInstanceState) {
++            setTheme(R.style.Theme_BrowserUI_DayNight);
++            super.onCreate(savedInstanceState);
++        }
++
++        @Override
++        public SnackbarManager getSnackbarManager() {
++            return mManager;
++        }
++    }
++
++    @Rule public TemporaryFolder mTemp = new TemporaryFolder();
++
++    private FakeBackend mBackend;
++    private CountingStore mStore;
++    private ZynclaveAccount mAccount;
++    private TestActivity mActivity;
++
++    @Before
++    public void setUp() {
++        mBackend = new FakeBackend();
++        mStore = new CountingStore(new File(mTemp.getRoot(), "zynclave"));
++        mBackend.mStore = mStore;
++        mAccount = ZynclaveAccount.forTesting(mBackend, mStore, ZynclaveAccountTest.DIRECT);
++        mActivity = Robolectric.buildActivity(TestActivity.class).setup().get();
++        mActivity.setTheme(R.style.Theme_BrowserUI_DayNight);
++    }
++
++    @After
++    public void tearDown() {
++        AlertDialog dialog = ZynclaveAccountSettings.getDialogForTesting();
++        if (dialog != null) dialog.dismiss();
++    }
++
++    private void signIn() {
++        mAccount.signIn(mActivity, false);
++        ShadowLooper.idleMainLooper();
++        AuthorizationRequest request = mBackend.lastRequest();
++        mAccount.onAuthorizationResult(mActivity, mBackend.successFor(request), null);
++        ShadowLooper.idleMainLooper();
++        assertEquals(State.SIGNED_IN, mAccount.state());
++    }
++
++    private ZynclaveAccountPreference row() {
++        return new ZynclaveAccountPreference(mActivity, null);
++    }
++
++    private static String text(CharSequence text) {
++        assertNotNull(text);
++        return text.toString();
++    }
++
++    @Test
++    public void testSignedOutRow() {
++        ZynclaveAccountPreference row = row();
++
++        assertEquals("Sign in with Zynclave", text(row.getTitle()));
++        assertEquals("Optional. Browsing never needs an account.", text(row.getSummary()));
++        assertNull(row.getFragment());
++
++        row.performClick();
++        ShadowLooper.idleMainLooper();
++
++        // signIn(activity, false): a full sign-in page, not prompt=none.
++        assertEquals(1, mBackend.mAuthorizeRequests.size());
++        assertNull(mBackend.lastRequest().prompt);
++        assertEquals(State.SIGNING_IN, mAccount.state());
++    }
++
++    @Test
++    public void testSignedInRowShowsNameAndEmail() {
++        signIn();
++        ZynclaveAccountPreference row = row();
++
++        assertEquals("Asha Rao", text(row.getTitle()));
++        assertEquals("asha@example.com", text(row.getSummary()));
++        // A tap opens the account page, as a Settings row with a fragment does; no sign-in.
++        assertEquals(ZynclaveAccountSettings.class.getName(), row.getFragment());
++        row.performClick();
++        ShadowLooper.idleMainLooper();
++        assertEquals(1, mBackend.mAuthorizeRequests.size());
++        assertEquals(State.SIGNED_IN, mAccount.state());
++    }
++
++    @Test
++    public void testNoNameNoEmail() {
++        mBackend.mName = null;
++        mBackend.mEmail = null;
++        signIn();
++        ZynclaveAccountPreference row = row();
++
++        assertEquals("Zynclave Account", text(row.getTitle()));
++        assertNull(row.getSummary());
++    }
++
++    @Test
++    public void testEmailWhenNoName() {
++        mBackend.mName = null;
++        signIn();
++        ZynclaveAccountPreference row = row();
++
++        assertEquals("asha@example.com", text(row.getTitle()));
++        assertNull(row.getSummary());
++    }
++
++    @Test
++    public void testNeedsSignInAgain() {
++        signIn();
++        mBackend.mRefreshResults.add(AuthorizationException.TokenRequestErrors.INVALID_GRANT);
++        mAccount.freshTokens(token -> {});
++        ShadowLooper.idleMainLooper();
++        assertEquals(State.NEEDS_SIGN_IN_AGAIN, mAccount.state());
++        ZynclaveAccountPreference row = row();
++
++        assertEquals("Sign in again", text(row.getTitle()));
++        assertEquals("Asha Rao", text(row.getSummary()));
++        assertNull(row.getFragment());
++
++        row.performClick();
++        ShadowLooper.idleMainLooper();
++        assertEquals(2, mBackend.mAuthorizeRequests.size());
++        assertEquals(State.SIGNING_IN, mAccount.state());
++    }
++
++    @Test
++    public void testStagingLabelOnlyInStaging() {
++        String label = "Zynclave staging";
++        assertEquals(
++                "Optional. Browsing never needs an account.",
++                text(
++                        ZynclaveAccountPreference.content(
++                                        mActivity, State.SIGNED_OUT, null, null, false)
++                                .summary()));
++        assertEquals(
++                "Optional. Browsing never needs an account. · " + label,
++                text(
++                        ZynclaveAccountPreference.content(
++                                        mActivity, State.SIGNED_OUT, null, null, true)
++                                .summary()));
++        assertEquals(
++                "asha@example.com",
++                text(
++                        ZynclaveAccountPreference.content(
++                                        mActivity,
++                                        State.SIGNED_IN,
++                                        "Asha Rao",
++                                        "asha@example.com",
++                                        false)
++                                .summary()));
++        assertEquals(
++                "asha@example.com · " + label,
++                text(
++                        ZynclaveAccountPreference.content(
++                                        mActivity,
++                                        State.SIGNED_IN,
++                                        "Asha Rao",
++                                        "asha@example.com",
++                                        true)
++                                .summary()));
++        // Nothing else to say: the label alone.
++        assertEquals(
++                label,
++                text(
++                        ZynclaveAccountPreference.content(
++                                        mActivity, State.SIGNED_IN, null, null, true)
++                                .summary()));
++        // A unit-test build is not a staging build: no label.
++        signIn();
++        assertFalse(text(row().getSummary()).contains(label));
++    }
++
++    @Test
++    public void testSignOutDialogAsksAndCancelSignsNothingOut() {
++        signIn();
++        AlertDialog dialog = ZynclaveAccountSettings.showSignOutDialog(mActivity);
++
++        assertTrue(dialog.isShowing());
++        assertEquals(
++                "Sign out of Tark only",
++                text(dialog.getButton(AlertDialog.BUTTON_NEGATIVE).getText()));
++        assertEquals(
++                "Sign out everywhere",
++                text(dialog.getButton(AlertDialog.BUTTON_POSITIVE).getText()));
++        assertEquals(
++                "Also sign out of Zynclave websites in Tark?",
++                text(mActivity.getString(R.string.tark_zynclave_sign_out_title)));
++
++        dialog.cancel();
++        ShadowLooper.idleMainLooper();
++
++        assertEquals(State.SIGNED_IN, mAccount.state());
++        assertTrue(mBackend.mRevoked.isEmpty());
++        assertNull(ZynclaveAccountSettings.getDialogForTesting());
++    }
++
++    @Test
++    public void testSignOutTarkOnly() {
++        signIn();
++        AlertDialog dialog = ZynclaveAccountSettings.showSignOutDialog(mActivity);
++        dialog.getButton(AlertDialog.BUTTON_NEGATIVE).performClick();
++        ShadowLooper.idleMainLooper();
++
++        assertEquals(State.SIGNED_OUT, mAccount.state());
++        assertEquals(1, mBackend.mRevoked.size());
++        assertTrue("no end-session page", mBackend.mOpened.isEmpty());
++        assertNull(mStore.read());
++        assertFalse(dialog.isShowing());
++    }
++
++    @Test
++    public void testSignOutEverywhere() {
++        signIn();
++        AlertDialog dialog = ZynclaveAccountSettings.showSignOutDialog(mActivity);
++        dialog.getButton(AlertDialog.BUTTON_POSITIVE).performClick();
++        ShadowLooper.idleMainLooper();
++
++        assertEquals(State.SIGNED_OUT, mAccount.state());
++        assertEquals(1, mBackend.mRevoked.size());
++        assertEquals(1, mBackend.mOpened.size());
++        assertEquals("IDT-1", mBackend.mOpened.get(0).getQueryParameter("id_token_hint"));
++        assertNull(mStore.read());
++        assertFalse(dialog.isShowing());
++    }
++
++    @Test
++    public void testRowUpdatesOnObserver() {
++        ZynclaveAccountPreference row = row();
++        row.startObserving();
++        assertEquals("Sign in with Zynclave", text(row.getTitle()));
++
++        signIn();
++        assertEquals("Asha Rao", text(row.getTitle()));
++        assertEquals("asha@example.com", text(row.getSummary()));
++        assertEquals(ZynclaveAccountSettings.class.getName(), row.getFragment());
++
++        mAccount.signOut(false, null);
++        ShadowLooper.idleMainLooper();
++        assertEquals("Sign in with Zynclave", text(row.getTitle()));
++        assertNull(row.getFragment());
++
++        // Detached from Settings: it no longer follows the account.
++        row.onDetached();
++        signIn();
++        assertEquals("Sign in with Zynclave", text(row.getTitle()));
++    }
++
++    @Test
++    public void testAttachedRowObserves() {
++        ZynclaveAccountPreference row = row();
++        row.onAttached();
++        signIn();
++        assertEquals("Asha Rao", text(row.getTitle()));
++        row.onDetached();
++    }
++
++    @Test
++    public void testRowDisabledWhileSigningIn() {
++        ZynclaveAccountPreference row = row();
++        row.startObserving();
++        row.performClick();
++        ShadowLooper.idleMainLooper();
++
++        assertEquals(State.SIGNING_IN, mAccount.state());
++        assertFalse(row.isEnabled());
++
++        mAccount.onAuthorizationResult(
++                mActivity, null, AuthorizationException.GeneralErrors.USER_CANCELED_AUTH_FLOW);
++        ShadowLooper.idleMainLooper();
++        assertTrue(row.isEnabled());
++        assertEquals("Sign in with Zynclave", text(row.getTitle()));
++    }
++
++    @Test
++    public void testSignInFailureShowsSnackbarInSettings() {
++        ManageableActivity activity =
++                Robolectric.buildActivity(ManageableActivity.class).setup().get();
++        ZynclaveAccountPreference row = new ZynclaveAccountPreference(activity, null);
++        row.startObserving();
++        mBackend.mAuthorizeSucceeds = false;
++
++        row.performClick();
++        ShadowLooper.idleMainLooper();
++
++        ArgumentCaptor<Snackbar> captor = ArgumentCaptor.forClass(Snackbar.class);
++        verify(activity.mManager).showSnackbar(captor.capture());
++        assertEquals(SIGN_IN_FAILED, captor.getValue().getTextForTesting().toString());
++        assertNull("no toast beside the snackbar", ShadowToast.getLatestToast());
++        assertEquals(State.SIGNED_OUT, mAccount.state());
++    }
++
++    @Test
++    public void testSignInFailureToastWhenNoSnackbarManager() {
++        ZynclaveAccountPreference row = row();
++        row.startObserving();
++        mBackend.mAuthorizeSucceeds = false;
++
++        row.performClick();
++        ShadowLooper.idleMainLooper();
++
++        assertEquals(SIGN_IN_FAILED, ShadowToast.getTextOfLatestToast());
++    }
++
++    @Test
++    public void testCancelShowsNoFailure() {
++        ManageableActivity activity =
++                Robolectric.buildActivity(ManageableActivity.class).setup().get();
++        ZynclaveAccountPreference row = new ZynclaveAccountPreference(activity, null);
++        row.startObserving();
++        row.performClick();
++        ShadowLooper.idleMainLooper();
++        mAccount.onAuthorizationResult(
++                activity, null, AuthorizationException.GeneralErrors.USER_CANCELED_AUTH_FLOW);
++        ShadowLooper.idleMainLooper();
++
++        verify(activity.mManager, never()).showSnackbar(any());
++        assertNull(ShadowToast.getLatestToast());
++    }
++
++    @Test
++    public void testDetachedRowShowsNoFailure() {
++        ZynclaveAccountPreference row = row();
++        row.startObserving();
++        row.stopObserving();
++        mBackend.mAuthorizeSucceeds = false;
++        mAccount.signIn(mActivity, false);
++        ShadowLooper.idleMainLooper();
++
++        assertNull(ShadowToast.getLatestToast());
++    }
++}
+diff --color '--color=never' -ruN a/chrome/browser/ui/android/strings/android_chrome_strings.grd b/chrome/browser/ui/android/strings/android_chrome_strings.grd
+--- a/chrome/browser/ui/android/strings/android_chrome_strings.grd	2026-10-26 03:25:49.331827488 +0530
++++ b/chrome/browser/ui/android/strings/android_chrome_strings.grd	2026-10-26 03:27:17.993938542 +0530
+@@ -1099,6 +1099,33 @@
+       <message name="IDS_TARK_ZYNCLAVE_SIGN_IN_FAILED" desc="Tark: snackbar when Sign in with Zynclave failed (no connection, the Zynclave Account refused it, or Tark could not open its sign-in page). Not shown when the person closed the page.">
+         Couldn't sign in. Try again.
+       </message>
++      <message name="IDS_TARK_ZYNCLAVE_SIGN_IN" desc="Tark: the Settings row that starts Sign in with Zynclave (an optional Zynclave Account). [CHAR_LIMIT=40]">
++        Sign in with Zynclave
++      </message>
++      <message name="IDS_TARK_ZYNCLAVE_SIGN_IN_SUMMARY" desc="Tark: the line under the Sign in with Zynclave row. Says signing in is optional.">
++        Optional. Browsing never needs an account.
++      </message>
++      <message name="IDS_TARK_ZYNCLAVE_ACCOUNT_FALLBACK" desc="Tark: the signed-in row's title (and the account page's) when Zynclave gave neither a name nor an email.">
++        Zynclave Account
++      </message>
++      <message name="IDS_TARK_ZYNCLAVE_SIGN_IN_AGAIN" desc="Tark: the Settings row's title when the saved Zynclave sign-in expired and the person has to sign in again.">
++        Sign in again
++      </message>
++      <message name="IDS_TARK_ZYNCLAVE_STAGING" desc="Tark: shown on the Zynclave account row in test builds only, which use Zynclave's staging servers.">
++        Zynclave staging
++      </message>
++      <message name="IDS_TARK_ZYNCLAVE_SIGN_OUT" desc="Tark: the Zynclave account page's row that signs out.">
++        Sign out
++      </message>
++      <message name="IDS_TARK_ZYNCLAVE_SIGN_OUT_TITLE" desc="Tark: the question after Sign out: whether to also sign out of Zynclave's websites (for example Shodhya) in Tark.">
++        Also sign out of Zynclave websites in Tark?
++      </message>
++      <message name="IDS_TARK_ZYNCLAVE_SIGN_OUT_TARK_ONLY" desc="Tark: sign-out dialog button: sign out of Tark's Zynclave sign-in only; websites stay signed in.">
++        Sign out of Tark only
++      </message>
++      <message name="IDS_TARK_ZYNCLAVE_SIGN_OUT_EVERYWHERE" desc="Tark: sign-out dialog button: sign out of Tark and of Zynclave's websites in Tark.">
++        Sign out everywhere
++      </message>
+       <message name="IDS_PASSWORD_MANAGER_SETTINGS_TITLE" desc="Title for the settings menu item leading to the Password Manager UI surface. This allows users to e.g. manage their saved passwords, toggle saving and auto-sign-in on/off, etc. [CHAR_LIMIT=32]">
+         Google Password Manager
+       </message>
+diff --color '--color=never' -ruN a/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb b/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb
+--- a/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb	2026-10-26 03:25:49.333935682 +0530
++++ b/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb	2026-10-26 03:27:17.998236558 +0530
+@@ -2223,4 +2223,13 @@
+ <translation id="2674490731131654801">अगली बार <ph name="LANGUAGE"/> इस्तेमाल करें</translation>
+ <translation id="2427661119626459258">यह <ph name="LANGUAGE"/> जैसा लगा। इस फ़ोन पर वॉइस सर्च के लिए <ph name="LANGUAGE_AGAIN"/> चाहिए।</translation>
+ <translation id="8177895288802336498">साइन इन नहीं हो सका। फिर से कोशिश करें।</translation>
++<translation id="3706775126712215532">Zynclave से साइन इन करें</translation>
++<translation id="540020521861957049">वैकल्पिक। ब्राउज़ करने के लिए खाते की ज़रूरत नहीं।</translation>
++<translation id="7315349496006684826">Zynclave खाता</translation>
++<translation id="9148126808321036104">फिर से साइन इन करें</translation>
++<translation id="6089066395413133050">Zynclave स्टेजिंग</translation>
++<translation id="5222676887888702881">साइन आउट करें</translation>
++<translation id="4833913037077569769">क्या Tark में Zynclave वेबसाइटों से भी साइन आउट करें?</translation>
++<translation id="3812160069211634854">सिर्फ़ Tark से साइन आउट करें</translation>
++<translation id="3134662555841684297">हर जगह से साइन आउट करें</translation>
+ </translationbundle>
+\ No newline at end of file
