@@ -20,6 +20,10 @@ on:
         description: Only check this finished run's build again (its id); builds nothing
         type: string
         default: ''
+      winsparkle_only:
+        description: Only build and check WinSparkle; builds no Chromium
+        type: boolean
+        default: false
   push:
     branches:
       - feat/w2-windows-parity
@@ -37,7 +41,7 @@ concurrency:
 jobs:
   onnxruntime:
     name: ONNX Runtime (static C runtime)
-    if: ${{ inputs.verify_run == '' }}
+    if: ${{ inputs.verify_run == '' && !inputs.winsparkle_only }}
     runs-on: windows-2022
     timeout-minutes: 300
     steps:
@@ -70,10 +74,42 @@ jobs:
           path: C:\ort-out
           retention-days: 7
 
+  winsparkle:
+    name: WinSparkle (no OpenSSL)
+    if: ${{ inputs.verify_run == '' }}
+    runs-on: windows-2022
+    timeout-minutes: 120
+    steps:
+      - name: Line endings as committed
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.eol lf
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Restore an earlier build
+        id: cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: C:\winsparkle-out
+          key: winsparkle-0.9.4-no-openssl-${{ hashFiles('windows/ci/build_winsparkle.ps1', 'windows/ci/winsparkle-patches/*') }}
+      - name: Build WinSparkle 0.9.4
+        if: steps.cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: windows\ci\build_winsparkle.ps1 -Out C:\winsparkle-out
+      - name: Check it needs no C runtime and holds no OpenSSL
+        shell: pwsh
+        run: windows\ci\build_winsparkle.ps1 -Out C:\winsparkle-out -CheckOnly
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: winsparkle-win-x64
+          path: C:\winsparkle-out
+          retention-days: 7
+
   build-1:
     name: Build, stage 1
-    needs: onnxruntime
-    if: ${{ !(inputs.resume_run != '' && inputs.resume_stage > 1) }}
+    needs: [onnxruntime, winsparkle]
+    if: ${{ !inputs.winsparkle_only && !(inputs.resume_run != '' && inputs.resume_stage > 1) }}
     runs-on: windows-2022
     timeout-minutes: 355
     outputs:
@@ -105,6 +141,11 @@ jobs:
         with:
           name: onnxruntime-win-x64
           path: C:\ort
+      - name: WinSparkle
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: winsparkle-win-x64
+          path: C:\winsparkle
       - name: Work folder
         shell: pwsh
         run: python windows\prepare_workdir.py $env:GITHUB_WORKSPACE C:\tw
@@ -114,6 +155,7 @@ jobs:
         working-directory: C:\tw
         env:
           TARK_ORT_DIR: C:\ort
+          TARK_WINSPARKLE_DIR: C:\winsparkle
           TARK_NINJA_HOURS: '3.5'
         run: |
           python -m pip install --disable-pip-version-check httplib2==0.22.0 clang==21.1.7
@@ -174,9 +216,10 @@ jobs:
 
   build-2:
     name: Build, stage 2
-    needs: [onnxruntime, build-1]
+    needs: [onnxruntime, winsparkle, build-1]
     if: >-
-      ${{ !cancelled() && needs.onnxruntime.result == 'success' && (
+      ${{ !cancelled() && needs.onnxruntime.result == 'success' &&
+      needs.winsparkle.result == 'success' && (
       (needs.build-1.result == 'success' && needs.build-1.outputs.finished == 'false') ||
       (inputs.resume_run != '' && inputs.resume_stage == 2)) }}
     runs-on: windows-2022
@@ -210,6 +253,11 @@ jobs:
         with:
           name: onnxruntime-win-x64
           path: C:\ort
+      - name: WinSparkle
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: winsparkle-win-x64
+          path: C:\winsparkle
       - name: Work folder
         shell: pwsh
         run: python windows\prepare_workdir.py $env:GITHUB_WORKSPACE C:\tw
@@ -247,6 +295,7 @@ jobs:
         working-directory: C:\tw
         env:
           TARK_ORT_DIR: C:\ort
+          TARK_WINSPARKLE_DIR: C:\winsparkle
           TARK_NINJA_HOURS: '3.5'
         run: |
           python -m pip install --disable-pip-version-check httplib2==0.22.0 clang==21.1.7
@@ -307,9 +356,10 @@ jobs:
 
   build-3:
     name: Build, stage 3
-    needs: [onnxruntime, build-2]
+    needs: [onnxruntime, winsparkle, build-2]
     if: >-
-      ${{ !cancelled() && needs.onnxruntime.result == 'success' && (
+      ${{ !cancelled() && needs.onnxruntime.result == 'success' &&
+      needs.winsparkle.result == 'success' && (
       (needs.build-2.result == 'success' && needs.build-2.outputs.finished == 'false') ||
       (inputs.resume_run != '' && inputs.resume_stage == 3)) }}
     runs-on: windows-2022
@@ -343,6 +393,11 @@ jobs:
         with:
           name: onnxruntime-win-x64
           path: C:\ort
+      - name: WinSparkle
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: winsparkle-win-x64
+          path: C:\winsparkle
       - name: Work folder
         shell: pwsh
         run: python windows\prepare_workdir.py $env:GITHUB_WORKSPACE C:\tw
@@ -380,6 +435,7 @@ jobs:
         working-directory: C:\tw
         env:
           TARK_ORT_DIR: C:\ort
+          TARK_WINSPARKLE_DIR: C:\winsparkle
           TARK_NINJA_HOURS: '3.5'
         run: |
           python -m pip install --disable-pip-version-check httplib2==0.22.0 clang==21.1.7
@@ -440,9 +496,10 @@ jobs:
 
   build-4:
     name: Build, stage 4
-    needs: [onnxruntime, build-3]
+    needs: [onnxruntime, winsparkle, build-3]
     if: >-
-      ${{ !cancelled() && needs.onnxruntime.result == 'success' && (
+      ${{ !cancelled() && needs.onnxruntime.result == 'success' &&
+      needs.winsparkle.result == 'success' && (
       (needs.build-3.result == 'success' && needs.build-3.outputs.finished == 'false') ||
       (inputs.resume_run != '' && inputs.resume_stage == 4)) }}
     runs-on: windows-2022
@@ -476,6 +533,11 @@ jobs:
         with:
           name: onnxruntime-win-x64
           path: C:\ort
+      - name: WinSparkle
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: winsparkle-win-x64
+          path: C:\winsparkle
       - name: Work folder
         shell: pwsh
         run: python windows\prepare_workdir.py $env:GITHUB_WORKSPACE C:\tw
@@ -513,6 +575,7 @@ jobs:
         working-directory: C:\tw
         env:
           TARK_ORT_DIR: C:\ort
+          TARK_WINSPARKLE_DIR: C:\winsparkle
           TARK_NINJA_HOURS: '3.5'
         run: |
           python -m pip install --disable-pip-version-check httplib2==0.22.0 clang==21.1.7
@@ -573,9 +636,10 @@ jobs:
 
   build-5:
     name: Build, stage 5
-    needs: [onnxruntime, build-4]
+    needs: [onnxruntime, winsparkle, build-4]
     if: >-
-      ${{ !cancelled() && needs.onnxruntime.result == 'success' && (
+      ${{ !cancelled() && needs.onnxruntime.result == 'success' &&
+      needs.winsparkle.result == 'success' && (
       (needs.build-4.result == 'success' && needs.build-4.outputs.finished == 'false') ||
       (inputs.resume_run != '' && inputs.resume_stage == 5)) }}
     runs-on: windows-2022
@@ -609,6 +673,11 @@ jobs:
         with:
           name: onnxruntime-win-x64
           path: C:\ort
+      - name: WinSparkle
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: winsparkle-win-x64
+          path: C:\winsparkle
       - name: Work folder
         shell: pwsh
         run: python windows\prepare_workdir.py $env:GITHUB_WORKSPACE C:\tw
@@ -646,6 +715,7 @@ jobs:
         working-directory: C:\tw
         env:
           TARK_ORT_DIR: C:\ort
+          TARK_WINSPARKLE_DIR: C:\winsparkle
           TARK_NINJA_HOURS: '3.5'
         run: |
           python -m pip install --disable-pip-version-check httplib2==0.22.0 clang==21.1.7
@@ -706,9 +776,10 @@ jobs:
 
   build-6:
     name: Build, stage 6
-    needs: [onnxruntime, build-5]
+    needs: [onnxruntime, winsparkle, build-5]
     if: >-
-      ${{ !cancelled() && needs.onnxruntime.result == 'success' && (
+      ${{ !cancelled() && needs.onnxruntime.result == 'success' &&
+      needs.winsparkle.result == 'success' && (
       (needs.build-5.result == 'success' && needs.build-5.outputs.finished == 'false') ||
       (inputs.resume_run != '' && inputs.resume_stage == 6)) }}
     runs-on: windows-2022
@@ -742,6 +813,11 @@ jobs:
         with:
           name: onnxruntime-win-x64
           path: C:\ort
+      - name: WinSparkle
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: winsparkle-win-x64
+          path: C:\winsparkle
       - name: Work folder
         shell: pwsh
         run: python windows\prepare_workdir.py $env:GITHUB_WORKSPACE C:\tw
@@ -779,6 +855,7 @@ jobs:
         working-directory: C:\tw
         env:
           TARK_ORT_DIR: C:\ort
+          TARK_WINSPARKLE_DIR: C:\winsparkle
           TARK_NINJA_HOURS: '3.5'
         run: |
           python -m pip install --disable-pip-version-check httplib2==0.22.0 clang==21.1.7
@@ -839,9 +916,10 @@ jobs:
 
   build-7:
     name: Build, stage 7
-    needs: [onnxruntime, build-6]
+    needs: [onnxruntime, winsparkle, build-6]
     if: >-
-      ${{ !cancelled() && needs.onnxruntime.result == 'success' && (
+      ${{ !cancelled() && needs.onnxruntime.result == 'success' &&
+      needs.winsparkle.result == 'success' && (
       (needs.build-6.result == 'success' && needs.build-6.outputs.finished == 'false') ||
       (inputs.resume_run != '' && inputs.resume_stage == 7)) }}
     runs-on: windows-2022
@@ -875,6 +953,11 @@ jobs:
         with:
           name: onnxruntime-win-x64
           path: C:\ort
+      - name: WinSparkle
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: winsparkle-win-x64
+          path: C:\winsparkle
       - name: Work folder
         shell: pwsh
         run: python windows\prepare_workdir.py $env:GITHUB_WORKSPACE C:\tw
@@ -912,6 +995,7 @@ jobs:
         working-directory: C:\tw
         env:
           TARK_ORT_DIR: C:\ort
+          TARK_WINSPARKLE_DIR: C:\winsparkle
           TARK_NINJA_HOURS: '3.5'
         run: |
           python -m pip install --disable-pip-version-check httplib2==0.22.0 clang==21.1.7
@@ -972,9 +1056,10 @@ jobs:
 
   build-8:
     name: Build, stage 8
-    needs: [onnxruntime, build-7]
+    needs: [onnxruntime, winsparkle, build-7]
     if: >-
-      ${{ !cancelled() && needs.onnxruntime.result == 'success' && (
+      ${{ !cancelled() && needs.onnxruntime.result == 'success' &&
+      needs.winsparkle.result == 'success' && (
       (needs.build-7.result == 'success' && needs.build-7.outputs.finished == 'false') ||
       (inputs.resume_run != '' && inputs.resume_stage == 8)) }}
     runs-on: windows-2022
@@ -1008,6 +1093,11 @@ jobs:
         with:
           name: onnxruntime-win-x64
           path: C:\ort
+      - name: WinSparkle
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: winsparkle-win-x64
+          path: C:\winsparkle
       - name: Work folder
         shell: pwsh
         run: python windows\prepare_workdir.py $env:GITHUB_WORKSPACE C:\tw
@@ -1045,6 +1135,7 @@ jobs:
         working-directory: C:\tw
         env:
           TARK_ORT_DIR: C:\ort
+          TARK_WINSPARKLE_DIR: C:\winsparkle
           TARK_NINJA_HOURS: '3.5'
         run: |
           python -m pip install --disable-pip-version-check httplib2==0.22.0 clang==21.1.7
@@ -1105,9 +1196,10 @@ jobs:
 
   build-9:
     name: Build, stage 9
-    needs: [onnxruntime, build-8]
+    needs: [onnxruntime, winsparkle, build-8]
     if: >-
-      ${{ !cancelled() && needs.onnxruntime.result == 'success' && (
+      ${{ !cancelled() && needs.onnxruntime.result == 'success' &&
+      needs.winsparkle.result == 'success' && (
       (needs.build-8.result == 'success' && needs.build-8.outputs.finished == 'false') ||
       (inputs.resume_run != '' && inputs.resume_stage == 9)) }}
     runs-on: windows-2022
@@ -1141,6 +1233,11 @@ jobs:
         with:
           name: onnxruntime-win-x64
           path: C:\ort
+      - name: WinSparkle
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: winsparkle-win-x64
+          path: C:\winsparkle
       - name: Work folder
         shell: pwsh
         run: python windows\prepare_workdir.py $env:GITHUB_WORKSPACE C:\tw
@@ -1178,6 +1275,7 @@ jobs:
         working-directory: C:\tw
         env:
           TARK_ORT_DIR: C:\ort
+          TARK_WINSPARKLE_DIR: C:\winsparkle
           TARK_NINJA_HOURS: '3.5'
         run: |
           python -m pip install --disable-pip-version-check httplib2==0.22.0 clang==21.1.7
@@ -1238,9 +1336,10 @@ jobs:
 
   build-10:
     name: Build, stage 10
-    needs: [onnxruntime, build-9]
+    needs: [onnxruntime, winsparkle, build-9]
     if: >-
-      ${{ !cancelled() && needs.onnxruntime.result == 'success' && (
+      ${{ !cancelled() && needs.onnxruntime.result == 'success' &&
+      needs.winsparkle.result == 'success' && (
       (needs.build-9.result == 'success' && needs.build-9.outputs.finished == 'false') ||
       (inputs.resume_run != '' && inputs.resume_stage == 10)) }}
     runs-on: windows-2022
@@ -1274,6 +1373,11 @@ jobs:
         with:
           name: onnxruntime-win-x64
           path: C:\ort
+      - name: WinSparkle
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: winsparkle-win-x64
+          path: C:\winsparkle
       - name: Work folder
         shell: pwsh
         run: python windows\prepare_workdir.py $env:GITHUB_WORKSPACE C:\tw
@@ -1311,6 +1415,7 @@ jobs:
         working-directory: C:\tw
         env:
           TARK_ORT_DIR: C:\ort
+          TARK_WINSPARKLE_DIR: C:\winsparkle
           TARK_NINJA_HOURS: '3.5'
         run: |
           python -m pip install --disable-pip-version-check httplib2==0.22.0 clang==21.1.7
@@ -1371,9 +1476,10 @@ jobs:
 
   build-11:
     name: Build, stage 11
-    needs: [onnxruntime, build-10]
+    needs: [onnxruntime, winsparkle, build-10]
     if: >-
-      ${{ !cancelled() && needs.onnxruntime.result == 'success' && (
+      ${{ !cancelled() && needs.onnxruntime.result == 'success' &&
+      needs.winsparkle.result == 'success' && (
       (needs.build-10.result == 'success' && needs.build-10.outputs.finished == 'false') ||
       (inputs.resume_run != '' && inputs.resume_stage == 11)) }}
     runs-on: windows-2022
@@ -1407,6 +1513,11 @@ jobs:
         with:
           name: onnxruntime-win-x64
           path: C:\ort
+      - name: WinSparkle
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: winsparkle-win-x64
+          path: C:\winsparkle
       - name: Work folder
         shell: pwsh
         run: python windows\prepare_workdir.py $env:GITHUB_WORKSPACE C:\tw
@@ -1444,6 +1555,7 @@ jobs:
         working-directory: C:\tw
         env:
           TARK_ORT_DIR: C:\ort
+          TARK_WINSPARKLE_DIR: C:\winsparkle
           TARK_NINJA_HOURS: '3.5'
         run: |
           python -m pip install --disable-pip-version-check httplib2==0.22.0 clang==21.1.7
@@ -1504,9 +1616,10 @@ jobs:
 
   build-12:
     name: Build, stage 12
-    needs: [onnxruntime, build-11]
+    needs: [onnxruntime, winsparkle, build-11]
     if: >-
-      ${{ !cancelled() && needs.onnxruntime.result == 'success' && (
+      ${{ !cancelled() && needs.onnxruntime.result == 'success' &&
+      needs.winsparkle.result == 'success' && (
       (needs.build-11.result == 'success' && needs.build-11.outputs.finished == 'false') ||
       (inputs.resume_run != '' && inputs.resume_stage == 12)) }}
     runs-on: windows-2022
@@ -1540,6 +1653,11 @@ jobs:
         with:
           name: onnxruntime-win-x64
           path: C:\ort
+      - name: WinSparkle
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: winsparkle-win-x64
+          path: C:\winsparkle
       - name: Work folder
         shell: pwsh
         run: python windows\prepare_workdir.py $env:GITHUB_WORKSPACE C:\tw
@@ -1577,6 +1695,7 @@ jobs:
         working-directory: C:\tw
         env:
           TARK_ORT_DIR: C:\ort
+          TARK_WINSPARKLE_DIR: C:\winsparkle
           TARK_NINJA_HOURS: '3.5'
         run: |
           python -m pip install --disable-pip-version-check httplib2==0.22.0 clang==21.1.7
@@ -1637,9 +1756,10 @@ jobs:
 
   build-13:
     name: Build, stage 13
-    needs: [onnxruntime, build-12]
+    needs: [onnxruntime, winsparkle, build-12]
     if: >-
-      ${{ !cancelled() && needs.onnxruntime.result == 'success' && (
+      ${{ !cancelled() && needs.onnxruntime.result == 'success' &&
+      needs.winsparkle.result == 'success' && (
       (needs.build-12.result == 'success' && needs.build-12.outputs.finished == 'false') ||
       (inputs.resume_run != '' && inputs.resume_stage == 13)) }}
     runs-on: windows-2022
@@ -1673,6 +1793,11 @@ jobs:
         with:
           name: onnxruntime-win-x64
           path: C:\ort
+      - name: WinSparkle
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: winsparkle-win-x64
+          path: C:\winsparkle
       - name: Work folder
         shell: pwsh
         run: python windows\prepare_workdir.py $env:GITHUB_WORKSPACE C:\tw
@@ -1710,6 +1835,7 @@ jobs:
         working-directory: C:\tw
         env:
           TARK_ORT_DIR: C:\ort
+          TARK_WINSPARKLE_DIR: C:\winsparkle
           TARK_NINJA_HOURS: '3.5'
         run: |
           python -m pip install --disable-pip-version-check httplib2==0.22.0 clang==21.1.7
@@ -1770,9 +1896,10 @@ jobs:
 
   build-14:
     name: Build, stage 14
-    needs: [onnxruntime, build-13]
+    needs: [onnxruntime, winsparkle, build-13]
     if: >-
-      ${{ !cancelled() && needs.onnxruntime.result == 'success' && (
+      ${{ !cancelled() && needs.onnxruntime.result == 'success' &&
+      needs.winsparkle.result == 'success' && (
       (needs.build-13.result == 'success' && needs.build-13.outputs.finished == 'false') ||
       (inputs.resume_run != '' && inputs.resume_stage == 14)) }}
     runs-on: windows-2022
@@ -1806,6 +1933,11 @@ jobs:
         with:
           name: onnxruntime-win-x64
           path: C:\ort
+      - name: WinSparkle
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: winsparkle-win-x64
+          path: C:\winsparkle
       - name: Work folder
         shell: pwsh
         run: python windows\prepare_workdir.py $env:GITHUB_WORKSPACE C:\tw
@@ -1843,6 +1975,7 @@ jobs:
         working-directory: C:\tw
         env:
           TARK_ORT_DIR: C:\ort
+          TARK_WINSPARKLE_DIR: C:\winsparkle
           TARK_NINJA_HOURS: '3.5'
         run: |
           python -m pip install --disable-pip-version-check httplib2==0.22.0 clang==21.1.7
@@ -1903,9 +2036,10 @@ jobs:
 
   build-15:
     name: Build, stage 15
-    needs: [onnxruntime, build-14]
+    needs: [onnxruntime, winsparkle, build-14]
     if: >-
-      ${{ !cancelled() && needs.onnxruntime.result == 'success' && (
+      ${{ !cancelled() && needs.onnxruntime.result == 'success' &&
+      needs.winsparkle.result == 'success' && (
       (needs.build-14.result == 'success' && needs.build-14.outputs.finished == 'false') ||
       (inputs.resume_run != '' && inputs.resume_stage == 15)) }}
     runs-on: windows-2022
@@ -1939,6 +2073,11 @@ jobs:
         with:
           name: onnxruntime-win-x64
           path: C:\ort
+      - name: WinSparkle
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: winsparkle-win-x64
+          path: C:\winsparkle
       - name: Work folder
         shell: pwsh
         run: python windows\prepare_workdir.py $env:GITHUB_WORKSPACE C:\tw
@@ -1976,6 +2115,7 @@ jobs:
         working-directory: C:\tw
         env:
           TARK_ORT_DIR: C:\ort
+          TARK_WINSPARKLE_DIR: C:\winsparkle
           TARK_NINJA_HOURS: '3.5'
         run: |
           python -m pip install --disable-pip-version-check httplib2==0.22.0 clang==21.1.7
@@ -2036,9 +2176,10 @@ jobs:
 
   build-16:
     name: Build, stage 16
-    needs: [onnxruntime, build-15]
+    needs: [onnxruntime, winsparkle, build-15]
     if: >-
-      ${{ !cancelled() && needs.onnxruntime.result == 'success' && (
+      ${{ !cancelled() && needs.onnxruntime.result == 'success' &&
+      needs.winsparkle.result == 'success' && (
       (needs.build-15.result == 'success' && needs.build-15.outputs.finished == 'false') ||
       (inputs.resume_run != '' && inputs.resume_stage == 16)) }}
     runs-on: windows-2022
@@ -2072,6 +2213,11 @@ jobs:
         with:
           name: onnxruntime-win-x64
           path: C:\ort
+      - name: WinSparkle
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: winsparkle-win-x64
+          path: C:\winsparkle
       - name: Work folder
         shell: pwsh
         run: python windows\prepare_workdir.py $env:GITHUB_WORKSPACE C:\tw
@@ -2109,6 +2255,7 @@ jobs:
         working-directory: C:\tw
         env:
           TARK_ORT_DIR: C:\ort
+          TARK_WINSPARKLE_DIR: C:\winsparkle
           TARK_NINJA_HOURS: '3.5'
         run: |
           python -m pip install --disable-pip-version-check httplib2==0.22.0 clang==21.1.7
@@ -2170,7 +2317,7 @@ jobs:
   complete:
     name: Finished
     needs: [build-1, build-2, build-3, build-4, build-5, build-6, build-7, build-8, build-9, build-10, build-11, build-12, build-13, build-14, build-15, build-16]
-    if: ${{ always() && inputs.verify_run == '' }}
+    if: ${{ always() && inputs.verify_run == '' && !inputs.winsparkle_only }}
     runs-on: ubuntu-24.04
     steps:
       - name: A stage finished the build

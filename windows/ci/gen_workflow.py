@@ -9,8 +9,10 @@ A Chromium build takes far longer than one job may run (6 hours), so it runs
 in stages, as upstream ungoogled-chromium-windows's workflow does (BSD-3):
 each stage builds for 3.5 hours (build.py --ci) and hands the source tree to
 the next as an artifact, until one finishes, packages Tark and checks it
-(windows/ci/verify.ps1). A first job builds ONNX Runtime with the static C
-runtime (windows/ci/build_onnxruntime.ps1), cached between runs.
+(windows/ci/verify.ps1). First jobs build ONNX Runtime with the static C
+runtime (windows/ci/build_onnxruntime.ps1) and WinSparkle without OpenSSL
+(windows/ci/build_winsparkle.ps1), each cached between runs; winsparkle_only
+builds and checks WinSparkle alone.
 
 A failed run can be resumed rather than rebuilt: run the workflow by hand
 with resume_run (the failed run's id) and resume_stage (the stage that
@@ -55,6 +57,10 @@ on:
         description: Only check this finished run's build again (its id); builds nothing
         type: string
         default: ''
+      winsparkle_only:
+        description: Only build and check WinSparkle; builds no Chromium
+        type: boolean
+        default: false
   push:
     branches:
       - feat/w2-windows-parity
@@ -72,7 +78,7 @@ concurrency:
 jobs:
   onnxruntime:
     name: ONNX Runtime (static C runtime)
-    if: ${{{{ inputs.verify_run == '' }}}}
+    if: ${{{{ inputs.verify_run == '' && !inputs.winsparkle_only }}}}
     runs-on: windows-2022
     timeout-minutes: 300
     steps:
@@ -103,6 +109,38 @@ jobs:
         with:
           name: onnxruntime-win-x64
           path: C:\\ort-out
+          retention-days: 7
+
+  winsparkle:
+    name: WinSparkle (no OpenSSL)
+    if: ${{{{ inputs.verify_run == '' }}}}
+    runs-on: windows-2022
+    timeout-minutes: 120
+    steps:
+      - name: Line endings as committed
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.eol lf
+      - uses: {CHECKOUT}
+        with:
+          persist-credentials: false
+      - name: Restore an earlier build
+        id: cache
+        uses: {CACHE}
+        with:
+          path: C:\\winsparkle-out
+          key: winsparkle-0.9.4-no-openssl-${{{{ hashFiles('windows/ci/build_winsparkle.ps1', 'windows/ci/winsparkle-patches/*') }}}}
+      - name: Build WinSparkle 0.9.4
+        if: steps.cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: windows\\ci\\build_winsparkle.ps1 -Out C:\\winsparkle-out
+      - name: Check it needs no C runtime and holds no OpenSSL
+        shell: pwsh
+        run: windows\\ci\\build_winsparkle.ps1 -Out C:\\winsparkle-out -CheckOnly
+      - uses: {UPLOAD}
+        with:
+          name: winsparkle-win-x64
+          path: C:\\winsparkle-out
           retention-days: 7
 '''
 
@@ -141,6 +179,11 @@ STAGE = '''
         with:
           name: onnxruntime-win-x64
           path: C:\\ort
+      - name: WinSparkle
+        uses: {download}
+        with:
+          name: winsparkle-win-x64
+          path: C:\\winsparkle
       - name: Work folder
         shell: pwsh
         run: python windows\\prepare_workdir.py $env:GITHUB_WORKSPACE C:\\tw
@@ -150,6 +193,7 @@ STAGE = '''
         working-directory: C:\\tw
         env:
           TARK_ORT_DIR: C:\\ort
+          TARK_WINSPARKLE_DIR: C:\\winsparkle
           TARK_NINJA_HOURS: '{hours}'
         run: |
           python -m pip install --disable-pip-version-check httplib2==0.22.0 clang==21.1.7
@@ -243,7 +287,7 @@ COMPLETE = '''
   complete:
     name: Finished
     needs: [{needs}]
-    if: ${{{{ always() && inputs.verify_run == '' }}}}
+    if: ${{{{ always() && inputs.verify_run == '' && !inputs.winsparkle_only }}}}
     runs-on: ubuntu-24.04
     steps:
       - name: A stage finished the build
@@ -300,12 +344,13 @@ def main():
     text = HEADER
     for n in range(1, STAGES + 1):
         if n == 1:
-            prev = 'onnxruntime'
-            cond = ("    if: ${{ !(inputs.resume_run != '' && inputs.resume_stage > 1) }}\n")
+            prev = '[onnxruntime, winsparkle]'
+            cond = ("    if: ${{ !inputs.winsparkle_only && !(inputs.resume_run != '' && inputs.resume_stage > 1) }}\n")
         else:
-            prev = f'[onnxruntime, build-{n - 1}]'
+            prev = f'[onnxruntime, winsparkle, build-{n - 1}]'
             cond = ("    if: >-\n"
-                    "      ${{ !cancelled() && needs.onnxruntime.result == 'success' && (\n"
+                    "      ${{ !cancelled() && needs.onnxruntime.result == 'success' &&\n"
+                    "      needs.winsparkle.result == 'success' && (\n"
                     f"      (needs.build-{n - 1}.result == 'success' && needs.build-{n - 1}.outputs.finished == 'false') ||\n"
                     f"      (inputs.resume_run != '' && inputs.resume_stage == {n})) }}}}\n")
         resume = '' if n == 1 else RESUME.format(download=DOWNLOAD, n=n)
