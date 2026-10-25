@@ -66,7 +66,7 @@
        registry);
 --- /dev/null
 +++ b/chrome/browser/tark_captions_android/BUILD.gn
-@@ -0,0 +1,47 @@
+@@ -0,0 +1,48 @@
 +# Copyright 2026 The Tark Authors
 +# Use of this source code is governed by a BSD-style license that can be
 +# found in the LICENSE file.
@@ -95,6 +95,7 @@
 +if (!is_android) {
 +  test("tark_captions_android_unittests") {
 +    sources = [
++      "caption_downloads_unittest.cc",
 +      "model_files_unittest.cc",
 +      "tab_captions_unittest.cc",
 +    ]
@@ -116,7 +117,7 @@
 +}
 --- /dev/null
 +++ b/chrome/browser/tark_captions_android/caption_downloads.cc
-@@ -0,0 +1,461 @@
+@@ -0,0 +1,557 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -135,6 +136,7 @@
 +#include "base/task/thread_pool.h"
 +#include "base/values.h"
 +#include "chrome/browser/browser_process.h"
++#include "chrome/browser/net/system_network_context_manager.h"
 +#include "components/prefs/pref_registry_simple.h"
 +#include "components/prefs/pref_service.h"
 +#include "components/prefs/scoped_user_pref_update.h"
@@ -143,6 +145,7 @@
 +#include "services/network/public/cpp/resource_request.h"
 +#include "services/network/public/cpp/shared_url_loader_factory.h"
 +#include "services/network/public/cpp/simple_url_loader.h"
++#include "services/network/public/mojom/network_context.mojom.h"
 +#include "services/network/public/mojom/fetch_api.mojom-shared.h"
 +#include "url/gurl.h"
 +
@@ -153,7 +156,6 @@
 +using tark_xlit::ShouldStartNow;
 +
 +constexpr base::TimeDelta kTimeout = base::Minutes(30);
-+constexpr base::TimeDelta kRetryDelay = base::Seconds(30);
 +// For android/captions/e2e/run.py only: where the files are served instead
 +// of gettarka.com (read from the command-line file on a debuggable device).
 +constexpr char kBaseUrlSwitch[] = "tark-captions-models-url";
@@ -237,6 +239,7 @@
 +  registry->RegisterIntegerPref(kStylePref, 0);
 +  registry->RegisterStringPref(kLanguagePref, std::string());
 +  registry->RegisterStringPref(kTargetPref, std::string());
++  registry->RegisterDictionaryPref(kOwnersPref);
 +}
 +
 +// static
@@ -245,7 +248,9 @@
 +  return *downloads;
 +}
 +
-+CaptionDownloads::CaptionDownloads() : dir_(CaptionsDirectory()) {
++CaptionDownloads::CaptionDownloads()
++    : dir_(CaptionsDirectory()),
++      owners_(g_browser_process->local_state()->GetDict(kOwnersPref)) {
 +  net::NetworkChangeNotifier::AddNetworkChangeObserver(this);
 +  base::ThreadPool::PostTaskAndReplyWithResult(
 +      FROM_HERE, {base::MayBlock(), base::TaskPriority::USER_VISIBLE},
@@ -278,16 +283,19 @@
 +    }
 +  }
 +  scanned_ = true;
-+  // A "Download now" that was not finished resumes.
-+  // Copied first: Request() rewrites this list (SetCellularOk).
-+  std::vector<std::string> resume;
++  // A download Tark stopped in the middle (a restart) resumes: every unit a
++  // feature still wants and that is not in place, with its "Download now".
++  // Copied first: Enqueue() rewrites this list (SetCellularOk).
++  std::vector<std::string> cellular_ok;
 +  for (const base::Value& unit : g_browser_process->local_state()->GetList(kCellularOkPref)) {
 +    if (unit.is_string()) {
-+      resume.push_back(unit.GetString());
++      cellular_ok.push_back(unit.GetString());
 +    }
 +  }
-+  for (const std::string& unit : resume) {
-+    Request(unit, /*now=*/true);
++  for (const Resume& resume :
++       UnitsToResume(owners_, cellular_ok, [&](const std::string& u) { return Ready(u); })) {
++    LOG(WARNING) << "tark captions: resuming " << resume.unit;
++    Enqueue(resume.unit, resume.now);
 +  }
 +  MaybeDownloadNext();
 +}
@@ -299,30 +307,61 @@
 +  return it != present_.end() && UnitReady(unit, it->second) && !use_.Removing(unit);
 +}
 +
-+void CaptionDownloads::Request(std::string_view unit, bool now) {
++void CaptionDownloads::Request(std::string_view unit, bool now, Owner owner) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  if (FilesOf(unit).empty()) {
++    return;
++  }
++  SetWantedBy(unit, owner, true);
++  // Removed while in use and wanted again before the release: its files are
++  // still here, so it is ready again with nothing fetched.
++  use_.CancelRemove(unit);
++  Enqueue(unit, now);
++}
++
++void CaptionDownloads::Enqueue(std::string_view unit, bool now) {
 +  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
 +  if (FilesOf(unit).empty()) {
 +    return;
 +  }
 +  for (const std::string& u : UnitsToFetch(unit)) {
-+    if (now) {
-+      SetCellularOk(u, true);
-+    }
 +    failed_.erase(u);
-+    // Being removed (its files still on disk): requested again once gone.
-+    if (!Ready(u) && !use_.Removing(u) && std::ranges::find(queue_, u) == queue_.end()) {
-+      queue_.push_back(u);
++  }
++  // A ready unit is never fetched again (voice asking for the detector that
++  // captions already has); one being removed is not queued.
++  for (std::string& u : UnitsToQueue(
++           unit, [&](const std::string& x) { return Ready(x); },
++           [&](const std::string& x) { return use_.Removing(x); }, queue_)) {
++    queue_.push_back(std::move(u));
++  }
++  if (now) {
++    for (const std::string& u : UnitsToFetch(unit)) {
++      if (std::ranges::find(queue_, u) != queue_.end()) {
++        SetCellularOk(u, true);
++      }
 +    }
 +  }
 +  g_browser_process->local_state()->CommitPendingWrite();
 +  // The person asked again: a spent budget starts over.
-+  attempts_.Reset();
++  failures_ = 0;
++  refused_ = false;
 +  retry_timer_.Stop();
 +  Notify(std::string(unit));
 +  MaybeDownloadNext();
 +}
 +
 +void CaptionDownloads::Cancel(std::string_view unit) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  // Captions no longer want it; a download another feature wants goes on.
++  SetWantedBy(unit, Owner::kCaptions, false);
++  if (owners_.Wanted(unit)) {
++    Notify(std::string(unit));
++    return;
++  }
++  Abort(unit);
++}
++
++void CaptionDownloads::Abort(std::string_view unit) {
 +  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
 +  std::erase(queue_, std::string(unit));
 +  SetCellularOk(unit, false);
@@ -337,17 +376,35 @@
 +
 +void CaptionDownloads::Remove(std::string_view unit) {
 +  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
-+  Cancel(unit);
-+  if (use_.RequestRemove(unit)) {
++  const Removal removal = DecideRemoval(unit, owners_, use_);
++  if (removal == Removal::kKeep) {
++    // Another feature still wants it (the detector, for captions or voice):
++    // its files and any download of it stay.
++    Notify(std::string(unit));
++    return;
++  }
++  Abort(unit);
++  if (removal == Removal::kNow) {
 +    DeleteUnit(std::string(unit));
 +  } else {
 +    Notify(std::string(unit));  // in use: tabs see it is no longer ready
 +  }
 +}
 +
++void CaptionDownloads::SetWantedBy(std::string_view unit, Owner owner, bool wanted) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  if (owners_.SetWanted(unit, owner, wanted)) {
++    g_browser_process->local_state()->SetDict(kOwnersPref, owners_.ToDict());
++  }
++}
++
 +void CaptionDownloads::SetInUse(std::string_view unit, bool in_use) {
 +  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
-+  if (use_.SetInUse(unit, in_use)) {
++  if (in_use) {
++    use_.SetInUse(unit, true);
++    return;
++  }
++  if (ReleaseDeletes(unit, owners_, use_)) {
 +    DeleteUnit(std::string(unit));
 +  }
 +}
@@ -389,19 +446,21 @@
 +  const bool queued = std::ranges::any_of(UnitsToFetch(unit), [&](const std::string& u) {
 +    return std::ranges::find(queue_, u) != queue_.end();
 +  });
-+  if (failed_.contains(unit) || failed_.contains("common")) {
++  const std::vector<std::string> fetch = UnitsToFetch(unit);
++  if (std::ranges::any_of(fetch, [&](const std::string& u) { return failed_.contains(u); })) {
 +    state.state = State::kFailed;
 +  } else if (queued && current_ && std::ranges::contains(UnitsToFetch(unit), current_->unit)) {
 +    state.state = State::kDownloading;
 +  } else if (queued) {
 +    state.state = State::kWaitingForWifi;
++    state.retrying = retry_timer_.IsRunning();
 +  }
 +  for (const std::string& u : UnitsToFetch(unit)) {
 +    if (!Ready(u)) {
 +      state.bytes += present_bytes(u);
 +    }
 +  }
-+  if (current_ && (current_->unit == unit || current_->unit == "common")) {
++  if (current_ && std::ranges::contains(fetch, current_->unit)) {
 +    state.bytes += current_bytes_;
 +  }
 +  return state;
@@ -410,7 +469,7 @@
 +std::map<std::string, int64_t> CaptionDownloads::ReadyUnits() const {
 +  std::map<std::string, int64_t> units;
 +  for (const auto& [unit, files] : present_) {
-+    if (unit != "common" && Ready(unit)) {
++    if (unit != "common" && unit != kLanguageIdUnit && Ready(unit)) {
 +      int64_t size = 0;
 +      for (const CaptionFile* file : FilesOf(unit)) {
 +        size += file->size;
@@ -440,12 +499,48 @@
 +}
 +
 +void CaptionDownloads::OnNetworkChanged(net::NetworkChangeNotifier::ConnectionType type) {
-+  MaybeDownloadNext();
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  if (type == net::NetworkChangeNotifier::CONNECTION_NONE ||
++      (current_ && type == fetch_network_)) {
++    // None: the fetch in flight fails and waits for the next network. The
++    // same kind of network as the fetch's: it goes on.
++    return;
++  }
++  // A new network: a fetch still on the old one starts again on a fresh
++  // loader, the budget starts over, and connections pinned to the old network
++  // (a QUIC session: ERR_QUIC_PROTOCOL_ERROR after Wi-Fi came back) are
++  // closed first.
++  if (current_) {
++    const std::string unit(current_->unit);
++    ++generation_;  // its .part file is removed at the next start
++    loader_.reset();
++    current_ = nullptr;
++    current_bytes_ = 0;
++    Notify(unit);
++  }
++  failures_ = 0;
++  failed_.clear();
++  retry_timer_.Stop();
++  RestartAfterClosingConnections();
++}
++
++void CaptionDownloads::RestartAfterClosingConnections() {
++  SystemNetworkContextManager* manager = SystemNetworkContextManager::GetInstance();
++  if (!manager) {
++    MaybeDownloadNext();
++    return;
++  }
++  manager->GetContext()->CloseAllConnections(
++      base::BindOnce(&CaptionDownloads::MaybeDownloadNext, weak_factory_.GetWeakPtr()));
++}
++
++bool CaptionDownloads::GaveUp() const {
++  return refused_ || (failures_ > 0 && !RetryDelay(failures_));
 +}
 +
 +void CaptionDownloads::MaybeDownloadNext() {
 +  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
-+  if (!scanned_ || current_ || retry_timer_.IsRunning() || attempts_.exhausted()) {
++  if (!scanned_ || current_ || retry_timer_.IsRunning() || GaveUp()) {
 +    return;
 +  }
 +  std::vector<std::string> done;
@@ -485,6 +580,7 @@
 +    return;
 +  }
 +  current_bytes_ = 0;
++  fetch_network_ = net::NetworkChangeNotifier::GetConnectionType();
 +  const uint64_t generation = ++generation_;
 +  base::CreateDirectory(UnitDir(unit));
 +  auto request = std::make_unique<network::ResourceRequest>();
@@ -509,7 +605,7 @@
 +            self->Notify(std::string(self->current_->unit));
 +          }
 +          self->current_ = nullptr;
-+          self->attempts_.Exhaust();
++          self->refused_ = true;
 +        }
 +      },
 +      weak_factory_.GetWeakPtr()));
@@ -567,9 +663,10 @@
 +    return;
 +  }
 +  LOG(WARNING) << "tark captions: " << file->name << " not accepted";
-+  if (attempts_.TryAgain()) {
-+    retry_timer_.Start(FROM_HERE, kRetryDelay,
-+                       base::BindOnce(&CaptionDownloads::MaybeDownloadNext,
++  if (const std::optional<base::TimeDelta> delay = RetryDelay(++failures_)) {
++    // Again on fresh connections: a broken one (QUIC) is not reused.
++    retry_timer_.Start(FROM_HERE, *delay,
++                       base::BindOnce(&CaptionDownloads::RestartAfterClosingConnections,
 +                                      weak_factory_.GetWeakPtr()));
 +  } else {
 +    failed_[unit] = true;
@@ -580,7 +677,7 @@
 +}  // namespace tark_captions
 --- /dev/null
 +++ b/chrome/browser/tark_captions_android/caption_downloads.h
-@@ -0,0 +1,128 @@
+@@ -0,0 +1,160 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -623,12 +720,17 @@
 +inline constexpr char kLanguagePref[] = "tark.captions.language";
 +// Translate's target: "" (off), "en", "hi", "ta".
 +inline constexpr char kTargetPref[] = "tark.captions.target";
++// Which features want each unit (UnitOwners): a unit captions and voice
++// search share stays until neither wants it.
++inline constexpr char kOwnersPref[] = "tark.captions.owners";
 +
 +// Tark for Android's live captions: downloads a language's model files (and
 +// "common", Silero VAD) into the app's data directory when the person turns
 +// captions on for it, on Wi-Fi unless they chose "Download now"; three tries,
 +// no redirects, a file that does not match is deleted. One per browser
 +// process, on the UI thread. Nothing is fetched until the person asks.
++// Voice search shares the spoken-language detector (kLanguageIdUnit) with
++// captions: one copy, kept while either feature wants it.
 +class CaptionDownloads : public net::NetworkChangeNotifier::NetworkChangeObserver {
 + public:
 +  enum class State { kMissing, kWaitingForWifi, kDownloading, kReady, kFailed };
@@ -636,6 +738,9 @@
 +    State state = State::kMissing;
 +    int64_t bytes = 0;  // downloaded so far (kDownloading)
 +    int64_t total = 0;  // the unit's size, "common" included while missing
++    // kWaitingForWifi only: not waiting for Wi-Fi but for the next try after
++    // a failure (RetryDelay).
++    bool retrying = false;
 +  };
 +
 +  class Observer : public base::CheckedObserver {
@@ -650,15 +755,25 @@
 +  CaptionDownloads(const CaptionDownloads&) = delete;
 +  CaptionDownloads& operator=(const CaptionDownloads&) = delete;
 +
-+  // The person turned captions on in `unit`'s language: its files (and
-+  // common's), on Wi-Fi, or now on any network.
-+  void Request(std::string_view unit, bool now);
++  // `owner` wants `unit` (captions: the person turned captions on in its
++  // language): its files (and common's), on Wi-Fi, or now on any network.
++  // Nothing is fetched for a unit already in place.
++  void Request(std::string_view unit, bool now, Owner owner = Owner::kCaptions);
++  // Captions no longer want `unit` (turned off before it arrived): its
++  // download stops unless another feature wants it.
 +  void Cancel(std::string_view unit);
-+  // Deletes the unit's files (Settings); while it is captioning, when it is
-+  // released.
++  // Deletes the unit's files (Settings) unless a feature still wants it
++  // (SetWantedBy); while it is captioning, when it is released.
 +  void Remove(std::string_view unit);
++  // Whether `owner` wants `unit`; kept in local state (kOwnersPref). A
++  // feature that turns a unit off says so before Remove().
++  void SetWantedBy(std::string_view unit, Owner owner, bool wanted);
++  bool WantedBy(std::string_view unit, Owner owner) const {
++    return owners_.WantedBy(unit, owner);
++  }
 +  UnitState State(std::string_view unit) const;
-+  // The units whose files are all in place (Settings), with their sizes.
++  // The caption and translation units whose files are all in place
++  // (Settings), with their sizes; not "common" or the language detector.
 +  std::map<std::string, int64_t> ReadyUnits() const;
 +  // Engines hold their unit while they run.
 +  void SetInUse(std::string_view unit, bool in_use);
@@ -679,9 +794,17 @@
 +  void OnNetworkChanged(net::NetworkChangeNotifier::ConnectionType type) override;
 +
 +  void OnScanned(std::map<std::string, std::vector<std::string>> present);
++  // Queues what `unit` still needs; no owner changes.
++  void Enqueue(std::string_view unit, bool now);
 +  bool Ready(std::string_view unit) const;
 +  // Starts the next missing file of the first queued unit if allowed.
 +  void MaybeDownloadNext();
++  // Closes the system network context's connections, then MaybeDownloadNext.
++  void RestartAfterClosingConnections();
++  // Stops `unit`'s download, whoever wants it.
++  void Abort(std::string_view unit);
++  // Retries are spent (RetryDelay), or a redirect was refused.
++  bool GaveUp() const;
 +  void OnProgress(uint64_t current);
 +  void OnDownloaded(uint64_t generation, const CaptionFile* file, base::FilePath part);
 +  void OnVerified(uint64_t generation, const CaptionFile* file, bool ok);
@@ -699,9 +822,15 @@
 +  const CaptionFile* current_ = nullptr;
 +  int64_t current_bytes_ = 0;
 +  uint64_t generation_ = 0;
-+  tark_xlit::Attempts attempts_;
++  // Failures in a row (RetryDelay); a request or a network change resets it.
++  int failures_ = 0;
++  bool refused_ = false;
++  // The kind of network the fetch in flight started on.
++  net::NetworkChangeNotifier::ConnectionType fetch_network_ =
++      net::NetworkChangeNotifier::CONNECTION_UNKNOWN;
 +  base::OneShotTimer retry_timer_;
 +  UnitUse use_;
++  UnitOwners owners_;
 +  base::ObserverList<Observer> observers_;
 +  base::WeakPtrFactory<CaptionDownloads> weak_factory_{this};
 +};
@@ -711,7 +840,7 @@
 +#endif  // CHROME_BROWSER_TARK_CAPTIONS_ANDROID_CAPTION_DOWNLOADS_H_
 --- /dev/null
 +++ b/chrome/browser/tark_captions_android/model_files.cc
-@@ -0,0 +1,247 @@
+@@ -0,0 +1,386 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -720,6 +849,7 @@
 +
 +#include <algorithm>
 +#include <optional>
++#include <utility>
 +
 +#include "base/files/file_enumerator.h"
 +#include "base/files/file_path.h"
@@ -796,8 +926,9 @@
 +}
 +
 +std::vector<std::string> UnitsToFetch(std::string_view unit) {
-+  // Translation models need no voice detector.
-+  if (unit.starts_with("tr_")) {
++  // Translation models need no voice detector; the language detector has its
++  // own copy (desktop's unit, published with the same files).
++  if (unit.starts_with("tr_") || unit == kLanguageIdUnit) {
 +    return {std::string(unit)};
 +  }
 +  std::vector<std::string> units = {kCommon};
@@ -918,6 +1049,136 @@
 +  return again;
 +}
 +
++std::vector<std::string> UnitsToQueue(std::string_view unit,
++                                      base::FunctionRef<bool(const std::string&)> ready,
++                                      base::FunctionRef<bool(const std::string&)> removing,
++                                      const std::deque<std::string>& queue) {
++  std::vector<std::string> out;
++  for (const std::string& u : UnitsToFetch(unit)) {
++    if (!ready(u) && !removing(u) && std::ranges::find(queue, u) == queue.end()) {
++      out.push_back(u);
++    }
++  }
++  return out;
++}
++
++namespace {
++
++constexpr std::pair<Owner, std::string_view> kOwnerNames[] = {
++    {Owner::kCaptions, "captions"},
++    {Owner::kVoice, "voice"},
++};
++
++}  // namespace
++
++UnitOwners::UnitOwners() = default;
++UnitOwners::UnitOwners(const UnitOwners&) = default;
++UnitOwners& UnitOwners::operator=(const UnitOwners&) = default;
++UnitOwners::~UnitOwners() = default;
++
++UnitOwners::UnitOwners(const base::DictValue& saved) {
++  for (const auto [unit, names] : saved) {
++    if (!names.is_list()) {
++      continue;
++    }
++    for (const base::Value& name : names.GetList()) {
++      for (const auto& [owner, owner_name] : kOwnerNames) {
++        if (name.is_string() && name.GetString() == owner_name) {
++          SetWanted(unit, owner, true);
++        }
++      }
++    }
++  }
++}
++
++bool UnitOwners::SetWanted(std::string_view unit, Owner owner, bool wanted) {
++  auto it = owners_.find(unit);
++  if (wanted) {
++    if (it == owners_.end()) {
++      it = owners_.emplace(std::string(unit), std::set<Owner>()).first;
++    }
++    return it->second.insert(owner).second;
++  }
++  if (it == owners_.end() || !it->second.erase(owner)) {
++    return false;
++  }
++  if (it->second.empty()) {
++    owners_.erase(it);
++  }
++  return true;
++}
++
++bool UnitOwners::WantedBy(std::string_view unit, Owner owner) const {
++  auto it = owners_.find(unit);
++  return it != owners_.end() && it->second.contains(owner);
++}
++
++bool UnitOwners::Wanted(std::string_view unit) const {
++  return owners_.find(unit) != owners_.end();
++}
++
++std::vector<std::string> UnitOwners::Units() const {
++  std::vector<std::string> units;
++  for (const auto& [unit, owners] : owners_) {
++    units.push_back(unit);
++  }
++  return units;
++}
++
++base::DictValue UnitOwners::ToDict() const {
++  base::DictValue dict;
++  for (const auto& [unit, owners] : owners_) {
++    base::ListValue names;
++    for (const auto& [owner, owner_name] : kOwnerNames) {
++      if (owners.contains(owner)) {
++        names.Append(owner_name);
++      }
++    }
++    dict.Set(unit, std::move(names));
++  }
++  return dict;
++}
++
++Removal DecideRemoval(std::string_view unit, const UnitOwners& owners, UnitUse& use) {
++  if (owners.Wanted(unit)) {
++    return Removal::kKeep;
++  }
++  return use.RequestRemove(unit) ? Removal::kNow : Removal::kOnRelease;
++}
++
++std::vector<Resume> UnitsToResume(const UnitOwners& owners,
++                                  const std::vector<std::string>& cellular_ok,
++                                  base::FunctionRef<bool(const std::string&)> ready) {
++  std::vector<Resume> out;
++  auto add = [&](const std::string& unit) {
++    if (ready(unit) || FilesOf(unit).empty() ||
++        std::ranges::any_of(out, [&](const Resume& r) { return r.unit == unit; })) {
++      return;
++    }
++    out.push_back({unit, std::ranges::find(cellular_ok, unit) != cellular_ok.end()});
++  };
++  for (const std::string& unit : cellular_ok) {
++    add(unit);
++  }
++  for (const std::string& unit : owners.Units()) {
++    add(unit);
++  }
++  return out;
++}
++
++std::optional<base::TimeDelta> RetryDelay(int failures) {
++  constexpr base::TimeDelta kDelays[] = {base::Seconds(5), base::Seconds(15), base::Seconds(45),
++                                         base::Minutes(2), base::Minutes(5)};
++  if (failures < 1 || failures > static_cast<int>(std::size(kDelays))) {
++    return std::nullopt;
++  }
++  return kDelays[failures - 1];
++}
++
++bool ReleaseDeletes(std::string_view unit, const UnitOwners& owners, UnitUse& use) {
++  return use.SetInUse(unit, false) && !owners.Wanted(unit);
++}
++
 +UnitUse::UnitUse() = default;
 +UnitUse::~UnitUse() = default;
 +
@@ -958,10 +1219,17 @@
 +  return pending_remove_.contains(unit);
 +}
 +
++void UnitUse::CancelRemove(std::string_view unit) {
++  auto it = pending_remove_.find(unit);
++  if (it != pending_remove_.end()) {
++    pending_remove_.erase(it);
++  }
++}
++
 +}  // namespace tark_captions
 --- /dev/null
 +++ b/chrome/browser/tark_captions_android/model_files.h
-@@ -0,0 +1,109 @@
+@@ -0,0 +1,186 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -980,6 +1248,8 @@
 +
 +#include "base/containers/span.h"
 +#include "base/functional/function_ref.h"
++#include "base/time/time.h"
++#include "base/values.h"
 +
 +namespace base {
 +class FilePath;
@@ -1004,7 +1274,12 @@
 +std::vector<const CaptionFile*> FilesOf(std::string_view unit,
 +                                        base::span<const CaptionFile> table = AllFiles());
 +
-+// What turning `unit` on downloads: "common" (Silero VAD) and the unit.
++// The spoken-language detector (lid.onnx, its labels and its own copy of
++// Silero VAD), shared by voice search and captions: one copy on disk.
++inline constexpr char kLanguageIdUnit[] = "language_id";
++
++// What turning `unit` on downloads: "common" (Silero VAD) and the unit. A
++// translation model and the detector bring what they need themselves.
 +std::vector<std::string> UnitsToFetch(std::string_view unit);
 +
 +// The translation units a caption in `source` ("hi", "ta", "en", "es") needs
@@ -1051,6 +1326,74 @@
 +                                        base::FunctionRef<bool(const std::string&)> missing,
 +                                        base::FunctionRef<bool(const std::string&)> removing);
 +
++// Of UnitsToFetch(unit), the units a request queues: not ready, not waiting
++// to be removed, not queued already. A unit that is ready is never fetched
++// again, whoever asks for it.
++std::vector<std::string> UnitsToQueue(std::string_view unit,
++                                      base::FunctionRef<bool(const std::string&)> ready,
++                                      base::FunctionRef<bool(const std::string&)> removing,
++                                      const std::deque<std::string>& queue);
++
++// The features that download units. A unit may be wanted by both (the
++// detector: voice search and captions), and stays while either wants it.
++enum class Owner { kCaptions, kVoice };
++
++// Which features want each unit, kept in local state (kOwnersPref) as
++// {"<unit>": ["captions", "voice"]}. A unit no feature wants may be deleted.
++class UnitOwners {
++ public:
++  UnitOwners();
++  // Unknown names and malformed entries are dropped.
++  explicit UnitOwners(const base::DictValue& saved);
++  UnitOwners(const UnitOwners&);
++  UnitOwners& operator=(const UnitOwners&);
++  ~UnitOwners();
++
++  // Returns whether this changed anything.
++  bool SetWanted(std::string_view unit, Owner owner, bool wanted);
++  bool WantedBy(std::string_view unit, Owner owner) const;
++  // By any feature.
++  bool Wanted(std::string_view unit) const;
++  // Every unit some feature wants.
++  std::vector<std::string> Units() const;
++  base::DictValue ToDict() const;
++
++ private:
++  std::map<std::string, std::set<Owner>, std::less<>> owners_;
++};
++
++class UnitUse;
++
++// After a start: the units to queue again, each with whether it may use
++// mobile data. A unit a feature still wants and that is not in place resumes
++// (an interrupted download; ScanUnit removed its .part files), with the
++// person's "Download now" if they chose it; so does a pending "Download now".
++struct Resume {
++  std::string unit;
++  bool now = false;
++  bool operator==(const Resume&) const = default;
++};
++std::vector<Resume> UnitsToResume(const UnitOwners& owners,
++                                  const std::vector<std::string>& cellular_ok,
++                                  base::FunctionRef<bool(const std::string&)> ready);
++
++// How long to wait before trying a failed file again: 5 s, 15 s, 45 s, 2 min
++// and 5 min after the 1st to 5th failure in a row; then none ("Couldn't
++// download"). A request or a network change starts the count over.
++std::optional<base::TimeDelta> RetryDelay(int failures);
++
++// What CaptionDownloads::Remove() does with a unit.
++enum class Removal {
++  kKeep,       // another feature still wants it: nothing is deleted
++  kNow,        // deleted now
++  kOnRelease,  // in use: deleted when the engine lets it go
++};
++Removal DecideRemoval(std::string_view unit, const UnitOwners& owners, UnitUse& use);
++
++// An engine lets `unit` go: whether its pending removal deletes it now. A
++// unit some feature wants again (asked for after Remove) is kept.
++bool ReleaseDeletes(std::string_view unit, const UnitOwners& owners, UnitUse& use);
++
 +class UnitUse {
 + public:
 +  UnitUse();
@@ -1062,6 +1405,8 @@
 +  bool RequestRemove(std::string_view unit);
 +  // Whether `unit` waits to be removed (no longer ready to the person).
 +  bool Removing(std::string_view unit) const;
++  // A feature wants `unit` again: its pending removal is dropped.
++  void CancelRemove(std::string_view unit);
 +
 + private:
 +  std::map<std::string, int, std::less<>> in_use_;
@@ -1770,6 +2115,275 @@
 +TEST(CaptionStyleTest, PrefWins) {
 +  EXPECT_EQ(StyleForDevice(2200000, 7600, /*pref=*/1), Style::kWordByWord);
 +  EXPECT_EQ(StyleForDevice(3300000, 11500, /*pref=*/2), Style::kPhrase);
++}
++
++}  // namespace
++}  // namespace tark_captions
+--- /dev/null
++++ b/chrome/browser/tark_captions_android/caption_downloads_unittest.cc
+@@ -0,0 +1,266 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// CaptionDownloads' sharing rules: the language detector (language_id) is
++// one unit on disk that captions and voice search both may want. The
++// decisions live in model_files (UnitOwners, DecideRemoval, UnitsToQueue,
++// UnitsToFetch), which CaptionDownloads calls as they are tested here; the
++// class itself needs a browser and does not build for the build machine.
++
++#include <deque>
++#include <optional>
++#include <set>
++#include <string>
++#include <vector>
++
++#include "base/values.h"
++#include "chrome/browser/tark_captions_android/model_files.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace tark_captions {
++namespace {
++
++constexpr char kLidSha256[] = "7cfabee2653ac9d6e80f9f766514dedb0983fc6cd6e078b499fc6d644164f0a4";
++
++// Plays CaptionDownloads' part: the units on disk and the queue of fetches.
++struct Disk {
++  std::set<std::string> ready;
++  std::deque<std::string> queue;
++  UnitOwners owners;
++  UnitUse use;
++
++  // CaptionDownloads::Request.
++  void Request(const std::string& unit, Owner owner) {
++    owners.SetWanted(unit, owner, true);
++    for (std::string& u : UnitsToQueue(
++             unit, [&](const std::string& x) { return ready.contains(x); },
++             [&](const std::string& x) { return use.Removing(x); }, queue)) {
++      queue.push_back(std::move(u));
++    }
++  }
++
++  // The queue's fetches finish.
++  void Download() {
++    for (const std::string& unit : queue) {
++      ready.insert(unit);
++    }
++    queue.clear();
++  }
++
++  // CaptionDownloads::Request cancels a removal waiting for the release.
++  void RequestAgain(const std::string& unit, Owner owner) {
++    owners.SetWanted(unit, owner, true);
++    use.CancelRemove(unit);
++    Request(unit, owner);
++  }
++
++  // CaptionDownloads::Remove.
++  void Remove(const std::string& unit) {
++    if (DecideRemoval(unit, owners, use) == Removal::kNow) {
++      ready.erase(unit);
++    }
++  }
++
++  // CaptionDownloads::SetInUse(unit, false).
++  void Release(const std::string& unit) {
++    if (ReleaseDeletes(unit, owners, use)) {
++      ready.erase(unit);
++    }
++  }
++};
++
++// Plan Review Focus 4: turning detection off while captions uses the
++// detector leaves its files, and captions keeps working.
++TEST(CaptionDownloadsTest, RemoveKeepsUnitCaptionsUses) {
++  Disk disk;
++  disk.Request(kLanguageIdUnit, Owner::kCaptions);
++  disk.Request(kLanguageIdUnit, Owner::kVoice);
++  disk.Download();
++  ASSERT_TRUE(disk.ready.contains(kLanguageIdUnit));
++
++  disk.owners.SetWanted(kLanguageIdUnit, Owner::kVoice, false);
++  EXPECT_EQ(DecideRemoval(kLanguageIdUnit, disk.owners, disk.use), Removal::kKeep);
++  disk.Remove(kLanguageIdUnit);
++  EXPECT_TRUE(disk.ready.contains(kLanguageIdUnit));  // State: kReady
++  EXPECT_TRUE(disk.owners.WantedBy(kLanguageIdUnit, Owner::kCaptions));
++  EXPECT_FALSE(disk.owners.WantedBy(kLanguageIdUnit, Owner::kVoice));
++  // Nothing waits to delete it later either.
++  EXPECT_FALSE(disk.use.Removing(kLanguageIdUnit));
++}
++
++TEST(CaptionDownloadsTest, RemoveDeletesWhenNoOwner) {
++  Disk disk;
++  disk.Request(kLanguageIdUnit, Owner::kVoice);
++  disk.Download();
++  disk.owners.SetWanted(kLanguageIdUnit, Owner::kVoice, false);
++  EXPECT_FALSE(disk.owners.Wanted(kLanguageIdUnit));
++  disk.Remove(kLanguageIdUnit);
++  EXPECT_FALSE(disk.ready.contains(kLanguageIdUnit));
++
++  // In use by a running engine: deleted when it is let go, as before.
++  Disk busy;
++  busy.Request(kLanguageIdUnit, Owner::kCaptions);
++  busy.Download();
++  busy.use.SetInUse(kLanguageIdUnit, true);
++  busy.owners.SetWanted(kLanguageIdUnit, Owner::kCaptions, false);
++  EXPECT_EQ(DecideRemoval(kLanguageIdUnit, busy.owners, busy.use), Removal::kOnRelease);
++  busy.Release(kLanguageIdUnit);
++  EXPECT_FALSE(busy.ready.contains(kLanguageIdUnit));
++}
++
++// In use, removed (no owner), then asked for again before the engine lets
++// go: the removal is dropped, nothing is fetched, and the release keeps it.
++TEST(CaptionDownloadsTest, RequestAfterPendingRemoveKeepsUnit) {
++  Disk disk;
++  disk.Request(kLanguageIdUnit, Owner::kVoice);
++  disk.Download();
++  disk.use.SetInUse(kLanguageIdUnit, true);
++  disk.owners.SetWanted(kLanguageIdUnit, Owner::kVoice, false);
++  disk.Remove(kLanguageIdUnit);
++  ASSERT_TRUE(disk.use.Removing(kLanguageIdUnit));
++
++  disk.RequestAgain(kLanguageIdUnit, Owner::kVoice);
++  EXPECT_FALSE(disk.use.Removing(kLanguageIdUnit));  // ready again at once
++  EXPECT_TRUE(disk.queue.empty());
++  disk.Release(kLanguageIdUnit);
++  EXPECT_TRUE(disk.ready.contains(kLanguageIdUnit));
++}
++
++// The release re-checks the owners even if a removal was due: an owner that
++// wants the unit by then keeps it.
++TEST(CaptionDownloadsTest, ReleaseKeepsUnitWantedAgain) {
++  Disk disk;
++  disk.Request(kLanguageIdUnit, Owner::kVoice);
++  disk.Download();
++  disk.use.SetInUse(kLanguageIdUnit, true);
++  disk.owners.SetWanted(kLanguageIdUnit, Owner::kVoice, false);
++  disk.Remove(kLanguageIdUnit);
++  disk.owners.SetWanted(kLanguageIdUnit, Owner::kCaptions, true);
++  disk.Release(kLanguageIdUnit);
++  EXPECT_TRUE(disk.ready.contains(kLanguageIdUnit));
++}
++
++// In use, and Remove while captions still want it: kept, and the release
++// deletes nothing either.
++TEST(CaptionDownloadsTest, InUseRemoveWhileKeptThenRelease) {
++  Disk disk;
++  disk.Request(kLanguageIdUnit, Owner::kCaptions);
++  disk.Request(kLanguageIdUnit, Owner::kVoice);
++  disk.Download();
++  disk.use.SetInUse(kLanguageIdUnit, true);
++  disk.owners.SetWanted(kLanguageIdUnit, Owner::kVoice, false);
++  disk.Remove(kLanguageIdUnit);
++  EXPECT_FALSE(disk.use.Removing(kLanguageIdUnit));
++  disk.Release(kLanguageIdUnit);
++  EXPECT_TRUE(disk.ready.contains(kLanguageIdUnit));
++}
++
++// The detector came with captions: voice asking for it fetches nothing.
++TEST(CaptionDownloadsTest, SharedNoSecondDownload) {
++  Disk disk;
++  disk.Request(kLanguageIdUnit, Owner::kCaptions);
++  EXPECT_EQ(disk.queue, (std::deque<std::string>{kLanguageIdUnit}));
++  disk.Download();
++
++  disk.Request(kLanguageIdUnit, Owner::kVoice);
++  EXPECT_TRUE(disk.queue.empty());
++  EXPECT_TRUE(disk.owners.WantedBy(kLanguageIdUnit, Owner::kVoice));
++  // Nor while it is still coming: it is queued once.
++  Disk coming;
++  coming.Request(kLanguageIdUnit, Owner::kCaptions);
++  coming.Request(kLanguageIdUnit, Owner::kVoice);
++  EXPECT_EQ(coming.queue, (std::deque<std::string>{kLanguageIdUnit}));
++}
++
++// The detector brings its own Silero VAD (the three files desktop
++// publishes), so it needs no "common".
++TEST(CaptionDownloadsTest, LanguageIdIsOneUnit) {
++  EXPECT_EQ(UnitsToFetch(kLanguageIdUnit), (std::vector<std::string>{kLanguageIdUnit}));
++  std::set<std::string> names;
++  int64_t total = 0;
++  for (const CaptionFile* file : FilesOf(kLanguageIdUnit)) {
++    names.emplace(file->name);
++    total += file->size;
++    if (file->name == "lid.onnx") {
++      EXPECT_EQ(file->size, 86063323);
++      EXPECT_EQ(file->sha256, kLidSha256);
++    }
++  }
++  EXPECT_EQ(names, (std::set<std::string>{"lid.onnx", "lid_labels.txt", "silero_vad.onnx"}));
++  EXPECT_EQ(total / 1'000'000, 88);  // "88 MB" in Settings
++}
++
++// Owners survive a restart (local state), and a damaged pref drops only the
++// entries it cannot read.
++TEST(CaptionDownloadsTest, OwnersPersist) {
++  UnitOwners owners;
++  EXPECT_TRUE(owners.SetWanted(kLanguageIdUnit, Owner::kVoice, true));
++  EXPECT_FALSE(owners.SetWanted(kLanguageIdUnit, Owner::kVoice, true));
++  EXPECT_TRUE(owners.SetWanted("hi", Owner::kCaptions, true));
++  const base::DictValue saved = owners.ToDict();
++  const UnitOwners restored(saved);
++  EXPECT_TRUE(restored.WantedBy(kLanguageIdUnit, Owner::kVoice));
++  EXPECT_FALSE(restored.WantedBy(kLanguageIdUnit, Owner::kCaptions));
++  EXPECT_TRUE(restored.WantedBy("hi", Owner::kCaptions));
++  EXPECT_EQ(restored.ToDict(), saved);
++
++  base::DictValue damaged;
++  damaged.Set("ta", "voice");  // not a list
++  base::ListValue names;
++  names.Append("search");
++  names.Append(3);
++  names.Append("voice");
++  damaged.Set(kLanguageIdUnit, std::move(names));
++  const UnitOwners read(damaged);
++  EXPECT_FALSE(read.Wanted("ta"));
++  EXPECT_TRUE(read.WantedBy(kLanguageIdUnit, Owner::kVoice));
++  EXPECT_FALSE(read.WantedBy(kLanguageIdUnit, Owner::kCaptions));
++
++  // The last owner gone: the unit has no entry left.
++  UnitOwners one;
++  one.SetWanted(kLanguageIdUnit, Owner::kVoice, true);
++  EXPECT_TRUE(one.SetWanted(kLanguageIdUnit, Owner::kVoice, false));
++  EXPECT_TRUE(one.ToDict().empty());
++  EXPECT_FALSE(one.SetWanted(kLanguageIdUnit, Owner::kVoice, false));
++}
++
++// A failed file is tried again later, each wait longer, five times; then
++// "Couldn't download" until the person asks again or the network changes.
++TEST(CaptionDownloadsTest, RetryBacksOffThenGivesUp) {
++  EXPECT_FALSE(RetryDelay(0).has_value());
++  EXPECT_EQ(RetryDelay(1), base::Seconds(5));
++  EXPECT_EQ(RetryDelay(2), base::Seconds(15));
++  EXPECT_EQ(RetryDelay(3), base::Seconds(45));
++  EXPECT_EQ(RetryDelay(4), base::Minutes(2));
++  EXPECT_EQ(RetryDelay(5), base::Minutes(5));
++  EXPECT_FALSE(RetryDelay(6).has_value());
++}
++
++// Tark restarted in the middle of the detector's download: it is queued
++// again on Wi-Fi, as voice asked; a ready unit is not.
++TEST(CaptionDownloadsTest, InterruptedDownloadResumes) {
++  UnitOwners owners;
++  owners.SetWanted(kLanguageIdUnit, Owner::kVoice, true);
++  owners.SetWanted("hi", Owner::kCaptions, true);
++  auto ready = [](const std::string& unit) { return unit == "hi"; };
++  EXPECT_EQ(UnitsToResume(owners, {}, ready),
++            (std::vector<Resume>{{kLanguageIdUnit, /*now=*/false}}));
++  // Nobody wants it any more (Remove, captions turned off): nothing resumes.
++  owners.SetWanted(kLanguageIdUnit, Owner::kVoice, false);
++  EXPECT_TRUE(UnitsToResume(owners, {}, ready).empty());
++}
++
++// With "Download now", it resumes on mobile data too; a pending "Download
++// now" with no owner (an older APK's) still resumes, once.
++TEST(CaptionDownloadsTest, ResumeKeepsDownloadNow) {
++  UnitOwners owners;
++  owners.SetWanted(kLanguageIdUnit, Owner::kVoice, true);
++  auto none = [](const std::string&) { return false; };
++  EXPECT_EQ(UnitsToResume(owners, {kLanguageIdUnit, "ta"}, none),
++            (std::vector<Resume>{{kLanguageIdUnit, true}, {"ta", true}}));
++  EXPECT_TRUE(UnitsToResume(UnitOwners(), {"not-a-unit"}, none).empty());
 +}
 +
 +}  // namespace

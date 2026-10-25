@@ -1,0 +1,55 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Speech timing</title>
+<!-- page.html plus timestamps, for phone_check.py. ?lang=TAG&interim=1 -->
+<button id="go" style="font-size:32px;padding:24px;width:100%">Listen</button>
+<pre id="out" style="font-size:24px;white-space:pre-wrap">idle</pre>
+<pre id="t" style="font-size:12px;white-space:pre-wrap">timing: {}</pre>
+<script>
+  const q = new URLSearchParams(location.search);
+  const lang = q.get('lang') || 'en-US';
+  const interim = q.get('interim') === '1';
+  const out = document.getElementById('out');
+  const tl = document.getElementById('t');
+  let t0 = 0, ev = {}, interims = [], finals = [];
+  const now = () => Math.round(performance.now() - t0);
+  const show = () => {
+    const body = JSON.stringify({ev, interims: interims.slice(-12), finals});
+    tl.textContent = 'timing: ' + body;
+    // The phone's accessibility dump doesn't always carry this line: send it
+    // to the test server as well.
+    fetch('/timing', {method: 'POST', body, keepalive: true}).catch(() => {});
+  };
+  const mark = (name) => { (ev[name] = ev[name] || []).push(now()); show(); };
+  document.getElementById('go').onclick = () => {
+    const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!Recognition) { out.textContent = 'error: unsupported'; return; }
+    const r = new Recognition();
+    r.lang = lang;
+    r.interimResults = interim;
+    t0 = performance.now(); ev = {}; interims = []; finals = [];
+    for (const name of ['audiostart', 'soundstart', 'speechstart', 'speechend', 'soundend',
+                        'audioend', 'nomatch', 'end']) {
+      r.addEventListener(name, () => mark(name));
+    }
+    r.onresult = (e) => {
+      let fin = '', tmp = '';
+      for (let i = 0; i < e.results.length; i++) {
+        const text = e.results[i][0].transcript;
+        if (e.results[i].isFinal) fin += text; else tmp += text;
+      }
+      if (tmp) { interims.push([now(), tmp]); show(); }
+      if (fin) {
+        finals.push([now(), fin]);
+        mark('final');
+        out.textContent = 'result: ' + fin;
+      }
+    };
+    r.onerror = (e) => { mark('error'); out.textContent = 'error: ' + e.error; };
+    r.onend = () => { if (/^listening/.test(out.textContent)) out.textContent = 'error: ended'; };
+    out.textContent = 'listening ' + lang;
+    mark('start');
+    r.start();
+  };
+</script>

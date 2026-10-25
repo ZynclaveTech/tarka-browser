@@ -1,0 +1,741 @@
+diff '--color=never' -ruN a/content/browser/speech/speech_recognizer_impl_android.cc b/content/browser/speech/speech_recognizer_impl_android.cc
+--- a/content/browser/speech/speech_recognizer_impl_android.cc	2026-10-25 09:11:15.502074353 +0530
++++ b/content/browser/speech/speech_recognizer_impl_android.cc	2026-10-25 09:11:15.476633211 +0530
+@@ -6,18 +6,24 @@
+ 
+ #include <stddef.h>
+ 
++#include <string>
++
+ #include "base/android/jni_android.h"
+ #include "base/android/jni_array.h"
+ #include "base/android/jni_string.h"
+ #include "base/android/scoped_java_ref.h"
+ #include "base/functional/bind.h"
+ #include "base/strings/utf_string_conversions.h"
++#include "content/public/browser/browser_context.h"
+ #include "content/public/browser/browser_task_traits.h"
+ #include "content/public/browser/browser_thread.h"
++#include "content/public/browser/global_routing_id.h"
++#include "content/public/browser/render_frame_host.h"
+ #include "content/public/browser/speech_recognition_event_listener.h"
+ #include "content/public/browser/speech_recognition_manager.h"
+ #include "content/public/browser/speech_recognition_session_config.h"
+ #include "media/mojo/mojom/speech_recognition_result.mojom.h"
++#include "url/origin.h"
+ 
+ // Must come after all headers that specialize FromJniType() / ToJniType().
+ #include "content/public/android/content_jni_headers/SpeechRecognitionImpl_jni.h"
+@@ -30,6 +36,25 @@
+ 
+ namespace content {
+ 
++namespace {
++
++// Tark: the origin the per-site voice language is kept under, or empty when
++// none may be read or written: a private (off-the-record) tab, or a frame that
++// is already gone. A cross-origin iframe is keyed by its own origin.
++std::string SiteLanguageOrigin(const std::string& origin,
++                               GlobalRenderFrameHostId frame_id) {
++  if (origin.empty()) {
++    return std::string();
++  }
++  RenderFrameHost* frame = RenderFrameHost::FromID(frame_id);
++  if (!frame || frame->GetBrowserContext()->IsOffTheRecord()) {
++    return std::string();
++  }
++  return origin;
++}
++
++}  // namespace
++
+ SpeechRecognizerImplAndroid::SpeechRecognizerImplAndroid(
+     SpeechRecognitionEventListener* listener,
+     int session_id)
+@@ -53,7 +78,11 @@
+       FROM_HERE,
+       base::BindOnce(
+           &content::SpeechRecognizerImplAndroid::StartRecognitionOnUIThread,
+-          this, config.language, config.continuous, config.interim_results));
++          this, config.language, config.continuous, config.interim_results,
++          // Tark: the frame's origin (scheme://host:port, never a path), for the
++          // language the person chose for the site. Opaque origins have none.
++          config.origin.opaque() ? std::string() : config.origin.Serialize(),
++          config.initial_context.global_id));
+ }
+ 
+ void SpeechRecognizerImplAndroid::UpdateRecognitionContext(
+@@ -76,14 +105,17 @@
+ void SpeechRecognizerImplAndroid::StartRecognitionOnUIThread(
+     const std::string& language,
+     bool continuous,
+-    bool interim_results) {
++    bool interim_results,
++    const std::string& origin,
++    GlobalRenderFrameHostId frame_id) {
+   CHECK_CURRENTLY_ON(BrowserThread::UI, base::NotFatalUntil::M159);
+   JNIEnv* env = AttachCurrentThread();
+   j_recognition_.Reset(Java_SpeechRecognitionImpl_createSpeechRecognition(
+       env, reinterpret_cast<intptr_t>(this)));
+   Java_SpeechRecognitionImpl_startRecognition(
+       env, j_recognition_, ConvertUTF8ToJavaString(env, language), continuous,
+-      interim_results);
++      interim_results,
++      ConvertUTF8ToJavaString(env, SiteLanguageOrigin(origin, frame_id)));
+ }
+ 
+ void SpeechRecognizerImplAndroid::AbortRecognition() {
+diff '--color=never' -ruN a/content/browser/speech/speech_recognizer_impl_android.h b/content/browser/speech/speech_recognizer_impl_android.h
+--- a/content/browser/speech/speech_recognizer_impl_android.h	2026-10-25 09:11:15.533162448 +0530
++++ b/content/browser/speech/speech_recognizer_impl_android.h	2026-10-25 09:11:15.507891434 +0530
+@@ -8,10 +8,12 @@
+ #include <jni.h>
+ 
+ #include <memory>
++#include <string>
+ 
+ #include "base/android/scoped_java_ref.h"
+ #include "content/browser/speech/speech_recognizer.h"
+ #include "content/common/content_export.h"
++#include "content/public/browser/global_routing_id.h"
+ #include "media/mojo/mojom/speech_recognition_error.mojom.h"
+ #include "media/mojo/mojom/speech_recognition_result.mojom.h"
+ 
+@@ -59,7 +61,9 @@
+ 
+   void StartRecognitionOnUIThread(const std::string& language,
+                                   bool continuous,
+-                                  bool interim_results);
++                                  bool interim_results,
++                                  const std::string& origin,
++                                  GlobalRenderFrameHostId frame_id);
+   void OnRecognitionResultsOnIOThread(
+       std::vector<media::mojom::WebSpeechRecognitionResultPtr> results);
+ 
+diff '--color=never' -ruN a/content/public/android/java/src/org/chromium/content/browser/SpeechRecognitionImpl.java b/content/public/android/java/src/org/chromium/content/browser/SpeechRecognitionImpl.java
+--- a/content/public/android/java/src/org/chromium/content/browser/SpeechRecognitionImpl.java	2026-10-25 09:11:15.565152514 +0530
++++ b/content/public/android/java/src/org/chromium/content/browser/SpeechRecognitionImpl.java	2026-10-25 09:11:15.538895069 +0530
+@@ -45,13 +45,43 @@
+ public class SpeechRecognitionImpl {
+     private static final String TAG = "SpeechRecog";
+ 
+-    /** Told when recognition failed because the device lacks the session's language. */
++    /**
++     * Told when recognition failed because the device lacks the session's language; also names the
++     * language the person chose for a site, and hears when a site's session ends.
++     */
+     public interface LanguageDelegate {
+         /**
+-         * @param bcp47 The language the session asked for (the page's, else the phone's).
++         * @param bcp47 The language the session asked for (the page's, else the phone's), or the
++         *     site's remembered language that the phone no longer has.
+          * @param canDownload Whether Android can download it on request (API 33+).
+          */
+         void onLanguageMissing(String bcp47, boolean canDownload);
++
++        /**
++         * The language the person chose for this site, used instead of the page's.
++         *
++         * @param origin The page's origin (scheme://host:port), never a URL.
++         * @return A BCP 47 tag, or null to use the page's.
++         */
++        default @Nullable String languageFor(String origin) {
++            return null;
++        }
++
++        /**
++         * Whether the phone is known to lack {@code bcp47}. False when that isn't known yet; the
++         * recognizer's own error then tells.
++         */
++        default boolean isLanguageMissing(String bcp47) {
++            return false;
++        }
++
++        /**
++         * A session of the page's ended (results, error or abort).
++         *
++         * @param origin The page's origin (scheme://host:port).
++         * @param bcp47 The language the session ran in.
++         */
++        default void onSessionEnded(String origin, String bcp47) {}
+     }
+ 
+     /** Creates Android's on-device recognizer; replaced in tests. */
+@@ -97,7 +127,9 @@
+     private int mState;
+ 
+     private final Intent mIntent;
+-    private final RecognitionListener mListener;
++    // The current recognizer's listener; a listener of a recognizer replaced by a restart is
++    // stale and ignored.
++    private Listener mListener;
+     private @Nullable SpeechRecognizer mRecognizer;
+ 
+     // Native pointer to C++ SpeechRecognizerImplAndroid.
+@@ -109,12 +141,33 @@
+     // The language this session asked for (BCP 47).
+     private String mLanguage = "";
+ 
++    // The page's origin (scheme://host:port), or empty if it has none (an opaque origin, a
++    // private tab).
++    private String mOrigin = "";
++
++    // The page's language (its lang, else the phone's); differs from mLanguage while the site's
++    // remembered language is used.
++    private String mPageLanguage = "";
++
++    // Whether the page asked to stop; a restart would listen again, so there is none then.
++    private boolean mStopRequested;
++
++    // Whether the session already restarted in the page's language, told the delegate of a
++    // missing language, and sent audiostart: each happens at most once per session.
++    private boolean mRestarted;
++    private boolean mLanguageMissingTold;
++    private boolean mAudioStartSent;
++
+     // Internal class to handle events from Android's SpeechRecognizer and route them to native.
+     class Listener implements RecognitionListener {
++        /** Whether this listener's events should be dropped. */
++        private boolean isStale() {
++            return mNativeSpeechRecognizerImplAndroid == 0 || this != mListener;
++        }
+ 
+         @Override
+         public void onBeginningOfSpeech() {
+-            if (mNativeSpeechRecognizerImplAndroid == 0) return;
++            if (isStale() || mState == STATE_CAPTURING_SPEECH) return;
+ 
+             mState = STATE_CAPTURING_SPEECH;
+             SpeechRecognitionImplJni.get().onSoundStart(mNativeSpeechRecognizerImplAndroid);
+@@ -131,7 +184,7 @@
+             // equivalent (onsoundend) event. Thus, the only way to provide a valid onsoundend
+             // event is to trigger it when the last result is received or the session is aborted.
+             if (!mContinuous) {
+-                if (mNativeSpeechRecognizerImplAndroid == 0) return;
++                if (isStale()) return;
+                 SpeechRecognitionImplJni.get().onSoundEnd(mNativeSpeechRecognizerImplAndroid);
+                 // Since Android doesn't have a dedicated event for when audio capture is finished,
+                 // we fire it after speech has ended.
+@@ -142,13 +195,17 @@
+ 
+         @Override
+         public void onError(int error) {
+-            if (mNativeSpeechRecognizerImplAndroid == 0) return;
++            if (isStale()) return;
+ 
+             int code = mapError(error);
+-            LanguageDelegate delegate = sLanguageDelegate;
+-            if (code == SpeechRecognitionErrorCode.LANGUAGE_NOT_SUPPORTED && delegate != null) {
+-                delegate.onLanguageMissing(
+-                        mLanguage, Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU);
++            if (code == SpeechRecognitionErrorCode.LANGUAGE_NOT_SUPPORTED) {
++                tellLanguageMissing(mLanguage);
++                // The site's remembered language turned out to be gone: the page never asked for
++                // it, so it never hears of it. The session goes on in the page's language, once.
++                if (!mRestarted && !mLanguage.equals(mPageLanguage)) {
++                    restartInPageLanguage();
++                    return;
++                }
+             }
+             // Every error ends the session, so the page never waits on one that Android dropped.
+             terminate(code);
+@@ -159,19 +216,24 @@
+ 
+         @Override
+         public void onPartialResults(Bundle bundle) {
++            if (isStale()) return;
+             handleResults(bundle, true);
+         }
+ 
+         @Override
+         public void onReadyForSpeech(Bundle bundle) {
+-            if (mNativeSpeechRecognizerImplAndroid == 0) return;
++            if (isStale()) return;
+ 
+-            mState = STATE_AWAITING_SPEECH;
++            if (mState == STATE_IDLE) mState = STATE_AWAITING_SPEECH;
++            // After a restart the page's audio has already started.
++            if (mAudioStartSent) return;
++            mAudioStartSent = true;
+             SpeechRecognitionImplJni.get().onAudioStart(mNativeSpeechRecognizerImplAndroid);
+         }
+ 
+         @Override
+         public void onResults(Bundle bundle) {
++            if (isStale()) return;
+             handleResults(bundle, false);
+             // We assume that onResults is called only once, at the end of a session, thus we
+             // terminate. If one day the recognition provider changes dictation mode behavior to
+@@ -222,6 +284,11 @@
+         sLanguageDelegate = delegate;
+     }
+ 
++    /** Whether a session (from any tab, private ones too) is starting or running. */
++    public static boolean hasLiveSession() {
++        return sLiveSession != null;
++    }
++
+     @VisibleForTesting
+     static void setRecognizerFactoryForTesting(@Nullable RecognizerFactory factory) {
+         sRecognizerFactoryForTesting = factory;
+@@ -278,10 +345,12 @@
+         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return null;
+         Context context = ContextUtils.getApplicationContext();
+         RecognizerFactory factory = getRecognizerFactory();
+-        if (!factory.isOnDeviceRecognitionAvailable(context)) return null;
++        // Anything Android throws here (unsupported, a SecurityException from a refused binding)
++        // ends the session like a missing recognizer, so the live-session flag never stays set.
+         try {
++            if (!factory.isOnDeviceRecognitionAvailable(context)) return null;
+             return factory.createOnDeviceSpeechRecognizer(context);
+-        } catch (UnsupportedOperationException e) {
++        } catch (RuntimeException e) {
+             Log.w(TAG, "No on-device recognizer", e);
+             return null;
+         }
+@@ -326,6 +395,12 @@
+         if (sLiveSession == this) sLiveSession = null;
+         SpeechRecognitionImplJni.get().onRecognitionEnd(mNativeSpeechRecognizerImplAndroid);
+         mNativeSpeechRecognizerImplAndroid = 0;
++
++        // Only a session that ran in a language, for a page with an origin.
++        LanguageDelegate delegate = sLanguageDelegate;
++        if (delegate != null && !mOrigin.isEmpty() && !mLanguage.isEmpty()) {
++            delegate.onSessionEnded(mOrigin, mLanguage);
++        }
+     }
+ 
+     @CalledByNative
+@@ -337,13 +412,17 @@
+ 
+     @CalledByNative
+     @VisibleForTesting
+-    void startRecognition(String language, boolean continuous, boolean interimResults) {
++    void startRecognition(
++            String language, boolean continuous, boolean interimResults, String origin) {
+         if (mNativeSpeechRecognizerImplAndroid == 0 || mRecognizer != null) return;
+ 
+         // Android runs one on-device session at a time: the newer session wins and the older one
+         // ends aborted, as in Chrome (SpeechRecognitionManagerImpl::StartSession aborts the
+         // previous microphone session; this covers the case where that has not reached here yet).
++        // This session is live from here, so the older one's end already sees a live session
++        // (nothing may then ask Android anything beside it).
+         SpeechRecognitionImpl older = sLiveSession;
++        sLiveSession = this;
+         if (older != null && older != this) older.abortRecognition();
+ 
+         SpeechRecognizer recognizer = createOnDeviceRecognizer();
+@@ -352,16 +431,33 @@
+             return;
+         }
+         mRecognizer = recognizer;
+-        sLiveSession = this;
+         recognizer.setRecognitionListener(mListener);
+ 
+-        // The page's lang, else the phone's.
+-        mLanguage =
++        // The language the person chose for this site, if the phone has it (or may: Android
++        // hasn't said yet, and its error will tell); else the page's lang, else the phone's.
++        mOrigin = origin;
++        mPageLanguage =
+                 TextUtils.isEmpty(language) ? Locale.getDefault().toLanguageTag() : language;
++        mLanguage = mPageLanguage;
++        LanguageDelegate delegate = sLanguageDelegate;
++        @Nullable String remembered =
++                delegate != null && !origin.isEmpty() ? delegate.languageFor(origin) : null;
++        if (delegate != null && remembered != null && !remembered.isEmpty()) {
++            if (delegate.isLanguageMissing(remembered)) {
++                // Never silently: the person hears the remembered language is gone.
++                tellLanguageMissing(remembered);
++            } else {
++                mLanguage = remembered;
++            }
++        }
+         mContinuous = continuous;
+         mIntent.putExtra("android.speech.extra.DICTATION_MODE", continuous);
+-        mIntent.putExtra(RecognizerIntent.EXTRA_LANGUAGE, mLanguage);
+         mIntent.putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, interimResults);
++        listen(recognizer);
++    }
++
++    private void listen(SpeechRecognizer recognizer) {
++        mIntent.putExtra(RecognizerIntent.EXTRA_LANGUAGE, mLanguage);
+         try {
+             recognizer.startListening(mIntent);
+         } catch (SecurityException e) {
+@@ -370,6 +466,45 @@
+         }
+     }
+ 
++    /** Tells the delegate a language is missing, at most once per session. */
++    private void tellLanguageMissing(String bcp47) {
++        LanguageDelegate delegate = sLanguageDelegate;
++        if (delegate == null || mLanguageMissingTold) return;
++        mLanguageMissingTold = true;
++        delegate.onLanguageMissing(bcp47, Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU);
++    }
++
++    /**
++     * The site's remembered language is gone: the same session goes on in the page's language,
++     * with a new recognizer. The page sees no error and no new events.
++     */
++    private void restartInPageLanguage() {
++        mRestarted = true;
++        if (mStopRequested) {
++            terminate(SpeechRecognitionErrorCode.NO_SPEECH);
++            return;
++        }
++        SpeechRecognizer old = mRecognizer;
++        mRecognizer = null;
++        if (old != null) {
++            try {
++                old.destroy();
++            } catch (IllegalArgumentException e) {
++                Log.w(TAG, "Destroy threw exception " + old, e);
++            }
++        }
++        SpeechRecognizer recognizer = createOnDeviceRecognizer();
++        if (recognizer == null) {
++            terminate(SpeechRecognitionErrorCode.SERVICE_NOT_ALLOWED);
++            return;
++        }
++        mRecognizer = recognizer;
++        mListener = new Listener();
++        recognizer.setRecognitionListener(mListener);
++        mLanguage = mPageLanguage;
++        listen(recognizer);
++    }
++
+     @VisibleForTesting
+     RecognitionListener getListenerForTesting() {
+         return mListener;
+@@ -389,6 +524,7 @@
+         if (mRecognizer == null) return;
+ 
+         mContinuous = false;
++        mStopRequested = true;
+         mRecognizer.stopListening();
+     }
+ 
+diff '--color=never' -ruN a/content/public/android/java/src/org/chromium/content_public/browser/SpeechRecognition.java b/content/public/android/java/src/org/chromium/content_public/browser/SpeechRecognition.java
+--- a/content/public/android/java/src/org/chromium/content_public/browser/SpeechRecognition.java	2026-10-25 09:11:15.597120496 +0530
++++ b/content/public/android/java/src/org/chromium/content_public/browser/SpeechRecognition.java	2026-10-25 09:11:15.570745883 +0530
+@@ -26,15 +26,39 @@
+         return SpeechRecognitionImpl.initialize();
+     }
+ 
+-    /** Tark: told when recognition failed because the device lacks the session's language. */
++    /**
++     * Tark: told when recognition failed because the device lacks the session's language; also
++     * names the language the person chose for a site. All calls come on the UI thread, and none
++     * changes what the page sees.
++     */
+     public interface LanguageDelegate {
+         /**
+-         * Called on the UI thread.
+-         *
+-         * @param bcp47 The language the session asked for (the page's, else the phone's).
++         * @param bcp47 The language the session asked for (the page's, else the phone's), or the
++         *     site's remembered language that the phone no longer has.
+          * @param canDownload Whether Android can download it on request (API 33+).
+          */
+         void onLanguageMissing(String bcp47, boolean canDownload);
++
++        /**
++         * @param origin The page's origin (scheme://host:port), never a URL.
++         * @return The language the person chose for the site, or null to use the page's.
++         */
++        default @Nullable String languageFor(String origin) {
++            return null;
++        }
++
++        /** Whether the phone is known to lack the language; false while that isn't known. */
++        default boolean isLanguageMissing(String bcp47) {
++            return false;
++        }
++
++        /** A session for the origin ended, having run in {@code bcp47}. */
++        default void onSessionEnded(String origin, String bcp47) {}
++    }
++
++    /** Tark: whether a speech recognition session (any tab's, private ones too) is live. */
++    public static boolean hasLiveSession() {
++        return SpeechRecognitionImpl.hasLiveSession();
+     }
+ 
+     /**
+@@ -44,6 +68,28 @@
+      */
+     public static void setLanguageDelegate(@Nullable LanguageDelegate delegate) {
+         SpeechRecognitionImpl.setLanguageDelegate(
+-                delegate == null ? null : delegate::onLanguageMissing);
++                delegate == null
++                        ? null
++                        : new SpeechRecognitionImpl.LanguageDelegate() {
++                            @Override
++                            public void onLanguageMissing(String bcp47, boolean canDownload) {
++                                delegate.onLanguageMissing(bcp47, canDownload);
++                            }
++
++                            @Override
++                            public @Nullable String languageFor(String origin) {
++                                return delegate.languageFor(origin);
++                            }
++
++                            @Override
++                            public boolean isLanguageMissing(String bcp47) {
++                                return delegate.isLanguageMissing(bcp47);
++                            }
++
++                            @Override
++                            public void onSessionEnded(String origin, String bcp47) {
++                                delegate.onSessionEnded(origin, bcp47);
++                            }
++                        });
+     }
+ }
+diff '--color=never' -ruN a/content/public/android/junit/src/org/chromium/content/browser/SpeechRecognitionImplTest.java b/content/public/android/junit/src/org/chromium/content/browser/SpeechRecognitionImplTest.java
+--- a/content/public/android/junit/src/org/chromium/content/browser/SpeechRecognitionImplTest.java	2026-10-25 09:11:15.629510234 +0530
++++ b/content/public/android/junit/src/org/chromium/content/browser/SpeechRecognitionImplTest.java	2026-10-25 09:11:15.602733240 +0530
+@@ -13,14 +13,18 @@
+ import static org.mockito.ArgumentMatchers.anyLong;
+ import static org.mockito.ArgumentMatchers.anyString;
+ import static org.mockito.ArgumentMatchers.eq;
++import static org.mockito.Mockito.doAnswer;
+ import static org.mockito.Mockito.mock;
+ import static org.mockito.Mockito.never;
+ import static org.mockito.Mockito.times;
+ import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.verifyNoInteractions;
++import static org.mockito.Mockito.when;
+ 
+ import android.content.Context;
+ import android.content.Intent;
+ import android.os.Bundle;
++import android.speech.RecognitionListener;
+ import android.speech.RecognizerIntent;
+ import android.speech.SpeechRecognizer;
+ 
+@@ -36,6 +40,7 @@
+ import org.robolectric.annotation.Config;
+ 
+ import org.chromium.base.test.BaseRobolectricTestRunner;
++import org.chromium.build.annotations.Nullable;
+ import org.chromium.media.mojom.SpeechRecognitionErrorCode;
+ 
+ import java.util.ArrayList;
+@@ -58,6 +63,7 @@
+     /** Stands in for Android: only on-device recognizers exist here. */
+     private static class FakeFactory implements SpeechRecognitionImpl.RecognizerFactory {
+         boolean mAvailable = true;
++        @Nullable RuntimeException mThrow;
+         final List<SpeechRecognizer> mCreated = new ArrayList<>();
+ 
+         @Override
+@@ -67,6 +73,7 @@
+ 
+         @Override
+         public SpeechRecognizer createOnDeviceSpeechRecognizer(Context context) {
++            if (mThrow != null) throw mThrow;
+             SpeechRecognizer recognizer = mock(SpeechRecognizer.class);
+             mCreated.add(recognizer);
+             return recognizer;
+@@ -86,12 +93,24 @@
+         SpeechRecognitionImpl.resetForTesting();
+     }
+ 
++    private static final String SITE = "https://shodhya.com";
++
+     private static SpeechRecognitionImpl start(long nativePtr, String language) {
++        return start(nativePtr, language, SITE);
++    }
++
++    private static SpeechRecognitionImpl start(long nativePtr, String language, String origin) {
+         SpeechRecognitionImpl session = SpeechRecognitionImpl.createSpeechRecognition(nativePtr);
+-        session.startRecognition(language, false, true);
++        session.startRecognition(language, false, true, origin);
+         return session;
+     }
+ 
++    private String intentLanguage(int recognizer) {
++        ArgumentCaptor<Intent> intent = ArgumentCaptor.forClass(Intent.class);
++        verify(mFactory.mCreated.get(recognizer)).startListening(intent.capture());
++        return intent.getValue().getStringExtra(RecognizerIntent.EXTRA_LANGUAGE);
++    }
++
+     private void verifyEndedWith(long nativePtr, int code) {
+         verify(mNatives).onRecognitionError(nativePtr, code);
+         verify(mNatives).onRecognitionEnd(nativePtr);
+@@ -259,4 +278,172 @@
+         verify(olderRecognizer, times(1)).destroy();
+         verify(mNatives, times(1)).onRecognitionEnd(NATIVE_1);
+     }
++
++    @Test
++    public void testRememberedLanguageUsed() {
++        when(mLanguageDelegate.languageFor(SITE)).thenReturn("hi-IN");
++        SpeechRecognitionImpl.setLanguageDelegate(mLanguageDelegate);
++        start(NATIVE_1, "en-US");
++
++        assertEquals("hi-IN", intentLanguage(0));
++        verify(mLanguageDelegate, never()).onLanguageMissing(anyString(), anyBoolean());
++        verify(mNatives, never()).onRecognitionError(anyLong(), anyInt());
++    }
++
++    @Test
++    @Config(sdk = 33)
++    public void testRememberedLanguageMissingFallsBack() {
++        when(mLanguageDelegate.languageFor(SITE)).thenReturn("hi-IN");
++        when(mLanguageDelegate.isLanguageMissing("hi-IN")).thenReturn(true);
++        SpeechRecognitionImpl.setLanguageDelegate(mLanguageDelegate);
++        SpeechRecognitionImpl session = start(NATIVE_1, "en-US");
++
++        // The page's language, and the person hears the remembered one is gone: never silent.
++        assertEquals("en-US", intentLanguage(0));
++        verify(mLanguageDelegate, times(1)).onLanguageMissing("hi-IN", true);
++        verify(mLanguageDelegate, times(1)).onLanguageMissing(anyString(), anyBoolean());
++        // The session runs as the page asked; the page sees no error.
++        verify(mNatives, never()).onRecognitionError(anyLong(), anyInt());
++        Bundle results = new Bundle();
++        results.putStringArrayList(
++                SpeechRecognizer.RESULTS_RECOGNITION, new ArrayList<>(Arrays.asList("hello")));
++        session.getListenerForTesting().onResults(results);
++        verify(mNatives).onRecognitionResults(eq(NATIVE_1), any(), any(), eq(false));
++        verify(mLanguageDelegate).onSessionEnded(SITE, "en-US");
++    }
++
++    @Test
++    public void testRememberedLanguageUnknownRestartsInPageLanguage() {
++        // Android hasn't said whether the phone has it: the remembered language is tried. When
++        // the recognizer says it is gone, the person hears so, and the session goes on in the
++        // page's language: the page never sees an error for a language it didn't ask for.
++        when(mLanguageDelegate.languageFor(SITE)).thenReturn("hi-IN");
++        SpeechRecognitionImpl.setLanguageDelegate(mLanguageDelegate);
++        SpeechRecognitionImpl session = start(NATIVE_1, "en-US");
++        assertEquals("hi-IN", intentLanguage(0));
++        RecognitionListener first = session.getListenerForTesting();
++        first.onReadyForSpeech(new Bundle());
++        first.onError(SpeechRecognizer.ERROR_LANGUAGE_UNAVAILABLE);
++
++        verify(mLanguageDelegate, times(1)).onLanguageMissing("hi-IN", false);
++        verify(mNatives, never()).onRecognitionError(anyLong(), anyInt());
++        verify(mNatives, never()).onRecognitionEnd(anyLong());
++        verify(mFactory.mCreated.get(0), times(1)).destroy();
++        assertEquals(2, mFactory.mCreated.size());
++        assertEquals("en-US", intentLanguage(1));
++
++        // The old recognizer's late events are dropped; the page's audiostart is not repeated.
++        first.onError(SpeechRecognizer.ERROR_CLIENT);
++        RecognitionListener second = session.getListenerForTesting();
++        second.onReadyForSpeech(new Bundle());
++        verify(mNatives, times(1)).onAudioStart(NATIVE_1);
++        verify(mNatives, never()).onRecognitionError(anyLong(), anyInt());
++
++        Bundle results = new Bundle();
++        results.putStringArrayList(
++                SpeechRecognizer.RESULTS_RECOGNITION, new ArrayList<>(Arrays.asList("hello")));
++        second.onResults(results);
++        verify(mNatives).onRecognitionResults(eq(NATIVE_1), any(), any(), eq(false));
++        verify(mNatives, times(1)).onRecognitionEnd(NATIVE_1);
++        verify(mNatives, never()).onRecognitionError(anyLong(), anyInt());
++        verify(mLanguageDelegate).onSessionEnded(SITE, "en-US");
++    }
++
++    @Test
++    public void testRestartOnlyOnce() {
++        when(mLanguageDelegate.languageFor(SITE)).thenReturn("hi-IN");
++        SpeechRecognitionImpl.setLanguageDelegate(mLanguageDelegate);
++        SpeechRecognitionImpl session = start(NATIVE_1, "en-US");
++        session.getListenerForTesting().onError(SpeechRecognizer.ERROR_LANGUAGE_UNAVAILABLE);
++        // The page's own language is missing too: that error is the page's, and ends it.
++        session.getListenerForTesting().onError(SpeechRecognizer.ERROR_LANGUAGE_NOT_SUPPORTED);
++
++        assertEquals(2, mFactory.mCreated.size());
++        verifyEndedWith(NATIVE_1, SpeechRecognitionErrorCode.LANGUAGE_NOT_SUPPORTED);
++        // One snackbar per session.
++        verify(mLanguageDelegate, times(1)).onLanguageMissing(anyString(), anyBoolean());
++    }
++
++    @Test
++    public void testPageLanguageMissingDoesNotRestart() {
++        SpeechRecognitionImpl.setLanguageDelegate(mLanguageDelegate);
++        SpeechRecognitionImpl session = start(NATIVE_1, "hi-IN");
++        session.getListenerForTesting().onError(SpeechRecognizer.ERROR_LANGUAGE_UNAVAILABLE);
++
++        assertEquals(1, mFactory.mCreated.size());
++        verifyEndedWith(NATIVE_1, SpeechRecognitionErrorCode.LANGUAGE_NOT_SUPPORTED);
++    }
++
++    // With no delegate (nothing registered, as before this task), the session runs in the page's
++    // language and ends as Task 2's tests expect; the remembered-language paths never run.
++    @Test
++    public void testNoDelegateUnchanged() {
++        SpeechRecognitionImpl session = start(NATIVE_1, "en-US");
++
++        assertEquals("en-US", intentLanguage(0));
++        session.getListenerForTesting().onError(SpeechRecognizer.ERROR_NO_MATCH);
++        verifyEndedWith(NATIVE_1, SpeechRecognitionErrorCode.NO_SPEECH);
++    }
++
++    // A private tab, or an opaque origin, arrives with an empty origin (the browser side blanks
++    // it): nothing is read for it and nothing is written after it.
++    @Test
++    public void testEmptyOriginNeitherReadsNorWrites() {
++        SpeechRecognitionImpl.setLanguageDelegate(mLanguageDelegate);
++        SpeechRecognitionImpl session = start(NATIVE_1, "en-US", "");
++        session.getListenerForTesting().onError(SpeechRecognizer.ERROR_NO_MATCH);
++
++        assertEquals("en-US", intentLanguage(0));
++        verifyNoInteractions(mLanguageDelegate);
++    }
++
++    @Test
++    public void testSessionEndedOnce() {
++        when(mLanguageDelegate.languageFor(SITE)).thenReturn("hi-IN");
++        SpeechRecognitionImpl.setLanguageDelegate(mLanguageDelegate);
++        SpeechRecognitionImpl session = start(NATIVE_1, "en-US");
++        session.abortRecognition();
++        session.getListenerForTesting().onError(SpeechRecognizer.ERROR_CLIENT);
++
++        verify(mLanguageDelegate, times(1)).onSessionEnded(SITE, "hi-IN");
++        verifyEndedWith(NATIVE_1, SpeechRecognitionErrorCode.ABORTED);
++    }
++
++    @Test
++    public void testLiveSessionTracked() {
++        assertFalse(SpeechRecognitionImpl.hasLiveSession());
++        SpeechRecognitionImpl session = start(NATIVE_1, "en-US", "");
++        assertTrue("a private session counts", SpeechRecognitionImpl.hasLiveSession());
++        session.abortRecognition();
++        assertFalse(SpeechRecognitionImpl.hasLiveSession());
++    }
++
++    @Test
++    public void testNewerSessionLiveWhenOlderEnds() {
++        SpeechRecognitionImpl.setLanguageDelegate(mLanguageDelegate);
++        List<Boolean> liveAtEnd = new ArrayList<>();
++        doAnswer(
++                        invocation -> {
++                            liveAtEnd.add(SpeechRecognitionImpl.hasLiveSession());
++                            return null;
++                        })
++                .when(mLanguageDelegate)
++                .onSessionEnded(anyString(), anyString());
++        start(NATIVE_1, "en-US");
++        start(NATIVE_2, "hi-IN", "");
++
++        // The older one ended aborted while the newer (private) one was already live.
++        verifyEndedWith(NATIVE_1, SpeechRecognitionErrorCode.ABORTED);
++        assertEquals(List.of(true), liveAtEnd);
++        assertTrue(SpeechRecognitionImpl.hasLiveSession());
++    }
++
++    @Test
++    public void testThrowingFactoryEndsTheSession() {
++        mFactory.mThrow = new SecurityException("binding refused");
++        start(NATIVE_1, "en-US");
++
++        verifyEndedWith(NATIVE_1, SpeechRecognitionErrorCode.SERVICE_NOT_ALLOWED);
++        assertFalse(SpeechRecognitionImpl.hasLiveSession());
++    }
+ }

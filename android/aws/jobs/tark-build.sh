@@ -58,6 +58,23 @@ fi
 timeout 8h bash $repo/android/build.sh $stop /tark/work >> $log 2>&1
 code=$?
 echo "exit $code" >> $log
+# The captions downloads' sharing rules (voice and captions share the
+# language detector) and voice's detector ring run in build.sh's host
+# tests: each must have run.
+if (( code == 0 )); then
+  for t in RemoveKeepsUnitCaptionsUses RemoveDeletesWhenNoOwner SharedNoSecondDownload \
+      RequestAfterPendingRemoveKeepsUnit ReleaseKeepsUnitWantedAgain InUseRemoveWhileKeptThenRelease \
+      RetryBacksOffThenGivesUp InterruptedDownloadResumes ResumeKeepsDownloadNow; do
+    grep -qE "^\[[0-9]+/[0-9]+\] CaptionDownloadsTest\.$t \([0-9]+ ms\)$" $log || { echo "no CaptionDownloadsTest.$t test ran" >> $log; code=1; }
+    grep -qE "CaptionDownloadsTest\.$t.*(SKIPPED|FAILED)|(SKIPPED|FAILED).*CaptionDownloadsTest\.$t" $log && { echo "CaptionDownloadsTest.$t did not pass" >> $log; code=1; }
+  done
+  # Voice search's detector: its 15 s ring of audio (voice-language-detect.patch).
+  for t in RingBufferKeeps15s RingBufferHoldsLessWhenShorter RingBufferDropsAtSessionEnd NoModelsDecidesNothing \
+      SharedModelsWaitForAttachedSessions UnattachedDetectorLeavesSharedUseAlone; do
+    grep -qE "^\[[0-9]+/[0-9]+\] VoiceLanguageDetectorTest\.$t \([0-9]+ ms\)$" $log || { echo "no VoiceLanguageDetectorTest.$t test ran" >> $log; code=1; }
+    grep -qE "VoiceLanguageDetectorTest\.$t.*(SKIPPED|FAILED)|(SKIPPED|FAILED).*VoiceLanguageDetectorTest\.$t" $log && { echo "VoiceLanguageDetectorTest.$t did not pass" >> $log; code=1; }
+  done
+fi
 (( code == 0 )) && upload /tark/work/src/out/Default/apks/ChromePublic.apk ChromePublic.apk
 (( code == 0 )) && upload /tark/work/src/out/Default/apks/ChromePublic.aab ChromePublic.aab
 # A3: the IndicXlit files this APK pins (android/xlit/files.py), for the
@@ -66,8 +83,8 @@ if (( code == 0 )); then
   tar -czf /tark/xlit-files.tgz -C /tark/work/src/third_party/indicxlit android
   upload /tark/xlit-files.tgz xlit-files.tgz
 fi
-# The junit tests of the speech patches (voice input) and of the Private
-# button (private-tab-button.patch), built and
+# The junit tests of the speech and voice patches (voice input) and of the
+# Private button (private-tab-button.patch), built and
 # run here on the same tree (the runners with a venv's Python: there is no
 # vpython3); a failure, or a filter that runs no test, fails the job.
 if (( code == 0 )); then
@@ -95,12 +112,12 @@ if (( code == 0 )); then
     {
       ninja -C $o content_junit_tests chrome_junit_tests &&
       /tark/junit-venv/bin/python $o/bin/run_content_junit_tests --gtest_filter='*SpeechRecognitionImplTest*' &&
-      /tark/junit-venv/bin/python $o/bin/run_chrome_junit_tests --gtest_filter='*SpeechLanguageSnackbarTest*' &&
+      /tark/junit-venv/bin/python $o/bin/run_chrome_junit_tests --gtest_filter='*SpeechLanguageSnackbarTest*:*VoiceDetectionTest*:*VoiceLanguagesTest*:*VoiceLanguageSignalsTest*:*VoiceLanguagesSettingsTest*:*AndroidVoicePlatformTest*:*VoiceSiteLanguagesTest*:*VoiceLanguageOfferTest*' &&
       /tark/junit-venv/bin/python $o/bin/run_chrome_junit_tests --gtest_filter='*IncognitoTabSwitcherPaneUnitTest*'
     } > /tark/junit.log 2>&1
     code=$?
     # A filter that matches nothing "passes" with no test run.
-    for t in SpeechRecognitionImplTest SpeechLanguageSnackbarTest IncognitoTabSwitcherPaneUnitTest; do
+    for t in SpeechRecognitionImplTest SpeechLanguageSnackbarTest VoiceDetectionTest VoiceLanguagesTest VoiceLanguageSignalsTest VoiceLanguagesSettingsTest AndroidVoicePlatformTest VoiceSiteLanguagesTest VoiceLanguageOfferTest IncognitoTabSwitcherPaneUnitTest; do
       grep -q "OK \] .*$t\." /tark/junit.log || { echo "junit: no $t test ran" >> $log; code=1; }
     done
     upload /tark/junit.log junit.log
