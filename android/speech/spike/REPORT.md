@@ -125,3 +125,21 @@ Run: `cd android/speech/spike && ./build.sh && ./run-phone.sh bf678949`. The scr
 the app with `-g`, then runs `pm grant ... RECORD_AUDIO`; if the phone refuses, tap Allow
 when the dialog appears. It prompts with a 3-2-1 countdown, saves `phone-<mode>.log`,
 and uninstalls the app at the end.
+
+## Step 2 — phone bf678949 (OnePlus, Android 14), live mic, 2026-10-25 17:04 (user speaking at SPEAK NOW)
+
+The user approved this run. The phrase was "hello world this is a test" (pipe and normal), and "... of switching languages" in the switch mode. Logs: phone-pipe.log, phone-normal.log, phone-switch.log.
+
+- **normal** (the recognizer's own mic, en-US): "Hello world this is just". The final partial came 24 ms after the last text change.
+- **switch** (Tark's AudioRecord through the EXTRA_AUDIO_SOURCE pipe, en-US; cancelled at 3 s; en-IN restarted, 96,000 buffered bytes replayed, then live): "hello world the sisters of switching languages".
+  - The words spoken before the switch survived the replay.
+  - The final partial matched the last text change at 0 ms, so the pipe adds no measurable delay to the end result.
+- **pipe** (en-US through the pipe, 6 s): speech was detected four times (onBeginningOfSpeech/onEndOfSpeech), but the only text was "Ab", ending in onError 7.
+  - That's one failed attempt with Tark's capture in en-US, while the same capture in the switch run worked in en-IN.
+  - Likely causes: the user's timing or a quiet first attempt, or something about en-US through the pipe. Not settled from one run.
+- **Permission:** `pm grant` was refused on this phone (OnePlus), but `install -g` had already granted RECORD_AUDIO.
+- **Cleanup:** the spike app was uninstalled afterwards.
+
+**Verdict: LIVE**, with a caveat.
+- Tark-fed mic audio is recognized on the phone. Replay across a language switch keeps the earlier words. No latency penalty was measured.
+- Task 7 should still keep "Use … next time" as the fallback. Its phone test must re-check en-US through the pipe, because the single en-US pipe attempt failed.

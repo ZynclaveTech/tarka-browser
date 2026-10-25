@@ -28,10 +28,11 @@ for M in $MODES; do
   echo "  ($NOTE) -- start speaking when the log shows SPEAK NOW"
   for n in 3 2 1; do echo "  $n..."; sleep 1; done
   $A shell am force-stop $PKG
-  $A logcat -c
+  # No logcat -c on a real phone: read only lines from the phone's clock now on.
+  T=$($A shell 'date "+%m-%d %H:%M:%S.000"' | tr -d '\r')
   $A shell am start -n $PKG/.Main --es mode "$M" >/dev/null
   # Tail until the app logs DONE (or 40 s safety timeout).
-  $A logcat -v time -s SpeechSpike:I | tee "phone-$M.log" | {
+  $A logcat -T "$T" -v time -s SpeechSpike:I | tee "phone-$M.log" | {
     while IFS= read -r line; do
       echo "$line"
       case "$line" in *" DONE"*) break ;; esac
@@ -40,7 +41,7 @@ for M in $MODES; do
   TP=$!
   i=0; while kill -0 $TP 2>/dev/null && [ $i -lt 40 ]; do sleep 1; i=$((i+1)); done
   kill $TP 2>/dev/null
-  pkill -f "adb -s $S logcat -v time -s SpeechSpike" 2>/dev/null
+  pkill -f "adb -s $S logcat -T" 2>/dev/null
   echo "saved $(pwd)/phone-$M.log"
 done
 
