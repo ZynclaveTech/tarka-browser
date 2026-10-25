@@ -1,6 +1,6 @@
 diff '--color=never' -ruN a/chrome/android/chrome_java_resources.gni b/chrome/android/chrome_java_resources.gni
---- a/chrome/android/chrome_java_resources.gni	2026-10-25 22:23:03.993855917 +0530
-+++ b/chrome/android/chrome_java_resources.gni	2026-10-25 22:23:03.964388125 +0530
+--- a/chrome/android/chrome_java_resources.gni	2026-10-26 00:01:24.016698752 +0530
++++ b/chrome/android/chrome_java_resources.gni	2026-10-26 00:01:23.990263240 +0530
 @@ -688,4 +688,5 @@
    "java/res/xml/tracing_preferences.xml",
    "java/res/xml/unified_account_settings_preferences.xml",
@@ -8,8 +8,8 @@ diff '--color=never' -ruN a/chrome/android/chrome_java_resources.gni b/chrome/an
 +  "java/res/xml/voice_languages_preferences.xml",
  ]
 diff '--color=never' -ruN a/chrome/android/chrome_java_sources.gni b/chrome/android/chrome_java_sources.gni
---- a/chrome/android/chrome_java_sources.gni	2026-10-25 22:23:04.030978650 +0530
-+++ b/chrome/android/chrome_java_sources.gni	2026-10-25 22:23:04.001470399 +0530
+--- a/chrome/android/chrome_java_sources.gni	2026-10-26 00:01:24.049395202 +0530
++++ b/chrome/android/chrome_java_sources.gni	2026-10-26 00:01:24.022968273 +0530
 @@ -1149,6 +1149,13 @@
    "java/src/org/chromium/chrome/browser/site_settings/ChromeSiteSettingsDelegate.java",
    "java/src/org/chromium/chrome/browser/site_settings/ManageSpaceActivity.java",
@@ -26,7 +26,7 @@ diff '--color=never' -ruN a/chrome/android/chrome_java_sources.gni b/chrome/andr
    "java/src/org/chromium/chrome/browser/status_indicator/StatusIndicatorProperties.java",
 diff '--color=never' -ruN a/chrome/android/java/res/xml/voice_languages_preferences.xml b/chrome/android/java/res/xml/voice_languages_preferences.xml
 --- a/chrome/android/java/res/xml/voice_languages_preferences.xml	1970-01-01 05:30:00.000000000 +0530
-+++ b/chrome/android/java/res/xml/voice_languages_preferences.xml	2026-10-25 22:23:04.037960123 +0530
++++ b/chrome/android/java/res/xml/voice_languages_preferences.xml	2026-10-26 00:01:24.055792890 +0530
 @@ -0,0 +1,46 @@
 +<?xml version="1.0" encoding="utf-8"?>
 +<!-- Copyright 2026 The Tark Authors
@@ -75,8 +75,8 @@ diff '--color=never' -ruN a/chrome/android/java/res/xml/voice_languages_preferen
 +        app:isPreferenceVisible="false" />
 +</PreferenceScreen>
 diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/speech/SpeechLanguageSnackbar.java b/chrome/android/java/src/org/chromium/chrome/browser/speech/SpeechLanguageSnackbar.java
---- a/chrome/android/java/src/org/chromium/chrome/browser/speech/SpeechLanguageSnackbar.java	2026-10-25 22:23:04.088449837 +0530
-+++ b/chrome/android/java/src/org/chromium/chrome/browser/speech/SpeechLanguageSnackbar.java	2026-10-25 22:23:04.057288105 +0530
+--- a/chrome/android/java/src/org/chromium/chrome/browser/speech/SpeechLanguageSnackbar.java	2026-10-26 00:01:24.100932547 +0530
++++ b/chrome/android/java/src/org/chromium/chrome/browser/speech/SpeechLanguageSnackbar.java	2026-10-26 00:01:24.073161855 +0530
 @@ -5,15 +5,10 @@
  package org.chromium.chrome.browser.speech;
  
@@ -242,8 +242,8 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
  }
 diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceDetector.java b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceDetector.java
 --- a/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceDetector.java	1970-01-01 05:30:00.000000000 +0530
-+++ b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceDetector.java	2026-10-25 22:23:04.095227724 +0530
-@@ -0,0 +1,156 @@
++++ b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceDetector.java	2026-10-26 00:01:24.106772021 +0530
+@@ -0,0 +1,161 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -279,11 +279,15 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
 +        /** Whether voice search turned detection on (it may still be downloading). */
 +        public final boolean wanted;
 +
-+        public Status(int state, long bytes, long total, boolean wanted) {
++        /** UNIT_WAITING_FOR_WIFI only: in fact waiting to try again after a failure. */
++        public final boolean retrying;
++
++        public Status(int state, long bytes, long total, boolean wanted, boolean retrying) {
 +            this.state = state;
 +            this.bytes = bytes;
 +            this.total = total;
 +            this.wanted = wanted;
++            this.retrying = retrying;
 +        }
 +
 +        /** Detection is on: voice asked for it, and the model is on the phone. */
@@ -295,7 +299,7 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
 +    /** Captions' downloads, as voice search uses them; replaced in tests. */
 +    @VisibleForTesting
 +    interface Downloads {
-+        /** {state, bytes, total} of a unit. */
++        /** {state, bytes, total[, retrying]} of a unit. */
 +        long[] unitState(String unit);
 +
 +        boolean wantedByVoice(String unit);
@@ -378,7 +382,8 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
 +                (int) state[0],
 +                state[1],
 +                state[2],
-+                downloads.wantedByVoice(TarkCaptionsBridge.LANGUAGE_ID_UNIT));
++                downloads.wantedByVoice(TarkCaptionsBridge.LANGUAGE_ID_UNIT),
++                state.length > 3 && state[3] != 0);
 +    }
 +
 +    /** `onChanged` runs (on the UI thread) whenever the detector's download changes. */
@@ -402,8 +407,8 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
 +}
 diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguageOffer.java b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguageOffer.java
 --- a/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguageOffer.java	1970-01-01 05:30:00.000000000 +0530
-+++ b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguageOffer.java	2026-10-25 22:23:04.115351675 +0530
-@@ -0,0 +1,356 @@
++++ b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguageOffer.java	2026-10-26 00:01:24.122729221 +0530
+@@ -0,0 +1,376 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -469,8 +474,20 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
 +    @VisibleForTesting static final String UNSEEN = "unseen";
 +    @VisibleForTesting static final String DONE = "done";
 +
-+    /** An answer later than this is not acted on. */
-+    @VisibleForTesting static final long ANSWER_LIMIT_MS = 10_000;
++    /**
++     * An answer later than this is not acted on. Android's first answer after a start binds its
++     * speech service, which on a busy emulator took longer than 10 s; a session that started
++     * meanwhile is still checked right before the offer shows.
++     */
++    @VisibleForTesting static final long ANSWER_LIMIT_MS = 30_000;
++
++    /**
++     * Android may answer while Tark's window is not in front or focused yet (just after the
++     * session ended): the offer waits for it, a second at a time, a few times.
++     */
++    @VisibleForTesting static final long FOCUS_RETRY_MS = 1000;
++
++    @VisibleForTesting static final int FOCUS_TRIES = 5;
 +
 +    /** Where the offer shows and whose languages it offers; replaced in tests. */
 +    @VisibleForTesting
@@ -535,7 +552,7 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
 +                                sAsking = 0;
 +                                VoiceSiteLanguages.onSupport(support);
 +                                if (support == null) return; // Android didn't say: not done.
-+                                offer(appContext, support);
++                                offer(appContext, support, 0);
 +                            });
 +        } catch (RuntimeException e) {
 +            // No recognizer to ask: ask again after the next session.
@@ -545,11 +562,19 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
 +        return true;
 +    }
 +
-+    private static void offer(Context appContext, RecognitionSupport support) {
++    private static void offer(Context appContext, RecognitionSupport support, int tries) {
 +        if (sShownThisRun || isDone()) return;
 +        Host host = host();
 +        AppCompatActivity activity = host.activity();
-+        if (activity == null || activity.isFinishing() || activity.isDestroyed()) return;
++        if (activity == null || activity.isFinishing() || activity.isDestroyed()) {
++            if (tries + 1 < FOCUS_TRIES) {
++                PostTask.postDelayedTask(
++                        TaskTraits.UI_DEFAULT,
++                        () -> offer(appContext, support, tries + 1),
++                        FOCUS_RETRY_MS);
++            }
++            return;
++        }
 +        List<Entry> suggested = suggestions(support, host.signals(activity), activity);
 +        if (suggested.isEmpty()) return; // Nothing to offer yet: a later session may have some.
 +        // A session started (perhaps a private one) while Android answered: not beside it.
@@ -762,7 +787,7 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
 +}
 diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguageSignals.java b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguageSignals.java
 --- a/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguageSignals.java	1970-01-01 05:30:00.000000000 +0530
-+++ b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguageSignals.java	2026-10-25 22:23:04.135192122 +0530
++++ b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguageSignals.java	2026-10-26 00:01:24.139251635 +0530
 @@ -0,0 +1,106 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
@@ -872,7 +897,7 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
 +}
 diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguages.java b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguages.java
 --- a/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguages.java	1970-01-01 05:30:00.000000000 +0530
-+++ b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguages.java	2026-10-25 22:23:04.154346185 +0530
++++ b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguages.java	2026-10-26 00:01:24.154996917 +0530
 @@ -0,0 +1,282 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
@@ -1158,8 +1183,8 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
 +}
 diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguagesSettings.java b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguagesSettings.java
 --- a/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguagesSettings.java	1970-01-01 05:30:00.000000000 +0530
-+++ b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguagesSettings.java	2026-10-25 22:23:04.173512664 +0530
-@@ -0,0 +1,875 @@
++++ b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguagesSettings.java	2026-10-26 00:01:24.171512914 +0530
+@@ -0,0 +1,890 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -1600,7 +1625,8 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
 +                    shown = DetectionRow.ON;
 +                    break;
 +                case TarkCaptionsBridge.UNIT_WAITING_FOR_WIFI:
-+                    shown = DetectionRow.WAITING;
++                    // A failed try waits for the next one, on any network: not for Wi-Fi.
++                    shown = status.retrying ? DetectionRow.RETRYING : DetectionRow.WAITING;
 +                    break;
 +                case TarkCaptionsBridge.UNIT_DOWNLOADING:
 +                    shown = DetectionRow.DOWNLOADING;
@@ -1628,6 +1654,10 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
 +                row.setSummary(R.string.tark_voice_downloading);
 +                row.show(shown, percent, null);
 +                break;
++            case DetectionRow.RETRYING:
++                row.setSummary(R.string.tark_voice_detection_retrying);
++                row.show(shown, -1, null);
++                break;
 +            case DetectionRow.FAILED:
 +                row.setSummary(R.string.tark_captions_download_failed);
 +                row.show(shown, -1, () -> getDetector(mDetectorNow));
@@ -1644,7 +1674,10 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
 +                row.show(shown, -1, () -> getDetector(false));
 +                break;
 +        }
-+        if (mResumed && (shown == DetectionRow.WAITING || shown == DetectionRow.DOWNLOADING)) {
++        if (mResumed
++                && (shown == DetectionRow.WAITING
++                        || shown == DetectionRow.DOWNLOADING
++                        || shown == DetectionRow.RETRYING)) {
 +            mHandler.postDelayed(mDetectorRefresh, DETECTOR_REFRESH_MS);
 +        }
 +    }
@@ -1830,11 +1863,17 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
 +        }
 +    }
 +
-+    /** A download's progress bar, two touch targets wide. */
-+    private static ProgressBar progressBar(Context context, int percent) {
++    /**
++     * A download's progress bar, two touch targets wide: determinate and never animated (an
++     * animating view keeps the page from going idle for UI automation and accessibility); it is
++     * rebuilt only when the whole percent changes.
++     */
++    @VisibleForTesting
++    static ProgressBar progressBar(Context context, int percent) {
 +        ProgressBar bar = new ProgressBar(context, null, android.R.attr.progressBarStyleHorizontal);
++        bar.setIndeterminate(false);
 +        bar.setMax(100);
-+        bar.setProgress(percent);
++        bar.setProgress(percent, /* animate= */ false);
 +        int width = context.getResources().getDimensionPixelSize(R.dimen.min_touch_target_size);
 +        bar.setLayoutParams(
 +                new ViewGroup.LayoutParams(2 * width, ViewGroup.LayoutParams.WRAP_CONTENT));
@@ -1868,6 +1907,7 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
 +        static final int DOWNLOADING = 2;
 +        static final int ON = 3;
 +        static final int FAILED = 4;
++        static final int RETRYING = 5;
 +
 +        private int mStatus = OFF;
 +        private int mPercent = -1;
@@ -2037,7 +2077,7 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
 +}
 diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/speech/VoicePlatform.java b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoicePlatform.java
 --- a/chrome/android/java/src/org/chromium/chrome/browser/speech/VoicePlatform.java	1970-01-01 05:30:00.000000000 +0530
-+++ b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoicePlatform.java	2026-10-25 22:23:04.192118051 +0530
++++ b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoicePlatform.java	2026-10-26 00:01:24.188595875 +0530
 @@ -0,0 +1,310 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
@@ -2351,7 +2391,7 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
 +}
 diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceSiteLanguages.java b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceSiteLanguages.java
 --- a/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceSiteLanguages.java	1970-01-01 05:30:00.000000000 +0530
-+++ b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceSiteLanguages.java	2026-10-25 22:23:04.210559062 +0530
++++ b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceSiteLanguages.java	2026-10-26 00:01:24.204873162 +0530
 @@ -0,0 +1,222 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
@@ -2576,8 +2616,8 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
 +    }
 +}
 diff '--color=never' -ruN a/chrome/android/junit/BUILD.gn b/chrome/android/junit/BUILD.gn
---- a/chrome/android/junit/BUILD.gn	2026-10-25 22:23:04.256677755 +0530
-+++ b/chrome/android/junit/BUILD.gn	2026-10-25 22:23:04.228208020 +0530
+--- a/chrome/android/junit/BUILD.gn	2026-10-26 00:01:24.246625784 +0530
++++ b/chrome/android/junit/BUILD.gn	2026-10-26 00:01:24.221182698 +0530
 @@ -1232,11 +1232,19 @@
      ]
    }
@@ -2602,7 +2642,7 @@ diff '--color=never' -ruN a/chrome/android/junit/BUILD.gn b/chrome/android/junit
        ":chrome_junit_tests_helper",
 diff '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome/browser/speech/AndroidVoicePlatformTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/speech/AndroidVoicePlatformTest.java
 --- a/chrome/android/junit/src/org/chromium/chrome/browser/speech/AndroidVoicePlatformTest.java	1970-01-01 05:30:00.000000000 +0530
-+++ b/chrome/android/junit/src/org/chromium/chrome/browser/speech/AndroidVoicePlatformTest.java	2026-10-25 22:23:04.264873288 +0530
++++ b/chrome/android/junit/src/org/chromium/chrome/browser/speech/AndroidVoicePlatformTest.java	2026-10-26 00:01:24.252879054 +0530
 @@ -0,0 +1,234 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
@@ -2840,8 +2880,8 @@ diff '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome/browser
 +}
 diff '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguageOfferTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguageOfferTest.java
 --- a/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguageOfferTest.java	1970-01-01 05:30:00.000000000 +0530
-+++ b/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguageOfferTest.java	2026-10-25 22:23:04.284404564 +0530
-@@ -0,0 +1,434 @@
++++ b/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguageOfferTest.java	2026-10-26 00:01:24.268647253 +0530
+@@ -0,0 +1,465 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -2945,6 +2985,7 @@ diff '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome/browser
 +    private final LocaleList mDefaultLocales = LocaleList.getDefault();
 +    private final Map<String, Reason> mSignals = new LinkedHashMap<>();
 +    private boolean mLive;
++    private boolean mNoFocus;
 +    private FakePlatform mPlatform;
 +    private TestActivity mActivity;
 +    private SpeechLanguageSnackbar mDelegate;
@@ -2969,7 +3010,7 @@ diff '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome/browser
 +                new VoiceLanguageOffer.Host() {
 +                    @Override
 +                    public @Nullable AppCompatActivity activity() {
-+                        return mActivity;
++                        return mNoFocus ? null : mActivity;
 +                    }
 +
 +                    @Override
@@ -3199,6 +3240,36 @@ diff '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome/browser
 +        assertNotNull(shown());
 +    }
 +
++    // Android answered before Tark's window had focus again: the offer waits for it.
++    @Test
++    @Config(minSdk = Build.VERSION_CODES.TIRAMISU)
++    public void testOfferWaitsForFocus() {
++        mNoFocus = true;
++        session(ORIGIN);
++        assertNull(shown());
++
++        mNoFocus = false;
++        ShadowLooper.idleMainLooper(VoiceLanguageOffer.FOCUS_RETRY_MS, TimeUnit.MILLISECONDS);
++        assertNotNull(shown());
++    }
++
++    @Test
++    @Config(minSdk = Build.VERSION_CODES.TIRAMISU)
++    public void testNoFocusGivesUpAfterTries() {
++        mNoFocus = true;
++        session(ORIGIN);
++        ShadowLooper.idleMainLooper(
++                VoiceLanguageOffer.FOCUS_TRIES * VoiceLanguageOffer.FOCUS_RETRY_MS,
++                TimeUnit.MILLISECONDS);
++        mNoFocus = false;
++        ShadowLooper.idleMainLooper(
++                10 * VoiceLanguageOffer.FOCUS_RETRY_MS, TimeUnit.MILLISECONDS);
++        assertNull(shown());
++        // Not done: the next session offers.
++        session(ORIGIN);
++        assertNotNull(shown());
++    }
++
 +    @Test
 +    @Config(sdk = 32)
 +    public void testNoOfferOnAndroid12() {
@@ -3278,7 +3349,7 @@ diff '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome/browser
 +}
 diff '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguageSignalsTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguageSignalsTest.java
 --- a/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguageSignalsTest.java	1970-01-01 05:30:00.000000000 +0530
-+++ b/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguageSignalsTest.java	2026-10-25 22:23:04.301913270 +0530
++++ b/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguageSignalsTest.java	2026-10-26 00:01:24.285600713 +0530
 @@ -0,0 +1,79 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
@@ -3361,8 +3432,8 @@ diff '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome/browser
 +}
 diff '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguagesSettingsTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguagesSettingsTest.java
 --- a/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguagesSettingsTest.java	1970-01-01 05:30:00.000000000 +0530
-+++ b/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguagesSettingsTest.java	2026-10-25 22:23:04.319461559 +0530
-@@ -0,0 +1,821 @@
++++ b/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguagesSettingsTest.java	2026-10-26 00:01:24.301473453 +0530
+@@ -0,0 +1,852 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -3477,6 +3548,7 @@ diff '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome/browser
 +
 +        int mState = TarkCaptionsBridge.UNIT_MISSING;
 +        long mBytes;
++        boolean mRetrying;
 +        boolean mCaptionsWant;
 +        boolean mVoiceWants;
 +        int mFetches;
@@ -3489,7 +3561,7 @@ diff '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome/browser
 +        public long[] unitState(String unit) {
 +            assertEquals("language_id", unit);
 +            mStateReads++;
-+            return new long[] {mState, mBytes, TOTAL};
++            return new long[] {mState, mBytes, TOTAL, mRetrying ? 1 : 0};
 +        }
 +
 +        @Override
@@ -3915,6 +3987,36 @@ diff '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome/browser
 +        assertEquals(1, mDetector.mListeners.size());
 +    }
 +
++    // On Wi-Fi a failed try waits for the next one: not "Waiting for Wi-Fi · Download now".
++    @Test
++    @Config(minSdk = Build.VERSION_CODES.TIRAMISU)
++    public void testDetectionRetryingIsNotWaitingForWifi() {
++        mDetector.mVoiceWants = true;
++        mDetector.mState = TarkCaptionsBridge.UNIT_WAITING_FOR_WIFI;
++        mDetector.mRetrying = true;
++        launch();
++
++        assertEquals(DetectionRow.RETRYING, detection().getStatus());
++        assertEquals("Trying again soon…", summary(detection()));
++        assertNull(label(detection()));
++
++        mDetector.mRetrying = false;
++        mDetector.changed();
++        ShadowLooper.idleMainLooper();
++        assertEquals(DetectionRow.WAITING, detection().getStatus());
++        assertEquals("Waiting for Wi-Fi", summary(detection()));
++    }
++
++    // The bar never animates: the page can go idle while it shows.
++    @Test
++    @Config(minSdk = Build.VERSION_CODES.TIRAMISU)
++    public void testProgressBarIsDeterminate() {
++        android.widget.ProgressBar bar = VoiceLanguagesSettings.progressBar(mActivity, 40);
++        assertFalse(bar.isIndeterminate());
++        assertEquals(40, bar.getProgress());
++        assertEquals(100, bar.getMax());
++    }
++
 +    @Test
 +    @Config(minSdk = Build.VERSION_CODES.TIRAMISU)
 +    public void testDetectionFailedTryAgain() {
@@ -4186,7 +4288,7 @@ diff '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome/browser
 +}
 diff '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguagesTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguagesTest.java
 --- a/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguagesTest.java	1970-01-01 05:30:00.000000000 +0530
-+++ b/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguagesTest.java	2026-10-25 22:23:04.337068350 +0530
++++ b/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguagesTest.java	2026-10-26 00:01:24.316832398 +0530
 @@ -0,0 +1,243 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
@@ -4433,7 +4535,7 @@ diff '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome/browser
 +}
 diff '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceSiteLanguagesTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceSiteLanguagesTest.java
 --- a/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceSiteLanguagesTest.java	1970-01-01 05:30:00.000000000 +0530
-+++ b/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceSiteLanguagesTest.java	2026-10-25 22:23:04.354980561 +0530
++++ b/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceSiteLanguagesTest.java	2026-10-26 00:01:24.332781723 +0530
 @@ -0,0 +1,247 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
@@ -4683,8 +4785,8 @@ diff '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome/browser
 +    }
 +}
 diff '--color=never' -ruN a/chrome/browser/language/android/java/src/org/chromium/chrome/browser/language/settings/LanguageSettings.java b/chrome/browser/language/android/java/src/org/chromium/chrome/browser/language/settings/LanguageSettings.java
---- a/chrome/browser/language/android/java/src/org/chromium/chrome/browser/language/settings/LanguageSettings.java	2026-10-25 22:23:04.400622831 +0530
-+++ b/chrome/browser/language/android/java/src/org/chromium/chrome/browser/language/settings/LanguageSettings.java	2026-10-25 22:23:04.373061692 +0530
+--- a/chrome/browser/language/android/java/src/org/chromium/chrome/browser/language/settings/LanguageSettings.java	2026-10-26 00:01:24.375229727 +0530
++++ b/chrome/browser/language/android/java/src/org/chromium/chrome/browser/language/settings/LanguageSettings.java	2026-10-26 00:01:24.349155135 +0530
 @@ -9,6 +9,7 @@
  import android.app.Activity;
  import android.content.Context;
@@ -4736,9 +4838,9 @@ diff '--color=never' -ruN a/chrome/browser/language/android/java/src/org/chromiu
          if (mTarkXlitSwitch == null) return;
          String summary;
 diff '--color=never' -ruN a/chrome/browser/ui/android/strings/android_chrome_strings.grd b/chrome/browser/ui/android/strings/android_chrome_strings.grd
---- a/chrome/browser/ui/android/strings/android_chrome_strings.grd	2026-10-25 22:23:04.434874690 +0530
-+++ b/chrome/browser/ui/android/strings/android_chrome_strings.grd	2026-10-25 22:23:04.407112423 +0530
-@@ -994,6 +994,83 @@
+--- a/chrome/browser/ui/android/strings/android_chrome_strings.grd	2026-10-26 00:01:24.406601913 +0530
++++ b/chrome/browser/ui/android/strings/android_chrome_strings.grd	2026-10-26 00:01:24.381035576 +0530
+@@ -994,6 +994,86 @@
        <message name="IDS_TARK_SPEECH_LANGUAGE_DOWNLOAD" desc="Tark: action of the voice language snackbar: Android downloads the language (or opens its voice input settings).">
          Download
        </message>
@@ -4806,6 +4908,9 @@ diff '--color=never' -ruN a/chrome/browser/ui/android/strings/android_chrome_str
 +      <message name="IDS_TARK_VOICE_DETECTION_ALREADY_HERE" desc="Tark: Settings > Voice languages > Spoken-language detection: below the row while it is off but the model is already on the phone (live captions downloaded it), so turning it on downloads nothing.">
 +        On this phone already · no download needed
 +      </message>
++      <message name="IDS_TARK_VOICE_DETECTION_RETRYING" desc="Tark: Settings > Voice languages > Spoken-language detection: below the row while the model's download failed for a moment and will be tried again shortly by itself.">
++        Trying again soon…
++      </message>
 +      <message name="IDS_TARK_VOICE_DETECTION_GET" desc="Tark: Settings > Voice languages > Spoken-language detection: button that downloads the model and turns detection on. [CHAR_LIMIT=16]">
 +        Get
 +      </message>
@@ -4823,9 +4928,9 @@ diff '--color=never' -ruN a/chrome/browser/ui/android/strings/android_chrome_str
          New versions of Tark, checked once a day unless Google Play installed it (gettarka.com)
        </message>
 diff '--color=never' -ruN a/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb b/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb
---- a/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb	2026-10-25 22:23:04.469882726 +0530
-+++ b/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb	2026-10-25 22:23:04.442244753 +0530
-@@ -2197,4 +2197,23 @@
+--- a/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb	2026-10-26 00:01:24.437675763 +0530
++++ b/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb	2026-10-26 00:01:24.412129385 +0530
+@@ -2197,4 +2197,24 @@
  <translation id="8955589894175271948">Tark के नए वर्शन, दिन में एक बार जांचे जाते हैं, जब तक इसे Google Play से इंस्टॉल न किया गया हो (gettarka.com)</translation>
  <translation id="1628159678930647766">इस फ़ोन पर वॉइस सर्च के लिए <ph name="LANGUAGE"/> चाहिए।</translation>
  <translation id="5742981176567952751">वॉइस के लिए एक भाषा डाउनलोड करनी होगी</translation>
@@ -4843,6 +4948,7 @@ diff '--color=never' -ruN a/chrome/browser/ui/android/strings/translations/andro
 +<translation id="150411034776756821"><ph name="SITE"/> हटाएं</translation>
 +<translation id="844753601361341551">अपनी भाषाओं में बोलें</translation>
 +<translation id="8718879320394438077">Tark इस फ़ोन पर उन भाषाओं में वॉइस सर्च कर सकता है जिनका आप इस्तेमाल करते हैं। हर भाषा एक बार डाउनलोड करनी होती है।</translation>
++<translation id="3722996002992057763">जल्द ही फिर कोशिश की जाएगी…</translation>
 +<translation id="7026478540401678525">बोली गई भाषा की पहचान</translation>
 +<translation id="5528857825864531390">मैं जो भाषा बोलूं, उसे पहचानें</translation>
 +<translation id="3168162253316954087">इस फ़ोन पर एक मॉडल · <ph name="SIZE"/>, वाई-फ़ाई पर · सिर्फ़ तब सुनता है जब आप वॉइस सर्च इस्तेमाल करते हैं</translation>
