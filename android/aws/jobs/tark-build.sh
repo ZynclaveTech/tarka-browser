@@ -62,7 +62,7 @@ echo "exit $code" >> $log
 # language detector) run in build.sh's host tests: each must have run.
 if (( code == 0 )); then
   for t in RemoveKeepsUnitCaptionsUses RemoveDeletesWhenNoOwner SharedNoSecondDownload; do
-    grep -q "OK \] CaptionDownloadsTest\.$t " $log || { echo "no CaptionDownloadsTest.$t test ran" >> $log; code=1; }
+    grep -qE "(OK \]|\[[0-9]+\/[0-9]+\]) CaptionDownloadsTest\.$t " $log || { echo "no CaptionDownloadsTest.$t test ran" >> $log; code=1; }
   done
 fi
 (( code == 0 )) && upload /tark/work/src/out/Default/apks/ChromePublic.apk ChromePublic.apk
