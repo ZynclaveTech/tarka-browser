@@ -1,0 +1,376 @@
+diff '--color=never' -ruN a/chrome/android/BUILD.gn b/chrome/android/BUILD.gn
+--- a/chrome/android/BUILD.gn	2026-10-26 02:31:11.066056478 +0530
++++ b/chrome/android/BUILD.gn	2026-10-26 02:31:46.724701398 +0530
+@@ -15,6 +15,14 @@
+ 
+ _is_default_toolchain = current_toolchain == default_toolchain
+ 
++declare_args() {
++  # Tark: Sign in with Zynclave against the staging Zynclave Account (issuer
++  # auth.staging.zynclave.com) instead of production. Test APKs only: set by
++  # the build job's --zynclave-staging, never in args.gn; android/release
++  # refuses an APK built with it.
++  tark_zynclave_staging = false
++}
++
+ if (_is_default_toolchain) {
+   import("//build/android/resource_sizes.gni")
+   import("//build/config/android/rules.gni")
+@@ -851,6 +859,7 @@
+       "//third_party/androidx:androidx_viewpager2_viewpager2_java",
+       "//third_party/androidx:androidx_viewpager_viewpager_java",
+       "//third_party/androidx:androidx_window_window_java",
++      "//third_party/appauth:appauth_java",
+       "//third_party/blink/public:blink_headers_java",
+       "//third_party/blink/public/common:common_java",
+       "//third_party/blink/public/mojom:android_mojo_bindings_java",
+@@ -883,6 +892,7 @@
+       ":chrome_android_java_enums_srcjar",
+       ":chrome_strict_mode_switch",
+       ":resource_id_javagen",
++      ":tark_zynclave_build_config",
+       "//chrome:offline_pages_enum_javagen",
+       "//chrome/browser:screenshot_mode_enum",
+       "//chrome/browser/enterprise/platform_auth:entra_auth_enum_javagen",
+@@ -984,6 +994,15 @@
+     }
+   }
+ 
++  # Tark: which Zynclave Account Sign in with Zynclave uses
++  # (TarkZynclaveBuildConfig.STAGING, read by ZynclaveConfig).
++  java_cpp_template("tark_zynclave_build_config") {
++    sources = [ "java/src/org/chromium/chrome/browser/tark/zynclave/TarkZynclaveBuildConfig.template" ]
++    if (tark_zynclave_staging) {
++      defines = [ "TARK_ZYNCLAVE_STAGING" ]
++    }
++  }
++
+   generate_product_config_srcjar("chrome_product_config") {
+     java_package = "org.chromium.chrome.browser"
+   }
+@@ -1168,6 +1187,7 @@
+       "junit:chrome_junit_tests_org.chromium.chrome.browser.tab",
+       "junit:chrome_junit_tests_org.chromium.chrome.browser.tabbed_mode",
+       "junit:chrome_junit_tests_org.chromium.chrome.browser.tabmodel",
++      "junit:chrome_junit_tests_org.chromium.chrome.browser.tark.zynclave",
+       "junit:chrome_junit_tests_org.chromium.chrome.browser.tasks",
+       "junit:chrome_junit_tests_org.chromium.chrome.browser.toolbar",
+       "junit:chrome_junit_tests_org.chromium.chrome.browser.ui",
+diff '--color=never' -ruN a/chrome/android/chrome_java_sources.gni b/chrome/android/chrome_java_sources.gni
+--- a/chrome/android/chrome_java_sources.gni	2026-10-26 02:31:11.067458914 +0530
++++ b/chrome/android/chrome_java_sources.gni	2026-10-26 02:31:46.723893553 +0530
+@@ -980,6 +980,8 @@
+   "java/src/org/chromium/chrome/browser/page_info/SiteSettingsHelper.java",
+   "java/src/org/chromium/chrome/browser/page_info/TarkAdblockSiteSwitch.java",
+   "java/src/org/chromium/chrome/browser/tark_captions/TarkCaptionBarCoordinator.java",
++  "java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAuthFlow.java",
++  "java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveConfig.java",
+   "java/src/org/chromium/chrome/browser/paint_preview/StartupPaintPreviewHelper.java",
+   "java/src/org/chromium/chrome/browser/paint_preview/StartupPaintPreviewHelperSupplier.java",
+   "java/src/org/chromium/chrome/browser/password_manager/AccountChooserDialog.java",
+diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/TarkZynclaveBuildConfig.template b/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/TarkZynclaveBuildConfig.template
+--- a/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/TarkZynclaveBuildConfig.template	1970-01-01 05:30:00.000000000 +0530
++++ b/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/TarkZynclaveBuildConfig.template	2026-10-26 02:32:55.592886123 +0530
+@@ -0,0 +1,16 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++package org.chromium.chrome.browser.tark.zynclave;
++
++/** Tark: the GN arg tark_zynclave_staging, for {@link ZynclaveConfig}. */
++public final class TarkZynclaveBuildConfig {
++#if defined(TARK_ZYNCLAVE_STAGING)
++    public static final boolean STAGING = true;
++#else
++    public static final boolean STAGING = false;
++#endif
++
++    private TarkZynclaveBuildConfig() {}
++}
+diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAuthFlow.java b/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAuthFlow.java
+--- a/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAuthFlow.java	1970-01-01 05:30:00.000000000 +0530
++++ b/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAuthFlow.java	2026-10-26 02:33:08.778543128 +0530
+@@ -0,0 +1,59 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++package org.chromium.chrome.browser.tark.zynclave;
++
++import net.openid.appauth.AuthorizationException;
++import net.openid.appauth.AuthorizationRequest;
++import net.openid.appauth.AuthorizationServiceConfiguration;
++import net.openid.appauth.ResponseTypeValues;
++
++import org.chromium.build.annotations.NullMarked;
++import org.chromium.build.annotations.Nullable;
++
++/**
++ * Tark: Sign in with Zynclave's authorization request (spec §5.3): the code flow with PKCE (S256,
++ * AppAuth's default code verifier), a random state and nonce (AppAuth's defaults), the scopes
++ * {@code openid profile email offline_access} and Tark's redirect.
++ */
++@NullMarked
++public final class ZynclaveAuthFlow {
++    private ZynclaveAuthFlow() {}
++
++    /**
++     * The authorization request for {@code cfg}'s client at {@code svc}. With {@code promptNone}
++     * it asks for {@code prompt=none}: no page is shown, and the request fails instead if the
++     * person would have to sign in or consent (see {@link #shouldRetryInteractive}).
++     */
++    public static AuthorizationRequest buildRequest(
++            ZynclaveConfig cfg, AuthorizationServiceConfiguration svc, boolean promptNone) {
++        AuthorizationRequest.Builder builder =
++                new AuthorizationRequest.Builder(
++                                svc, cfg.clientId(), ResponseTypeValues.CODE, cfg.redirectUri())
++                        .setScopes(
++                                AuthorizationRequest.Scope.OPENID,
++                                AuthorizationRequest.Scope.PROFILE,
++                                AuthorizationRequest.Scope.EMAIL,
++                                AuthorizationRequest.Scope.OFFLINE_ACCESS);
++        if (promptNone) builder.setPrompt(AuthorizationRequest.Prompt.NONE);
++        return builder.build();
++    }
++
++    /**
++     * Whether a failed {@code prompt=none} request should be asked again with the sign-in page:
++     * only when the authorization server said the person has to sign in, interact or consent. Any
++     * other failure (access denied, network, a state mismatch) is final.
++     */
++    public static boolean shouldRetryInteractive(@Nullable AuthorizationException ex) {
++        if (ex == null || ex.type != AuthorizationException.TYPE_OAUTH_AUTHORIZATION_ERROR) {
++            return false;
++        }
++        // OpenID Connect Core §3.1.2.6: the errors a prompt=none request ends with when the
++        // person must act. AppAuth maps them to OTHER and keeps the server's string.
++        String error = ex.error;
++        return "login_required".equals(error)
++                || "interaction_required".equals(error)
++                || "consent_required".equals(error);
++    }
++}
+diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveConfig.java b/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveConfig.java
+--- a/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveConfig.java	1970-01-01 05:30:00.000000000 +0530
++++ b/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveConfig.java	2026-10-26 02:32:55.595589244 +0530
+@@ -0,0 +1,80 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++package org.chromium.chrome.browser.tark.zynclave;
++
++import android.net.Uri;
++
++import org.chromium.build.annotations.NullMarked;
++
++/**
++ * Tark: the Zynclave Account that Sign in with Zynclave talks to (spec §5.1). Every published APK
++ * uses production; a test APK built with the GN arg tark_zynclave_staging uses staging.
++ */
++@NullMarked
++public final class ZynclaveConfig {
++    /** The redirect registered for both clients (scheme: Tark's package name). */
++    private static final String REDIRECT_URI = "com.gettarka.tarka:/oauth2redirect";
++
++    private static final ZynclaveConfig PRODUCTION =
++            new ZynclaveConfig(
++                    /* staging= */ false,
++                    "https://auth.zynclave.com/",
++                    "fa54f2e8-2dfe-4c73-8002-01caea05f849",
++                    "accounts.zynclave.com");
++
++    private static final ZynclaveConfig STAGING =
++            new ZynclaveConfig(
++                    /* staging= */ true,
++                    "https://auth.staging.zynclave.com/",
++                    "1664a81e-6fe5-4eb9-9869-ca0c7a7a04c4",
++                    "accounts.staging.zynclave.com");
++
++    private final boolean mStaging;
++    private final Uri mIssuer;
++    private final String mClientId;
++    private final String mAccountsHost;
++    private final Uri mRedirectUri;
++
++    private ZynclaveConfig(boolean staging, String issuer, String clientId, String accountsHost) {
++        mStaging = staging;
++        mIssuer = Uri.parse(issuer);
++        mClientId = clientId;
++        mAccountsHost = accountsHost;
++        mRedirectUri = Uri.parse(REDIRECT_URI);
++    }
++
++    /** The build's environment. */
++    public static ZynclaveConfig get() {
++        return TarkZynclaveBuildConfig.STAGING ? STAGING : PRODUCTION;
++    }
++
++    /** Either environment, whatever the build's. */
++    public static ZynclaveConfig forTesting(boolean staging) {
++        return staging ? STAGING : PRODUCTION;
++    }
++
++    /** The OpenID Connect issuer (Hydra), with its trailing slash. */
++    public Uri issuer() {
++        return mIssuer;
++    }
++
++    /** Tark's public OAuth client (no secret: PKCE). */
++    public String clientId() {
++        return mClientId;
++    }
++
++    /** The host of the Zynclave Account web pages (handoff §2a). */
++    public String accountsHost() {
++        return mAccountsHost;
++    }
++
++    public Uri redirectUri() {
++        return mRedirectUri;
++    }
++
++    public boolean isStaging() {
++        return mStaging;
++    }
++}
+diff '--color=never' -ruN a/chrome/android/junit/BUILD.gn b/chrome/android/junit/BUILD.gn
+--- a/chrome/android/junit/BUILD.gn	2026-10-26 02:31:11.066764654 +0530
++++ b/chrome/android/junit/BUILD.gn	2026-10-26 02:31:57.241465435 +0530
+@@ -1394,6 +1394,17 @@
+     ]
+   }
+ 
++  # Tark: Sign in with Zynclave.
++  robolectric_library(
++      "chrome_junit_tests_org.chromium.chrome.browser.tark.zynclave") {
++    sources = [ "src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAuthFlowTest.java" ]
++
++    deps = [
++      ":chrome_junit_tests_helper",
++      "//third_party/appauth:appauth_java",
++    ]
++  }
++
+   robolectric_library("chrome_junit_tests_org.chromium.chrome.browser.tasks") {
+     resources_package = "org.chromium.chrome.browser.tasks.tab_management"
+ 
+diff '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAuthFlowTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAuthFlowTest.java
+--- a/chrome/android/junit/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAuthFlowTest.java	1970-01-01 05:30:00.000000000 +0530
++++ b/chrome/android/junit/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAuthFlowTest.java	2026-10-26 02:33:18.897582500 +0530
+@@ -0,0 +1,114 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++package org.chromium.chrome.browser.tark.zynclave;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.assertNotEquals;
++import static org.junit.Assert.assertNotNull;
++import static org.junit.Assert.assertNull;
++import static org.junit.Assert.assertTrue;
++
++import android.net.Uri;
++
++import net.openid.appauth.AuthorizationException;
++import net.openid.appauth.AuthorizationException.AuthorizationRequestErrors;
++import net.openid.appauth.AuthorizationException.GeneralErrors;
++import net.openid.appauth.AuthorizationRequest;
++import net.openid.appauth.AuthorizationServiceConfiguration;
++
++import org.junit.Test;
++import org.junit.runner.RunWith;
++import org.robolectric.annotation.Config;
++
++import org.chromium.base.test.BaseRobolectricTestRunner;
++
++import java.util.Arrays;
++import java.util.HashSet;
++
++/** Tests for {@link ZynclaveAuthFlow}'s request and {@link ZynclaveConfig}'s environments. */
++@RunWith(BaseRobolectricTestRunner.class)
++@Config(manifest = Config.NONE)
++public class ZynclaveAuthFlowTest {
++    private static AuthorizationServiceConfiguration service(ZynclaveConfig cfg) {
++        return new AuthorizationServiceConfiguration(
++                cfg.issuer().buildUpon().appendPath("oauth2").appendPath("auth").build(),
++                cfg.issuer().buildUpon().appendPath("oauth2").appendPath("token").build());
++    }
++
++    private static AuthorizationException oauthError(String error) {
++        return AuthorizationException.fromOAuthTemplate(
++                AuthorizationRequestErrors.byString(error), error, null, null);
++    }
++
++    @Test
++    public void testProductionRequest() {
++        ZynclaveConfig cfg = ZynclaveConfig.forTesting(false);
++        assertFalse(cfg.isStaging());
++        assertEquals(Uri.parse("https://auth.zynclave.com/"), cfg.issuer());
++        assertEquals("accounts.zynclave.com", cfg.accountsHost());
++
++        AuthorizationRequest request =
++                ZynclaveAuthFlow.buildRequest(cfg, service(cfg), /* promptNone= */ false);
++        assertEquals("fa54f2e8-2dfe-4c73-8002-01caea05f849", request.clientId);
++        assertEquals(Uri.parse("com.gettarka.tarka:/oauth2redirect"), request.redirectUri);
++        assertEquals("code", request.responseType);
++        assertEquals("openid profile email offline_access", request.scope);
++        assertEquals(
++                new HashSet<>(Arrays.asList("openid", "profile", "email", "offline_access")),
++                request.getScopeSet());
++        assertEquals("S256", request.codeVerifierChallengeMethod);
++        assertNotNull(request.codeVerifier);
++        assertNotNull(request.state);
++        assertNotNull(request.nonce);
++        assertNull(request.prompt);
++    }
++
++    @Test
++    public void testStagingRequest() {
++        ZynclaveConfig cfg = ZynclaveConfig.forTesting(true);
++        assertTrue(cfg.isStaging());
++        assertEquals(Uri.parse("https://auth.staging.zynclave.com/"), cfg.issuer());
++        assertEquals("accounts.staging.zynclave.com", cfg.accountsHost());
++
++        AuthorizationRequest request =
++                ZynclaveAuthFlow.buildRequest(cfg, service(cfg), /* promptNone= */ false);
++        assertEquals("1664a81e-6fe5-4eb9-9869-ca0c7a7a04c4", request.clientId);
++        assertEquals(Uri.parse("com.gettarka.tarka:/oauth2redirect"), request.redirectUri);
++    }
++
++    @Test
++    public void testEachRequestIsFresh() {
++        ZynclaveConfig cfg = ZynclaveConfig.forTesting(false);
++        AuthorizationRequest a = ZynclaveAuthFlow.buildRequest(cfg, service(cfg), false);
++        AuthorizationRequest b = ZynclaveAuthFlow.buildRequest(cfg, service(cfg), false);
++        assertNotEquals(a.state, b.state);
++        assertNotEquals(a.nonce, b.nonce);
++        assertNotEquals(a.codeVerifier, b.codeVerifier);
++    }
++
++    @Test
++    public void testPromptNone() {
++        ZynclaveConfig cfg = ZynclaveConfig.forTesting(false);
++        AuthorizationRequest request =
++                ZynclaveAuthFlow.buildRequest(cfg, service(cfg), /* promptNone= */ true);
++        assertEquals("none", request.prompt);
++        assertEquals("none", request.toUri().getQueryParameter("prompt"));
++    }
++
++    @Test
++    public void testRetryOnlyOnInteractionErrors() {
++        assertTrue(ZynclaveAuthFlow.shouldRetryInteractive(oauthError("login_required")));
++        assertTrue(ZynclaveAuthFlow.shouldRetryInteractive(oauthError("interaction_required")));
++        assertTrue(ZynclaveAuthFlow.shouldRetryInteractive(oauthError("consent_required")));
++
++        assertFalse(ZynclaveAuthFlow.shouldRetryInteractive(oauthError("access_denied")));
++        assertFalse(
++                ZynclaveAuthFlow.shouldRetryInteractive(AuthorizationRequestErrors.ACCESS_DENIED));
++        assertFalse(ZynclaveAuthFlow.shouldRetryInteractive(GeneralErrors.NETWORK_ERROR));
++        assertFalse(ZynclaveAuthFlow.shouldRetryInteractive(GeneralErrors.USER_CANCELED_AUTH_FLOW));
++        assertFalse(ZynclaveAuthFlow.shouldRetryInteractive(null));
++    }
++}
