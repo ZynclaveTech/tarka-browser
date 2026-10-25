@@ -61,8 +61,10 @@ echo "exit $code" >> $log
 # The captions downloads' sharing rules (voice and captions share the
 # language detector) run in build.sh's host tests: each must have run.
 if (( code == 0 )); then
-  for t in RemoveKeepsUnitCaptionsUses RemoveDeletesWhenNoOwner SharedNoSecondDownload; do
-    grep -qE "(OK \]|\[[0-9]+\/[0-9]+\]) CaptionDownloadsTest\.$t " $log || { echo "no CaptionDownloadsTest.$t test ran" >> $log; code=1; }
+  for t in RemoveKeepsUnitCaptionsUses RemoveDeletesWhenNoOwner SharedNoSecondDownload \
+      RequestAfterPendingRemoveKeepsUnit ReleaseKeepsUnitWantedAgain InUseRemoveWhileKeptThenRelease; do
+    grep -qE "^\[[0-9]+/[0-9]+\] CaptionDownloadsTest\.$t \([0-9]+ ms\)$" $log || { echo "no CaptionDownloadsTest.$t test ran" >> $log; code=1; }
+    grep -qE "CaptionDownloadsTest\.$t.*(SKIPPED|FAILED)|(SKIPPED|FAILED).*CaptionDownloadsTest\.$t" $log && { echo "CaptionDownloadsTest.$t did not pass" >> $log; code=1; }
   done
 fi
 (( code == 0 )) && upload /tark/work/src/out/Default/apks/ChromePublic.apk ChromePublic.apk

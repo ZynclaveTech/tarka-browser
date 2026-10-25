@@ -66,6 +66,10 @@ while read -r name sha size; do
   there=$(aws s3api head-object --bucket $BUCKET --key "$PREFIX/$sha.bin" \
             --query Metadata.sha256 --output text 2>/dev/null || true)
   if [[ $there == "$sha" ]]; then echo "already there: $name"; continue; fi
+  if [[ $there == None ]]; then
+    echo "$PREFIX/$sha.bin is published without its sha256 metadata; check it by hand" >&2
+    exit 1
+  fi
   if [[ -n $there ]]; then
     echo "$PREFIX/$sha.bin is already published with another hash ($there)" >&2
     exit 1

@@ -314,9 +314,14 @@ class TestModels(unittest.TestCase):
         # Android's credits page lists third_party folders with a
         # README.chromium; build.sh puts the detector's there.
         text = (ANDROID / 'build.sh').read_text(encoding='utf-8')
-        self.assertIn('resources/captions/credits/voxlingua_ecapa', text)
-        self.assertIn('third_party/tark_voxlingua_ecapa', text)
-        self.assertLess(text.index('tark_voxlingua_ecapa'), text.index('/out/Default/gn" gen'))
+        self.assertIn('for _credit in voxlingua_ecapa silero_vad; do', text)
+        self.assertIn('resources/captions/credits/$_credit/README.chromium', text)
+        self.assertIn('third_party/tark_$_credit', text)
+        self.assertLess(text.index('for _credit in'), text.index('/out/Default/gn" gen'))
+        for name in ('voxlingua_ecapa', 'silero_vad'):
+            self.assertTrue((ROOT / 'resources' / 'captions' / 'credits' / name / 'LICENSE').exists())
+        readme = (ROOT / 'resources/captions/credits/voxlingua_ecapa/README.chromium').read_text(encoding='utf-8')
+        self.assertIn('voice search', readme)
 
     def test_build_sh_writes_the_table(self):
         text = (ANDROID / 'build.sh').read_text(encoding='utf-8')

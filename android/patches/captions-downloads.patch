@@ -117,7 +117,7 @@
 +}
 --- /dev/null
 +++ b/chrome/browser/tark_captions_android/caption_downloads.cc
-@@ -0,0 +1,495 @@
+@@ -0,0 +1,502 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -309,6 +309,9 @@
 +    return;
 +  }
 +  SetWantedBy(unit, owner, true);
++  // Removed while in use and wanted again before the release: its files are
++  // still here, so it is ready again with nothing fetched.
++  use_.CancelRemove(unit);
 +  Enqueue(unit, now);
 +}
 +
@@ -381,7 +384,11 @@
 +
 +void CaptionDownloads::SetInUse(std::string_view unit, bool in_use) {
 +  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
-+  if (use_.SetInUse(unit, in_use)) {
++  if (in_use) {
++    use_.SetInUse(unit, true);
++    return;
++  }
++  if (ReleaseDeletes(unit, owners_, use_)) {
 +    DeleteUnit(std::string(unit));
 +  }
 +}
@@ -762,7 +769,7 @@
 +#endif  // CHROME_BROWSER_TARK_CAPTIONS_ANDROID_CAPTION_DOWNLOADS_H_
 --- /dev/null
 +++ b/chrome/browser/tark_captions_android/model_files.cc
-@@ -0,0 +1,338 @@
+@@ -0,0 +1,349 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -1060,6 +1067,10 @@
 +  return use.RequestRemove(unit) ? Removal::kNow : Removal::kOnRelease;
 +}
 +
++bool ReleaseDeletes(std::string_view unit, const UnitOwners& owners, UnitUse& use) {
++  return use.SetInUse(unit, false) && !owners.Wanted(unit);
++}
++
 +UnitUse::UnitUse() = default;
 +UnitUse::~UnitUse() = default;
 +
@@ -1100,10 +1111,17 @@
 +  return pending_remove_.contains(unit);
 +}
 +
++void UnitUse::CancelRemove(std::string_view unit) {
++  auto it = pending_remove_.find(unit);
++  if (it != pending_remove_.end()) {
++    pending_remove_.erase(it);
++  }
++}
++
 +}  // namespace tark_captions
 --- /dev/null
 +++ b/chrome/browser/tark_captions_android/model_files.h
-@@ -0,0 +1,159 @@
+@@ -0,0 +1,165 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -1243,6 +1261,10 @@
 +};
 +Removal DecideRemoval(std::string_view unit, const UnitOwners& owners, UnitUse& use);
 +
++// An engine lets `unit` go: whether its pending removal deletes it now. A
++// unit some feature wants again (asked for after Remove) is kept.
++bool ReleaseDeletes(std::string_view unit, const UnitOwners& owners, UnitUse& use);
++
 +class UnitUse {
 + public:
 +  UnitUse();
@@ -1254,6 +1276,8 @@
 +  bool RequestRemove(std::string_view unit);
 +  // Whether `unit` waits to be removed (no longer ready to the person).
 +  bool Removing(std::string_view unit) const;
++  // A feature wants `unit` again: its pending removal is dropped.
++  void CancelRemove(std::string_view unit);
 +
 + private:
 +  std::map<std::string, int, std::less<>> in_use_;
@@ -1968,7 +1992,7 @@
 +}  // namespace tark_captions
 --- /dev/null
 +++ b/chrome/browser/tark_captions_android/caption_downloads_unittest.cc
-@@ -0,0 +1,166 @@
+@@ -0,0 +1,228 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -2018,9 +2042,23 @@
 +    queue.clear();
 +  }
 +
++  // CaptionDownloads::Request cancels a removal waiting for the release.
++  void RequestAgain(const std::string& unit, Owner owner) {
++    owners.SetWanted(unit, owner, true);
++    use.CancelRemove(unit);
++    Request(unit, owner);
++  }
++
 +  // CaptionDownloads::Remove.
 +  void Remove(const std::string& unit) {
 +    if (DecideRemoval(unit, owners, use) == Removal::kNow) {
++      ready.erase(unit);
++    }
++  }
++
++  // CaptionDownloads::SetInUse(unit, false).
++  void Release(const std::string& unit) {
++    if (ReleaseDeletes(unit, owners, use)) {
 +      ready.erase(unit);
 +    }
 +  }
@@ -2061,7 +2099,55 @@
 +  busy.use.SetInUse(kLanguageIdUnit, true);
 +  busy.owners.SetWanted(kLanguageIdUnit, Owner::kCaptions, false);
 +  EXPECT_EQ(DecideRemoval(kLanguageIdUnit, busy.owners, busy.use), Removal::kOnRelease);
-+  EXPECT_TRUE(busy.use.SetInUse(kLanguageIdUnit, false));
++  busy.Release(kLanguageIdUnit);
++  EXPECT_FALSE(busy.ready.contains(kLanguageIdUnit));
++}
++
++// In use, removed (no owner), then asked for again before the engine lets
++// go: the removal is dropped, nothing is fetched, and the release keeps it.
++TEST(CaptionDownloadsTest, RequestAfterPendingRemoveKeepsUnit) {
++  Disk disk;
++  disk.Request(kLanguageIdUnit, Owner::kVoice);
++  disk.Download();
++  disk.use.SetInUse(kLanguageIdUnit, true);
++  disk.owners.SetWanted(kLanguageIdUnit, Owner::kVoice, false);
++  disk.Remove(kLanguageIdUnit);
++  ASSERT_TRUE(disk.use.Removing(kLanguageIdUnit));
++
++  disk.RequestAgain(kLanguageIdUnit, Owner::kVoice);
++  EXPECT_FALSE(disk.use.Removing(kLanguageIdUnit));  // ready again at once
++  EXPECT_TRUE(disk.queue.empty());
++  disk.Release(kLanguageIdUnit);
++  EXPECT_TRUE(disk.ready.contains(kLanguageIdUnit));
++}
++
++// The release re-checks the owners even if a removal was due: an owner that
++// wants the unit by then keeps it.
++TEST(CaptionDownloadsTest, ReleaseKeepsUnitWantedAgain) {
++  Disk disk;
++  disk.Request(kLanguageIdUnit, Owner::kVoice);
++  disk.Download();
++  disk.use.SetInUse(kLanguageIdUnit, true);
++  disk.owners.SetWanted(kLanguageIdUnit, Owner::kVoice, false);
++  disk.Remove(kLanguageIdUnit);
++  disk.owners.SetWanted(kLanguageIdUnit, Owner::kCaptions, true);
++  disk.Release(kLanguageIdUnit);
++  EXPECT_TRUE(disk.ready.contains(kLanguageIdUnit));
++}
++
++// In use, and Remove while captions still want it: kept, and the release
++// deletes nothing either.
++TEST(CaptionDownloadsTest, InUseRemoveWhileKeptThenRelease) {
++  Disk disk;
++  disk.Request(kLanguageIdUnit, Owner::kCaptions);
++  disk.Request(kLanguageIdUnit, Owner::kVoice);
++  disk.Download();
++  disk.use.SetInUse(kLanguageIdUnit, true);
++  disk.owners.SetWanted(kLanguageIdUnit, Owner::kVoice, false);
++  disk.Remove(kLanguageIdUnit);
++  EXPECT_FALSE(disk.use.Removing(kLanguageIdUnit));
++  disk.Release(kLanguageIdUnit);
++  EXPECT_TRUE(disk.ready.contains(kLanguageIdUnit));
 +}
 +
 +// The detector came with captions: voice asking for it fetches nothing.
