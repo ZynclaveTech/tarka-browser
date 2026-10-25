@@ -10,7 +10,8 @@ the APK pins.
 
 `build` runs on the Mac (the exports come from gated checkpoints and never go
 to the build machine): EXPORTS holds the measuring spike's int8 exports
-(ic130m-hi, ic130m-ta, fc-en, fc-es); OUT_DIR gets one folder per unit, the
+(ic130m-hi, ic130m-ta, fc-en, fc-es), the translation exports and
+utils/lid_export.py's output (lid); OUT_DIR gets one folder per unit, the
 files published on gettarka.com by sha256, and files.json
 {"<unit>/<file>": {unit, size, sha256}}, which is committed as
 android/captions/files.json. `header` (android/build.sh) writes the C++ rows
@@ -33,6 +34,15 @@ SPEECH_FILES = ('encoder.int8.onnx', 'ctc_decoder.onnx', 'window.f32', 'mel_fb.f
 TRANSLATION_UNITS = {'tr_indic_en': 'it2_indic_en', 'tr_en_indic': 'it2_en_indic', 'tr_es_en': 'opus_es_en'}
 TRANSLATION_FILES = ('config.json', 'dict.SRC.json', 'dict.TGT.json', 'model.SRC',
                      'encoder.int8.onnx', 'decoder_step.int8.onnx')
+# The spoken-language detector (VoxLingua107 ECAPA, utils/lid_export.py),
+# shared by voice search and captions. Desktop's unit, the same three files and
+# bytes (components/tark_captions/model_manifest.cc): its own Silero VAD copy,
+# so it needs no "common".
+LANGUAGE_ID_UNIT, LANGUAGE_ID_EXPORT = 'language_id', 'lid'
+LANGUAGE_ID_FILES = ('lid.onnx', 'lid_labels.txt')
+# lid.onnx as desktop published it (2026-10-20): never re-exported here.
+LID_ONNX = {'size': 86063323,
+            'sha256': '7cfabee2653ac9d6e80f9f766514dedb0983fc6cd6e078b499fc6d644164f0a4'}
 
 
 def sha256(path):
@@ -80,12 +90,18 @@ def build(exports, silero_vad, out_dir):
         check_translation(unit, exports / folder)
         for name in TRANSLATION_FILES:
             sources[f'{unit}/{name}'] = exports / folder / name
+    for name in LANGUAGE_ID_FILES:
+        sources[f'{LANGUAGE_ID_UNIT}/{name}'] = exports / LANGUAGE_ID_EXPORT / name
+    sources[f'{LANGUAGE_ID_UNIT}/silero_vad.onnx'] = pathlib.Path(silero_vad)
     files = {}
     for name, source in sources.items():
         dest = out_dir / name
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(source, dest)
         files[name] = {'unit': name.split('/', 1)[0], 'size': dest.stat().st_size, 'sha256': sha256(dest)}
+    lid = files[f'{LANGUAGE_ID_UNIT}/lid.onnx']
+    if (lid['size'], lid['sha256']) != (LID_ONNX['size'], LID_ONNX['sha256']):
+        sys.exit(f'{LANGUAGE_ID_EXPORT}/lid.onnx is not the detector desktop published: {lid}')
     (out_dir / 'files.json').write_text(json.dumps(files, indent=1, sort_keys=True) + '\n', encoding='utf-8')
     return files
 

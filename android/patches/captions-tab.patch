@@ -46,7 +46,7 @@
  
 --- /dev/null
 +++ b/chrome/browser/tark_captions_android/android/tark_captions_bridge.cc
-@@ -0,0 +1,132 @@
+@@ -0,0 +1,165 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -83,6 +83,11 @@
 +  }
 +  TarkCaptionsTab::CreateForWebContents(web_contents);
 +  return TarkCaptionsTab::FromWebContents(web_contents);
++}
++
++// TarkCaptionsBridge.OWNER_CAPTIONS and OWNER_VOICE.
++Owner OwnerFrom(int32_t owner) {
++  return owner == 1 ? Owner::kVoice : Owner::kCaptions;
 +}
 +
 +}  // namespace
@@ -169,7 +174,35 @@
 +}
 +
 +static void JNI_TarkCaptionsBridge_RemoveLanguage(JNIEnv* env, const std::string& language) {
++  // Captions no longer want it; a unit voice search still wants stays.
++  CaptionDownloads::Get().SetWantedBy(language, Owner::kCaptions, false);
 +  CaptionDownloads::Get().Remove(language);
++}
++
++static std::vector<int64_t> JNI_TarkCaptionsBridge_GetUnitState(JNIEnv* env,
++                                                                const std::string& unit) {
++  const CaptionDownloads::UnitState state = CaptionDownloads::Get().State(unit);
++  return {static_cast<int64_t>(state.state), state.bytes, state.total};
++}
++
++static bool JNI_TarkCaptionsBridge_IsUnitWantedBy(JNIEnv* env,
++                                                  const std::string& unit,
++                                                  int32_t owner) {
++  return CaptionDownloads::Get().WantedBy(unit, OwnerFrom(owner));
++}
++
++static void JNI_TarkCaptionsBridge_RequestUnit(JNIEnv* env,
++                                               const std::string& unit,
++                                               int32_t owner,
++                                               bool now) {
++  CaptionDownloads::Get().Request(unit, now, OwnerFrom(owner));
++}
++
++static void JNI_TarkCaptionsBridge_RemoveUnit(JNIEnv* env,
++                                              const std::string& unit,
++                                              int32_t owner) {
++  CaptionDownloads::Get().SetWantedBy(unit, OwnerFrom(owner), false);
++  CaptionDownloads::Get().Remove(unit);
 +}
 +
 +static int64_t JNI_TarkCaptionsBridge_GetDownloadSize(JNIEnv* env, const std::string& language) {

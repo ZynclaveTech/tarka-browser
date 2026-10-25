@@ -1,6 +1,6 @@
 diff '--color=never' -ruN a/chrome/android/chrome_java_resources.gni b/chrome/android/chrome_java_resources.gni
---- a/chrome/android/chrome_java_resources.gni	2026-10-25 09:11:15.678023027 +0530
-+++ b/chrome/android/chrome_java_resources.gni	2026-10-25 09:11:15.652955057 +0530
+--- a/chrome/android/chrome_java_resources.gni	2026-10-25 09:24:14.496476480 +0530
++++ b/chrome/android/chrome_java_resources.gni	2026-10-25 09:24:14.463597777 +0530
 @@ -688,4 +688,5 @@
    "java/res/xml/tracing_preferences.xml",
    "java/res/xml/unified_account_settings_preferences.xml",
@@ -8,12 +8,13 @@ diff '--color=never' -ruN a/chrome/android/chrome_java_resources.gni b/chrome/an
 +  "java/res/xml/voice_languages_preferences.xml",
  ]
 diff '--color=never' -ruN a/chrome/android/chrome_java_sources.gni b/chrome/android/chrome_java_sources.gni
---- a/chrome/android/chrome_java_sources.gni	2026-10-25 09:11:15.708651615 +0530
-+++ b/chrome/android/chrome_java_sources.gni	2026-10-25 09:11:15.683436476 +0530
-@@ -1149,6 +1149,12 @@
+--- a/chrome/android/chrome_java_sources.gni	2026-10-25 09:24:14.531473462 +0530
++++ b/chrome/android/chrome_java_sources.gni	2026-10-25 09:24:14.503297574 +0530
+@@ -1149,6 +1149,13 @@
    "java/src/org/chromium/chrome/browser/site_settings/ChromeSiteSettingsDelegate.java",
    "java/src/org/chromium/chrome/browser/site_settings/ManageSpaceActivity.java",
    "java/src/org/chromium/chrome/browser/speech/SpeechLanguageSnackbar.java",
++  "java/src/org/chromium/chrome/browser/speech/VoiceDetector.java",
 +  "java/src/org/chromium/chrome/browser/speech/VoiceLanguageOffer.java",
 +  "java/src/org/chromium/chrome/browser/speech/VoiceLanguageSignals.java",
 +  "java/src/org/chromium/chrome/browser/speech/VoiceLanguages.java",
@@ -25,8 +26,8 @@ diff '--color=never' -ruN a/chrome/android/chrome_java_sources.gni b/chrome/andr
    "java/src/org/chromium/chrome/browser/status_indicator/StatusIndicatorProperties.java",
 diff '--color=never' -ruN a/chrome/android/java/res/xml/voice_languages_preferences.xml b/chrome/android/java/res/xml/voice_languages_preferences.xml
 --- a/chrome/android/java/res/xml/voice_languages_preferences.xml	1970-01-01 05:30:00.000000000 +0530
-+++ b/chrome/android/java/res/xml/voice_languages_preferences.xml	2026-10-25 09:11:15.714576822 +0530
-@@ -0,0 +1,41 @@
++++ b/chrome/android/java/res/xml/voice_languages_preferences.xml	2026-10-25 09:24:14.538858022 +0530
+@@ -0,0 +1,46 @@
 +<?xml version="1.0" encoding="utf-8"?>
 +<!-- Copyright 2026 The Tark Authors
 +     Use of this source code is governed by a BSD-style license that can be
@@ -57,6 +58,11 @@ diff '--color=never' -ruN a/chrome/android/java/res/xml/voice_languages_preferen
 +        android:key="voice_languages_more"
 +        android:title="@string/tark_voice_more" />
 +
++    <!-- Spoken-language detection (Android 13+): one row, added in code. -->
++    <PreferenceCategory
++        android:key="voice_languages_detection"
++        android:title="@string/tark_voice_detection" />
++
 +    <!-- Android 12: no list, Android's own settings instead. -->
 +    <org.chromium.components.browser_ui.settings.TextMessagePreference
 +        android:key="voice_languages_needs_android_13"
@@ -69,8 +75,8 @@ diff '--color=never' -ruN a/chrome/android/java/res/xml/voice_languages_preferen
 +        app:isPreferenceVisible="false" />
 +</PreferenceScreen>
 diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/speech/SpeechLanguageSnackbar.java b/chrome/android/java/src/org/chromium/chrome/browser/speech/SpeechLanguageSnackbar.java
---- a/chrome/android/java/src/org/chromium/chrome/browser/speech/SpeechLanguageSnackbar.java	2026-10-25 09:11:15.757113033 +0530
-+++ b/chrome/android/java/src/org/chromium/chrome/browser/speech/SpeechLanguageSnackbar.java	2026-10-25 09:11:15.730985715 +0530
+--- a/chrome/android/java/src/org/chromium/chrome/browser/speech/SpeechLanguageSnackbar.java	2026-10-25 09:24:14.589950226 +0530
++++ b/chrome/android/java/src/org/chromium/chrome/browser/speech/SpeechLanguageSnackbar.java	2026-10-25 09:24:14.559037009 +0530
 @@ -5,15 +5,10 @@
  package org.chromium.chrome.browser.speech;
  
@@ -234,9 +240,130 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
 +        return VoicePlatform.voiceInputSettingsIntent(context);
      }
  }
+diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceDetector.java b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceDetector.java
+--- a/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceDetector.java	1970-01-01 05:30:00.000000000 +0530
++++ b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceDetector.java	2026-10-25 09:24:14.596818821 +0530
+@@ -0,0 +1,117 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++package org.chromium.chrome.browser.speech;
++
++import androidx.annotation.VisibleForTesting;
++
++import org.chromium.base.ResettersForTesting;
++import org.chromium.build.annotations.NullMarked;
++import org.chromium.build.annotations.Nullable;
++import org.chromium.chrome.browser.tark_captions.TarkCaptionsBridge;
++
++/**
++ * Tark: spoken-language detection's model (spec §3). It is live captions' {@code language_id}
++ * download unit (the ECAPA detector), which voice search shares: one copy on the phone, fetched by
++ * captions' downloader (on Wi-Fi unless "Download now"), nothing fetched when captions already
++ * have it, and kept when voice turns detection off while captions still want it.
++ */
++@NullMarked
++public final class VoiceDetector {
++    /** The unit's download, as captions' downloader reports it. */
++    public static final class Status {
++        /** One of TarkCaptionsBridge.UNIT_*. */
++        public final int state;
++
++        public final long bytes;
++        public final long total;
++
++        /** Whether voice search turned detection on (it may still be downloading). */
++        public final boolean wanted;
++
++        public Status(int state, long bytes, long total, boolean wanted) {
++            this.state = state;
++            this.bytes = bytes;
++            this.total = total;
++            this.wanted = wanted;
++        }
++
++        /** Detection is on: voice asked for it, and the model is on the phone. */
++        public boolean isOn() {
++            return wanted && state == TarkCaptionsBridge.UNIT_READY;
++        }
++    }
++
++    /** Captions' downloads, as voice search uses them; replaced in tests. */
++    @VisibleForTesting
++    interface Downloads {
++        /** {state, bytes, total} of a unit. */
++        long[] unitState(String unit);
++
++        boolean wantedByVoice(String unit);
++
++        /** Voice wants the unit. */
++        void request(String unit, boolean now);
++
++        /** Voice no longer wants the unit: deleted unless captions still want it. */
++        void remove(String unit);
++    }
++
++    private static final class BridgeDownloads implements Downloads {
++        @Override
++        public long[] unitState(String unit) {
++            return TarkCaptionsBridge.getUnitState(unit);
++        }
++
++        @Override
++        public boolean wantedByVoice(String unit) {
++            return TarkCaptionsBridge.isUnitWantedBy(unit, TarkCaptionsBridge.OWNER_VOICE);
++        }
++
++        @Override
++        public void request(String unit, boolean now) {
++            TarkCaptionsBridge.requestUnit(unit, TarkCaptionsBridge.OWNER_VOICE, now);
++        }
++
++        @Override
++        public void remove(String unit) {
++            TarkCaptionsBridge.removeUnit(unit, TarkCaptionsBridge.OWNER_VOICE);
++        }
++    }
++
++    private static @Nullable Downloads sDownloadsForTesting;
++
++    private VoiceDetector() {}
++
++    @VisibleForTesting
++    static void setDownloadsForTesting(@Nullable Downloads downloads) {
++        sDownloadsForTesting = downloads;
++        ResettersForTesting.register(() -> sDownloadsForTesting = null);
++    }
++
++    private static Downloads downloads() {
++        return sDownloadsForTesting != null ? sDownloadsForTesting : new BridgeDownloads();
++    }
++
++    /** The detector's state for voice search. */
++    public static Status status() {
++        Downloads downloads = downloads();
++        long[] state = downloads.unitState(TarkCaptionsBridge.LANGUAGE_ID_UNIT);
++        return new Status(
++                (int) state[0],
++                state[1],
++                state[2],
++                downloads.wantedByVoice(TarkCaptionsBridge.LANGUAGE_ID_UNIT));
++    }
++
++    /** Get (on Wi-Fi), "Download now" or Try again. */
++    public static void get(boolean now) {
++        downloads().request(TarkCaptionsBridge.LANGUAGE_ID_UNIT, now);
++    }
++
++    /** Turns detection off; the model goes unless captions still want it. */
++    public static void remove() {
++        downloads().remove(TarkCaptionsBridge.LANGUAGE_ID_UNIT);
++    }
++}
 diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguageOffer.java b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguageOffer.java
 --- a/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguageOffer.java	1970-01-01 05:30:00.000000000 +0530
-+++ b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguageOffer.java	2026-10-25 09:11:16.116927322 +0530
++++ b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguageOffer.java	2026-10-25 09:24:14.615605371 +0530
 @@ -0,0 +1,356 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
@@ -596,7 +723,7 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
 +}
 diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguageSignals.java b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguageSignals.java
 --- a/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguageSignals.java	1970-01-01 05:30:00.000000000 +0530
-+++ b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguageSignals.java	2026-10-25 09:11:15.779438174 +0530
++++ b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguageSignals.java	2026-10-25 09:24:14.635435394 +0530
 @@ -0,0 +1,106 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
@@ -706,7 +833,7 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
 +}
 diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguages.java b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguages.java
 --- a/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguages.java	1970-01-01 05:30:00.000000000 +0530
-+++ b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguages.java	2026-10-25 09:11:15.795970526 +0530
++++ b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguages.java	2026-10-25 09:24:14.654460073 +0530
 @@ -0,0 +1,282 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
@@ -992,8 +1119,8 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
 +}
 diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguagesSettings.java b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguagesSettings.java
 --- a/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguagesSettings.java	1970-01-01 05:30:00.000000000 +0530
-+++ b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguagesSettings.java	2026-10-25 09:11:15.811350155 +0530
-@@ -0,0 +1,647 @@
++++ b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguagesSettings.java	2026-10-25 09:24:14.673449459 +0530
+@@ -0,0 +1,841 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -1008,6 +1135,7 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
 +import android.os.SystemClock;
 +import android.os.LocaleList;
 +import android.speech.RecognitionSupport;
++import android.text.format.Formatter;
 +import android.view.Gravity;
 +import android.view.View;
 +import android.view.ViewGroup;
@@ -1032,6 +1160,7 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
 +import org.chromium.chrome.browser.speech.VoiceLanguages.Reason;
 +import org.chromium.chrome.browser.speech.VoiceLanguages.Sections;
 +import org.chromium.chrome.browser.speech.VoiceLanguages.State;
++import org.chromium.chrome.browser.tark_captions.TarkCaptionsBridge;
 +import org.chromium.components.browser_ui.settings.SettingsUtils;
 +import org.chromium.ui.widget.ButtonCompat;
 +
@@ -1053,6 +1182,10 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
 + * <p>The list is read again on resume and every few seconds while something downloads. Tark keeps
 + * no download logic of its own: progress where Android 14 reports it, "Downloading…" otherwise,
 + * and a failure offers Try again.
++ *
++ * <p>Last, spoken-language detection (spec §3, mockup 2): Get downloads the detector through
++ * captions' downloader ({@link VoiceDetector}), Remove turns it off and deletes it unless captions
++ * still use it.
 + */
 +@NullMarked
 +public class VoiceLanguagesSettings extends ChromeBaseSettingsFragment {
@@ -1063,6 +1196,8 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
 +    static final String SITES_KEY = "voice_languages_sites";
 +    static final String NEEDS_ANDROID_13_KEY = "voice_languages_needs_android_13";
 +    static final String SYSTEM_SETTINGS_KEY = "voice_languages_system_settings";
++    static final String DETECTION_KEY = "voice_languages_detection";
++    static final String DETECTION_ROW_KEY = "voice_detection";
 +    private static final String ROW_KEY_PREFIX = "voice_language_";
 +    static final String SITE_KEY_PREFIX = "voice_site_";
 +
@@ -1077,6 +1212,9 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
 +     * yet) before the download counts as failed.
 +     */
 +    static final long FAIL_AFTER_MS = 10_000;
++
++    /** How often the detector's download is read again while it waits or downloads. */
++    static final long DETECTOR_REFRESH_MS = 1000;
 +
 +    private static @Nullable Map<String, Reason> sSignalsForTesting;
 +
@@ -1104,6 +1242,7 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
 +            ObservableSuppliers.createMonotonic();
 +    private final Handler mHandler = new Handler(Looper.getMainLooper());
 +    private final Runnable mRefresh = this::refresh;
++    private final Runnable mDetectorRefresh = this::showDetection;
 +    // Tags whose download was asked for here, until Android lists them as installed, or a read of
 +    // its list shows the download went nowhere (then they stay, as failed).
 +    private final Map<String, Download> mDownloads = new HashMap<>();
@@ -1124,7 +1263,9 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
 +        mPlatform = VoicePlatform.get();
 +        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
 +            // Android 12: no list, only Android's own settings.
-+            for (String key : new String[] {INTRO_KEY, ON_PHONE_KEY, SUGGESTED_KEY, MORE_KEY}) {
++            // Detection needs Android 13's audio source for the recognizer.
++            for (String key :
++                    new String[] {INTRO_KEY, ON_PHONE_KEY, SUGGESTED_KEY, MORE_KEY, DETECTION_KEY}) {
 +                Preference preference = findPreference(key);
 +                if (preference != null) preference.setVisible(false);
 +            }
@@ -1146,6 +1287,13 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
 +            Preference section = findPreference(key);
 +            if (section != null) section.setVisible(false);
 +        }
++        PreferenceCategory detection = findPreference(DETECTION_KEY);
++        if (detection != null) {
++            DetectionRow row = new DetectionRow(getContext());
++            row.setKey(DETECTION_ROW_KEY);
++            row.setTitle(R.string.tark_voice_detection_title);
++            detection.addPreference(row);
++        }
 +    }
 +
 +    @Override
@@ -1166,6 +1314,7 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
 +        mPollingSince = -1;
 +        fillSites();
 +        refresh();
++        showDetection();
 +    }
 +
 +    @Override
@@ -1173,6 +1322,7 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
 +        super.onPause();
 +        mResumed = false;
 +        mHandler.removeCallbacks(mRefresh);
++        mHandler.removeCallbacks(mDetectorRefresh);
 +    }
 +
 +    @Override
@@ -1180,6 +1330,7 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
 +        super.onDestroy();
 +        mDestroyed = true;
 +        mHandler.removeCallbacks(mRefresh);
++        mHandler.removeCallbacks(mDetectorRefresh);
 +    }
 +
 +    @VisibleForTesting
@@ -1374,6 +1525,82 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
 +        return downloading;
 +    }
 +
++    /**
++     * Spoken-language detection's row, from captions' downloader; read again every second while
++     * the detector waits for Wi-Fi or downloads and the page shows.
++     */
++    @VisibleForTesting
++    void showDetection() {
++        mHandler.removeCallbacks(mDetectorRefresh);
++        DetectionRow row = findPreference(DETECTION_ROW_KEY);
++        if (row == null || !isAlive() || Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
++            return;
++        }
++        VoiceDetector.Status status = VoiceDetector.status();
++        int shown = DetectionRow.OFF;
++        if (status.wanted) {
++            switch (status.state) {
++                case TarkCaptionsBridge.UNIT_READY:
++                    shown = DetectionRow.ON;
++                    break;
++                case TarkCaptionsBridge.UNIT_WAITING_FOR_WIFI:
++                    shown = DetectionRow.WAITING;
++                    break;
++                case TarkCaptionsBridge.UNIT_DOWNLOADING:
++                    shown = DetectionRow.DOWNLOADING;
++                    break;
++                case TarkCaptionsBridge.UNIT_FAILED:
++                    shown = DetectionRow.FAILED;
++                    break;
++                default:
++                    // Asked for, yet neither here nor coming (removed elsewhere): Get again.
++                    break;
++            }
++        }
++        int percent =
++                status.total > 0 ? (int) Math.min(100, status.bytes * 100 / status.total) : -1;
++        switch (shown) {
++            case DetectionRow.ON:
++                row.setSummary(R.string.tark_voice_detection_on);
++                row.show(shown, -1, this::removeDetector);
++                break;
++            case DetectionRow.WAITING:
++                row.setSummary(R.string.tark_captions_waiting_for_wifi);
++                row.show(shown, -1, () -> getDetector(true));
++                break;
++            case DetectionRow.DOWNLOADING:
++                row.setSummary(R.string.tark_voice_downloading);
++                row.show(shown, percent, null);
++                break;
++            case DetectionRow.FAILED:
++                row.setSummary(R.string.tark_captions_download_failed);
++                row.show(shown, -1, () -> getDetector(false));
++                break;
++            default:
++                row.setSummary(
++                        getString(
++                                R.string.tark_voice_detection_summary,
++                                Formatter.formatShortFileSize(getContext(), status.total)));
++                row.show(shown, -1, () -> getDetector(false));
++                break;
++        }
++        if (mResumed && (shown == DetectionRow.WAITING || shown == DetectionRow.DOWNLOADING)) {
++            mHandler.postDelayed(mDetectorRefresh, DETECTOR_REFRESH_MS);
++        }
++    }
++
++    private void getDetector(boolean now) {
++        if (!isAlive()) return;
++        VoiceDetector.get(now);
++        showDetection();
++    }
++
++    private void removeDetector() {
++        if (!isAlive()) return;
++        VoiceDetector.remove();
++        showDetection();
++    }
++
 +    /** Sites: the language chosen for each site, each with Remove; hidden when there are none. */
 +    private void fillSites() {
 +        PreferenceCategory category = findPreference(SITES_KEY);
@@ -1532,6 +1759,122 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
 +        }
 +    }
 +
++    /** A download's progress bar, two touch targets wide. */
++    private static ProgressBar progressBar(Context context, int percent) {
++        ProgressBar bar = new ProgressBar(context, null, android.R.attr.progressBarStyleHorizontal);
++        bar.setMax(100);
++        bar.setProgress(percent);
++        int width = context.getResources().getDimensionPixelSize(R.dimen.min_touch_target_size);
++        bar.setLayoutParams(
++                new ViewGroup.LayoutParams(2 * width, ViewGroup.LayoutParams.WRAP_CONTENT));
++        return bar;
++    }
++
++    /** Shows `widget` at the row's end, or nothing. */
++    private static void bindWidget(PreferenceViewHolder holder, @Nullable View widget) {
++        View frame = holder.findViewById(android.R.id.widget_frame);
++        if (!(frame instanceof ViewGroup widgetFrame)) return;
++        widgetFrame.removeAllViews();
++        if (widget == null) {
++            widgetFrame.setVisibility(View.GONE);
++            return;
++        }
++        widgetFrame.setVisibility(View.VISIBLE);
++        if (widgetFrame instanceof android.widget.LinearLayout linear) {
++            linear.setGravity(Gravity.CENTER_VERTICAL | Gravity.END);
++        }
++        widgetFrame.addView(widget);
++    }
++
++    /**
++     * Spoken-language detection: "Notice the language I speak", a line below, and Get, Download
++     * now, progress, Try again or Remove.
++     */
++    @VisibleForTesting
++    static final class DetectionRow extends Preference {
++        static final int OFF = 0;
++        static final int WAITING = 1;
++        static final int DOWNLOADING = 2;
++        static final int ON = 3;
++        static final int FAILED = 4;
++
++        private int mStatus = OFF;
++        private int mPercent = -1;
++        private @Nullable Runnable mAction;
++
++        DetectionRow(Context context) {
++            super(context);
++            setPersistent(false);
++        }
++
++        void show(int status, int percent, @Nullable Runnable action) {
++            mStatus = status;
++            mPercent = percent;
++            mAction = action;
++            // A tap on the row gets the detector; only the button deletes it.
++            setSelectable(action != null && status != ON);
++            setOnPreferenceClickListener(
++                    action == null || status == ON
++                            ? null
++                            : p -> {
++                                action.run();
++                                return true;
++                            });
++            notifyChanged();
++        }
++
++        int getStatus() {
++            return mStatus;
++        }
++
++        int getPercent() {
++            return mPercent;
++        }
++
++        /** The button's label, or 0 without one. */
++        int getActionLabel() {
++            switch (mStatus) {
++                case OFF:
++                    return R.string.tark_voice_detection_get;
++                case WAITING:
++                    return R.string.tark_captions_download_now;
++                case FAILED:
++                    return R.string.tark_captions_try_again;
++                case ON:
++                    return R.string.tark_voice_detection_remove;
++                default:
++                    return 0;
++            }
++        }
++
++        /** The button: Get, Download now, Try again or Remove. */
++        void tapAction() {
++            if (mAction != null) mAction.run();
++        }
++
++        @Override
++        public void onBindViewHolder(PreferenceViewHolder holder) {
++            super.onBindViewHolder(holder);
++            Context context = getContext();
++            View widget = null;
++            int label = getActionLabel();
++            if (label != 0) {
++                ButtonCompat button =
++                        new ButtonCompat(
++                                context,
++                                mStatus == OFF
++                                        ? R.style.FilledButtonThemeOverlay
++                                        : R.style.TextButtonThemeOverlay);
++                button.setText(label);
++                button.setOnClickListener(v -> tapAction());
++                widget = button;
++            } else if (mStatus == DOWNLOADING && mPercent >= 0) {
++                widget = progressBar(context, mPercent);
++            }
++            bindWidget(holder, widget);
++        }
++    }
++
 +    /** A language: its name, a line below, and Ready, progress, or a Download button. */
 +    @VisibleForTesting
 +    static final class LanguageRow extends Preference {
@@ -1591,9 +1934,6 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
 +        @Override
 +        public void onBindViewHolder(PreferenceViewHolder holder) {
 +            super.onBindViewHolder(holder);
-+            View frame = holder.findViewById(android.R.id.widget_frame);
-+            if (!(frame instanceof ViewGroup widgetFrame)) return;
-+            widgetFrame.removeAllViews();
 +            Context context = getContext();
 +            View widget = null;
 +            switch (mStatus) {
@@ -1605,18 +1945,7 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
 +                    break;
 +                case DOWNLOADING:
 +                    if (mPercent < 0) break;
-+                    ProgressBar bar =
-+                            new ProgressBar(
-+                                    context, null, android.R.attr.progressBarStyleHorizontal);
-+                    bar.setMax(100);
-+                    bar.setProgress(mPercent);
-+                    int width =
-+                            context.getResources()
-+                                    .getDimensionPixelSize(R.dimen.min_touch_target_size);
-+                    bar.setLayoutParams(
-+                            new ViewGroup.LayoutParams(
-+                                    2 * width, ViewGroup.LayoutParams.WRAP_CONTENT));
-+                    widget = bar;
++                    widget = progressBar(context, mPercent);
 +                    break;
 +                case AVAILABLE:
 +                case FAILED:
@@ -1629,21 +1958,13 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
 +                    widget = button;
 +                    break;
 +            }
-+            if (widget == null) {
-+                widgetFrame.setVisibility(View.GONE);
-+                return;
-+            }
-+            widgetFrame.setVisibility(View.VISIBLE);
-+            if (widgetFrame instanceof android.widget.LinearLayout linear) {
-+                linear.setGravity(Gravity.CENTER_VERTICAL | Gravity.END);
-+            }
-+            widgetFrame.addView(widget);
++            bindWidget(holder, widget);
 +        }
 +    }
 +}
 diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/speech/VoicePlatform.java b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoicePlatform.java
 --- a/chrome/android/java/src/org/chromium/chrome/browser/speech/VoicePlatform.java	1970-01-01 05:30:00.000000000 +0530
-+++ b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoicePlatform.java	2026-10-25 09:11:15.827553961 +0530
++++ b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoicePlatform.java	2026-10-25 09:24:14.692456888 +0530
 @@ -0,0 +1,310 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
@@ -1957,7 +2278,7 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
 +}
 diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceSiteLanguages.java b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceSiteLanguages.java
 --- a/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceSiteLanguages.java	1970-01-01 05:30:00.000000000 +0530
-+++ b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceSiteLanguages.java	2026-10-25 09:11:16.084249580 +0530
++++ b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceSiteLanguages.java	2026-10-25 09:24:14.712948628 +0530
 @@ -0,0 +1,222 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
@@ -2182,8 +2503,8 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
 +    }
 +}
 diff '--color=never' -ruN a/chrome/android/junit/BUILD.gn b/chrome/android/junit/BUILD.gn
---- a/chrome/android/junit/BUILD.gn	2026-10-25 09:11:15.885022670 +0530
-+++ b/chrome/android/junit/BUILD.gn	2026-10-25 09:11:15.859872657 +0530
+--- a/chrome/android/junit/BUILD.gn	2026-10-25 09:24:14.771418808 +0530
++++ b/chrome/android/junit/BUILD.gn	2026-10-25 09:24:14.738028182 +0530
 @@ -1232,11 +1232,19 @@
      ]
    }
@@ -2208,7 +2529,7 @@ diff '--color=never' -ruN a/chrome/android/junit/BUILD.gn b/chrome/android/junit
        ":chrome_junit_tests_helper",
 diff '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome/browser/speech/AndroidVoicePlatformTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/speech/AndroidVoicePlatformTest.java
 --- a/chrome/android/junit/src/org/chromium/chrome/browser/speech/AndroidVoicePlatformTest.java	1970-01-01 05:30:00.000000000 +0530
-+++ b/chrome/android/junit/src/org/chromium/chrome/browser/speech/AndroidVoicePlatformTest.java	2026-10-25 09:11:15.890762999 +0530
++++ b/chrome/android/junit/src/org/chromium/chrome/browser/speech/AndroidVoicePlatformTest.java	2026-10-25 09:24:14.778896453 +0530
 @@ -0,0 +1,234 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
@@ -2446,7 +2767,7 @@ diff '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome/browser
 +}
 diff '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguageOfferTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguageOfferTest.java
 --- a/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguageOfferTest.java	1970-01-01 05:30:00.000000000 +0530
-+++ b/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguageOfferTest.java	2026-10-25 09:11:16.133964640 +0530
++++ b/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguageOfferTest.java	2026-10-25 09:24:14.798105801 +0530
 @@ -0,0 +1,434 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
@@ -2884,7 +3205,7 @@ diff '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome/browser
 +}
 diff '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguageSignalsTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguageSignalsTest.java
 --- a/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguageSignalsTest.java	1970-01-01 05:30:00.000000000 +0530
-+++ b/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguageSignalsTest.java	2026-10-25 09:11:15.923822204 +0530
++++ b/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguageSignalsTest.java	2026-10-25 09:24:14.815515374 +0530
 @@ -0,0 +1,79 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
@@ -2967,8 +3288,8 @@ diff '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome/browser
 +}
 diff '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguagesSettingsTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguagesSettingsTest.java
 --- a/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguagesSettingsTest.java	1970-01-01 05:30:00.000000000 +0530
-+++ b/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguagesSettingsTest.java	2026-10-25 09:11:15.940024677 +0530
-@@ -0,0 +1,550 @@
++++ b/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguagesSettingsTest.java	2026-10-25 09:24:14.844743985 +0530
+@@ -0,0 +1,752 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -3007,8 +3328,10 @@ diff '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome/browser
 +import org.chromium.chrome.R;
 +import org.chromium.chrome.browser.profiles.Profile;
 +import org.chromium.chrome.browser.speech.VoiceLanguages.Reason;
++import org.chromium.chrome.browser.speech.VoiceLanguagesSettings.DetectionRow;
 +import org.chromium.chrome.browser.speech.VoiceLanguagesSettings.LanguageRow;
 +import org.chromium.chrome.browser.speech.VoiceLanguagesSettings.SiteRow;
++import org.chromium.chrome.browser.tark_captions.TarkCaptionsBridge;
 +import org.chromium.ui.base.TestActivity;
 +
 +import java.util.ArrayList;
@@ -3072,12 +3395,63 @@ diff '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome/browser
 +        }
 +    }
 +
++    /**
++     * Captions' downloader for the detector unit (CaptionDownloads), as voice sees it: owners, and
++     * a fetch only for a unit that is not on the phone.
++     */
++    private static class FakeDownloads implements VoiceDetector.Downloads {
++        static final long TOTAL = 86_063_323L + 325L + 2_327_524L;
++
++        int mState = TarkCaptionsBridge.UNIT_MISSING;
++        long mBytes;
++        boolean mCaptionsWant;
++        boolean mVoiceWants;
++        int mFetches;
++        final List<Boolean> mRequests = new ArrayList<>();
++        int mRemoves;
++
++        @Override
++        public long[] unitState(String unit) {
++            assertEquals("language_id", unit);
++            return new long[] {mState, mBytes, TOTAL};
++        }
++
++        @Override
++        public boolean wantedByVoice(String unit) {
++            return mVoiceWants;
++        }
++
++        @Override
++        public void request(String unit, boolean now) {
++            mVoiceWants = true;
++            mRequests.add(now);
++            if (mState != TarkCaptionsBridge.UNIT_READY) {
++                mFetches++;
++                mState =
++                        now
++                                ? TarkCaptionsBridge.UNIT_DOWNLOADING
++                                : TarkCaptionsBridge.UNIT_WAITING_FOR_WIFI;
++            }
++        }
++
++        @Override
++        public void remove(String unit) {
++            mVoiceWants = false;
++            mRemoves++;
++            if (!mCaptionsWant) {
++                mState = TarkCaptionsBridge.UNIT_MISSING;
++                mBytes = 0;
++            }
++        }
++    }
++
 +    @Rule
 +    public ActivityScenarioRule<TestActivity> mActivityScenarioRule =
 +            new ActivityScenarioRule<>(TestActivity.class);
 +
 +    private final LocaleList mDefaultLocales = LocaleList.getDefault();
 +    private FakePlatform mPlatform;
++    private FakeDownloads mDetector;
 +    private TestActivity mActivity;
 +    private VoiceLanguagesSettings mSettings;
 +
@@ -3085,6 +3459,8 @@ diff '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome/browser
 +    public void setUp() {
 +        mPlatform = new FakePlatform();
 +        VoicePlatform.setForTesting(mPlatform);
++        mDetector = new FakeDownloads();
++        VoiceDetector.setDownloadsForTesting(mDetector);
 +        VoiceSiteLanguages.setInstalledForTesting(null);
 +        Map<String, Reason> signals = new LinkedHashMap<>();
 +        signals.put("hi", Reason.TARK_LANGUAGES);
@@ -3169,8 +3545,8 @@ diff '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome/browser
 +        assertEquals(LanguageRow.AVAILABLE, row("bn-IN").getStatus());
 +        assertEquals(LanguageRow.READY, row("en-US").getStatus());
 +
-+        // Spoken-language detection comes with its own task; no placeholder until then.
-+        assertNull(mSettings.findPreference("voice_languages_detection"));
++        assertEquals("Spoken-language detection", title(VoiceLanguagesSettings.DETECTION_KEY));
++        assertTrue(section(VoiceLanguagesSettings.DETECTION_KEY).isVisible());
 +        Preference line = mSettings.findPreference(VoiceLanguagesSettings.NEEDS_ANDROID_13_KEY);
 +        assertNotNull(line);
 +        assertFalse(line.isVisible());
@@ -3317,10 +3693,157 @@ diff '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome/browser
 +        assertFalse(section(VoiceLanguagesSettings.ON_PHONE_KEY).isVisible());
 +        assertFalse(section(VoiceLanguagesSettings.SUGGESTED_KEY).isVisible());
 +        assertFalse(section(VoiceLanguagesSettings.MORE_KEY).isVisible());
++        // Detection needs Android 13's audio source.
++        assertFalse(section(VoiceLanguagesSettings.DETECTION_KEY).isVisible());
++        assertNull(mSettings.findPreference(VoiceLanguagesSettings.DETECTION_ROW_KEY));
 +        assertEquals(0, mPlatform.mSupportCalls);
 +
 +        button.getOnPreferenceClickListener().onPreferenceClick(button);
 +        assertEquals(1, mPlatform.mSystemSettingsOpened);
++    }
++
++    private DetectionRow detection() {
++        DetectionRow row = mSettings.findPreference(VoiceLanguagesSettings.DETECTION_ROW_KEY);
++        assertNotNull(row);
++        return row;
++    }
++
++    private String label(DetectionRow row) {
++        int label = row.getActionLabel();
++        return label == 0 ? null : mActivity.getString(label);
++    }
++
++    @Test
++    @Config(minSdk = Build.VERSION_CODES.TIRAMISU)
++    public void testDetectionRowOff() {
++        launch();
++
++        DetectionRow row = detection();
++        assertEquals("Notice the language I speak", String.valueOf(row.getTitle()));
++        String line = summary(row);
++        assertTrue(line, line.startsWith("A model on this phone · 88"));
++        assertTrue(line, line.endsWith(" MB, on Wi-Fi · listens only while you use voice search"));
++        assertEquals(DetectionRow.OFF, row.getStatus());
++        assertEquals("Get", label(row));
++        assertEquals(0, mDetector.mRequests.size());
++    }
++
++    @Test
++    @Config(minSdk = Build.VERSION_CODES.TIRAMISU)
++    public void testDetectionGetWaitsForWifiThenDownloadNow() {
++        launch();
++        detection().tapAction();
++
++        // On Wi-Fi first: captions' downloader waits for it.
++        assertEquals(List.of(false), mDetector.mRequests);
++        assertEquals(DetectionRow.WAITING, detection().getStatus());
++        assertEquals("Waiting for Wi-Fi", summary(detection()));
++        assertEquals("Download now", label(detection()));
++
++        detection().tapAction();
++        assertEquals(List.of(false, true), mDetector.mRequests);
++        assertEquals(DetectionRow.DOWNLOADING, detection().getStatus());
++        assertEquals("Downloading…", summary(detection()));
++        assertNull(label(detection()));
++    }
++
++    @Test
++    @Config(minSdk = Build.VERSION_CODES.TIRAMISU)
++    public void testDetectionProgressThenReady() {
++        mDetector.mVoiceWants = true;
++        mDetector.mState = TarkCaptionsBridge.UNIT_DOWNLOADING;
++        mDetector.mBytes = FakeDownloads.TOTAL / 4;
++        launch();
++
++        assertEquals(DetectionRow.DOWNLOADING, detection().getStatus());
++        assertEquals(25, detection().getPercent());
++
++        mDetector.mBytes = FakeDownloads.TOTAL / 2;
++        ShadowLooper.idleMainLooper(
++                VoiceLanguagesSettings.DETECTOR_REFRESH_MS, TimeUnit.MILLISECONDS);
++        assertEquals(50, detection().getPercent());
++
++        mDetector.mState = TarkCaptionsBridge.UNIT_READY;
++        ShadowLooper.idleMainLooper(
++                VoiceLanguagesSettings.DETECTOR_REFRESH_MS, TimeUnit.MILLISECONDS);
++        assertEquals(DetectionRow.ON, detection().getStatus());
++        assertEquals(
++                "On this phone · listens only while you use voice search", summary(detection()));
++        assertEquals("Remove", label(detection()));
++    }
++
++    @Test
++    @Config(minSdk = Build.VERSION_CODES.TIRAMISU)
++    public void testDetectionPollStopsWhenPaused() {
++        mDetector.mVoiceWants = true;
++        mDetector.mState = TarkCaptionsBridge.UNIT_DOWNLOADING;
++        launch();
++        mActivityScenarioRule.getScenario().moveToState(Lifecycle.State.STARTED);
++
++        mDetector.mState = TarkCaptionsBridge.UNIT_READY;
++        ShadowLooper.idleMainLooper(
++                3 * VoiceLanguagesSettings.DETECTOR_REFRESH_MS, TimeUnit.MILLISECONDS);
++        assertEquals(DetectionRow.DOWNLOADING, detection().getStatus());
++    }
++
++    @Test
++    @Config(minSdk = Build.VERSION_CODES.TIRAMISU)
++    public void testDetectionFailedTryAgain() {
++        mDetector.mVoiceWants = true;
++        mDetector.mState = TarkCaptionsBridge.UNIT_FAILED;
++        launch();
++
++        assertEquals(DetectionRow.FAILED, detection().getStatus());
++        assertEquals("Couldn't download", summary(detection()));
++        assertEquals("Try again", label(detection()));
++        detection().tapAction();
++        assertEquals(List.of(false), mDetector.mRequests);
++        assertEquals(DetectionRow.WAITING, detection().getStatus());
++    }
++
++    // Plan Review Focus 4, voice's side: Remove while captions use the detector turns detection
++    // off for voice; the files stay (CaptionDownloadsTest.RemoveKeepsUnitCaptionsUses).
++    @Test
++    @Config(minSdk = Build.VERSION_CODES.TIRAMISU)
++    public void testDetectionRemoveKeepsCaptionsCopy() {
++        mDetector.mCaptionsWant = true;
++        mDetector.mVoiceWants = true;
++        mDetector.mState = TarkCaptionsBridge.UNIT_READY;
++        launch();
++        assertEquals(DetectionRow.ON, detection().getStatus());
++
++        detection().tapAction();
++        assertEquals(1, mDetector.mRemoves);
++        assertEquals(TarkCaptionsBridge.UNIT_READY, mDetector.mState);
++        assertEquals(DetectionRow.OFF, detection().getStatus());
++        assertEquals("Get", label(detection()));
++    }
++
++    @Test
++    @Config(minSdk = Build.VERSION_CODES.TIRAMISU)
++    public void testDetectionRemoveDeletesWhenNoOneElseWants() {
++        mDetector.mVoiceWants = true;
++        mDetector.mState = TarkCaptionsBridge.UNIT_READY;
++        launch();
++
++        detection().tapAction();
++        assertEquals(TarkCaptionsBridge.UNIT_MISSING, mDetector.mState);
++        assertEquals(DetectionRow.OFF, detection().getStatus());
++    }
++
++    // The detector came with captions: Get turns detection on with no second download.
++    @Test
++    @Config(minSdk = Build.VERSION_CODES.TIRAMISU)
++    public void testDetectionSharedNoSecondDownload() {
++        mDetector.mCaptionsWant = true;
++        mDetector.mState = TarkCaptionsBridge.UNIT_READY;
++        launch();
++        // Captions' copy alone doesn't turn detection on.
++        assertEquals(DetectionRow.OFF, detection().getStatus());
++
++        detection().tapAction();
++        assertEquals(0, mDetector.mFetches);
++        assertEquals(DetectionRow.ON, detection().getStatus());
 +    }
 +
 +    @Test
@@ -3521,7 +4044,7 @@ diff '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome/browser
 +}
 diff '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguagesTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguagesTest.java
 --- a/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguagesTest.java	1970-01-01 05:30:00.000000000 +0530
-+++ b/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguagesTest.java	2026-10-25 09:11:15.956700740 +0530
++++ b/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguagesTest.java	2026-10-25 09:24:14.886621187 +0530
 @@ -0,0 +1,243 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
@@ -3768,7 +4291,7 @@ diff '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome/browser
 +}
 diff '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceSiteLanguagesTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceSiteLanguagesTest.java
 --- a/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceSiteLanguagesTest.java	1970-01-01 05:30:00.000000000 +0530
-+++ b/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceSiteLanguagesTest.java	2026-10-25 09:11:16.100341177 +0530
++++ b/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceSiteLanguagesTest.java	2026-10-25 09:24:14.939049575 +0530
 @@ -0,0 +1,247 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
@@ -4018,8 +4541,8 @@ diff '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome/browser
 +    }
 +}
 diff '--color=never' -ruN a/chrome/browser/language/android/java/src/org/chromium/chrome/browser/language/settings/LanguageSettings.java b/chrome/browser/language/android/java/src/org/chromium/chrome/browser/language/settings/LanguageSettings.java
---- a/chrome/browser/language/android/java/src/org/chromium/chrome/browser/language/settings/LanguageSettings.java	2026-10-25 09:11:16.016004640 +0530
-+++ b/chrome/browser/language/android/java/src/org/chromium/chrome/browser/language/settings/LanguageSettings.java	2026-10-25 09:11:15.989934448 +0530
+--- a/chrome/browser/language/android/java/src/org/chromium/chrome/browser/language/settings/LanguageSettings.java	2026-10-25 09:24:15.061160549 +0530
++++ b/chrome/browser/language/android/java/src/org/chromium/chrome/browser/language/settings/LanguageSettings.java	2026-10-25 09:24:14.984426575 +0530
 @@ -9,6 +9,7 @@
  import android.app.Activity;
  import android.content.Context;
@@ -4071,9 +4594,9 @@ diff '--color=never' -ruN a/chrome/browser/language/android/java/src/org/chromiu
          if (mTarkXlitSwitch == null) return;
          String summary;
 diff '--color=never' -ruN a/chrome/browser/ui/android/strings/android_chrome_strings.grd b/chrome/browser/ui/android/strings/android_chrome_strings.grd
---- a/chrome/browser/ui/android/strings/android_chrome_strings.grd	2026-10-25 09:11:16.048311669 +0530
-+++ b/chrome/browser/ui/android/strings/android_chrome_strings.grd	2026-10-25 09:11:16.021732886 +0530
-@@ -994,6 +994,62 @@
+--- a/chrome/browser/ui/android/strings/android_chrome_strings.grd	2026-10-25 09:24:15.138765451 +0530
++++ b/chrome/browser/ui/android/strings/android_chrome_strings.grd	2026-10-25 09:24:15.081376244 +0530
+@@ -994,6 +994,80 @@
        <message name="IDS_TARK_SPEECH_LANGUAGE_DOWNLOAD" desc="Tark: action of the voice language snackbar: Android downloads the language (or opens its voice input settings).">
          Download
        </message>
@@ -4126,6 +4649,24 @@ diff '--color=never' -ruN a/chrome/browser/ui/android/strings/android_chrome_str
 +      <message name="IDS_TARK_VOICE_SITE_REMOVE_DESCRIPTION" desc="Tark: Settings > Voice languages > Sites: what a screen reader says for the Remove button beside a website, naming the site (its host).">
 +        Remove <ph name="SITE">%1$s<ex>shodhya.com</ex></ph>
 +      </message>
++      <message name="IDS_TARK_VOICE_DETECTION" desc="Tark: Settings > Voice languages: heading of the section about the optional on-phone model that recognizes which language the person is speaking during voice search.">
++        Spoken-language detection
++      </message>
++      <message name="IDS_TARK_VOICE_DETECTION_TITLE" desc="Tark: Settings > Voice languages > Spoken-language detection: the row that turns on recognizing which language the person speaks during voice search (then Tark can offer to switch to it).">
++        Notice the language I speak
++      </message>
++      <message name="IDS_TARK_VOICE_DETECTION_SUMMARY" desc="Tark: Settings > Voice languages > Spoken-language detection: below the row while it is off: the model runs on the phone, its download size (downloaded on Wi-Fi), and it only listens during voice search. SIZE is a file size.">
++        A model on this phone · <ph name="SIZE">%1$s<ex>88 MB</ex></ph>, on Wi-Fi · listens only while you use voice search
++      </message>
++      <message name="IDS_TARK_VOICE_DETECTION_ON" desc="Tark: Settings > Voice languages > Spoken-language detection: below the row once the model is downloaded and detection is on.">
++        On this phone · listens only while you use voice search
++      </message>
++      <message name="IDS_TARK_VOICE_DETECTION_GET" desc="Tark: Settings > Voice languages > Spoken-language detection: button that downloads the model and turns detection on. [CHAR_LIMIT=16]">
++        Get
++      </message>
++      <message name="IDS_TARK_VOICE_DETECTION_REMOVE" desc="Tark: Settings > Voice languages > Spoken-language detection: button that turns detection off and deletes the model from the phone (unless live captions still use it). [CHAR_LIMIT=20]">
++        Remove
++      </message>
 +      <!-- Tark: the one-time offer of the person's voice languages, after a voice search. -->
 +      <message name="IDS_TARK_VOICE_OFFER_TITLE" desc="Tark: title of the dialog shown once after a voice search, offering to download speech recognition for the languages the person uses (each listed with a checkbox).">
 +        Speak in your languages
@@ -4137,9 +4678,9 @@ diff '--color=never' -ruN a/chrome/browser/ui/android/strings/android_chrome_str
          New versions of Tark, checked once a day unless Google Play installed it (gettarka.com)
        </message>
 diff '--color=never' -ruN a/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb b/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb
---- a/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb	2026-10-25 09:11:16.078789297 +0530
-+++ b/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb	2026-10-25 09:11:16.053852953 +0530
-@@ -2197,4 +2197,18 @@
+--- a/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb	2026-10-25 09:24:15.213533106 +0530
++++ b/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb	2026-10-25 09:24:15.151474543 +0530
+@@ -2197,4 +2197,22 @@
  <translation id="8955589894175271948">Tark के नए वर्शन, दिन में एक बार जांचे जाते हैं, जब तक इसे Google Play से इंस्टॉल न किया गया हो (gettarka.com)</translation>
  <translation id="1628159678930647766">इस फ़ोन पर वॉइस सर्च के लिए <ph name="LANGUAGE"/> चाहिए।</translation>
  <translation id="5742981176567952751">वॉइस के लिए एक भाषा डाउनलोड करनी होगी</translation>
@@ -4157,5 +4698,9 @@ diff '--color=never' -ruN a/chrome/browser/ui/android/strings/translations/andro
 +<translation id="150411034776756821"><ph name="SITE"/> हटाएं</translation>
 +<translation id="844753601361341551">अपनी भाषाओं में बोलें</translation>
 +<translation id="8718879320394438077">Tark इस फ़ोन पर उन भाषाओं में वॉइस सर्च कर सकता है जिनका आप इस्तेमाल करते हैं। हर भाषा एक बार डाउनलोड करनी होती है।</translation>
++<translation id="7026478540401678525">बोली गई भाषा की पहचान</translation>
++<translation id="5528857825864531390">मैं जो भाषा बोलूं, उसे पहचानें</translation>
++<translation id="3168162253316954087">इस फ़ोन पर एक मॉडल · <ph name="SIZE"/>, वाई-फ़ाई पर · सिर्फ़ तब सुनता है जब आप वॉइस सर्च इस्तेमाल करते हैं</translation>
++<translation id="1072845305096600654">इस फ़ोन पर है · सिर्फ़ तब सुनता है जब आप वॉइस सर्च इस्तेमाल करते हैं</translation>
  </translationbundle>
 \ No newline at end of file

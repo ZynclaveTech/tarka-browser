@@ -261,6 +261,12 @@ run python3 "$_root_dir/android/captions/models.py" header "$_root_dir/android/c
 # Live captions: ONNX Runtime's headers and its arm64 .so, pinned
 # (android/captions/ort.sh).
 run bash "$_root_dir/android/captions/ort.sh" "$_src_dir/third_party/tark_onnxruntime"
+# Voice search's language detector (the captions unit language_id, downloaded
+# on request) in Tark's credits: Android's credits page lists each
+# third_party folder with a README.chromium.
+run mkdir -p "$_src_dir/third_party/tark_voxlingua_ecapa"
+run cp "$_root_dir/resources/captions/credits/voxlingua_ecapa/README.chromium" \
+  "$_root_dir/resources/captions/credits/voxlingua_ecapa/LICENSE" "$_src_dir/third_party/tark_voxlingua_ecapa/"
 mkdir -p "$_src_dir/out/Default"
 # Chromium's own clang (fetched while preparing) builds gn and everything else.
 export PATH="$_src_dir/third_party/llvm-build/Release+Asserts/bin:$PATH"

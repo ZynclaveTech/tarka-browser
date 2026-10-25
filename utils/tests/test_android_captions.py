@@ -17,6 +17,10 @@ import models  # noqa: E402
 
 ENGINE_PATCH = ANDROID / 'patches' / 'captions-engine.patch'
 ORT_SHA256 = '72683787a80d0608a3121b967d8e1239aef48286826661c953211626690540a7'
+# The plan's Global Constraints: desktop's detector, byte for byte.
+LID_ONNX_SIZE = 86063323
+LID_ONNX_SHA256 = '7cfabee2653ac9d6e80f9f766514dedb0983fc6cd6e078b499fc6d644164f0a4'
+PUBLISHED_LID = dict(models.LID_ONNX)  # before any test stands a fake in
 
 
 def android_series():
@@ -149,6 +153,15 @@ def fake_export(folder, lang, blank):
         {'lang': lang, 'blank': blank, 'valid_frames': 'n/hop', 'pad': 'constant'}))
 
 
+def fake_lid_export(folder, onnx=b'lid'):
+    folder.mkdir(parents=True)
+    (folder / 'lid.onnx').write_bytes(onnx)
+    (folder / 'lid_labels.txt').write_text('hi\nen\n')
+    # build() accepts only the published detector; the fake stands in for it.
+    import hashlib
+    models.LID_ONNX = {'size': len(b'lid'), 'sha256': hashlib.sha256(b'lid').hexdigest()}
+
+
 def fake_translation_export(folder, language_tags):
     folder.mkdir(parents=True)
     for name in models.TRANSLATION_FILES:
@@ -169,11 +182,14 @@ class TestModels(unittest.TestCase):
         for unit, folder in models.TRANSLATION_UNITS.items():
             fake_translation_export(exports / folder, language_tags=unit != 'tr_es_en')
         (self.tmp / 'silero_vad.onnx').write_bytes(b'vad')
+        self.addCleanup(setattr, models, 'LID_ONNX', models.LID_ONNX)
+        fake_lid_export(exports / models.LANGUAGE_ID_EXPORT)
         self.files = models.build(exports, self.tmp / 'silero_vad.onnx', self.tmp / 'out')
 
     def test_units_files_have_engine_json(self):
         self.assertEqual(set(models.units(self.files)),
-                         {'common', 'hi', 'ta', 'en', 'es', 'tr_indic_en', 'tr_en_indic', 'tr_es_en'})
+                         {'common', 'hi', 'ta', 'en', 'es', 'tr_indic_en', 'tr_en_indic', 'tr_es_en',
+                          'language_id'})
         for unit in models.SPEECH_UNITS:
             names = {n.split('/', 1)[1] for n, f in self.files.items() if f['unit'] == unit}
             self.assertEqual(names, set(models.SPEECH_FILES), unit)
@@ -247,6 +263,60 @@ class TestModels(unittest.TestCase):
             self.assertGreater(f['size'], 0, name)
         # IndicConformer 130M int8, as the spike measured.
         self.assertEqual(committed['hi/encoder.int8.onnx']['size'] // 1_000_000, 137)
+
+    def test_language_id_built_with_its_own_vad(self):
+        names = {n for n, f in self.files.items() if f['unit'] == 'language_id'}
+        self.assertEqual(names, {'language_id/lid.onnx', 'language_id/lid_labels.txt',
+                                 'language_id/silero_vad.onnx'})
+        self.assertEqual(self.files['language_id/silero_vad.onnx'],
+                         dict(self.files['common/silero_vad.onnx'], unit='language_id'))
+
+    def test_build_refuses_another_detector(self):
+        exports = self.tmp / 'other'
+        for unit, folder in models.SPEECH_UNITS.items():
+            fake_export(exports / folder, unit, 1024 if unit in ('en', 'es') else 256)
+        for unit, folder in models.TRANSLATION_UNITS.items():
+            fake_translation_export(exports / folder, language_tags=unit != 'tr_es_en')
+        fake_lid_export(exports / models.LANGUAGE_ID_EXPORT, onnx=b're-exported')
+        models.LID_ONNX = {'size': len(b'lid'), 'sha256': 'f' * 64}
+        with self.assertRaises(SystemExit):
+            models.build(exports, self.tmp / 'silero_vad.onnx', self.tmp / 'out4')
+
+    def test_committed_files_json_pins_language_id(self):
+        # Voice search's detector: desktop's unit, its three files, unchanged.
+        committed = json.loads((ANDROID / 'captions' / 'files.json').read_text(encoding='utf-8'))
+        unit = {n: f for n, f in committed.items() if f['unit'] == 'language_id'}
+        self.assertEqual(set(unit), {'language_id/lid.onnx', 'language_id/lid_labels.txt',
+                                     'language_id/silero_vad.onnx'})
+        self.assertEqual(unit['language_id/lid.onnx']['size'], LID_ONNX_SIZE)
+        self.assertEqual(unit['language_id/lid.onnx']['sha256'], LID_ONNX_SHA256)
+        self.assertEqual(unit['language_id/silero_vad.onnx']['sha256'],
+                         committed['common/silero_vad.onnx']['sha256'])
+        self.assertEqual(sum(f['size'] for f in unit.values()) // 1_000_000, 88)
+        self.assertEqual(PUBLISHED_LID, {'size': LID_ONNX_SIZE, 'sha256': LID_ONNX_SHA256})
+
+    def test_language_id_matches_the_engine(self):
+        # The engine (captions-engine.patch, desktop's manifest) pins the same
+        # files: the Android download is what LanguageDetector loads.
+        committed = json.loads((ANDROID / 'captions' / 'files.json').read_text(encoding='utf-8'))
+        engine_patch = ENGINE_PATCH.read_text(encoding='utf-8')
+        for name, f in committed.items():
+            if f['unit'] == 'language_id':
+                row = f'{{"{name.split("/", 1)[1]}", {f["size"]}, "{f["sha256"]}"}}'
+                self.assertIn(row, engine_patch, name)
+
+    def test_publish_sh_takes_units(self):
+        text = (ANDROID / 'captions' / 'publish.sh').read_text(encoding='utf-8')
+        self.assertIn('--unit) units+=', text)
+        self.assertIn("if units and f['unit'] not in units:", text)
+
+    def test_voxlingua_credited(self):
+        # Android's credits page lists third_party folders with a
+        # README.chromium; build.sh puts the detector's there.
+        text = (ANDROID / 'build.sh').read_text(encoding='utf-8')
+        self.assertIn('resources/captions/credits/voxlingua_ecapa', text)
+        self.assertIn('third_party/tark_voxlingua_ecapa', text)
+        self.assertLess(text.index('tark_voxlingua_ecapa'), text.index('/out/Default/gn" gen'))
 
     def test_build_sh_writes_the_table(self):
         text = (ANDROID / 'build.sh').read_text(encoding='utf-8')

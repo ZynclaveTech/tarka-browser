@@ -58,6 +58,13 @@ fi
 timeout 8h bash $repo/android/build.sh $stop /tark/work >> $log 2>&1
 code=$?
 echo "exit $code" >> $log
+# The captions downloads' sharing rules (voice and captions share the
+# language detector) run in build.sh's host tests: each must have run.
+if (( code == 0 )); then
+  for t in RemoveKeepsUnitCaptionsUses RemoveDeletesWhenNoOwner SharedNoSecondDownload; do
+    grep -q "OK \] CaptionDownloadsTest\.$t " $log || { echo "no CaptionDownloadsTest.$t test ran" >> $log; code=1; }
+  done
+fi
 (( code == 0 )) && upload /tark/work/src/out/Default/apks/ChromePublic.apk ChromePublic.apk
 (( code == 0 )) && upload /tark/work/src/out/Default/apks/ChromePublic.aab ChromePublic.aab
 # A3: the IndicXlit files this APK pins (android/xlit/files.py), for the

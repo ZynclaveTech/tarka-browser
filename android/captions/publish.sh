@@ -3,9 +3,10 @@
 # https://gettarka.com/models/android/v1/<sha256>.bin (Phase 1), the URLs every
 # APK pins (android/captions/files.json, compiled in as model_files.inc).
 #
-#   android/captions/publish.sh [--dry-run] MODELS_DIR
+#   android/captions/publish.sh [--dry-run] [--unit UNIT]... MODELS_DIR
 #
-# MODELS_DIR is android/captions/models.py build's output. Like
+# MODELS_DIR is android/captions/models.py build's output (with --unit, only
+# those units' folders are needed and published). Like
 # utils/publish_caption_models.sh (the Mac's):
 # 1. Checks every file in MODELS_DIR against files.json (size and sha256);
 #    stops on any difference.
@@ -21,16 +22,30 @@ BASE=https://gettarka.com/$PREFIX
 here=$(cd "$(dirname "$0")" && pwd)
 
 dry=0
-if [[ ${1:-} == --dry-run ]]; then dry=1; shift; fi
-models=${1:?usage: publish.sh [--dry-run] MODELS_DIR}
+units=()
+while [[ ${1:-} == --* ]]; do
+  case $1 in
+    --dry-run) dry=1; shift ;;
+    --unit) units+=("${2:?--unit needs a unit}"); shift 2 ;;
+    *) echo "unknown option $1" >&2; exit 1 ;;
+  esac
+done
+models=${1:?usage: publish.sh [--dry-run] [--unit UNIT]... MODELS_DIR}
 
-# "<file> <sha256> <size>" for each pinned file, after checking MODELS_DIR.
-rows=$(python3 - "$here/files.json" "$models" <<'PY'
+# "<file> <sha256> <size>" for each pinned file (of the chosen units), after
+# checking MODELS_DIR.
+rows=$(python3 - "$here/files.json" "$models" ${units[@]+"${units[@]}"} <<'PY'
 import hashlib, json, pathlib, sys
 table = json.loads(pathlib.Path(sys.argv[1]).read_text())
 models = pathlib.Path(sys.argv[2])
+units = set(sys.argv[3:])
+unknown = units - {f['unit'] for f in table.values()}
+if unknown:
+    sys.exit(f'not in files.json: {sorted(unknown)}')
 bad = 0
 for name, f in sorted(table.items()):
+    if units and f['unit'] not in units:
+        continue
     path = models / name
     data = path.read_bytes() if path.exists() else b''
     if len(data) != f['size'] or hashlib.sha256(data).hexdigest() != f['sha256']:
