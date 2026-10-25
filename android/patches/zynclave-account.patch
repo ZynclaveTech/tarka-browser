@@ -1,5 +1,5 @@
 diff '--color=never' -ruN a/chrome/android/BUILD.gn b/chrome/android/BUILD.gn
---- a/chrome/android/BUILD.gn	2026-10-26 02:31:11.066056478 +0530
+--- a/chrome/android/BUILD.gn	2026-10-26 02:46:39.306137144 +0530
 +++ b/chrome/android/BUILD.gn	2026-10-26 02:31:46.724701398 +0530
 @@ -15,6 +15,14 @@
  
@@ -56,18 +56,280 @@ diff '--color=never' -ruN a/chrome/android/BUILD.gn b/chrome/android/BUILD.gn
        "junit:chrome_junit_tests_org.chromium.chrome.browser.tasks",
        "junit:chrome_junit_tests_org.chromium.chrome.browser.toolbar",
        "junit:chrome_junit_tests_org.chromium.chrome.browser.ui",
+diff '--color=never' -ruN a/chrome/android/chrome_java_resources.gni b/chrome/android/chrome_java_resources.gni
+--- a/chrome/android/chrome_java_resources.gni	2026-10-26 02:46:39.331948042 +0530
++++ b/chrome/android/chrome_java_resources.gni	2026-10-26 02:46:26.794090617 +0530
+@@ -685,6 +685,8 @@
+   "java/res/xml/personalize_google_services_preferences.xml",
+   "java/res/xml/privacy_preferences.xml",
+   "java/res/xml/search_widget_info.xml",
++  "java/res/xml/tark_backup_rules.xml",
++  "java/res/xml/tark_data_extraction_rules.xml",
+   "java/res/xml/tracing_preferences.xml",
+   "java/res/xml/unified_account_settings_preferences.xml",
+   "java/res/xml/universal_opt_out_preferences.xml",
 diff '--color=never' -ruN a/chrome/android/chrome_java_sources.gni b/chrome/android/chrome_java_sources.gni
---- a/chrome/android/chrome_java_sources.gni	2026-10-26 02:31:11.067458914 +0530
-+++ b/chrome/android/chrome_java_sources.gni	2026-10-26 02:31:46.723893553 +0530
-@@ -980,6 +980,8 @@
+--- a/chrome/android/chrome_java_sources.gni	2026-10-26 02:46:39.320045628 +0530
++++ b/chrome/android/chrome_java_sources.gni	2026-10-26 02:46:39.253017867 +0530
+@@ -980,6 +980,9 @@
    "java/src/org/chromium/chrome/browser/page_info/SiteSettingsHelper.java",
    "java/src/org/chromium/chrome/browser/page_info/TarkAdblockSiteSwitch.java",
    "java/src/org/chromium/chrome/browser/tark_captions/TarkCaptionBarCoordinator.java",
++  "java/src/org/chromium/chrome/browser/tark/zynclave/AuthStateStore.java",
 +  "java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAuthFlow.java",
 +  "java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveConfig.java",
    "java/src/org/chromium/chrome/browser/paint_preview/StartupPaintPreviewHelper.java",
    "java/src/org/chromium/chrome/browser/paint_preview/StartupPaintPreviewHelperSupplier.java",
    "java/src/org/chromium/chrome/browser/password_manager/AccountChooserDialog.java",
+diff '--color=never' -ruN a/chrome/android/java/AndroidManifest.xml b/chrome/android/java/AndroidManifest.xml
+--- a/chrome/android/java/AndroidManifest.xml	2026-10-26 02:46:39.366686481 +0530
++++ b/chrome/android/java/AndroidManifest.xml	2026-10-26 02:46:26.793895823 +0530
+@@ -237,6 +237,8 @@
+         android:allowBackup="false"
+         {% endif %}
+         android:networkSecurityConfig="@xml/network_security_config"
++        android:fullBackupContent="@xml/tark_backup_rules"
++        android:dataExtractionRules="@xml/tark_data_extraction_rules"
+         android:appComponentFactory="org.chromium.chrome.browser.base.SplitCompatAppComponentFactory"
+         android:enableOnBackInvokedCallback="true"
+         android:zygotePreloadNativeLib="lib{{ library_name }}.so"
+diff '--color=never' -ruN a/chrome/android/java/res/xml/tark_backup_rules.xml b/chrome/android/java/res/xml/tark_backup_rules.xml
+--- a/chrome/android/java/res/xml/tark_backup_rules.xml	1970-01-01 05:30:00.000000000 +0530
++++ b/chrome/android/java/res/xml/tark_backup_rules.xml	2026-10-26 02:46:14.612979500 +0530
+@@ -0,0 +1,11 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!--
++Copyright 2026 The Tark Authors
++Use of this source code is governed by a BSD-style license that can be
++found in the LICENSE file.
++-->
++
++<!-- Tark: Android 11 and older. The Zynclave account never leaves the device through backup. -->
++<full-backup-content>
++    <exclude domain="file" path="zynclave/" />
++</full-backup-content>
+diff '--color=never' -ruN a/chrome/android/java/res/xml/tark_data_extraction_rules.xml b/chrome/android/java/res/xml/tark_data_extraction_rules.xml
+--- a/chrome/android/java/res/xml/tark_data_extraction_rules.xml	1970-01-01 05:30:00.000000000 +0530
++++ b/chrome/android/java/res/xml/tark_data_extraction_rules.xml	2026-10-26 02:46:14.615697079 +0530
+@@ -0,0 +1,16 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!--
++Copyright 2026 The Tark Authors
++Use of this source code is governed by a BSD-style license that can be
++found in the LICENSE file.
++-->
++
++<!-- Tark: Android 12 and newer. The Zynclave account is in neither cloud backup nor device transfer. -->
++<data-extraction-rules>
++    <cloud-backup>
++        <exclude domain="file" path="zynclave/" />
++    </cloud-backup>
++    <device-transfer>
++        <exclude domain="file" path="zynclave/" />
++    </device-transfer>
++</data-extraction-rules>
+diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/AuthStateStore.java b/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/AuthStateStore.java
+--- a/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/AuthStateStore.java	1970-01-01 05:30:00.000000000 +0530
++++ b/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/AuthStateStore.java	2026-10-26 02:46:14.618469575 +0530
+@@ -0,0 +1,198 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++package org.chromium.chrome.browser.tark.zynclave;
++
++import android.content.Context;
++import android.security.keystore.KeyGenParameterSpec;
++import android.security.keystore.KeyProperties;
++
++import org.json.JSONException;
++import org.json.JSONObject;
++
++import org.chromium.base.Log;
++import org.chromium.build.annotations.NullMarked;
++import org.chromium.build.annotations.Nullable;
++
++import java.io.File;
++import java.io.FileOutputStream;
++import java.io.IOException;
++import java.nio.charset.StandardCharsets;
++import java.nio.file.Files;
++import java.nio.file.StandardCopyOption;
++import java.security.GeneralSecurityException;
++import java.security.KeyStore;
++import java.util.Arrays;
++
++import javax.crypto.Cipher;
++import javax.crypto.KeyGenerator;
++import javax.crypto.SecretKey;
++import javax.crypto.spec.GCMParameterSpec;
++
++/**
++ * Tark: Sign in with Zynclave's account store (spec §5.4). AppAuth's serialized state (the refresh
++ * token is in it) and the cached name and email are one JSON document, encrypted with AES-256-GCM
++ * under a non-exportable Android Keystore key and kept in {@code dir/account.bin} as a 12-byte IV
++ * followed by the ciphertext.
++ *
++ * <p>If the file can't be decrypted, or the key is gone or invalidated, the file is deleted, the
++ * key is dropped and the person is simply signed out. Nothing here throws on the read path. Calls
++ * are blocking: run them on the account executor, never on the UI thread.
++ */
++@NullMarked
++public class AuthStateStore {
++    private static final String TAG = "TarkZynclave";
++    private static final String KEY_ALIAS = "tark_zynclave_v1";
++    private static final String FILE_NAME = "account.bin";
++    private static final String TEMP_NAME = "account.bin.tmp";
++    private static final String TRANSFORMATION = "AES/GCM/NoPadding";
++    private static final int IV_BYTES = 12;
++    private static final int TAG_BITS = 128;
++    private static final int VERSION = 1;
++
++    /** What the store keeps: the AppAuth state JSON plus the cached userinfo. */
++    public record Stored(String authStateJson, @Nullable String name, @Nullable String email) {}
++
++    /** The encryption key's home, so tests can use a software key. */
++    public interface KeyProvider {
++        /** The existing key, or a new one if there is none. */
++        SecretKey getOrCreate() throws GeneralSecurityException;
++
++        /** Forgets the key. Never throws. */
++        void delete();
++    }
++
++    private final File mDir;
++    private final KeyProvider mKeys;
++
++    public AuthStateStore(File dir, KeyProvider keys) {
++        mDir = dir;
++        mKeys = keys;
++    }
++
++    /** The store for the app: {@code files/zynclave/} and the Keystore key {@code tark_zynclave_v1}. */
++    public static AuthStateStore create(Context context) {
++        return new AuthStateStore(
++                new File(context.getFilesDir(), "zynclave"), new KeystoreKeyProvider());
++    }
++
++    /** The stored account, or null if there is none or it can't be read (then it is cleared). */
++    public synchronized @Nullable Stored read() {
++        File file = new File(mDir, FILE_NAME);
++        if (!file.exists()) return null;
++        try {
++            byte[] blob = Files.readAllBytes(file.toPath());
++            if (blob.length <= IV_BYTES) throw new GeneralSecurityException("short file");
++            SecretKey key = mKeys.getOrCreate();
++            Cipher cipher = Cipher.getInstance(TRANSFORMATION);
++            cipher.init(
++                    Cipher.DECRYPT_MODE,
++                    key,
++                    new GCMParameterSpec(TAG_BITS, blob, 0, IV_BYTES));
++            byte[] plain = cipher.doFinal(blob, IV_BYTES, blob.length - IV_BYTES);
++            JSONObject json = new JSONObject(new String(plain, StandardCharsets.UTF_8));
++            if (json.getInt("v") != VERSION) throw new GeneralSecurityException("version");
++            return new Stored(
++                    json.getString("auth"), optString(json, "name"), optString(json, "email"));
++        } catch (GeneralSecurityException | JSONException | IOException | RuntimeException e) {
++            Log.i(TAG, "Account file unreadable (%s); signing out", e.getClass().getSimpleName());
++            clear();
++            mKeys.delete();
++            return null;
++        }
++    }
++
++    /**
++     * Encrypts and saves {@code stored}, through a temp file and a rename so a crash leaves either
++     * the old file or the new one.
++     *
++     * @throws IOException if the key or the disk fails; the previous file is left as it was.
++     */
++    public synchronized void write(Stored stored) throws IOException {
++        try {
++            JSONObject json = new JSONObject();
++            json.put("v", VERSION);
++            json.put("auth", stored.authStateJson());
++            json.put("name", stored.name());
++            json.put("email", stored.email());
++            byte[] plain = json.toString().getBytes(StandardCharsets.UTF_8);
++
++            Cipher cipher = Cipher.getInstance(TRANSFORMATION);
++            cipher.init(Cipher.ENCRYPT_MODE, mKeys.getOrCreate());
++            byte[] iv = cipher.getIV();
++            if (iv == null || iv.length != IV_BYTES) {
++                throw new GeneralSecurityException("unexpected IV");
++            }
++            byte[] sealed = cipher.doFinal(plain);
++            byte[] blob = new byte[IV_BYTES + sealed.length];
++            System.arraycopy(iv, 0, blob, 0, IV_BYTES);
++            System.arraycopy(sealed, 0, blob, IV_BYTES, sealed.length);
++            Arrays.fill(plain, (byte) 0);
++
++            if (!mDir.isDirectory() && !mDir.mkdirs()) throw new IOException("no directory");
++            File temp = new File(mDir, TEMP_NAME);
++            try (FileOutputStream out = new FileOutputStream(temp)) {
++                out.write(blob);
++                out.getFD().sync();
++            }
++            Files.move(
++                    temp.toPath(),
++                    new File(mDir, FILE_NAME).toPath(),
++                    StandardCopyOption.ATOMIC_MOVE,
++                    StandardCopyOption.REPLACE_EXISTING);
++        } catch (GeneralSecurityException | JSONException e) {
++            throw new IOException("could not encrypt the account", e);
++        }
++    }
++
++    /** Deletes the account file (and any leftover temp file). The key is kept. */
++    public synchronized void clear() {
++        new File(mDir, FILE_NAME).delete();
++        new File(mDir, TEMP_NAME).delete();
++    }
++
++    private static @Nullable String optString(JSONObject json, String name) {
++        return json.isNull(name) ? null : json.optString(name, null);
++    }
++
++    /** The Android Keystore key: AES-256-GCM, random IVs, no user authentication. */
++    private static class KeystoreKeyProvider implements KeyProvider {
++        private static final String PROVIDER = "AndroidKeyStore";
++
++        @Override
++        public SecretKey getOrCreate() throws GeneralSecurityException {
++            try {
++                KeyStore store = KeyStore.getInstance(PROVIDER);
++                store.load(null);
++                if (store.getKey(KEY_ALIAS, null) instanceof SecretKey existing) return existing;
++                KeyGenerator generator =
++                        KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, PROVIDER);
++                generator.init(
++                        new KeyGenParameterSpec.Builder(
++                                        KEY_ALIAS,
++                                        KeyProperties.PURPOSE_ENCRYPT
++                                                | KeyProperties.PURPOSE_DECRYPT)
++                                .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
++                                .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
++                                .setKeySize(256)
++                                .setRandomizedEncryptionRequired(true)
++                                .build());
++                return generator.generateKey();
++            } catch (IOException e) {
++                throw new GeneralSecurityException(e);
++            }
++        }
++
++        @Override
++        public void delete() {
++            try {
++                KeyStore store = KeyStore.getInstance(PROVIDER);
++                store.load(null);
++                store.deleteEntry(KEY_ALIAS);
++            } catch (GeneralSecurityException | IOException | RuntimeException e) {
++                Log.i(TAG, "Could not delete the key (%s)", e.getClass().getSimpleName());
++            }
++        }
++    }
++}
 diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/TarkZynclaveBuildConfig.template b/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/TarkZynclaveBuildConfig.template
 --- a/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/TarkZynclaveBuildConfig.template	1970-01-01 05:30:00.000000000 +0530
 +++ b/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/TarkZynclaveBuildConfig.template	2026-10-26 02:32:55.592886123 +0530
@@ -236,16 +498,19 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
 +    }
 +}
 diff '--color=never' -ruN a/chrome/android/junit/BUILD.gn b/chrome/android/junit/BUILD.gn
---- a/chrome/android/junit/BUILD.gn	2026-10-26 02:31:11.066764654 +0530
-+++ b/chrome/android/junit/BUILD.gn	2026-10-26 02:31:57.241465435 +0530
-@@ -1394,6 +1394,17 @@
+--- a/chrome/android/junit/BUILD.gn	2026-10-26 02:46:39.344909055 +0530
++++ b/chrome/android/junit/BUILD.gn	2026-10-26 02:46:26.794926087 +0530
+@@ -1394,6 +1394,20 @@
      ]
    }
  
 +  # Tark: Sign in with Zynclave.
 +  robolectric_library(
 +      "chrome_junit_tests_org.chromium.chrome.browser.tark.zynclave") {
-+    sources = [ "src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAuthFlowTest.java" ]
++    sources = [
++      "src/org/chromium/chrome/browser/tark/zynclave/AuthStateStoreTest.java",
++      "src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAuthFlowTest.java",
++    ]
 +
 +    deps = [
 +      ":chrome_junit_tests_helper",
@@ -256,6 +521,189 @@ diff '--color=never' -ruN a/chrome/android/junit/BUILD.gn b/chrome/android/junit
    robolectric_library("chrome_junit_tests_org.chromium.chrome.browser.tasks") {
      resources_package = "org.chromium.chrome.browser.tasks.tab_management"
  
+diff '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome/browser/tark/zynclave/AuthStateStoreTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/tark/zynclave/AuthStateStoreTest.java
+--- a/chrome/android/junit/src/org/chromium/chrome/browser/tark/zynclave/AuthStateStoreTest.java	1970-01-01 05:30:00.000000000 +0530
++++ b/chrome/android/junit/src/org/chromium/chrome/browser/tark/zynclave/AuthStateStoreTest.java	2026-10-26 02:46:14.620764441 +0530
+@@ -0,0 +1,179 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++package org.chromium.chrome.browser.tark.zynclave;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.assertNull;
++import static org.junit.Assert.assertTrue;
++
++import android.security.keystore.KeyPermanentlyInvalidatedException;
++
++import org.junit.Before;
++import org.junit.Rule;
++import org.junit.Test;
++import org.junit.rules.TemporaryFolder;
++import org.junit.runner.RunWith;
++import org.robolectric.annotation.Config;
++
++import org.chromium.base.test.BaseRobolectricTestRunner;
++import org.chromium.chrome.browser.tark.zynclave.AuthStateStore.KeyProvider;
++import org.chromium.chrome.browser.tark.zynclave.AuthStateStore.Stored;
++
++import java.io.File;
++import java.nio.charset.StandardCharsets;
++import java.nio.file.Files;
++import java.security.GeneralSecurityException;
++
++import javax.crypto.KeyGenerator;
++import javax.crypto.SecretKey;
++
++/** Tests for {@link AuthStateStore}, with a software key: Robolectric has no AndroidKeyStore. */
++@RunWith(BaseRobolectricTestRunner.class)
++@Config(manifest = Config.NONE)
++public class AuthStateStoreTest {
++    private static final String REFRESH_TOKEN = "rt-very-secret-refresh-token";
++    private static final String AUTH_JSON =
++            "{\"refreshToken\":\"" + REFRESH_TOKEN + "\",\"scope\":\"openid\"}";
++
++    /** An AES-256 key held in memory; counts the calls the store makes. */
++    private static class SoftwareKeys implements KeyProvider {
++        private SecretKey mKey;
++        int mDeleteCalls;
++
++        @Override
++        public SecretKey getOrCreate() throws GeneralSecurityException {
++            if (mKey == null) {
++                KeyGenerator generator = KeyGenerator.getInstance("AES");
++                generator.init(256);
++                mKey = generator.generateKey();
++            }
++            return mKey;
++        }
++
++        @Override
++        public void delete() {
++            mDeleteCalls++;
++            mKey = null;
++        }
++    }
++
++    @Rule public TemporaryFolder mTemp = new TemporaryFolder();
++
++    private File mDir;
++    private SoftwareKeys mKeys;
++    private AuthStateStore mStore;
++
++    @Before
++    public void setUp() {
++        mDir = new File(mTemp.getRoot(), "zynclave");
++        mKeys = new SoftwareKeys();
++        mStore = new AuthStateStore(mDir, mKeys);
++    }
++
++    private File accountFile() {
++        return new File(mDir, "account.bin");
++    }
++
++    @Test
++    public void testNothingStoredIsSignedOut() {
++        assertNull(mStore.read());
++        assertEquals(0, mKeys.mDeleteCalls);
++    }
++
++    @Test
++    public void testRoundTrip() throws Exception {
++        Stored saved = new Stored(AUTH_JSON, "Asha", "asha@example.com");
++        mStore.write(saved);
++        assertEquals(saved, mStore.read());
++
++        // A second store over the same file and key, as after a process restart.
++        assertEquals(saved, new AuthStateStore(mDir, mKeys).read());
++
++        Stored noProfile = new Stored(AUTH_JSON, null, null);
++        mStore.write(noProfile);
++        assertEquals(noProfile, mStore.read());
++        assertFalse(new File(mDir, "account.bin.tmp").exists());
++    }
++
++    @Test
++    public void testFileIsIvThenCiphertext() throws Exception {
++        mStore.write(new Stored(AUTH_JSON, null, null));
++        byte[] first = Files.readAllBytes(accountFile().toPath());
++        assertTrue(first.length > 12 + 16);
++        mStore.write(new Stored(AUTH_JSON, null, null));
++        byte[] second = Files.readAllBytes(accountFile().toPath());
++        // Same plaintext, different IV: the bytes differ.
++        assertFalse(java.util.Arrays.equals(first, second));
++    }
++
++    @Test
++    public void testUndecryptableIsSignedOut() throws Exception {
++        mStore.write(new Stored(AUTH_JSON, "Asha", "asha@example.com"));
++        byte[] bytes = Files.readAllBytes(accountFile().toPath());
++        bytes[bytes.length - 1] ^= 0x01;
++        Files.write(accountFile().toPath(), bytes);
++
++        assertNull(mStore.read());
++        assertFalse(accountFile().exists());
++        assertEquals(1, mKeys.mDeleteCalls);
++    }
++
++    @Test
++    public void testTruncatedFileIsSignedOut() throws Exception {
++        mStore.write(new Stored(AUTH_JSON, null, null));
++        Files.write(accountFile().toPath(), new byte[5]);
++
++        assertNull(mStore.read());
++        assertFalse(accountFile().exists());
++        assertEquals(1, mKeys.mDeleteCalls);
++    }
++
++    @Test
++    public void testKeyLostIsSignedOut() throws Exception {
++        mStore.write(new Stored(AUTH_JSON, "Asha", "asha@example.com"));
++        SoftwareKeys lost =
++                new SoftwareKeys() {
++                    @Override
++                    public SecretKey getOrCreate() throws GeneralSecurityException {
++                        throw new KeyPermanentlyInvalidatedException();
++                    }
++                };
++
++        assertNull(new AuthStateStore(mDir, lost).read());
++        assertFalse(accountFile().exists());
++        assertEquals(1, lost.mDeleteCalls);
++    }
++
++    @Test
++    public void testNewKeyCannotReadOldFile() throws Exception {
++        mStore.write(new Stored(AUTH_JSON, null, null));
++
++        assertNull(new AuthStateStore(mDir, new SoftwareKeys()).read());
++        assertFalse(accountFile().exists());
++    }
++
++    @Test
++    public void testNoPlaintextOnDisk() throws Exception {
++        mStore.write(new Stored(AUTH_JSON, "Asha", "asha@example.com"));
++        String onDisk =
++                new String(Files.readAllBytes(accountFile().toPath()), StandardCharsets.ISO_8859_1);
++
++        assertFalse(onDisk.contains(REFRESH_TOKEN));
++        assertFalse(onDisk.contains("Asha"));
++        assertFalse(onDisk.contains("asha@example.com"));
++        assertFalse(onDisk.contains("refreshToken"));
++    }
++
++    @Test
++    public void testClear() throws Exception {
++        mStore.write(new Stored(AUTH_JSON, "Asha", "asha@example.com"));
++        mStore.clear();
++
++        assertFalse(accountFile().exists());
++        assertNull(mStore.read());
++        mStore.clear();
++    }
++}
 diff '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAuthFlowTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAuthFlowTest.java
 --- a/chrome/android/junit/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAuthFlowTest.java	1970-01-01 05:30:00.000000000 +0530
 +++ b/chrome/android/junit/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAuthFlowTest.java	2026-10-26 02:33:18.897582500 +0530
