@@ -156,7 +156,7 @@ Check 'package contents' {
   if (-not $zip) { throw 'no Tark-*.zip' }
   $entries = [System.IO.Compression.ZipFile]::OpenRead($zip.FullName).Entries | ForEach-Object FullName
   $entries | Out-File "$Report\zip-contents.txt"
-  foreach ($want in 'chrome.exe', 'onnxruntime.dll', 'xlit-model.bin', 'xlit-words.bin') {
+  foreach ($want in 'chrome.exe', 'onnxruntime.dll', 'WinSparkle.dll', 'xlit-model.bin', 'xlit-words.bin') {
     if (-not ($entries | Where-Object { $_ -like "*/$want" -or $_ -like "*\$want" })) { throw "the zip lacks $want" }
   }
   if (-not (Get-ChildItem "$Work\build\Tark-*-setup.exe")) { throw 'no Tark-*-setup.exe' }
