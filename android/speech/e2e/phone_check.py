@@ -44,7 +44,30 @@ _spec.loader.exec_module(R)
 xlit = R.xlit
 
 PACKAGE = R.PACKAGE
-PORT = R.PORT
+R.PORT = PORT = 8015  # not 8005: run.py on the emulator may hold it
+
+# British-English phones say "Customise and control Tark": accept either spelling.
+_tap_desc = R.tap_desc
+def _tap_desc_any_spelling(dev, desc, xml=None, contains=False):
+    xml = xml if xml is not None else dev.screen()
+    if _tap_desc(dev, desc, xml, contains):
+        return True
+    alt = desc.replace('Customize', 'Customise')
+    return alt != desc and _tap_desc(dev, alt, xml, contains)
+R.tap_desc = _tap_desc_any_spelling
+
+# A phone's app menu is taller than its screen: scroll it to reach "Settings".
+_tap_text = R.xlit.tap_text
+def _tap_text_scrolling(dev, text, tries=5, contains=False):
+    if _tap_text(dev, text, tries=2, contains=contains):
+        return True
+    for _ in range(3):
+        dev.shell('input', 'swipe', '760', '1900', '760', '700', '300')
+        time.sleep(0.8)
+        if _tap_text(dev, text, tries=1, contains=contains):
+            return True
+    return False
+R.xlit.tap_text = _tap_text_scrolling
 PAGE = f'http://127.0.0.1:{PORT}/page_timing.html'
 HOST = f'127.0.0.1:{PORT}'
 DETECT = R.DETECT
@@ -154,13 +177,31 @@ def tap_text_in(dev, xml, label, contains=False):
     return True
 
 
+LAST_TIMING = {}
+
+
+class TimingHandler(R.Handler):
+    """Serves the pages, and keeps the page's latest timing (POST /timing)."""
+    def do_POST(self):
+        n = int(self.headers.get('Content-Length') or 0)
+        body = self.rfile.read(n)
+        if self.path == '/timing':
+            try:
+                LAST_TIMING.clear()
+                LAST_TIMING.update(json.loads(body))
+            except ValueError:
+                pass
+        self.send_response(204)
+        self.end_headers()
+
+
 def page_state(xml):
     """#out and the timing line, from one dump."""
     out = ''
     m = re.search(r'text="((?:idle|listening|result:|error:)[^"]*)"', xml)
     if m:
         out = html.unescape(m.group(1))
-    timing = {}
+    timing = dict(LAST_TIMING)
     m = re.search(r'text="timing: ([^"]*)"', xml)
     if m:
         try:
@@ -730,7 +771,7 @@ def main(argv=None):
         dev.airplane(False)
         time.sleep(3)
     socketserver.ThreadingTCPServer.allow_reuse_address = True
-    server = socketserver.ThreadingTCPServer(('127.0.0.1', PORT), R.Handler)
+    server = socketserver.ThreadingTCPServer(('127.0.0.1', PORT), TimingHandler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     dev.run('reverse', f'tcp:{PORT}', f'tcp:{PORT}')
 
