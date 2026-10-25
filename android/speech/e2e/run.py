@@ -897,6 +897,13 @@ def detection_download(dev, mark, unreadable, limit=180):
     RESULTS['seen while downloading'] = seen
     files = lid_files(dev)
     RESULTS['files'] = files
+    # A retry on Wi-Fi backs off as "Trying again soon…", never as waiting
+    # for Wi-Fi (Wi-Fi is on from here on).
+    first = next((i for i, x in enumerate(seen) if 'Downloading' in str(x)), None)
+    if first is not None and any('Waiting for Wi-Fi' in str(x) for x in seen[first:]):
+        return f'"Waiting for Wi-Fi" on Wi-Fi after downloading began: {seen}'
+    if RESULTS['failed attempts (retries)'] and not any('Trying again soon' in str(x) for x in seen):
+        RESULTS['note'] = 'a retry happened but no dump caught "Trying again soon…"'
     if not any('Downloading' in str(s) for s in seen) and 'partial file' not in seen:
         return 'never saw it downloading'
     wrong = {n: files.get(n) for n, size in LID_FILES.items() if files.get(n) != size}
