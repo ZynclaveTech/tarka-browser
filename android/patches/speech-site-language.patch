@@ -1,6 +1,6 @@
 diff '--color=never' -ruN a/content/browser/speech/speech_recognizer_impl_android.cc b/content/browser/speech/speech_recognizer_impl_android.cc
---- a/content/browser/speech/speech_recognizer_impl_android.cc	2026-10-25 08:51:52.754860215 +0530
-+++ b/content/browser/speech/speech_recognizer_impl_android.cc	2026-10-25 08:51:52.730296734 +0530
+--- a/content/browser/speech/speech_recognizer_impl_android.cc	2026-10-25 09:11:15.502074353 +0530
++++ b/content/browser/speech/speech_recognizer_impl_android.cc	2026-10-25 09:11:15.476633211 +0530
 @@ -6,18 +6,24 @@
  
  #include <stddef.h>
@@ -86,8 +86,8 @@ diff '--color=never' -ruN a/content/browser/speech/speech_recognizer_impl_androi
  
  void SpeechRecognizerImplAndroid::AbortRecognition() {
 diff '--color=never' -ruN a/content/browser/speech/speech_recognizer_impl_android.h b/content/browser/speech/speech_recognizer_impl_android.h
---- a/content/browser/speech/speech_recognizer_impl_android.h	2026-10-25 08:51:52.783318661 +0530
-+++ b/content/browser/speech/speech_recognizer_impl_android.h	2026-10-25 08:51:52.759644067 +0530
+--- a/content/browser/speech/speech_recognizer_impl_android.h	2026-10-25 09:11:15.533162448 +0530
++++ b/content/browser/speech/speech_recognizer_impl_android.h	2026-10-25 09:11:15.507891434 +0530
 @@ -8,10 +8,12 @@
  #include <jni.h>
  
@@ -113,8 +113,8 @@ diff '--color=never' -ruN a/content/browser/speech/speech_recognizer_impl_androi
        std::vector<media::mojom::WebSpeechRecognitionResultPtr> results);
  
 diff '--color=never' -ruN a/content/public/android/java/src/org/chromium/content/browser/SpeechRecognitionImpl.java b/content/public/android/java/src/org/chromium/content/browser/SpeechRecognitionImpl.java
---- a/content/public/android/java/src/org/chromium/content/browser/SpeechRecognitionImpl.java	2026-10-25 08:51:52.814178888 +0530
-+++ b/content/public/android/java/src/org/chromium/content/browser/SpeechRecognitionImpl.java	2026-10-25 08:51:52.788916941 +0530
+--- a/content/public/android/java/src/org/chromium/content/browser/SpeechRecognitionImpl.java	2026-10-25 09:11:15.565152514 +0530
++++ b/content/public/android/java/src/org/chromium/content/browser/SpeechRecognitionImpl.java	2026-10-25 09:11:15.538895069 +0530
 @@ -45,13 +45,43 @@
  public class SpeechRecognitionImpl {
      private static final String TAG = "SpeechRecog";
@@ -278,7 +278,22 @@ diff '--color=never' -ruN a/content/public/android/java/src/org/chromium/content
      @VisibleForTesting
      static void setRecognizerFactoryForTesting(@Nullable RecognizerFactory factory) {
          sRecognizerFactoryForTesting = factory;
-@@ -326,6 +393,12 @@
+@@ -278,10 +345,12 @@
+         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return null;
+         Context context = ContextUtils.getApplicationContext();
+         RecognizerFactory factory = getRecognizerFactory();
+-        if (!factory.isOnDeviceRecognitionAvailable(context)) return null;
++        // Anything Android throws here (unsupported, a SecurityException from a refused binding)
++        // ends the session like a missing recognizer, so the live-session flag never stays set.
+         try {
++            if (!factory.isOnDeviceRecognitionAvailable(context)) return null;
+             return factory.createOnDeviceSpeechRecognizer(context);
+-        } catch (UnsupportedOperationException e) {
++        } catch (RuntimeException e) {
+             Log.w(TAG, "No on-device recognizer", e);
+             return null;
+         }
+@@ -326,6 +395,12 @@
          if (sLiveSession == this) sLiveSession = null;
          SpeechRecognitionImplJni.get().onRecognitionEnd(mNativeSpeechRecognizerImplAndroid);
          mNativeSpeechRecognizerImplAndroid = 0;
@@ -291,7 +306,7 @@ diff '--color=never' -ruN a/content/public/android/java/src/org/chromium/content
      }
  
      @CalledByNative
-@@ -337,13 +410,17 @@
+@@ -337,13 +412,17 @@
  
      @CalledByNative
      @VisibleForTesting
@@ -310,7 +325,7 @@ diff '--color=never' -ruN a/content/public/android/java/src/org/chromium/content
          if (older != null && older != this) older.abortRecognition();
  
          SpeechRecognizer recognizer = createOnDeviceRecognizer();
-@@ -352,16 +429,33 @@
+@@ -352,16 +431,33 @@
              return;
          }
          mRecognizer = recognizer;
@@ -348,7 +363,7 @@ diff '--color=never' -ruN a/content/public/android/java/src/org/chromium/content
          try {
              recognizer.startListening(mIntent);
          } catch (SecurityException e) {
-@@ -370,6 +464,45 @@
+@@ -370,6 +466,45 @@
          }
      }
  
@@ -394,7 +409,7 @@ diff '--color=never' -ruN a/content/public/android/java/src/org/chromium/content
      @VisibleForTesting
      RecognitionListener getListenerForTesting() {
          return mListener;
-@@ -389,6 +522,7 @@
+@@ -389,6 +524,7 @@
          if (mRecognizer == null) return;
  
          mContinuous = false;
@@ -403,8 +418,8 @@ diff '--color=never' -ruN a/content/public/android/java/src/org/chromium/content
      }
  
 diff '--color=never' -ruN a/content/public/android/java/src/org/chromium/content_public/browser/SpeechRecognition.java b/content/public/android/java/src/org/chromium/content_public/browser/SpeechRecognition.java
---- a/content/public/android/java/src/org/chromium/content_public/browser/SpeechRecognition.java	2026-10-25 08:51:52.843099091 +0530
-+++ b/content/public/android/java/src/org/chromium/content_public/browser/SpeechRecognition.java	2026-10-25 08:51:52.819043992 +0530
+--- a/content/public/android/java/src/org/chromium/content_public/browser/SpeechRecognition.java	2026-10-25 09:11:15.597120496 +0530
++++ b/content/public/android/java/src/org/chromium/content_public/browser/SpeechRecognition.java	2026-10-25 09:11:15.570745883 +0530
 @@ -26,15 +26,39 @@
          return SpeechRecognitionImpl.initialize();
      }
@@ -480,8 +495,8 @@ diff '--color=never' -ruN a/content/public/android/java/src/org/chromium/content
      }
  }
 diff '--color=never' -ruN a/content/public/android/junit/src/org/chromium/content/browser/SpeechRecognitionImplTest.java b/content/public/android/junit/src/org/chromium/content/browser/SpeechRecognitionImplTest.java
---- a/content/public/android/junit/src/org/chromium/content/browser/SpeechRecognitionImplTest.java	2026-10-25 08:51:52.873729648 +0530
-+++ b/content/public/android/junit/src/org/chromium/content/browser/SpeechRecognitionImplTest.java	2026-10-25 08:51:52.848922957 +0530
+--- a/content/public/android/junit/src/org/chromium/content/browser/SpeechRecognitionImplTest.java	2026-10-25 09:11:15.629510234 +0530
++++ b/content/public/android/junit/src/org/chromium/content/browser/SpeechRecognitionImplTest.java	2026-10-25 09:11:15.602733240 +0530
 @@ -13,14 +13,18 @@
  import static org.mockito.ArgumentMatchers.anyLong;
  import static org.mockito.ArgumentMatchers.anyString;
@@ -501,7 +516,31 @@ diff '--color=never' -ruN a/content/public/android/junit/src/org/chromium/conten
  import android.speech.RecognizerIntent;
  import android.speech.SpeechRecognizer;
  
-@@ -86,12 +90,24 @@
+@@ -36,6 +40,7 @@
+ import org.robolectric.annotation.Config;
+ 
+ import org.chromium.base.test.BaseRobolectricTestRunner;
++import org.chromium.build.annotations.Nullable;
+ import org.chromium.media.mojom.SpeechRecognitionErrorCode;
+ 
+ import java.util.ArrayList;
+@@ -58,6 +63,7 @@
+     /** Stands in for Android: only on-device recognizers exist here. */
+     private static class FakeFactory implements SpeechRecognitionImpl.RecognizerFactory {
+         boolean mAvailable = true;
++        @Nullable RuntimeException mThrow;
+         final List<SpeechRecognizer> mCreated = new ArrayList<>();
+ 
+         @Override
+@@ -67,6 +73,7 @@
+ 
+         @Override
+         public SpeechRecognizer createOnDeviceSpeechRecognizer(Context context) {
++            if (mThrow != null) throw mThrow;
+             SpeechRecognizer recognizer = mock(SpeechRecognizer.class);
+             mCreated.add(recognizer);
+             return recognizer;
+@@ -86,12 +93,24 @@
          SpeechRecognitionImpl.resetForTesting();
      }
  
@@ -527,7 +566,7 @@ diff '--color=never' -ruN a/content/public/android/junit/src/org/chromium/conten
      private void verifyEndedWith(long nativePtr, int code) {
          verify(mNatives).onRecognitionError(nativePtr, code);
          verify(mNatives).onRecognitionEnd(nativePtr);
-@@ -259,4 +275,163 @@
+@@ -259,4 +278,172 @@
          verify(olderRecognizer, times(1)).destroy();
          verify(mNatives, times(1)).onRecognitionEnd(NATIVE_1);
      }
@@ -689,5 +728,14 @@ diff '--color=never' -ruN a/content/public/android/junit/src/org/chromium/conten
 +        verifyEndedWith(NATIVE_1, SpeechRecognitionErrorCode.ABORTED);
 +        assertEquals(List.of(true), liveAtEnd);
 +        assertTrue(SpeechRecognitionImpl.hasLiveSession());
++    }
++
++    @Test
++    public void testThrowingFactoryEndsTheSession() {
++        mFactory.mThrow = new SecurityException("binding refused");
++        start(NATIVE_1, "en-US");
++
++        verifyEndedWith(NATIVE_1, SpeechRecognitionErrorCode.SERVICE_NOT_ALLOWED);
++        assertFalse(SpeechRecognitionImpl.hasLiveSession());
 +    }
  }
