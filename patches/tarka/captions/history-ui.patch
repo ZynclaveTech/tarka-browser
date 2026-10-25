@@ -1,763 +1,3 @@
---- /dev/null
-+++ b/chrome/browser/ui/views/tark_captions/history_follow.h
-@@ -0,0 +1,36 @@
-+// Copyright 2026 The Tark Authors
-+// Use of this source code is governed by a BSD-style license that can be
-+// found in the LICENSE file.
-+
-+#ifndef CHROME_BROWSER_UI_VIEWS_TARK_CAPTIONS_HISTORY_FOLLOW_H_
-+#define CHROME_BROWSER_UI_VIEWS_TARK_CAPTIONS_HISTORY_FOLLOW_H_
-+
-+#include <cstdint>
-+#include <vector>
-+
-+// D4 captions history panel: whether it sticks to the newest line. Scrolling
-+// up holds it still and counts the lines that arrive ("↓ Live · 3 new");
-+// back at the bottom it follows again. Content growing below (new lines, a
-+// line gaining its translation) moves the bottom, not the scroll offset, so
-+// it is not taken for the user scrolling up.
-+class HistoryFollow {
-+ public:
-+  // `offset`: how far the rows are scrolled from the top.
-+  void OnScrolled(int offset, bool at_bottom);
-+  void OnRowsAdded(int count);
-+  bool following() const { return following_; }
-+  int unseen() const { return unseen_; }
-+
-+ private:
-+  bool following_ = true;
-+  int unseen_ = 0;
-+  int last_offset_ = 0;
-+};
-+
-+// The ids in `shown` (the panel's row views) that are no longer in
-+// `current` (the history's rows); both ascending. By id, not by range: a
-+// wrong guess dropped from the end leaves a gap that later lines sit beyond.
-+std::vector<uint64_t> GoneRowIds(const std::vector<uint64_t>& shown,
-+                                 const std::vector<uint64_t>& current);
-+
-+#endif  // CHROME_BROWSER_UI_VIEWS_TARK_CAPTIONS_HISTORY_FOLLOW_H_
---- /dev/null
-+++ b/chrome/browser/ui/views/tark_captions/history_follow.cc
-@@ -0,0 +1,36 @@
-+// Copyright 2026 The Tark Authors
-+// Use of this source code is governed by a BSD-style license that can be
-+// found in the LICENSE file.
-+
-+#include "chrome/browser/ui/views/tark_captions/history_follow.h"
-+
-+void HistoryFollow::OnScrolled(int offset, bool at_bottom) {
-+  if (at_bottom) {
-+    following_ = true;
-+    unseen_ = 0;
-+  } else if (offset < last_offset_) {
-+    following_ = false;
-+  }
-+  last_offset_ = offset;
-+}
-+
-+void HistoryFollow::OnRowsAdded(int count) {
-+  if (!following_) {
-+    unseen_ += count;
-+  }
-+}
-+
-+std::vector<uint64_t> GoneRowIds(const std::vector<uint64_t>& shown,
-+                                 const std::vector<uint64_t>& current) {
-+  std::vector<uint64_t> gone;
-+  auto now = current.begin();
-+  for (uint64_t id : shown) {
-+    while (now != current.end() && *now < id) {
-+      ++now;
-+    }
-+    if (now == current.end() || *now != id) {
-+      gone.push_back(id);
-+    }
-+  }
-+  return gone;
-+}
---- /dev/null
-+++ b/chrome/browser/ui/views/tark_captions/history_follow_unittest.cc
-@@ -0,0 +1,66 @@
-+// Copyright 2026 The Tark Authors
-+// Use of this source code is governed by a BSD-style license that can be
-+// found in the LICENSE file.
-+
-+#include "chrome/browser/ui/views/tark_captions/history_follow.h"
-+
-+#include <cstdint>
-+#include <vector>
-+
-+#include "testing/gtest/include/gtest/gtest.h"
-+
-+namespace {
-+
-+TEST(HistoryFollowTest, FollowsUntilScrolledUp) {
-+  HistoryFollow follow;
-+  EXPECT_TRUE(follow.following());
-+  follow.OnScrolled(/*offset=*/300, /*at_bottom=*/true);
-+  follow.OnScrolled(/*offset=*/120, /*at_bottom=*/false);
-+  follow.OnRowsAdded(2);
-+  EXPECT_FALSE(follow.following());
-+  EXPECT_EQ(follow.unseen(), 2);
-+}
-+
-+TEST(HistoryFollowTest, BackAtBottomFollowsAgain) {
-+  HistoryFollow follow;
-+  follow.OnScrolled(/*offset=*/300, /*at_bottom=*/true);
-+  follow.OnScrolled(/*offset=*/100, /*at_bottom=*/false);
-+  follow.OnRowsAdded(3);
-+  follow.OnScrolled(/*offset=*/500, /*at_bottom=*/true);
-+  EXPECT_TRUE(follow.following());
-+  EXPECT_EQ(follow.unseen(), 0);
-+}
-+
-+TEST(HistoryFollowTest, RowsWhileFollowingAreNotCounted) {
-+  HistoryFollow follow;
-+  follow.OnRowsAdded(5);
-+  EXPECT_TRUE(follow.following());
-+  EXPECT_EQ(follow.unseen(), 0);
-+}
-+
-+// Lines arriving (or a line growing with its translation) push the bottom
-+// down without the user scrolling: still following.
-+TEST(HistoryFollowTest, ContentGrowingBelowKeepsFollowing) {
-+  HistoryFollow follow;
-+  follow.OnScrolled(/*offset=*/300, /*at_bottom=*/true);
-+  follow.OnScrolled(/*offset=*/300, /*at_bottom=*/false);
-+  follow.OnRowsAdded(1);
-+  EXPECT_TRUE(follow.following());
-+  EXPECT_EQ(follow.unseen(), 0);
-+}
-+
-+// The panel's row views against the history's rows: a wrong guess dropped
-+// from the end can leave a gap that later lines sit beyond, so rows go by
-+// id, not by range.
-+TEST(HistoryFollowTest, GoneRowIdsFindsAGapLeftByADroppedGuess) {
-+  EXPECT_EQ(GoneRowIds({1, 2, 3}, {1, 4}), (std::vector<uint64_t>{2, 3}));
-+}
-+
-+TEST(HistoryFollowTest, GoneRowIdsFindsRowsDroppedFromTheTop) {
-+  EXPECT_EQ(GoneRowIds({1, 2, 3}, {2, 3, 4}), (std::vector<uint64_t>{1}));
-+  EXPECT_EQ(GoneRowIds({1, 2}, {}), (std::vector<uint64_t>{1, 2}));
-+  EXPECT_TRUE(GoneRowIds({}, {1, 2}).empty());
-+  EXPECT_TRUE(GoneRowIds({1, 2}, {1, 2, 3}).empty());
-+}
-+
-+}  // namespace
---- /dev/null
-+++ b/chrome/browser/ui/views/tark_captions/caption_history_view.h
-@@ -0,0 +1,83 @@
-+// Copyright 2026 The Tark Authors
-+// Use of this source code is governed by a BSD-style license that can be
-+// found in the LICENSE file.
-+
-+#ifndef CHROME_BROWSER_UI_VIEWS_TARK_CAPTIONS_CAPTION_HISTORY_VIEW_H_
-+#define CHROME_BROWSER_UI_VIEWS_TARK_CAPTIONS_CAPTION_HISTORY_VIEW_H_
-+
-+#include <cstdint>
-+#include <map>
-+#include <string>
-+
-+#include "base/callback_list.h"
-+#include "base/memory/raw_ptr.h"
-+#include "chrome/browser/ui/views/tark_captions/history_follow.h"
-+#include "components/tark_captions/caption_history.h"
-+#include "ui/base/metadata/metadata_header_macros.h"
-+#include "ui/views/view.h"
-+
-+namespace views {
-+class Label;
-+class MdTextButton;
-+class ScrollView;
-+}  // namespace views
-+
-+// Tark (D4): the captions history panel's contents (mockup
-+// captions-history-panel-mockup.html): "Captions · <tab>" with Copy and ✕,
-+// the stopped and dropped notes, then every line with its time and
-+// translation, the draft faded last, and "↓ Live · N new" while scrolled up.
-+class TarkCaptionHistoryView : public views::View {
-+  METADATA_HEADER(TarkCaptionHistoryView, views::View)
-+
-+ public:
-+  class Delegate {
-+   public:
-+    virtual void OnCopyPressed() = 0;
-+    virtual void OnCloseHistoryPressed() = 0;
-+
-+   protected:
-+    virtual ~Delegate() = default;
-+  };
-+
-+  explicit TarkCaptionHistoryView(Delegate* delegate);
-+  TarkCaptionHistoryView(const TarkCaptionHistoryView&) = delete;
-+  TarkCaptionHistoryView& operator=(const TarkCaptionHistoryView&) = delete;
-+  ~TarkCaptionHistoryView() override;
-+
-+  void SetTitle(const std::u16string& tab_title);
-+  // Captions stopped by themselves; the history stays until the user ends it.
-+  void SetStopped(bool stopped);
-+  // Rows are kept by id: new ones are added, changed ones updated, gone ones
-+  // removed; the rest stay as they are.
-+  void SetHistory(const tark_captions::CaptionHistory& history);
-+  // Another tab's history comes next: its row ids start again at 1.
-+  void Reset();
-+
-+ private:
-+  struct RowViews {
-+    raw_ptr<views::View> row = nullptr;
-+    raw_ptr<views::Label> text = nullptr;
-+    raw_ptr<views::Label> translation = nullptr;
-+    uint32_t version = 0;
-+  };
-+
-+  views::View* MakeRow(const tark_captions::CaptionHistory::Row& row, RowViews* views);
-+  void FillRow(const tark_captions::CaptionHistory::Row& row, RowViews* views);
-+  void OnScrolled();
-+  void ScrollToBottom();
-+  void UpdateLive();
-+
-+  raw_ptr<Delegate> delegate_;
-+  raw_ptr<views::Label> title_ = nullptr;
-+  raw_ptr<views::Label> stopped_ = nullptr;
-+  raw_ptr<views::Label> dropped_ = nullptr;
-+  raw_ptr<views::ScrollView> scroll_ = nullptr;
-+  raw_ptr<views::View> rows_ = nullptr;
-+  raw_ptr<views::Label> draft_ = nullptr;
-+  raw_ptr<views::MdTextButton> live_ = nullptr;
-+  std::map<uint64_t, RowViews> row_views_;
-+  HistoryFollow follow_;
-+  base::CallbackListSubscription scrolled_subscription_;
-+};
-+
-+#endif  // CHROME_BROWSER_UI_VIEWS_TARK_CAPTIONS_CAPTION_HISTORY_VIEW_H_
---- /dev/null
-+++ b/chrome/browser/ui/views/tark_captions/caption_history_view.cc
-@@ -0,0 +1,248 @@
-+// Copyright 2026 The Tark Authors
-+// Use of this source code is governed by a BSD-style license that can be
-+// found in the LICENSE file.
-+
-+#include "chrome/browser/ui/views/tark_captions/caption_history_view.h"
-+
-+#include <limits>
-+#include <memory>
-+#include <utility>
-+#include <vector>
-+
-+#include "base/functional/bind.h"
-+#include "base/strings/string_number_conversions.h"
-+#include "chrome/grit/generated_resources.h"
-+#include "components/vector_icons/vector_icons.h"
-+#include "ui/base/l10n/l10n_util.h"
-+#include "ui/base/metadata/metadata_impl_macros.h"
-+#include "ui/color/color_id.h"
-+#include "ui/gfx/font.h"
-+#include "ui/views/accessibility/view_accessibility.h"
-+#include "ui/views/background.h"
-+#include "ui/views/border.h"
-+#include "ui/views/controls/button/image_button.h"
-+#include "ui/views/controls/button/image_button_factory.h"
-+#include "ui/views/controls/button/md_text_button.h"
-+#include "ui/views/controls/label.h"
-+#include "ui/views/controls/scroll_view.h"
-+#include "ui/views/layout/box_layout.h"
-+#include "ui/views/layout/box_layout_view.h"
-+#include "ui/views/widget/widget.h"
-+
-+namespace {
-+
-+using Row = tark_captions::CaptionHistory::Row;
-+using Kind = tark_captions::CaptionHistory::Kind;
-+
-+// Close enough to the bottom to count as there.
-+constexpr int kBottomSlop = 4;
-+
-+std::unique_ptr<views::Label> MakeLabel(ui::ColorId color, bool multiline) {
-+  auto label = std::make_unique<views::Label>();
-+  label->SetMultiLine(multiline);
-+  label->SetHorizontalAlignment(gfx::ALIGN_LEFT);
-+  label->SetEnabledColor(color);
-+  return label;
-+}
-+
-+}  // namespace
-+
-+TarkCaptionHistoryView::TarkCaptionHistoryView(Delegate* delegate) : delegate_(delegate) {
-+  SetLayoutManager(std::make_unique<views::BoxLayout>(views::BoxLayout::Orientation::kVertical,
-+                                                      gfx::Insets::TLBR(10, 12, 10, 12), 6))
-+      ->set_cross_axis_alignment(views::BoxLayout::CrossAxisAlignment::kStretch);
-+  SetBackground(views::CreateSolidBackground(ui::kColorDialogBackground));
-+
-+  auto* header = AddChildView(std::make_unique<views::BoxLayoutView>());
-+  header->SetOrientation(views::BoxLayout::Orientation::kHorizontal);
-+  header->SetCrossAxisAlignment(views::BoxLayout::CrossAxisAlignment::kCenter);
-+  header->SetBetweenChildSpacing(6);
-+  title_ = header->AddChildView(MakeLabel(ui::kColorLabelForeground, /*multiline=*/false));
-+  title_->SetElideBehavior(gfx::ELIDE_TAIL);
-+  title_->SetFontList(title_->font_list().DeriveWithWeight(gfx::Font::Weight::SEMIBOLD));
-+  header->SetFlexForView(title_, 1);
-+  header->AddChildView(std::make_unique<views::MdTextButton>(
-+      base::BindRepeating(&Delegate::OnCopyPressed, base::Unretained(delegate_.get())),
-+      l10n_util::GetStringUTF16(IDS_TARK_CAPTIONS_HISTORY_COPY)));
-+  auto* close = header->AddChildView(views::CreateVectorImageButtonWithNativeTheme(
-+      base::BindRepeating(&Delegate::OnCloseHistoryPressed, base::Unretained(delegate_.get())),
-+      vector_icons::kCloseIcon, 16));
-+  close->SetTooltipText(l10n_util::GetStringUTF16(IDS_TARK_CAPTIONS_HISTORY_CLOSE));
-+  close->GetViewAccessibility().SetName(
-+      l10n_util::GetStringUTF16(IDS_TARK_CAPTIONS_HISTORY_CLOSE));
-+
-+  stopped_ = AddChildView(MakeLabel(ui::kColorLabelForegroundSecondary, /*multiline=*/true));
-+  stopped_->SetText(l10n_util::GetStringUTF16(IDS_TARK_CAPTIONS_HISTORY_STOPPED_NOTE));
-+  stopped_->SetBackground(
-+      views::CreateRoundedRectBackground(ui::kColorSubtleEmphasisBackground, 6));
-+  stopped_->SetBorder(views::CreateEmptyBorder(gfx::Insets::VH(3, 8)));
-+  stopped_->SetVisible(false);
-+  dropped_ = AddChildView(MakeLabel(ui::kColorLabelForegroundSecondary, /*multiline=*/false));
-+  dropped_->SetText(l10n_util::GetStringUTF16(IDS_TARK_CAPTIONS_HISTORY_DROPPED));
-+  dropped_->SetVisible(false);
-+
-+  scroll_ = AddChildView(std::make_unique<views::ScrollView>());
-+  scroll_->SetHorizontalScrollBarMode(views::ScrollView::ScrollBarMode::kDisabled);
-+  // Bounded: the rows get the viewport's width (lines wrap) and their own
-+  // height, and scroll past it.
-+  scroll_->ClipHeightTo(0, std::numeric_limits<int>::max());
-+  scroll_->SetBackgroundColor(std::nullopt);
-+  auto rows = std::make_unique<views::BoxLayoutView>();
-+  rows->SetOrientation(views::BoxLayout::Orientation::kVertical);
-+  rows->SetCrossAxisAlignment(views::BoxLayout::CrossAxisAlignment::kStretch);
-+  rows_ = scroll_->SetContents(std::move(rows));
-+  draft_ = rows_->AddChildView(MakeLabel(ui::kColorLabelForegroundSecondary, /*multiline=*/true));
-+  draft_->SetBorder(views::CreateEmptyBorder(gfx::Insets::VH(5, 0)));
-+  draft_->SetVisible(false);
-+  static_cast<views::BoxLayout*>(GetLayoutManager())->SetFlexForView(scroll_, 1);
-+  scrolled_subscription_ = scroll_->AddContentsScrolledCallback(
-+      base::BindRepeating(&TarkCaptionHistoryView::OnScrolled, base::Unretained(this)));
-+
-+  live_ = AddChildView(std::make_unique<views::MdTextButton>(
-+      base::BindRepeating(
-+          [](TarkCaptionHistoryView* view) {
-+            view->follow_.OnScrolled(view->scroll_->GetVisibleRect().y(), /*at_bottom=*/true);
-+            view->ScrollToBottom();
-+            view->UpdateLive();
-+          },
-+          base::Unretained(this)),
-+      std::u16string()));
-+  live_->SetStyle(ui::ButtonStyle::kProminent);
-+  live_->SetVisible(false);
-+}
-+
-+TarkCaptionHistoryView::~TarkCaptionHistoryView() = default;
-+
-+void TarkCaptionHistoryView::SetTitle(const std::u16string& tab_title) {
-+  title_->SetText(l10n_util::GetStringFUTF16(IDS_TARK_CAPTIONS_HISTORY_TITLE, tab_title));
-+}
-+
-+void TarkCaptionHistoryView::SetStopped(bool stopped) {
-+  if (stopped_->GetVisible() != stopped) {
-+    stopped_->SetVisible(stopped);
-+    InvalidateLayout();
-+  }
-+}
-+
-+void TarkCaptionHistoryView::SetHistory(const tark_captions::CaptionHistory& history) {
-+  const auto& rows = history.rows();
-+  // Rows gone: dropped from the top for the limits, a wrong guess (whose
-+  // gap later lines can sit beyond), or all of them.
-+  std::vector<uint64_t> shown;
-+  shown.reserve(row_views_.size());
-+  for (const auto& [id, views] : row_views_) {
-+    shown.push_back(id);
-+  }
-+  std::vector<uint64_t> current;
-+  current.reserve(rows.size());
-+  for (const Row& row : rows) {
-+    current.push_back(row.id);
-+  }
-+  for (uint64_t id : GoneRowIds(shown, current)) {
-+    auto it = row_views_.find(id);
-+    rows_->RemoveChildViewT(it->second.row.get());
-+    row_views_.erase(it);
-+  }
-+  int added = 0;
-+  for (const Row& row : rows) {
-+    auto it = row_views_.find(row.id);
-+    if (it == row_views_.end()) {
-+      RowViews views;
-+      // Before the draft, which stays last.
-+      rows_->AddChildViewAt(MakeRow(row, &views), rows_->children().size() - 1);
-+      row_views_.emplace(row.id, views);
-+      ++added;
-+    } else if (it->second.version != row.version) {
-+      FillRow(row, &it->second);
-+    }
-+  }
-+  const tark_captions::CaptionHistory::Draft& draft = history.draft();
-+  draft_->SetVisible(!draft.text.empty());
-+  draft_->SetText(draft.translation.empty() ? draft.text
-+                                            : draft.text + u"\n" + draft.translation);
-+  dropped_->SetVisible(history.dropped());
-+  follow_.OnRowsAdded(added);
-+  InvalidateLayout();
-+  if (follow_.following()) {
-+    ScrollToBottom();
-+  }
-+  UpdateLive();
-+}
-+
-+void TarkCaptionHistoryView::Reset() {
-+  for (auto& [id, views] : row_views_) {
-+    rows_->RemoveChildViewT(views.row.get());
-+  }
-+  row_views_.clear();
-+  follow_ = HistoryFollow();
-+  draft_->SetVisible(false);
-+  dropped_->SetVisible(false);
-+  UpdateLive();
-+  InvalidateLayout();
-+}
-+
-+views::View* TarkCaptionHistoryView::MakeRow(const Row& row, RowViews* views) {
-+  auto view = std::make_unique<views::BoxLayoutView>();
-+  view->SetOrientation(views::BoxLayout::Orientation::kVertical);
-+  view->SetCrossAxisAlignment(views::BoxLayout::CrossAxisAlignment::kStretch);
-+  view->SetInsideBorderInsets(gfx::Insets::VH(5, 0));
-+  view->SetBorder(views::CreateSolidSidedBorder(gfx::Insets::TLBR(1, 0, 0, 0),
-+                                                ui::kColorSeparator));
-+  if (row.kind == Kind::kLine) {
-+    auto* time = view->AddChildView(MakeLabel(ui::kColorLabelForegroundSecondary, false));
-+    time->SetText(tark_captions::HistoryTime(row.at));
-+    time->SetFontList(time->font_list().DeriveWithSizeDelta(-2));
-+    views->text = view->AddChildView(MakeLabel(ui::kColorLabelForeground, true));
-+    views->translation =
-+        view->AddChildView(MakeLabel(ui::kColorButtonBackgroundProminent, true));
-+  } else {
-+    auto* divider = view->AddChildView(MakeLabel(ui::kColorLabelForegroundSecondary, false));
-+    divider->SetHorizontalAlignment(gfx::ALIGN_CENTER);
-+    divider->SetFontList(divider->font_list().DeriveWithSizeDelta(-2));
-+    divider->SetText(l10n_util::GetStringUTF16(row.kind == Kind::kNewVideo
-+                                                   ? IDS_TARK_CAPTIONS_HISTORY_NEW_VIDEO
-+                                                   : IDS_TARK_CAPTIONS_HISTORY_RESTARTED));
-+  }
-+  views->row = view.get();
-+  FillRow(row, views);
-+  return view.release();
-+}
-+
-+void TarkCaptionHistoryView::FillRow(const Row& row, RowViews* views) {
-+  views->version = row.version;
-+  if (!views->text) {
-+    return;
-+  }
-+  views->text->SetText(row.text);
-+  views->translation->SetText(row.translation);
-+  views->translation->SetVisible(!row.translation.empty());
-+}
-+
-+void TarkCaptionHistoryView::OnScrolled() {
-+  // Our own scrolls go down, so they never stop the following.
-+  const gfx::Rect visible = scroll_->GetVisibleRect();
-+  follow_.OnScrolled(visible.y(), visible.bottom() + kBottomSlop >= rows_->height());
-+  UpdateLive();
-+}
-+
-+void TarkCaptionHistoryView::ScrollToBottom() {
-+  if (views::Widget* widget = GetWidget()) {
-+    widget->LayoutRootViewIfNecessary();
-+  }
-+  rows_->ScrollRectToVisible(gfx::Rect(0, rows_->height() - 1, 1, 1));
-+}
-+
-+void TarkCaptionHistoryView::UpdateLive() {
-+  const bool show = !follow_.following() && follow_.unseen() > 0;
-+  if (show) {
-+    live_->SetText(l10n_util::GetStringFUTF16(IDS_TARK_CAPTIONS_HISTORY_LIVE,
-+                                              base::NumberToString16(follow_.unseen())));
-+  }
-+  if (live_->GetVisible() != show) {
-+    live_->SetVisible(show);
-+    InvalidateLayout();
-+  }
-+}
-+
-+BEGIN_METADATA(TarkCaptionHistoryView)
-+END_METADATA
---- /dev/null
-+++ b/chrome/browser/ui/views/tark_captions/caption_history_panel.h
-@@ -0,0 +1,93 @@
-+// Copyright 2026 The Tark Authors
-+// Use of this source code is governed by a BSD-style license that can be
-+// found in the LICENSE file.
-+
-+#ifndef CHROME_BROWSER_UI_VIEWS_TARK_CAPTIONS_CAPTION_HISTORY_PANEL_H_
-+#define CHROME_BROWSER_UI_VIEWS_TARK_CAPTIONS_CAPTION_HISTORY_PANEL_H_
-+
-+#include <memory>
-+
-+#include "base/functional/callback.h"
-+#include "base/memory/raw_ptr.h"
-+#include "base/memory/weak_ptr.h"
-+#include "base/scoped_observation.h"
-+#include "base/timer/timer.h"
-+#include "chrome/browser/tark_captions/call_captions_tab_helper.h"
-+#include "chrome/browser/ui/views/tark_captions/caption_history_view.h"
-+#include "ui/views/view_observer.h"
-+#include "ui/views/widget/widget_observer.h"
-+
-+class BrowserView;
-+
-+namespace views {
-+class Widget;
-+}
-+
-+// Tark (D4): the captions history panel, docked to the browser window's
-+// right edge over the page (spec 2026-10-22-tark-d4-captions-history-
-+// design.md). Its own window, so it stays out of screen shares like the
-+// caption bar; macOS and Windows can hide only whole windows.
-+class TarkCaptionHistoryPanel : public views::WidgetObserver,
-+                                public views::ViewObserver,
-+                                public CallCaptionsTabHelper::Observer,
-+                                public TarkCaptionHistoryView::Delegate {
-+ public:
-+  explicit TarkCaptionHistoryPanel(BrowserView* browser_view);
-+  TarkCaptionHistoryPanel(const TarkCaptionHistoryPanel&) = delete;
-+  TarkCaptionHistoryPanel& operator=(const TarkCaptionHistoryPanel&) = delete;
-+  ~TarkCaptionHistoryPanel() override;
-+
-+  // Opens on `tab`'s history, or follows `tab` when open on another.
-+  void Show(CallCaptionsTabHelper* tab);
-+  void Close();
-+  bool showing() const { return !!tab_; }
-+  CallCaptionsTabHelper* tab() const { return tab_; }
-+  // The width it covers on the right of the page; 0 when closed or hidden.
-+  int OccupiedWidth() const;
-+  bool IsPanelWidget(const views::Widget* widget) const { return widget == widget_.get(); }
-+  // The tab's captions are off only while Tark downloads a model they need
-+  // (they come back on by themselves): not "Captions stopped".
-+  void SetModelsPending(bool pending);
-+
-+  // Runs when it appears, closes or hides: the bar re-centres.
-+  void set_on_visibility_changed(base::RepeatingClosure callback) {
-+    on_visibility_changed_ = std::move(callback);
-+  }
-+
-+  // CallCaptionsTabHelper::Observer:
-+  void OnHistoryChanged(CallCaptionsTabHelper* tab) override;
-+  void OnCallStateChanged(CallCaptionsTabHelper* tab) override;
-+
-+  // TarkCaptionHistoryView::Delegate:
-+  void OnCopyPressed() override;
-+  void OnCloseHistoryPressed() override;
-+
-+  // views::WidgetObserver:
-+  void OnWidgetBoundsChanged(views::Widget* widget, const gfx::Rect& new_bounds) override;
-+  void OnWidgetDestroying(views::Widget* widget) override;
-+
-+  // views::ViewObserver:
-+  void OnViewBoundsChanged(views::View* observed_view) override;
-+
-+ private:
-+  void ScheduleRefresh();
-+  void Refresh();
-+  void Reposition();
-+
-+  raw_ptr<BrowserView> browser_view_;
-+  raw_ptr<CallCaptionsTabHelper> tab_ = nullptr;
-+  std::unique_ptr<views::Widget> widget_;
-+  raw_ptr<TarkCaptionHistoryView> view_ = nullptr;
-+  bool models_pending_ = false;
-+  // Captions come several times a second; the panel takes at most four.
-+  base::OneShotTimer refresh_timer_;
-+  base::RepeatingClosure on_visibility_changed_;
-+  base::ScopedObservation<CallCaptionsTabHelper, CallCaptionsTabHelper::Observer>
-+      tab_observation_{this};
-+  base::ScopedObservation<views::Widget, views::WidgetObserver> browser_widget_observation_{
-+      this};
-+  base::ScopedObservation<views::View, views::ViewObserver> contents_observation_{this};
-+  base::WeakPtrFactory<TarkCaptionHistoryPanel> weak_factory_{this};
-+};
-+
-+#endif  // CHROME_BROWSER_UI_VIEWS_TARK_CAPTIONS_CAPTION_HISTORY_PANEL_H_
---- /dev/null
-+++ b/chrome/browser/ui/views/tark_captions/caption_history_panel.cc
-@@ -0,0 +1,177 @@
-+// Copyright 2026 The Tark Authors
-+// Use of this source code is governed by a BSD-style license that can be
-+// found in the LICENSE file.
-+
-+#include "chrome/browser/ui/views/tark_captions/caption_history_panel.h"
-+
-+#include <algorithm>
-+#include <utility>
-+
-+#include "base/task/sequenced_task_runner.h"
-+
-+#include "chrome/browser/ui/views/frame/browser_view.h"
-+#include "chrome/grit/generated_resources.h"
-+#include "content/public/browser/web_contents.h"
-+#include "ui/base/clipboard/scoped_clipboard_writer.h"
-+#include "ui/base/l10n/l10n_util.h"
-+#include "ui/views/controls/webview/webview.h"
-+#include "ui/views/widget/widget.h"
-+
-+namespace {
-+
-+constexpr int kPanelWidth = 340;
-+constexpr base::TimeDelta kRefreshDelay = base::Milliseconds(250);
-+
-+}  // namespace
-+
-+TarkCaptionHistoryPanel::TarkCaptionHistoryPanel(BrowserView* browser_view)
-+    : browser_view_(browser_view) {}
-+
-+TarkCaptionHistoryPanel::~TarkCaptionHistoryPanel() {
-+  Close();
-+}
-+
-+void TarkCaptionHistoryPanel::Show(CallCaptionsTabHelper* tab) {
-+  if (!tab || tab->history().empty() || !browser_view_->GetWidget()) {
-+    return;
-+  }
-+  if (tab != tab_) {
-+    tab_observation_.Reset();
-+    tab_ = tab;
-+    tab_observation_.Observe(tab);
-+    models_pending_ = false;
-+    if (view_) {
-+      view_->Reset();
-+    }
-+  }
-+  if (!widget_) {
-+    views::Widget::InitParams params(views::Widget::InitParams::CLIENT_OWNS_WIDGET,
-+                                     views::Widget::InitParams::TYPE_POPUP);
-+    params.parent = browser_view_->GetWidget()->GetNativeView();
-+    params.activatable = views::Widget::InitParams::Activatable::kNo;
-+    params.shadow_type = views::Widget::InitParams::ShadowType::kDrop;
-+    params.name = "TarkCaptionHistory";
-+    widget_ = std::make_unique<views::Widget>();
-+    widget_->Init(std::move(params));
-+    view_ = widget_->SetContentsView(std::make_unique<TarkCaptionHistoryView>(this));
-+    // What was said is private to whoever reads it: out of screen shares
-+    // and screenshots, before anything shows.
-+    widget_->SetAllowScreenshots(false);
-+    browser_widget_observation_.Observe(browser_view_->GetWidget());
-+    contents_observation_.Observe(browser_view_->contents_web_view());
-+  }
-+  Refresh();
-+  // Runs on_visibility_changed_ when it appears.
-+  Reposition();
-+}
-+
-+void TarkCaptionHistoryPanel::Close() {
-+  refresh_timer_.Stop();
-+  tab_observation_.Reset();
-+  browser_widget_observation_.Reset();
-+  contents_observation_.Reset();
-+  tab_ = nullptr;
-+  view_ = nullptr;
-+  const bool was_open = !!widget_;
-+  widget_.reset();
-+  if (was_open && on_visibility_changed_) {
-+    on_visibility_changed_.Run();
-+  }
-+}
-+
-+int TarkCaptionHistoryPanel::OccupiedWidth() const {
-+  return widget_ && widget_->IsVisible() ? widget_->GetWindowBoundsInScreen().width() : 0;
-+}
-+
-+void TarkCaptionHistoryPanel::SetModelsPending(bool pending) {
-+  if (models_pending_ != pending) {
-+    models_pending_ = pending;
-+    ScheduleRefresh();
-+  }
-+}
-+
-+void TarkCaptionHistoryPanel::OnHistoryChanged(CallCaptionsTabHelper* tab) {
-+  ScheduleRefresh();
-+}
-+
-+void TarkCaptionHistoryPanel::OnCallStateChanged(CallCaptionsTabHelper* tab) {
-+  ScheduleRefresh();
-+}
-+
-+void TarkCaptionHistoryPanel::OnCopyPressed() {
-+  if (!tab_) {
-+    return;
-+  }
-+  ui::ScopedClipboardWriter(ui::ClipboardBuffer::kCopyPaste)
-+      .WriteText(tab_->history().CopyText(
-+          l10n_util::GetStringUTF16(IDS_TARK_CAPTIONS_HISTORY_NEW_VIDEO),
-+          l10n_util::GetStringUTF16(IDS_TARK_CAPTIONS_HISTORY_RESTARTED)));
-+}
-+
-+void TarkCaptionHistoryPanel::OnCloseHistoryPressed() {
-+  // Not from inside the button's own press: closing destroys it.
-+  base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
-+      FROM_HERE,
-+      base::BindOnce(&TarkCaptionHistoryPanel::Close, weak_factory_.GetWeakPtr()));
-+}
-+
-+void TarkCaptionHistoryPanel::OnWidgetBoundsChanged(views::Widget* widget,
-+                                                    const gfx::Rect& new_bounds) {
-+  Reposition();
-+}
-+
-+void TarkCaptionHistoryPanel::OnWidgetDestroying(views::Widget* widget) {
-+  Close();
-+}
-+
-+void TarkCaptionHistoryPanel::OnViewBoundsChanged(views::View* observed_view) {
-+  Reposition();
-+}
-+
-+void TarkCaptionHistoryPanel::ScheduleRefresh() {
-+  if (!refresh_timer_.IsRunning()) {
-+    refresh_timer_.Start(FROM_HERE, kRefreshDelay,
-+                         base::BindOnce(&TarkCaptionHistoryPanel::Refresh,
-+                                        base::Unretained(this)));
-+  }
-+}
-+
-+void TarkCaptionHistoryPanel::Refresh() {
-+  if (!tab_ || !view_) {
-+    return;
-+  }
-+  if (tab_->history().empty()) {
-+    // Cleared: the user turned captions off, or the tab left the site.
-+    Close();
-+    return;
-+  }
-+  view_->SetTitle(tab_->web_contents()->GetTitle());
-+  view_->SetStopped(!tab_->captions_on() && !models_pending_);
-+  view_->SetHistory(tab_->history());
-+}
-+
-+void TarkCaptionHistoryPanel::Reposition() {
-+  if (!widget_ || !browser_view_->GetWidget()) {
-+    return;
-+  }
-+  const bool was_visible = widget_->IsVisible();
-+  const gfx::Rect area = browser_view_->contents_web_view()->GetBoundsInScreen();
-+  // Full-screen video takes the whole screen; the panel waits.
-+  content::WebContents* front = browser_view_->GetActiveWebContents();
-+  const bool hide = !tab_ || area.IsEmpty() || (front && front->IsFullscreen());
-+  if (hide) {
-+    widget_->Hide();
-+  } else {
-+    const int width = std::min(kPanelWidth, area.width() * 2 / 5);
-+    widget_->SetBounds(gfx::Rect(area.right() - width, area.y(), width, area.height()));
-+    if (!was_visible) {
-+      widget_->ShowInactive();
-+    }
-+    // macOS keeps the capture-exclusion shape it was given: give it the
-+    // new one, now that the window has its size and shows.
-+    widget_->SetAllowScreenshots(false);
-+  }
-+  if (was_visible != widget_->IsVisible() && on_visibility_changed_) {
-+    on_visibility_changed_.Run();
-+  }
-+}
 --- a/chrome/app/tark_captions_strings.grdp
 +++ b/chrome/app/tark_captions_strings.grdp
 @@ -121,6 +121,36 @@
@@ -1098,8 +338,8 @@
  #if BUILDFLAG(IS_MAC)
 --- a/chrome/browser/ui/BUILD.gn
 +++ b/chrome/browser/ui/BUILD.gn
-@@ -2754,6 +2754,10 @@
-       "views/tab_search_bubble_host.h",
+@@ -3538,6 +3538,10 @@
+       "views/frame/vertical_tab_strip_region_view.h",
        "views/tark_captions/caption_button_view.cc",
        "views/tark_captions/caption_button_view.h",
 +      "views/tark_captions/caption_history_panel.cc",
@@ -1268,6 +508,619 @@
 +}
 +
  }  // namespace
+--- /dev/null
++++ b/chrome/browser/ui/views/tark_captions/caption_history_panel.cc
+@@ -0,0 +1,177 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/ui/views/tark_captions/caption_history_panel.h"
++
++#include <algorithm>
++#include <utility>
++
++#include "base/task/sequenced_task_runner.h"
++
++#include "chrome/browser/ui/views/frame/browser_view.h"
++#include "chrome/grit/generated_resources.h"
++#include "content/public/browser/web_contents.h"
++#include "ui/base/clipboard/scoped_clipboard_writer.h"
++#include "ui/base/l10n/l10n_util.h"
++#include "ui/views/controls/webview/webview.h"
++#include "ui/views/widget/widget.h"
++
++namespace {
++
++constexpr int kPanelWidth = 340;
++constexpr base::TimeDelta kRefreshDelay = base::Milliseconds(250);
++
++}  // namespace
++
++TarkCaptionHistoryPanel::TarkCaptionHistoryPanel(BrowserView* browser_view)
++    : browser_view_(browser_view) {}
++
++TarkCaptionHistoryPanel::~TarkCaptionHistoryPanel() {
++  Close();
++}
++
++void TarkCaptionHistoryPanel::Show(CallCaptionsTabHelper* tab) {
++  if (!tab || tab->history().empty() || !browser_view_->GetWidget()) {
++    return;
++  }
++  if (tab != tab_) {
++    tab_observation_.Reset();
++    tab_ = tab;
++    tab_observation_.Observe(tab);
++    models_pending_ = false;
++    if (view_) {
++      view_->Reset();
++    }
++  }
++  if (!widget_) {
++    views::Widget::InitParams params(views::Widget::InitParams::CLIENT_OWNS_WIDGET,
++                                     views::Widget::InitParams::TYPE_POPUP);
++    params.parent = browser_view_->GetWidget()->GetNativeView();
++    params.activatable = views::Widget::InitParams::Activatable::kNo;
++    params.shadow_type = views::Widget::InitParams::ShadowType::kDrop;
++    params.name = "TarkCaptionHistory";
++    widget_ = std::make_unique<views::Widget>();
++    widget_->Init(std::move(params));
++    view_ = widget_->SetContentsView(std::make_unique<TarkCaptionHistoryView>(this));
++    // What was said is private to whoever reads it: out of screen shares
++    // and screenshots, before anything shows.
++    widget_->SetAllowScreenshots(false);
++    browser_widget_observation_.Observe(browser_view_->GetWidget());
++    contents_observation_.Observe(browser_view_->contents_web_view());
++  }
++  Refresh();
++  // Runs on_visibility_changed_ when it appears.
++  Reposition();
++}
++
++void TarkCaptionHistoryPanel::Close() {
++  refresh_timer_.Stop();
++  tab_observation_.Reset();
++  browser_widget_observation_.Reset();
++  contents_observation_.Reset();
++  tab_ = nullptr;
++  view_ = nullptr;
++  const bool was_open = !!widget_;
++  widget_.reset();
++  if (was_open && on_visibility_changed_) {
++    on_visibility_changed_.Run();
++  }
++}
++
++int TarkCaptionHistoryPanel::OccupiedWidth() const {
++  return widget_ && widget_->IsVisible() ? widget_->GetWindowBoundsInScreen().width() : 0;
++}
++
++void TarkCaptionHistoryPanel::SetModelsPending(bool pending) {
++  if (models_pending_ != pending) {
++    models_pending_ = pending;
++    ScheduleRefresh();
++  }
++}
++
++void TarkCaptionHistoryPanel::OnHistoryChanged(CallCaptionsTabHelper* tab) {
++  ScheduleRefresh();
++}
++
++void TarkCaptionHistoryPanel::OnCallStateChanged(CallCaptionsTabHelper* tab) {
++  ScheduleRefresh();
++}
++
++void TarkCaptionHistoryPanel::OnCopyPressed() {
++  if (!tab_) {
++    return;
++  }
++  ui::ScopedClipboardWriter(ui::ClipboardBuffer::kCopyPaste)
++      .WriteText(tab_->history().CopyText(
++          l10n_util::GetStringUTF16(IDS_TARK_CAPTIONS_HISTORY_NEW_VIDEO),
++          l10n_util::GetStringUTF16(IDS_TARK_CAPTIONS_HISTORY_RESTARTED)));
++}
++
++void TarkCaptionHistoryPanel::OnCloseHistoryPressed() {
++  // Not from inside the button's own press: closing destroys it.
++  base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++      FROM_HERE,
++      base::BindOnce(&TarkCaptionHistoryPanel::Close, weak_factory_.GetWeakPtr()));
++}
++
++void TarkCaptionHistoryPanel::OnWidgetBoundsChanged(views::Widget* widget,
++                                                    const gfx::Rect& new_bounds) {
++  Reposition();
++}
++
++void TarkCaptionHistoryPanel::OnWidgetDestroying(views::Widget* widget) {
++  Close();
++}
++
++void TarkCaptionHistoryPanel::OnViewBoundsChanged(views::View* observed_view) {
++  Reposition();
++}
++
++void TarkCaptionHistoryPanel::ScheduleRefresh() {
++  if (!refresh_timer_.IsRunning()) {
++    refresh_timer_.Start(FROM_HERE, kRefreshDelay,
++                         base::BindOnce(&TarkCaptionHistoryPanel::Refresh,
++                                        base::Unretained(this)));
++  }
++}
++
++void TarkCaptionHistoryPanel::Refresh() {
++  if (!tab_ || !view_) {
++    return;
++  }
++  if (tab_->history().empty()) {
++    // Cleared: the user turned captions off, or the tab left the site.
++    Close();
++    return;
++  }
++  view_->SetTitle(tab_->web_contents()->GetTitle());
++  view_->SetStopped(!tab_->captions_on() && !models_pending_);
++  view_->SetHistory(tab_->history());
++}
++
++void TarkCaptionHistoryPanel::Reposition() {
++  if (!widget_ || !browser_view_->GetWidget()) {
++    return;
++  }
++  const bool was_visible = widget_->IsVisible();
++  const gfx::Rect area = browser_view_->contents_web_view()->GetBoundsInScreen();
++  // Full-screen video takes the whole screen; the panel waits.
++  content::WebContents* front = browser_view_->GetActiveWebContents();
++  const bool hide = !tab_ || area.IsEmpty() || (front && front->IsFullscreen());
++  if (hide) {
++    widget_->Hide();
++  } else {
++    const int width = std::min(kPanelWidth, area.width() * 2 / 5);
++    widget_->SetBounds(gfx::Rect(area.right() - width, area.y(), width, area.height()));
++    if (!was_visible) {
++      widget_->ShowInactive();
++    }
++    // macOS keeps the capture-exclusion shape it was given: give it the
++    // new one, now that the window has its size and shows.
++    widget_->SetAllowScreenshots(false);
++  }
++  if (was_visible != widget_->IsVisible() && on_visibility_changed_) {
++    on_visibility_changed_.Run();
++  }
++}
+--- /dev/null
++++ b/chrome/browser/ui/views/tark_captions/caption_history_panel.h
+@@ -0,0 +1,93 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_TARK_CAPTIONS_CAPTION_HISTORY_PANEL_H_
++#define CHROME_BROWSER_UI_VIEWS_TARK_CAPTIONS_CAPTION_HISTORY_PANEL_H_
++
++#include <memory>
++
++#include "base/functional/callback.h"
++#include "base/memory/raw_ptr.h"
++#include "base/memory/weak_ptr.h"
++#include "base/scoped_observation.h"
++#include "base/timer/timer.h"
++#include "chrome/browser/tark_captions/call_captions_tab_helper.h"
++#include "chrome/browser/ui/views/tark_captions/caption_history_view.h"
++#include "ui/views/view_observer.h"
++#include "ui/views/widget/widget_observer.h"
++
++class BrowserView;
++
++namespace views {
++class Widget;
++}
++
++// Tark (D4): the captions history panel, docked to the browser window's
++// right edge over the page (spec 2026-10-22-tark-d4-captions-history-
++// design.md). Its own window, so it stays out of screen shares like the
++// caption bar; macOS and Windows can hide only whole windows.
++class TarkCaptionHistoryPanel : public views::WidgetObserver,
++                                public views::ViewObserver,
++                                public CallCaptionsTabHelper::Observer,
++                                public TarkCaptionHistoryView::Delegate {
++ public:
++  explicit TarkCaptionHistoryPanel(BrowserView* browser_view);
++  TarkCaptionHistoryPanel(const TarkCaptionHistoryPanel&) = delete;
++  TarkCaptionHistoryPanel& operator=(const TarkCaptionHistoryPanel&) = delete;
++  ~TarkCaptionHistoryPanel() override;
++
++  // Opens on `tab`'s history, or follows `tab` when open on another.
++  void Show(CallCaptionsTabHelper* tab);
++  void Close();
++  bool showing() const { return !!tab_; }
++  CallCaptionsTabHelper* tab() const { return tab_; }
++  // The width it covers on the right of the page; 0 when closed or hidden.
++  int OccupiedWidth() const;
++  bool IsPanelWidget(const views::Widget* widget) const { return widget == widget_.get(); }
++  // The tab's captions are off only while Tark downloads a model they need
++  // (they come back on by themselves): not "Captions stopped".
++  void SetModelsPending(bool pending);
++
++  // Runs when it appears, closes or hides: the bar re-centres.
++  void set_on_visibility_changed(base::RepeatingClosure callback) {
++    on_visibility_changed_ = std::move(callback);
++  }
++
++  // CallCaptionsTabHelper::Observer:
++  void OnHistoryChanged(CallCaptionsTabHelper* tab) override;
++  void OnCallStateChanged(CallCaptionsTabHelper* tab) override;
++
++  // TarkCaptionHistoryView::Delegate:
++  void OnCopyPressed() override;
++  void OnCloseHistoryPressed() override;
++
++  // views::WidgetObserver:
++  void OnWidgetBoundsChanged(views::Widget* widget, const gfx::Rect& new_bounds) override;
++  void OnWidgetDestroying(views::Widget* widget) override;
++
++  // views::ViewObserver:
++  void OnViewBoundsChanged(views::View* observed_view) override;
++
++ private:
++  void ScheduleRefresh();
++  void Refresh();
++  void Reposition();
++
++  raw_ptr<BrowserView> browser_view_;
++  raw_ptr<CallCaptionsTabHelper> tab_ = nullptr;
++  std::unique_ptr<views::Widget> widget_;
++  raw_ptr<TarkCaptionHistoryView> view_ = nullptr;
++  bool models_pending_ = false;
++  // Captions come several times a second; the panel takes at most four.
++  base::OneShotTimer refresh_timer_;
++  base::RepeatingClosure on_visibility_changed_;
++  base::ScopedObservation<CallCaptionsTabHelper, CallCaptionsTabHelper::Observer>
++      tab_observation_{this};
++  base::ScopedObservation<views::Widget, views::WidgetObserver> browser_widget_observation_{
++      this};
++  base::ScopedObservation<views::View, views::ViewObserver> contents_observation_{this};
++  base::WeakPtrFactory<TarkCaptionHistoryPanel> weak_factory_{this};
++};
++
++#endif  // CHROME_BROWSER_UI_VIEWS_TARK_CAPTIONS_CAPTION_HISTORY_PANEL_H_
+--- /dev/null
++++ b/chrome/browser/ui/views/tark_captions/caption_history_view.cc
+@@ -0,0 +1,248 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/ui/views/tark_captions/caption_history_view.h"
++
++#include <limits>
++#include <memory>
++#include <utility>
++#include <vector>
++
++#include "base/functional/bind.h"
++#include "base/strings/string_number_conversions.h"
++#include "chrome/grit/generated_resources.h"
++#include "components/vector_icons/vector_icons.h"
++#include "ui/base/l10n/l10n_util.h"
++#include "ui/base/metadata/metadata_impl_macros.h"
++#include "ui/color/color_id.h"
++#include "ui/gfx/font.h"
++#include "ui/views/accessibility/view_accessibility.h"
++#include "ui/views/background.h"
++#include "ui/views/border.h"
++#include "ui/views/controls/button/image_button.h"
++#include "ui/views/controls/button/image_button_factory.h"
++#include "ui/views/controls/button/md_text_button.h"
++#include "ui/views/controls/label.h"
++#include "ui/views/controls/scroll_view.h"
++#include "ui/views/layout/box_layout.h"
++#include "ui/views/layout/box_layout_view.h"
++#include "ui/views/widget/widget.h"
++
++namespace {
++
++using Row = tark_captions::CaptionHistory::Row;
++using Kind = tark_captions::CaptionHistory::Kind;
++
++// Close enough to the bottom to count as there.
++constexpr int kBottomSlop = 4;
++
++std::unique_ptr<views::Label> MakeLabel(ui::ColorId color, bool multiline) {
++  auto label = std::make_unique<views::Label>();
++  label->SetMultiLine(multiline);
++  label->SetHorizontalAlignment(gfx::ALIGN_LEFT);
++  label->SetEnabledColor(color);
++  return label;
++}
++
++}  // namespace
++
++TarkCaptionHistoryView::TarkCaptionHistoryView(Delegate* delegate) : delegate_(delegate) {
++  SetLayoutManager(std::make_unique<views::BoxLayout>(views::BoxLayout::Orientation::kVertical,
++                                                      gfx::Insets::TLBR(10, 12, 10, 12), 6))
++      ->set_cross_axis_alignment(views::BoxLayout::CrossAxisAlignment::kStretch);
++  SetBackground(views::CreateSolidBackground(ui::kColorDialogBackground));
++
++  auto* header = AddChildView(std::make_unique<views::BoxLayoutView>());
++  header->SetOrientation(views::BoxLayout::Orientation::kHorizontal);
++  header->SetCrossAxisAlignment(views::BoxLayout::CrossAxisAlignment::kCenter);
++  header->SetBetweenChildSpacing(6);
++  title_ = header->AddChildView(MakeLabel(ui::kColorLabelForeground, /*multiline=*/false));
++  title_->SetElideBehavior(gfx::ELIDE_TAIL);
++  title_->SetFontList(title_->font_list().DeriveWithWeight(gfx::Font::Weight::SEMIBOLD));
++  header->SetFlexForView(title_, 1);
++  header->AddChildView(std::make_unique<views::MdTextButton>(
++      base::BindRepeating(&Delegate::OnCopyPressed, base::Unretained(delegate_.get())),
++      l10n_util::GetStringUTF16(IDS_TARK_CAPTIONS_HISTORY_COPY)));
++  auto* close = header->AddChildView(views::CreateVectorImageButtonWithNativeTheme(
++      base::BindRepeating(&Delegate::OnCloseHistoryPressed, base::Unretained(delegate_.get())),
++      vector_icons::kCloseIcon, 16));
++  close->SetTooltipText(l10n_util::GetStringUTF16(IDS_TARK_CAPTIONS_HISTORY_CLOSE));
++  close->GetViewAccessibility().SetName(
++      l10n_util::GetStringUTF16(IDS_TARK_CAPTIONS_HISTORY_CLOSE));
++
++  stopped_ = AddChildView(MakeLabel(ui::kColorLabelForegroundSecondary, /*multiline=*/true));
++  stopped_->SetText(l10n_util::GetStringUTF16(IDS_TARK_CAPTIONS_HISTORY_STOPPED_NOTE));
++  stopped_->SetBackground(
++      views::CreateRoundedRectBackground(ui::kColorSubtleEmphasisBackground, 6));
++  stopped_->SetBorder(views::CreateEmptyBorder(gfx::Insets::VH(3, 8)));
++  stopped_->SetVisible(false);
++  dropped_ = AddChildView(MakeLabel(ui::kColorLabelForegroundSecondary, /*multiline=*/false));
++  dropped_->SetText(l10n_util::GetStringUTF16(IDS_TARK_CAPTIONS_HISTORY_DROPPED));
++  dropped_->SetVisible(false);
++
++  scroll_ = AddChildView(std::make_unique<views::ScrollView>());
++  scroll_->SetHorizontalScrollBarMode(views::ScrollView::ScrollBarMode::kDisabled);
++  // Bounded: the rows get the viewport's width (lines wrap) and their own
++  // height, and scroll past it.
++  scroll_->ClipHeightTo(0, std::numeric_limits<int>::max());
++  scroll_->SetBackgroundColor(std::nullopt);
++  auto rows = std::make_unique<views::BoxLayoutView>();
++  rows->SetOrientation(views::BoxLayout::Orientation::kVertical);
++  rows->SetCrossAxisAlignment(views::BoxLayout::CrossAxisAlignment::kStretch);
++  rows_ = scroll_->SetContents(std::move(rows));
++  draft_ = rows_->AddChildView(MakeLabel(ui::kColorLabelForegroundSecondary, /*multiline=*/true));
++  draft_->SetBorder(views::CreateEmptyBorder(gfx::Insets::VH(5, 0)));
++  draft_->SetVisible(false);
++  static_cast<views::BoxLayout*>(GetLayoutManager())->SetFlexForView(scroll_, 1);
++  scrolled_subscription_ = scroll_->AddContentsScrolledCallback(
++      base::BindRepeating(&TarkCaptionHistoryView::OnScrolled, base::Unretained(this)));
++
++  live_ = AddChildView(std::make_unique<views::MdTextButton>(
++      base::BindRepeating(
++          [](TarkCaptionHistoryView* view) {
++            view->follow_.OnScrolled(view->scroll_->GetVisibleRect().y(), /*at_bottom=*/true);
++            view->ScrollToBottom();
++            view->UpdateLive();
++          },
++          base::Unretained(this)),
++      std::u16string()));
++  live_->SetStyle(ui::ButtonStyle::kProminent);
++  live_->SetVisible(false);
++}
++
++TarkCaptionHistoryView::~TarkCaptionHistoryView() = default;
++
++void TarkCaptionHistoryView::SetTitle(const std::u16string& tab_title) {
++  title_->SetText(l10n_util::GetStringFUTF16(IDS_TARK_CAPTIONS_HISTORY_TITLE, tab_title));
++}
++
++void TarkCaptionHistoryView::SetStopped(bool stopped) {
++  if (stopped_->GetVisible() != stopped) {
++    stopped_->SetVisible(stopped);
++    InvalidateLayout();
++  }
++}
++
++void TarkCaptionHistoryView::SetHistory(const tark_captions::CaptionHistory& history) {
++  const auto& rows = history.rows();
++  // Rows gone: dropped from the top for the limits, a wrong guess (whose
++  // gap later lines can sit beyond), or all of them.
++  std::vector<uint64_t> shown;
++  shown.reserve(row_views_.size());
++  for (const auto& [id, views] : row_views_) {
++    shown.push_back(id);
++  }
++  std::vector<uint64_t> current;
++  current.reserve(rows.size());
++  for (const Row& row : rows) {
++    current.push_back(row.id);
++  }
++  for (uint64_t id : GoneRowIds(shown, current)) {
++    auto it = row_views_.find(id);
++    rows_->RemoveChildViewT(it->second.row.get());
++    row_views_.erase(it);
++  }
++  int added = 0;
++  for (const Row& row : rows) {
++    auto it = row_views_.find(row.id);
++    if (it == row_views_.end()) {
++      RowViews views;
++      // Before the draft, which stays last.
++      rows_->AddChildViewAt(MakeRow(row, &views), rows_->children().size() - 1);
++      row_views_.emplace(row.id, views);
++      ++added;
++    } else if (it->second.version != row.version) {
++      FillRow(row, &it->second);
++    }
++  }
++  const tark_captions::CaptionHistory::Draft& draft = history.draft();
++  draft_->SetVisible(!draft.text.empty());
++  draft_->SetText(draft.translation.empty() ? draft.text
++                                            : draft.text + u"\n" + draft.translation);
++  dropped_->SetVisible(history.dropped());
++  follow_.OnRowsAdded(added);
++  InvalidateLayout();
++  if (follow_.following()) {
++    ScrollToBottom();
++  }
++  UpdateLive();
++}
++
++void TarkCaptionHistoryView::Reset() {
++  for (auto& [id, views] : row_views_) {
++    rows_->RemoveChildViewT(views.row.get());
++  }
++  row_views_.clear();
++  follow_ = HistoryFollow();
++  draft_->SetVisible(false);
++  dropped_->SetVisible(false);
++  UpdateLive();
++  InvalidateLayout();
++}
++
++views::View* TarkCaptionHistoryView::MakeRow(const Row& row, RowViews* views) {
++  auto view = std::make_unique<views::BoxLayoutView>();
++  view->SetOrientation(views::BoxLayout::Orientation::kVertical);
++  view->SetCrossAxisAlignment(views::BoxLayout::CrossAxisAlignment::kStretch);
++  view->SetInsideBorderInsets(gfx::Insets::VH(5, 0));
++  view->SetBorder(views::CreateSolidSidedBorder(gfx::Insets::TLBR(1, 0, 0, 0),
++                                                ui::kColorSeparator));
++  if (row.kind == Kind::kLine) {
++    auto* time = view->AddChildView(MakeLabel(ui::kColorLabelForegroundSecondary, false));
++    time->SetText(tark_captions::HistoryTime(row.at));
++    time->SetFontList(time->font_list().DeriveWithSizeDelta(-2));
++    views->text = view->AddChildView(MakeLabel(ui::kColorLabelForeground, true));
++    views->translation =
++        view->AddChildView(MakeLabel(ui::kColorButtonBackgroundProminent, true));
++  } else {
++    auto* divider = view->AddChildView(MakeLabel(ui::kColorLabelForegroundSecondary, false));
++    divider->SetHorizontalAlignment(gfx::ALIGN_CENTER);
++    divider->SetFontList(divider->font_list().DeriveWithSizeDelta(-2));
++    divider->SetText(l10n_util::GetStringUTF16(row.kind == Kind::kNewVideo
++                                                   ? IDS_TARK_CAPTIONS_HISTORY_NEW_VIDEO
++                                                   : IDS_TARK_CAPTIONS_HISTORY_RESTARTED));
++  }
++  views->row = view.get();
++  FillRow(row, views);
++  return view.release();
++}
++
++void TarkCaptionHistoryView::FillRow(const Row& row, RowViews* views) {
++  views->version = row.version;
++  if (!views->text) {
++    return;
++  }
++  views->text->SetText(row.text);
++  views->translation->SetText(row.translation);
++  views->translation->SetVisible(!row.translation.empty());
++}
++
++void TarkCaptionHistoryView::OnScrolled() {
++  // Our own scrolls go down, so they never stop the following.
++  const gfx::Rect visible = scroll_->GetVisibleRect();
++  follow_.OnScrolled(visible.y(), visible.bottom() + kBottomSlop >= rows_->height());
++  UpdateLive();
++}
++
++void TarkCaptionHistoryView::ScrollToBottom() {
++  if (views::Widget* widget = GetWidget()) {
++    widget->LayoutRootViewIfNecessary();
++  }
++  rows_->ScrollRectToVisible(gfx::Rect(0, rows_->height() - 1, 1, 1));
++}
++
++void TarkCaptionHistoryView::UpdateLive() {
++  const bool show = !follow_.following() && follow_.unseen() > 0;
++  if (show) {
++    live_->SetText(l10n_util::GetStringFUTF16(IDS_TARK_CAPTIONS_HISTORY_LIVE,
++                                              base::NumberToString16(follow_.unseen())));
++  }
++  if (live_->GetVisible() != show) {
++    live_->SetVisible(show);
++    InvalidateLayout();
++  }
++}
++
++BEGIN_METADATA(TarkCaptionHistoryView)
++END_METADATA
+--- /dev/null
++++ b/chrome/browser/ui/views/tark_captions/caption_history_view.h
+@@ -0,0 +1,83 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_TARK_CAPTIONS_CAPTION_HISTORY_VIEW_H_
++#define CHROME_BROWSER_UI_VIEWS_TARK_CAPTIONS_CAPTION_HISTORY_VIEW_H_
++
++#include <cstdint>
++#include <map>
++#include <string>
++
++#include "base/callback_list.h"
++#include "base/memory/raw_ptr.h"
++#include "chrome/browser/ui/views/tark_captions/history_follow.h"
++#include "components/tark_captions/caption_history.h"
++#include "ui/base/metadata/metadata_header_macros.h"
++#include "ui/views/view.h"
++
++namespace views {
++class Label;
++class MdTextButton;
++class ScrollView;
++}  // namespace views
++
++// Tark (D4): the captions history panel's contents (mockup
++// captions-history-panel-mockup.html): "Captions · <tab>" with Copy and ✕,
++// the stopped and dropped notes, then every line with its time and
++// translation, the draft faded last, and "↓ Live · N new" while scrolled up.
++class TarkCaptionHistoryView : public views::View {
++  METADATA_HEADER(TarkCaptionHistoryView, views::View)
++
++ public:
++  class Delegate {
++   public:
++    virtual void OnCopyPressed() = 0;
++    virtual void OnCloseHistoryPressed() = 0;
++
++   protected:
++    virtual ~Delegate() = default;
++  };
++
++  explicit TarkCaptionHistoryView(Delegate* delegate);
++  TarkCaptionHistoryView(const TarkCaptionHistoryView&) = delete;
++  TarkCaptionHistoryView& operator=(const TarkCaptionHistoryView&) = delete;
++  ~TarkCaptionHistoryView() override;
++
++  void SetTitle(const std::u16string& tab_title);
++  // Captions stopped by themselves; the history stays until the user ends it.
++  void SetStopped(bool stopped);
++  // Rows are kept by id: new ones are added, changed ones updated, gone ones
++  // removed; the rest stay as they are.
++  void SetHistory(const tark_captions::CaptionHistory& history);
++  // Another tab's history comes next: its row ids start again at 1.
++  void Reset();
++
++ private:
++  struct RowViews {
++    raw_ptr<views::View> row = nullptr;
++    raw_ptr<views::Label> text = nullptr;
++    raw_ptr<views::Label> translation = nullptr;
++    uint32_t version = 0;
++  };
++
++  views::View* MakeRow(const tark_captions::CaptionHistory::Row& row, RowViews* views);
++  void FillRow(const tark_captions::CaptionHistory::Row& row, RowViews* views);
++  void OnScrolled();
++  void ScrollToBottom();
++  void UpdateLive();
++
++  raw_ptr<Delegate> delegate_;
++  raw_ptr<views::Label> title_ = nullptr;
++  raw_ptr<views::Label> stopped_ = nullptr;
++  raw_ptr<views::Label> dropped_ = nullptr;
++  raw_ptr<views::ScrollView> scroll_ = nullptr;
++  raw_ptr<views::View> rows_ = nullptr;
++  raw_ptr<views::Label> draft_ = nullptr;
++  raw_ptr<views::MdTextButton> live_ = nullptr;
++  std::map<uint64_t, RowViews> row_views_;
++  HistoryFollow follow_;
++  base::CallbackListSubscription scrolled_subscription_;
++};
++
++#endif  // CHROME_BROWSER_UI_VIEWS_TARK_CAPTIONS_CAPTION_HISTORY_VIEW_H_
 --- a/chrome/browser/ui/views/tark_captions/caption_pill_controller.cc
 +++ b/chrome/browser/ui/views/tark_captions/caption_pill_controller.cc
 @@ -148,6 +148,11 @@
@@ -1592,6 +1445,153 @@
    gfx::Point drag_last_;
  };
  
+--- /dev/null
++++ b/chrome/browser/ui/views/tark_captions/history_follow.cc
+@@ -0,0 +1,36 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/ui/views/tark_captions/history_follow.h"
++
++void HistoryFollow::OnScrolled(int offset, bool at_bottom) {
++  if (at_bottom) {
++    following_ = true;
++    unseen_ = 0;
++  } else if (offset < last_offset_) {
++    following_ = false;
++  }
++  last_offset_ = offset;
++}
++
++void HistoryFollow::OnRowsAdded(int count) {
++  if (!following_) {
++    unseen_ += count;
++  }
++}
++
++std::vector<uint64_t> GoneRowIds(const std::vector<uint64_t>& shown,
++                                 const std::vector<uint64_t>& current) {
++  std::vector<uint64_t> gone;
++  auto now = current.begin();
++  for (uint64_t id : shown) {
++    while (now != current.end() && *now < id) {
++      ++now;
++    }
++    if (now == current.end() || *now != id) {
++      gone.push_back(id);
++    }
++  }
++  return gone;
++}
+--- /dev/null
++++ b/chrome/browser/ui/views/tark_captions/history_follow.h
+@@ -0,0 +1,36 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_TARK_CAPTIONS_HISTORY_FOLLOW_H_
++#define CHROME_BROWSER_UI_VIEWS_TARK_CAPTIONS_HISTORY_FOLLOW_H_
++
++#include <cstdint>
++#include <vector>
++
++// D4 captions history panel: whether it sticks to the newest line. Scrolling
++// up holds it still and counts the lines that arrive ("↓ Live · 3 new");
++// back at the bottom it follows again. Content growing below (new lines, a
++// line gaining its translation) moves the bottom, not the scroll offset, so
++// it is not taken for the user scrolling up.
++class HistoryFollow {
++ public:
++  // `offset`: how far the rows are scrolled from the top.
++  void OnScrolled(int offset, bool at_bottom);
++  void OnRowsAdded(int count);
++  bool following() const { return following_; }
++  int unseen() const { return unseen_; }
++
++ private:
++  bool following_ = true;
++  int unseen_ = 0;
++  int last_offset_ = 0;
++};
++
++// The ids in `shown` (the panel's row views) that are no longer in
++// `current` (the history's rows); both ascending. By id, not by range: a
++// wrong guess dropped from the end leaves a gap that later lines sit beyond.
++std::vector<uint64_t> GoneRowIds(const std::vector<uint64_t>& shown,
++                                 const std::vector<uint64_t>& current);
++
++#endif  // CHROME_BROWSER_UI_VIEWS_TARK_CAPTIONS_HISTORY_FOLLOW_H_
+--- /dev/null
++++ b/chrome/browser/ui/views/tark_captions/history_follow_unittest.cc
+@@ -0,0 +1,66 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/ui/views/tark_captions/history_follow.h"
++
++#include <cstdint>
++#include <vector>
++
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace {
++
++TEST(HistoryFollowTest, FollowsUntilScrolledUp) {
++  HistoryFollow follow;
++  EXPECT_TRUE(follow.following());
++  follow.OnScrolled(/*offset=*/300, /*at_bottom=*/true);
++  follow.OnScrolled(/*offset=*/120, /*at_bottom=*/false);
++  follow.OnRowsAdded(2);
++  EXPECT_FALSE(follow.following());
++  EXPECT_EQ(follow.unseen(), 2);
++}
++
++TEST(HistoryFollowTest, BackAtBottomFollowsAgain) {
++  HistoryFollow follow;
++  follow.OnScrolled(/*offset=*/300, /*at_bottom=*/true);
++  follow.OnScrolled(/*offset=*/100, /*at_bottom=*/false);
++  follow.OnRowsAdded(3);
++  follow.OnScrolled(/*offset=*/500, /*at_bottom=*/true);
++  EXPECT_TRUE(follow.following());
++  EXPECT_EQ(follow.unseen(), 0);
++}
++
++TEST(HistoryFollowTest, RowsWhileFollowingAreNotCounted) {
++  HistoryFollow follow;
++  follow.OnRowsAdded(5);
++  EXPECT_TRUE(follow.following());
++  EXPECT_EQ(follow.unseen(), 0);
++}
++
++// Lines arriving (or a line growing with its translation) push the bottom
++// down without the user scrolling: still following.
++TEST(HistoryFollowTest, ContentGrowingBelowKeepsFollowing) {
++  HistoryFollow follow;
++  follow.OnScrolled(/*offset=*/300, /*at_bottom=*/true);
++  follow.OnScrolled(/*offset=*/300, /*at_bottom=*/false);
++  follow.OnRowsAdded(1);
++  EXPECT_TRUE(follow.following());
++  EXPECT_EQ(follow.unseen(), 0);
++}
++
++// The panel's row views against the history's rows: a wrong guess dropped
++// from the end can leave a gap that later lines sit beyond, so rows go by
++// id, not by range.
++TEST(HistoryFollowTest, GoneRowIdsFindsAGapLeftByADroppedGuess) {
++  EXPECT_EQ(GoneRowIds({1, 2, 3}, {1, 4}), (std::vector<uint64_t>{2, 3}));
++}
++
++TEST(HistoryFollowTest, GoneRowIdsFindsRowsDroppedFromTheTop) {
++  EXPECT_EQ(GoneRowIds({1, 2, 3}, {2, 3, 4}), (std::vector<uint64_t>{1}));
++  EXPECT_EQ(GoneRowIds({1, 2}, {}), (std::vector<uint64_t>{1, 2}));
++  EXPECT_TRUE(GoneRowIds({}, {1, 2}).empty());
++  EXPECT_TRUE(GoneRowIds({1, 2}, {1, 2, 3}).empty());
++}
++
++}  // namespace
 --- a/chrome/browser/ui/views/tark_captions/pill_language.cc
 +++ b/chrome/browser/ui/views/tark_captions/pill_language.cc
 @@ -72,9 +72,9 @@
