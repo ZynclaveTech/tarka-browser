@@ -16,18 +16,25 @@
 # between builds, so a change to Tark's patches or steps alone rebuilds only
 # what it changed (see the prepare section and android/layers.py).
 #
+# --zynclave-staging builds a test APK signed in to Zynclave staging (the GN
+# arg tark_zynclave_staging, zynclave-account.patch); never a published one.
 # --stop-before-gn stops after the patches and Tark's steps with exit 3 (the
 # patch-only job). TARK_ANDROID_DRYRUN=1 prints each external command as
 # "tark: run ..." instead of running it (utils/tests/test_android_build_sh.py).
 set -euo pipefail
 
 stop_before_gn=0
-if [[ "${1:-}" == --stop-before-gn ]]; then
-  stop_before_gn=1
+zynclave_staging=0
+while [[ "${1:-}" == --* ]]; do
+  case $1 in
+    --stop-before-gn) stop_before_gn=1;;
+    --zynclave-staging) zynclave_staging=1;;
+    *) echo "usage: $0 [--stop-before-gn] [--zynclave-staging] WORKDIR" >&2; exit 2;;
+  esac
   shift
-fi
+done
 if [[ $# -ne 1 ]]; then
-  echo "usage: $0 [--stop-before-gn] WORKDIR" >&2
+  echo "usage: $0 [--stop-before-gn] [--zynclave-staging] WORKDIR" >&2
   exit 2
 fi
 
@@ -283,6 +290,9 @@ cat "$_main_repo/flags.gn" "$_root_dir/android/args.gn" > "$_src_dir/out/Default
 read -r _version_name _version_code < <(python3 "$_root_dir/android/release/version.py" "$_root_dir")
 printf 'android_override_version_name = "%s"\nandroid_override_version_code = "%s"\n' \
   "$_version_name" "$_version_code" >> "$_src_dir/out/Default/args.gn"
+if (( zynclave_staging )); then
+  echo 'tark_zynclave_staging = true' >> "$_src_dir/out/Default/args.gn"
+fi
 run python3 "$_src_dir/tools/gn/bootstrap/bootstrap.py" -o "$_src_dir/out/Default/gn" --skip-generate-buildfiles
 # Scripts run with the machine's python3, as in Chromium's source tarball (a
 # git checkout's .gn names a bundled Python the Android tree does not have).

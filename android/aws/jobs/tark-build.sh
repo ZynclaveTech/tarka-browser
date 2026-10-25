@@ -3,7 +3,10 @@
 # Use of this source code is governed by a BSD-style license that can be
 # found in the LICENSE file.
 #
-#   tark-build.sh BUCKET PREFIX SUBMODULE_COMMIT [--stop-before-gn] [--fresh]
+#   tark-build.sh BUCKET PREFIX SUBMODULE_COMMIT [--stop-before-gn] [--fresh] [--zynclave-staging]
+#
+# --zynclave-staging: a test APK on Zynclave staging (tark_zynclave_staging =
+# true in out/Default/args.gn, through build.sh); never one to publish.
 #
 # A1: build Tark for Android from the source andbuild.sh put in S3. /tark/work
 # keeps the Chromium checkout and its base copy between runs (--fresh wipes
@@ -11,9 +14,9 @@
 # at the end, success or not, unless another build is still running.
 set -uo pipefail
 B=$1; P=$2; SUB=$3; shift 3
-stop=""; fresh=0
+stop=""; fresh=0; staging=""
 for a in "$@"; do
-  case $a in --stop-before-gn) stop=--stop-before-gn;; --fresh) fresh=1;; esac
+  case $a in --stop-before-gn) stop=--stop-before-gn;; --fresh) fresh=1;; --zynclave-staging) staging=--zynclave-staging;; esac
 done
 # Never the SSM agent's folder: tools write state into their working directory.
 cd /tark
@@ -55,7 +58,7 @@ if aws s3 cp --quiet --recursive "s3://$B/lists/" /tark/lists/ && [[ -f /tark/li
   export TARK_LISTS_DIR=/tark/lists
 fi
 # A hung step (a stalled sync, a stuck link) ends here instead of billing on.
-timeout 8h bash $repo/android/build.sh $stop /tark/work >> $log 2>&1
+timeout 8h bash $repo/android/build.sh $stop $staging /tark/work >> $log 2>&1
 code=$?
 echo "exit $code" >> $log
 # The captions downloads' sharing rules (voice and captions share the
@@ -84,7 +87,8 @@ if (( code == 0 )); then
   upload /tark/xlit-files.tgz xlit-files.tgz
 fi
 # The junit tests of the speech and voice patches (voice input) and of the
-# Private button (private-tab-button.patch), built and
+# Private button (private-tab-button.patch) and of Sign in with Zynclave
+# (zynclave-*.patch), built and
 # run here on the same tree (the runners with a venv's Python: there is no
 # vpython3); a failure, or a filter that runs no test, fails the job.
 if (( code == 0 )); then
@@ -113,11 +117,13 @@ if (( code == 0 )); then
       ninja -C $o content_junit_tests chrome_junit_tests &&
       /tark/junit-venv/bin/python $o/bin/run_content_junit_tests --gtest_filter='*SpeechRecognitionImplTest*' &&
       /tark/junit-venv/bin/python $o/bin/run_chrome_junit_tests --gtest_filter='*SpeechLanguageSnackbarTest*:*VoiceDetectionTest*:*VoiceLanguagesTest*:*VoiceLanguageSignalsTest*:*VoiceLanguagesSettingsTest*:*AndroidVoicePlatformTest*:*VoiceSiteLanguagesTest*:*VoiceLanguageOfferTest*' &&
-      /tark/junit-venv/bin/python $o/bin/run_chrome_junit_tests --gtest_filter='*IncognitoTabSwitcherPaneUnitTest*'
+      /tark/junit-venv/bin/python $o/bin/run_chrome_junit_tests --gtest_filter='*IncognitoTabSwitcherPaneUnitTest*' &&
+      /tark/junit-venv/bin/python $o/bin/run_chrome_junit_tests --gtest_filter='*ZynclaveAuthFlowTest*:*AuthStateStoreTest*:*ZynclaveAccountTest*:*ZynclaveNoTokenLogsTest*:*ZynclaveRedirectTest*'
     } > /tark/junit.log 2>&1
     code=$?
     # A filter that matches nothing "passes" with no test run.
-    for t in SpeechRecognitionImplTest SpeechLanguageSnackbarTest VoiceDetectionTest VoiceLanguagesTest VoiceLanguageSignalsTest VoiceLanguagesSettingsTest AndroidVoicePlatformTest VoiceSiteLanguagesTest VoiceLanguageOfferTest IncognitoTabSwitcherPaneUnitTest; do
+    for t in SpeechRecognitionImplTest SpeechLanguageSnackbarTest VoiceDetectionTest VoiceLanguagesTest VoiceLanguageSignalsTest VoiceLanguagesSettingsTest AndroidVoicePlatformTest VoiceSiteLanguagesTest VoiceLanguageOfferTest IncognitoTabSwitcherPaneUnitTest \
+        ZynclaveAuthFlowTest AuthStateStoreTest ZynclaveAccountTest ZynclaveNoTokenLogsTest ZynclaveRedirectTest; do
       grep -q "OK \] .*$t\." /tark/junit.log || { echo "junit: no $t test ran" >> $log; code=1; }
     done
     upload /tark/junit.log junit.log

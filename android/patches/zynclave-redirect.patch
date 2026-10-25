@@ -1,0 +1,418 @@
+diff --color=never -ruN a/chrome/android/chrome_java_sources.gni b/chrome/android/chrome_java_sources.gni
+--- a/chrome/android/chrome_java_sources.gni	2026-10-26 03:13:04
++++ b/chrome/android/chrome_java_sources.gni	2026-10-26 03:13:25
+@@ -985,6 +985,7 @@
+   "java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAuthActivity.java",
+   "java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAuthFlow.java",
+   "java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveConfig.java",
++  "java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveRedirect.java",
+   "java/src/org/chromium/chrome/browser/paint_preview/StartupPaintPreviewHelper.java",
+   "java/src/org/chromium/chrome/browser/paint_preview/StartupPaintPreviewHelperSupplier.java",
+   "java/src/org/chromium/chrome/browser/password_manager/AccountChooserDialog.java",
+diff --color=never -ruN a/chrome/android/java/src/org/chromium/chrome/browser/externalnav/ExternalNavigationDelegateImpl.java b/chrome/android/java/src/org/chromium/chrome/browser/externalnav/ExternalNavigationDelegateImpl.java
+--- a/chrome/android/java/src/org/chromium/chrome/browser/externalnav/ExternalNavigationDelegateImpl.java	2026-10-26 03:13:04
++++ b/chrome/android/java/src/org/chromium/chrome/browser/externalnav/ExternalNavigationDelegateImpl.java	2026-10-26 03:13:25
+@@ -23,6 +23,7 @@
+ import org.chromium.base.IntentUtils;
+ import org.chromium.base.PackageManagerUtils;
+ import org.chromium.base.ResettersForTesting;
++import org.chromium.base.ThreadUtils;
+ import org.chromium.build.annotations.NullMarked;
+ import org.chromium.build.annotations.Nullable;
+ import org.chromium.chrome.browser.ChromeTabbedActivity2;
+@@ -41,6 +42,8 @@
+ import org.chromium.chrome.browser.tabmodel.TabClosureParams;
+ import org.chromium.chrome.browser.tabmodel.TabModelSelector;
+ import org.chromium.chrome.browser.tabmodel.TabModelSelectorSupplier;
++import org.chromium.chrome.browser.tark.zynclave.ZynclaveAccount;
++import org.chromium.chrome.browser.tark.zynclave.ZynclaveRedirect;
+ import org.chromium.components.embedder_support.util.UrlConstants;
+ import org.chromium.components.embedder_support.util.UrlUtilities;
+ import org.chromium.components.external_intents.ExternalNavigationDelegate;
+@@ -343,6 +346,27 @@
+     @Override
+     public boolean allowExternalNavigationForHttpProtocols(GURL url) {
+         return !OpenInAppUtils.isOpenInAppAvailable() || !UrlUtilities.isHttpOrHttps(url);
++    }
++
++    @Override
++    public @Nullable Intent tarkZynclaveRedirectIntent(GURL url) {
++        if (!hasValidTab()) return null;
++        Activity activity = ContextUtils.activityFromContext(getContext());
++        if (activity == null) return null;
++        return ZynclaveRedirect.intentFor(
++                activity,
++                url.getSpec(),
++                mTab.isCustomTab(),
++                mTab.isIncognito(),
++                activity.getIntent(),
++                () -> ZynclaveAccount.get().pendingAuthToken());
++    }
++
++    @Override
++    public void tarkZynclaveRedirectStarted() {
++        // The sign-in Custom Tab has done its job; AppAuth finishes the sign-in.
++        Activity activity = ContextUtils.activityFromContext(getContext());
++        if (activity != null) ThreadUtils.postOnUiThread(activity::finish);
+     }
+ 
+     /**
+diff --color=never -ruN a/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveRedirect.java b/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveRedirect.java
+--- a/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveRedirect.java	1970-01-01 05:30:00
++++ b/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveRedirect.java	2026-10-26 03:13:47
+@@ -0,0 +1,67 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++package org.chromium.chrome.browser.tark.zynclave;
++
++import android.content.Context;
++import android.content.Intent;
++import android.net.Uri;
++
++import net.openid.appauth.RedirectUriReceiverActivity;
++
++import org.chromium.base.IntentUtils;
++import org.chromium.build.annotations.NullMarked;
++import org.chromium.build.annotations.Nullable;
++
++import java.nio.charset.StandardCharsets;
++import java.security.MessageDigest;
++import java.util.function.Supplier;
++
++/**
++ * Tark: whether a navigation is the Zynclave sign-in redirect that AppAuth must get (spec §5.3).
++ * ExternalNavigationDelegateImpl asks it for every external-protocol main-frame navigation.
++ */
++@NullMarked
++public final class ZynclaveRedirect {
++    static final String REDIRECT_PATH = "/oauth2redirect";
++
++    private ZynclaveRedirect() {}
++
++    /**
++     * The explicit intent to AppAuth's RedirectUriReceiverActivity, with {@code spec} as its
++     * data, when all hold: the scheme is Tark's package name and the path is /oauth2redirect;
++     * the tab is a Custom Tab, not incognito; its intent carries {@link
++     * ZynclaveAccount#EXTRA_AUTH_TOKEN} equal to the pending sign-in's token. Null otherwise, and
++     * the navigation is handled as upstream would (a self-navigation stays in the tab).
++     *
++     * @param context The Custom Tab's activity; also gives the package name.
++     * @param tabIntent The intent that opened the tab's activity.
++     * @param pendingAuthToken Read only when everything else holds.
++     */
++    public static @Nullable Intent intentFor(
++            Context context,
++            String spec,
++            boolean isCustomTab,
++            boolean isIncognito,
++            @Nullable Intent tabIntent,
++            Supplier<@Nullable String> pendingAuthToken) {
++        Uri uri = Uri.parse(spec);
++        if (!context.getPackageName().equals(uri.getScheme())) return null;
++        if (!REDIRECT_PATH.equals(uri.getPath())) return null;
++        if (!isCustomTab || isIncognito || tabIntent == null) return null;
++        String tabToken =
++                IntentUtils.safeGetStringExtra(tabIntent, ZynclaveAccount.EXTRA_AUTH_TOKEN);
++        if (tabToken == null) return null;
++        String pending = pendingAuthToken.get();
++        if (pending == null) return null;
++        if (!MessageDigest.isEqual(
++                tabToken.getBytes(StandardCharsets.UTF_8),
++                pending.getBytes(StandardCharsets.UTF_8))) {
++            return null;
++        }
++        Intent intent = new Intent(Intent.ACTION_VIEW, uri);
++        intent.setClass(context, RedirectUriReceiverActivity.class);
++        return intent;
++    }
++}
+diff --color=never -ruN a/chrome/android/junit/BUILD.gn b/chrome/android/junit/BUILD.gn
+--- a/chrome/android/junit/BUILD.gn	2026-10-26 03:13:04
++++ b/chrome/android/junit/BUILD.gn	2026-10-26 03:13:25
+@@ -1402,6 +1402,7 @@
+       "src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAuthFlowTest.java",
+       "src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAccountTest.java",
+       "src/org/chromium/chrome/browser/tark/zynclave/ZynclaveNoTokenLogsTest.java",
++      "src/org/chromium/chrome/browser/tark/zynclave/ZynclaveRedirectTest.java",
+     ]
+ 
+     deps = [
+diff --color=never -ruN a/chrome/android/junit/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveRedirectTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveRedirectTest.java
+--- a/chrome/android/junit/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveRedirectTest.java	1970-01-01 05:30:00
++++ b/chrome/android/junit/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveRedirectTest.java	2026-10-26 03:14:59
+@@ -0,0 +1,209 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++package org.chromium.chrome.browser.tark.zynclave;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertNotNull;
++import static org.junit.Assert.assertNull;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.when;
++
++import android.app.Activity;
++import android.content.Intent;
++import android.net.Uri;
++
++import net.openid.appauth.RedirectUriReceiverActivity;
++
++import org.junit.Before;
++import org.junit.Test;
++import org.junit.runner.RunWith;
++import org.robolectric.Robolectric;
++import org.robolectric.Shadows;
++import org.robolectric.annotation.Config;
++
++import org.chromium.base.test.BaseRobolectricTestRunner;
++import org.chromium.base.test.util.Features.DisableFeatures;
++import org.chromium.build.annotations.Nullable;
++import org.chromium.components.external_intents.ExternalIntentsFeatures;
++import org.chromium.components.external_intents.ExternalNavigationDelegate;
++import org.chromium.components.external_intents.ExternalNavigationHandler;
++import org.chromium.components.external_intents.ExternalNavigationHandler.OverrideUrlLoadingResult;
++import org.chromium.components.external_intents.ExternalNavigationHandler.OverrideUrlLoadingResultType;
++import org.chromium.components.external_intents.ExternalNavigationParams;
++import org.chromium.components.external_intents.RedirectHandler;
++import org.chromium.ui.base.WindowAndroid;
++import org.chromium.ui.modaldialog.ModalDialogManager;
++import org.chromium.url.GURL;
++
++/**
++ * Tests for the Zynclave sign-in redirect (spec §5.3, zynclave-redirect.patch): {@link
++ * ZynclaveRedirect}'s decision, and {@link ExternalNavigationHandler} handing a marked redirect to
++ * AppAuth ahead of its own rules.
++ */
++@RunWith(BaseRobolectricTestRunner.class)
++@Config(manifest = Config.NONE)
++@DisableFeatures(ExternalIntentsFeatures.EXTERNAL_NAVIGATION_DEBUG_LOGS_NAME)
++public class ZynclaveRedirectTest {
++    private static final String TOKEN = "pending-token";
++    private Activity mActivity;
++    private String mRedirect;
++
++    @Before
++    public void setUp() {
++        mActivity = Robolectric.buildActivity(Activity.class).get();
++        mRedirect = mActivity.getPackageName() + ":/oauth2redirect?code=x&state=y";
++    }
++
++    private Intent customTabIntent(@Nullable String token) {
++        Intent intent = new Intent(Intent.ACTION_VIEW, Uri.parse("https://auth.zynclave.com/"));
++        if (token != null) intent.putExtra(ZynclaveAccount.EXTRA_AUTH_TOKEN, token);
++        return intent;
++    }
++
++    private @Nullable Intent decide(
++            String spec,
++            boolean isCustomTab,
++            boolean isIncognito,
++            @Nullable Intent tabIntent,
++            @Nullable String pending) {
++        return ZynclaveRedirect.intentFor(
++                mActivity, spec, isCustomTab, isIncognito, tabIntent, () -> pending);
++    }
++
++    /** The handler for a tab whose delegate answers with {@link ZynclaveRedirect}. */
++    private ExternalNavigationHandler handler(
++            ExternalNavigationDelegate delegate, boolean isCustomTab, @Nullable String tabToken) {
++        WindowAndroid window = mock(WindowAndroid.class);
++        when(window.getModalDialogManager()).thenReturn(mock(ModalDialogManager.class));
++        when(delegate.getWindowAndroid()).thenReturn(window);
++        when(delegate.getContext()).thenReturn(mActivity);
++        when(delegate.tarkZynclaveRedirectIntent(any()))
++                .thenAnswer(
++                        call ->
++                                decide(
++                                        call.<GURL>getArgument(0).getSpec(),
++                                        isCustomTab,
++                                        /* isIncognito= */ false,
++                                        customTabIntent(tabToken),
++                                        TOKEN));
++        return new ExternalNavigationHandler(delegate);
++    }
++
++    /** A main-frame navigation to {@code spec}, a custom scheme. */
++    private static ExternalNavigationParams navigation(
++            String spec, boolean isRedirect, boolean hasUserGesture) {
++        GURL url = mock(GURL.class);
++        when(url.getSpec()).thenReturn(spec);
++        when(url.getScheme()).thenReturn(Uri.parse(spec).getScheme());
++        when(url.isValid()).thenReturn(true);
++        when(url.isEmpty()).thenReturn(false);
++        RedirectHandler redirectHandler = mock(RedirectHandler.class);
++        ExternalNavigationParams params = mock(ExternalNavigationParams.class);
++        when(params.getUrl()).thenReturn(url);
++        when(params.isMainFrame()).thenReturn(true);
++        when(params.isRedirect()).thenReturn(isRedirect);
++        when(params.hasUserGesture()).thenReturn(hasUserGesture);
++        when(params.isRendererInitiated()).thenReturn(true);
++        when(params.getRedirectHandler()).thenReturn(redirectHandler);
++        return params;
++    }
++
++    private void assertStartedAppAuth(String spec) {
++        Intent started = Shadows.shadowOf(mActivity).getNextStartedActivity();
++        assertNotNull(started);
++        assertEquals(
++                RedirectUriReceiverActivity.class.getName(), started.getComponent().getClassName());
++        assertEquals(mActivity.getPackageName(), started.getComponent().getPackageName());
++        assertEquals(Uri.parse(spec), started.getData());
++    }
++
++    @Test
++    public void testMarkedCustomTabRedirectGoesToAppAuth() {
++        Intent intent = decide(mRedirect, true, false, customTabIntent(TOKEN), TOKEN);
++        assertNotNull(intent);
++        assertEquals(
++                "net.openid.appauth.RedirectUriReceiverActivity",
++                intent.getComponent().getClassName());
++        assertEquals(Intent.ACTION_VIEW, intent.getAction());
++        assertEquals(Uri.parse(mRedirect), intent.getData());
++
++        ExternalNavigationDelegate delegate = mock(ExternalNavigationDelegate.class);
++        OverrideUrlLoadingResult result =
++                handler(delegate, true, TOKEN)
++                        .shouldOverrideUrlLoading(
++                                navigation(mRedirect, /* isRedirect= */ false, true));
++        assertEquals(
++                OverrideUrlLoadingResultType.OVERRIDE_WITH_EXTERNAL_INTENT,
++                result.getResultType());
++        assertStartedAppAuth(mRedirect);
++        verify(delegate).tarkZynclaveRedirectStarted();
++    }
++
++    @Test
++    public void testServerRedirectWithoutGestureReachesAppAuth() {
++        // Hydra's 302 at the end of the login chain: a redirect, no gesture.
++        ExternalNavigationDelegate delegate = mock(ExternalNavigationDelegate.class);
++        OverrideUrlLoadingResult result =
++                handler(delegate, true, TOKEN)
++                        .shouldOverrideUrlLoading(
++                                navigation(mRedirect, /* isRedirect= */ true, false));
++        assertEquals(
++                OverrideUrlLoadingResultType.OVERRIDE_WITH_EXTERNAL_INTENT,
++                result.getResultType());
++        assertStartedAppAuth(mRedirect);
++        verify(delegate).tarkZynclaveRedirectStarted();
++    }
++
++    @Test
++    public void testNormalTabStaysInTab() {
++        assertNull(
++                decide(mRedirect, /* isCustomTab= */ false, false, customTabIntent(TOKEN), TOKEN));
++    }
++
++    @Test
++    public void testIncognitoStaysInTab() {
++        assertNull(decide(mRedirect, true, /* isIncognito= */ true, customTabIntent(TOKEN), TOKEN));
++    }
++
++    @Test
++    public void testUnmarkedCustomTabStaysInTab() {
++        assertNull(decide(mRedirect, true, false, customTabIntent(null), TOKEN));
++        assertNull(decide(mRedirect, true, false, null, TOKEN));
++    }
++
++    @Test
++    public void testNoPendingRequestStaysInTab() {
++        assertNull(decide(mRedirect, true, false, customTabIntent(TOKEN), null));
++    }
++
++    @Test
++    public void testWrongTokenStaysInTab() {
++        assertNull(decide(mRedirect, true, false, customTabIntent("other-token"), TOKEN));
++        assertNull(decide(mRedirect, true, false, customTabIntent(""), TOKEN));
++    }
++
++    @Test
++    public void testOtherPathStaysInTab() {
++        String pkg = mActivity.getPackageName();
++        assertNull(decide(pkg + ":/other", true, false, customTabIntent(TOKEN), TOKEN));
++        assertNull(decide(pkg + ":/oauth2redirect/x", true, false, customTabIntent(TOKEN), TOKEN));
++        assertNull(
++                decide(
++                        "com.example.app:/oauth2redirect?code=x",
++                        true,
++                        false,
++                        customTabIntent(TOKEN),
++                        TOKEN));
++        assertNull(
++                decide(
++                        "https://auth.zynclave.com/oauth2redirect",
++                        true,
++                        false,
++                        customTabIntent(TOKEN),
++                        TOKEN));
++    }
++}
+diff --color=never -ruN a/components/external_intents/android/java/src/org/chromium/components/external_intents/ExternalNavigationDelegate.java b/components/external_intents/android/java/src/org/chromium/components/external_intents/ExternalNavigationDelegate.java
+--- a/components/external_intents/android/java/src/org/chromium/components/external_intents/ExternalNavigationDelegate.java	2026-10-26 03:13:04
++++ b/components/external_intents/android/java/src/org/chromium/components/external_intents/ExternalNavigationDelegate.java	2026-10-26 03:13:25
+@@ -225,4 +225,16 @@
+ 
+     /** Reparents the tab associated with this delegate to a new instance of the same PWA. */
+     default void reparentTabToSamePwa() {}
++
++    /**
++     * Tark: the explicit intent to AppAuth's RedirectUriReceiverActivity when {@code url} is the
++     * Zynclave sign-in redirect in the Custom Tab Tark opened for the pending sign-in; null
++     * otherwise, and the navigation goes on as usual.
++     */
++    default @Nullable Intent tarkZynclaveRedirectIntent(GURL url) {
++        return null;
++    }
++
++    /** Tark: the intent from {@link #tarkZynclaveRedirectIntent} was started. */
++    default void tarkZynclaveRedirectStarted() {}
+ }
+diff --color=never -ruN a/components/external_intents/android/java/src/org/chromium/components/external_intents/ExternalNavigationHandler.java b/components/external_intents/android/java/src/org/chromium/components/external_intents/ExternalNavigationHandler.java
+--- a/components/external_intents/android/java/src/org/chromium/components/external_intents/ExternalNavigationHandler.java	2026-10-26 03:13:04
++++ b/components/external_intents/android/java/src/org/chromium/components/external_intents/ExternalNavigationHandler.java	2026-10-26 03:13:25
+@@ -735,6 +735,9 @@
+      */
+     public OverrideUrlLoadingResult shouldOverrideUrlLoading(ExternalNavigationParams params) {
+         if (debug()) Log.i(TAG, "shouldOverrideUrlLoading called on " + params.getUrl().getSpec());
++        // Tark: the Zynclave sign-in redirect goes to AppAuth before any other rule (spec §5.3).
++        OverrideUrlLoadingResult tarkZynclaveResult = handleTarkZynclaveRedirect(params);
++        if (tarkZynclaveResult != null) return tarkZynclaveResult;
+         Intent targetIntent;
+         boolean isIntentUrl = UrlUtilities.hasIntentScheme(params.getUrl());
+         // Perform generic parsing of the URI to turn it into an Intent.
+@@ -781,6 +784,30 @@
+         if (result.getResultType() == OverrideUrlLoadingResultType.OVERRIDE_WITH_ASYNC_ACTION) {
+             params.onAsyncActionStarted();
+         }
++        return result;
++    }
++
++    /**
++     * Tark: hands the Zynclave sign-in redirect ({@code <package>:/oauth2redirect?code=...}) to
++     * AppAuth, only from the Custom Tab Tark opened for the pending sign-in (the delegate checks
++     * the tab). It runs ahead of every upstream rule because two of them would keep the redirect
++     * in the tab: isNavigationToSelf() turns any custom-scheme URL that resolves to Tark into
++     * forNavigateTab, and navigationChainBlocksExternalNavigation() asks for a prompt when the
++     * chain has no gesture, has expired, or has already launched an app. The redirect is a
++     * server 302 at the end of the login chain, so neither may apply to it. Returns null for
++     * every other navigation.
++     */
++    private @Nullable OverrideUrlLoadingResult handleTarkZynclaveRedirect(
++            ExternalNavigationParams params) {
++        if (!params.isMainFrame()) return null;
++        if (UrlUtilities.isAcceptedScheme(params.getUrl())) return null;
++        Intent intent = mDelegate.tarkZynclaveRedirectIntent(params.getUrl());
++        if (intent == null) return null;
++        OverrideUrlLoadingResult result = startActivity(intent, params);
++        if (result.getResultType() == OverrideUrlLoadingResultType.OVERRIDE_WITH_EXTERNAL_INTENT) {
++            mDelegate.tarkZynclaveRedirectStarted();
++        }
++        // If AppAuth could not be started the redirect still never loads as a page.
+         return result;
+     }
+ 
