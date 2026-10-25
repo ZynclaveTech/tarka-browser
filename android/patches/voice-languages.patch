@@ -1,6 +1,6 @@
 diff '--color=never' -ruN a/chrome/android/chrome_java_resources.gni b/chrome/android/chrome_java_resources.gni
---- a/chrome/android/chrome_java_resources.gni	2026-10-25 05:40:40.085297212 +0530
-+++ b/chrome/android/chrome_java_resources.gni	2026-10-25 05:40:40.034033688 +0530
+--- a/chrome/android/chrome_java_resources.gni	2026-10-25 06:32:07.813001423 +0530
++++ b/chrome/android/chrome_java_resources.gni	2026-10-25 06:32:07.787588780 +0530
 @@ -688,4 +688,5 @@
    "java/res/xml/tracing_preferences.xml",
    "java/res/xml/unified_account_settings_preferences.xml",
@@ -8,8 +8,8 @@ diff '--color=never' -ruN a/chrome/android/chrome_java_resources.gni b/chrome/an
 +  "java/res/xml/voice_languages_preferences.xml",
  ]
 diff '--color=never' -ruN a/chrome/android/chrome_java_sources.gni b/chrome/android/chrome_java_sources.gni
---- a/chrome/android/chrome_java_sources.gni	2026-10-25 05:40:40.152360479 +0530
-+++ b/chrome/android/chrome_java_sources.gni	2026-10-25 05:40:40.098899093 +0530
+--- a/chrome/android/chrome_java_sources.gni	2026-10-25 06:32:07.843130109 +0530
++++ b/chrome/android/chrome_java_sources.gni	2026-10-25 06:32:07.818972643 +0530
 @@ -1149,6 +1149,11 @@
    "java/src/org/chromium/chrome/browser/site_settings/ChromeSiteSettingsDelegate.java",
    "java/src/org/chromium/chrome/browser/site_settings/ManageSpaceActivity.java",
@@ -24,7 +24,7 @@ diff '--color=never' -ruN a/chrome/android/chrome_java_sources.gni b/chrome/andr
    "java/src/org/chromium/chrome/browser/status_indicator/StatusIndicatorProperties.java",
 diff '--color=never' -ruN a/chrome/android/java/res/xml/voice_languages_preferences.xml b/chrome/android/java/res/xml/voice_languages_preferences.xml
 --- a/chrome/android/java/res/xml/voice_languages_preferences.xml	1970-01-01 05:30:00.000000000 +0530
-+++ b/chrome/android/java/res/xml/voice_languages_preferences.xml	2026-10-25 05:40:40.164140629 +0530
++++ b/chrome/android/java/res/xml/voice_languages_preferences.xml	2026-10-25 06:32:07.848223071 +0530
 @@ -0,0 +1,41 @@
 +<?xml version="1.0" encoding="utf-8"?>
 +<!-- Copyright 2026 The Tark Authors
@@ -68,8 +68,8 @@ diff '--color=never' -ruN a/chrome/android/java/res/xml/voice_languages_preferen
 +        app:isPreferenceVisible="false" />
 +</PreferenceScreen>
 diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/speech/SpeechLanguageSnackbar.java b/chrome/android/java/src/org/chromium/chrome/browser/speech/SpeechLanguageSnackbar.java
---- a/chrome/android/java/src/org/chromium/chrome/browser/speech/SpeechLanguageSnackbar.java	2026-10-25 05:40:40.254079894 +0530
-+++ b/chrome/android/java/src/org/chromium/chrome/browser/speech/SpeechLanguageSnackbar.java	2026-10-25 05:40:40.193576335 +0530
+--- a/chrome/android/java/src/org/chromium/chrome/browser/speech/SpeechLanguageSnackbar.java	2026-10-25 06:32:07.888318429 +0530
++++ b/chrome/android/java/src/org/chromium/chrome/browser/speech/SpeechLanguageSnackbar.java	2026-10-25 06:32:07.863945045 +0530
 @@ -5,15 +5,10 @@
  package org.chromium.chrome.browser.speech;
  
@@ -86,16 +86,7 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
  import android.text.TextUtils;
  
  import androidx.annotation.RequiresApi;
-@@ -81,6 +76,8 @@
-                 sPlatformForTesting != null ? sPlatformForTesting : new AndroidPlatform();
-         sInstance = new SpeechLanguageSnackbar(context.getApplicationContext(), platform);
-         SpeechRecognition.setLanguageDelegate(sInstance);
-+        // Whether the phone still has the sites' languages (only if any site has one).
-+        VoiceSiteLanguages.refreshInstalled(sInstance.mContext);
-     }
- 
-     @VisibleForTesting
-@@ -125,6 +122,23 @@
+@@ -125,6 +120,23 @@
                                          : null));
      }
  
@@ -111,15 +102,15 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
 +
 +    @Override
 +    public void onSessionEnded(String origin, String bcp47) {
-+        // Checked after the session rather than at its start, so the check never competes
-+        // with the session's own recognizer.
++        // Checked lazily, only for a site with a remembered language, and after its session
++        // (the recognizer is already destroyed), so the check never runs beside a session.
 +        if (VoiceSiteLanguages.get(origin) != null) VoiceSiteLanguages.refreshInstalled(mContext);
 +    }
 +
      static final int MAX_TAG_LENGTH = 35;
  
      /**
-@@ -204,10 +218,8 @@
+@@ -204,10 +216,8 @@
          return false;
      }
  
@@ -131,7 +122,7 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
          @Override
          public @Nullable SnackbarManager getSnackbarManager() {
              Activity activity = ApplicationStatus.getLastTrackedFocusedActivity();
-@@ -219,78 +231,43 @@
+@@ -219,78 +229,43 @@
  
          @Override
          public void isLanguageKnown(Context context, String bcp47, Callback<Boolean> callback) {
@@ -237,7 +228,7 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
  }
 diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguageSignals.java b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguageSignals.java
 --- a/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguageSignals.java	1970-01-01 05:30:00.000000000 +0530
-+++ b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguageSignals.java	2026-10-25 05:40:40.263777225 +0530
++++ b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguageSignals.java	2026-10-25 06:32:07.893532933 +0530
 @@ -0,0 +1,106 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
@@ -347,8 +338,8 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
 +}
 diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguages.java b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguages.java
 --- a/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguages.java	1970-01-01 05:30:00.000000000 +0530
-+++ b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguages.java	2026-10-25 05:40:40.290760776 +0530
-@@ -0,0 +1,269 @@
++++ b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguages.java	2026-10-25 06:32:07.908589859 +0530
+@@ -0,0 +1,282 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -578,6 +569,19 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
 +    }
 +
 +    /**
++     * The name of {@code tag} as the lists name it, by the same rule as {@link #build}: the
++     * language alone unless {@code known} has another tag of that language.
++     */
++    static String displayName(String tag, List<String> known, Locale uiLocale) {
++        List<String> tags = new ArrayList<>();
++        for (String other : known) {
++            if (SpeechLanguageSnackbar.isWellFormedTag(other)) tags.add(other);
++        }
++        tags.add(tag);
++        return new Names(tags).displayName(tag, uiLocale);
++    }
++
++    /**
 +     * Names a tag as plainly as Android's list allows: the language alone ("Hindi") when it has
 +     * one tag in the whole list, the language and country ("English (India)") otherwise, and the
 +     * script too only when two tags share language and country.
@@ -620,8 +624,8 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
 +}
 diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguagesSettings.java b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguagesSettings.java
 --- a/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguagesSettings.java	1970-01-01 05:30:00.000000000 +0530
-+++ b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguagesSettings.java	2026-10-25 05:40:40.322842390 +0530
-@@ -0,0 +1,627 @@
++++ b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceLanguagesSettings.java	2026-10-25 06:32:07.924265791 +0530
+@@ -0,0 +1,647 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -904,6 +908,7 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
 +        downloading |= fill(ON_PHONE_KEY, sections.onPhone(), defaultTag);
 +        downloading |= fill(SUGGESTED_KEY, sections.suggested(), null);
 +        downloading |= fill(MORE_KEY, sections.more(), null);
++        fillSites();
 +        schedulePoll(downloading);
 +    }
 +
@@ -1009,12 +1014,23 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
 +        Map<String, String> sites = VoiceSiteLanguages.all();
 +        category.setVisible(!sites.isEmpty());
 +        Locale ui = getResources().getConfiguration().getLocales().get(0);
++        // Named as the lists name them (Task 2's rule), against Android's list once it answered.
++        List<String> known = new ArrayList<>(sites.values());
++        if (mSupport != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
++            readSupport(mSupport, known, known, known);
++        }
 +        for (Map.Entry<String, String> site : sites.entrySet()) {
 +            String origin = site.getKey();
-+            SiteRow row = new SiteRow(getContext(), origin, () -> removeSite(origin));
++            String host = VoiceSiteLanguages.hostOf(origin);
++            SiteRow row =
++                    new SiteRow(
++                            getContext(),
++                            origin,
++                            getString(R.string.tark_voice_site_remove_description, host),
++                            () -> removeSite(origin));
 +            row.setKey(SITE_KEY_PREFIX + origin);
-+            row.setTitle(VoiceSiteLanguages.hostOf(origin));
-+            row.setSummary(Locale.forLanguageTag(site.getValue()).getDisplayName(ui));
++            row.setTitle(host);
++            row.setSummary(VoiceLanguages.displayName(site.getValue(), known, ui));
 +            category.addPreference(row);
 +        }
 +    }
@@ -1029,11 +1045,13 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
 +    @VisibleForTesting
 +    static final class SiteRow extends Preference {
 +        private final String mOrigin;
++        private final String mRemoveDescription;
 +        private final Runnable mRemove;
 +
-+        SiteRow(Context context, String origin, Runnable remove) {
++        SiteRow(Context context, String origin, String removeDescription, Runnable remove) {
 +            super(context);
 +            mOrigin = origin;
++            mRemoveDescription = removeDescription;
 +            mRemove = remove;
 +            setPersistent(false);
 +            setSelectable(false);
@@ -1041,6 +1059,11 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
 +
 +        String getOrigin() {
 +            return mOrigin;
++        }
++
++        /** What a screen reader says for Remove ("Remove shodhya.com"). */
++        String getRemoveDescription() {
++            return mRemoveDescription;
 +        }
 +
 +        /** Remove. */
@@ -1057,6 +1080,7 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
 +            ButtonCompat button =
 +                    new ButtonCompat(getContext(), R.style.TextButtonThemeOverlay);
 +            button.setText(R.string.tark_voice_site_remove);
++            button.setContentDescription(mRemoveDescription);
 +            button.setOnClickListener(v -> tapRemove());
 +            widgetFrame.setVisibility(View.VISIBLE);
 +            if (widgetFrame instanceof android.widget.LinearLayout linear) {
@@ -1251,7 +1275,7 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
 +}
 diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/speech/VoicePlatform.java b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoicePlatform.java
 --- a/chrome/android/java/src/org/chromium/chrome/browser/speech/VoicePlatform.java	1970-01-01 05:30:00.000000000 +0530
-+++ b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoicePlatform.java	2026-10-25 05:40:40.362275599 +0530
++++ b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoicePlatform.java	2026-10-25 06:32:07.940149724 +0530
 @@ -0,0 +1,310 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
@@ -1565,8 +1589,8 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
 +}
 diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceSiteLanguages.java b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceSiteLanguages.java
 --- a/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceSiteLanguages.java	1970-01-01 05:30:00.000000000 +0530
-+++ b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceSiteLanguages.java	2026-10-25 05:40:40.836484693 +0530
-@@ -0,0 +1,172 @@
++++ b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceSiteLanguages.java	2026-10-25 06:32:08.170293943 +0530
+@@ -0,0 +1,222 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -1578,11 +1602,15 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
 +import android.os.Build;
 +import android.speech.RecognitionSupport;
 +
++import androidx.annotation.MainThread;
 +import androidx.annotation.VisibleForTesting;
 +
 +import org.chromium.base.ContextUtils;
 +import org.chromium.base.ResettersForTesting;
 +import org.chromium.base.StrictModeContext;
++import org.chromium.base.ThreadUtils;
++import org.chromium.base.task.PostTask;
++import org.chromium.base.task.TaskTraits;
 +import org.chromium.build.annotations.NullMarked;
 +import org.chromium.build.annotations.Nullable;
 +
@@ -1601,9 +1629,13 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
 + * BCP 47 tag); the key is the origin alone (scheme://host:port), never a path or query.
 + *
 + * <p>Whether the phone still has a remembered language comes from Android's last answer, read
-+ * when the app starts (if any site is remembered), after each session on a remembered site, and
++ * after a session on a remembered site ends (never at startup, never during a session) and
 + * whenever Voice languages lists the phone's languages. Until Android has answered, the
-+ * remembered language is tried and the recognizer's own error tells if it is gone.
++ * remembered language is tried; if the recognizer says it is gone, the session goes on in the
++ * page's language and the person hears so.
++ *
++ * <p>A cross-origin iframe is keyed by its own origin. Private tabs never reach here: the browser
++ * gives their sessions no origin.
 + */
 +@NullMarked
 +public final class VoiceSiteLanguages {
@@ -1611,7 +1643,12 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
 +
 +    // The phone's installed recognizer languages as Android last said, or null if unknown.
 +    private static @Nullable List<String> sInstalled;
-+    private static boolean sChecking;
++    // The check in flight, if any (0: none). A check Android never answers is given up after
++    // CHECK_TIMEOUT_MS.
++    private static int sChecking;
++    private static int sLastCheck;
++
++    @VisibleForTesting static final long CHECK_TIMEOUT_MS = 10_000;
 +
 +    private VoiceSiteLanguages() {}
 +
@@ -1641,11 +1678,26 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
 +        return scheme + "://" + host + (defaultPort ? "" : ":" + port);
 +    }
 +
-+    /** The host shown for an origin in Voice languages' Sites. */
++    /**
++     * The site as Voice languages' Sites shows it: the host, with the port when it isn't the
++     * scheme's default and the scheme when it isn't https ("shodhya.com", "http://localhost:8080").
++     */
 +    static String hostOf(String origin) {
 +        try {
-+            String host = new URI(origin).getHost();
-+            if (host != null && !host.isEmpty()) return host;
++            URI uri = new URI(origin);
++            String host = uri.getHost();
++            String scheme = uri.getScheme();
++            if (host != null && !host.isEmpty() && scheme != null) {
++                scheme = scheme.toLowerCase(Locale.ROOT);
++                int port = uri.getPort();
++                boolean defaultPort =
++                        port == -1
++                                || (scheme.equals("https") && port == 443)
++                                || (scheme.equals("http") && port == 80);
++                return (scheme.equals("https") ? "" : scheme + "://")
++                        + host
++                        + (defaultPort ? "" : ":" + port);
++            }
 +        } catch (URISyntaxException e) {
 +            // Shown as stored.
 +        }
@@ -1700,28 +1752,50 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
 +     * Whether Android said the phone lacks {@code tag}. False while it hasn't said (or can't, below
 +     * Android 13).
 +     */
++    @MainThread
 +    static boolean isMissing(String tag) {
++        ThreadUtils.assertOnUiThread();
 +        List<String> installed = sInstalled;
 +        return installed != null && !SpeechLanguageSnackbar.listsLanguage(installed, tag);
 +    }
 +
-+    /** Asks Android which languages the phone has, if any site is remembered. */
++    /**
++     * Asks Android which languages the phone has, if any site is remembered. Called after a
++     * session ends, so it never runs beside a session's recognizer.
++     */
++    @MainThread
 +    static void refreshInstalled(Context context) {
-+        if (sChecking || Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return;
++        ThreadUtils.assertOnUiThread();
++        if (sChecking != 0 || Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return;
 +        if (all().isEmpty()) return;
-+        sChecking = true;
-+        VoicePlatform.get()
-+                .support(
-+                        context,
-+                        null,
-+                        support -> {
-+                            sChecking = false;
-+                            onSupport(support);
-+                        });
++        int check = ++sLastCheck;
++        sChecking = check;
++        PostTask.postDelayedTask(
++                TaskTraits.UI_DEFAULT,
++                () -> {
++                    if (sChecking == check) sChecking = 0;
++                },
++                CHECK_TIMEOUT_MS);
++        try {
++            VoicePlatform.get()
++                    .support(
++                            context,
++                            null,
++                            support -> {
++                                // A late answer after the timeout is still Android's latest.
++                                if (sChecking == check) sChecking = 0;
++                                onSupport(support);
++                            });
++        } catch (RuntimeException e) {
++            // No recognizer to ask (a binding Android refused): ask again next time.
++            if (sChecking == check) sChecking = 0;
++        }
 +    }
 +
 +    /** Android's latest answer, from here or from Voice languages. */
++    @MainThread
 +    static void onSupport(@Nullable RecognitionSupport support) {
++        ThreadUtils.assertOnUiThread();
 +        if (support == null || Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
 +            sInstalled = null;
 +            return;
@@ -1735,13 +1809,13 @@ diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/
 +        ResettersForTesting.register(
 +                () -> {
 +                    sInstalled = null;
-+                    sChecking = false;
++                    sChecking = 0;
 +                });
 +    }
 +}
 diff '--color=never' -ruN a/chrome/android/junit/BUILD.gn b/chrome/android/junit/BUILD.gn
---- a/chrome/android/junit/BUILD.gn	2026-10-25 05:40:40.450773387 +0530
-+++ b/chrome/android/junit/BUILD.gn	2026-10-25 05:40:40.403906835 +0530
+--- a/chrome/android/junit/BUILD.gn	2026-10-25 06:32:07.995302466 +0530
++++ b/chrome/android/junit/BUILD.gn	2026-10-25 06:32:07.970915999 +0530
 @@ -1232,11 +1232,18 @@
      ]
    }
@@ -1765,7 +1839,7 @@ diff '--color=never' -ruN a/chrome/android/junit/BUILD.gn b/chrome/android/junit
        ":chrome_junit_tests_helper",
 diff '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome/browser/speech/AndroidVoicePlatformTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/speech/AndroidVoicePlatformTest.java
 --- a/chrome/android/junit/src/org/chromium/chrome/browser/speech/AndroidVoicePlatformTest.java	1970-01-01 05:30:00.000000000 +0530
-+++ b/chrome/android/junit/src/org/chromium/chrome/browser/speech/AndroidVoicePlatformTest.java	2026-10-25 05:40:40.466239250 +0530
++++ b/chrome/android/junit/src/org/chromium/chrome/browser/speech/AndroidVoicePlatformTest.java	2026-10-25 06:32:08.001418104 +0530
 @@ -0,0 +1,234 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
@@ -2003,7 +2077,7 @@ diff '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome/browser
 +}
 diff '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguageSignalsTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguageSignalsTest.java
 --- a/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguageSignalsTest.java	1970-01-01 05:30:00.000000000 +0530
-+++ b/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguageSignalsTest.java	2026-10-25 05:40:40.501215110 +0530
++++ b/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguageSignalsTest.java	2026-10-25 06:32:08.017276162 +0530
 @@ -0,0 +1,79 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
@@ -2086,8 +2160,8 @@ diff '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome/browser
 +}
 diff '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguagesSettingsTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguagesSettingsTest.java
 --- a/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguagesSettingsTest.java	1970-01-01 05:30:00.000000000 +0530
-+++ b/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguagesSettingsTest.java	2026-10-25 05:40:40.535975551 +0530
-@@ -0,0 +1,547 @@
++++ b/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguagesSettingsTest.java	2026-10-25 06:32:08.032179128 +0530
+@@ -0,0 +1,550 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -2592,7 +2666,9 @@ diff '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome/browser
 +        SiteRow shodhya = mSettings.findPreference("voice_site_https://shodhya.com");
 +        assertNotNull(shodhya);
 +        assertEquals("shodhya.com", String.valueOf(shodhya.getTitle()));
-+        assertEquals("Hindi (India)", summary(shodhya));
++        // Task 2's naming rule: Android lists one Hindi, so just "Hindi".
++        assertEquals("Hindi", summary(shodhya));
++        assertEquals("Remove shodhya.com", shodhya.getRemoveDescription());
 +
 +        shodhya.tapRemove();
 +        ShadowLooper.idleMainLooper();
@@ -2602,7 +2678,8 @@ diff '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome/browser
 +        assertEquals("ta-IN", VoiceSiteLanguages.get("http://localhost:8080"));
 +        assertNull(mSettings.findPreference("voice_site_https://shodhya.com"));
 +        assertEquals(1, sites.getPreferenceCount());
-+        assertEquals("localhost", String.valueOf(sites.getPreference(0).getTitle()));
++        assertEquals(
++                "http://localhost:8080", String.valueOf(sites.getPreference(0).getTitle()));
 +
 +        // The last one gone hides the section.
 +        ((SiteRow) sites.getPreference(0)).tapRemove();
@@ -2637,7 +2714,7 @@ diff '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome/browser
 +}
 diff '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguagesTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguagesTest.java
 --- a/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguagesTest.java	1970-01-01 05:30:00.000000000 +0530
-+++ b/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguagesTest.java	2026-10-25 05:40:40.573351525 +0530
++++ b/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceLanguagesTest.java	2026-10-25 06:32:08.046701549 +0530
 @@ -0,0 +1,243 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
@@ -2884,8 +2961,8 @@ diff '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome/browser
 +}
 diff '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceSiteLanguagesTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceSiteLanguagesTest.java
 --- a/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceSiteLanguagesTest.java	1970-01-01 05:30:00.000000000 +0530
-+++ b/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceSiteLanguagesTest.java	2026-10-25 05:40:40.876211738 +0530
-@@ -0,0 +1,199 @@
++++ b/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceSiteLanguagesTest.java	2026-10-25 06:32:08.185696872 +0530
+@@ -0,0 +1,242 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -2905,6 +2982,7 @@ diff '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome/browser
 +import org.junit.Test;
 +import org.junit.runner.RunWith;
 +import org.robolectric.annotation.Config;
++import org.robolectric.shadows.ShadowLooper;
 +
 +import org.chromium.base.Callback;
 +import org.chromium.base.ContextUtils;
@@ -2915,6 +2993,7 @@ diff '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome/browser
 +import java.util.ArrayList;
 +import java.util.List;
 +import java.util.Map;
++import java.util.concurrent.TimeUnit;
 +
 +/** Tests for {@link VoiceSiteLanguages}. */
 +@RunWith(BaseRobolectricTestRunner.class)
@@ -2925,12 +3004,14 @@ diff '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome/browser
 +    private static class FakePlatform implements VoicePlatform {
 +        List<String> mInstalled = new ArrayList<>(List.of("en-IN"));
 +        final List<Callback<@Nullable RecognitionSupport>> mPending = new ArrayList<>();
++        boolean mThrow;
 +
 +        @Override
 +        public void support(
 +                Context context,
 +                @Nullable String tag,
 +                Callback<@Nullable RecognitionSupport> callback) {
++            if (mThrow) throw new IllegalStateException();
 +            mPending.add(callback);
 +        }
 +
@@ -3002,7 +3083,10 @@ diff '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome/browser
 +        // Any URL of the site finds it.
 +        assertEquals("hi-IN", VoiceSiteLanguages.get("https://shodhya.com/other"));
 +        assertEquals("shodhya.com", VoiceSiteLanguages.hostOf("https://shodhya.com"));
-+        assertEquals("localhost", VoiceSiteLanguages.hostOf("http://localhost:8080"));
++        // The scheme when it isn't https, the port when it isn't the default.
++        assertEquals("http://localhost:8080", VoiceSiteLanguages.hostOf("http://localhost:8080"));
++        assertEquals("http://example.com", VoiceSiteLanguages.hostOf("http://example.com"));
++        assertEquals("shodhya.com:8443", VoiceSiteLanguages.hostOf("https://shodhya.com:8443"));
 +    }
 +
 +    @Test
@@ -3084,10 +3168,46 @@ diff '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome/browser
 +        delegate.onSessionEnded("https://example.com", "en-IN");
 +        assertTrue(mPlatform.mPending.isEmpty());
 +    }
++
++    @Test
++    @Config(minSdk = Build.VERSION_CODES.TIRAMISU)
++    public void testUnansweredCheckTimesOut() {
++        VoiceSiteLanguages.set(SITE, "hi-IN");
++        VoiceSiteLanguages.refreshInstalled(ContextUtils.getApplicationContext());
++        assertEquals(1, mPlatform.mPending.size());
++
++        // Android never answers: after the timeout, the next session's check asks again.
++        ShadowLooper.idleMainLooper(
++                VoiceSiteLanguages.CHECK_TIMEOUT_MS - 1, TimeUnit.MILLISECONDS);
++        VoiceSiteLanguages.refreshInstalled(ContextUtils.getApplicationContext());
++        assertEquals(1, mPlatform.mPending.size());
++        ShadowLooper.idleMainLooper(1, TimeUnit.MILLISECONDS);
++        VoiceSiteLanguages.refreshInstalled(ContextUtils.getApplicationContext());
++        assertEquals(2, mPlatform.mPending.size());
++    }
++
++    @Test
++    @Config(minSdk = Build.VERSION_CODES.TIRAMISU)
++    public void testThrowingCheckDoesNotStick() {
++        VoiceSiteLanguages.set(SITE, "hi-IN");
++        mPlatform.mThrow = true;
++        VoiceSiteLanguages.refreshInstalled(ContextUtils.getApplicationContext());
++        mPlatform.mThrow = false;
++        VoiceSiteLanguages.refreshInstalled(ContextUtils.getApplicationContext());
++        assertEquals(1, mPlatform.mPending.size());
++    }
++
++    @Test
++    public void testNoCheckAtRegister() {
++        VoiceSiteLanguages.set(SITE, "hi-IN");
++        SpeechLanguageSnackbar.setPlatformForTesting(null); // Resets the registration after.
++        SpeechLanguageSnackbar.register(ContextUtils.getApplicationContext());
++        assertTrue(mPlatform.mPending.isEmpty());
++    }
 +}
 diff '--color=never' -ruN a/chrome/browser/language/android/java/src/org/chromium/chrome/browser/language/settings/LanguageSettings.java b/chrome/browser/language/android/java/src/org/chromium/chrome/browser/language/settings/LanguageSettings.java
---- a/chrome/browser/language/android/java/src/org/chromium/chrome/browser/language/settings/LanguageSettings.java	2026-10-25 05:40:40.677347092 +0530
-+++ b/chrome/browser/language/android/java/src/org/chromium/chrome/browser/language/settings/LanguageSettings.java	2026-10-25 05:40:40.610505996 +0530
+--- a/chrome/browser/language/android/java/src/org/chromium/chrome/browser/language/settings/LanguageSettings.java	2026-10-25 06:32:08.102811133 +0530
++++ b/chrome/browser/language/android/java/src/org/chromium/chrome/browser/language/settings/LanguageSettings.java	2026-10-25 06:32:08.077731618 +0530
 @@ -9,6 +9,7 @@
  import android.app.Activity;
  import android.content.Context;
@@ -3139,9 +3259,9 @@ diff '--color=never' -ruN a/chrome/browser/language/android/java/src/org/chromiu
          if (mTarkXlitSwitch == null) return;
          String summary;
 diff '--color=never' -ruN a/chrome/browser/ui/android/strings/android_chrome_strings.grd b/chrome/browser/ui/android/strings/android_chrome_strings.grd
---- a/chrome/browser/ui/android/strings/android_chrome_strings.grd	2026-10-25 05:40:40.748537620 +0530
-+++ b/chrome/browser/ui/android/strings/android_chrome_strings.grd	2026-10-25 05:40:40.691387854 +0530
-@@ -994,6 +994,52 @@
+--- a/chrome/browser/ui/android/strings/android_chrome_strings.grd	2026-10-25 06:32:08.133737576 +0530
++++ b/chrome/browser/ui/android/strings/android_chrome_strings.grd	2026-10-25 06:32:08.108427058 +0530
+@@ -994,6 +994,55 @@
        <message name="IDS_TARK_SPEECH_LANGUAGE_DOWNLOAD" desc="Tark: action of the voice language snackbar: Android downloads the language (or opens its voice input settings).">
          Download
        </message>
@@ -3191,13 +3311,16 @@ diff '--color=never' -ruN a/chrome/browser/ui/android/strings/android_chrome_str
 +      <message name="IDS_TARK_VOICE_SITE_REMOVE" desc="Tark: Settings > Voice languages > Sites: button beside a website that forgets the voice search language chosen for it. [CHAR_LIMIT=20]">
 +        Remove
 +      </message>
++      <message name="IDS_TARK_VOICE_SITE_REMOVE_DESCRIPTION" desc="Tark: Settings > Voice languages > Sites: what a screen reader says for the Remove button beside a website, naming the site (its host).">
++        Remove <ph name="SITE">%1$s<ex>shodhya.com</ex></ph>
++      </message>
        <message name="IDS_TARK_CONNECTS_UPDATE" desc="Tark: item in the list of services Tark connects to: the direct APK's daily check for a newer version, with its host name.">
          New versions of Tark, checked once a day unless Google Play installed it (gettarka.com)
        </message>
 diff '--color=never' -ruN a/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb b/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb
---- a/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb	2026-10-25 05:40:40.820450990 +0530
-+++ b/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb	2026-10-25 05:40:40.763465976 +0530
-@@ -2197,4 +2197,15 @@
+--- a/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb	2026-10-25 06:32:08.164353265 +0530
++++ b/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb	2026-10-25 06:32:08.139369292 +0530
+@@ -2197,4 +2197,16 @@
  <translation id="8955589894175271948">Tark के नए वर्शन, दिन में एक बार जांचे जाते हैं, जब तक इसे Google Play से इंस्टॉल न किया गया हो (gettarka.com)</translation>
  <translation id="1628159678930647766">इस फ़ोन पर वॉइस सर्च के लिए <ph name="LANGUAGE"/> चाहिए।</translation>
  <translation id="5742981176567952751">वॉइस के लिए एक भाषा डाउनलोड करनी होगी</translation>
@@ -3212,5 +3335,6 @@ diff '--color=never' -ruN a/chrome/browser/ui/android/strings/translations/andro
 +<translation id="1130658841328970784">✓ तैयार</translation>
 +<translation id="2542401797433880942">वॉइस की भाषाओं की सूची देखने और उन्हें डाउनलोड करने के लिए Android 13 या उसके बाद का वर्शन चाहिए</translation>
 +<translation id="4602818610815242693">Android की वॉइस इनपुट सेटिंग खोलें</translation>
++<translation id="150411034776756821"><ph name="SITE"/> हटाएं</translation>
  </translationbundle>
 \ No newline at end of file
