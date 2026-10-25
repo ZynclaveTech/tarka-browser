@@ -1,6 +1,6 @@
 --- a/chrome/BUILD.gn
 +++ b/chrome/BUILD.gn
-@@ -1101,6 +1101,17 @@
+@@ -1110,6 +1110,17 @@
      }
    }
  
@@ -18,7 +18,7 @@
    # Add the ANGLE .dylibs in the MODULE_DIR of Chromium.app
    if (!use_static_angle) {
      bundle_data("angle_binaries") {
-@@ -1377,6 +1388,7 @@
+@@ -1386,6 +1397,7 @@
        ":chrome_framework_resources",
        ":optimization_guide_library",
        ":swiftshader_binaries",
@@ -28,7 +28,7 @@
      ]
 --- a/components/omnibox/browser/BUILD.gn
 +++ b/components/omnibox/browser/BUILD.gn
-@@ -514,6 +514,16 @@
+@@ -516,6 +516,16 @@
      deps += [ "//components/vector_icons" ]
    }
  
@@ -47,19 +47,19 @@
        "actions/history_clusters_action.cc",
 --- a/components/omnibox/browser/autocomplete_classifier.cc
 +++ b/components/omnibox/browser/autocomplete_classifier.cc
-@@ -68,6 +68,9 @@
-            ? AutocompleteProvider::TYPE_RECENTLY_CLOSED_TABS
-            : 0) |
-       AutocompleteProvider::TYPE_CONTEXTUAL_SEARCH |
+@@ -69,6 +69,9 @@
+            ? AutocompleteProvider::Type::kRecentlyClosedTabs
+            : AutocompleteProvider::Type::kNone) |
+       AutocompleteProvider::Type::kContextualSearch |
 +      // Indian-language rows; AutocompleteController builds the provider on
 +      // macOS only.
-+      AutocompleteProvider::TYPE_QUERY_TILE |
++      AutocompleteProvider::Type::kQueryTile |
  #elif !BUILDFLAG(IS_DESKTOP_ANDROID)
-       AutocompleteProvider::TYPE_CLIPBOARD |
-       AutocompleteProvider::TYPE_MOST_VISITED_SITES |
+       AutocompleteProvider::Type::kClipboard |
+       AutocompleteProvider::Type::kMostVisitedSites |
 --- a/components/omnibox/browser/autocomplete_controller.cc
 +++ b/components/omnibox/browser/autocomplete_controller.cc
-@@ -118,6 +118,10 @@
+@@ -119,6 +119,10 @@
  #include "components/open_from_clipboard/clipboard_recent_content_generic.h"
  #endif
  
@@ -70,29 +70,30 @@
  #include "components/omnibox/browser/autocomplete_scoring_model_service.h"
  
  namespace {
-@@ -1243,6 +1247,14 @@
+@@ -1266,6 +1270,14 @@
            return (keyword_turl->starter_pack_id() ==
                    template_url_starter_pack_data::StarterPackId::kTabs);
  
 +#if BUILDFLAG(IS_MAC)
 +        // Indian-language rows (TarkTransliterationProvider): web sources
 +        // only, never @bookmarks, @history or @tabs.
-+        case AutocompleteProvider::TYPE_QUERY_TILE:
++        case AutocompleteProvider::Type::kQueryTile:
 +          return TarkTransliterationProvider::RunsInStarterPackScope(
 +              keyword_turl->starter_pack_id());
 +#endif
 +
-         case AutocompleteProvider::TYPE_ENTERPRISE_SEARCH_AGGREGATOR:
+         case AutocompleteProvider::Type::kEnterpriseSearchAggregator:
            return keyword_turl->policy_origin() ==
                   TemplateURLData::PolicyOrigin::kSearchAggregator;
-@@ -1395,6 +1407,14 @@
+@@ -1426,6 +1438,15 @@
      contextual_search_provider_ = contextual_search_provider.get();
      providers_.push_back(std::move(contextual_search_provider));
    }
 +#if BUILDFLAG(IS_MAC)
-+  // TYPE_QUERY_TILE is unused on desktop; it carries the Indian-language rows
++  // Type::kQueryTile is unused on desktop; it carries the Indian-language rows
 +  // so that no provider type has to be added.
-+  if (provider_types & AutocompleteProvider::TYPE_QUERY_TILE) {
++  if (provider_types &
++      static_cast<int>(AutocompleteProvider::Type::kQueryTile)) {
 +    providers_.push_back(base::MakeRefCounted<TarkTransliterationProvider>(
 +        provider_client_.get(), this));
 +  }
@@ -320,7 +321,7 @@
 +TarkTransliterationProvider::TarkTransliterationProvider(
 +    AutocompleteProviderClient* client,
 +    AutocompleteProviderListener* listener)
-+    : AutocompleteProvider(AutocompleteProvider::TYPE_QUERY_TILE),
++    : AutocompleteProvider(AutocompleteProvider::Type::kQueryTile),
 +      client_(client),
 +      latest_request_id_(base::MakeRefCounted<LatestRequestId>()) {
 +  AddListener(listener);
@@ -544,7 +545,7 @@
 +      const tark_xlit::Language& language = *request.languages[i];
 +
 +      SearchSuggestionParser::SuggestResult suggestion(
-+          /*suggestion=*/*phrase, AutocompleteMatchType::SEARCH_SUGGEST,
++          /*suggestion=*/*phrase, omnibox::AutocompleteMatchType::kSearchSuggest,
 +          /*suggest_type=*/omnibox::TYPE_NATIVE_CHROME, /*subtypes=*/{},
 +          /*match_contents=*/*phrase,
 +          /*match_contents_prefix=*/std::u16string(),
@@ -608,8 +609,8 @@
 +// accept-languages (components/tark_xlit chooses them; Hindi when there are
 +// none). The rows are worked out on the device: nothing is fetched.
 +//
-+// The provider reuses AutocompleteProvider::TYPE_QUERY_TILE (unused on
-+// desktop) and AutocompleteMatchType::SEARCH_SUGGEST, so that no enum, proto
++// The provider reuses AutocompleteProvider::Type::kQueryTile (unused on
++// desktop) and omnibox::AutocompleteMatchType::kSearchSuggest, so that no enum, proto
 +// or histogram gains a value. Its rows are never the default match: Enter
 +// still searches what was typed.
 +//

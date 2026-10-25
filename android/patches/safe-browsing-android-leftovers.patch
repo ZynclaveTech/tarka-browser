@@ -1,6 +1,6 @@
 --- a/chrome/browser/download/chrome_download_manager_delegate.cc
 +++ b/chrome/browser/download/chrome_download_manager_delegate.cc
-@@ -1186,7 +1186,8 @@
+@@ -1187,7 +1187,8 @@
  
  bool ChromeDownloadManagerDelegate::ShouldObfuscateDownload(
      download::DownloadItem* item) {
@@ -22,7 +22,7 @@
  #include "chrome/browser/profiles/profile.h"
 --- a/chrome/browser/interstitials/enterprise_util.cc
 +++ b/chrome/browser/interstitials/enterprise_util.cc
-@@ -119,8 +119,6 @@
+@@ -121,8 +121,6 @@
  #endif  // BUILDFLAG(ENABLE_EXTENSIONS) && BUILDFLAG(SAFE_BROWSING_AVAILABLE)
  
  #if BUILDFLAG(ENTERPRISE_CONTENT_ANALYSIS) || BUILDFLAG(IS_ANDROID)
@@ -31,7 +31,7 @@
    enterprise_connectors::ReportingEventRouter* reporting_event_router =
        GetReportingEventRouter(web_contents);
  
-@@ -136,8 +134,8 @@
+@@ -138,8 +136,8 @@
  
    reporting_event_router->OnSecurityInterstitialShown(
        page_url, reason, net_error_code,
@@ -44,7 +44,7 @@
  }
 --- a/chrome/browser/notifications/persistent_notification_handler.cc
 +++ b/chrome/browser/notifications/persistent_notification_handler.cc
-@@ -393,7 +393,7 @@
+@@ -394,7 +394,7 @@
      const GURL& url,
      const std::string& notification_id,
      Profile* profile) {
@@ -55,20 +55,34 @@
            static_cast<int>(
 --- a/components/enterprise/connectors/core/cloud_content_scanning/cloud_binary_upload_service_base.cc
 +++ b/components/enterprise/connectors/core/cloud_content_scanning/cloud_binary_upload_service_base.cc
-@@ -362,17 +362,8 @@
-     ScanRequestUploadResult result,
-     BinaryUploadRequest* request,
-     const ContentAnalysisResponse& response) {
+@@ -370,31 +370,8 @@
+     const ContentAnalysisResponse& response,
+     int http_status,
+     const std::string& response_data) {
 -#if !BUILDFLAG(IS_IOS)
 -  safe_browsing::WebUIContentInfoSingleton::GetInstance()
 -      ->AddToDeepScanRequests(request->per_profile_request(),
 -                              request->access_token(), upload_info,
 -                              request->GetUrlWithParams().spec(),
 -                              request->content_analysis_request());
+-  std::string status = ScanRequestUploadResultToString(result);
+-  bool upload_failed = result != ScanRequestUploadResult::kSuccess;
+-  bool has_http_activity = http_status != 0 || !response_data.empty();
+-  // On kSuccess, `response_data` contains raw binary protobuf bytes which are
+-  // already parsed into `response` and serialized to JSON. Only append raw
+-  // `response_data` on failure, where the server/proxy returns text/HTML.
+-  if (upload_failed && has_http_activity) {
+-    // Maximum number of characters of the raw response body appended to the
+-    // deep scan status shown on chrome://safe-browsing.
+-    constexpr size_t kMaxResponseDataLength = 1024;
+-    status = base::StrCat(
+-        {status, " (HTTP ", base::NumberToString(http_status), "): ",
+-         response_data.empty() ? std::string_view("No response to show")
+-                               : std::string_view(response_data)
+-                                     .substr(0, kMaxResponseDataLength)});
+-  }
 -  safe_browsing::WebUIContentInfoSingleton::GetInstance()
--      ->AddToDeepScanResponses(active_tokens_[request->id()],
--                               ScanRequestUploadResultToString(result),
--                               response);
+-      ->AddToDeepScanResponses(active_tokens_[request->id()], status, response);
 -#endif
 +  // Tark: ungoogled removes the Safe Browsing page's deep-scan log
 +  // (as in files_request_handler_base.cc).
