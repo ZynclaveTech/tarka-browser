@@ -757,7 +757,7 @@
 +}
 --- /dev/null
 +++ b/chrome/browser/tark_captions_android/android/java/src/org/chromium/chrome/browser/tark_captions/TarkCaptionsBridge.java
-@@ -0,0 +1,243 @@
+@@ -0,0 +1,270 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -859,6 +859,14 @@
 +
 +    private static final ObserverList<Listener> sListeners = new ObserverList<>();
 +
++    /** Told when a download unit's state or progress changes (CaptionDownloads::Observer). */
++    public interface UnitListener {
++        void onUnitChanged(String unit);
++    }
++
++    private static final ObserverList<UnitListener> sUnitListeners = new ObserverList<>();
++    private static boolean sObservingUnits;
++
 +    private TarkCaptionsBridge() {}
 +
 +    public static void addListener(Listener listener) {
@@ -867,6 +875,23 @@
 +
 +    public static void removeListener(Listener listener) {
 +        sListeners.removeObserver(listener);
++    }
++
++    public static void addUnitListener(UnitListener listener) {
++        if (!sObservingUnits) {
++            TarkCaptionsBridgeJni.get().observeUnits();
++            sObservingUnits = true;
++        }
++        sUnitListeners.addObserver(listener);
++    }
++
++    public static void removeUnitListener(UnitListener listener) {
++        sUnitListeners.removeObserver(listener);
++    }
++
++    @CalledByNative
++    private static void onUnitChanged(@JniType("std::string") String unit) {
++        for (UnitListener listener : sUnitListeners) listener.onUnitChanged(unit);
 +    }
 +
 +    public static State getState(WebContents webContents) {
@@ -980,6 +1005,8 @@
 +        int getStyle();
 +
 +        void setStyle(int style);
++
++        void observeUnits();
 +
 +        @JniType("std::vector<std::string>")
 +        String[] getReadyLanguages();

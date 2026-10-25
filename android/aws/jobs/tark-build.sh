@@ -63,7 +63,8 @@ echo "exit $code" >> $log
 # tests: each must have run.
 if (( code == 0 )); then
   for t in RemoveKeepsUnitCaptionsUses RemoveDeletesWhenNoOwner SharedNoSecondDownload \
-      RequestAfterPendingRemoveKeepsUnit ReleaseKeepsUnitWantedAgain InUseRemoveWhileKeptThenRelease; do
+      RequestAfterPendingRemoveKeepsUnit ReleaseKeepsUnitWantedAgain InUseRemoveWhileKeptThenRelease \
+      RetryBacksOffThenGivesUp InterruptedDownloadResumes ResumeKeepsDownloadNow; do
     grep -qE "^\[[0-9]+/[0-9]+\] CaptionDownloadsTest\.$t \([0-9]+ ms\)$" $log || { echo "no CaptionDownloadsTest.$t test ran" >> $log; code=1; }
     grep -qE "CaptionDownloadsTest\.$t.*(SKIPPED|FAILED)|(SKIPPED|FAILED).*CaptionDownloadsTest\.$t" $log && { echo "CaptionDownloadsTest.$t did not pass" >> $log; code=1; }
   done

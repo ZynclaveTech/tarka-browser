@@ -117,7 +117,7 @@
 +}
 --- /dev/null
 +++ b/chrome/browser/tark_captions_android/caption_downloads.cc
-@@ -0,0 +1,502 @@
+@@ -0,0 +1,556 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -136,6 +136,7 @@
 +#include "base/task/thread_pool.h"
 +#include "base/values.h"
 +#include "chrome/browser/browser_process.h"
++#include "chrome/browser/net/system_network_context_manager.h"
 +#include "components/prefs/pref_registry_simple.h"
 +#include "components/prefs/pref_service.h"
 +#include "components/prefs/scoped_user_pref_update.h"
@@ -144,6 +145,7 @@
 +#include "services/network/public/cpp/resource_request.h"
 +#include "services/network/public/cpp/shared_url_loader_factory.h"
 +#include "services/network/public/cpp/simple_url_loader.h"
++#include "services/network/public/mojom/network_context.mojom.h"
 +#include "services/network/public/mojom/fetch_api.mojom-shared.h"
 +#include "url/gurl.h"
 +
@@ -154,7 +156,6 @@
 +using tark_xlit::ShouldStartNow;
 +
 +constexpr base::TimeDelta kTimeout = base::Minutes(30);
-+constexpr base::TimeDelta kRetryDelay = base::Seconds(30);
 +// For android/captions/e2e/run.py only: where the files are served instead
 +// of gettarka.com (read from the command-line file on a debuggable device).
 +constexpr char kBaseUrlSwitch[] = "tark-captions-models-url";
@@ -282,16 +283,19 @@
 +    }
 +  }
 +  scanned_ = true;
-+  // A "Download now" that was not finished resumes.
-+  // Copied first: Request() rewrites this list (SetCellularOk).
-+  std::vector<std::string> resume;
++  // A download Tark stopped in the middle (a restart) resumes: every unit a
++  // feature still wants and that is not in place, with its "Download now".
++  // Copied first: Enqueue() rewrites this list (SetCellularOk).
++  std::vector<std::string> cellular_ok;
 +  for (const base::Value& unit : g_browser_process->local_state()->GetList(kCellularOkPref)) {
 +    if (unit.is_string()) {
-+      resume.push_back(unit.GetString());
++      cellular_ok.push_back(unit.GetString());
 +    }
 +  }
-+  for (const std::string& unit : resume) {
-+    Enqueue(unit, /*now=*/true);
++  for (const Resume& resume :
++       UnitsToResume(owners_, cellular_ok, [&](const std::string& u) { return Ready(u); })) {
++    LOG(WARNING) << "tark captions: resuming " << resume.unit;
++    Enqueue(resume.unit, resume.now);
 +  }
 +  MaybeDownloadNext();
 +}
@@ -339,13 +343,25 @@
 +  }
 +  g_browser_process->local_state()->CommitPendingWrite();
 +  // The person asked again: a spent budget starts over.
-+  attempts_.Reset();
++  failures_ = 0;
++  refused_ = false;
 +  retry_timer_.Stop();
 +  Notify(std::string(unit));
 +  MaybeDownloadNext();
 +}
 +
 +void CaptionDownloads::Cancel(std::string_view unit) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  // Captions no longer want it; a download another feature wants goes on.
++  SetWantedBy(unit, Owner::kCaptions, false);
++  if (owners_.Wanted(unit)) {
++    Notify(std::string(unit));
++    return;
++  }
++  Abort(unit);
++}
++
++void CaptionDownloads::Abort(std::string_view unit) {
 +  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
 +  std::erase(queue_, std::string(unit));
 +  SetCellularOk(unit, false);
@@ -367,7 +383,7 @@
 +    Notify(std::string(unit));
 +    return;
 +  }
-+  Cancel(unit);
++  Abort(unit);
 +  if (removal == Removal::kNow) {
 +    DeleteUnit(std::string(unit));
 +  } else {
@@ -482,12 +498,48 @@
 +}
 +
 +void CaptionDownloads::OnNetworkChanged(net::NetworkChangeNotifier::ConnectionType type) {
-+  MaybeDownloadNext();
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  if (type == net::NetworkChangeNotifier::CONNECTION_NONE ||
++      (current_ && type == fetch_network_)) {
++    // None: the fetch in flight fails and waits for the next network. The
++    // same kind of network as the fetch's: it goes on.
++    return;
++  }
++  // A new network: a fetch still on the old one starts again on a fresh
++  // loader, the budget starts over, and connections pinned to the old network
++  // (a QUIC session: ERR_QUIC_PROTOCOL_ERROR after Wi-Fi came back) are
++  // closed first.
++  if (current_) {
++    const std::string unit(current_->unit);
++    ++generation_;  // its .part file is removed at the next start
++    loader_.reset();
++    current_ = nullptr;
++    current_bytes_ = 0;
++    Notify(unit);
++  }
++  failures_ = 0;
++  failed_.clear();
++  retry_timer_.Stop();
++  RestartAfterClosingConnections();
++}
++
++void CaptionDownloads::RestartAfterClosingConnections() {
++  SystemNetworkContextManager* manager = SystemNetworkContextManager::GetInstance();
++  if (!manager) {
++    MaybeDownloadNext();
++    return;
++  }
++  manager->GetContext()->CloseAllConnections(
++      base::BindOnce(&CaptionDownloads::MaybeDownloadNext, weak_factory_.GetWeakPtr()));
++}
++
++bool CaptionDownloads::GaveUp() const {
++  return refused_ || (failures_ > 0 && !RetryDelay(failures_));
 +}
 +
 +void CaptionDownloads::MaybeDownloadNext() {
 +  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
-+  if (!scanned_ || current_ || retry_timer_.IsRunning() || attempts_.exhausted()) {
++  if (!scanned_ || current_ || retry_timer_.IsRunning() || GaveUp()) {
 +    return;
 +  }
 +  std::vector<std::string> done;
@@ -527,6 +579,7 @@
 +    return;
 +  }
 +  current_bytes_ = 0;
++  fetch_network_ = net::NetworkChangeNotifier::GetConnectionType();
 +  const uint64_t generation = ++generation_;
 +  base::CreateDirectory(UnitDir(unit));
 +  auto request = std::make_unique<network::ResourceRequest>();
@@ -551,7 +604,7 @@
 +            self->Notify(std::string(self->current_->unit));
 +          }
 +          self->current_ = nullptr;
-+          self->attempts_.Exhaust();
++          self->refused_ = true;
 +        }
 +      },
 +      weak_factory_.GetWeakPtr()));
@@ -609,9 +662,10 @@
 +    return;
 +  }
 +  LOG(WARNING) << "tark captions: " << file->name << " not accepted";
-+  if (attempts_.TryAgain()) {
-+    retry_timer_.Start(FROM_HERE, kRetryDelay,
-+                       base::BindOnce(&CaptionDownloads::MaybeDownloadNext,
++  if (const std::optional<base::TimeDelta> delay = RetryDelay(++failures_)) {
++    // Again on fresh connections: a broken one (QUIC) is not reused.
++    retry_timer_.Start(FROM_HERE, *delay,
++                       base::BindOnce(&CaptionDownloads::RestartAfterClosingConnections,
 +                                      weak_factory_.GetWeakPtr()));
 +  } else {
 +    failed_[unit] = true;
@@ -622,7 +676,7 @@
 +}  // namespace tark_captions
 --- /dev/null
 +++ b/chrome/browser/tark_captions_android/caption_downloads.h
-@@ -0,0 +1,144 @@
+@@ -0,0 +1,157 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -701,6 +755,8 @@
 +  // language): its files (and common's), on Wi-Fi, or now on any network.
 +  // Nothing is fetched for a unit already in place.
 +  void Request(std::string_view unit, bool now, Owner owner = Owner::kCaptions);
++  // Captions no longer want `unit` (turned off before it arrived): its
++  // download stops unless another feature wants it.
 +  void Cancel(std::string_view unit);
 +  // Deletes the unit's files (Settings) unless a feature still wants it
 +  // (SetWantedBy); while it is captioning, when it is released.
@@ -739,6 +795,12 @@
 +  bool Ready(std::string_view unit) const;
 +  // Starts the next missing file of the first queued unit if allowed.
 +  void MaybeDownloadNext();
++  // Closes the system network context's connections, then MaybeDownloadNext.
++  void RestartAfterClosingConnections();
++  // Stops `unit`'s download, whoever wants it.
++  void Abort(std::string_view unit);
++  // Retries are spent (RetryDelay), or a redirect was refused.
++  bool GaveUp() const;
 +  void OnProgress(uint64_t current);
 +  void OnDownloaded(uint64_t generation, const CaptionFile* file, base::FilePath part);
 +  void OnVerified(uint64_t generation, const CaptionFile* file, bool ok);
@@ -756,7 +818,12 @@
 +  const CaptionFile* current_ = nullptr;
 +  int64_t current_bytes_ = 0;
 +  uint64_t generation_ = 0;
-+  tark_xlit::Attempts attempts_;
++  // Failures in a row (RetryDelay); a request or a network change resets it.
++  int failures_ = 0;
++  bool refused_ = false;
++  // The kind of network the fetch in flight started on.
++  net::NetworkChangeNotifier::ConnectionType fetch_network_ =
++      net::NetworkChangeNotifier::CONNECTION_UNKNOWN;
 +  base::OneShotTimer retry_timer_;
 +  UnitUse use_;
 +  UnitOwners owners_;
@@ -769,7 +836,7 @@
 +#endif  // CHROME_BROWSER_TARK_CAPTIONS_ANDROID_CAPTION_DOWNLOADS_H_
 --- /dev/null
 +++ b/chrome/browser/tark_captions_android/model_files.cc
-@@ -0,0 +1,349 @@
+@@ -0,0 +1,386 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -1046,6 +1113,14 @@
 +  return owners_.find(unit) != owners_.end();
 +}
 +
++std::vector<std::string> UnitOwners::Units() const {
++  std::vector<std::string> units;
++  for (const auto& [unit, owners] : owners_) {
++    units.push_back(unit);
++  }
++  return units;
++}
++
 +base::DictValue UnitOwners::ToDict() const {
 +  base::DictValue dict;
 +  for (const auto& [unit, owners] : owners_) {
@@ -1065,6 +1140,35 @@
 +    return Removal::kKeep;
 +  }
 +  return use.RequestRemove(unit) ? Removal::kNow : Removal::kOnRelease;
++}
++
++std::vector<Resume> UnitsToResume(const UnitOwners& owners,
++                                  const std::vector<std::string>& cellular_ok,
++                                  base::FunctionRef<bool(const std::string&)> ready) {
++  std::vector<Resume> out;
++  auto add = [&](const std::string& unit) {
++    if (ready(unit) || FilesOf(unit).empty() ||
++        std::ranges::any_of(out, [&](const Resume& r) { return r.unit == unit; })) {
++      return;
++    }
++    out.push_back({unit, std::ranges::find(cellular_ok, unit) != cellular_ok.end()});
++  };
++  for (const std::string& unit : cellular_ok) {
++    add(unit);
++  }
++  for (const std::string& unit : owners.Units()) {
++    add(unit);
++  }
++  return out;
++}
++
++std::optional<base::TimeDelta> RetryDelay(int failures) {
++  constexpr base::TimeDelta kDelays[] = {base::Seconds(5), base::Seconds(15), base::Seconds(45),
++                                         base::Minutes(2), base::Minutes(5)};
++  if (failures < 1 || failures > static_cast<int>(std::size(kDelays))) {
++    return std::nullopt;
++  }
++  return kDelays[failures - 1];
 +}
 +
 +bool ReleaseDeletes(std::string_view unit, const UnitOwners& owners, UnitUse& use) {
@@ -1121,7 +1225,7 @@
 +}  // namespace tark_captions
 --- /dev/null
 +++ b/chrome/browser/tark_captions_android/model_files.h
-@@ -0,0 +1,165 @@
+@@ -0,0 +1,186 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -1140,6 +1244,7 @@
 +
 +#include "base/containers/span.h"
 +#include "base/functional/function_ref.h"
++#include "base/time/time.h"
 +#include "base/values.h"
 +
 +namespace base {
@@ -1245,6 +1350,8 @@
 +  bool WantedBy(std::string_view unit, Owner owner) const;
 +  // By any feature.
 +  bool Wanted(std::string_view unit) const;
++  // Every unit some feature wants.
++  std::vector<std::string> Units() const;
 +  base::DictValue ToDict() const;
 +
 + private:
@@ -1252,6 +1359,24 @@
 +};
 +
 +class UnitUse;
++
++// After a start: the units to queue again, each with whether it may use
++// mobile data. A unit a feature still wants and that is not in place resumes
++// (an interrupted download; ScanUnit removed its .part files), with the
++// person's "Download now" if they chose it; so does a pending "Download now".
++struct Resume {
++  std::string unit;
++  bool now = false;
++  bool operator==(const Resume&) const = default;
++};
++std::vector<Resume> UnitsToResume(const UnitOwners& owners,
++                                  const std::vector<std::string>& cellular_ok,
++                                  base::FunctionRef<bool(const std::string&)> ready);
++
++// How long to wait before trying a failed file again: 5 s, 15 s, 45 s, 2 min
++// and 5 min after the 1st to 5th failure in a row; then none ("Couldn't
++// download"). A request or a network change starts the count over.
++std::optional<base::TimeDelta> RetryDelay(int failures);
 +
 +// What CaptionDownloads::Remove() does with a unit.
 +enum class Removal {
@@ -1992,7 +2117,7 @@
 +}  // namespace tark_captions
 --- /dev/null
 +++ b/chrome/browser/tark_captions_android/caption_downloads_unittest.cc
-@@ -0,0 +1,228 @@
+@@ -0,0 +1,266 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -2004,6 +2129,7 @@
 +// class itself needs a browser and does not build for the build machine.
 +
 +#include <deque>
++#include <optional>
 +#include <set>
 +#include <string>
 +#include <vector>
@@ -2217,6 +2343,43 @@
 +  EXPECT_TRUE(one.SetWanted(kLanguageIdUnit, Owner::kVoice, false));
 +  EXPECT_TRUE(one.ToDict().empty());
 +  EXPECT_FALSE(one.SetWanted(kLanguageIdUnit, Owner::kVoice, false));
++}
++
++// A failed file is tried again later, each wait longer, five times; then
++// "Couldn't download" until the person asks again or the network changes.
++TEST(CaptionDownloadsTest, RetryBacksOffThenGivesUp) {
++  EXPECT_FALSE(RetryDelay(0).has_value());
++  EXPECT_EQ(RetryDelay(1), base::Seconds(5));
++  EXPECT_EQ(RetryDelay(2), base::Seconds(15));
++  EXPECT_EQ(RetryDelay(3), base::Seconds(45));
++  EXPECT_EQ(RetryDelay(4), base::Minutes(2));
++  EXPECT_EQ(RetryDelay(5), base::Minutes(5));
++  EXPECT_FALSE(RetryDelay(6).has_value());
++}
++
++// Tark restarted in the middle of the detector's download: it is queued
++// again on Wi-Fi, as voice asked; a ready unit is not.
++TEST(CaptionDownloadsTest, InterruptedDownloadResumes) {
++  UnitOwners owners;
++  owners.SetWanted(kLanguageIdUnit, Owner::kVoice, true);
++  owners.SetWanted("hi", Owner::kCaptions, true);
++  auto ready = [](const std::string& unit) { return unit == "hi"; };
++  EXPECT_EQ(UnitsToResume(owners, {}, ready),
++            (std::vector<Resume>{{kLanguageIdUnit, /*now=*/false}}));
++  // Nobody wants it any more (Remove, captions turned off): nothing resumes.
++  owners.SetWanted(kLanguageIdUnit, Owner::kVoice, false);
++  EXPECT_TRUE(UnitsToResume(owners, {}, ready).empty());
++}
++
++// With "Download now", it resumes on mobile data too; a pending "Download
++// now" with no owner (an older APK's) still resumes, once.
++TEST(CaptionDownloadsTest, ResumeKeepsDownloadNow) {
++  UnitOwners owners;
++  owners.SetWanted(kLanguageIdUnit, Owner::kVoice, true);
++  auto none = [](const std::string&) { return false; };
++  EXPECT_EQ(UnitsToResume(owners, {kLanguageIdUnit, "ta"}, none),
++            (std::vector<Resume>{{kLanguageIdUnit, true}, {"ta", true}}));
++  EXPECT_TRUE(UnitsToResume(UnitOwners(), {"not-a-unit"}, none).empty());
 +}
 +
 +}  // namespace
