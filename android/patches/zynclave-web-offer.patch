@@ -35,8 +35,8 @@ diff --color '--color=never' -ruN a/chrome/android/chrome_java_sources.gni b/chr
    "java/src/org/chromium/chrome/browser/password_manager/AccountChooserDialog.java",
 diff --color '--color=never' -ruN a/chrome/android/java/res/layout/zynclave_offer_sheet.xml b/chrome/android/java/res/layout/zynclave_offer_sheet.xml
 --- a/chrome/android/java/res/layout/zynclave_offer_sheet.xml	1970-01-01 05:30:00.000000000 +0530
-+++ b/chrome/android/java/res/layout/zynclave_offer_sheet.xml	2026-10-26 03:48:29.960547618 +0530
-@@ -0,0 +1,52 @@
++++ b/chrome/android/java/res/layout/zynclave_offer_sheet.xml	2026-10-26 03:58:13.060105652 +0530
+@@ -0,0 +1,60 @@
 +<?xml version="1.0" encoding="utf-8"?>
 +<!-- Copyright 2026 The Tark Authors
 +     Use of this source code is governed by a BSD-style license that can be
@@ -57,6 +57,14 @@ diff --color '--color=never' -ruN a/chrome/android/java/res/layout/zynclave_offe
 +        android:layout_height="wrap_content"
 +        android:accessibilityHeading="true"
 +        android:textAppearance="@style/TextAppearance.TextLarge.Primary" />
++
++    <TextView
++        android:id="@+id/zynclave_offer_email"
++        android:layout_width="match_parent"
++        android:layout_height="wrap_content"
++        android:layout_marginTop="4dp"
++        android:visibility="gone"
++        android:textAppearance="@style/TextAppearance.TextMedium.Primary" />
 +
 +    <TextView
 +        android:id="@+id/zynclave_offer_body"
@@ -113,8 +121,8 @@ diff --color '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/
      /**
 diff --color '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveOfferSheet.java b/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveOfferSheet.java
 --- a/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveOfferSheet.java	1970-01-01 05:30:00.000000000 +0530
-+++ b/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveOfferSheet.java	2026-10-26 03:52:02.007752568 +0530
-@@ -0,0 +1,157 @@
++++ b/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveOfferSheet.java	2026-10-26 03:58:13.059953900 +0530
+@@ -0,0 +1,164 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -159,6 +167,11 @@ diff --color '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/
 +        mView = LayoutInflater.from(activity).inflate(R.layout.zynclave_offer_sheet, null);
 +        TextView title = mView.findViewById(R.id.zynclave_offer_title);
 +        title.setText(ZynclaveWebOffer.title(activity.getResources(), name, email));
++        // The email under a name, so a name the web session made up never stands alone.
++        TextView emailLine = mView.findViewById(R.id.zynclave_offer_email);
++        String line = ZynclaveWebOffer.emailLine(name, email);
++        emailLine.setText(line);
++        emailLine.setVisibility(line == null ? View.GONE : View.VISIBLE);
 +        mView.findViewById(R.id.zynclave_offer_sign_in)
 +                .setOnClickListener(
 +                        v -> {
@@ -230,6 +243,8 @@ diff --color '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/
 +        mChoice = null;
 +        TextView title = mView.findViewById(R.id.zynclave_offer_title);
 +        title.setText(null);
++        TextView emailLine = mView.findViewById(R.id.zynclave_offer_email);
++        emailLine.setText(null);
 +    }
 +
 +    @Override
@@ -274,8 +289,8 @@ diff --color '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/
 +}
 diff --color '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveWebOffer.java b/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveWebOffer.java
 --- a/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveWebOffer.java	1970-01-01 05:30:00.000000000 +0530
-+++ b/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveWebOffer.java	2026-10-26 03:53:33.941245899 +0530
-@@ -0,0 +1,364 @@
++++ b/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveWebOffer.java	2026-10-26 03:59:37.453039854 +0530
+@@ -0,0 +1,577 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -288,6 +303,7 @@ diff --color '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/
 +import android.os.Looper;
 +import android.text.TextUtils;
 +import android.util.Base64;
++import android.widget.Toast;
 +
 +import androidx.annotation.VisibleForTesting;
 +
@@ -302,6 +318,9 @@ diff --color '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/
 +import org.chromium.chrome.browser.tab.Tab;
 +import org.chromium.chrome.browser.tab.TabObserver;
 +import org.chromium.chrome.browser.tark_zynclave.ZynclaveWhoami;
++import org.chromium.chrome.browser.ui.messages.snackbar.Snackbar;
++import org.chromium.chrome.browser.ui.messages.snackbar.SnackbarManager;
++import org.chromium.chrome.browser.ui.messages.snackbar.SnackbarManager.SnackbarManageable;
 +import org.chromium.content_public.browser.NavigationHandle;
 +import org.chromium.url.GURL;
 +
@@ -352,7 +371,30 @@ diff --color '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/
 +        /** SIGNED_IN or SIGNING_IN: no check, no sheet. */
 +        boolean isSignedInOrSigningIn();
 +
++        boolean isSigningIn();
++
++        boolean isSignedIn();
++
++        /** The signed-in account's email (userinfo), if any. */
++        @Nullable String email();
++
 +        void signIn(Activity activity, boolean promptNone);
++
++        /** Sign out of Tark only (no revoke of the web session). */
++        void signOutLocally();
++
++        void addObserver(Runnable observer);
++
++        void removeObserver(Runnable observer);
++
++        void addSignInFailureObserver(Runnable observer);
++
++        void removeSignInFailureObserver(Runnable observer);
++    }
++
++    /** Says a sign-in started from the sheet failed (the §5.3 snackbar). */
++    interface Notifier {
++        void signInFailed(Activity activity);
 +    }
 +
 +    /** The declined accounts (salted hashes only) and the salt. */
@@ -363,6 +405,11 @@ diff --color '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/
 +
 +        void decline(String key);
 +    }
++
++    /** Longest name and email shown on the sheet, in code points (with the ellipsis). */
++    @VisibleForTesting static final int MAX_NAME = 40;
++
++    @VisibleForTesting static final int MAX_EMAIL = 64;
 +
 +    private static final String[] SIGN_IN_PATHS = {
 +        "/login", "/registration", "/recovery", "/verification", "/error"
@@ -377,6 +424,7 @@ diff --color '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/
 +    private final Presenter mPresenter;
 +    private final Account mAccount;
 +    private final Store mStore;
++    private final Notifier mNotifier;
 +    private final Handler mHandler = new Handler(Looper.getMainLooper());
 +    private final Runnable mCheck = this::check;
 +
@@ -392,13 +440,15 @@ diff --color '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/
 +            Fetcher fetcher,
 +            Presenter presenter,
 +            Account account,
-+            Store store) {
++            Store store,
++            Notifier notifier) {
 +        mOffTheRecord = offTheRecord;
 +        mAccountsHost = accountsHost;
 +        mFetcher = fetcher;
 +        mPresenter = presenter;
 +        mAccount = account;
 +        mStore = store;
++        mNotifier = notifier;
 +    }
 +
 +    /**
@@ -416,7 +466,8 @@ diff --color '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/
 +                                ZynclaveWhoami.fetch(tab.getProfile(), "https://" + host, callback),
 +                        new ZynclaveOfferSheet.TabPresenter(tab),
 +                        new RealAccount(),
-+                        new PrefsStore());
++                        new PrefsStore(),
++                        ZynclaveWebOffer::showSignInFailed);
 +        tab.addObserver(offer.new Observer());
 +    }
 +
@@ -460,15 +511,73 @@ diff --color '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/
 +        }
 +    }
 +
-+    /** The sheet's title: the name, else the email, else the generic question. */
++    /**
++     * The sheet's title: the name, else the email, else the generic question. Both come from the
++     * web session, which a page could have set (login CSRF), so they are {@link #clean}ed.
++     */
 +    public static String title(Resources res, @Nullable String name, @Nullable String email) {
-+        if (!TextUtils.isEmpty(name)) {
-+            return res.getString(R.string.tark_zynclave_offer_title, name);
++        String shownName = clean(name, MAX_NAME);
++        if (!shownName.isEmpty()) {
++            return res.getString(R.string.tark_zynclave_offer_title, shownName);
 +        }
-+        if (!TextUtils.isEmpty(email)) {
-+            return res.getString(R.string.tark_zynclave_offer_title, email);
++        String shownEmail = clean(email, MAX_EMAIL);
++        if (!shownEmail.isEmpty()) {
++            return res.getString(R.string.tark_zynclave_offer_title, shownEmail);
 +        }
 +        return res.getString(R.string.tark_zynclave_offer_title_generic);
++    }
++
++    /**
++     * The line under the title: the email whenever the title shows a name, so a made-up name never
++     * stands alone; null when the title already shows the email, or there is none.
++     */
++    public static @Nullable String emailLine(@Nullable String name, @Nullable String email) {
++        String shownEmail = clean(email, MAX_EMAIL);
++        if (shownEmail.isEmpty() || clean(name, MAX_NAME).isEmpty()) return null;
++        return shownEmail;
++    }
++
++    /**
++     * Text from the web session made safe to show: no control or format characters (Unicode Cc and
++     * Cf, which include every bidi control), whitespace runs as one space, trimmed, and at most
++     * {@code max} code points, the last an ellipsis when cut.
++     */
++    @VisibleForTesting
++    static String clean(@Nullable String text, int max) {
++        if (text == null) return "";
++        StringBuilder out = new StringBuilder();
++        boolean space = false;
++        for (int i = 0; i < text.length(); ) {
++            int c = text.codePointAt(i);
++            i += Character.charCount(c);
++            int type = Character.getType(c);
++            if (Character.isWhitespace(c) || Character.isSpaceChar(c)) {
++                space = out.length() > 0;
++                continue;
++            }
++            if (type == Character.CONTROL
++                    || type == Character.FORMAT
++                    || type == Character.UNASSIGNED
++                    || type == Character.PRIVATE_USE
++                    || type == Character.SURROGATE
++                    || isBidiControl(c)) {
++                continue;
++            }
++            if (space) out.append(' ');
++            space = false;
++            out.appendCodePoint(c);
++        }
++        String cleaned = out.toString();
++        if (cleaned.codePointCount(0, cleaned.length()) <= max) return cleaned;
++        int end = cleaned.offsetByCodePoints(0, max - 1);
++        return cleaned.substring(0, end).trim() + "\u2026";
++    }
++
++    private static boolean isBidiControl(int c) {
++        return (c >= 0x202A && c <= 0x202E)
++                || (c >= 0x2066 && c <= 0x2069)
++                || c == 0x200E
++                || c == 0x200F;
 +    }
 +
 +    /** A main-frame navigation to a new document started: the wait ends. */
@@ -537,7 +646,7 @@ diff --color '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/
 +                        new Choice() {
 +                            @Override
 +                            public void onSignIn(Activity activity) {
-+                                mAccount.signIn(activity, /* promptNone= */ true);
++                                new SignInWatch(activity, session.email).start();
 +                            }
 +
 +                            @Override
@@ -552,6 +661,85 @@ diff --color '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/
 +    static void resetShownForTesting() {
 +        sShownThisProcess.clear();
 +        ResettersForTesting.register(sShownThisProcess::clear);
++    }
++
++    /**
++     * One sign-in started from the sheet, watched to its end: a failure shows the §5.3 snackbar
++     * (ZynclaveAccount shows none), and an account other than the one the sheet named (userinfo's
++     * email against whoami's, when both have one) is signed out again with the same message. The
++     * Kratos id is never compared with the OIDC sub: the sub is pairwise and never matches.
++     */
++    private final class SignInWatch {
++        private final Activity mActivity;
++        private final @Nullable String mExpectedEmail;
++        private final Runnable mStateObserver = this::onStateChanged;
++        private final Runnable mFailureObserver = this::onFailed;
++        private boolean mStarted;
++        private boolean mEnded;
++
++        SignInWatch(Activity activity, @Nullable String expectedEmail) {
++            mActivity = activity;
++            mExpectedEmail = expectedEmail;
++        }
++
++        void start() {
++            mAccount.addObserver(mStateObserver);
++            mAccount.addSignInFailureObserver(mFailureObserver);
++            mAccount.signIn(mActivity, /* promptNone= */ true);
++            mStarted = true;
++            // Signed in or signing in already: nothing of ours to watch.
++            if (!mAccount.isSigningIn()) end();
++        }
++
++        private void onStateChanged() {
++            if (mEnded || !mStarted || mAccount.isSigningIn()) return;
++            if (mAccount.isSignedIn()) {
++                end();
++                if (!sameAccount(mExpectedEmail, mAccount.email())) {
++                    mAccount.signOutLocally();
++                    mNotifier.signInFailed(mActivity);
++                }
++                return;
++            }
++            // Cancelled or failed. ZynclaveAccount resets the state before it tells the failure
++            // observers, so stop watching only after this turn.
++            mHandler.post(this::end);
++        }
++
++        private void onFailed() {
++            if (mEnded) return;
++            end();
++            mNotifier.signInFailed(mActivity);
++        }
++
++        private void end() {
++            if (mEnded) return;
++            mEnded = true;
++            mAccount.removeObserver(mStateObserver);
++            mAccount.removeSignInFailureObserver(mFailureObserver);
++        }
++    }
++
++    /** Whether the signed-in account is the one the sheet named; unknown (no email) is accepted. */
++    @VisibleForTesting
++    static boolean sameAccount(@Nullable String sheetEmail, @Nullable String signedInEmail) {
++        if (TextUtils.isEmpty(sheetEmail) || TextUtils.isEmpty(signedInEmail)) return true;
++        return sheetEmail.trim().equalsIgnoreCase(signedInEmail.trim());
++    }
++
++    /** The §5.3 message, in the tab activity's snackbar (a toast if it has none). */
++    private static void showSignInFailed(Activity activity) {
++        String text = activity.getString(R.string.tark_zynclave_sign_in_failed);
++        if (activity instanceof SnackbarManageable manageable) {
++            SnackbarManager snackbars = manageable.getSnackbarManager();
++            if (snackbars != null) {
++                snackbars.showSnackbar(
++                        Snackbar.make(
++                                text, null, Snackbar.TYPE_NOTIFICATION, Snackbar.UMA_UNKNOWN));
++                return;
++            }
++        }
++        Toast.makeText(activity.getApplicationContext(), text, Toast.LENGTH_LONG).show();
 +    }
 +
 +    /** The tab's events, as the policy above takes them. */
@@ -596,8 +784,48 @@ diff --color '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/
 +        }
 +
 +        @Override
++        public boolean isSigningIn() {
++            return ZynclaveAccount.get().state() == ZynclaveAccount.State.SIGNING_IN;
++        }
++
++        @Override
++        public boolean isSignedIn() {
++            return ZynclaveAccount.get().state() == ZynclaveAccount.State.SIGNED_IN;
++        }
++
++        @Override
++        public @Nullable String email() {
++            return ZynclaveAccount.get().email();
++        }
++
++        @Override
 +        public void signIn(Activity activity, boolean promptNone) {
 +            ZynclaveAccount.get().signIn(activity, promptNone);
++        }
++
++        @Override
++        public void signOutLocally() {
++            ZynclaveAccount.get().signOut(/* everywhere= */ false, null);
++        }
++
++        @Override
++        public void addObserver(Runnable observer) {
++            ZynclaveAccount.get().addObserver(observer);
++        }
++
++        @Override
++        public void removeObserver(Runnable observer) {
++            ZynclaveAccount.get().removeObserver(observer);
++        }
++
++        @Override
++        public void addSignInFailureObserver(Runnable observer) {
++            ZynclaveAccount.get().addSignInFailureObserver(observer);
++        }
++
++        @Override
++        public void removeSignInFailureObserver(Runnable observer) {
++            ZynclaveAccount.get().removeSignInFailureObserver(observer);
 +        }
 +    }
 +
@@ -658,8 +886,8 @@ diff --color '--color=never' -ruN a/chrome/android/junit/BUILD.gn b/chrome/andro
      ]
 diff --color '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveWebOfferTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveWebOfferTest.java
 --- a/chrome/android/junit/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveWebOfferTest.java	1970-01-01 05:30:00.000000000 +0530
-+++ b/chrome/android/junit/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveWebOfferTest.java	2026-10-26 03:50:36.865662787 +0530
-@@ -0,0 +1,424 @@
++++ b/chrome/android/junit/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveWebOfferTest.java	2026-10-26 03:58:51.797671647 +0530
+@@ -0,0 +1,638 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -669,6 +897,7 @@ diff --color '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome
 +import static org.junit.Assert.assertEquals;
 +import static org.junit.Assert.assertFalse;
 +import static org.junit.Assert.assertNotEquals;
++import static org.junit.Assert.assertNull;
 +import static org.junit.Assert.assertSame;
 +import static org.junit.Assert.assertTrue;
 +
@@ -687,9 +916,11 @@ diff --color '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome
 +import org.chromium.base.test.BaseRobolectricTestRunner;
 +import org.chromium.build.annotations.Nullable;
 +import org.chromium.chrome.browser.tark_zynclave.ZynclaveWhoami;
++import org.chromium.chrome.browser.tab.Tab;
 +import org.chromium.chrome.browser.tark_zynclave.ZynclaveWhoami.Session;
 +import org.chromium.url.GURL;
 +
++import java.lang.reflect.Proxy;
 +import java.nio.charset.StandardCharsets;
 +import java.util.ArrayList;
 +import java.util.HashSet;
@@ -714,6 +945,7 @@ diff --color '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome
 +    private final FakePresenter mPresenter = new FakePresenter();
 +    private final FakeAccount mAccount = new FakeAccount();
 +    private final FakeStore mStore = new FakeStore();
++    private final List<Activity> mFailures = new ArrayList<>();
 +
 +    @Before
 +    public void setUp() {
@@ -725,7 +957,8 @@ diff --color '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome
 +    }
 +
 +    private ZynclaveWebOffer newOffer(boolean offTheRecord, ZynclaveWebOffer.Store store) {
-+        return new ZynclaveWebOffer(offTheRecord, HOST, mFetcher, mPresenter, mAccount, store);
++        return new ZynclaveWebOffer(
++                offTheRecord, HOST, mFetcher, mPresenter, mAccount, store, mFailures::add);
 +    }
 +
 +    /** A page committed and finished loading. */
@@ -1008,6 +1241,138 @@ diff --color '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome
 +        assertTrue(sawDeclined);
 +    }
 +
++    /** Shows the sheet for {@code session} and taps Sign in. */
++    private Activity tapSignIn(Session session) {
++        ZynclaveWebOffer offer = newOffer();
++        roundTrip(offer);
++        mFetcher.answer(mFetcher.calls.size() - 1, session);
++        Activity activity = Robolectric.buildActivity(Activity.class).get();
++        mPresenter.shown.get(mPresenter.shown.size() - 1).choice.onSignIn(activity);
++        return activity;
++    }
++
++    private void assertNotWatching() {
++        ShadowLooper.idleMainLooper();
++        assertTrue(mAccount.observers.isEmpty());
++        assertTrue(mAccount.failureObservers.isEmpty());
++    }
++
++    @Test
++    public void testSheetSignInFailureShowsSnackbar() {
++        Activity activity = tapSignIn(new Session(ID, "Sooraj Pandey", "s@example.com"));
++        assertTrue(mAccount.signingIn);
++        assertEquals(0, mFailures.size());
++        mAccount.fail();
++        assertEquals(1, mFailures.size());
++        assertSame(activity, mFailures.get(0));
++        assertNotWatching();
++        // Unregistered: a later failure (from Settings, say) is not ours.
++        mAccount.fail();
++        assertEquals(1, mFailures.size());
++    }
++
++    @Test
++    public void testSheetSignInSuccessOrCancelUnregisters() {
++        tapSignIn(new Session(ID, "Sooraj Pandey", "s@example.com"));
++        mAccount.cancel();
++        assertNotWatching();
++        assertEquals(0, mFailures.size());
++
++        ZynclaveWebOffer.resetShownForTesting();
++        tapSignIn(new Session("other-identity", "Asha", ""));
++        mAccount.complete("asha@example.com");
++        assertNotWatching();
++        assertEquals(0, mFailures.size());
++        assertEquals(0, mAccount.signOuts);
++    }
++
++    @Test
++    public void testDifferentAccountSignedInIsSignedOut() {
++        tapSignIn(new Session(ID, "Sooraj Pandey", "s@example.com"));
++        mAccount.complete("mallory@example.com");
++        assertEquals(1, mAccount.signOuts);
++        assertFalse(mAccount.signedIn);
++        assertEquals(1, mFailures.size());
++        assertNotWatching();
++    }
++
++    @Test
++    public void testSameAccountStaysSignedIn() {
++        tapSignIn(new Session(ID, "Sooraj Pandey", "S@Example.com"));
++        mAccount.complete("s@example.com");
++        assertEquals(0, mAccount.signOuts);
++        assertTrue(mAccount.signedIn);
++        assertEquals(0, mFailures.size());
++
++        // Either email missing (a phone-only account): accepted.
++        assertTrue(ZynclaveWebOffer.sameAccount("", "s@example.com"));
++        assertTrue(ZynclaveWebOffer.sameAccount("s@example.com", null));
++        assertFalse(ZynclaveWebOffer.sameAccount("s@example.com", "t@example.com"));
++    }
++
++    @Test
++    public void testBidiNameStripped() {
++        String spoofed = "Sooraj\u202E\u2066 Pandey\u200F\u0007\u200B";
++        assertEquals("Sooraj Pandey", ZynclaveWebOffer.clean(spoofed, ZynclaveWebOffer.MAX_NAME));
++        assertEquals("a b c", ZynclaveWebOffer.clean("  a \n\t b\u00A0\u00A0c ", 40));
++        ZynclaveWebOffer offer = newOffer();
++        roundTrip(offer);
++        mFetcher.answer(0, new Session(ID, spoofed, "s@exa\u202Emple.com"));
++        assertEquals("Sign in to Tark as Sooraj Pandey?", mPresenter.shown.get(0).title);
++        assertEquals("s@example.com", mPresenter.shown.get(0).emailLine);
++    }
++
++    @Test
++    public void testLongNameCapped() {
++        String longName = "Sooraj Pandey " + "x".repeat(100);
++        String shown = ZynclaveWebOffer.clean(longName, ZynclaveWebOffer.MAX_NAME);
++        assertEquals(ZynclaveWebOffer.MAX_NAME, shown.codePointCount(0, shown.length()));
++        assertTrue(shown.endsWith("\u2026"));
++        assertTrue(shown.startsWith("Sooraj Pandey x"));
++        String longEmail = "a".repeat(100) + "@example.com";
++        String shownEmail = ZynclaveWebOffer.clean(longEmail, ZynclaveWebOffer.MAX_EMAIL);
++        assertEquals(ZynclaveWebOffer.MAX_EMAIL, shownEmail.length());
++        assertEquals("Sooraj", ZynclaveWebOffer.clean("Sooraj", ZynclaveWebOffer.MAX_NAME));
++    }
++
++    @Test
++    public void testEmailShownWithName() {
++        ZynclaveWebOffer offer = newOffer();
++        roundTrip(offer);
++        mFetcher.answer(0, new Session(ID, "Sooraj Pandey", "s@example.com"));
++        assertEquals("Sign in to Tark as Sooraj Pandey?", mPresenter.shown.get(0).title);
++        assertEquals("s@example.com", mPresenter.shown.get(0).emailLine);
++
++        // Email only: the title has it, no second line. Phone only: neither.
++        assertNull(ZynclaveWebOffer.emailLine("", "s@example.com"));
++        assertNull(ZynclaveWebOffer.emailLine("Sooraj", ""));
++        assertNull(ZynclaveWebOffer.emailLine(null, null));
++    }
++
++    @Test
++    public void testAttachOffTheRecordAddsNoObserver() {
++        List<String> calls = new ArrayList<>();
++        Tab tab =
++                (Tab)
++                        Proxy.newProxyInstance(
++                                Tab.class.getClassLoader(),
++                                new Class<?>[] {Tab.class},
++                                (proxy, method, args) -> {
++                                    calls.add(method.getName());
++                                    if (method.getName().equals("isOffTheRecord")) return true;
++                                    Class<?> type = method.getReturnType();
++                                    if (type == boolean.class) return false;
++                                    if (type == int.class) return 0;
++                                    if (type == long.class) return 0L;
++                                    if (type == float.class) return 0f;
++                                    return null;
++                                });
++        ZynclaveWebOffer.attach(tab);
++        assertTrue(calls.contains("isOffTheRecord"));
++        assertFalse(calls.contains("addObserver"));
++        assertFalse(calls.contains("getProfile"));
++    }
++
 +    private static final class FakeFetcher implements ZynclaveWebOffer.Fetcher {
 +        final List<ZynclaveWhoami.Callback> calls = new ArrayList<>();
 +
@@ -1023,10 +1388,12 @@ diff --color '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome
 +
 +    private static final class Shown {
 +        final String title;
++        final @Nullable String emailLine;
 +        final ZynclaveWebOffer.Choice choice;
 +
-+        Shown(String title, ZynclaveWebOffer.Choice choice) {
++        Shown(String title, @Nullable String emailLine, ZynclaveWebOffer.Choice choice) {
 +            this.title = title;
++            this.emailLine = emailLine;
 +            this.choice = choice;
 +        }
 +    }
@@ -1043,25 +1410,100 @@ diff --color '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome
 +                                    RuntimeEnvironment.getApplication().getResources(),
 +                                    name,
 +                                    email),
++                            ZynclaveWebOffer.emailLine(name, email),
 +                            choice));
 +            return true;
 +        }
 +    }
 +
++    /** ZynclaveAccount's order: state first, then (on failure) the failure observers. */
 +    private static final class FakeAccount implements ZynclaveWebOffer.Account {
 +        boolean signedInOrSigningIn;
++        boolean signingIn;
++        boolean signedIn;
++        @Nullable String email;
++        int signOuts;
 +        final List<Boolean> signIns = new ArrayList<>();
 +        @Nullable Activity signInActivity;
++        final List<Runnable> observers = new ArrayList<>();
++        final List<Runnable> failureObservers = new ArrayList<>();
 +
 +        @Override
 +        public boolean isSignedInOrSigningIn() {
-+            return signedInOrSigningIn;
++            return signedInOrSigningIn || signingIn || signedIn;
++        }
++
++        @Override
++        public boolean isSigningIn() {
++            return signingIn;
++        }
++
++        @Override
++        public boolean isSignedIn() {
++            return signedIn;
++        }
++
++        @Override
++        public @Nullable String email() {
++            return email;
 +        }
 +
 +        @Override
 +        public void signIn(Activity activity, boolean promptNone) {
 +            signInActivity = activity;
 +            signIns.add(promptNone);
++            signingIn = true;
++            notifyState();
++        }
++
++        @Override
++        public void signOutLocally() {
++            signOuts++;
++            signedIn = false;
++            email = null;
++            notifyState();
++        }
++
++        void complete(@Nullable String userinfoEmail) {
++            signingIn = false;
++            signedIn = true;
++            email = userinfoEmail;
++            notifyState();
++        }
++
++        void cancel() {
++            signingIn = false;
++            notifyState();
++        }
++
++        void fail() {
++            signingIn = false;
++            notifyState();
++            for (Runnable r : new ArrayList<>(failureObservers)) r.run();
++        }
++
++        private void notifyState() {
++            for (Runnable r : new ArrayList<>(observers)) r.run();
++        }
++
++        @Override
++        public void addObserver(Runnable observer) {
++            observers.add(observer);
++        }
++
++        @Override
++        public void removeObserver(Runnable observer) {
++            observers.remove(observer);
++        }
++
++        @Override
++        public void addSignInFailureObserver(Runnable observer) {
++            failureObservers.add(observer);
++        }
++
++        @Override
++        public void removeSignInFailureObserver(Runnable observer) {
++            failureObservers.remove(observer);
 +        }
 +    }
 +
@@ -1126,17 +1568,17 @@ diff --color '--color=never' -ruN a/chrome/browser/preferences/android/java/src/
              "Chrome.TipsNotifications.OptInAccepted";
 diff --color '--color=never' -ruN a/chrome/browser/preferences/android/java/src/org/chromium/chrome/browser/preferences/LegacyChromePreferenceKeys.java b/chrome/browser/preferences/android/java/src/org/chromium/chrome/browser/preferences/LegacyChromePreferenceKeys.java
 --- a/chrome/browser/preferences/android/java/src/org/chromium/chrome/browser/preferences/LegacyChromePreferenceKeys.java	2026-10-26 03:42:59.532612906 +0530
-+++ b/chrome/browser/preferences/android/java/src/org/chromium/chrome/browser/preferences/LegacyChromePreferenceKeys.java	2026-10-26 03:48:45.494232045 +0530
-@@ -38,6 +38,9 @@
-                 ChromePreferenceKeys.CONTEXTUAL_SEARCH_TAP_TRIGGERED_PROMO_COUNT,
-                 ChromePreferenceKeys.CRASH_UPLOAD_FAILURE_BROWSER,
-                 ChromePreferenceKeys.CRASH_UPLOAD_FAILURE_GPU,
++++ b/chrome/browser/preferences/android/java/src/org/chromium/chrome/browser/preferences/LegacyChromePreferenceKeys.java	2026-10-26 03:57:20.665863978 +0530
+@@ -111,6 +111,9 @@
+                 ChromePreferenceKeys.TABMODEL_HAS_RUN_FILE_MIGRATION,
+                 ChromePreferenceKeys.TABMODEL_HAS_RUN_MULTI_INSTANCE_FILE_MIGRATION,
+                 ChromePreferenceKeys.TAB_ID_MANAGER_NEXT_ID,
 +                // Tark's keys keep Tark's "tark." naming (Sign in with Zynclave).
 +                ChromePreferenceKeys.TARK_ZYNCLAVE_DECLINED,
 +                ChromePreferenceKeys.TARK_ZYNCLAVE_SALT,
-                 ChromePreferenceKeys.CRASH_UPLOAD_FAILURE_OTHER,
-                 ChromePreferenceKeys.CRASH_UPLOAD_FAILURE_RENDERER,
-                 ChromePreferenceKeys.CRASH_UPLOAD_SUCCESS_BROWSER,
+                 ChromePreferenceKeys.TOS_ACKED_ACCOUNTS,
+                 ChromePreferenceKeys.TWA_DIALOG_NUMBER_OF_DISMISSALS_ON_CLEAR_DATA,
+                 ChromePreferenceKeys.TWA_DIALOG_NUMBER_OF_DISMISSALS_ON_UNINSTALL,
 diff --color '--color=never' -ruN a/chrome/browser/tark_zynclave/BUILD.gn b/chrome/browser/tark_zynclave/BUILD.gn
 --- a/chrome/browser/tark_zynclave/BUILD.gn	1970-01-01 05:30:00.000000000 +0530
 +++ b/chrome/browser/tark_zynclave/BUILD.gn	2026-10-26 03:45:41.428355943 +0530
