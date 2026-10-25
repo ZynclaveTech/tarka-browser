@@ -7,7 +7,8 @@
     android/speech/e2e/run.py APK [--serial emulator-5554] [case ...]
         cases: answers offline missing_pack no_network_host navigate_away
                permission_denied settings_sections site_language private_tab
-               offer_once detection_row detection_wifi_wait detection_netlog
+               offer_once detection_row detection_wifi_wait detection_resume
+               detection_netlog
 
 Installs APK, serves page.html from this Mac (port 8005, through adb
 reverse) and reads the page's #out line from the screen. Speech, the
@@ -865,12 +866,16 @@ def case_detection_wifi_wait(dev):
     return detection_get(dev, wifi_first=False)
 
 
-def detection_download(dev, mark, unreadable):
-    # Downloading: the row's progress bar animates, so uiautomator often
-    # can't dump the page; a partial file and the download log count too.
-    seen, end = [], time.time() + 240
+def detection_download(dev, mark, unreadable, limit=180):
+    """From now (Wi-Fi on) until the unit is ready, within `limit` s; the
+    row must be readable throughout (the page goes idle between updates)."""
+    seen, started, failed_dumps = [], time.time(), 0
+    end = started + limit
+    ready_at = None
     while time.time() < end:
-        row = detection_row(busy_screen(dev, 1))
+        xml = busy_screen(dev, 1)
+        row = detection_row(xml)
+        failed_dumps += not xml
         files = lid_files(dev)
         if row and row not in seen:
             seen.append(row)
@@ -878,10 +883,17 @@ def detection_download(dev, mark, unreadable):
             seen.append('partial file')
         if files and all(files.get(n) == size for n, size in LID_FILES.items()) and \
                 (not row or 'Remove' in row):
+            ready_at = time.time()
             break
         time.sleep(1)
+    RESULTS['seconds to ready'] = round(ready_at - started, 1) if ready_at else f'not ready in {limit}'
+    RESULTS['failed uiautomator dumps'] = failed_dumps
+    if failed_dumps:
+        unreadable.append(f'downloading ({failed_dumps} dumps)')
     log = dev.log_since(mark, '-s', 'chromium:*')
-    RESULTS['download log'] = [l.split('] ', 1)[-1] for l in log.splitlines() if 'tark captions' in l][:12]
+    lines = [l.split('] ', 1)[-1] for l in log.splitlines() if 'tark captions' in l]
+    RESULTS['download log'] = lines[:16]
+    RESULTS['failed attempts (retries)'] = sum(' failed' in l for l in lines)
     RESULTS['seen while downloading'] = seen
     files = lid_files(dev)
     RESULTS['files'] = files
@@ -904,8 +916,48 @@ def detection_download(dev, mark, unreadable):
     if any(n in left for n in LID_FILES):
         return f'files left after Remove: {left}'
     if unreadable:
-        return ('the Voice languages page never went idle while the row refreshes '
+        return ('the Voice languages page was not idle '
                 f'(uiautomator could not read it: {", ".join(unreadable)}); see the screenshots')
+    return ''
+
+
+def case_detection_resume(dev):
+    """Get, then Tark is stopped mid-download: relaunched, it finishes
+    without another tap."""
+    dev.fresh()
+    open_voice_languages(dev)
+    if not find_scrolling(dev, DETECT, swipes=14) or not xlit.tap_text(dev, 'Get'):
+        return 'no Get button'
+    end = time.time() + 60
+    while time.time() < end and not any(n.endswith('.part') for n in lid_files(dev)):
+        time.sleep(0.3)
+    partial = lid_files(dev)
+    RESULTS['when stopped'] = partial
+    if lid_ready(dev) or not any(n.endswith('.part') for n in partial):
+        raise NotRun(f'could not stop it mid-download: {partial}')
+    dev.shell('am', 'force-stop', PACKAGE)
+    mark = dev.mark()
+    dev.shell('am', 'start', '-n', f'{PACKAGE}/com.google.android.apps.chrome.Main')
+    started = time.time()
+    end = started + 180
+    while time.time() < end and not lid_ready(dev):
+        time.sleep(1)
+    RESULTS['seconds to ready after relaunch'] = round(time.time() - started, 1)
+    log = dev.log_since(mark, '-s', 'chromium:*')
+    RESULTS['log after relaunch'] = [l.split('] ', 1)[-1] for l in log.splitlines()
+                                     if 'tark captions' in l][:12]
+    files = lid_files(dev)
+    RESULTS['files'] = files
+    if not lid_ready(dev):
+        return f'not finished 180 s after the relaunch: {files}'
+    stale = [n for n in files if n.endswith('.part')]
+    if stale:
+        return f'partial files left: {stale}'
+    open_voice_languages(dev)
+    xml = find_scrolling(dev, DETECT, swipes=14)
+    RESULTS['row'] = detection_row(xml)
+    if 'Remove' not in detection_row(xml):
+        return f'the row is not on: {detection_row(xml)}'
     return ''
 
 
@@ -922,7 +974,9 @@ def case_detection_netlog(dev):
     open_voice_languages(dev)
     if not find_scrolling(dev, DETECT, swipes=14) or not xlit.tap_text(dev, 'Get'):
         return 'no Get button'
-    end = time.time() + 240
+    # Retries back off up to 5 min (CaptionDownloads); the emulator's QUIC
+    # is flaky, so allow two of them.
+    end = time.time() + 600
     while time.time() < end and not lid_ready(dev):
         time.sleep(2)
     if not lid_ready(dev):
