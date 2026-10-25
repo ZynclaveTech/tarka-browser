@@ -114,17 +114,14 @@ transcript is ready about 0.5 s after speech ends. If it waits for `onResults`, 
 is ready as soon as the client closes the pipe. Either way the pipe adds no
 measurable latency of its own; I can't separate it from the 120 ms partial cadence.
 
-## Step 2 on the phone (PENDING: needs the user's approval for the run)
+## Step 2 on the phone (PENDING: approved for one run, which the controller performs)
 
-This is not run. Step 2 also needs an `AudioRecord` mic-capture mode added to the
-spike (with RECORD_AUDIO), which does not exist yet. The file-replay modes can run on
-the phone as they are:
+`Main` activity (live mic, tag `SpeechSpike`), modes:
+- `pipe`: AudioRecord (VOICE_RECOGNITION, 16 kHz mono PCM16) into the EXTRA_AUDIO_SOURCE pipe for 6 s, en-US
+- `normal`: the recognizer's own mic, en-US (latency baseline)
+- `switch`: en-US for 3 s, then cancel, then a new session in en-IN (or en-US if en-IN is not installed). The 3 s buffer is written first, then live audio, and the pipe closes at 7 s.
 
-```sh
-cd android/speech/spike && ./build.sh && adb -s bf678949 install -r out/spike.apk
-./run.sh bf678949 check en-US 5
-./run.sh bf678949 pipe en-US 10
-./run.sh bf678949 file en-US 5
-LANG2=hi-IN ./run.sh bf678949 replay en-US 10   # or LANG2=en-US if only one pack
-adb -s bf678949 uninstall com.gettarka.speechspike
-```
+Run: `cd android/speech/spike && ./build.sh && ./run-phone.sh bf678949`. The script installs
+the app with `-g`, then runs `pm grant ... RECORD_AUDIO`; if the phone refuses, tap Allow
+when the dialog appears. It prompts with a 3-2-1 countdown, saves `phone-<mode>.log`,
+and uninstalls the app at the end.
