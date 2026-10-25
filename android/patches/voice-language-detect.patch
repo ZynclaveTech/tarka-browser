@@ -1,0 +1,3202 @@
+diff '--color=never' -ruN a/chrome/android/BUILD.gn b/chrome/android/BUILD.gn
+--- a/chrome/android/BUILD.gn	2026-10-25 17:34:18.223221177 +0530
++++ b/chrome/android/BUILD.gn	2026-10-25 17:34:18.193722552 +0530
+@@ -474,6 +474,7 @@
+       "//chrome/browser/ntp_customization:public_java",
+       "//chrome/browser/omaha/android:java",
+       "//chrome/browser/tark_captions_android/android:java",
++      "//chrome/browser/tark_voice_android/android:java",
+       "//chrome/browser/open_in_app/android:java",
+       "//chrome/browser/optimization_guide/android:java",
+       "//chrome/browser/page_content_annotations:java",
+diff '--color=never' -ruN a/chrome/android/chrome_java_sources.gni b/chrome/android/chrome_java_sources.gni
+--- a/chrome/android/chrome_java_sources.gni	2026-10-25 17:34:18.257697940 +0530
++++ b/chrome/android/chrome_java_sources.gni	2026-10-25 17:34:18.229844668 +0530
+@@ -1149,6 +1149,7 @@
+   "java/src/org/chromium/chrome/browser/site_settings/ChromeSiteSettingsDelegate.java",
+   "java/src/org/chromium/chrome/browser/site_settings/ManageSpaceActivity.java",
+   "java/src/org/chromium/chrome/browser/speech/SpeechLanguageSnackbar.java",
++  "java/src/org/chromium/chrome/browser/speech/VoiceDetection.java",
+   "java/src/org/chromium/chrome/browser/speech/VoiceDetector.java",
+   "java/src/org/chromium/chrome/browser/speech/VoiceLanguageOffer.java",
+   "java/src/org/chromium/chrome/browser/speech/VoiceLanguageSignals.java",
+diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/speech/SpeechLanguageSnackbar.java b/chrome/android/java/src/org/chromium/chrome/browser/speech/SpeechLanguageSnackbar.java
+--- a/chrome/android/java/src/org/chromium/chrome/browser/speech/SpeechLanguageSnackbar.java	2026-10-25 17:34:18.292884920 +0530
++++ b/chrome/android/java/src/org/chromium/chrome/browser/speech/SpeechLanguageSnackbar.java	2026-10-25 17:34:18.264371807 +0530
+@@ -121,6 +121,12 @@
+     }
+ 
+     @Override
++    public SpeechRecognition.@Nullable AudioSource audioSourceFor(String origin, String bcp47) {
++        // Spoken-language detection, when it is on: Tark captures the session's audio.
++        return VoiceDetection.audioSourceFor(mContext, origin, bcp47);
++    }
++
++    @Override
+     public @Nullable String languageFor(String origin) {
+         return VoiceSiteLanguages.get(origin);
+     }
+@@ -186,24 +192,38 @@
+     }
+ 
+     private void show(String text, @Nullable Runnable download) {
+-        SnackbarManager manager = mPlatform.getSnackbarManager();
++        showSnackbar(
++                mPlatform.getSnackbarManager(),
++                text,
++                mContext.getString(R.string.tark_speech_language_download),
++                download);
++    }
++
++    /**
++     * Shows voice's snackbar: {@code text}, with {@code actionText} running {@code action} when
++     * there is one. Also the variants that name the language the person spoke (spoken-language
++     * detection: "That sounded like Tamil. Voice search needs Tamil on this phone.").
++     */
++    static void showSnackbar(
++            @Nullable SnackbarManager manager,
++            String text,
++            String actionText,
++            @Nullable Runnable action) {
+         if (manager == null) return;
+         SnackbarManager.SnackbarController controller =
+                 new SnackbarManager.SnackbarController() {
+                     @Override
+                     public void onAction(@Nullable Object actionData) {
+-                        if (download != null) download.run();
++                        if (action != null) action.run();
+                     }
+                 };
+         Snackbar snackbar =
+                 Snackbar.make(
+                         text,
+-                        download != null ? controller : null,
+-                        download != null ? Snackbar.TYPE_ACTION : Snackbar.TYPE_NOTIFICATION,
++                        action != null ? controller : null,
++                        action != null ? Snackbar.TYPE_ACTION : Snackbar.TYPE_NOTIFICATION,
+                         Snackbar.UMA_UNKNOWN);
+-        if (download != null) {
+-            snackbar.setAction(mContext.getString(R.string.tark_speech_language_download), null);
+-        }
++        if (action != null) snackbar.setAction(actionText, null);
+         manager.showSnackbar(snackbar);
+     }
+ 
+diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceDetection.java b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceDetection.java
+--- a/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceDetection.java	1970-01-01 05:30:00.000000000 +0530
++++ b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceDetection.java	2026-10-25 17:34:18.299286575 +0530
+@@ -0,0 +1,887 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++package org.chromium.chrome.browser.speech;
++
++import static org.chromium.build.NullUtil.assumeNonNull;
++
++import android.Manifest;
++import android.app.Activity;
++import android.content.Context;
++import android.content.pm.PackageManager;
++import android.media.AudioFormat;
++import android.media.AudioRecord;
++import android.media.MediaRecorder;
++import android.os.Build;
++import android.os.ParcelFileDescriptor;
++import android.os.Process;
++import android.os.SystemClock;
++import android.speech.RecognitionSupport;
++import android.text.TextUtils;
++
++import androidx.annotation.RequiresApi;
++import androidx.annotation.VisibleForTesting;
++
++import org.chromium.base.ApplicationStatus;
++import org.chromium.base.Callback;
++import org.chromium.base.Log;
++import org.chromium.base.ResettersForTesting;
++import org.chromium.base.task.PostTask;
++import org.chromium.base.task.SequencedTaskRunner;
++import org.chromium.base.task.TaskTraits;
++import org.chromium.build.annotations.NullMarked;
++import org.chromium.build.annotations.Nullable;
++import org.chromium.chrome.R;
++import org.chromium.chrome.browser.tark_captions.TarkCaptionsBridge;
++import org.chromium.chrome.browser.tark_voice.VoiceLanguageDetector;
++import org.chromium.chrome.browser.ui.messages.snackbar.SnackbarManager;
++import org.chromium.content_public.browser.SpeechRecognition;
++
++import java.io.IOException;
++import java.io.OutputStream;
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.List;
++import java.util.Locale;
++import java.util.Map;
++import java.util.concurrent.ExecutorService;
++import java.util.concurrent.Executor;
++import java.util.concurrent.Executors;
++import java.util.concurrent.atomic.AtomicBoolean;
++import java.util.concurrent.atomic.AtomicReference;
++
++/**
++ * Tark: spoken-language detection during a voice search (spec §3, M4–M6).
++ *
++ * <p>With detection on (the {@code language_id} model is on the phone and the person turned it on,
++ * Android 13+, Tark holds RECORD_AUDIO), Tark captures the microphone itself at 16 kHz mono and
++ * hands Android's recognizer that audio through a pipe, as it is captured. The same audio goes
++ * into the detector's 15 s ring (memory only, dropped when the session ends), which captions'
++ * detector reads on a background sequence. The recognizer's results reach the page exactly as
++ * before; detection never holds them back.
++ *
++ * <p>When the detector names a language the session isn't in, {@link #decide} says what the person
++ * sees: nothing; while the session runs (its first 15 s) and the phone has the language, "Sounds
++ * like Hindi · Switch", which carries on in Hindi from the start of what was said; after the
++ * session, "That sounded like Hindi · Use Hindi next time"; or, when the phone lacks it, "That
++ * sounded like Tamil. Voice search needs Tamil on this phone." with Download. Tark changes the
++ * language only on the person's tap. A private tab's session has no origin: nothing is remembered
++ * for it, and "Use … next time" is not offered.
++ *
++ * <p>Threads: the UI thread (the session, its decisions and snackbars), a capture thread (the
++ * microphone, the ring, the pipe), a writer per pipe (writes block while the recognizer catches
++ * up, never faster than {@link #REPLAY_SPEEDUP} times real time), and the detector's sequence.
++ */
++@NullMarked
++public final class VoiceDetection {
++    /** What the person sees when the detector names a language. */
++    public enum Decision {
++        /** Nothing: the same language, unsure, or one Android can't recognize. */
++        QUIET,
++        /** "Sounds like Hindi · Switch", while the session runs. */
++        SWITCH_CHIP,
++        /** "That sounded like Hindi · Use Hindi next time", after the session. */
++        NEXT_TIME,
++        /** "That sounded like Tamil. Voice search needs Tamil on this phone." with Download. */
++        NEEDS_PACK,
++    }
++
++    private static final String TAG = "VoiceDetection";
++
++    /** How far into a session the chip is offered: the ring can't replay further back. */
++    @VisibleForTesting static final long CHIP_WINDOW_MS = 15_000;
++
++    @VisibleForTesting static final int SAMPLE_RATE = 16_000;
++    // 20 ms of audio, the capture's and the pipe's unit.
++    @VisibleForTesting static final int CHUNK_SAMPLES = 320;
++    // The detector reads what is new every 200 ms.
++    @VisibleForTesting static final int PROCESS_EVERY_CHUNKS = 10;
++    // A replay goes into the new pipe at up to twice real time: faster than real time loses
++    // speech on some recognizers, but the new recognizer has to catch up with the live audio.
++    @VisibleForTesting static final int REPLAY_SPEEDUP = 2;
++
++    // VoxLingua107's and Java's old codes, and Android's tags, as one language each.
++    private static final Map<String, String> SAME_LANGUAGE =
++            Map.of("iw", "he", "jw", "jv", "in", "id", "ji", "yi", "no", "nb", "ur", "hi");
++
++    /** Android's speech languages: on the phone, and what it can download. */
++    @VisibleForTesting
++    static final class Languages {
++        final List<String> installed;
++        final List<String> downloadable;
++
++        Languages(List<String> installed, List<String> downloadable) {
++            this.installed = installed;
++            this.downloadable = downloadable;
++        }
++    }
++
++    /** The microphone; replaced in tests. */
++    @VisibleForTesting
++    interface Mic {
++        boolean start();
++
++        /** Fills {@code buffer} with 16 kHz mono PCM16; the count read, or ≤ 0 at the end. */
++        int read(short[] buffer);
++
++        void release();
++    }
++
++    /** A pipe to the recognizer. */
++    @VisibleForTesting
++    static final class Pipe {
++        final ParcelFileDescriptor readEnd;
++        final OutputStream writeEnd;
++
++        Pipe(ParcelFileDescriptor readEnd, OutputStream writeEnd) {
++            this.readEnd = readEnd;
++            this.writeEnd = writeEnd;
++        }
++    }
++
++    /** The session's detector ({@link VoiceLanguageDetector}); replaced in tests. */
++    @VisibleForTesting
++    interface Detector {
++        void append(short[] pcm, int length);
++
++        short[] buffered();
++
++        boolean load(String modelsDir);
++
++        @Nullable String process();
++
++        @Nullable String finish();
++
++        void destroy();
++    }
++
++    /** Android's and Tark's pieces; replaced in tests. */
++    @VisibleForTesting
++    interface Host {
++        boolean hasRecordPermission();
++
++        /** Whether voice wants the language_id unit and it is on the phone. */
++        boolean isDetectionOn();
++
++        String modelsDir();
++
++        /** Holds (or releases) the language_id unit, so a removal waits for the release. */
++        void setUnitInUse(boolean inUse);
++
++        @Nullable Mic openMic();
++
++        @Nullable Pipe createPipe();
++
++        Detector newDetector();
++
++        void startThread(Runnable task, String name);
++
++        Executor newWriterExecutor();
++
++        void sleepMs(long ms);
++
++        void runOnDetectorSequence(Runnable task);
++
++        void runOnUiThread(Runnable task);
++
++        long now();
++
++        /** Android's speech languages, or null if it can't say; on the UI thread. */
++        void languages(Callback<@Nullable Languages> callback);
++
++        boolean switchLanguage(String bcp47);
++
++        @Nullable SnackbarManager snackbarManager();
++
++        void download(String bcp47);
++
++        Context context();
++    }
++
++    private static @Nullable Host sHostForTesting;
++    // Android's latest answer about its speech languages, or null while unknown. Never asked
++    // during a session: only after one ends, or when Voice languages asks.
++    private static @Nullable Languages sLanguages;
++
++    private VoiceDetection() {}
++
++    @VisibleForTesting
++    static void setHostForTesting(@Nullable Host host) {
++        sHostForTesting = host;
++        ResettersForTesting.register(
++                () -> {
++                    sHostForTesting = null;
++                    sLanguages = null;
++                });
++    }
++
++    @VisibleForTesting
++    static void setLanguagesForTesting(@Nullable Languages languages) {
++        sLanguages = languages;
++    }
++
++    /**
++     * The audio for a session that starts, if detection runs for it; else null, and Android's
++     * recognizer uses the microphone as without detection.
++     */
++    public static SpeechRecognition.@Nullable AudioSource audioSourceFor(
++            Context context, String origin, String bcp47) {
++        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return null;
++        Host host = sHostForTesting != null ? sHostForTesting : new AndroidHost(context);
++        // Tark's own capture needs Tark's own permission, whatever the site was granted.
++        if (!host.hasRecordPermission()) return null;
++        if (!host.isDetectionOn()) return null;
++        return new Session(host, origin, bcp47);
++    }
++
++    /** Android's latest answer, from Voice languages or the site languages' check. */
++    static void onSupport(@Nullable RecognitionSupport support) {
++        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return;
++        sLanguages = languagesOf(support);
++    }
++
++    @RequiresApi(Build.VERSION_CODES.TIRAMISU)
++    private static @Nullable Languages languagesOf(@Nullable RecognitionSupport support) {
++        if (support == null) return null;
++        List<String> downloadable = new ArrayList<>(support.getSupportedOnDeviceLanguages());
++        downloadable.addAll(support.getPendingOnDeviceLanguages());
++        return new Languages(
++                new ArrayList<>(support.getInstalledOnDeviceLanguages()), downloadable);
++    }
++
++    /**
++     * What the person sees when the detector heard {@code heardLang} in a session in {@code
++     * sessionTag}.
++     *
++     * @param sessionTag The language the session listens in (BCP 47).
++     * @param heardLang The detector's language (a VoxLingua code: "hi", "en"), or "und".
++     * @param sessionRunning Whether the session still listens.
++     * @param msSinceStart How long ago the session started.
++     * @param heardInstalled Whether the phone has the heard language.
++     * @param heardDownloadable Whether Android can download it.
++     */
++    public static Decision decide(
++            String sessionTag,
++            String heardLang,
++            boolean sessionRunning,
++            long msSinceStart,
++            boolean heardInstalled,
++            boolean heardDownloadable) {
++        if (TextUtils.isEmpty(heardLang) || VoiceLanguageDetector.UNSURE.equals(heardLang)) {
++            return Decision.QUIET;
++        }
++        if (sameLanguage(sessionTag, heardLang)) return Decision.QUIET;
++        if (heardInstalled) {
++            return sessionRunning && msSinceStart <= CHIP_WINDOW_MS
++                    ? Decision.SWITCH_CHIP
++                    : Decision.NEXT_TIME;
++        }
++        return heardDownloadable ? Decision.NEEDS_PACK : Decision.QUIET;
++    }
++
++    /** One language's code, whatever form names it ("iw" and "he"; Urdu as Hindi). */
++    @VisibleForTesting
++    static String languageOf(String code) {
++        String language = code.toLowerCase(Locale.ROOT);
++        String same = SAME_LANGUAGE.get(language);
++        return same != null ? same : language;
++    }
++
++    /** Whether a tag ("en-US") and a code ("en") name the same language, region aside. */
++    @VisibleForTesting
++    static boolean sameLanguage(String tag, String code) {
++        String language = Locale.forLanguageTag(tag).getLanguage();
++        return !language.isEmpty() && languageOf(language).equals(languageOf(code));
++    }
++
++    /**
++     * The tag among {@code tags} (Android's) for the heard language, preferring the session's
++     * region, then the phone's; null if none is for it.
++     */
++    @VisibleForTesting
++    static @Nullable String tagFor(String heard, List<String> tags, String sessionTag) {
++        String language = languageOf(heard);
++        String sessionRegion = Locale.forLanguageTag(sessionTag).getCountry();
++        String phoneRegion = Locale.getDefault().getCountry();
++        String best = null;
++        int bestScore = -1;
++        for (String tag : tags) {
++            if (!SpeechLanguageSnackbar.isWellFormedTag(tag)) continue;
++            Locale locale = Locale.forLanguageTag(tag);
++            if (!languageOf(locale.getLanguage()).equals(language)) continue;
++            String region = locale.getCountry();
++            int score =
++                    !region.isEmpty() && region.equals(sessionRegion)
++                            ? 3
++                            : !region.isEmpty() && region.equals(phoneRegion) ? 2 : 1;
++            if (score > bestScore) {
++                best = tag;
++                bestScore = score;
++            }
++        }
++        return best;
++    }
++
++    /** One voice search session's capture, detection and offer. UI thread unless noted. */
++    @VisibleForTesting
++    static final class Session implements SpeechRecognition.AudioSource {
++        private final Host mHost;
++        private final String mOrigin;
++        private final Detector mDetector;
++        private final long mStartMs;
++        // The language the recognizer listens in (the switched-to one after a switch).
++        private String mTag;
++        private @Nullable Capture mCapture;
++        private boolean mOpened;
++        private boolean mEnded;
++        private boolean mSwitched;
++        private @Nullable String mHeard;
++        private boolean mOffered;
++        private boolean mAsking;
++        // Touched only on the detector's sequence.
++        private boolean mLoaded;
++
++        Session(Host host, String origin, String tag) {
++            mHost = host;
++            mOrigin = origin;
++            mTag = tag;
++            mDetector = host.newDetector();
++            mStartMs = host.now();
++        }
++
++        @Override
++        public @Nullable ParcelFileDescriptor open() {
++            if (mOpened || mEnded) return null;
++            mOpened = true;
++            Pipe pipe = mHost.createPipe();
++            Mic mic = pipe != null ? mHost.openMic() : null;
++            if (pipe == null || mic == null) {
++                if (pipe != null) closeQuietly(pipe);
++                return null;
++            }
++            // Held while the detector may read its files; released when it is gone.
++            mHost.setUnitInUse(true);
++            String modelsDir = mHost.modelsDir();
++            mHost.runOnDetectorSequence(() -> mLoaded = mDetector.load(modelsDir));
++            Capture capture = new Capture(mic, new Writer(pipe.writeEnd));
++            mCapture = capture;
++            mHost.startThread(capture, "TarkVoiceCapture");
++            return pipe.readEnd;
++        }
++
++        @Override
++        public @Nullable ParcelFileDescriptor replay() {
++            Capture capture = mCapture;
++            if (capture == null || mEnded) return null;
++            Pipe pipe = mHost.createPipe();
++            if (pipe == null) return null;
++            capture.replayInto(new Writer(pipe.writeEnd));
++            return pipe.readEnd;
++        }
++
++        @Override
++        public void close() {
++            if (mEnded) return;
++            mEnded = true;
++            Capture capture = mCapture;
++            if (capture != null) {
++                // The capture thread stops, then the detector decides on what it heard and
++                // drops the audio (finishDetector()).
++                capture.stop();
++            } else {
++                mHost.runOnDetectorSequence(mDetector::destroy);
++            }
++            maybeOffer();
++        }
++
++        // Detector's sequence: the audio appended since the last read.
++        private void process() {
++            if (!mLoaded) return;
++            String heard = mDetector.process();
++            if (heard != null) mHost.runOnUiThread(() -> onHeard(heard));
++        }
++
++        // Detector's sequence, once the capture stopped: the last decision, then the audio goes.
++        private void finishDetector() {
++            String heard = mLoaded ? mDetector.finish() : null;
++            mDetector.destroy();
++            mHost.runOnUiThread(
++                    () -> {
++                        mHost.setUnitInUse(false);
++                        if (heard != null) onHeard(heard);
++                    });
++        }
++
++        @VisibleForTesting
++        void onHeard(String heard) {
++            if (mHeard != null) return;
++            mHeard = heard;
++            maybeOffer();
++        }
++
++        /** Decides, once the detector has, and once what Android has is known. */
++        private void maybeOffer() {
++            String heard = mHeard;
++            if (mOffered || heard == null) return;
++            if (decide(mTag, heard, true, 0, true, true) == Decision.QUIET) {
++                mOffered = true;
++                return;
++            }
++            Languages languages = sLanguages;
++            if (languages == null) {
++                // Android is asked only once the session's recognizer is gone.
++                if (!mEnded || mAsking) return;
++                mAsking = true;
++                mHost.languages(
++                        answer -> {
++                            mAsking = false;
++                            if (answer == null) {
++                                mOffered = true;
++                                return;
++                            }
++                            sLanguages = answer;
++                            maybeOffer();
++                        });
++                return;
++            }
++            String installed = tagFor(heard, languages.installed, mTag);
++            String downloadable = tagFor(heard, languages.downloadable, mTag);
++            Decision decision =
++                    decide(
++                            mTag,
++                            heard,
++                            !mEnded,
++                            mHost.now() - mStartMs,
++                            installed != null,
++                            downloadable != null);
++            // "Use … next time" comes after the session.
++            if (decision == Decision.NEXT_TIME && !mEnded) return;
++            mOffered = true;
++            String name = displayName(mHost.context(), heard);
++            if (name == null) return;
++            switch (decision) {
++                case SWITCH_CHIP:
++                    showSwitch(name, assumeNonNull(installed));
++                    break;
++                case NEXT_TIME:
++                    // Nothing to remember for a private tab.
++                    if (TextUtils.isEmpty(mOrigin)) return;
++                    showNextTime(name, assumeNonNull(installed));
++                    break;
++                case NEEDS_PACK:
++                    showNeedsPack(name, assumeNonNull(downloadable));
++                    break;
++                case QUIET:
++                    break;
++            }
++        }
++
++        private void showSwitch(String name, String tag) {
++            Context context = mHost.context();
++            SpeechLanguageSnackbar.showSnackbar(
++                    mHost.snackbarManager(),
++                    context.getString(R.string.tark_voice_heard_switch, name),
++                    context.getString(R.string.tark_voice_heard_switch_action),
++                    () -> {
++                        // The person chose it: this site starts in it from now on too.
++                        if (!mEnded && mHost.switchLanguage(tag)) {
++                            mSwitched = true;
++                            mTag = tag;
++                        }
++                        remember(tag);
++                    });
++        }
++
++        private void showNextTime(String name, String tag) {
++            Context context = mHost.context();
++            SpeechLanguageSnackbar.showSnackbar(
++                    mHost.snackbarManager(),
++                    context.getString(R.string.tark_voice_heard, name),
++                    context.getString(R.string.tark_voice_heard_use_next_time, name),
++                    () -> remember(tag));
++        }
++
++        private void showNeedsPack(String name, String tag) {
++            Context context = mHost.context();
++            SpeechLanguageSnackbar.showSnackbar(
++                    mHost.snackbarManager(),
++                    context.getString(R.string.tark_voice_heard_missing, name),
++                    context.getString(R.string.tark_speech_language_download),
++                    () -> {
++                        mHost.download(tag);
++                        // The next session here starts in it once it is on the phone, as if
++                        // "Use … next time" had been tapped.
++                        remember(tag);
++                    });
++        }
++
++        private void remember(String tag) {
++            // A private tab's session has no origin: nothing is stored for it.
++            if (TextUtils.isEmpty(mOrigin)) return;
++            VoiceSiteLanguages.set(mOrigin, tag);
++        }
++
++        @VisibleForTesting
++        boolean isSwitchedForTesting() {
++            return mSwitched;
++        }
++
++        /**
++         * The capture thread: reads the microphone in 20 ms chunks, appends each to the ring and
++         * writes it to the current pipe; a replay writes the ring into a new pipe first.
++         */
++        private final class Capture implements Runnable {
++            private final Mic mMic;
++            private final AtomicReference<@Nullable Writer> mReplay = new AtomicReference<>();
++            private volatile boolean mStopped;
++            // Capture thread only.
++            private Writer mWriter;
++
++            Capture(Mic mic, Writer writer) {
++                mMic = mic;
++                mWriter = writer;
++            }
++
++            void replayInto(Writer writer) {
++                Writer previous = mReplay.getAndSet(writer);
++                if (previous != null) previous.close();
++                if (mStopped) {
++                    Writer left = mReplay.getAndSet(null);
++                    if (left != null) left.close();
++                }
++            }
++
++            void stop() {
++                mStopped = true;
++            }
++
++            @Override
++            public void run() {
++                try {
++                    if (!mMic.start()) return;
++                    short[] buffer = new short[CHUNK_SAMPLES];
++                    int chunks = 0;
++                    while (!mStopped) {
++                        int read = mMic.read(buffer);
++                        if (read <= 0) break;
++                        Writer replay = mReplay.getAndSet(null);
++                        if (replay != null) {
++                            // Everything held so far, then the live audio from this chunk on.
++                            replay.write(mDetector.buffered());
++                            mWriter.close();
++                            mWriter = replay;
++                        }
++                        mDetector.append(buffer, read);
++                        mWriter.write(Arrays.copyOf(buffer, read));
++                        if (++chunks % PROCESS_EVERY_CHUNKS == 0) {
++                            mHost.runOnDetectorSequence(Session.this::process);
++                        }
++                    }
++                } catch (RuntimeException e) {
++                    Log.w(TAG, "Capture ended", e);
++                } finally {
++                    mStopped = true;
++                    mMic.release();
++                    mWriter.close();
++                    Writer replay = mReplay.getAndSet(null);
++                    if (replay != null) replay.close();
++                    mHost.runOnDetectorSequence(Session.this::finishDetector);
++                }
++            }
++        }
++
++        /** Writes PCM16 into one pipe, on its own executor; drops writes once it broke. */
++        private final class Writer {
++            private final OutputStream mOut;
++            private final Executor mExecutor;
++            private final AtomicBoolean mClosed = new AtomicBoolean();
++            // The writer's executor only.
++            private boolean mBroken;
++            private long mFirstWriteMs = -1;
++            private long mWrittenSamples;
++
++            Writer(OutputStream out) {
++                mOut = out;
++                mExecutor = mHost.newWriterExecutor();
++            }
++
++            void write(short[] pcm) {
++                mExecutor.execute(() -> writeNow(pcm));
++            }
++
++            void close() {
++                if (!mClosed.compareAndSet(false, true)) return;
++                mExecutor.execute(
++                        () -> {
++                            mBroken = true;
++                            try {
++                                mOut.close();
++                            } catch (IOException e) {
++                                // Gone either way.
++                            }
++                        });
++                if (mExecutor instanceof ExecutorService service) service.shutdown();
++            }
++
++            private void writeNow(short[] pcm) {
++                if (mBroken) return;
++                if (mFirstWriteMs < 0) mFirstWriteMs = mHost.now();
++                byte[] bytes = new byte[CHUNK_SAMPLES * 2];
++                try {
++                    for (int start = 0; start < pcm.length; start += CHUNK_SAMPLES) {
++                        int count = Math.min(CHUNK_SAMPLES, pcm.length - start);
++                        // Never faster than REPLAY_SPEEDUP times real time.
++                        long due =
++                                mFirstWriteMs
++                                        + mWrittenSamples * 1000 / SAMPLE_RATE / REPLAY_SPEEDUP;
++                        long wait = due - mHost.now();
++                        if (wait > 0) mHost.sleepMs(wait);
++                        for (int i = 0; i < count; i++) {
++                            short sample = pcm[start + i];
++                            bytes[2 * i] = (byte) sample;
++                            bytes[2 * i + 1] = (byte) (sample >> 8);
++                        }
++                        mOut.write(bytes, 0, count * 2);
++                        mWrittenSamples += count;
++                    }
++                } catch (IOException e) {
++                    // The recognizer went away (cancelled, switched, ended).
++                    mBroken = true;
++                }
++            }
++        }
++    }
++
++    private static void closeQuietly(Pipe pipe) {
++        try {
++            pipe.readEnd.close();
++        } catch (IOException e) {
++            // Gone either way.
++        }
++        try {
++            pipe.writeEnd.close();
++        } catch (IOException e) {
++            // Gone either way.
++        }
++    }
++
++    /** The language's name in the UI's language ("Hindi"), or null if Android has none. */
++    private static @Nullable String displayName(Context context, String code) {
++        Locale language = Locale.forLanguageTag(languageOf(code));
++        Locale ui = context.getResources().getConfiguration().getLocales().get(0);
++        String name = language.getDisplayLanguage(ui);
++        if (TextUtils.isEmpty(name) || name.equalsIgnoreCase(language.getLanguage())) return null;
++        return name;
++    }
++
++    /** The real pieces. */
++    private static final class AndroidHost implements Host {
++        private static @Nullable SequencedTaskRunner sDetectorSequence;
++        private final Context mContext;
++
++        AndroidHost(Context context) {
++            mContext = context.getApplicationContext();
++        }
++
++        @Override
++        public boolean hasRecordPermission() {
++            return mContext.checkSelfPermission(Manifest.permission.RECORD_AUDIO)
++                    == PackageManager.PERMISSION_GRANTED;
++        }
++
++        @Override
++        public boolean isDetectionOn() {
++            return VoiceDetector.status().isOn();
++        }
++
++        @Override
++        public String modelsDir() {
++            return TarkCaptionsBridge.getUnitDir(TarkCaptionsBridge.LANGUAGE_ID_UNIT);
++        }
++
++        @Override
++        public void setUnitInUse(boolean inUse) {
++            TarkCaptionsBridge.setUnitInUse(TarkCaptionsBridge.LANGUAGE_ID_UNIT, inUse);
++        }
++
++        @Override
++        public @Nullable Mic openMic() {
++            int minimum =
++                    AudioRecord.getMinBufferSize(
++                            SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT);
++            if (minimum <= 0) return null;
++            AudioRecord record;
++            try {
++                // A second of slack: the capture thread may wait on a replay's first write.
++                record =
++                        new AudioRecord(
++                                MediaRecorder.AudioSource.VOICE_RECOGNITION,
++                                SAMPLE_RATE,
++                                AudioFormat.CHANNEL_IN_MONO,
++                                AudioFormat.ENCODING_PCM_16BIT,
++                                Math.max(minimum, SAMPLE_RATE * 2));
++            } catch (IllegalArgumentException | SecurityException e) {
++                Log.w(TAG, "No microphone", e);
++                return null;
++            }
++            if (record.getState() != AudioRecord.STATE_INITIALIZED) {
++                record.release();
++                return null;
++            }
++            return new Mic() {
++                @Override
++                public boolean start() {
++                    Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO);
++                    try {
++                        record.startRecording();
++                    } catch (IllegalStateException | SecurityException e) {
++                        Log.w(TAG, "Recording refused", e);
++                        return false;
++                    }
++                    return record.getRecordingState() == AudioRecord.RECORDSTATE_RECORDING;
++                }
++
++                @Override
++                public int read(short[] buffer) {
++                    return record.read(buffer, 0, buffer.length);
++                }
++
++                @Override
++                public void release() {
++                    try {
++                        record.stop();
++                    } catch (IllegalStateException e) {
++                        // Never started.
++                    }
++                    record.release();
++                }
++            };
++        }
++
++        @Override
++        public @Nullable Pipe createPipe() {
++            try {
++                ParcelFileDescriptor[] pipe = ParcelFileDescriptor.createPipe();
++                return new Pipe(
++                        pipe[0], new ParcelFileDescriptor.AutoCloseOutputStream(pipe[1]));
++            } catch (IOException e) {
++                Log.w(TAG, "No pipe", e);
++                return null;
++            }
++        }
++
++        @Override
++        public Detector newDetector() {
++            VoiceLanguageDetector detector = new VoiceLanguageDetector();
++            return new Detector() {
++                @Override
++                public void append(short[] pcm, int length) {
++                    detector.append(pcm, length);
++                }
++
++                @Override
++                public short[] buffered() {
++                    return detector.buffered();
++                }
++
++                @Override
++                public boolean load(String modelsDir) {
++                    return detector.load(modelsDir);
++                }
++
++                @Override
++                public @Nullable String process() {
++                    return detector.process();
++                }
++
++                @Override
++                public @Nullable String finish() {
++                    return detector.finish();
++                }
++
++                @Override
++                public void destroy() {
++                    detector.destroy();
++                }
++            };
++        }
++
++        @Override
++        public void startThread(Runnable task, String name) {
++            new Thread(task, name).start();
++        }
++
++        @Override
++        public Executor newWriterExecutor() {
++            return Executors.newSingleThreadExecutor(task -> new Thread(task, "TarkVoicePipe"));
++        }
++
++        @Override
++        public void sleepMs(long ms) {
++            SystemClock.sleep(ms);
++        }
++
++        @Override
++        public void runOnDetectorSequence(Runnable task) {
++            if (sDetectorSequence == null) {
++                sDetectorSequence =
++                        PostTask.createSequencedTaskRunner(TaskTraits.USER_VISIBLE_MAY_BLOCK);
++            }
++            sDetectorSequence.postTask(task);
++        }
++
++        @Override
++        public void runOnUiThread(Runnable task) {
++            PostTask.postTask(TaskTraits.UI_DEFAULT, task);
++        }
++
++        @Override
++        public long now() {
++            return SystemClock.elapsedRealtime();
++        }
++
++        @Override
++        public void languages(Callback<@Nullable Languages> callback) {
++            try {
++                VoicePlatform.get()
++                        .support(
++                                mContext,
++                                null,
++                                support ->
++                                        callback.onResult(
++                                                Build.VERSION.SDK_INT
++                                                                >= Build.VERSION_CODES.TIRAMISU
++                                                        ? languagesOf(support)
++                                                        : null));
++            } catch (RuntimeException e) {
++                // No recognizer to ask (a binding Android refused).
++                callback.onResult(null);
++            }
++        }
++
++        @Override
++        public boolean switchLanguage(String bcp47) {
++            return SpeechRecognition.switchLanguage(bcp47);
++        }
++
++        @Override
++        public @Nullable SnackbarManager snackbarManager() {
++            Activity activity = ApplicationStatus.getLastTrackedFocusedActivity();
++            if (activity instanceof SnackbarManager.SnackbarManageable manageable) {
++                return manageable.getSnackbarManager();
++            }
++            return null;
++        }
++
++        @Override
++        public void download(String bcp47) {
++            VoicePlatform.get().download(mContext, bcp47, null);
++        }
++
++        @Override
++        public Context context() {
++            return mContext;
++        }
++    }
++}
+diff '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceSiteLanguages.java b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceSiteLanguages.java
+--- a/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceSiteLanguages.java	2026-10-25 17:34:18.343425031 +0530
++++ b/chrome/android/java/src/org/chromium/chrome/browser/speech/VoiceSiteLanguages.java	2026-10-25 17:34:18.316982358 +0530
+@@ -203,6 +203,8 @@
+     @MainThread
+     static void onSupport(@Nullable RecognitionSupport support) {
+         ThreadUtils.assertOnUiThread();
++        // Spoken-language detection decides with the same answer.
++        VoiceDetection.onSupport(support);
+         if (support == null || Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
+             sInstalled = null;
+             return;
+diff '--color=never' -ruN a/chrome/android/junit/BUILD.gn b/chrome/android/junit/BUILD.gn
+--- a/chrome/android/junit/BUILD.gn	2026-10-25 17:34:18.375059554 +0530
++++ b/chrome/android/junit/BUILD.gn	2026-10-25 17:34:18.349071011 +0530
+@@ -1239,6 +1239,7 @@
+     sources = [
+       "src/org/chromium/chrome/browser/speech/AndroidVoicePlatformTest.java",
+       "src/org/chromium/chrome/browser/speech/SpeechLanguageSnackbarTest.java",
++      "src/org/chromium/chrome/browser/speech/VoiceDetectionTest.java",
+       "src/org/chromium/chrome/browser/speech/VoiceLanguageOfferTest.java",
+       "src/org/chromium/chrome/browser/speech/VoiceLanguageSignalsTest.java",
+       "src/org/chromium/chrome/browser/speech/VoiceLanguagesSettingsTest.java",
+diff '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceDetectionTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceDetectionTest.java
+--- a/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceDetectionTest.java	1970-01-01 05:30:00.000000000 +0530
++++ b/chrome/android/junit/src/org/chromium/chrome/browser/speech/VoiceDetectionTest.java	2026-10-25 17:34:18.381270499 +0530
+@@ -0,0 +1,568 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++package org.chromium.chrome.browser.speech;
++
++import static org.junit.Assert.assertArrayEquals;
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.assertNotNull;
++import static org.junit.Assert.assertNull;
++import static org.junit.Assert.assertTrue;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.never;
++import static org.mockito.Mockito.verify;
++
++import android.content.Context;
++import android.os.ParcelFileDescriptor;
++
++import androidx.test.core.app.ApplicationProvider;
++
++import org.junit.Before;
++import org.junit.Test;
++import org.junit.runner.RunWith;
++import org.mockito.ArgumentCaptor;
++import org.robolectric.annotation.Config;
++
++import org.chromium.base.Callback;
++import org.chromium.base.test.BaseRobolectricTestRunner;
++import org.chromium.build.annotations.Nullable;
++import org.chromium.chrome.browser.speech.VoiceDetection.Decision;
++import org.chromium.chrome.browser.ui.messages.snackbar.Snackbar;
++import org.chromium.chrome.browser.ui.messages.snackbar.SnackbarManager;
++import org.chromium.content_public.browser.SpeechRecognition;
++
++import java.io.ByteArrayOutputStream;
++import java.io.File;
++import java.io.IOException;
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.List;
++import java.util.concurrent.Executor;
++
++/** Tests for {@link VoiceDetection}: spoken-language detection during a voice search. */
++@RunWith(BaseRobolectricTestRunner.class)
++@Config(qualifiers = "en-rUS", sdk = 33)
++public class VoiceDetectionTest {
++    private static final String SITE = "https://shodhya.com";
++
++    /** One pipe: what was written into it, and whether it was closed. */
++    private static final class FakePipeOut extends ByteArrayOutputStream {
++        boolean mClosed;
++
++        @Override
++        public void close() {
++            mClosed = true;
++        }
++    }
++
++    /** Stands in for the native detector: its ring is a list, its answers are set by the test. */
++    private static final class FakeDetector implements VoiceDetection.Detector {
++        final List<Short> mRing = new ArrayList<>();
++        @Nullable String mProcessAnswer;
++        @Nullable String mFinishAnswer;
++        boolean mLoaded;
++        boolean mDestroyed;
++
++        @Override
++        public void append(short[] pcm, int length) {
++            for (int i = 0; i < length; i++) mRing.add(pcm[i]);
++        }
++
++        @Override
++        public short[] buffered() {
++            short[] held = new short[mRing.size()];
++            for (int i = 0; i < held.length; i++) held[i] = mRing.get(i);
++            return held;
++        }
++
++        @Override
++        public boolean load(String modelsDir) {
++            mLoaded = true;
++            return true;
++        }
++
++        @Override
++        public @Nullable String process() {
++            String answer = mProcessAnswer;
++            mProcessAnswer = null;
++            return answer;
++        }
++
++        @Override
++        public @Nullable String finish() {
++            return mFinishAnswer;
++        }
++
++        @Override
++        public void destroy() {
++            // The ring goes with the native detector.
++            mRing.clear();
++            mDestroyed = true;
++        }
++    }
++
++    /** Android's and Tark's pieces; threads are queues the test runs. */
++    private final class FakeHost implements VoiceDetection.Host {
++        boolean mPermission = true;
++        boolean mDetectionOn = true;
++        final List<Boolean> mInUse = new ArrayList<>();
++        final List<FakePipeOut> mPipes = new ArrayList<>();
++        final List<ParcelFileDescriptor> mReadEnds = new ArrayList<>();
++        final List<Runnable> mThreads = new ArrayList<>();
++        final List<Runnable> mDetectorTasks = new ArrayList<>();
++        final List<String> mSwitches = new ArrayList<>();
++        final List<String> mDownloads = new ArrayList<>();
++        final FakeDetector mDetector = new FakeDetector();
++        final SnackbarManager mSnackbars = mock(SnackbarManager.class);
++        int mMicsOpened;
++        int mDetectorsMade;
++        int mLanguageChecks;
++        long mNow;
++        // Chunks the microphone gives, then its end; mOnRead runs before read number mOnReadAt.
++        final List<short[]> mChunks = new ArrayList<>();
++        @Nullable Runnable mOnRead;
++        int mOnReadAt = -1;
++        // The live session, which a switch replays into (SpeechRecognitionImpl's part).
++        VoiceDetection.@Nullable Session mSession;
++        @Nullable Callback<VoiceDetection.@Nullable Languages> mLanguagesCallback;
++
++        @Override
++        public boolean hasRecordPermission() {
++            return mPermission;
++        }
++
++        @Override
++        public boolean isDetectionOn() {
++            return mDetectionOn;
++        }
++
++        @Override
++        public String modelsDir() {
++            return "/data/captions/language_id";
++        }
++
++        @Override
++        public void setUnitInUse(boolean inUse) {
++            mInUse.add(inUse);
++        }
++
++        @Override
++        public VoiceDetection.@Nullable Mic openMic() {
++            mMicsOpened++;
++            return new VoiceDetection.Mic() {
++                int mReads;
++
++                @Override
++                public boolean start() {
++                    return true;
++                }
++
++                @Override
++                public int read(short[] buffer) {
++                    if (mReads == mOnReadAt && mOnRead != null) mOnRead.run();
++                    if (mReads >= mChunks.size()) return 0;
++                    short[] chunk = mChunks.get(mReads++);
++                    System.arraycopy(chunk, 0, buffer, 0, chunk.length);
++                    return chunk.length;
++                }
++
++                @Override
++                public void release() {}
++            };
++        }
++
++        @Override
++        public VoiceDetection.@Nullable Pipe createPipe() {
++            try {
++                File file = File.createTempFile("pipe", ".pcm");
++                file.deleteOnExit();
++                ParcelFileDescriptor readEnd =
++                        ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY);
++                FakePipeOut out = new FakePipeOut();
++                mPipes.add(out);
++                mReadEnds.add(readEnd);
++                return new VoiceDetection.Pipe(readEnd, out);
++            } catch (IOException e) {
++                throw new AssertionError(e);
++            }
++        }
++
++        @Override
++        public VoiceDetection.Detector newDetector() {
++            mDetectorsMade++;
++            return mDetector;
++        }
++
++        @Override
++        public void startThread(Runnable task, String name) {
++            mThreads.add(task);
++        }
++
++        @Override
++        public Executor newWriterExecutor() {
++            return Runnable::run;
++        }
++
++        @Override
++        public void sleepMs(long ms) {}
++
++        @Override
++        public void runOnDetectorSequence(Runnable task) {
++            mDetectorTasks.add(task);
++        }
++
++        @Override
++        public void runOnUiThread(Runnable task) {
++            task.run();
++        }
++
++        @Override
++        public long now() {
++            return mNow;
++        }
++
++        @Override
++        public void languages(Callback<VoiceDetection.@Nullable Languages> callback) {
++            mLanguageChecks++;
++            mLanguagesCallback = callback;
++        }
++
++        @Override
++        public boolean switchLanguage(String bcp47) {
++            mSwitches.add(bcp47);
++            // As SpeechRecognitionImpl does: a new recognizer, fed the replay.
++            return mSession != null && mSession.replay() != null;
++        }
++
++        @Override
++        public @Nullable SnackbarManager snackbarManager() {
++            return mSnackbars;
++        }
++
++        @Override
++        public void download(String bcp47) {
++            mDownloads.add(bcp47);
++        }
++
++        @Override
++        public Context context() {
++            return ApplicationProvider.getApplicationContext();
++        }
++
++        void runCapture() {
++            List<Runnable> threads = new ArrayList<>(mThreads);
++            mThreads.clear();
++            for (Runnable thread : threads) thread.run();
++        }
++
++        void runDetector() {
++            while (!mDetectorTasks.isEmpty()) mDetectorTasks.remove(0).run();
++        }
++    }
++
++    private FakeHost mHost;
++
++    @Before
++    public void setUp() {
++        mHost = new FakeHost();
++        VoiceDetection.setHostForTesting(mHost);
++        VoiceDetection.setLanguagesForTesting(null);
++        VoiceSiteLanguages.remove(SITE);
++    }
++
++    /** Chunk i of 20 ms, every sample i + 1. */
++    private static short[] chunk(int i) {
++        short[] pcm = new short[VoiceDetection.CHUNK_SAMPLES];
++        Arrays.fill(pcm, (short) (i + 1));
++        return pcm;
++    }
++
++    private static byte[] bytesOf(int from, int to) {
++        ByteArrayOutputStream out = new ByteArrayOutputStream();
++        for (int i = from; i < to; i++) {
++            for (short sample : chunk(i)) {
++                out.write((byte) sample);
++                out.write((byte) (sample >> 8));
++            }
++        }
++        return out.toByteArray();
++    }
++
++    private void giveChunks(int count) {
++        for (int i = 0; i < count; i++) mHost.mChunks.add(chunk(i));
++    }
++
++    private VoiceDetection.Session open(String origin, String tag) {
++        SpeechRecognition.AudioSource source =
++                VoiceDetection.audioSourceFor(
++                        ApplicationProvider.getApplicationContext(), origin, tag);
++        assertNotNull(source);
++        VoiceDetection.Session session = (VoiceDetection.Session) source;
++        mHost.mSession = session;
++        assertNotNull(session.open());
++        return session;
++    }
++
++    private static VoiceDetection.Languages languages(List<String> installed, List<String> more) {
++        return new VoiceDetection.Languages(installed, more);
++    }
++
++    private Snackbar shown() {
++        ArgumentCaptor<Snackbar> captor = ArgumentCaptor.forClass(Snackbar.class);
++        verify(mHost.mSnackbars).showSnackbar(captor.capture());
++        return captor.getValue();
++    }
++
++    private static void tap(Snackbar snackbar) {
++        assertNotNull(snackbar.getController());
++        snackbar.getController().onAction(snackbar.getActionData());
++    }
++
++    /** A session in en-IN whose detector hears {@code heard} after the session ended. */
++    private VoiceDetection.Session endedHearing(String origin, String heard) {
++        giveChunks(3);
++        VoiceDetection.Session session = open(origin, "en-IN");
++        mHost.mDetector.mFinishAnswer = heard;
++        mHost.runCapture();
++        session.close();
++        mHost.runDetector();
++        return session;
++    }
++
++    // decide().
++
++    @Test
++    public void testSameLanguageDifferentRegionIsQuiet() {
++        assertEquals(Decision.QUIET, VoiceDetection.decide("en-US", "en", true, 4000, true, true));
++        assertEquals(Decision.QUIET, VoiceDetection.decide("en-IN", "en", false, 4000, true, true));
++        // Old and new codes of one language, and Urdu heard in an Urdu session.
++        assertEquals(Decision.QUIET, VoiceDetection.decide("he-IL", "iw", true, 4000, true, true));
++        assertEquals(Decision.QUIET, VoiceDetection.decide("ur-PK", "hi", true, 4000, true, true));
++    }
++
++    @Test
++    public void testUnsureIsQuiet() {
++        assertEquals(Decision.QUIET, VoiceDetection.decide("en-US", "und", true, 4000, true, true));
++        assertEquals(Decision.QUIET, VoiceDetection.decide("en-US", "", true, 4000, true, true));
++    }
++
++    @Test
++    public void testRunningInstalledEarlyIsChip() {
++        assertEquals(
++                Decision.SWITCH_CHIP, VoiceDetection.decide("en-IN", "hi", true, 4000, true, false));
++    }
++
++    @Test
++    public void testRunningAfter15sIsNextTime() {
++        assertEquals(
++                Decision.NEXT_TIME, VoiceDetection.decide("en-IN", "hi", true, 16000, true, false));
++    }
++
++    @Test
++    public void testEndedInstalledIsNextTime() {
++        assertEquals(
++                Decision.NEXT_TIME, VoiceDetection.decide("en-IN", "hi", false, 4000, true, false));
++
++        VoiceDetection.setLanguagesForTesting(
++                languages(List.of("en-IN", "hi-IN"), List.of("ta-IN")));
++        endedHearing(SITE, "hi");
++
++        Snackbar snackbar = shown();
++        assertEquals("That sounded like Hindi", snackbar.getTextForTesting().toString());
++        assertEquals("Use Hindi next time", snackbar.getActionText());
++        assertNull(VoiceSiteLanguages.get(SITE));
++        tap(snackbar);
++        assertEquals("hi-IN", VoiceSiteLanguages.get(SITE));
++    }
++
++    @Test
++    public void testMissingIsNeedsPack() {
++        assertEquals(
++                Decision.NEEDS_PACK, VoiceDetection.decide("en-IN", "ta", true, 4000, false, true));
++        assertEquals(
++                Decision.NEEDS_PACK, VoiceDetection.decide("en-IN", "ta", false, 4000, false, true));
++
++        VoiceDetection.setLanguagesForTesting(
++                languages(List.of("en-IN", "hi-IN"), List.of("ta-IN", "ta-LK")));
++        endedHearing(SITE, "ta");
++
++        Snackbar snackbar = shown();
++        assertEquals(
++                "That sounded like Tamil. Voice search needs Tamil on this phone.",
++                snackbar.getTextForTesting().toString());
++        assertEquals("Download", snackbar.getActionText());
++        tap(snackbar);
++        // The session's region first.
++        assertEquals(List.of("ta-IN"), mHost.mDownloads);
++        assertEquals("ta-IN", VoiceSiteLanguages.get(SITE));
++    }
++
++    @Test
++    public void testNoPackAnywhereIsQuiet() {
++        assertEquals(Decision.QUIET, VoiceDetection.decide("en-IN", "sw", true, 4000, false, false));
++        assertEquals(
++                Decision.QUIET, VoiceDetection.decide("en-IN", "sw", false, 4000, false, false));
++
++        VoiceDetection.setLanguagesForTesting(languages(List.of("en-IN"), List.of("hi-IN")));
++        endedHearing(SITE, "sw");
++
++        verify(mHost.mSnackbars, never()).showSnackbar(any());
++    }
++
++    // The chip: a switch replays the session's audio.
++
++    /**
++     * A session in en-IN with 14 chunks of audio. After the 10th, the detector hears Hindi (4 s
++     * in): the chip is shown and tapped before the 11th chunk is read.
++     */
++    private VoiceDetection.Session switchedSession(String origin) {
++        VoiceDetection.setLanguagesForTesting(
++                languages(List.of("en-IN", "hi-IN"), List.of("ta-IN")));
++        giveChunks(14);
++        VoiceDetection.Session session = open(origin, "en-IN");
++        mHost.mDetector.mProcessAnswer = "hi";
++        mHost.mNow = 4000;
++        mHost.mOnReadAt = 10;
++        mHost.mOnRead =
++                () -> {
++                    // The detector's sequence runs meanwhile: it hears Hindi.
++                    mHost.runDetector();
++                    Snackbar snackbar = shown();
++                    assertEquals("Sounds like Hindi", snackbar.getTextForTesting().toString());
++                    assertEquals("Switch", snackbar.getActionText());
++                    tap(snackbar);
++                };
++        mHost.runCapture();
++        return session;
++    }
++
++    @Test
++    public void testSwitchReplaysBuffer() {
++        VoiceDetection.Session session = switchedSession(SITE);
++
++        assertEquals(List.of("hi-IN"), mHost.mSwitches);
++        assertTrue(session.isSwitchedForTesting());
++        assertEquals(2, mHost.mPipes.size());
++        // The first recognizer's pipe had the first 10 chunks, then ended.
++        assertArrayEquals(bytesOf(0, 10), mHost.mPipes.get(0).toByteArray());
++        assertTrue(mHost.mPipes.get(0).mClosed);
++        // The new one: the 10 buffered chunks first, then the live ones.
++        assertArrayEquals(bytesOf(0, 14), mHost.mPipes.get(1).toByteArray());
++        assertTrue("the pipe ends with the capture", mHost.mPipes.get(1).mClosed);
++    }
++
++    @Test
++    public void testSwitchRemembersSite() {
++        switchedSession(SITE);
++        assertEquals("hi-IN", VoiceSiteLanguages.get(SITE));
++    }
++
++    @Test
++    public void testPrivateTabNeverRemembers() {
++        // A private tab's session has no origin: it may switch, but nothing is stored.
++        switchedSession("");
++        assertEquals(List.of("hi-IN"), mHost.mSwitches);
++        assertTrue(VoiceSiteLanguages.all().isEmpty());
++    }
++
++    @Test
++    public void testPrivateTabNoNextTimeOffer() {
++        VoiceDetection.setLanguagesForTesting(languages(List.of("en-IN", "hi-IN"), List.of()));
++        endedHearing("", "hi");
++        verify(mHost.mSnackbars, never()).showSnackbar(any());
++        assertTrue(VoiceSiteLanguages.all().isEmpty());
++    }
++
++    // When detection runs, and what it holds.
++
++    @Test
++    public void testNoRecordPermissionSkipsDetection() {
++        mHost.mPermission = false;
++        assertNull(
++                VoiceDetection.audioSourceFor(
++                        ApplicationProvider.getApplicationContext(), SITE, "en-IN"));
++        assertEquals(0, mHost.mMicsOpened);
++        assertEquals(0, mHost.mDetectorsMade);
++    }
++
++    @Test
++    public void testDetectionOffNoAudioSource() {
++        mHost.mDetectionOn = false;
++        assertNull(
++                VoiceDetection.audioSourceFor(
++                        ApplicationProvider.getApplicationContext(), SITE, "en-IN"));
++        assertEquals(0, mHost.mMicsOpened);
++        assertEquals(0, mHost.mDetectorsMade);
++    }
++
++    @Test
++    @Config(sdk = 32)
++    public void testBelow33NoAudioSource() {
++        assertNull(
++                VoiceDetection.audioSourceFor(
++                        ApplicationProvider.getApplicationContext(), SITE, "en-IN"));
++        assertEquals(0, mHost.mDetectorsMade);
++    }
++
++    @Test
++    public void testUnitHeldWhileRunningAudioDroppedAtEnd() {
++        giveChunks(5);
++        VoiceDetection.Session session = open(SITE, "en-IN");
++        assertEquals(List.of(true), mHost.mInUse);
++        mHost.runCapture();
++        mHost.runDetector();
++        assertTrue(mHost.mDetector.mLoaded);
++        session.close();
++
++        assertTrue(mHost.mDetector.mDestroyed);
++        assertTrue(mHost.mDetector.mRing.isEmpty());
++        assertEquals(List.of(true, false), mHost.mInUse);
++        assertNull("no replay once ended", session.replay());
++    }
++
++    @Test
++    public void testAndroidAskedOnlyAfterTheSession() {
++        // Unknown languages: no chip while the session runs, no question to Android beside it.
++        giveChunks(12);
++        VoiceDetection.Session session = open(SITE, "en-IN");
++        mHost.mDetector.mProcessAnswer = "hi";
++        mHost.mNow = 4000;
++        mHost.runCapture();
++        mHost.runDetector();
++        assertEquals(0, mHost.mLanguageChecks);
++        verify(mHost.mSnackbars, never()).showSnackbar(any());
++
++        session.close();
++        assertEquals(1, mHost.mLanguageChecks);
++        assertNotNull(mHost.mLanguagesCallback);
++        mHost.mLanguagesCallback.onResult(languages(List.of("en-IN", "hi-IN"), List.of()));
++        assertEquals("That sounded like Hindi", shown().getTextForTesting().toString());
++    }
++
++    @Test
++    public void testSameLanguageHeardShowsNothing() {
++        VoiceDetection.setLanguagesForTesting(languages(List.of("en-IN", "en-US"), List.of()));
++        endedHearing(SITE, "en");
++        verify(mHost.mSnackbars, never()).showSnackbar(any());
++        assertEquals(0, mHost.mLanguageChecks);
++    }
++
++    // The detector's labels as Android's tags.
++
++    @Test
++    public void testLabelToTag() {
++        List<String> android = List.of("en-US", "en-IN", "hi-IN", "he-IL", "jv-ID", "nb-NO");
++        assertEquals("hi-IN", VoiceDetection.tagFor("hi", android, "en-IN"));
++        assertEquals("en-IN", VoiceDetection.tagFor("en", android, "hi-IN"));
++        assertEquals("he-IL", VoiceDetection.tagFor("iw", android, "en-US"));
++        assertEquals("jv-ID", VoiceDetection.tagFor("jw", android, "en-US"));
++        assertEquals("nb-NO", VoiceDetection.tagFor("no", android, "en-US"));
++        // Urdu is heard as Hindi.
++        assertEquals("hi-IN", VoiceDetection.tagFor("ur", android, "en-US"));
++        assertNull(VoiceDetection.tagFor("ta", android, "en-IN"));
++        assertFalse(VoiceDetection.sameLanguage("en-IN", "hi"));
++    }
++}
+diff '--color=never' -ruN a/chrome/browser/tark_captions_android/BUILD.gn b/chrome/browser/tark_captions_android/BUILD.gn
+--- a/chrome/browser/tark_captions_android/BUILD.gn	2026-10-25 17:34:18.424221274 +0530
++++ b/chrome/browser/tark_captions_android/BUILD.gn	2026-10-25 17:34:18.399043199 +0530
+@@ -21,6 +21,11 @@
+     "//base",
+     "//crypto",
+   ]
++  if (is_android) {
++    # Voice search's spoken-language detector (JNI), which shares captions'
++    # language_id unit; linked wherever the browser is.
++    deps += [ "//chrome/browser/tark_voice_android:android" ]
++  }
+ }
+ 
+ if (!is_android) {
+@@ -29,9 +34,13 @@
+       "caption_downloads_unittest.cc",
+       "model_files_unittest.cc",
+       "tab_captions_unittest.cc",
++
++      # Voice search's detector: its 15 s ring of audio.
++      "//chrome/browser/tark_voice_android/voice_language_detector_unittest.cc",
+     ]
+     deps = [
+       ":rules",
++      "//chrome/browser/tark_voice_android:detector",
+       "//base",
+       "//base/test:run_all_unittests",
+       "//base/test:test_support",
+diff '--color=never' -ruN a/chrome/browser/tark_captions_android/android/java/src/org/chromium/chrome/browser/tark_captions/TarkCaptionsBridge.java b/chrome/browser/tark_captions_android/android/java/src/org/chromium/chrome/browser/tark_captions/TarkCaptionsBridge.java
+--- a/chrome/browser/tark_captions_android/android/java/src/org/chromium/chrome/browser/tark_captions/TarkCaptionsBridge.java	2026-10-25 17:34:18.456277011 +0530
++++ b/chrome/browser/tark_captions_android/android/java/src/org/chromium/chrome/browser/tark_captions/TarkCaptionsBridge.java	2026-10-25 17:34:18.430266676 +0530
+@@ -180,6 +180,19 @@
+         TarkCaptionsBridgeJni.get().removeUnit(unit, owner);
+     }
+ 
++    /**
++     * Holds the unit while an engine uses it (true), or releases it (false): a removal asked for
++     * meanwhile waits for the release, and deletes only if no feature wants the unit by then.
++     */
++    public static void setUnitInUse(String unit, boolean inUse) {
++        TarkCaptionsBridgeJni.get().setUnitInUse(unit, inUse);
++    }
++
++    /** Where the unit's files are on the phone. */
++    public static String getUnitDir(String unit) {
++        return TarkCaptionsBridgeJni.get().getUnitDir(unit);
++    }
++
+     /** A language's download size in bytes (its model and, if missing, the common files). */
+     public static long getDownloadSize(String language) {
+         return TarkCaptionsBridgeJni.get().getDownloadSize(language);
+@@ -239,5 +252,10 @@
+         void requestUnit(@JniType("std::string") String unit, int owner, boolean now);
+ 
+         void removeUnit(@JniType("std::string") String unit, int owner);
++
++        void setUnitInUse(@JniType("std::string") String unit, boolean inUse);
++
++        @JniType("std::string")
++        String getUnitDir(@JniType("std::string") String unit);
+     }
+ }
+diff '--color=never' -ruN a/chrome/browser/tark_captions_android/android/tark_captions_bridge.cc b/chrome/browser/tark_captions_android/android/tark_captions_bridge.cc
+--- a/chrome/browser/tark_captions_android/android/tark_captions_bridge.cc	2026-10-25 17:34:18.486865647 +0530
++++ b/chrome/browser/tark_captions_android/android/tark_captions_bridge.cc	2026-10-25 17:34:18.461833865 +0530
+@@ -156,6 +156,16 @@
+   CaptionDownloads::Get().Remove(unit);
+ }
+ 
++static void JNI_TarkCaptionsBridge_SetUnitInUse(JNIEnv* env,
++                                                const std::string& unit,
++                                                bool in_use) {
++  CaptionDownloads::Get().SetInUse(unit, in_use);
++}
++
++static std::string JNI_TarkCaptionsBridge_GetUnitDir(JNIEnv* env, const std::string& unit) {
++  return CaptionDownloads::Get().UnitDir(unit).value();
++}
++
+ static int64_t JNI_TarkCaptionsBridge_GetDownloadSize(JNIEnv* env, const std::string& language) {
+   return CaptionDownloads::Get().State(language).total;
+ }
+diff '--color=never' -ruN a/chrome/browser/tark_voice_android/BUILD.gn b/chrome/browser/tark_voice_android/BUILD.gn
+--- a/chrome/browser/tark_voice_android/BUILD.gn	1970-01-01 05:30:00.000000000 +0530
++++ b/chrome/browser/tark_voice_android/BUILD.gn	2026-10-25 17:34:18.492398501 +0530
+@@ -0,0 +1,50 @@
++# Copyright 2026 The Tark Authors
++# Use of this source code is governed by a BSD-style license that can be
++# found in the LICENSE file.
++#
++# Voice search's spoken-language detection (Tark for Android): captions'
++# language detector and Silero VAD over a session's audio, which a 15 s ring
++# holds in memory. Java (chrome/browser/speech/VoiceDetection.java) reaches
++# it through VoiceLanguageDetector.java. The ring's tests also build for the
++# build machine, in tark_captions_android_unittests (android/build.sh runs
++# them).
++
++static_library("detector") {
++  sources = [
++    "voice_language_detector.cc",
++    "voice_language_detector.h",
++  ]
++  deps = [ "//base" ]
++  if (is_android) {
++    deps += [ "//components/tark_captions" ]
++  } else {
++    # The build machine's tests: only what the detector compiles against,
++    # as components/tark_captions:tark_captions_engine_unittests does.
++    sources += [
++      "//components/tark_captions/detection_policy.cc",
++      "//components/tark_captions/detection_policy.h",
++      "//components/tark_captions/language_detector.cc",
++      "//components/tark_captions/language_detector.h",
++      "//components/tark_captions/model_source.cc",
++      "//components/tark_captions/model_source.h",
++      "//components/tark_captions/ort_runtime.cc",
++      "//components/tark_captions/ort_runtime.h",
++      "//components/tark_captions/vad.cc",
++      "//components/tark_captions/vad.h",
++    ]
++    include_dirs = [ "//third_party/tark_onnxruntime/include" ]
++  }
++}
++
++if (is_android) {
++  # The JNI side of VoiceLanguageDetector.java, linked into the browser
++  # through //chrome/browser/tark_captions_android:rules.
++  source_set("android") {
++    sources = [ "android/voice_language_detector_android.cc" ]
++    deps = [
++      ":detector",
++      "//base",
++      "//chrome/browser/tark_voice_android/android:jni_headers",
++    ]
++  }
++}
+diff '--color=never' -ruN a/chrome/browser/tark_voice_android/android/BUILD.gn b/chrome/browser/tark_voice_android/android/BUILD.gn
+--- a/chrome/browser/tark_voice_android/android/BUILD.gn	1970-01-01 05:30:00.000000000 +0530
++++ b/chrome/browser/tark_voice_android/android/BUILD.gn	2026-10-25 17:34:18.513867326 +0530
+@@ -0,0 +1,21 @@
++# Copyright 2026 The Tark Authors
++# Use of this source code is governed by a BSD-style license that can be
++# found in the LICENSE file.
++
++import("//build/config/android/rules.gni")
++import("//third_party/jni_zero/jni_zero.gni")
++
++# Voice search's spoken-language detector for chrome_java's VoiceDetection.
++android_library("java") {
++  srcjar_deps = [ ":jni_headers" ]
++  sources = [ "java/src/org/chromium/chrome/browser/tark_voice/VoiceLanguageDetector.java" ]
++  deps = [
++    "//base:base_java",
++    "//build/android:build_java",
++    "//third_party/jni_zero:jni_zero_java",
++  ]
++}
++
++generate_jni("jni_headers") {
++  sources = [ "java/src/org/chromium/chrome/browser/tark_voice/VoiceLanguageDetector.java" ]
++}
+diff '--color=never' -ruN a/chrome/browser/tark_voice_android/android/java/src/org/chromium/chrome/browser/tark_voice/VoiceLanguageDetector.java b/chrome/browser/tark_voice_android/android/java/src/org/chromium/chrome/browser/tark_voice/VoiceLanguageDetector.java
+--- a/chrome/browser/tark_voice_android/android/java/src/org/chromium/chrome/browser/tark_voice/VoiceLanguageDetector.java	1970-01-01 05:30:00.000000000 +0530
++++ b/chrome/browser/tark_voice_android/android/java/src/org/chromium/chrome/browser/tark_voice/VoiceLanguageDetector.java	2026-10-25 17:34:18.530411888 +0530
+@@ -0,0 +1,93 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++package org.chromium.chrome.browser.tark_voice;
++
++import org.jni_zero.JNINamespace;
++import org.jni_zero.JniType;
++import org.jni_zero.NativeMethods;
++
++import org.chromium.build.annotations.NullMarked;
++import org.chromium.build.annotations.Nullable;
++
++/**
++ * Tark: voice search's spoken-language detector for one session
++ * (chrome/browser/tark_voice_android/voice_language_detector.h): captions' language detector and
++ * Silero VAD over the session's audio, which a ring holds in memory (at most 15 s) and drops when
++ * the session ends.
++ *
++ * <p>{@link #append} and {@link #buffered} may be called from the capture thread; every other
++ * call, {@link #destroy} last, from one sequence (the detector's), once the capture has stopped.
++ */
++@JNINamespace("tark_voice")
++@NullMarked
++public final class VoiceLanguageDetector {
++    /** What {@link #process} and {@link #finish} report for speech in an unknown language. */
++    public static final String UNSURE = "und";
++
++    private final long mDetector;
++    private boolean mDestroyed;
++
++    public VoiceLanguageDetector() {
++        mDetector = VoiceLanguageDetectorJni.get().create();
++    }
++
++    /** Appends 16 kHz mono PCM16 to the session's audio. */
++    public void append(short[] pcm, int length) {
++        VoiceLanguageDetectorJni.get().append(mDetector, pcm, length);
++    }
++
++    /** The audio held, oldest first (at most 15 s). */
++    public short[] buffered() {
++        return VoiceLanguageDetectorJni.get().buffered(mDetector);
++    }
++
++    /** Loads the language_id unit's models from {@code modelsDir}; false if they can't be. */
++    public boolean load(String modelsDir) {
++        return VoiceLanguageDetectorJni.get().load(mDetector, modelsDir);
++    }
++
++    /**
++     * Reads the audio appended since the last call: the language heard (a VoxLingua code, Urdu as
++     * "hi") or {@link #UNSURE} once decided, else null.
++     */
++    public @Nullable String process() {
++        return orNull(VoiceLanguageDetectorJni.get().process(mDetector));
++    }
++
++    /** The session's audio ended: a decision on the speech heard, if the detector is sure. */
++    public @Nullable String finish() {
++        return orNull(VoiceLanguageDetectorJni.get().finish(mDetector));
++    }
++
++    /** Drops the session's audio and frees the detector. */
++    public void destroy() {
++        if (mDestroyed) return;
++        mDestroyed = true;
++        VoiceLanguageDetectorJni.get().destroy(mDetector);
++    }
++
++    private static @Nullable String orNull(String code) {
++        return code.isEmpty() ? null : code;
++    }
++
++    @NativeMethods
++    interface Natives {
++        long create();
++
++        void append(long detector, short[] pcm, int length);
++
++        short[] buffered(long detector);
++
++        boolean load(long detector, @JniType("std::string") String modelsDir);
++
++        @JniType("std::string")
++        String process(long detector);
++
++        @JniType("std::string")
++        String finish(long detector);
++
++        void destroy(long detector);
++    }
++}
+diff '--color=never' -ruN a/chrome/browser/tark_voice_android/android/voice_language_detector_android.cc b/chrome/browser/tark_voice_android/android/voice_language_detector_android.cc
+--- a/chrome/browser/tark_voice_android/android/voice_language_detector_android.cc	1970-01-01 05:30:00.000000000 +0530
++++ b/chrome/browser/tark_voice_android/android/voice_language_detector_android.cc	2026-10-25 17:34:18.545992730 +0530
+@@ -0,0 +1,79 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include <jni.h>
++
++#include <cstdint>
++#include <optional>
++#include <string>
++#include <vector>
++
++#include "base/android/jni_android.h"
++#include "base/files/file_path.h"
++#include "chrome/browser/tark_voice_android/voice_language_detector.h"
++
++// Must come after all headers that specialize FromJniType() / ToJniType().
++#include "chrome/browser/tark_voice_android/android/jni_headers/VoiceLanguageDetector_jni.h"
++
++namespace tark_voice {
++namespace {
++
++// Loaded by name from the app's native libraries, as the captions process
++// does (android/captions/ort.sh).
++constexpr char kOrtLibrary[] = "libonnxruntime.so";
++
++VoiceLanguageDetector* From(int64_t detector) {
++  return reinterpret_cast<VoiceLanguageDetector*>(static_cast<intptr_t>(detector));
++}
++
++}  // namespace
++
++static int64_t JNI_VoiceLanguageDetector_Create(JNIEnv* env) {
++  return static_cast<int64_t>(reinterpret_cast<intptr_t>(new VoiceLanguageDetector()));
++}
++
++static void JNI_VoiceLanguageDetector_Append(JNIEnv* env,
++                                             int64_t detector,
++                                             const base::android::JavaParamRef<jshortArray>& pcm,
++                                             int32_t length) {
++  if (length <= 0) {
++    return;
++  }
++  std::vector<int16_t> samples(static_cast<size_t>(length));
++  env->GetShortArrayRegion(pcm.obj(), 0, length, reinterpret_cast<jshort*>(samples.data()));
++  From(detector)->ring().Append(samples);
++}
++
++static base::android::ScopedJavaLocalRef<jshortArray> JNI_VoiceLanguageDetector_Buffered(
++    JNIEnv* env,
++    int64_t detector) {
++  const std::vector<int16_t> held = From(detector)->ring().Snapshot();
++  jshortArray array = env->NewShortArray(static_cast<jsize>(held.size()));
++  env->SetShortArrayRegion(array, 0, static_cast<jsize>(held.size()),
++                           reinterpret_cast<const jshort*>(held.data()));
++  return base::android::ScopedJavaLocalRef<jshortArray>(env, array);
++}
++
++static bool JNI_VoiceLanguageDetector_Load(JNIEnv* env,
++                                           int64_t detector,
++                                           const std::string& models_dir) {
++  return From(detector)->Load(base::FilePath(models_dir), base::FilePath(kOrtLibrary));
++}
++
++static std::string JNI_VoiceLanguageDetector_Process(JNIEnv* env, int64_t detector) {
++  return From(detector)->Process().value_or(std::string());
++}
++
++static std::string JNI_VoiceLanguageDetector_Finish(JNIEnv* env, int64_t detector) {
++  return From(detector)->Finish().value_or(std::string());
++}
++
++static void JNI_VoiceLanguageDetector_Destroy(JNIEnv* env, int64_t detector) {
++  // Drops the session's audio (the destructor ends the session).
++  delete From(detector);
++}
++
++}  // namespace tark_voice
++
++DEFINE_JNI(VoiceLanguageDetector)
+diff '--color=never' -ruN a/chrome/browser/tark_voice_android/voice_language_detector.cc b/chrome/browser/tark_voice_android/voice_language_detector.cc
+--- a/chrome/browser/tark_voice_android/voice_language_detector.cc	1970-01-01 05:30:00.000000000 +0530
++++ b/chrome/browser/tark_voice_android/voice_language_detector.cc	2026-10-25 17:34:18.561795991 +0530
+@@ -0,0 +1,219 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/tark_voice_android/voice_language_detector.h"
++
++#include <algorithm>
++#include <array>
++#include <utility>
++
++#include "components/tark_captions/detection_policy.h"
++#include "components/tark_captions/language_detector.h"
++#include "components/tark_captions/ort_runtime.h"
++#include "components/tark_captions/vad.h"
++
++namespace tark_voice {
++
++namespace {
++
++// Silero's chunks are speech at this probability (as captions' segmenter).
++constexpr float kSpeechProbability = 0.5f;
++// A session that ends sooner is decided on at least this much speech.
++constexpr double kShortestSpeech = 1.0;
++
++}  // namespace
++
++AudioRing::AudioRing() = default;
++AudioRing::~AudioRing() = default;
++
++void AudioRing::Append(base::span<const int16_t> pcm) {
++  base::AutoLock lock(lock_);
++  for (int16_t sample : pcm) {
++    if (samples_.size() < kCapacity) {
++      samples_.push_back(sample);
++    } else {
++      samples_[next_] = sample;
++      next_ = (next_ + 1) % kCapacity;
++    }
++  }
++  total_ += static_cast<int64_t>(pcm.size());
++}
++
++std::vector<int16_t> AudioRing::Snapshot() const {
++  base::AutoLock lock(lock_);
++  std::vector<int16_t> out;
++  out.reserve(samples_.size());
++  out.insert(out.end(), samples_.begin() + next_, samples_.end());
++  out.insert(out.end(), samples_.begin(), samples_.begin() + next_);
++  return out;
++}
++
++std::vector<int16_t> AudioRing::Range(int64_t begin, int64_t end) const {
++  base::AutoLock lock(lock_);
++  const int64_t oldest = total_ - static_cast<int64_t>(samples_.size());
++  begin = std::max(begin, oldest);
++  end = std::min(end, total_);
++  std::vector<int16_t> out;
++  if (begin >= end) {
++    return out;
++  }
++  out.reserve(static_cast<size_t>(end - begin));
++  for (int64_t i = begin; i < end; ++i) {
++    // The held sample i is at (next_ + (i - oldest)) % size once full, and
++    // at i - oldest (oldest is 0) before.
++    const size_t index = (next_ + static_cast<size_t>(i - oldest)) % samples_.size();
++    out.push_back(samples_[index]);
++  }
++  return out;
++}
++
++size_t AudioRing::size() const {
++  base::AutoLock lock(lock_);
++  return samples_.size();
++}
++
++int64_t AudioRing::total() const {
++  base::AutoLock lock(lock_);
++  return total_;
++}
++
++void AudioRing::Clear() {
++  base::AutoLock lock(lock_);
++  // swap() frees the memory; clear() would keep it.
++  std::vector<int16_t>().swap(samples_);
++  next_ = 0;
++  total_ = 0;
++}
++
++VoiceLanguageDetector::VoiceLanguageDetector() {
++  DETACH_FROM_SEQUENCE(sequence_checker_);
++}
++
++VoiceLanguageDetector::~VoiceLanguageDetector() {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  EndSession();
++}
++
++bool VoiceLanguageDetector::Load(const base::FilePath& models_dir,
++                                 const base::FilePath& ort_library) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  runtime_ = tark_captions::OrtRuntime::Load(ort_library);
++  if (!runtime_) {
++    return false;
++  }
++  detector_ = tark_captions::LanguageDetector::Load(runtime_.get(), models_dir);
++  vad_ = tark_captions::Vad::Load(runtime_.get(), models_dir);
++  if (!detector_ || !vad_) {
++    detector_.reset();
++    vad_.reset();
++    runtime_.reset();
++    return false;
++  }
++  next_check_ = tark_captions::kFirstDecision;
++  return true;
++}
++
++std::optional<std::string> VoiceLanguageDetector::Process() {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  if (decided_ || !detector_ || !vad_) {
++    return std::nullopt;
++  }
++  constexpr int64_t kChunk = static_cast<int64_t>(tark_captions::Vad::kChunk);
++  const int64_t total = ring_.total();
++  // A detector that fell more than the ring behind goes on from what is held.
++  read_ = std::max(read_, total - static_cast<int64_t>(ring_.size()));
++  while (read_ + kChunk <= total) {
++    const std::vector<int16_t> pcm = ring_.Range(read_, read_ + kChunk);
++    if (pcm.size() != static_cast<size_t>(kChunk)) {
++      break;
++    }
++    std::array<float, tark_captions::Vad::kChunk> chunk;
++    for (size_t i = 0; i < chunk.size(); ++i) {
++      chunk[i] = pcm[i] / 32768.0f;
++    }
++    if (vad_->Process(chunk) >= kSpeechProbability) {
++      if (!speech_.empty() && speech_.back().second == read_) {
++        speech_.back().second += kChunk;
++      } else {
++        speech_.emplace_back(read_, read_ + kChunk);
++      }
++      speech_samples_ += kChunk;
++    }
++    read_ += kChunk;
++    const double seconds = static_cast<double>(speech_samples_) / AudioRing::kSampleRate;
++    if (seconds >= next_check_) {
++      next_check_ += 1.0;
++      if (std::optional<std::string> decision = DecideOn(seconds)) {
++        return decision;
++      }
++    }
++  }
++  return std::nullopt;
++}
++
++std::optional<std::string> VoiceLanguageDetector::Finish() {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  if (decided_ || !detector_) {
++    return std::nullopt;
++  }
++  // The last of the audio first: it may reach a check.
++  if (std::optional<std::string> decision = Process()) {
++    return decision;
++  }
++  if (decided_) {
++    return std::nullopt;
++  }
++  const double seconds = static_cast<double>(speech_samples_) / AudioRing::kSampleRate;
++  if (seconds < kShortestSpeech) {
++    return std::nullopt;
++  }
++  // Below kLastDecision the policy decides only when the detector is sure.
++  std::optional<std::string> decision =
++      DecideOn(std::min(std::max(seconds, tark_captions::kFirstDecision),
++                        tark_captions::kLastDecision - 0.5));
++  return decision && *decision != kUnsure ? decision : std::nullopt;
++}
++
++std::optional<std::string> VoiceLanguageDetector::DecideOn(double speech_seconds) {
++  std::vector<float> speech;
++  for (const auto& [begin, end] : speech_) {
++    const std::vector<int16_t> pcm = ring_.Range(begin, end);
++    for (int16_t sample : pcm) {
++      speech.push_back(sample / 32768.0f);
++    }
++  }
++  const std::vector<float> logits = detector_->Logits(speech);
++  const tark_captions::Detection detection =
++      tark_captions::DecideLanguage(logits, detector_->labels(), speech_seconds);
++  if (detection.kind == tark_captions::Detection::Kind::kUnsure) {
++    if (speech_seconds < tark_captions::kLastDecision) {
++      return std::nullopt;
++    }
++    // No answer at the last check (the model failed, or the speech left the
++    // ring): unsure, and nothing more is tried.
++    decided_ = true;
++    return std::string(kUnsure);
++  }
++  decided_ = true;
++  return detection.code;
++}
++
++void VoiceLanguageDetector::EndSession() {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  ring_.Clear();
++  if (vad_) {
++    vad_->Reset();
++  }
++  read_ = 0;
++  std::vector<std::pair<int64_t, int64_t>>().swap(speech_);
++  speech_samples_ = 0;
++  next_check_ = tark_captions::kFirstDecision;
++  decided_ = false;
++}
++
++double VoiceLanguageDetector::speech_seconds_for_testing() const {
++  return static_cast<double>(speech_samples_) / AudioRing::kSampleRate;
++}
++
++}  // namespace tark_voice
+diff '--color=never' -ruN a/chrome/browser/tark_voice_android/voice_language_detector.h b/chrome/browser/tark_voice_android/voice_language_detector.h
+--- a/chrome/browser/tark_voice_android/voice_language_detector.h	1970-01-01 05:30:00.000000000 +0530
++++ b/chrome/browser/tark_voice_android/voice_language_detector.h	2026-10-25 17:34:18.577285624 +0530
+@@ -0,0 +1,125 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_TARK_VOICE_ANDROID_VOICE_LANGUAGE_DETECTOR_H_
++#define CHROME_BROWSER_TARK_VOICE_ANDROID_VOICE_LANGUAGE_DETECTOR_H_
++
++#include <cstddef>
++#include <cstdint>
++#include <memory>
++#include <optional>
++#include <string>
++#include <utility>
++#include <vector>
++
++#include "base/containers/span.h"
++#include "base/files/file_path.h"
++#include "base/sequence_checker.h"
++#include "base/synchronization/lock.h"
++#include "base/thread_annotations.h"
++
++namespace tark_captions {
++class LanguageDetector;
++class OrtRuntime;
++class Vad;
++}  // namespace tark_captions
++
++namespace tark_voice {
++
++// The audio a voice search session holds: at most the last 15 s of 16 kHz
++// mono PCM16, in memory only, so that a switch to another language can play
++// it to a new recognizer. Thread-safe: the capture thread appends and reads
++// it, the detector's sequence reads it.
++class AudioRing {
++ public:
++  static constexpr int kSampleRate = 16000;
++  static constexpr size_t kCapacity = 15 * kSampleRate;
++
++  AudioRing();
++  AudioRing(const AudioRing&) = delete;
++  AudioRing& operator=(const AudioRing&) = delete;
++  ~AudioRing();
++
++  void Append(base::span<const int16_t> pcm);
++  // What is held, oldest first.
++  std::vector<int16_t> Snapshot() const;
++  // The samples [begin, end) of the session's audio (counted from its start)
++  // that are still held; earlier ones are gone.
++  std::vector<int16_t> Range(int64_t begin, int64_t end) const;
++  // How many samples are held, and how many were ever appended.
++  size_t size() const;
++  int64_t total() const;
++  // Drops everything (the session ended); the memory goes too.
++  void Clear();
++
++ private:
++  mutable base::Lock lock_;
++  std::vector<int16_t> samples_ GUARDED_BY(lock_);  // kCapacity once full
++  size_t next_ GUARDED_BY(lock_) = 0;  // where the next sample goes, once full
++  int64_t total_ GUARDED_BY(lock_) = 0;
++};
++
++// Voice search's spoken-language detection (spec §3): Silero VAD finds the
++// speech in a session's audio, and captions' detector (VoxLingua107 ECAPA,
++// the language_id unit) names its language with captions' policy
++// (detection_policy.h): once sure after 3 s of speech, else whatever it
++// thinks after 5 s. A session that ends earlier is decided on what speech
++// it had, and only if the detector is sure. The audio stays in the ring
++// (at most 15 s) and is dropped when the session ends.
++//
++// The ring may be used from any thread. Everything else runs on one
++// sequence (the detector's), which also destroys this.
++class VoiceLanguageDetector {
++ public:
++  // What Decide() and Finish() report when the detector heard speech but
++  // could not tell its language.
++  static constexpr char kUnsure[] = "und";
++
++  VoiceLanguageDetector();
++  VoiceLanguageDetector(const VoiceLanguageDetector&) = delete;
++  VoiceLanguageDetector& operator=(const VoiceLanguageDetector&) = delete;
++  ~VoiceLanguageDetector();
++
++  AudioRing& ring() { return ring_; }
++
++  // Loads ONNX Runtime (`ort_library`) and the language_id unit's models
++  // from `models_dir`. False if any is missing; nothing is detected then.
++  bool Load(const base::FilePath& models_dir, const base::FilePath& ort_library);
++
++  // Reads the audio appended since the last call. Returns the language (a
++  // VoxLingua code: "hi", "en", ..., Urdu as "hi") or kUnsure once decided,
++  // and nothing before; after a decision, nothing more.
++  std::optional<std::string> Process();
++  // The session's audio ended: the decision on the speech heard, if none was
++  // made and there was at least 1 s of it; the detector must be sure then.
++  std::optional<std::string> Finish();
++  // Drops the session's audio and state.
++  void EndSession();
++
++  double speech_seconds_for_testing() const;
++
++ private:
++  // Runs the detector on the speech still held, as if `speech_seconds` of it
++  // had been heard.
++  std::optional<std::string> DecideOn(double speech_seconds);
++
++  AudioRing ring_;
++
++  SEQUENCE_CHECKER(sequence_checker_);
++  std::unique_ptr<tark_captions::OrtRuntime> runtime_;
++  std::unique_ptr<tark_captions::LanguageDetector> detector_;
++  std::unique_ptr<tark_captions::Vad> vad_;
++  // Samples of the session read so far, and the speech among them (VAD
++  // chunks, [begin, end) in the session's samples).
++  int64_t read_ = 0;
++  std::vector<std::pair<int64_t, int64_t>> speech_;
++  int64_t speech_samples_ = 0;
++  // The next amount of speech, in seconds, to run the detector at.
++  double next_check_ = 0;
++  bool decided_ = false;
++};
++
++}  // namespace tark_voice
++
++#endif  // CHROME_BROWSER_TARK_VOICE_ANDROID_VOICE_LANGUAGE_DETECTOR_H_
+diff '--color=never' -ruN a/chrome/browser/tark_voice_android/voice_language_detector_unittest.cc b/chrome/browser/tark_voice_android/voice_language_detector_unittest.cc
+--- a/chrome/browser/tark_voice_android/voice_language_detector_unittest.cc	1970-01-01 05:30:00.000000000 +0530
++++ b/chrome/browser/tark_voice_android/voice_language_detector_unittest.cc	2026-10-25 17:34:18.593084219 +0530
+@@ -0,0 +1,75 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/tark_voice_android/voice_language_detector.h"
++
++#include <cstdint>
++#include <vector>
++
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace tark_voice {
++namespace {
++
++constexpr int kRate = AudioRing::kSampleRate;
++
++// `seconds` of audio whose sample i (counted from the session's start,
++// `first` onwards) is i % 30000, so any sample tells where it came from.
++std::vector<int16_t> Audio(int64_t first, int seconds) {
++  std::vector<int16_t> pcm;
++  for (int64_t i = first; i < first + int64_t{seconds} * kRate; ++i) {
++    pcm.push_back(static_cast<int16_t>(i % 30000));
++  }
++  return pcm;
++}
++
++TEST(VoiceLanguageDetectorTest, RingBufferKeeps15s) {
++  VoiceLanguageDetector detector;
++  // 20 s, a second at a time, as the capture appends it.
++  for (int second = 0; second < 20; ++second) {
++    detector.ring().Append(Audio(int64_t{second} * kRate, 1));
++  }
++  const std::vector<int16_t> held = detector.ring().Snapshot();
++  ASSERT_EQ(held.size(), size_t{15} * kRate);
++  EXPECT_EQ(detector.ring().size(), size_t{15} * kRate);
++  EXPECT_EQ(detector.ring().total(), int64_t{20} * kRate);
++  // The last 15 s, oldest first: samples 5 s to 20 s.
++  EXPECT_EQ(held, Audio(int64_t{5} * kRate, 15));
++  // What a detector asks for that is gone is left out.
++  const std::vector<int16_t> range = detector.ring().Range(0, int64_t{6} * kRate);
++  EXPECT_EQ(range, Audio(int64_t{5} * kRate, 1));
++}
++
++TEST(VoiceLanguageDetectorTest, RingBufferHoldsLessWhenShorter) {
++  VoiceLanguageDetector detector;
++  detector.ring().Append(Audio(0, 4));
++  EXPECT_EQ(detector.ring().Snapshot(), Audio(0, 4));
++  EXPECT_EQ(detector.ring().Range(kRate, 2 * kRate), Audio(kRate, 1));
++}
++
++TEST(VoiceLanguageDetectorTest, RingBufferDropsAtSessionEnd) {
++  VoiceLanguageDetector detector;
++  detector.ring().Append(Audio(0, 20));
++  detector.EndSession();
++  EXPECT_TRUE(detector.ring().Snapshot().empty());
++  EXPECT_EQ(detector.ring().size(), 0u);
++  EXPECT_EQ(detector.ring().total(), 0);
++  EXPECT_DOUBLE_EQ(detector.speech_seconds_for_testing(), 0);
++}
++
++TEST(VoiceLanguageDetectorTest, NoModelsDecidesNothing) {
++  VoiceLanguageDetector detector;
++  EXPECT_FALSE(detector.Load(base::FilePath(FILE_PATH_LITERAL("/nonexistent")),
++                             base::FilePath(FILE_PATH_LITERAL("/nonexistent/libonnxruntime.so"))));
++  detector.ring().Append(Audio(0, 10));
++  EXPECT_FALSE(detector.Process());
++  EXPECT_FALSE(detector.Finish());
++  // The audio is still only the ring's, and goes at the session's end.
++  EXPECT_EQ(detector.ring().size(), size_t{10} * kRate);
++  detector.EndSession();
++  EXPECT_EQ(detector.ring().size(), 0u);
++}
++
++}  // namespace
++}  // namespace tark_voice
+diff '--color=never' -ruN a/chrome/browser/ui/android/strings/android_chrome_strings.grd b/chrome/browser/ui/android/strings/android_chrome_strings.grd
+--- a/chrome/browser/ui/android/strings/android_chrome_strings.grd	2026-10-25 17:34:18.635882951 +0530
++++ b/chrome/browser/ui/android/strings/android_chrome_strings.grd	2026-10-25 17:34:18.609434820 +0530
+@@ -1064,6 +1064,22 @@
+       <message name="IDS_TARK_VOICE_DETECTION_REMOVE" desc="Tark: Settings > Voice languages > Spoken-language detection: button that turns detection off and deletes the model from the phone (unless live captions still use it). [CHAR_LIMIT=20]">
+         Remove
+       </message>
++      <!-- Tark: spoken-language detection, during and after a voice search. -->
++      <message name="IDS_TARK_VOICE_HEARD_SWITCH" desc="Tark: snackbar while voice search is still listening, when the on-phone detector hears the person speak a different language than the one voice search listens in (and the phone has it). The Switch action carries on in that language. LANGUAGE is a language name.">
++        Sounds like <ph name="LANGUAGE">%1$s<ex>Hindi</ex></ph>
++      </message>
++      <message name="IDS_TARK_VOICE_HEARD_SWITCH_ACTION" desc="Tark: action of the snackbar 'Sounds like Hindi': voice search carries on in that language, from what the person already said. [CHAR_LIMIT=16]">
++        Switch
++      </message>
++      <message name="IDS_TARK_VOICE_HEARD" desc="Tark: snackbar after a voice search, when the on-phone detector heard the person speak a different language than the one voice search used (and the phone has it). LANGUAGE is a language name.">
++        That sounded like <ph name="LANGUAGE">%1$s<ex>Hindi</ex></ph>
++      </message>
++      <message name="IDS_TARK_VOICE_HEARD_USE_NEXT_TIME" desc="Tark: action of the snackbar 'That sounded like Hindi': voice search on this site starts in that language from now on. LANGUAGE is a language name. [CHAR_LIMIT=32]">
++        Use <ph name="LANGUAGE">%1$s<ex>Hindi</ex></ph> next time
++      </message>
++      <message name="IDS_TARK_VOICE_HEARD_MISSING" desc="Tark: snackbar when the on-phone detector heard the person speak a language that the phone's voice recognition has not downloaded. Offers Download. LANGUAGE and LANGUAGE_AGAIN are the same language name.">
++        That sounded like <ph name="LANGUAGE">%1$s<ex>Tamil</ex></ph>. Voice search needs <ph name="LANGUAGE_AGAIN">%1$s<ex>Tamil</ex></ph> on this phone.
++      </message>
+       <!-- Tark: the one-time offer of the person's voice languages, after a voice search. -->
+       <message name="IDS_TARK_VOICE_OFFER_TITLE" desc="Tark: title of the dialog shown once after a voice search, offering to download speech recognition for the languages the person uses (each listed with a checkbox).">
+         Speak in your languages
+diff '--color=never' -ruN a/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb b/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb
+--- a/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb	2026-10-25 17:34:18.666675506 +0530
++++ b/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb	2026-10-25 17:34:18.641617807 +0530
+@@ -2216,4 +2216,9 @@
+ <translation id="3168162253316954087">इस फ़ोन पर एक मॉडल · <ph name="SIZE"/>, वाई-फ़ाई पर · सिर्फ़ तब सुनता है जब आप वॉइस सर्च इस्तेमाल करते हैं</translation>
+ <translation id="1072845305096600654">इस फ़ोन पर है · सिर्फ़ तब सुनता है जब आप वॉइस सर्च इस्तेमाल करते हैं</translation>
+ <translation id="5361408634628853522">इस फ़ोन पर पहले से है · डाउनलोड की ज़रूरत नहीं</translation>
++<translation id="3804706067874532251"><ph name="LANGUAGE"/> जैसा लग रहा है</translation>
++<translation id="4305817255990598646">बदलें</translation>
++<translation id="5496611901216958278">यह <ph name="LANGUAGE"/> जैसा लगा</translation>
++<translation id="2674490731131654801">अगली बार <ph name="LANGUAGE"/> इस्तेमाल करें</translation>
++<translation id="2427661119626459258">यह <ph name="LANGUAGE"/> जैसा लगा। इस फ़ोन पर वॉइस सर्च के लिए <ph name="LANGUAGE_AGAIN"/> चाहिए।</translation>
+ </translationbundle>
+\ No newline at end of file
+diff '--color=never' -ruN a/content/public/android/java/src/org/chromium/content/browser/SpeechRecognitionImpl.java b/content/public/android/java/src/org/chromium/content/browser/SpeechRecognitionImpl.java
+--- a/content/public/android/java/src/org/chromium/content/browser/SpeechRecognitionImpl.java	2026-10-25 17:34:18.698682075 +0530
++++ b/content/public/android/java/src/org/chromium/content/browser/SpeechRecognitionImpl.java	2026-10-25 17:34:18.673290581 +0530
+@@ -10,6 +10,10 @@
+ import android.content.Intent;
+ import android.os.Build;
+ import android.os.Bundle;
++import android.os.Handler;
++import android.os.Looper;
++import android.os.ParcelFileDescriptor;
++import android.os.SystemClock;
+ import android.speech.RecognitionListener;
+ import android.speech.RecognizerIntent;
+ import android.speech.SpeechRecognizer;
+@@ -30,7 +34,9 @@
+ import org.chromium.content_public.browser.SpeechRecognition;
+ import org.chromium.media.mojom.SpeechRecognitionErrorCode;
+ 
++import java.io.IOException;
+ import java.util.ArrayList;
++import java.util.List;
+ import java.util.Locale;
+ 
+ /**
+@@ -39,6 +45,22 @@
+  * <p>Tark: recognition runs on the device only (Android 12+), through Android's on-device
+  * recognizer; there is no path to an online recognizer, not even as a fallback. Below Android 12,
+  * or with no on-device recognizer, start() ends with service-not-allowed.
++ *
++ * <p>With spoken-language detection on (Android 13+, single-utterance sessions), Tark captures the
++ * microphone itself and hands the recognizer that audio through a pipe ({@link
++ * SpeechRecognition.AudioSource}). The recognizer then behaves differently, and this class makes
++ * the page see the same as without the pipe:
++ *
++ * <ul>
++ *   <li>The text comes from the partial results: the final bundle is empty. The recognizer keeps
++ *       listening across pauses, starting a new segment each time; the segments are joined here.
++ *   <li>The session ends here, when the speech has ended (the recognizer's end of speech, then a
++ *       short quiet; or no new text for a while; or no speech at all), or when the page stops. The
++ *       last text is the final result; none is ever made up: a session with no text ends in
++ *       no-speech, as without the pipe.
++ *   <li>stopListening() while the pipe is open is an error: the pipe is closed instead.
++ *   <li>A stray ERROR_CLIENT from a cancelled recognizer may reach the next one: ignored.
++ * </ul>
+  */
+ @JNINamespace("content")
+ @NullMarked
+@@ -82,6 +104,18 @@
+          * @param bcp47 The language the session ran in.
+          */
+         default void onSessionEnded(String origin, String bcp47) {}
++
++        /**
++         * Tark's own capture of the microphone for a session that starts (spoken-language
++         * detection), or null: Android's recognizer uses the microphone itself.
++         *
++         * @param origin The page's origin, or empty (a private tab, an opaque origin).
++         * @param bcp47 The language the session starts in.
++         */
++        default SpeechRecognition.@Nullable AudioSource audioSourceFor(
++                String origin, String bcp47) {
++            return null;
++        }
+     }
+ 
+     /** Creates Android's on-device recognizer; replaced in tests. */
+@@ -110,6 +144,31 @@
+     private static final int ERROR_LANGUAGE_NOT_SUPPORTED = 12;
+     private static final int ERROR_LANGUAGE_UNAVAILABLE = 13;
+ 
++    // RecognizerIntent.EXTRA_AUDIO_SOURCE* (API 33), spelled out for the same reason;
++    // AudioFormat.ENCODING_PCM_16BIT.
++    @VisibleForTesting static final String EXTRA_AUDIO_SOURCE = "android.speech.extra.AUDIO_SOURCE";
++
++    @VisibleForTesting
++    static final String EXTRA_AUDIO_SOURCE_CHANNEL_COUNT =
++            "android.speech.extra.AUDIO_SOURCE_CHANNEL_COUNT";
++
++    @VisibleForTesting
++    static final String EXTRA_AUDIO_SOURCE_ENCODING = "android.speech.extra.AUDIO_SOURCE_ENCODING";
++
++    @VisibleForTesting
++    static final String EXTRA_AUDIO_SOURCE_SAMPLING_RATE =
++            "android.speech.extra.AUDIO_SOURCE_SAMPLING_RATE";
++
++    private static final int ENCODING_PCM_16BIT = 2;
++
++    // Piped sessions end here (the recognizer listens on): this long after its end of speech
++    // with no new speech, after the last new text, or, with no text at all, after the start.
++    @VisibleForTesting static final long PIPE_END_AFTER_SPEECH_MS = 600;
++    @VisibleForTesting static final long PIPE_END_AFTER_TEXT_MS = 2000;
++    @VisibleForTesting static final long PIPE_NO_SPEECH_MS = 8000;
++    // How long a stray ERROR_CLIENT from a cancelled recognizer may reach the next one.
++    @VisibleForTesting static final long STRAY_CLIENT_ERROR_MS = 250;
++
+     private static @Nullable RecognizerFactory sRecognizerFactoryForTesting;
+     private static @Nullable RecognizerFactory sPlatformRecognizerFactory;
+     private static @Nullable LanguageDelegate sLanguageDelegate;
+@@ -158,6 +217,23 @@
+     private boolean mLanguageMissingTold;
+     private boolean mAudioStartSent;
+ 
++    // Tark's own capture of this session's audio (spoken-language detection), or null: Android's
++    // recognizer uses the microphone itself and nothing below applies.
++    private SpeechRecognition.@Nullable AudioSource mAudio;
++    // The read end of the pipe the current recognizer reads.
++    private @Nullable ParcelFileDescriptor mPipe;
++    // Whether the page asked for interim results (a piped recognizer always gives them).
++    private boolean mInterimResults;
++    // The text of the segments that ended, and of the current one.
++    private final List<String> mSegments = new ArrayList<>();
++    private String mSegment = "";
++    // The text before a switch to another language, used if the new recognizer has none.
++    private String mTextBeforeSwitch = "";
++    private boolean mFinishing;
++    private long mIgnoreClientErrorUntil;
++    private final Handler mHandler = new Handler(Looper.getMainLooper());
++    private final Runnable mPipeEnd = this::finishPiped;
++
+     // Internal class to handle events from Android's SpeechRecognizer and route them to native.
+     class Listener implements RecognitionListener {
+         /** Whether this listener's events should be dropped. */
+@@ -167,7 +243,9 @@
+ 
+         @Override
+         public void onBeginningOfSpeech() {
+-            if (isStale() || mState == STATE_CAPTURING_SPEECH) return;
++            if (isStale()) return;
++            if (mAudio != null) scheduleEnd(PIPE_END_AFTER_TEXT_MS);
++            if (mState == STATE_CAPTURING_SPEECH) return;
+ 
+             mState = STATE_CAPTURING_SPEECH;
+             SpeechRecognitionImplJni.get().onSoundStart(mNativeSpeechRecognizerImplAndroid);
+@@ -178,6 +256,13 @@
+ 
+         @Override
+         public void onEndOfSpeech() {
++            if (mAudio != null) {
++                // A piped recognizer listens on: its segment ended, the session may not have.
++                if (isStale()) return;
++                commitSegment();
++                scheduleEnd(PIPE_END_AFTER_SPEECH_MS);
++                return;
++            }
+             // Ignore onEndOfSpeech in continuous mode to let terminate() take care of ending
+             // events. The Android API documentation is vague as to when onEndOfSpeech is called in
+             // continuous mode, whereas the Web Speech API defines a stronger semantic on the
+@@ -196,6 +281,20 @@
+         @Override
+         public void onError(int error) {
+             if (isStale()) return;
++            if (mAudio != null) {
++                // A cancelled recognizer's ERROR_CLIENT, reaching its successor.
++                if (error == SpeechRecognizer.ERROR_CLIENT
++                        && SystemClock.uptimeMillis() < mIgnoreClientErrorUntil) {
++                    return;
++                }
++                // The recognizer gave up on more speech after some text: that text is the result.
++                if ((error == SpeechRecognizer.ERROR_NO_MATCH
++                                || error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT)
++                        && !pipedText().isEmpty()) {
++                    finishPiped();
++                    return;
++                }
++            }
+ 
+             int code = mapError(error);
+             if (code == SpeechRecognitionErrorCode.LANGUAGE_NOT_SUPPORTED) {
+@@ -217,6 +316,10 @@
+         @Override
+         public void onPartialResults(Bundle bundle) {
+             if (isStale()) return;
++            if (mAudio != null) {
++                onPipedText(bundle);
++                return;
++            }
+             handleResults(bundle, true);
+         }
+ 
+@@ -234,6 +337,13 @@
+         @Override
+         public void onResults(Bundle bundle) {
+             if (isStale()) return;
++            if (mAudio != null) {
++                // Comes only once the pipe has ended, and is empty; text in it is used.
++                String text = firstResult(bundle);
++                if (!text.isEmpty()) mSegment = text;
++                finishPiped();
++                return;
++            }
+             handleResults(bundle, false);
+             // We assume that onResults is called only once, at the end of a session, thus we
+             // terminate. If one day the recognition provider changes dictation mode behavior to
+@@ -393,6 +503,8 @@
+             mRecognizer = null;
+         }
+         if (sLiveSession == this) sLiveSession = null;
++        // After the recognizer is gone: the capture stops and its audio is dropped.
++        closeAudio();
+         SpeechRecognitionImplJni.get().onRecognitionEnd(mNativeSpeechRecognizerImplAndroid);
+         mNativeSpeechRecognizerImplAndroid = 0;
+ 
+@@ -451,13 +563,41 @@
+             }
+         }
+         mContinuous = continuous;
++        mInterimResults = interimResults;
+         mIntent.putExtra("android.speech.extra.DICTATION_MODE", continuous);
+         mIntent.putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, interimResults);
+-        listen(recognizer);
++
++        // Spoken-language detection: Tark's capture, for a single utterance on Android 13+. If
++        // it can't start, Android's recognizer uses the microphone as without it.
++        @Nullable ParcelFileDescriptor pipe = null;
++        if (delegate != null
++                && !continuous
++                && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
++            SpeechRecognition.@Nullable AudioSource audio =
++                    delegate.audioSourceFor(origin, mLanguage);
++            pipe = audio != null ? audio.open() : null;
++            if (pipe != null) {
++                mAudio = audio;
++            } else if (audio != null) {
++                audio.close();
++            }
++        }
++        listen(recognizer, pipe);
+     }
+ 
+-    private void listen(SpeechRecognizer recognizer) {
++    private void listen(SpeechRecognizer recognizer, @Nullable ParcelFileDescriptor pipe) {
+         mIntent.putExtra(RecognizerIntent.EXTRA_LANGUAGE, mLanguage);
++        if (pipe != null) {
++            closePipe();
++            mPipe = pipe;
++            mIntent.putExtra(EXTRA_AUDIO_SOURCE, pipe);
++            mIntent.putExtra(EXTRA_AUDIO_SOURCE_ENCODING, ENCODING_PCM_16BIT);
++            mIntent.putExtra(EXTRA_AUDIO_SOURCE_CHANNEL_COUNT, 1);
++            mIntent.putExtra(EXTRA_AUDIO_SOURCE_SAMPLING_RATE, 16000);
++            // The text comes from the partial results; the page gets them only if it asked.
++            mIntent.putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true);
++            scheduleEnd(PIPE_NO_SPEECH_MS);
++        }
+         try {
+             recognizer.startListening(mIntent);
+         } catch (SecurityException e) {
+@@ -502,7 +642,169 @@
+         mListener = new Listener();
+         recognizer.setRecognitionListener(mListener);
+         mLanguage = mPageLanguage;
+-        listen(recognizer);
++        if (mAudio == null) {
++            listen(recognizer, null);
++            return;
++        }
++        // The new recognizer hears the session's audio from its start.
++        @Nullable ParcelFileDescriptor pipe = mAudio.replay();
++        if (pipe == null) {
++            terminate(SpeechRecognitionErrorCode.LANGUAGE_NOT_SUPPORTED);
++            return;
++        }
++        mIgnoreClientErrorUntil = SystemClock.uptimeMillis() + STRAY_CLIENT_ERROR_MS;
++        mSegments.clear();
++        mSegment = "";
++        listen(recognizer, pipe);
++    }
++
++    /**
++     * The person's tap on "Switch": the live piped session goes on in {@code bcp47}, a new
++     * recognizer hearing the session's audio again from its start.
++     */
++    static boolean switchLiveSession(String bcp47) {
++        SpeechRecognitionImpl session = sLiveSession;
++        return session != null && session.switchLanguage(bcp47);
++    }
++
++    private boolean switchLanguage(String bcp47) {
++        if (mAudio == null
++                || mRecognizer == null
++                || mFinishing
++                || mStopRequested
++                || mNativeSpeechRecognizerImplAndroid == 0
++                || TextUtils.isEmpty(bcp47)
++                || bcp47.equals(mLanguage)) {
++            return false;
++        }
++        @Nullable ParcelFileDescriptor pipe = mAudio.replay();
++        if (pipe == null) return false;
++        SpeechRecognizer old = mRecognizer;
++        mRecognizer = null;
++        try {
++            old.cancel();
++            old.destroy();
++        } catch (IllegalArgumentException e) {
++            Log.w(TAG, "Destroy threw exception " + old, e);
++        }
++        SpeechRecognizer recognizer = createOnDeviceRecognizer();
++        if (recognizer == null) {
++            closeQuietly(pipe);
++            terminate(SpeechRecognitionErrorCode.SERVICE_NOT_ALLOWED);
++            return true;
++        }
++        mRecognizer = recognizer;
++        mListener = new Listener();
++        recognizer.setRecognitionListener(mListener);
++        // What the page has so far stays; the new recognizer's text replaces the interim text,
++        // and is used if it finds none.
++        String before = pipedText();
++        if (!before.isEmpty()) mTextBeforeSwitch = before;
++        mSegments.clear();
++        mSegment = "";
++        mLanguage = bcp47;
++        mIgnoreClientErrorUntil = SystemClock.uptimeMillis() + STRAY_CLIENT_ERROR_MS;
++        listen(recognizer, pipe);
++        return true;
++    }
++
++    /** A piped recognizer's partial result: the current segment's text so far. */
++    private void onPipedText(Bundle bundle) {
++        String text = firstResult(bundle);
++        if (text.isEmpty() || text.equals(mSegment)) return;
++        mSegment = text;
++        scheduleEnd(PIPE_END_AFTER_TEXT_MS);
++        if (!mInterimResults || mNativeSpeechRecognizerImplAndroid == 0) return;
++        SpeechRecognitionImplJni.get()
++                .onRecognitionResults(
++                        mNativeSpeechRecognizerImplAndroid,
++                        new String[] {pipedText()},
++                        null,
++                        true);
++    }
++
++    private void commitSegment() {
++        if (!mSegment.isEmpty()) mSegments.add(mSegment);
++        mSegment = "";
++    }
++
++    /** The session's text: the segments that ended and the current one, joined. */
++    private String pipedText() {
++        StringBuilder text = new StringBuilder();
++        for (String segment : mSegments) appendWord(text, segment);
++        appendWord(text, mSegment);
++        return text.toString();
++    }
++
++    private static void appendWord(StringBuilder text, String part) {
++        String trimmed = part.trim();
++        if (trimmed.isEmpty()) return;
++        if (text.length() > 0) text.append(' ');
++        text.append(trimmed);
++    }
++
++    private static String firstResult(Bundle bundle) {
++        @Nullable ArrayList<String> list =
++                bundle.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION);
++        if (list == null || list.isEmpty() || list.get(0) == null) return "";
++        return list.get(0).trim();
++    }
++
++    private void scheduleEnd(long delayMs) {
++        if (mAudio == null || mFinishing) return;
++        mHandler.removeCallbacks(mPipeEnd);
++        mHandler.postDelayed(mPipeEnd, delayMs);
++    }
++
++    /**
++     * Ends a piped session with its text as the final result, in the order the page gets them
++     * without the pipe (sound end, audio end, result, end); with no text, in no-speech.
++     */
++    private void finishPiped() {
++        if (mAudio == null || mFinishing || mNativeSpeechRecognizerImplAndroid == 0) return;
++        mFinishing = true;
++        mHandler.removeCallbacks(mPipeEnd);
++        commitSegment();
++        String text = pipedText();
++        if (text.isEmpty()) text = mTextBeforeSwitch;
++        if (text.isEmpty()) {
++            // Never made up: no text is no speech, whatever the audio sounded like.
++            terminate(SpeechRecognitionErrorCode.NO_SPEECH);
++            return;
++        }
++        if (mState == STATE_CAPTURING_SPEECH) {
++            SpeechRecognitionImplJni.get().onSoundEnd(mNativeSpeechRecognizerImplAndroid);
++        }
++        if (mState != STATE_IDLE) {
++            SpeechRecognitionImplJni.get().onAudioEnd(mNativeSpeechRecognizerImplAndroid);
++            mState = STATE_IDLE;
++        }
++        SpeechRecognitionImplJni.get()
++                .onRecognitionResults(
++                        mNativeSpeechRecognizerImplAndroid, new String[] {text}, null, false);
++        terminate(SpeechRecognitionErrorCode.NONE);
++    }
++
++    private void closeAudio() {
++        mHandler.removeCallbacks(mPipeEnd);
++        closePipe();
++        SpeechRecognition.@Nullable AudioSource audio = mAudio;
++        mAudio = null;
++        if (audio != null) audio.close();
++    }
++
++    private void closePipe() {
++        if (mPipe == null) return;
++        closeQuietly(mPipe);
++        mPipe = null;
++    }
++
++    private static void closeQuietly(ParcelFileDescriptor pipe) {
++        try {
++            pipe.close();
++        } catch (IOException e) {
++            // Nothing to do: the pipe is gone either way.
++        }
+     }
+ 
+     @VisibleForTesting
+@@ -525,9 +827,19 @@
+ 
+         mContinuous = false;
+         mStopRequested = true;
++        if (mAudio != null) {
++            // stopListening() with the pipe open is an error: the text so far is the result.
++            finishPiped();
++            return;
++        }
+         mRecognizer.stopListening();
+     }
+ 
++    @VisibleForTesting
++    void stopRecognitionForTesting() {
++        stopRecognition();
++    }
++
+     @NativeMethods
+     interface Natives {
+         // Native JNI calls to content/browser/speech/speech_recognizer_impl_android.cc
+diff '--color=never' -ruN a/content/public/android/java/src/org/chromium/content_public/browser/SpeechRecognition.java b/content/public/android/java/src/org/chromium/content_public/browser/SpeechRecognition.java
+--- a/content/public/android/java/src/org/chromium/content_public/browser/SpeechRecognition.java	2026-10-25 17:34:18.726806100 +0530
++++ b/content/public/android/java/src/org/chromium/content_public/browser/SpeechRecognition.java	2026-10-25 17:34:18.704576183 +0530
+@@ -4,6 +4,8 @@
+ 
+ package org.chromium.content_public.browser;
+ 
++import android.os.ParcelFileDescriptor;
++
+ import org.chromium.build.annotations.NullMarked;
+ import org.chromium.build.annotations.Nullable;
+ import org.chromium.content.browser.SpeechRecognitionImpl;
+@@ -54,6 +56,41 @@
+ 
+         /** A session for the origin ended, having run in {@code bcp47}. */
+         default void onSessionEnded(String origin, String bcp47) {}
++
++        /**
++         * Tark's own capture of the microphone for a session that starts (spoken-language
++         * detection, Android 13+, single-utterance sessions only), or null to let Android's
++         * recognizer use the microphone itself, as without detection.
++         *
++         * @param origin The page's origin, or empty (a private tab, an opaque origin).
++         * @param bcp47 The language the session starts in.
++         */
++        default @Nullable AudioSource audioSourceFor(String origin, String bcp47) {
++            return null;
++        }
++    }
++
++    /**
++     * Tark: a session's audio when Tark captures the microphone itself: 16 kHz mono 16-bit PCM,
++     * written into a pipe as it is captured (never faster than real time), for Android's
++     * recognizer to read through {@code RecognizerIntent.EXTRA_AUDIO_SOURCE}. All calls come on
++     * the UI thread.
++     */
++    public interface AudioSource {
++        /** The read end of the session's pipe, or null if the capture can't start. */
++        @Nullable ParcelFileDescriptor open();
++
++        /**
++         * A new pipe for a restarted recognizer: the audio held so far (at most 15 s, in memory
++         * only) first, then the live audio. The previous pipe ends. Null if there is none.
++         */
++        @Nullable ParcelFileDescriptor replay();
++
++        /**
++         * The session ended (results, error or abort), after its recognizer is gone: the capture
++         * stops and the audio held is dropped. Called once.
++         */
++        void close();
+     }
+ 
+     /** Tark: whether a speech recognition session (any tab's, private ones too) is live. */
+@@ -62,6 +99,18 @@
+     }
+ 
+     /**
++     * Tark: the live session, when Tark captures its audio, goes on in {@code bcp47}: a new
++     * recognizer hears the session's audio again from its start, then the live audio. Results
++     * the page already has stay as they are, and the page sees no new events. Only the person's
++     * tap calls this.
++     *
++     * @return Whether the session switched.
++     */
++    public static boolean switchLanguage(String bcp47) {
++        return SpeechRecognitionImpl.switchLiveSession(bcp47);
++    }
++
++    /**
+      * Tark: sets the delegate told when a session fails for a language the device lacks.
+      *
+      * @param delegate The delegate, or null for none.
+@@ -90,6 +139,12 @@
+                             public void onSessionEnded(String origin, String bcp47) {
+                                 delegate.onSessionEnded(origin, bcp47);
+                             }
++
++                            @Override
++                            public @Nullable AudioSource audioSourceFor(
++                                    String origin, String bcp47) {
++                                return delegate.audioSourceFor(origin, bcp47);
++                            }
+                         });
+     }
+ }
+diff '--color=never' -ruN a/content/public/android/junit/src/org/chromium/content/browser/SpeechRecognitionImplTest.java b/content/public/android/junit/src/org/chromium/content/browser/SpeechRecognitionImplTest.java
+--- a/content/public/android/junit/src/org/chromium/content/browser/SpeechRecognitionImplTest.java	2026-10-25 17:34:18.754542330 +0530
++++ b/content/public/android/junit/src/org/chromium/content/browser/SpeechRecognitionImplTest.java	2026-10-25 17:34:18.731846074 +0530
+@@ -4,6 +4,8 @@
+ 
+ package org.chromium.content.browser;
+ 
++import static java.util.concurrent.TimeUnit.MILLISECONDS;
++
+ import static org.junit.Assert.assertEquals;
+ import static org.junit.Assert.assertFalse;
+ import static org.junit.Assert.assertTrue;
+@@ -24,6 +26,7 @@
+ import android.content.Context;
+ import android.content.Intent;
+ import android.os.Bundle;
++import android.os.ParcelFileDescriptor;
+ import android.speech.RecognitionListener;
+ import android.speech.RecognizerIntent;
+ import android.speech.SpeechRecognizer;
+@@ -38,11 +41,15 @@
+ import org.mockito.junit.MockitoJUnit;
+ import org.mockito.junit.MockitoRule;
+ import org.robolectric.annotation.Config;
++import org.robolectric.shadows.ShadowLooper;
+ 
+ import org.chromium.base.test.BaseRobolectricTestRunner;
+ import org.chromium.build.annotations.Nullable;
++import org.chromium.content_public.browser.SpeechRecognition;
+ import org.chromium.media.mojom.SpeechRecognitionErrorCode;
+ 
++import java.io.File;
++import java.io.IOException;
+ import java.util.ArrayList;
+ import java.util.Arrays;
+ import java.util.List;
+@@ -446,4 +453,259 @@
+         verifyEndedWith(NATIVE_1, SpeechRecognitionErrorCode.SERVICE_NOT_ALLOWED);
+         assertFalse(SpeechRecognitionImpl.hasLiveSession());
+     }
++
++    // Tark: spoken-language detection's pipe (Android 13+).
++
++    /** Stands in for Tark's capture: each pipe is a file here; counts what was asked. */
++    private static class FakeAudio implements SpeechRecognition.AudioSource {
++        final List<ParcelFileDescriptor> mOpened = new ArrayList<>();
++        int mReplays;
++        int mCloses;
++        boolean mFail;
++
++        private ParcelFileDescriptor pipe() {
++            try {
++                File file = File.createTempFile("pipe", ".pcm");
++                file.deleteOnExit();
++                ParcelFileDescriptor pfd =
++                        ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY);
++                mOpened.add(pfd);
++                return pfd;
++            } catch (IOException e) {
++                throw new AssertionError(e);
++            }
++        }
++
++        @Override
++        public @Nullable ParcelFileDescriptor open() {
++            return mFail ? null : pipe();
++        }
++
++        @Override
++        public @Nullable ParcelFileDescriptor replay() {
++            mReplays++;
++            return pipe();
++        }
++
++        @Override
++        public void close() {
++            mCloses++;
++        }
++    }
++
++    private final FakeAudio mAudio = new FakeAudio();
++
++    private static Bundle results(String... texts) {
++        Bundle bundle = new Bundle();
++        bundle.putStringArrayList(
++                SpeechRecognizer.RESULTS_RECOGNITION, new ArrayList<>(Arrays.asList(texts)));
++        return bundle;
++    }
++
++    private Intent intent(int recognizer) {
++        ArgumentCaptor<Intent> intent = ArgumentCaptor.forClass(Intent.class);
++        verify(mFactory.mCreated.get(recognizer)).startListening(intent.capture());
++        return intent.getValue();
++    }
++
++    private SpeechRecognitionImpl startPiped(String language) {
++        when(mLanguageDelegate.audioSourceFor(SITE, language)).thenReturn(mAudio);
++        SpeechRecognitionImpl.setLanguageDelegate(mLanguageDelegate);
++        return start(NATIVE_1, language);
++    }
++
++    @Test
++    @Config(sdk = 33)
++    public void testNoAudioSourceNoPipe() {
++        SpeechRecognitionImpl.setLanguageDelegate(mLanguageDelegate);
++        start(NATIVE_1, "en-US");
++
++        verify(mLanguageDelegate).audioSourceFor(SITE, "en-US");
++        assertFalse(intent(0).hasExtra(SpeechRecognitionImpl.EXTRA_AUDIO_SOURCE));
++    }
++
++    @Test
++    public void testBelow33NeverAsksForAudio() {
++        SpeechRecognitionImpl.setLanguageDelegate(mLanguageDelegate);
++        start(NATIVE_1, "en-US");
++
++        verify(mLanguageDelegate, never()).audioSourceFor(anyString(), anyString());
++        assertFalse(intent(0).hasExtra(SpeechRecognitionImpl.EXTRA_AUDIO_SOURCE));
++    }
++
++    @Test
++    @Config(sdk = 33)
++    public void testContinuousNeverPiped() {
++        SpeechRecognitionImpl.setLanguageDelegate(mLanguageDelegate);
++        SpeechRecognitionImpl session = SpeechRecognitionImpl.createSpeechRecognition(NATIVE_1);
++        session.startRecognition("en-US", true, true, SITE);
++
++        verify(mLanguageDelegate, never()).audioSourceFor(anyString(), anyString());
++    }
++
++    @Test
++    @Config(sdk = 33)
++    public void testCaptureThatCannotStartUsesTheMic() {
++        mAudio.mFail = true;
++        startPiped("en-US");
++
++        assertFalse(intent(0).hasExtra(SpeechRecognitionImpl.EXTRA_AUDIO_SOURCE));
++        assertEquals(1, mAudio.mCloses);
++    }
++
++    @Test
++    @Config(sdk = 33)
++    public void testPipedSessionJoinsSegments() {
++        SpeechRecognitionImpl session = startPiped("en-US");
++        Intent intent = intent(0);
++        assertEquals(
++                mAudio.mOpened.get(0),
++                intent.getParcelableExtra(SpeechRecognitionImpl.EXTRA_AUDIO_SOURCE, ParcelFileDescriptor.class));
++        assertEquals(16000, intent.getIntExtra(SpeechRecognitionImpl.EXTRA_AUDIO_SOURCE_SAMPLING_RATE, 0));
++        assertEquals(1, intent.getIntExtra(SpeechRecognitionImpl.EXTRA_AUDIO_SOURCE_CHANNEL_COUNT, 0));
++        assertEquals(2, intent.getIntExtra(SpeechRecognitionImpl.EXTRA_AUDIO_SOURCE_ENCODING, 0));
++        assertTrue(intent.getBooleanExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, false));
++
++        RecognitionListener listener = session.getListenerForTesting();
++        listener.onReadyForSpeech(new Bundle());
++        listener.onBeginningOfSpeech();
++        listener.onPartialResults(results("Hello"));
++        listener.onPartialResults(results("Hello world"));
++        listener.onEndOfSpeech();
++        // A short pause: the recognizer starts a new segment, and the session goes on.
++        ShadowLooper.idleMainLooper(SpeechRecognitionImpl.PIPE_END_AFTER_SPEECH_MS / 2, MILLISECONDS);
++        listener.onBeginningOfSpeech();
++        listener.onPartialResults(results("this is a test", "this is a tent"));
++        verify(mNatives)
++                .onRecognitionResults(NATIVE_1, new String[] {"Hello world this is a test"}, null, true);
++        verify(mNatives, never()).onRecognitionEnd(anyLong());
++
++        listener.onEndOfSpeech();
++        ShadowLooper.idleMainLooper(SpeechRecognitionImpl.PIPE_END_AFTER_SPEECH_MS, MILLISECONDS);
++
++        verify(mNatives)
++                .onRecognitionResults(NATIVE_1, new String[] {"Hello world this is a test"}, null, false);
++        verify(mNatives).onSoundEnd(NATIVE_1);
++        verify(mNatives).onAudioEnd(NATIVE_1);
++        verify(mNatives, never()).onRecognitionError(anyLong(), anyInt());
++        verify(mNatives).onRecognitionEnd(NATIVE_1);
++        assertEquals(1, mAudio.mCloses);
++        // The empty final bundle, once the pipe closed, changes nothing.
++        listener.onResults(new Bundle());
++        verify(mNatives, times(1)).onRecognitionEnd(NATIVE_1);
++    }
++
++    @Test
++    @Config(sdk = 33)
++    public void testPipedNoTextIsNoSpeech() {
++        SpeechRecognitionImpl session = startPiped("en-US");
++        RecognitionListener listener = session.getListenerForTesting();
++        listener.onReadyForSpeech(new Bundle());
++        listener.onBeginningOfSpeech();
++        ShadowLooper.idleMainLooper(SpeechRecognitionImpl.PIPE_NO_SPEECH_MS, MILLISECONDS);
++
++        verify(mNatives, never())
++                .onRecognitionResults(anyLong(), any(), any(), anyBoolean());
++        verifyEndedWith(NATIVE_1, SpeechRecognitionErrorCode.NO_SPEECH);
++        assertEquals(1, mAudio.mCloses);
++    }
++
++    @Test
++    @Config(sdk = 33)
++    public void testPipedTextEndsAfterQuiet() {
++        // A recognizer that never says the speech ended (en-IN): the text stops changing.
++        SpeechRecognitionImpl session = startPiped("en-IN");
++        RecognitionListener listener = session.getListenerForTesting();
++        listener.onReadyForSpeech(new Bundle());
++        listener.onPartialResults(results("mausam kaisa hai"));
++        ShadowLooper.idleMainLooper(SpeechRecognitionImpl.PIPE_END_AFTER_TEXT_MS, MILLISECONDS);
++
++        verify(mNatives).onRecognitionResults(NATIVE_1, new String[] {"mausam kaisa hai"}, null, false);
++        verify(mNatives).onRecognitionEnd(NATIVE_1);
++    }
++
++    @Test
++    @Config(sdk = 33)
++    public void testPipedStopClosesThePipeNotStopListening() {
++        SpeechRecognitionImpl session = startPiped("en-US");
++        RecognitionListener listener = session.getListenerForTesting();
++        listener.onReadyForSpeech(new Bundle());
++        listener.onPartialResults(results("hello"));
++        session.stopRecognitionForTesting();
++
++        verify(mFactory.mCreated.get(0), never()).stopListening();
++        verify(mNatives).onRecognitionResults(NATIVE_1, new String[] {"hello"}, null, false);
++        verify(mNatives, never()).onRecognitionError(anyLong(), anyInt());
++        verify(mNatives).onRecognitionEnd(NATIVE_1);
++        assertEquals(1, mAudio.mCloses);
++    }
++
++    @Test
++    @Config(sdk = 33)
++    public void testPipedAbortClosesAudio() {
++        SpeechRecognitionImpl session = startPiped("en-US");
++        session.abortRecognition();
++
++        verifyEndedWith(NATIVE_1, SpeechRecognitionErrorCode.ABORTED);
++        assertEquals(1, mAudio.mCloses);
++    }
++
++    @Test
++    @Config(sdk = 33)
++    public void testSwitchRestartsInLanguageWithReplay() {
++        SpeechRecognitionImpl session = startPiped("en-IN");
++        RecognitionListener first = session.getListenerForTesting();
++        first.onReadyForSpeech(new Bundle());
++        first.onBeginningOfSpeech();
++        first.onPartialResults(results("mosam kesa"));
++        verify(mNatives).onRecognitionResults(NATIVE_1, new String[] {"mosam kesa"}, null, true);
++
++        assertTrue(SpeechRecognition.switchLanguage("hi-IN"));
++
++        assertEquals(2, mFactory.mCreated.size());
++        verify(mFactory.mCreated.get(0)).cancel();
++        assertEquals(1, mAudio.mReplays);
++        Intent second = intent(1);
++        assertEquals("hi-IN", second.getStringExtra(RecognizerIntent.EXTRA_LANGUAGE));
++        assertEquals(
++                mAudio.mOpened.get(1),
++                second.getParcelableExtra(SpeechRecognitionImpl.EXTRA_AUDIO_SOURCE, ParcelFileDescriptor.class));
++        RecognitionListener listener = session.getListenerForTesting();
++        // The cancelled recognizer's stray error, and its late events, change nothing.
++        listener.onError(SpeechRecognizer.ERROR_CLIENT);
++        first.onPartialResults(results("stale"));
++        listener.onReadyForSpeech(new Bundle());
++        listener.onPartialResults(results("मौसम कैसा है"));
++        listener.onEndOfSpeech();
++        ShadowLooper.idleMainLooper(SpeechRecognitionImpl.PIPE_END_AFTER_SPEECH_MS, MILLISECONDS);
++
++        // The page's audio started once; what it already had was never taken back.
++        verify(mNatives, times(1)).onAudioStart(NATIVE_1);
++        verify(mNatives, times(1)).onRecognitionResults(NATIVE_1, new String[] {"mosam kesa"}, null, true);
++        verify(mNatives).onRecognitionResults(NATIVE_1, new String[] {"मौसम कैसा है"}, null, false);
++        verify(mNatives, never()).onRecognitionError(anyLong(), anyInt());
++        verify(mNatives).onRecognitionEnd(NATIVE_1);
++        verify(mLanguageDelegate).onSessionEnded(SITE, "hi-IN");
++    }
++
++    @Test
++    @Config(sdk = 33)
++    public void testSwitchKeepsTextIfTheNewRecognizerHasNone() {
++        SpeechRecognitionImpl session = startPiped("en-IN");
++        session.getListenerForTesting().onPartialResults(results("mosam kesa"));
++        assertTrue(SpeechRecognition.switchLanguage("hi-IN"));
++        ShadowLooper.idleMainLooper(SpeechRecognitionImpl.PIPE_NO_SPEECH_MS, MILLISECONDS);
++
++        verify(mNatives).onRecognitionResults(NATIVE_1, new String[] {"mosam kesa"}, null, false);
++        verify(mNatives, never()).onRecognitionError(anyLong(), anyInt());
++    }
++
++    @Test
++    @Config(sdk = 33)
++    public void testNoSwitchWithoutPipe() {
++        SpeechRecognitionImpl.setLanguageDelegate(mLanguageDelegate);
++        start(NATIVE_1, "en-US");
++        assertFalse(SpeechRecognition.switchLanguage("hi-IN"));
++        assertEquals(1, mFactory.mCreated.size());
++    }
+ }
