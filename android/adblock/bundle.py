@@ -56,10 +56,20 @@ MAX_SIZE = 16 * 1024 * 1024
 FORMAT = 1
 USER_AGENT = 'Tark-lists/1 (+https://gettarka.com)'
 
-# `!#if` tokens that hold for Tark on Android, as uBO evaluates them on
-# Chromium for Android. Tark injects user stylesheets (cap_user_stylesheet);
-# every other token is false, as in uBO.
-TRUE_TOKENS = {'env_chromium', 'env_mobile', 'cap_user_stylesheet'}
+# `!#if` tokens that hold for Tark, per platform, as uBO evaluates them on
+# Chromium for Android and on desktop Chromium (Mac and Windows share one
+# bundle). Tark injects user stylesheets (cap_user_stylesheet); every other
+# token is false, as in uBO.
+PLATFORM_TOKENS = {
+    'android': frozenset({'env_chromium', 'env_mobile', 'cap_user_stylesheet'}),
+    'desktop': frozenset({'env_chromium', 'cap_user_stylesheet'}),
+}
+
+
+def _tokens(platform):
+    if platform not in PLATFORM_TOKENS:
+        raise ValueError(f'unknown platform {platform!r}')
+    return PLATFORM_TOKENS[platform]
 
 List = namedtuple('List', 'name url permission text')
 
@@ -72,7 +82,7 @@ def _fetch(url):
 
 # --- !#if / !#include, as uBO's preprocessor ---------------------------------
 
-def _eval(expr):
+def _eval(expr, true_tokens):
     tokens = re.findall(r'!|&&|\|\||\(|\)|[A-Za-z0-9_]+', expr)
     pos = 0
 
@@ -93,7 +103,7 @@ def _eval(expr):
             if take() != ')':
                 raise ValueError(f'bad !#if expression: {expr}')
             return v
-        return t in TRUE_TOKENS
+        return t in true_tokens
 
     def conj():
         v = unary()
@@ -115,9 +125,10 @@ def _eval(expr):
     return value
 
 
-def preprocess(text, base_url, fetch=_fetch):
+def preprocess(text, base_url, fetch=_fetch, platform='android'):
     """Evaluates !#if/!#else/!#endif and inlines same-origin !#include files
     (themselves preprocessed). adblock-rust treats these lines as comments."""
+    true_tokens = _tokens(platform)
     out = []
     stack = []  # (taking, parent_taking)
     taking = True
@@ -126,7 +137,7 @@ def preprocess(text, base_url, fetch=_fetch):
         s = line.strip()
         if s.startswith('!#if '):
             stack.append((taking, taking))
-            taking = taking and _eval(s[5:])
+            taking = taking and _eval(s[5:], true_tokens)
         elif s == '!#else':
             if not stack:
                 raise ValueError('!#else without !#if')
@@ -143,7 +154,7 @@ def preprocess(text, base_url, fetch=_fetch):
             u = urllib.parse.urlsplit(url)
             if (u.scheme, u.netloc) != (base.scheme, base.netloc):
                 raise ValueError(f'cross-origin !#include refused: {url}')
-            out.append(preprocess(fetch(url), url, fetch))
+            out.append(preprocess(fetch(url), url, fetch, platform))
         else:
             out.append(line)
     return '\n'.join(out) + '\n'
@@ -158,12 +169,16 @@ def _entry(name):
     return info
 
 
-def make_zip(lists, resources, created, ubo_tag):
-    """The bundle's bytes; the same inputs always give the same bytes."""
+def make_zip(lists, resources, created, ubo_tag, platform='android'):
+    """The bundle's bytes; the same inputs always give the same bytes. The
+    platform is in the signed manifest, so one platform's bundle never stands
+    in for the other's (both are signed with the same key)."""
+    _tokens(platform)
     resources_json = json.dumps(resources, separators=(',', ':'), sort_keys=True).encode()
     manifest = {
         'format': FORMAT,
         'created': created,
+        'platform': platform,
         'ubo_tag': ubo_tag,
         'lists': [{'name': l.name, 'url': l.url, 'permission': l.permission,
                    'sha256': hashlib.sha256(l.text.encode()).hexdigest()} for l in lists],
@@ -250,7 +265,7 @@ def _ubo_source(pin, dest, fetch=_fetch_bytes):
     return next(pathlib.Path(dest).glob('uBlock-*'))
 
 
-def fetch_lists(assets):
+def fetch_lists(assets, platform='android'):
     lists = []
     for name, permission in LISTS:
         entry = assets.get(name)
@@ -260,7 +275,7 @@ def fetch_lists(assets):
             urls = entry['contentURL']
             urls = [urls] if isinstance(urls, str) else urls
             url = next(u for u in urls if u.startswith('https://'))
-        text = preprocess(_fetch(url), url)
+        text = preprocess(_fetch(url), url, platform=platform)
         if len(text) < 1000:
             raise ValueError(f'{name} is suspiciously short ({len(text)} bytes)')
         lists.append(List(name, url, permission, text))
@@ -280,13 +295,14 @@ def bundle_file_name(now):
     return f'lists-{minutes:08d}.zip'
 
 
-def build(out_dir, listtool=None):
+def build(out_dir, listtool=None, platform='android'):
+    _tokens(platform)
     pin = ubo_pin()
     listtool = listtool or str(HERE / 'listtool' / 'target' / 'release' / 'listtool')
     with tempfile.TemporaryDirectory() as tmp:
         ubo = _ubo_source(pin, tmp)
         assets = json.loads((ubo / 'assets' / 'assets.json').read_text())
-        lists = fetch_lists(assets)
+        lists = fetch_lists(assets, platform)
         redirects = pathlib.Path(tmp) / 'redirects.json'
         subprocess.run([listtool, 'resources', '--ubo', str(ubo), '--out', str(redirects)], check=True)
         scriptlets = subprocess.run(['node', str(HERE / 'scriptlets.mjs'), str(ubo)], check=True,
@@ -294,7 +310,7 @@ def build(out_dir, listtool=None):
         resources = json.loads(redirects.read_text()) + json.loads(scriptlets)
     now = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)
     created = now.strftime('%Y-%m-%dT%H:%M:%SZ')
-    data = make_zip(lists, resources, created, pin['tag'])
+    data = make_zip(lists, resources, created, pin['tag'], platform=platform)
     path = pathlib.Path(out_dir) / bundle_file_name(now)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(data)
@@ -313,6 +329,7 @@ def main(argv=None):
     b = sub.add_parser('build')
     b.add_argument('--out', required=True)
     b.add_argument('--listtool')
+    b.add_argument('--platform', choices=sorted(PLATFORM_TOKENS), default='android')
     s = sub.add_parser('sign')
     s.add_argument('zip')
     s.add_argument('--key', required=True)
@@ -327,7 +344,7 @@ def main(argv=None):
     args = ap.parse_args(argv)
 
     if args.cmd == 'build':
-        print(build(args.out, args.listtool))
+        print(build(args.out, args.listtool, args.platform))
     elif args.cmd == 'pin-ubo':
         print(json.dumps(pin_ubo(args.tag), indent=1))
     elif args.cmd == 'sign':
