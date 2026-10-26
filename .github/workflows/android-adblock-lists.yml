@@ -1,8 +1,10 @@
-# Tark for Android's adblock lists (A2, spec §4): once a day, fetch the lists
-# and uBlock Origin's scriptlets and resources, bundle them as text, check the
-# bundle by compiling it with the browser's adblock-rust, sign it (Ed25519)
-# and publish it on gettarka.com. Phones verify the signature with the public
-# key in android/adblock/lists_pubkey.txt and compile the lists themselves.
+# Tark's adblock lists (A2, spec §4): once a day, fetch the lists and uBlock
+# Origin's scriptlets and resources, bundle them as text, check the bundle by
+# compiling it with the browser's adblock-rust, sign it (Ed25519) and publish
+# it on gettarka.com: one bundle for Android (lists/android/v1/) and one that
+# Mac and Windows share (lists/desktop/v1/, uBO's env_mobile blocks dropped).
+# Browsers verify the signature with the public key in
+# android/adblock/lists_pubkey.txt and compile the lists themselves.
 #
 # Two jobs, because bundling runs third-party code (uBlock Origin's scriptlet
 # module, pinned in android/adblock/ubo.json): "build" does that with nothing
@@ -37,12 +39,16 @@ jobs:
           persist-credentials: false
       - name: Build the list tool
         run: cargo build --release --locked --manifest-path android/adblock/listtool/Cargo.toml
+      # Android's bundle (uBO's env_mobile blocks kept) and the desktop one
+      # Mac and Windows share (env_mobile blocks dropped).
       - name: Bundle
-        run: python3 android/adblock/bundle.py build --out out
+        run: |
+          python3 android/adblock/bundle.py build --out out/android --platform android
+          python3 android/adblock/bundle.py build --out out/desktop --platform desktop
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: lists
-          path: out/lists-*.zip
+          path: out/*/lists-*.zip
           if-no-files-found: error
           retention-days: 1
 
@@ -68,47 +74,66 @@ jobs:
         with:
           name: lists
           path: in
-      - name: Take the zip
-        # Exactly one file, named as phones accept (ValidBundleFileName), and
-        # of a sane size, before its name is used anywhere.
+      - name: Take the zips
+        # Per platform, exactly one file, named as installed Tarks accept
+        # (ValidBundleFileName), and of a sane size, before its name is used
+        # anywhere; and nothing else in the artifact.
         run: |
           shopt -s nullglob dotglob
-          files=(in/*)
-          if [[ ${#files[@]} -ne 1 || ! ${files[0]} =~ ^in/lists-[0-9]{8}\.zip$ ]]; then
-            echo "expected one lists-<8 digits>.zip, got ${#files[@]} files" >&2
+          all=(in/*)
+          if [[ ${#all[@]} -ne 2 ]]; then
+            echo "expected the android and desktop folders, got ${#all[@]} entries" >&2
             exit 1
           fi
-          size=$(stat -c %s "${files[0]}")
-          if (( size == 0 || size > 20000000 )); then
-            echo "the zip is $size bytes" >&2
-            exit 1
-          fi
-          mkdir out
-          cp "${files[0]}" out/
+          for platform in android desktop; do
+            files=(in/$platform/*)
+            if [[ ${#files[@]} -ne 1 || ! ${files[0]} =~ ^in/$platform/lists-[0-9]{8}\.zip$ ]]; then
+              echo "expected one $platform lists-<8 digits>.zip, got ${#files[@]} files" >&2
+              exit 1
+            fi
+            size=$(stat -c %s "${files[0]}")
+            if (( size == 0 || size > 20000000 )); then
+              echo "the $platform zip is $size bytes" >&2
+              exit 1
+            fi
+            mkdir -p out/$platform
+            cp "${files[0]}" out/$platform/
+          done
       - name: Check
-        run: android/adblock/listtool/target/release/listtool check out/lists-*.zip android/adblock/canaries.txt
+        run: |
+          android/adblock/listtool/target/release/listtool check out/android/lists-*.zip android/adblock/canaries.txt
+          android/adblock/listtool/target/release/listtool check out/desktop/lists-*.zip android/adblock/canaries.txt
       - name: Sign
         env:
           TARK_LISTS_SIGNING_KEY: ${{ secrets.TARK_LISTS_SIGNING_KEY }}
         run: |
           umask 077
           printf '%s\n' "$TARK_LISTS_SIGNING_KEY" > "$RUNNER_TEMP/key"
-          python3 android/adblock/bundle.py sign out/lists-*.zip --key "$RUNNER_TEMP/key"
+          python3 android/adblock/bundle.py sign out/android/lists-*.zip --key "$RUNNER_TEMP/key"
+          python3 android/adblock/bundle.py sign out/desktop/lists-*.zip --key "$RUNNER_TEMP/key"
           rm -f "$RUNNER_TEMP/key"
-          python3 android/adblock/bundle.py verify out/lists-*.zip out/latest.json --pubkey android/adblock/lists_pubkey.txt
+          python3 android/adblock/bundle.py verify out/android/lists-*.zip out/android/latest.json --pubkey android/adblock/lists_pubkey.txt
+          python3 android/adblock/bundle.py verify out/desktop/lists-*.zip out/desktop/latest.json --pubkey android/adblock/lists_pubkey.txt
       - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd  # v6.3.0
         with:
           role-to-assume: arn:aws:iam::967555169405:role/tark-lists-publisher
           aws-region: ap-south-1
       - name: Publish
         run: |
-          z=$(ls out/lists-*.zip)
-          # The zip first, under a name no earlier bundle had (bundle.py), and
-          # never over an existing one (--if-none-match: a name already there
-          # fails the run before the index moves); then the index.
+          # Per platform: the zip first, under a name no earlier bundle had
+          # (bundle.py), and never over an existing one (--if-none-match: a
+          # name already there fails the run before the index moves); then
+          # the index.
+          z=$(ls out/android/lists-*.zip)
           aws s3api put-object --bucket tark-site-967555169405 --key "lists/android/v1/$(basename "$z")" \
             --body "$z" --if-none-match '*' \
             --content-type application/zip --cache-control 'public, max-age=31536000, immutable'
-          aws s3 cp out/latest.json s3://tark-site-967555169405/lists/android/v1/latest.json --content-type application/json \
+          aws s3 cp out/android/latest.json s3://tark-site-967555169405/lists/android/v1/latest.json --content-type application/json \
             --cache-control 'public, max-age=300'
-          aws cloudfront create-invalidation --distribution-id E1F37RZV3Y8TAK --paths /lists/android/v1/latest.json
+          z=$(ls out/desktop/lists-*.zip)
+          aws s3api put-object --bucket tark-site-967555169405 --key "lists/desktop/v1/$(basename "$z")" \
+            --body "$z" --if-none-match '*' \
+            --content-type application/zip --cache-control 'public, max-age=31536000, immutable'
+          aws s3 cp out/desktop/latest.json s3://tark-site-967555169405/lists/desktop/v1/latest.json --content-type application/json \
+            --cache-control 'public, max-age=300'
+          aws cloudfront create-invalidation --distribution-id E1F37RZV3Y8TAK --paths /lists/android/v1/latest.json /lists/desktop/v1/latest.json

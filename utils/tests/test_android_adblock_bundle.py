@@ -57,6 +57,26 @@ class TestPreprocess(unittest.TestCase):
         out = self.pre('!#if env_mobile\n!#if adguard_app_android\nx\n!#endif\ny\n!#endif\n!#if (env_safari || env_mobile)\nz\n!#endif\n')
         self.assertEqual(out.split(), ['y', 'z'])
 
+    def test_desktop_drops_mobile_blocks(self):
+        out = bundle.preprocess('!#if env_mobile\nm\n!#else\nd\n!#endif\n',
+                                'https://lists.example/f.txt', platform='desktop')
+        self.assertEqual(out.split(), ['d'])
+
+    def test_android_keeps_mobile_blocks(self):
+        out = bundle.preprocess('!#if env_mobile\nm\n!#else\nd\n!#endif\n',
+                                'https://lists.example/f.txt', platform='android')
+        self.assertEqual(out.split(), ['m'])
+
+    def test_desktop_include_keeps_the_platform(self):
+        files = {'https://lists.example/inc.txt': '!#if env_mobile\nm\n!#endif\nk\n'}
+        out = bundle.preprocess('!#include inc.txt\n', 'https://lists.example/f.txt',
+                                lambda url: files[url], platform='desktop')
+        self.assertEqual(out.split(), ['k'])
+
+    def test_build_rejects_unknown_platform(self):
+        with self.assertRaises(ValueError):
+            bundle.build('/nonexistent', platform='ios')
+
     def test_same_origin_include_inlined(self):
         files = {'https://lists.example/filters/part.txt': 'p1\n!#if env_firefox\np2\n!#endif\n'}
         out = self.pre('a\n!#include part.txt\nb\n', files)
@@ -169,6 +189,17 @@ class TestWorkflow(unittest.TestCase):
         self.assertIn('role-to-assume: arn:aws:iam::967555169405:role/tark-lists-publisher', self.y)
         self.assertNotIn('AWS_SECRET_ACCESS_KEY', self.y)
         self.assertNotIn('aws-secret-access-key', self.y)
+
+    def test_workflow_builds_and_publishes_both_platforms(self):
+        self.assertIn('bundle.py build --out out/android --platform android', self.y)
+        self.assertIn('bundle.py build --out out/desktop --platform desktop', self.y)
+        for platform in ('android', 'desktop'):
+            zip_up = self.y.index(f'lists/{platform}/v1/$(basename "$z")')
+            index_up = self.y.index(f'lists/{platform}/v1/latest.json --content-type')
+            self.assertLess(zip_up, index_up)
+        invalidation = next(l for l in self.y.splitlines() if 'create-invalidation' in l)
+        self.assertIn('/lists/android/v1/latest.json', invalidation)
+        self.assertIn('/lists/desktop/v1/latest.json', invalidation)
 
     def test_workflow_uploads_zip_before_index_and_invalidates_only_the_index(self):
         zip_up = self.y.index('lists/android/v1/$(basename "$z")')
