@@ -1,6 +1,6 @@
 diff --color '--color=never' -ruN a/chrome/android/chrome_java_resources.gni b/chrome/android/chrome_java_resources.gni
---- a/chrome/android/chrome_java_resources.gni	2026-10-26 11:24:30.147094952 +0530
-+++ b/chrome/android/chrome_java_resources.gni	2026-10-26 11:24:30.176168173 +0530
+--- a/chrome/android/chrome_java_resources.gni	2026-10-26 12:03:20.814334681 +0530
++++ b/chrome/android/chrome_java_resources.gni	2026-10-26 12:03:20.870389554 +0530
 @@ -687,4 +687,5 @@
    "java/res/xml/unified_account_settings_preferences.xml",
    "java/res/xml/universal_opt_out_preferences.xml",
@@ -8,8 +8,8 @@ diff --color '--color=never' -ruN a/chrome/android/chrome_java_resources.gni b/c
 +  "java/res/xml/zynclave_account_preferences.xml",
  ]
 diff --color '--color=never' -ruN a/chrome/android/chrome_java_sources.gni b/chrome/android/chrome_java_sources.gni
---- a/chrome/android/chrome_java_sources.gni	2026-10-26 11:24:30.138878758 +0530
-+++ b/chrome/android/chrome_java_sources.gni	2026-10-26 11:24:30.167241435 +0530
+--- a/chrome/android/chrome_java_sources.gni	2026-10-26 12:03:20.821709236 +0530
++++ b/chrome/android/chrome_java_sources.gni	2026-10-26 12:03:20.873301493 +0530
 @@ -976,6 +976,8 @@
    "java/src/org/chromium/chrome/browser/tark_captions/TarkCaptionBarCoordinator.java",
    "java/src/org/chromium/chrome/browser/tark/zynclave/AuthStateStore.java",
@@ -20,8 +20,8 @@ diff --color '--color=never' -ruN a/chrome/android/chrome_java_sources.gni b/chr
    "java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAuthFlow.java",
    "java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveConfig.java",
 diff --color '--color=never' -ruN a/chrome/android/java/res/xml/main_preferences.xml b/chrome/android/java/res/xml/main_preferences.xml
---- a/chrome/android/java/res/xml/main_preferences.xml	2026-10-26 11:24:30.140305388 +0530
-+++ b/chrome/android/java/res/xml/main_preferences.xml	2026-10-26 11:24:30.168384356 +0530
+--- a/chrome/android/java/res/xml/main_preferences.xml	2026-10-26 12:03:20.809555562 +0530
++++ b/chrome/android/java/res/xml/main_preferences.xml	2026-10-26 12:03:20.876136764 +0530
 @@ -8,6 +8,13 @@
  <PreferenceScreen xmlns:android="http://schemas.android.com/apk/res/android"
      xmlns:app="http://schemas.android.com/apk/res-auto"
@@ -38,7 +38,7 @@ diff --color '--color=never' -ruN a/chrome/android/java/res/xml/main_preferences
          android:order="0" />
 diff --color '--color=never' -ruN a/chrome/android/java/res/xml/zynclave_account_preferences.xml b/chrome/android/java/res/xml/zynclave_account_preferences.xml
 --- a/chrome/android/java/res/xml/zynclave_account_preferences.xml	1970-01-01 05:30:00.000000000 +0530
-+++ b/chrome/android/java/res/xml/zynclave_account_preferences.xml	2026-10-26 11:24:30.169034733 +0530
++++ b/chrome/android/java/res/xml/zynclave_account_preferences.xml	2026-10-26 12:03:20.876828852 +0530
 @@ -0,0 +1,14 @@
 +<?xml version="1.0" encoding="utf-8"?>
 +<!-- Copyright 2026 The Tark Authors
@@ -56,8 +56,8 @@ diff --color '--color=never' -ruN a/chrome/android/java/res/xml/zynclave_account
 +</PreferenceScreen>
 diff --color '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAccountPreference.java b/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAccountPreference.java
 --- a/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAccountPreference.java	1970-01-01 05:30:00.000000000 +0530
-+++ b/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAccountPreference.java	2026-10-26 12:00:00.000000000 +0530
-@@ -0,0 +1,276 @@
++++ b/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAccountPreference.java	2026-10-26 12:07:07.997575102 +0530
+@@ -0,0 +1,297 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -328,6 +328,27 @@ diff --color '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/
 +                new ViewGroup.LayoutParams(
 +                        ViewGroup.LayoutParams.MATCH_PARENT,
 +                        ViewGroup.LayoutParams.WRAP_CONTENT));
++        if (!isEnabled()) {
++            // Disabled while the sign-in page is open (refresh()). The tile's colors are its
++            // own, so it dims itself, as Chromium's disabled preferences do, and the row takes
++            // no taps. The next bind (enabled again) restores both: super sets the item view's
++            // click listener and clickable state each time, and the tile is new.
++            tile.setAlpha(disabledAlpha(context));
++            tile.setEnabled(false);
++            root.setOnClickListener(null); // Before setClickable: setting a listener sets it.
++            root.setClickable(false);
++            root.setFocusable(false);
++        }
++    }
++
++    /** The theme's disabled alpha (android:disabledAlpha), as disabled preferences use. */
++    private static float disabledAlpha(Context context) {
++        TypedValue value = new TypedValue();
++        if (context.getTheme().resolveAttribute(android.R.attr.disabledAlpha, value, true)
++                && value.type == TypedValue.TYPE_FLOAT) {
++            return value.getFloat();
++        }
++        return 0.38f;
 +    }
 +
 +    private static int dp(Context context, int dp) {
@@ -336,7 +357,7 @@ diff --color '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/
 +}
 diff --color '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAccountSettings.java b/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAccountSettings.java
 --- a/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAccountSettings.java	1970-01-01 05:30:00.000000000 +0530
-+++ b/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAccountSettings.java	2026-10-26 12:00:00.000000000 +0530
++++ b/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAccountSettings.java	2026-10-26 12:05:40.925121743 +0530
 @@ -0,0 +1,165 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
@@ -504,8 +525,8 @@ diff --color '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/
 +    }
 +}
 diff --color '--color=never' -ruN a/chrome/android/junit/BUILD.gn b/chrome/android/junit/BUILD.gn
---- a/chrome/android/junit/BUILD.gn	2026-10-26 11:24:30.134345034 +0530
-+++ b/chrome/android/junit/BUILD.gn	2026-10-26 11:24:30.163054755 +0530
+--- a/chrome/android/junit/BUILD.gn	2026-10-26 12:03:20.829405960 +0530
++++ b/chrome/android/junit/BUILD.gn	2026-10-26 12:03:20.886443424 +0530
 @@ -1426,9 +1426,12 @@
    # Tark: Sign in with Zynclave.
    robolectric_library(
@@ -529,8 +550,8 @@ diff --color '--color=never' -ruN a/chrome/android/junit/BUILD.gn b/chrome/andro
    }
 diff --color '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAccountRowTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAccountRowTest.java
 --- a/chrome/android/junit/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAccountRowTest.java	1970-01-01 05:30:00.000000000 +0530
-+++ b/chrome/android/junit/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAccountRowTest.java	2026-10-26 12:00:00.000000000 +0530
-@@ -0,0 +1,461 @@
++++ b/chrome/android/junit/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAccountRowTest.java	2026-10-26 12:05:40.885941244 +0530
+@@ -0,0 +1,505 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -547,11 +568,15 @@ diff --color '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome
 +import static org.mockito.Mockito.verify;
 +
 +import android.os.Bundle;
++import android.view.View;
++import android.view.ViewGroup;
++import android.widget.FrameLayout;
 +
 +import androidx.appcompat.app.AlertDialog;
 +import androidx.appcompat.app.AppCompatActivity;
 +import androidx.fragment.app.Fragment;
 +import androidx.fragment.app.FragmentManager;
++import androidx.preference.PreferenceViewHolder;
 +
 +import net.openid.appauth.AuthorizationException;
 +import net.openid.appauth.AuthorizationRequest;
@@ -801,6 +826,41 @@ diff --color '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome
 +        assertNull(ZynclaveAccountSettings.getDialogForTesting());
 +    }
 +
++    /** A row bound to a fresh item view, as the Settings list binds it. */
++    private View bind(ZynclaveAccountPreference row) {
++        FrameLayout itemView = new FrameLayout(mActivity);
++        row.onBindViewHolder(PreferenceViewHolder.createInstanceForTests(itemView));
++        return itemView;
++    }
++
++    @Test
++    public void testSigningInRowLooksDisabled() {
++        mAccount.signIn(mActivity, false);
++        ShadowLooper.idleMainLooper();
++        assertEquals(State.SIGNING_IN, mAccount.state());
++
++        ZynclaveAccountPreference row = row();
++        assertFalse(row.isEnabled());
++        ViewGroup itemView = (ViewGroup) bind(row);
++        View tile = itemView.getChildAt(0);
++        assertTrue("dimmed", tile.getAlpha() < 1f);
++        assertFalse(tile.isEnabled());
++        assertFalse(itemView.isClickable());
++        assertFalse(itemView.performClick());
++        ShadowLooper.idleMainLooper();
++        assertEquals(1, mBackend.mAuthorizeRequests.size());
++
++        // Back to signed out: the same row, bound again, is whole and takes taps.
++        mAccount.onAuthorizationResult(
++                mActivity, null, AuthorizationException.GeneralErrors.USER_CANCELED_AUTH_FLOW);
++        ShadowLooper.idleMainLooper();
++        ZynclaveAccountPreference after = row();
++        assertTrue(after.isEnabled());
++        ViewGroup again = (ViewGroup) bind(after);
++        assertEquals(1f, again.getChildAt(0).getAlpha(), 0f);
++        assertTrue(again.isClickable());
++    }
++
 +    @Test
 +    public void testSignOutTarkOnly() {
 +        signIn();
@@ -825,7 +885,12 @@ diff --color '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome
 +        assertEquals(State.SIGNED_OUT, mAccount.state());
 +        assertEquals(1, mBackend.mRevoked.size());
 +        assertEquals(1, mBackend.mOpened.size());
-+        assertEquals("IDT-1", mBackend.mOpened.get(0).getQueryParameter("id_token_hint"));
++        // RP-initiated logout by client_id: no token in the URL (review ruling 2026-10-26).
++        assertEquals(
++                ZynclaveConfig.get().clientId(),
++                mBackend.mOpened.get(0).getQueryParameter("client_id"));
++        assertNull(mBackend.mOpened.get(0).getQueryParameter("id_token_hint"));
++        assertFalse(mBackend.mOpened.get(0).toString().contains("IDT-1"));
 +        assertNull(mStore.read());
 +        assertFalse(dialog.isShowing());
 +    }
@@ -993,8 +1058,8 @@ diff --color '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome
 +    }
 +}
 diff --color '--color=never' -ruN a/chrome/browser/ui/android/strings/android_chrome_strings.grd b/chrome/browser/ui/android/strings/android_chrome_strings.grd
---- a/chrome/browser/ui/android/strings/android_chrome_strings.grd	2026-10-26 11:24:30.127494886 +0530
-+++ b/chrome/browser/ui/android/strings/android_chrome_strings.grd	2026-10-26 11:24:30.155441979 +0530
+--- a/chrome/browser/ui/android/strings/android_chrome_strings.grd	2026-10-26 12:03:20.799424821 +0530
++++ b/chrome/browser/ui/android/strings/android_chrome_strings.grd	2026-10-26 12:03:20.899346436 +0530
 @@ -1099,6 +1099,33 @@
        <message name="IDS_TARK_ZYNCLAVE_SIGN_IN_FAILED" desc="Tark: snackbar when Sign in with Zynclave failed (no connection, the Zynclave Account refused it, or Tark could not open its sign-in page). Not shown when the person closed the page.">
          Couldn't sign in. Try again.
@@ -1030,8 +1095,8 @@ diff --color '--color=never' -ruN a/chrome/browser/ui/android/strings/android_ch
          Google Password Manager
        </message>
 diff --color '--color=never' -ruN a/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb b/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb
---- a/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb	2026-10-26 11:24:30.128371973 +0530
-+++ b/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb	2026-10-26 11:24:30.156628608 +0530
+--- a/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb	2026-10-26 12:03:20.800229410 +0530
++++ b/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb	2026-10-26 12:03:20.906413363 +0530
 @@ -2209,4 +2209,13 @@
  <translation id="2674490731131654801">अगली बार <ph name="LANGUAGE"/> इस्तेमाल करें</translation>
  <translation id="2427661119626459258">यह <ph name="LANGUAGE"/> जैसा लगा। इस फ़ोन पर वॉइस सर्च के लिए <ph name="LANGUAGE_AGAIN"/> चाहिए।</translation>
