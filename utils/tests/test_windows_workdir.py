@@ -77,6 +77,12 @@ class TestWindowsWorkdir(unittest.TestCase):
         revision = (REPO / 'revision.txt').read_text().strip()
         self.assertEqual(package.tark_stem(outputs), 'Tark-%s-%s-x64' % (chromium, revision))
 
+    def test_ninja_first_list_has_no_comments(self):
+        first = (self.work / 'tark_ninja_first.txt').read_text().split()
+        self.assertEqual(first, lines(REPO / 'windows' / 'ninja-first.txt'))
+        self.assertIn('components/tark_captions:tark_captions', first)
+        self.assertFalse([w for w in first if w.startswith('#')])
+
     def test_rerun_keeps_build_dir(self):
         marker = self.work / 'build' / 'keep.txt'
         marker.parent.mkdir(parents=True, exist_ok=True)

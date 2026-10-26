@@ -199,7 +199,13 @@ class TestBuildPyPhases(unittest.TestCase):
         self.assertIn("not e.strip().startswith(('#', 'tarka/'))", self.text)
 
     def test_build_phase_has_no_ci_timeout(self):
-        self.assertIn("if args.ci:\n        _run_build_process_timeout", self.text)
+        # The time limit belongs to --ci (upstream's CI) only: Tark's build
+        # phase runs ninja without one.
+        run = self.text[self.text.index('    # Run ninja\n'):]
+        ci, rest = run.split('    else:\n', 1)
+        self.assertIn('if args.ci:', ci)
+        self.assertIn('_run_build_process_timeout(', ci)
+        self.assertNotIn('_run_build_process_timeout(', rest.split('\n\n\nif __name__')[0])
 
 
 if __name__ == '__main__':
