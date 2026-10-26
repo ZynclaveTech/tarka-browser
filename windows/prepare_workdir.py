@@ -64,6 +64,7 @@ def prepare(repo, work):
     (work / 'domain_substitution.list').write_text(text, encoding='utf-8')
 
     shutil.copy2(HERE / 'tark_post_patch.py', work / 'tark_post_patch.py')
+    shutil.copy2(HERE / 'layered_build.py', work / 'layered_build.py')
     (work / 'tark_repo.txt').write_text(str(repo) + '\n', encoding='utf-8')
     return len(series), len(tark)
 
