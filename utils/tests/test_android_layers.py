@@ -172,6 +172,39 @@ class TestSettle(unittest.TestCase):
             layers.settle(t.base, t.src, t.record)
             self.assertGreater(mtime(t.src / 'tark' / 'new.cc'), built)
 
+    def test_a_failed_layer_keeps_the_last_builds_record(self):
+        # A run whose layer fails (a patch does not apply) never settles: its
+        # files carry that run's times. The next reset must not record them
+        # over the last build's, or every later build recompiles them.
+        with tempfile.TemporaryDirectory() as tmp:
+            t = Trees(tmp)
+            first, built = self.layer_built_then_reset(t)
+            time.sleep(0.01)
+            t.tark_layer()  # applied again, then the run stops: no settle
+            layers.reset(t.base, t.src, t.record)
+            t.tark_layer()
+            layers.settle(t.base, t.src, t.record)
+            self.assertEqual(mtime(t.src / 'a.cc'), first['a.cc'])
+            self.assertLess(mtime(t.src / 'a.cc'), built)
+
+    def test_a_settled_layer_is_recorded_again(self):
+        # After a settled layer, reset records the tree as it is (a changed
+        # file's new time included).
+        with tempfile.TemporaryDirectory() as tmp:
+            t = Trees(tmp)
+            t.tark_layer()
+            layers.settle(t.base, t.src, t.record)
+            t.build()
+            layers.reset(t.base, t.src, t.record)
+            t.tark_layer(a='int a; // tark, changed\n')
+            layers.settle(t.base, t.src, t.record)
+            second = mtime(t.src / 'a.cc')
+            t.build()
+            layers.reset(t.base, t.src, t.record)
+            t.tark_layer(a='int a; // tark, changed\n')
+            layers.settle(t.base, t.src, t.record)
+            self.assertEqual(mtime(t.src / 'a.cc'), second)
+
     def test_first_layer_without_a_record(self):
         with tempfile.TemporaryDirectory() as tmp:
             t = Trees(tmp)

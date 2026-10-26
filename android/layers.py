@@ -17,6 +17,11 @@ back the base wherever SRC differs: changed and deleted files come back from
 BASE, added ones go. What comes back is written now, so it is newer than any
 object built from the layer it replaces: a reset cut short still rebuilds.
 
+A layer that never settled (its run stopped, say on a patch that did not
+apply) is not recorded: its files carry that run's times, and recording them
+over the last build's would make every later build recompile them. RECORD's
+'.settled' file marks a settled layer.
+
 settle, after the layer is applied again: a file of the new layer with the
 same contents as in RECORD gets its time back, and ninja keeps what was built
 from it; any other file of the layer is dated now. Domain and name
@@ -122,16 +127,24 @@ def _put_back(base, src, rel):
         shutil.copy(b, s)
 
 
+def _settled(record):
+    return record.with_name(record.name + '.settled')
+
+
 def reset(base, src, record):
     base, src, record = pathlib.Path(base), pathlib.Path(src), pathlib.Path(record)
     changed = footprint(base, src)
-    files = {}
-    for rel in changed:
-        for f in _files(src, rel):
-            files[f] = [_sha256(src / f), os.lstat(src / f).st_mtime_ns]
-    partial = record.with_name(record.name + '.part')
-    partial.write_text(json.dumps(files, sort_keys=True))
-    os.replace(partial, record)
+    settled = _settled(record)
+    if settled.exists() or not record.exists():
+        files = {}
+        for rel in changed:
+            for f in _files(src, rel):
+                files[f] = [_sha256(src / f), os.lstat(src / f).st_mtime_ns]
+        partial = record.with_name(record.name + '.part')
+        partial.write_text(json.dumps(files, sort_keys=True))
+        os.replace(partial, record)
+    # The layer about to be applied has not settled yet.
+    settled.unlink(missing_ok=True)
     for rel in changed:
         _put_back(base, src, rel)
     return changed
@@ -151,6 +164,7 @@ def settle(base, src, record):
             else:
                 os.utime(src / f, ns=(now, now))
                 dated += 1
+    _settled(record).touch()
     return kept, dated
 
 
