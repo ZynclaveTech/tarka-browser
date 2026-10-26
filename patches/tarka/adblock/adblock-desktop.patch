@@ -116,9 +116,9 @@
 +
 +std::string ReadBuiltInBundleFile(const base::FilePath& assets_dir) {
 +  std::string data;
-+  if (!base::ReadFileToStringWithMaxSize(
-+          assets_dir.AppendASCII("tark_adblock").AppendASCII("lists.zip"), &data,
-+          kMaxBundleSize)) {
++  const base::FilePath path =
++      assets_dir.AppendASCII("tark_adblock").AppendASCII("lists.zip");
++  if (!base::ReadFileToStringWithMaxSize(path, &data, kMaxBundleSize)) {
 +    return std::string();
 +  }
 +  return data;
@@ -355,3 +355,159 @@
    # IWA Key Distribution files:
    {
      'filename': 'IwaKeyDistribution/iwa-key-distribution.pb',
+--- a/chrome/browser/chrome_content_browser_client.cc
++++ b/chrome/browser/chrome_content_browser_client.cc
+@@ -6961,6 +6961,11 @@
+   if (!frame) {
+     return false;
+   }
++  // Tark: once the ad blocker is ready it checks every frame's WebSockets
++  // (CreateWebSocket()), extensions or not.
++  if (tark_adblock::AdblockService::Get()->IsReady()) {
++    return true;
++  }
+   const auto* web_request_api =
+       extensions::BrowserContextKeyedAPIFactory<extensions::WebRequestAPI>::Get(
+           frame->GetBrowserContext());
+@@ -7008,14 +7013,43 @@
+   if (!frame) {
+     return;
+   }
+-  auto* web_request_api =
+-      extensions::BrowserContextKeyedAPIFactory<extensions::WebRequestAPI>::Get(
+-          frame->GetBrowserContext());
+-
+-  DCHECK(web_request_api);
+-  web_request_api->ProxyWebSocket(
+-      frame, std::move(factory), url, site_for_cookies, user_agent,
+-      std::move(handshake_client), std::move(options.header_client));
++  // Tark: the ad blocker first. A blocked socket never connects; an allowed
++  // one goes through WebRequest's proxy when an extension may want it, and
++  // straight to the network otherwise.
++  tark_adblock::ProxyingURLLoaderFactory::CheckWebSocket(
++      frame, url,
++      base::BindOnce(
++          [](content::GlobalRenderFrameHostId frame_id,
++             WebSocketFactory factory, const GURL& url,
++             const net::SiteForCookies& site_for_cookies,
++             const std::optional<std::string>& user_agent,
++             mojo::PendingRemote<network::mojom::WebSocketHandshakeClient>
++                 handshake_client,
++             mojo::PendingRemote<network::mojom::TrustedHeaderClient>
++                 header_client,
++             bool blocked) {
++            content::RenderFrameHost* frame =
++                content::RenderFrameHost::FromID(frame_id);
++            if (blocked || !frame) {
++              return;
++            }
++            auto* web_request_api = extensions::BrowserContextKeyedAPIFactory<
++                extensions::WebRequestAPI>::Get(frame->GetBrowserContext());
++            if (web_request_api &&
++                web_request_api->MayHaveProxiesForFrame(frame)) {
++              web_request_api->ProxyWebSocket(
++                  frame, std::move(factory), url, site_for_cookies,
++                  user_agent, std::move(handshake_client),
++                  std::move(header_client));
++              return;
++            }
++            std::move(factory).Run(url, {}, std::move(handshake_client),
++                                   mojo::NullRemote(),
++                                   std::move(header_client));
++          },
++          frame->GetGlobalId(), std::move(factory), url, site_for_cookies,
++          user_agent, std::move(handshake_client),
++          std::move(options.header_client)));
+ #else
+   // Tark (A2): see WillInterceptWebSocket().
+   tark_adblock::ProxyingURLLoaderFactory::MaybeConnectWebSocket(
+--- a/chrome/browser/tark_adblock/tark_adblock_proxying_url_loader_factory.cc
++++ b/chrome/browser/tark_adblock/tark_adblock_proxying_url_loader_factory.cc
+@@ -373,34 +373,50 @@
+         handshake_client,
+     mojo::PendingRemote<network::mojom::TrustedHeaderClient> header_client) {
+   DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
+-  auto connect = base::BindOnce(
+-      [](content::ContentBrowserClient::WebSocketFactory factory,
+-         const GURL& url,
+-         mojo::PendingRemote<network::mojom::WebSocketHandshakeClient>
+-             handshake_client,
+-         mojo::PendingRemote<network::mojom::TrustedHeaderClient>
+-             header_client,
+-         BlockResult result) {
+-        // A blocked socket never connects: dropping the handshake client
+-        // fails it in the page.
+-        if (result.block) {
+-          return;
+-        }
+-        std::move(factory).Run(url, {}, std::move(handshake_client),
+-                               mojo::NullRemote(), std::move(header_client));
+-      },
+-      std::move(factory), url, std::move(handshake_client),
+-      std::move(header_client));
++  CheckWebSocket(
++      frame, url,
++      base::BindOnce(
++          [](content::ContentBrowserClient::WebSocketFactory factory,
++             const GURL& url,
++             mojo::PendingRemote<network::mojom::WebSocketHandshakeClient>
++                 handshake_client,
++             mojo::PendingRemote<network::mojom::TrustedHeaderClient>
++                 header_client,
++             bool blocked) {
++            // A blocked socket never connects: dropping the handshake client
++            // fails it in the page.
++            if (blocked) {
++              return;
++            }
++            std::move(factory).Run(url, {}, std::move(handshake_client),
++                                   mojo::NullRemote(),
++                                   std::move(header_client));
++          },
++          std::move(factory), url, std::move(handshake_client),
++          std::move(header_client)));
++}
++
++// static
++void ProxyingURLLoaderFactory::CheckWebSocket(
++    content::RenderFrameHost* frame,
++    const GURL& url,
++    base::OnceCallback<void(bool blocked)> done) {
++  DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
+   const HostContentSettingsMap* settings =
+       HostContentSettingsMapFactory::GetForProfile(frame->GetBrowserContext());
+   if (!url.SchemeIsWSOrWSS() ||
+       AdsAllowed(settings,
+                  frame->GetOutermostMainFrame()->GetLastCommittedOrigin())) {
+-    std::move(connect).Run(BlockResult());
++    std::move(done).Run(false);
+     return;
+   }
+-  AdblockService::Get()->ShouldBlock(url, frame->GetLastCommittedOrigin(),
+-                                     "websocket", "GET", std::move(connect));
++  AdblockService::Get()->ShouldBlock(
++      url, frame->GetLastCommittedOrigin(), "websocket", "GET",
++      base::BindOnce(
++          [](base::OnceCallback<void(bool)> done, BlockResult result) {
++            std::move(done).Run(result.block);
++          },
++          std::move(done)));
+ }
+ 
+ ProxyingURLLoaderFactory::ProxyingURLLoaderFactory(
+--- a/chrome/browser/tark_adblock/tark_adblock_proxying_url_loader_factory.h
++++ b/chrome/browser/tark_adblock/tark_adblock_proxying_url_loader_factory.h
+@@ -61,6 +61,13 @@
+       const net::IsolationInfo& isolation_info,
+       network::URLLoaderFactoryBuilder& factory_builder);
+ 
++  // Whether the engine blocks the WebSocket `frame` opens to `url`: `done`
++  // gets true for a blocked one (never for a site the person turned
++  // blocking off for, or before the engine is ready).
++  static void CheckWebSocket(content::RenderFrameHost* frame,
++                             const GURL& url,
++                             base::OnceCallback<void(bool blocked)> done);
++
+   // Checks a WebSocket a frame opens; connects it through `factory` unless
+   // the engine blocks it (then the handshake client is dropped).
+   static void MaybeConnectWebSocket(

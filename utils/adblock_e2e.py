@@ -5,7 +5,8 @@
 """End-to-end checks of Tark's ad blocker on the Mac (desktop ad blocker).
 
     adblock_e2e.py APP [CASES...]
-        cases: network websocket cosmetic switch failopen offline
+        cases: network websocket websocket_with_extension cosmetic switch
+               failopen offline
 
 The same pages, expectations and test list as Android's
 (android/adblock/e2e/run.py: CASES, extra.txt), served from this Mac on port
@@ -118,6 +119,13 @@ class Browser:
         return None
 
 
+def allow_ads(host):
+    """Preferences with 'Block ads on this site' off for HOST:PORT
+    (ContentSettingsType::ADS, stored as "subresource-filter")."""
+    return {'profile': {'content_settings': {'exceptions': {'subresource_filter': {
+        f'http://{host}:{PORT},*': {'setting': 1}}}}}}
+
+
 def check(browser, page, expected, host):
     url = f'http://{host}:{PORT}/{page}?{time.time_ns()}'
     browser.open(url)
@@ -140,6 +148,40 @@ def run_case(app, name):
             return check(b, *android.FAILOPEN)
         finally:
             b.close()
+    if name == 'websocket_with_extension':
+        # An extension that watches every request puts the frame's sockets
+        # on WebRequest's proxy: a blocked one must still never open.
+        ext = pathlib.Path(tempfile.mkdtemp(prefix='tark-adblock-ext-'))
+        (ext / 'manifest.json').write_text(json.dumps({
+            'manifest_version': 3, 'name': 'Tark adblock e2e watcher', 'version': '1',
+            'permissions': ['webRequest'], 'host_permissions': ['<all_urls>'],
+            'background': {'service_worker': 'sw.js'}}))
+        (ext / 'sw.js').write_text(
+            "chrome.webRequest.onBeforeRequest.addListener(() => {}, {urls: ['<all_urls>']});\n")
+        flags = [f'--load-extension={ext}', '--disable-features=DisableLoadExtensionCommandLineSwitch']
+        failed = 0
+        try:
+            b = Browser(app, flags)
+            try:
+                if not b.wait_ready():
+                    print('FAIL  websocket_with_extension: the engine was never ready', flush=True)
+                    return 1
+                time.sleep(3)  # the extension's listener registers
+                failed += check(b, 'net.html', {'ws': 'failed'}, '127.0.0.1')
+            finally:
+                b.close()
+            # An allowed socket (blocking off for the site) still opens
+            # through the extension's proxy.
+            b = Browser(app, flags, prefs=allow_ads('127.0.0.1'))
+            try:
+                b.wait_ready()
+                time.sleep(3)
+                failed += check(b, 'net.html', {'ws': 'open'}, '127.0.0.1')
+            finally:
+                b.close()
+        finally:
+            shutil.rmtree(ext, ignore_errors=True)
+        return failed
     if name == 'offline':
         # A first start with no network: every other host resolves to
         # nothing, so the engine has only the bundle built into the app.
@@ -158,10 +200,7 @@ def run_case(app, name):
     if name == 'switch':
         # 'Block ads on this site' off for 127.0.0.1 (ADS = allow): its test
         # ad loads; localhost, another site, stays blocked.
-        # ContentSettingsType::ADS is stored as "subresource-filter".
-        prefs = {'profile': {'content_settings': {'exceptions': {'subresource_filter': {
-            f'http://127.0.0.1:{PORT},*': {'setting': 1}}}}}}
-        b = Browser(app, prefs=prefs)
+        b = Browser(app, prefs=allow_ads('127.0.0.1'))
         try:
             if not b.wait_ready():
                 print('FAIL  switch: the engine was never ready', flush=True)
@@ -185,7 +224,8 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument('app')
     ap.add_argument('cases', nargs='*',
-                    default=['failopen', 'offline', 'network', 'websocket', 'cosmetic', 'switch'])
+                    default=['failopen', 'offline', 'network', 'websocket', 'websocket_with_extension',
+                             'cosmetic', 'switch'])
     args = ap.parse_args(argv)
     socketserver.ThreadingTCPServer.allow_reuse_address = True
     server = socketserver.ThreadingTCPServer(('127.0.0.1', PORT), android.Handler)
