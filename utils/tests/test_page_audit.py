@@ -45,7 +45,7 @@ SENTENCES = {
                    '1 file today, saved to your Downloads folder',
                    'Saved to your Downloads folder'],
                   ['Download history', '3 files today']),
-    'extensions': (['1 extension on. uBlock Origin blocks ads on every site.',
+    'extensions': (['1 extension on.',
                     '0 extensions on.'],
                    ['Extensions']),
     'history': (['Kept on this Mac only. 5 pages today.',

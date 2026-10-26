@@ -224,17 +224,11 @@ class TestAndroidBuildSh(unittest.TestCase):
         result, runs, files, tmp = dryrun('--stop-before-gn')
         self.assertIn('install.txt install-android.txt', runs[index_of(runs, 'utils/install_branding.py')])
 
-    def test_ublock_sources_unpacked_until_a2(self):
-        # Tark's shared patches put uBlock Origin's files into the resource
-        # paks (chrome_paks.gni) on every platform; A1 unpacks them as the Mac
-        # does. Android never loads them (no extension system); A2's
-        # engine-level blocker removes them.
+    def test_no_ublock(self):
+        # The engine-level blocker replaced uBlock Origin everywhere: nothing
+        # fetches or keys it.
         result, runs, files, tmp = dryrun('--stop-before-gn')
-        retrieve = index_of(runs, 'downloads-tark.ini')
-        self.assertLess(index_of(runs, 'name_substitution.py --sub'), retrieve)
-        self.assertLess(retrieve, index_of(runs, 'ublock_key.py'))
-        # uBlock ships as a .zip: GNU tar cannot read it, bsdtar can (as on the Mac).
-        self.assertIn('--tar-path bsdtar', runs[index_of(runs, 'downloads.py unpack -i')])
+        self.assertFalse(any('ublock' in r.lower() or 'downloads-tark.ini' in r for r in runs))
 
     def test_full_build_writes_args_and_builds_the_apk(self):
         result, runs, files, tmp = dryrun()

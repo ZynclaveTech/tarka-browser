@@ -10,17 +10,15 @@ Run by the hook in upstream's build.py (after patches and domain
 substitution, before gn gen), from the workdir prepare_workdir.py made; the
 repo is named in tark_repo.txt next to this file. The same steps as Tark's
 macOS build.sh, minus the Mac-only ones (app.icns, Sparkle): name
-substitution, the mark, Inter for WebUI, uBlock Origin with its fixed key,
+substitution, the mark, Inter for WebUI, the ad blocker's crates and lists,
 and IndicXlit for the address bar (D1).
 """
 
-import configparser
 import os
 import pathlib
 import shutil
 import subprocess
 import sys
-import zipfile
 
 WORK = pathlib.Path(__file__).resolve().parent
 REPO = pathlib.Path((WORK / 'tark_repo.txt').read_text(encoding='utf-8').strip())
@@ -32,39 +30,6 @@ BASH = os.environ.get('TARK_BASH', r'C:\Program Files\Git\bin\bash.exe' if os.na
 def run(*args, **kwargs):
     print('tark:', ' '.join(str(a) for a in args), flush=True)
     subprocess.run([str(a) for a in args], check=True, **kwargs)
-
-
-def unpack_zips(ini, src):
-    """Each .zip download in INI into SRC/output_path, minus strip_leading_dirs
-    (the same layout downloads.py unpack gives)."""
-    parser = configparser.ConfigParser()
-    parser.read(ini, encoding='utf-8')
-    for name in parser.sections():
-        entry = parser[name]
-        archive = CACHE / entry['download_filename']
-        if archive.suffix != '.zip':
-            continue
-        out = src / entry['output_path']
-        strip = entry.get('strip_leading_dirs', '').strip('/')
-        # Extract over what is there, as downloads.py does: patches applied
-        # earlier add files to this folder (uBlock's BUILD.gn).
-        with zipfile.ZipFile(archive) as zf:
-            for info in zf.infolist():
-                path = pathlib.PurePosixPath(info.filename)
-                if strip:
-                    if path.parts[:1] != (strip,):
-                        continue
-                    path = pathlib.PurePosixPath(*path.parts[1:])
-                if not path.parts or '..' in path.parts or path.is_absolute():
-                    continue
-                target = out.joinpath(*path.parts)
-                if info.is_dir():
-                    target.mkdir(parents=True, exist_ok=True)
-                    continue
-                target.parent.mkdir(parents=True, exist_ok=True)
-                with zf.open(info) as source, open(target, 'wb') as sink:
-                    shutil.copyfileobj(source, sink)
-        print(f'tark: unpacked {name} to {out}', flush=True)
 
 
 def main():
@@ -86,15 +51,6 @@ def main():
     fonts.mkdir(parents=True, exist_ok=True)
     for woff in (REPO / 'resources' / 'fonts').glob('inter-latin*.woff2'):
         shutil.copy2(woff, fonts / woff.name)
-    # uBlock Origin's sources and the key that fixes its extension id.
-    ini = REPO / 'downloads-tark.ini'
-    run(py, CORE / 'utils' / 'downloads.py', 'retrieve', '-i', ini, '-c', CACHE)
-    # Unpacked here with Python's zipfile: ungoogled-chromium's downloads.py
-    # unpacks zips on Windows through a 7-Zip pipe that breaks ("The pipe
-    # has been ended"); a zip needs no 7-Zip.
-    unpack_zips(ini, src)
-    run(py, REPO / 'utils' / 'ublock_key.py', src / 'third_party' / 'ublock' / 'manifest.json',
-        REPO / 'resources' / 'ublock' / 'key.txt')
     # The ad blocker: adblock-rust's crates (pinned sha256) and its built-in
     # list bundle, checked against Tark's list-signing key
     # (utils/adblock_lists.py; TARK_LISTS_DIR stands in for gettarka.com).

@@ -38,7 +38,6 @@ INPUTS = BASE_INPUTS + [
     'utils/name_substitution.py', 'utils/name_substitution_utils.py',
     'utils/domain_substitution_skip.txt', 'utils/filter_substitution_list.py',
     'utils/install_branding.py', 'utils/install_xlit.sh', 'downloads-xlit.ini',
-    'downloads-tark.ini', 'utils/ublock_key.py', 'resources/ublock/key.txt',
     'android/adblock/crates.py', 'android/appauth/fetch.py', 'android/xlit/files.py',
     'utils/trust_data.py',
 ]

@@ -29,7 +29,8 @@ the Mac.
   local change to upstream's build.py. Test:
   `pytest utils/tests/test_windows_layers.py`.
 - `tark_post_patch.py` — Tark's steps from `build.sh` that are not Mac-only:
-  name substitution, the mark, Inter, uBlock Origin, IndicXlit.
+  name substitution, the mark, Inter, the ad blocker's crates and lists,
+  IndicXlit.
 - `mac-only-patches.txt` — patches the Windows build leaves out (Sparkle).
 - `aws/` — the build machine: `bootstrap.ps1` (one-time setup, idle stop),
   `winbuild.sh` (drive it from the Mac over SSM), `jobs/*.ps1`.

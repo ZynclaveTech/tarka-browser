@@ -115,9 +115,6 @@ MSG
   mkdir -p "$_src_dir/third_party/llvm-build/Release+Asserts" "$_src_dir/third_party/rust-toolchain/bin"
   "$_root_dir/retrieve_and_unpack_resource.py" -p "$_arch"
 
-  # Tark: uBlock Origin's sources, and the key that fixes its extension id.
-  python3 "$_main_repo/utils/downloads.py" retrieve -i "$_root_dir/downloads-tark.ini" -c "$_download_cache"
-  python3 "$_main_repo/utils/downloads.py" unpack -i "$_root_dir/downloads-tark.ini" -c "$_download_cache" "$_src_dir"
   # Tark: Sparkle 2, the updater (M5); installed into the app when it is signed.
   python3 "$_main_repo/utils/downloads.py" retrieve -i "$_root_dir/downloads-sparkle.ini" -c "$_download_cache"
   python3 "$_main_repo/utils/downloads.py" unpack -i "$_root_dir/downloads-sparkle.ini" -c "$_download_cache" "$_src_dir"
@@ -125,7 +122,6 @@ MSG
   python3 "$_main_repo/utils/downloads.py" retrieve -i "$_root_dir/downloads-onnxruntime.ini" -c "$_download_cache"
   python3 "$_main_repo/utils/downloads.py" unpack -i "$_root_dir/downloads-onnxruntime.ini" -c "$_download_cache" "$_src_dir"
   _install_captions_credits
-  python3 "$_root_dir/utils/ublock_key.py" "$_src_dir/third_party/ublock/manifest.json" "$_root_dir/resources/ublock/key.txt"
 
   # Tark: IndicXlit weights and word lists for the address bar (D1).
   _install_xlit

@@ -196,14 +196,6 @@ class TestEnginePatch(unittest.TestCase):
         self.assertIn('  tark_adblock::AdblockService::Get();', self.add)
 
 
-class TestNoUblockPak(unittest.TestCase):
-    def test_android_ships_no_ublock_pak(self):
-        p = patch_text('adblock-no-ublock-pak.patch')
-        self.assertIn('-      "$root_gen_dir/third_party/ublock/resources/ublock_resources.pak",', p)
-        self.assertIn('-      "//third_party/ublock",', p)
-        self.assertIn('adblock-no-ublock-pak.patch', android_series())
-
-
 class TestListsInTheBuild(unittest.TestCase):
     def test_build_verifies_the_bundle_before_the_apk_gets_it(self):
         s = (ROOT / 'android' / 'build.sh').read_text()

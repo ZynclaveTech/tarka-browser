@@ -177,10 +177,7 @@ else
   rm -f "$work/namesubs.tar"
   run python3 "$_root_dir/utils/name_substitution.py" --sub -t "$_src_dir" --backup-path "$work/namesubs.tar"
 
-  # 5. Tark's steps: the mark, Inter for WebUI pages, uBlock Origin's sources
-  #    (Tark's shared patches put its files into the resource paks on every
-  #    platform; Android never loads them, having no extension system, and
-  #    A2's engine-level blocker removes them), IndicXlit (D1).
+  # 5. Tark's steps: the mark, Inter for WebUI pages, IndicXlit (D1).
   run python3 "$_root_dir/utils/install_branding.py" "$_root_dir/resources/branding/mark" "$_src_dir" \
     install.txt install-android.txt
   # Certificate trust data: CT log list, Chrome Root Store, CRLSet (resources/trust).
@@ -188,11 +185,6 @@ else
   run mkdir -p "$_src_dir/ui/webui/resources/fonts"
   run cp "$_root_dir"/resources/fonts/inter-latin.woff2 "$_root_dir"/resources/fonts/inter-latin-ext.woff2 \
     "$_src_dir/ui/webui/resources/fonts/"
-  run python3 "$_main_repo/utils/downloads.py" retrieve -i "$_root_dir/downloads-tark.ini" -c "$_download_cache"
-  run python3 "$_main_repo/utils/downloads.py" unpack -i "$_root_dir/downloads-tark.ini" -c "$_download_cache" \
-    --tar-path bsdtar "$_src_dir"
-  run python3 "$_root_dir/utils/ublock_key.py" "$_src_dir/third_party/ublock/manifest.json" \
-    "$_root_dir/resources/ublock/key.txt"
   # A2: adblock-rust and its new crates into Chromium's vendored crates, each
   # .crate checked against its pinned sha256 (android/adblock/crates.py).
   run python3 "$_root_dir/android/adblock/crates.py" "$_src_dir" --cache "$_download_cache/crates"
