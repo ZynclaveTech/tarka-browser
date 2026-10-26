@@ -3,7 +3,10 @@
 # found in the LICENSE file.
 #
 # W1: build Tark for Windows from a commit of tarka-browser. The work
-# folder C:\tw keeps build\ between runs (incremental). -Fresh wipes it.
+# folder C:\tw keeps build\ between runs: windows/layered_build.py keeps the
+# base (Chromium, core and Windows patches, toolchains) as build\src-base and
+# applies Tark's layer again, so a change to Tark's patches rebuilds only what
+# it changed, as on Android. -Fresh makes a new base.
 # Artifacts and the log go to the job's S3 prefix; the machine shuts down
 # (stops) at the end, success or not.
 param([string]$Bucket, [string]$Prefix, [string]$Ref = 'main', [switch]$Fresh, [switch]$PatchOnly)
@@ -36,24 +39,22 @@ try {
   git -C $repo submodule update --init --depth 1 ungoogled-chromium *>> $log
   "commit $(git -C $repo rev-parse HEAD)" | Add-Content $log
 
-  if ($Fresh) {
-    # A fresh tree: the source and name substitution's backup of the old one
-    # (name_substitution.py refuses to overwrite an existing backup).
-    if (Test-Path "$work\build\src") { Remove-Item -Recurse -Force "$work\build\src" }
-    Remove-Item -Force "$work\build\namesubs.tar" -ErrorAction SilentlyContinue
-  }
   python3 "$repo\windows\prepare_workdir.py" $repo $work *>> $log
   # The last build's packages, so only this build's are uploaded.
   Get-ChildItem "$work\build" -File -ErrorAction SilentlyContinue |
     Where-Object { $_.Extension -in '.zip', '.exe' } | Remove-Item -Force
   Set-Location $work
   $vcvars = "$env:vs2022_install\VC\Auxiliary\Build\vcvars64.bat"
+  $layered = 'python3 layered_build.py . --jobs 64'
+  if ($Fresh) { $layered += ' --fresh' }
   if ($PatchOnly) {
-    # Extract, patch and run Tark's steps, then stop before gn gen: the
-    # cheapest way to see every patch conflict on the Windows stack.
-    $env:TARK_STOP_BEFORE_GN = '1'
+    # The base (if it changed) and Tark's layer, no ninja: the cheapest way to
+    # see every patch conflict on the Windows stack.
+    $layered += ' --patch-only'
+    cmd.exe /c "call `"$vcvars`" && $layered" *>> $log
+  } else {
+    cmd.exe /c "call `"$vcvars`" && $layered && python3 package.py" *>> $log
   }
-  cmd.exe /c "call `"$vcvars`" && python3 build.py --tarball -j 64 && python3 package.py" *>> $log
   "exit $LASTEXITCODE" | Add-Content $log
   # Only package.py's installer and zip, which sit directly in build\ (a
   # recursive search also picked up hundreds of tool files).

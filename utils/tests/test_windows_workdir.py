@@ -34,7 +34,7 @@ class TestWindowsWorkdir(unittest.TestCase):
 
     def test_upstream_files_and_hook(self):
         for name in ('build.py', 'package.py', 'flags.windows.gn', 'downloads.ini',
-                     'tark_post_patch.py', 'tark_repo.txt'):
+                     'tark_post_patch.py', 'tark_repo.txt', 'layered_build.py'):
             self.assertTrue((self.work / name).is_file(), name)
         self.assertIn('tark_post_patch.py', (self.work / 'build.py').read_text())
         self.assertEqual((self.work / 'tark_repo.txt').read_text().strip(), str(REPO))
