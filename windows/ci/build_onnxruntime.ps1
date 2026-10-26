@@ -20,7 +20,7 @@ $Tag = 'v1.31.0'
 $Commit = '402979ac1bef89dcd55add41eaa7277c407599eb'
 
 function Find-Dumpbin {
-  $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
+  $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -products * -latest -property installationPath
   $tool = Get-ChildItem "$vs\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" | Select-Object -First 1
   if (-not $tool) { throw 'dumpbin.exe not found' }
   $tool.FullName
@@ -34,7 +34,7 @@ if (-not $CheckOnly) {
   $ErrorActionPreference = 'Continue'
   # Visual Studio's own CMake (the build machine has no other), named
   # outright: build.py looks for 'cmake' on PATH otherwise.
-  $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
+  $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -products * -latest -property installationPath
   $cmake = "$vs\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe"
   if (-not (Test-Path $cmake)) { throw "no CMake at $cmake" }
   # A run cut short leaves a partial clone and build behind; start clean.
