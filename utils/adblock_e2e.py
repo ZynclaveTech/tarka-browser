@@ -6,7 +6,7 @@
 
     adblock_e2e.py APP [CASES...]
         cases: network websocket websocket_with_extension cosmetic switch
-               failopen offline
+               failopen offline global_off migration
 
 The same pages, expectations and test list as Android's
 (android/adblock/e2e/run.py: CASES, extra.txt), served from this Mac on port
@@ -35,6 +35,7 @@ import urllib.request
 REPO = pathlib.Path(__file__).resolve().parents[1]
 E2E = REPO / 'android' / 'adblock' / 'e2e'
 DEVTOOLS_PORT = 9334
+UBLOCK_ID = 'onfgfofhhcjllijjogonbaokaiokfgna'
 
 _spec = importlib.util.spec_from_file_location('android_adblock_e2e', E2E / 'run.py')
 android = importlib.util.module_from_spec(_spec)
@@ -60,11 +61,57 @@ def results_from_title(title):
     return json.loads(title[5:])
 
 
+def evaluate(tab_ws_url, expression):
+    """Runs EXPRESSION in a tab over DevTools; returns the result's value."""
+    import websocket  # websocket-client
+    ws = websocket.create_connection(tab_ws_url, suppress_origin=True, timeout=30)
+    try:
+        ws.send(json.dumps({'id': 1, 'method': 'Runtime.evaluate',
+                            'params': {'expression': expression, 'awaitPromise': True, 'returnByValue': True}}))
+        while True:
+            m = json.loads(ws.recv())
+            if m.get('id') == 1:
+                return m.get('result', {}).get('result', {}).get('value')
+    finally:
+        ws.close()
+
+
+def ublock_off_profile(app, keep=None):
+    """A profile as a person who had switched uBlock Origin off left it:
+    uBlock switched off through chrome.management (what Settings' "Block ads
+    and trackers" called), and Tark's one-time carry-over not run yet. Needs
+    a build that still ships uBlock. KEEP: also copy the profile there."""
+    b = Browser(app, keep_profile=True)
+    try:
+        b.open('chrome://settings/')
+        for _ in range(30):
+            tabs = json.load(urllib.request.urlopen(f'http://127.0.0.1:{DEVTOOLS_PORT}/json'))
+            tab = next((t for t in tabs if t.get('url', '').startswith('chrome://settings')), None)
+            if tab and evaluate(tab['webSocketDebuggerUrl'], 'typeof chrome.management') == 'object':
+                break
+            time.sleep(1)
+        evaluate(tab['webSocketDebuggerUrl'],
+                 f"new Promise(r => chrome.management.setEnabled('{UBLOCK_ID}', false, () => r(1)))")
+        time.sleep(2)
+    finally:
+        b.quit()
+    prefs_file = b.profile / 'Default' / 'Preferences'
+    prefs = json.loads(prefs_file.read_text())
+    prefs.get('tark_adblock', {}).pop('migrated_from_ublock', None)
+    prefs.get('profile', {}).get('default_content_setting_values', {}).pop('subresource_filter', None)
+    prefs_file.write_text(json.dumps(prefs))
+    if keep:
+        shutil.copytree(b.profile, keep, dirs_exist_ok=True,
+                        ignore=shutil.ignore_patterns('Singleton*', 'RunningChromeVersion'))
+    return b.profile
+
+
 class Browser:
-    def __init__(self, app, extra_flags=(), prefs=None):
-        self.profile = pathlib.Path(tempfile.mkdtemp(prefix='tark-adblock-e2e-'))
+    def __init__(self, app, extra_flags=(), prefs=None, profile=None, keep_profile=False):
+        self.keep_profile = keep_profile or profile is not None
+        self.profile = pathlib.Path(profile or tempfile.mkdtemp(prefix='tark-adblock-e2e-'))
         if prefs:
-            (self.profile / 'Default').mkdir(parents=True)
+            (self.profile / 'Default').mkdir(parents=True, exist_ok=True)
             (self.profile / 'Default' / 'Preferences').write_text(json.dumps(prefs))
         self.log = self.profile / 'tark.log'
         binary = pathlib.Path(app) / 'Contents' / 'MacOS' / pathlib.Path(app).stem
@@ -76,13 +123,22 @@ class Browser:
                else ['--host-resolver-rules=MAP tark.test 127.0.0.1', *extra_flags]), 'about:blank'],
             stdout=subprocess.DEVNULL, stderr=self.log.open('w'))
 
-    def close(self):
+    def quit(self):
+        """Ends the browser and keeps its profile."""
         self.proc.terminate()
         try:
             self.proc.wait(timeout=20)
         except subprocess.TimeoutExpired:
             self.proc.kill()
-        shutil.rmtree(self.profile, ignore_errors=True)
+
+    def close_keeping(self, path):
+        """close(), once the browser has written PATH (its net log)."""
+        self.close()
+
+    def close(self):
+        self.quit()
+        if not self.keep_profile:
+            shutil.rmtree(self.profile, ignore_errors=True)
 
     def wait_ready(self, timeout=120):
         end = time.time() + timeout
@@ -182,6 +238,37 @@ def run_case(app, name):
         finally:
             shutil.rmtree(ext, ignore_errors=True)
         return failed
+    if name in ('global_off', 'migration'):
+        # Blocking off for the whole profile: "Block ads and trackers" off
+        # (ADS allowed by default), or uBlock Origin switched off in a
+        # profile from before (carried over on the first start). Nothing is
+        # blocked and no list is downloaded; blocking on, a list is.
+        netlog = pathlib.Path(tempfile.mkdtemp(prefix='tark-adblock-netlog-')) / 'net.json'
+        flags = [f'--log-net-log={netlog}']
+        failed = 0
+        if name == 'global_off':
+            b = Browser(app, flags, prefs={'profile': {'default_content_setting_values': {'subresource_filter': 1}}})
+        else:
+            b = Browser(app, flags, profile=ublock_off_profile(app))
+        try:
+            b.wait_ready()
+            failed += check(b, 'net.html', {'blocked': 'loaded'}, '127.0.0.1')
+            time.sleep(5)
+        finally:
+            b.close_keeping(netlog)
+        fetched = 'gettarka.com/lists' in netlog.read_text(errors='replace')
+        print(f'{"ok  " if not fetched else "FAIL"}  {name}: no list download while off', flush=True)
+        failed += fetched
+        # The positive control: the same check sees a download when on.
+        on = Browser(app, flags)
+        try:
+            on.wait_ready()
+            time.sleep(8)
+        finally:
+            on.close_keeping(netlog)
+        seen = 'gettarka.com/lists' in netlog.read_text(errors='replace')
+        print(f'{"ok  " if seen else "FAIL"}  {name}: a list download while on (control)', flush=True)
+        return failed + (not seen)
     if name == 'offline':
         # A first start with no network: every other host resolves to
         # nothing, so the engine has only the bundle built into the app.
