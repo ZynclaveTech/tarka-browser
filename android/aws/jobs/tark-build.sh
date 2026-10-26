@@ -6,7 +6,7 @@
 #   tark-build.sh BUCKET PREFIX SUBMODULE_COMMIT [--stop-before-gn] [--fresh] [--zynclave-staging]
 #
 # --zynclave-staging: a test APK on Zynclave staging (tark_zynclave_staging =
-# true in out/Default/args.gn, through build.sh); never one to publish.
+# true in out/Default/args.gn, through build.sh's TARK_ZYNCLAVE_STAGING); never one to publish.
 #
 # A1: build Tark for Android from the source andbuild.sh put in S3. /tark/work
 # keeps the Chromium checkout and its base copy between runs (--fresh wipes
@@ -16,7 +16,7 @@ set -uo pipefail
 B=$1; P=$2; SUB=$3; shift 3
 stop=""; fresh=0; staging=""
 for a in "$@"; do
-  case $a in --stop-before-gn) stop=--stop-before-gn;; --fresh) fresh=1;; --zynclave-staging) staging=--zynclave-staging;; esac
+  case $a in --stop-before-gn) stop=--stop-before-gn;; --fresh) fresh=1;; --zynclave-staging) staging=1;; esac
 done
 # Never the SSM agent's folder: tools write state into their working directory.
 cd /tark
@@ -58,7 +58,7 @@ if aws s3 cp --quiet --recursive "s3://$B/lists/" /tark/lists/ && [[ -f /tark/li
   export TARK_LISTS_DIR=/tark/lists
 fi
 # A hung step (a stalled sync, a stuck link) ends here instead of billing on.
-timeout 8h bash $repo/android/build.sh $stop $staging /tark/work >> $log 2>&1
+TARK_ZYNCLAVE_STAGING=${staging:-0} timeout 8h bash $repo/android/build.sh $stop /tark/work >> $log 2>&1
 code=$?
 echo "exit $code" >> $log
 # The captions downloads' sharing rules (voice and captions share the
