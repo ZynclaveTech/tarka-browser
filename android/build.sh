@@ -196,6 +196,10 @@ else
   # A2: adblock-rust and its new crates into Chromium's vendored crates, each
   # .crate checked against its pinned sha256 (android/adblock/crates.py).
   run python3 "$_root_dir/android/adblock/crates.py" "$_src_dir" --cache "$_download_cache/crates"
+  # Sign in with Zynclave: AppAuth for Android's library sources into
+  # third_party/appauth/src, the archive checked against its pinned sha256
+  # (android/appauth/fetch.py; the BUILD.gn is appauth-library.patch).
+  run python3 "$_root_dir/android/appauth/fetch.py" "$_src_dir" --cache "$_download_cache/appauth"
   echo "tark: run _install_xlit"
   if [[ "$dryrun" != 1 ]]; then
     export _root_dir _src_dir _main_repo _download_cache
@@ -279,6 +283,12 @@ cat "$_main_repo/flags.gn" "$_root_dir/android/args.gn" > "$_src_dir/out/Default
 read -r _version_name _version_code < <(python3 "$_root_dir/android/release/version.py" "$_root_dir")
 printf 'android_override_version_name = "%s"\nandroid_override_version_code = "%s"\n' \
   "$_version_name" "$_version_code" >> "$_src_dir/out/Default/args.gn"
+# TARK_ZYNCLAVE_STAGING=1 (tark-build.sh --zynclave-staging): a test APK on
+# Zynclave staging (zynclave-account.patch's GN arg); never a published one.
+# Read here, not with the flags above: that part of this file is the base's.
+if [[ "${TARK_ZYNCLAVE_STAGING:-0}" == 1 ]]; then
+  echo 'tark_zynclave_staging = true' >> "$_src_dir/out/Default/args.gn"
+fi
 run python3 "$_src_dir/tools/gn/bootstrap/bootstrap.py" -o "$_src_dir/out/Default/gn" --skip-generate-buildfiles
 # Scripts run with the machine's python3, as in Chromium's source tarball (a
 # git checkout's .gn names a bundled Python the Android tree does not have).
