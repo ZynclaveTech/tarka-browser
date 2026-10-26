@@ -111,6 +111,19 @@ class TestPlan(unittest.TestCase):
         self.runner.steps.clear()
         self.assertEqual(self.build()[:3], ['wipe', 'build.py:base', 'copy-base'])
 
+    def test_a_tree_without_a_stamp_starts_again(self):
+        # A run cut short after the base (or before it was copied) leaves a
+        # tree but no stamp: it is wiped, never patched twice.
+        (self.work / 'build' / 'src').mkdir(parents=True)
+        self.assertEqual(self.build()[:3], ['wipe', 'build.py:base', 'copy-base'])
+
+    def test_the_base_copy_keeps_links_as_links(self):
+        # Chromium's tree has symbolic links; robocopy follows them without
+        # /SL and is refused.
+        self.assertIn('/SL', layered_build.ROBOCOPY_FLAGS)
+        self.assertIn('/COPY:DAT', layered_build.ROBOCOPY_FLAGS)
+        self.assertIn('/DCOPY:DAT', layered_build.ROBOCOPY_FLAGS)
+
     def test_fresh_starts_again(self):
         self.build()
         (self.work / 'build' / 'src-base').mkdir(parents=True, exist_ok=True)

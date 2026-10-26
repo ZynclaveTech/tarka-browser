@@ -37,6 +37,11 @@ BASE_FILES = [
 ]
 BASE_GLOBS = ['ungoogled-chromium/patches/**/*.patch', 'patches/ungoogled-chromium/**/*.patch']
 
+# The base's copy: times kept (layers.py compares them; /COPY:DAT, and
+# /DCOPY:DAT for folders) and symbolic links copied as links (/SL: Chromium's
+# tree has some, and following them is refused).
+ROBOCOPY_FLAGS = ['/MIR', '/SL', '/COPY:DAT', '/DCOPY:DAT', '/R:1', '/W:1', '/NFL', '/NDL', '/NP', '/MT:32']
+
 
 def _platform_series(work):
     """patches/series without Tark's entries: the Windows platform patches."""
@@ -70,11 +75,9 @@ def _system_runner(work, jobs):
             subprocess.run([sys.executable, 'build.py', '--tarball', '-j', str(jobs)], cwd=work,
                            env={**os.environ, **(env or {})}, check=True)
         elif step == 'copy-base':
-            # Times kept (layers.py compares them): robocopy's /COPY:DAT, and
-            # /DCOPY:DAT for folders. Exit codes below 8 mean success.
-            code = subprocess.run(['robocopy', str(src), str(base), '/MIR', '/COPY:DAT', '/DCOPY:DAT',
-                                   '/XD', str(src / 'out'), '/R:1', '/W:1', '/NFL', '/NDL', '/NP',
-                                   '/MT:32']).returncode
+            # Exit codes below 8 mean success.
+            code = subprocess.run(['robocopy', str(src), str(base), *ROBOCOPY_FLAGS,
+                                   '/XD', str(src / 'out')]).returncode
             if code >= 8:
                 raise subprocess.CalledProcessError(code, 'robocopy')
         elif step in ('reset', 'settle'):
@@ -101,7 +104,9 @@ def run(work, fresh=False, patch_only=False, jobs=64, runner=None):
     if not fresh and have == want and (build / 'src-base').is_dir():
         runner('reset')
     else:
-        if have is not None or fresh:
+        # Anything left from an earlier run (a tree patched by its layer, or
+        # one cut short before its stamp) is never patched again.
+        if have is not None or fresh or (build / 'src').exists() or (build / 'src-base').exists():
             runner('wipe')
         stamp.unlink(missing_ok=True)
         runner('build.py', env={'TARK_PHASE': 'base'})
