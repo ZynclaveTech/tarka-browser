@@ -160,6 +160,20 @@ class TestWipe(unittest.TestCase):
             self.assertFalse((work / 'build' / 'src').exists())
 
 
+class TestByteExactCheckout(unittest.TestCase):
+    """Git for Windows turns LF into CRLF on checkout unless told not to;
+    the trust data's sha256s (resources/trust/manifest.json) then fail."""
+
+    def test_trust_data_is_never_converted(self):
+        attrs = (REPO / '.gitattributes').read_text()
+        self.assertIn('resources/trust/** -text', attrs)
+
+    def test_build_machine_checkout_is_byte_exact(self):
+        job = (REPO / 'windows' / 'aws' / 'jobs' / 'tark-build.ps1').read_text()
+        self.assertIn('core.autocrlf false', job)
+        self.assertLess(job.index('core.autocrlf false'), job.index('checkout --quiet --force $Ref'))
+
+
 class TestBuildPyPhases(unittest.TestCase):
     """Tark's local change to upstream's build.py: TARK_PHASE splits it."""
 

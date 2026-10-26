@@ -33,6 +33,13 @@ try {
   if (-not (Test-Path "$repo\.git")) {
     git clone --quiet https://github.com/ZynclaveTech/tarka-browser.git $repo *>> $log
   }
+  # Byte for byte as in the repository (Git for Windows turns LF into CRLF by
+  # default, which breaks the trust data's sha256s): once, the setting and a
+  # checkout of every file again.
+  if ((git -C $repo config core.autocrlf) -ne 'false') {
+    git -C $repo config core.autocrlf false *>> $log
+    git -C $repo rm -r --cached --quiet . *>> $log
+  }
   git -C $repo fetch --quiet origin *>> $log
   git -C $repo checkout --quiet --force $Ref *>> $log
   git -C $repo reset --quiet --hard "origin/$Ref" *>> $log
