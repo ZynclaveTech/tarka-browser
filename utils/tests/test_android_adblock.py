@@ -1,7 +1,7 @@
 """A2: adblock-rust in Tark for Android (spec §4). Task 3: the adblock crate
 and its new dependencies, placed into Chromium's vendored crates by
 android/adblock/crates.py (each .crate checked against a pinned sha256) and
-wired up by android/patches/adblock-crates.patch."""
+wired up by patches/tarka/adblock/adblock-crates.patch."""
 import hashlib
 import re
 import io
@@ -18,10 +18,24 @@ sys.path.insert(0, str(ROOT / 'android' / 'adblock'))
 import crates  # noqa: E402
 
 PATCHES = ROOT / 'android' / 'patches'
+# The engine patches are shared since the desktop blocker (Task 2); Android's
+# own hooks are in adblock-android.patch.
+SHARED = ROOT / 'patches' / 'tarka' / 'adblock'
+sys.path.insert(0, str(ROOT / 'android'))
+import series as series_py  # noqa: E402
 
 
 def patch_text(name):
+    if name == 'adblock-engine.patch':
+        return (SHARED / name).read_text() + (PATCHES / 'adblock-android.patch').read_text()
+    if (SHARED / name).is_file():
+        return (SHARED / name).read_text()
     return (PATCHES / name).read_text()
+
+
+def android_series():
+    """The Android build's whole Tark series, file names only."""
+    return [e.split('/')[-1] for e in series_py.series(ROOT)]
 
 
 def added(text):
@@ -95,7 +109,7 @@ class TestCratesPatch(unittest.TestCase):
         self.add = added(self.p)
 
     def test_in_the_series(self):
-        self.assertIn('adblock-crates.patch', (PATCHES / 'series').read_text().split())
+        self.assertIn('adblock-crates.patch', android_series())
 
     def test_adblock_pinned_with_only_its_two_features(self):
         self.assertIn('adblock = { version = "=0.13.3", default-features = false, '
@@ -142,7 +156,7 @@ class TestEnginePatch(unittest.TestCase):
         self.add = added(self.p)
 
     def test_in_the_series_after_the_crates(self):
-        series = (PATCHES / 'series').read_text().split()
+        series = android_series()
         self.assertLess(series.index('adblock-crates.patch'), series.index('adblock-engine.patch'))
 
     def test_borrowed_files_keep_mpl_and_say_what_changed(self):
@@ -187,7 +201,7 @@ class TestNoUblockPak(unittest.TestCase):
         p = patch_text('adblock-no-ublock-pak.patch')
         self.assertIn('-      "$root_gen_dir/third_party/ublock/resources/ublock_resources.pak",', p)
         self.assertIn('-      "//third_party/ublock",', p)
-        self.assertIn('adblock-no-ublock-pak.patch', (PATCHES / 'series').read_text().split())
+        self.assertIn('adblock-no-ublock-pak.patch', android_series())
 
 
 class TestListsInTheBuild(unittest.TestCase):
@@ -211,7 +225,7 @@ class TestNetworkPatch(unittest.TestCase):
         self.add = added(self.p)
 
     def test_in_the_series_after_the_engine(self):
-        series = (PATCHES / 'series').read_text().split()
+        series = android_series()
         self.assertLess(series.index('adblock-engine.patch'), series.index('adblock-network.patch'))
 
     def test_blocked_like_ublock(self):
@@ -258,7 +272,7 @@ class TestCosmeticPatch(unittest.TestCase):
         self.add = added(self.p)
 
     def test_in_the_series_after_the_network(self):
-        series = (PATCHES / 'series').read_text().split()
+        series = android_series()
         self.assertLess(series.index('adblock-network.patch'), series.index('adblock-cosmetic.patch'))
 
     def test_resources_arrive_before_the_page_scripts(self):
@@ -321,7 +335,7 @@ class TestSiteSwitchPatch(unittest.TestCase):
         self.add = added(self.p)
 
     def test_in_the_series(self):
-        self.assertIn('adblock-site-switch.patch', (PATCHES / 'series').read_text().split())
+        self.assertIn('adblock-site-switch.patch', android_series())
 
     def test_the_row_in_page_info(self):
         self.assertIn('TarkAdblockSiteSwitch.create(', self.add)
