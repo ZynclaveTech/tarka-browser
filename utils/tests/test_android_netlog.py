@@ -48,8 +48,12 @@ class TestAllowedHosts(unittest.TestCase):
         mac = load_allowed(REPO / 'utils' / 'allowed_hosts.txt')
         # A2: the ad blocker's daily lists come from gettarka.com, a host only
         # Tark for Android contacts.
-        self.assertLessEqual(android - {'gettarka.com'}, mac)
+        # Sign in with Zynclave: the account hosts are Android only too.
+        zynclave = {'auth.zynclave.com', 'accounts.zynclave.com'}
+        self.assertLessEqual(android - {'gettarka.com'} - zynclave, mac)
         self.assertIn('gettarka.com', android)
+        self.assertLessEqual(zynclave, android)
+        self.assertFalse(any('staging' in h for h in android))
         self.assertIn('shodhya.com', android)
         self.assertIn('api.shodhya.com', android)
         # Widevine on Android comes from the OS (MediaDrm), not the component

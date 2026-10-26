@@ -360,3 +360,55 @@ class TestPlayArt(unittest.TestCase):
                 width, height, depth, colour = struct.unpack('>IIBB', data[16:26])
                 self.assertEqual((width, height), size, name)
                 self.assertEqual((depth, colour), (8, 2), f'{name}: 8-bit RGB, no alpha')
+
+
+class TestStagingGuard(unittest.TestCase):
+    """Sign in with Zynclave: an APK or bundle built with --zynclave-staging
+    (its dex holds the staging client id) is never signed or published. Needs
+    no Android SDK."""
+    STAGING = b'1664a81e-6fe5-4eb9-9869-ca0c7a7a04c4'
+
+    def make(self, tmp, name, entries):
+        import zipfile
+        path = pathlib.Path(tmp) / name
+        with zipfile.ZipFile(path, 'w') as z:
+            for entry, data in entries.items():
+                z.writestr(entry, data)
+        return path
+
+    def test_refuses_staging_in_any_dex(self):
+        import tempfile
+        sys.path.insert(0, str(REPO / 'android' / 'release'))
+        import sign
+        with tempfile.TemporaryDirectory() as tmp:
+            for entries in ({'classes.dex': b'x' + self.STAGING},
+                            {'classes.dex': b'x', 'classes3.dex': self.STAGING + b'y'},
+                            {'base/dex/classes2.dex': self.STAGING}):
+                apk = self.make(tmp, 'a.apk', entries)
+                with self.assertRaisesRegex(ValueError, 'staging APK: not publishing'):
+                    sign.refuse_staging(apk)
+                apk.unlink()
+
+    def test_production_passes_and_other_files_are_ignored(self):
+        import tempfile
+        sys.path.insert(0, str(REPO / 'android' / 'release'))
+        import sign
+        with tempfile.TemporaryDirectory() as tmp:
+            apk = self.make(tmp, 'p.apk', {'classes.dex': b'production-client-id',
+                                           'assets/notes.txt': self.STAGING})
+            sign.refuse_staging(apk)
+
+    def test_release_and_publish_refuse_before_any_work(self):
+        import tempfile
+        sys.path.insert(0, str(REPO / 'android' / 'release'))
+        import publish
+        import sign
+        with tempfile.TemporaryDirectory() as tmp:
+            apk = self.make(tmp, 'a.apk', {'classes.dex': self.STAGING})
+            aab = self.make(tmp, 'a.aab', {'base/dex/classes.dex': b'x'})
+            with self.assertRaisesRegex(ValueError, 'staging APK'):
+                sign.release(apk, aab, pathlib.Path(tmp) / 'out')
+            self.assertFalse((pathlib.Path(tmp) / 'out').exists())
+            with self.assertRaisesRegex(ValueError, 'staging APK'):
+                publish.publish(apk, {'url': publish.APK_PREFIX + 'x.apk', 'version_code': 1},
+                                cert_file=pathlib.Path(tmp) / 'none.txt')
