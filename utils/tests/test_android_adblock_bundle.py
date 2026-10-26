@@ -125,6 +125,18 @@ class TestBundle(unittest.TestCase):
         self.assertEqual(self.data, again)
 
 
+class TestPlatformInManifest(unittest.TestCase):
+    def test_the_manifest_names_the_platform(self):
+        for platform in ('android', 'desktop'):
+            data = bundle.make_zip(fixture_lists(), RESOURCES, '2026-10-20T02:30:00Z', '1.75.0', platform=platform)
+            self.assertEqual(bundle.manifest_of(data)['platform'], platform)
+
+    def test_build_records_its_platform(self):
+        import inspect
+        self.assertIn('make_zip(lists, resources, created, pin[\'tag\'], platform=platform)',
+                      inspect.getsource(bundle.build))
+
+
 class TestSignVerify(unittest.TestCase):
     def setUp(self):
         self.data = bundle.make_zip(fixture_lists(), RESOURCES, '2026-10-20T02:30:00Z', '1.75.0')

@@ -169,12 +169,16 @@ def _entry(name):
     return info
 
 
-def make_zip(lists, resources, created, ubo_tag):
-    """The bundle's bytes; the same inputs always give the same bytes."""
+def make_zip(lists, resources, created, ubo_tag, platform='android'):
+    """The bundle's bytes; the same inputs always give the same bytes. The
+    platform is in the signed manifest, so one platform's bundle never stands
+    in for the other's (both are signed with the same key)."""
+    _tokens(platform)
     resources_json = json.dumps(resources, separators=(',', ':'), sort_keys=True).encode()
     manifest = {
         'format': FORMAT,
         'created': created,
+        'platform': platform,
         'ubo_tag': ubo_tag,
         'lists': [{'name': l.name, 'url': l.url, 'permission': l.permission,
                    'sha256': hashlib.sha256(l.text.encode()).hexdigest()} for l in lists],
@@ -306,7 +310,7 @@ def build(out_dir, listtool=None, platform='android'):
         resources = json.loads(redirects.read_text()) + json.loads(scriptlets)
     now = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)
     created = now.strftime('%Y-%m-%dT%H:%M:%SZ')
-    data = make_zip(lists, resources, created, pin['tag'])
+    data = make_zip(lists, resources, created, pin['tag'], platform=platform)
     path = pathlib.Path(out_dir) / bundle_file_name(now)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(data)

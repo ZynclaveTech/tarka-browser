@@ -15,6 +15,7 @@ the build: an app is never built without lists or with unsigned ones.
 """
 
 import argparse
+import datetime
 import json
 import pathlib
 import re
@@ -28,6 +29,9 @@ import bundle  # noqa: E402
 
 LISTS_BASE = 'https://gettarka.com/lists/desktop/v1/'
 BUNDLE_NAME = re.compile(r'lists-[0-9]{8}\.zip')
+# A bundle older than this is refused: the daily job publishes a new one, so
+# an old one served again is a rollback (or a stalled job, worth a look).
+MAX_AGE = datetime.timedelta(days=30)
 
 
 def _fetch(url):
@@ -59,6 +63,15 @@ def main(argv=None):
         return 1
     public = bytes.fromhex(pathlib.Path(args.pubkey).read_text().strip())
     reason = bundle.check(data, index, public)
+    if not reason:
+        manifest = bundle.manifest_of(data)
+        if manifest.get('platform') != 'desktop':
+            reason = f'its platform is {manifest.get("platform")!r}, not desktop'
+        else:
+            created = datetime.datetime.strptime(manifest['created'], '%Y-%m-%dT%H:%M:%SZ').replace(
+                tzinfo=datetime.timezone.utc)
+            if datetime.datetime.now(datetime.timezone.utc) - created > MAX_AGE:
+                reason = f'it was made {manifest["created"]}, more than {MAX_AGE.days} days ago'
     if reason:
         print(f'adblock_lists: refused {name}: {reason}', file=sys.stderr)
         return 1

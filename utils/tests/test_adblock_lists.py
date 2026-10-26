@@ -1,6 +1,7 @@
 """Desktop ad blocker: utils/adblock_lists.py puts the newest signed desktop
 list bundle into the tree before every Mac and Windows build, and refuses
 anything whose signature does not check (the build stops)."""
+import datetime
 import json
 import pathlib
 import subprocess
@@ -26,13 +27,19 @@ class TestAdblockLists(unittest.TestCase):
         root = pathlib.Path(self.tmp.name)
         self.lists = root / 'lists'
         self.lists.mkdir()
-        self.data = bundle.make_zip(fixture_lists(), RESOURCES, '2026-10-26T02:30:00Z', '1.75.0')
         self.name = 'lists-00432630.zip'
-        (self.lists / self.name).write_bytes(self.data)
-        (self.lists / 'latest.json').write_text(json.dumps(bundle.make_index(self.data, self.name, RFC_SECRET1)))
+        self.data = self.publish(platform='desktop', age_days=1)
         self.pubkey = root / 'pub.txt'
         self.pubkey.write_text(ed25519.secret_to_public(RFC_SECRET1).hex())
         self.dest = root / 'src' / 'chrome' / 'browser' / 'tark_adblock' / 'lists.zip'
+
+    def publish(self, platform, age_days):
+        created = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=age_days))
+        data = bundle.make_zip(fixture_lists(), RESOURCES, created.strftime('%Y-%m-%dT%H:%M:%SZ'), '1.75.0',
+                               platform=platform)
+        (self.lists / self.name).write_bytes(data)
+        (self.lists / 'latest.json').write_text(json.dumps(bundle.make_index(data, self.name, RFC_SECRET1)))
+        return data
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -64,6 +71,22 @@ class TestAdblockLists(unittest.TestCase):
         index = json.loads((self.lists / 'latest.json').read_text())
         index['file'] = '../evil.zip'
         (self.lists / 'latest.json').write_text(json.dumps(index))
+        r = self.run_script()
+        self.assertNotEqual(r.returncode, 0)
+        self.assertFalse(self.dest.exists())
+
+    def test_an_android_bundle_is_refused(self):
+        # Both bundles are signed with the same key: the platform is in the
+        # signed manifest, so Android's cannot stand in for the desktop one.
+        self.publish(platform='android', age_days=1)
+        r = self.run_script()
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn('platform', r.stderr)
+        self.assertFalse(self.dest.exists())
+
+    def test_a_stale_bundle_is_refused(self):
+        # An old signed bundle served again (a rollback) is refused.
+        self.publish(platform='desktop', age_days=31)
         r = self.run_script()
         self.assertNotEqual(r.returncode, 0)
         self.assertFalse(self.dest.exists())
