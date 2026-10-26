@@ -89,6 +89,7 @@ def _uploaded(apk, key, bucket, run):
 
 
 def publish(apk, index, bucket=BUCKET, cert_file=CERT_FILE, live_code=0, dry_run=True, run=subprocess.run):
+    sign.refuse_staging(apk)
     want = pathlib.Path(cert_file).read_text().strip()
     if _apk_cert(apk) != [want]:
         raise ValueError(f'{apk} is not signed by the release certificate alone ({want})')

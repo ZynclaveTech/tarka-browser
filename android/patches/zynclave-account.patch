@@ -1,0 +1,2693 @@
+diff --color '--color=never' -ruN a/chrome/android/BUILD.gn b/chrome/android/BUILD.gn
+--- a/chrome/android/BUILD.gn	2026-10-26 12:03:20.715826451 +0530
++++ b/chrome/android/BUILD.gn	2026-10-26 12:03:20.756669962 +0530
+@@ -15,6 +15,14 @@
+ 
+ _is_default_toolchain = current_toolchain == default_toolchain
+ 
++declare_args() {
++  # Tark: Sign in with Zynclave against the staging Zynclave Account (issuer
++  # auth.staging.zynclave.com) instead of production. Test APKs only: set by
++  # the build job's --zynclave-staging, never in args.gn; android/release
++  # refuses an APK built with it.
++  tark_zynclave_staging = false
++}
++
+ if (_is_default_toolchain) {
+   import("//build/android/resource_sizes.gni")
+   import("//build/config/android/rules.gni")
+@@ -853,6 +861,7 @@
+       "//third_party/androidx:androidx_viewpager2_viewpager2_java",
+       "//third_party/androidx:androidx_viewpager_viewpager_java",
+       "//third_party/androidx:androidx_window_window_java",
++      "//third_party/appauth:appauth_java",
+       "//third_party/blink/public:blink_headers_java",
+       "//third_party/blink/public/common:common_java",
+       "//third_party/blink/public/mojom:android_mojo_bindings_java",
+@@ -883,6 +892,7 @@
+       ":chrome_android_java_enums_srcjar",
+       ":chrome_strict_mode_switch",
+       ":resource_id_javagen",
++      ":tark_zynclave_build_config",
+       "//chrome:offline_pages_enum_javagen",
+       "//chrome/browser:screenshot_mode_enum",
+       "//chrome/browser/enterprise/platform_auth:entra_auth_enum_javagen",
+@@ -984,6 +994,15 @@
+     }
+   }
+ 
++  # Tark: which Zynclave Account Sign in with Zynclave uses
++  # (TarkZynclaveBuildConfig.STAGING, read by ZynclaveConfig).
++  java_cpp_template("tark_zynclave_build_config") {
++    sources = [ "java/src/org/chromium/chrome/browser/tark/zynclave/TarkZynclaveBuildConfig.template" ]
++    if (tark_zynclave_staging) {
++      defines = [ "TARK_ZYNCLAVE_STAGING" ]
++    }
++  }
++
+   generate_product_config_srcjar("chrome_product_config") {
+     java_package = "org.chromium.chrome.browser"
+   }
+@@ -1166,6 +1185,7 @@
+       "junit:chrome_junit_tests_org.chromium.chrome.browser.tab",
+       "junit:chrome_junit_tests_org.chromium.chrome.browser.tabbed_mode",
+       "junit:chrome_junit_tests_org.chromium.chrome.browser.tabmodel",
++      "junit:chrome_junit_tests_org.chromium.chrome.browser.tark.zynclave",
+       "junit:chrome_junit_tests_org.chromium.chrome.browser.tasks",
+       "junit:chrome_junit_tests_org.chromium.chrome.browser.toolbar",
+       "junit:chrome_junit_tests_org.chromium.chrome.browser.ui",
+diff --color '--color=never' -ruN a/chrome/android/chrome_java_resources.gni b/chrome/android/chrome_java_resources.gni
+--- a/chrome/android/chrome_java_resources.gni	2026-10-26 12:03:20.721961204 +0530
++++ b/chrome/android/chrome_java_resources.gni	2026-10-26 12:03:20.757662094 +0530
+@@ -681,6 +681,8 @@
+   "java/res/xml/privacy_preferences.xml",
+   "java/res/xml/search_widget_info.xml",
+   "java/res/xml/tab_position_preferences.xml",
++  "java/res/xml/tark_backup_rules.xml",
++  "java/res/xml/tark_data_extraction_rules.xml",
+   "java/res/xml/tracing_preferences.xml",
+   "java/res/xml/unified_account_settings_preferences.xml",
+   "java/res/xml/universal_opt_out_preferences.xml",
+diff --color '--color=never' -ruN a/chrome/android/chrome_java_sources.gni b/chrome/android/chrome_java_sources.gni
+--- a/chrome/android/chrome_java_sources.gni	2026-10-26 12:03:20.718081800 +0530
++++ b/chrome/android/chrome_java_sources.gni	2026-10-26 12:03:20.760078320 +0530
+@@ -974,6 +974,11 @@
+   "java/src/org/chromium/chrome/browser/page_info/SiteSettingsHelper.java",
+   "java/src/org/chromium/chrome/browser/page_info/TarkAdblockSiteSwitch.java",
+   "java/src/org/chromium/chrome/browser/tark_captions/TarkCaptionBarCoordinator.java",
++  "java/src/org/chromium/chrome/browser/tark/zynclave/AuthStateStore.java",
++  "java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAccount.java",
++  "java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAuthActivity.java",
++  "java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAuthFlow.java",
++  "java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveConfig.java",
+   "java/src/org/chromium/chrome/browser/paint_preview/StartupPaintPreviewHelper.java",
+   "java/src/org/chromium/chrome/browser/paint_preview/StartupPaintPreviewHelperSupplier.java",
+   "java/src/org/chromium/chrome/browser/password_manager/AccountChooserDialog.java",
+diff --color '--color=never' -ruN a/chrome/android/java/AndroidManifest.xml b/chrome/android/java/AndroidManifest.xml
+--- a/chrome/android/java/AndroidManifest.xml	2026-10-26 12:03:20.719571812 +0530
++++ b/chrome/android/java/AndroidManifest.xml	2026-10-26 12:03:20.762392421 +0530
+@@ -237,6 +237,8 @@
+         android:allowBackup="false"
+         {% endif %}
+         android:networkSecurityConfig="@xml/network_security_config"
++        android:fullBackupContent="@xml/tark_backup_rules"
++        android:dataExtractionRules="@xml/tark_data_extraction_rules"
+         android:appComponentFactory="org.chromium.chrome.browser.base.SplitCompatAppComponentFactory"
+         android:enableOnBackInvokedCallback="true"
+         android:zygotePreloadNativeLib="lib{{ library_name }}.so"
+@@ -574,6 +576,31 @@
+             android:excludeFromRecents="true"
+             android:exported="false" />
+ 
++        <!-- Tark: Sign in with Zynclave (AppAuth). AppAuth's own manifest and res/ are not in
++             the tree, so its activities are declared here with Chromium's translucent theme.
++             The redirect reaches RedirectUriReceiverActivity only by Tark's explicit intent from
++             the marked sign-in Custom Tab, or from another app. -->
++        <activity android:name="net.openid.appauth.RedirectUriReceiverActivity"
++            android:theme="@style/Theme.BrowserUI.Translucent"
++            android:excludeFromRecents="true"
++            android:exported="true">
++            <intent-filter>
++                <action android:name="android.intent.action.VIEW"/>
++                <category android:name="android.intent.category.DEFAULT"/>
++                <category android:name="android.intent.category.BROWSABLE"/>
++                <data android:scheme="com.gettarka.tarka" android:path="/oauth2redirect"/>
++            </intent-filter>
++        </activity>
++        <activity android:name="net.openid.appauth.AuthorizationManagementActivity"
++            android:theme="@style/Theme.BrowserUI.Translucent"
++            android:configChanges="screenSize|smallestScreenSize|screenLayout|orientation|keyboard|keyboardHidden"
++            android:launchMode="singleTask"
++            android:exported="false" />
++        <activity android:name="org.chromium.chrome.browser.tark.zynclave.ZynclaveAuthActivity"
++            android:theme="@style/Theme.BrowserUI.Translucent"
++            android:configChanges="screenSize|smallestScreenSize|screenLayout|orientation|keyboard|keyboardHidden"
++            android:exported="false" />
++
+         <!-- Phishing Protection related -->
+         <receiver android:name="org.chromium.chrome.browser.safe_browsing.PasswordProtectionBroadcastReceiver"
+         android:exported="true"
+diff --color '--color=never' -ruN a/chrome/android/java/res/xml/tark_backup_rules.xml b/chrome/android/java/res/xml/tark_backup_rules.xml
+--- a/chrome/android/java/res/xml/tark_backup_rules.xml	1970-01-01 05:30:00.000000000 +0530
++++ b/chrome/android/java/res/xml/tark_backup_rules.xml	2026-10-26 12:03:20.763133551 +0530
+@@ -0,0 +1,11 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!--
++Copyright 2026 The Tark Authors
++Use of this source code is governed by a BSD-style license that can be
++found in the LICENSE file.
++-->
++
++<!-- Tark: Android 11 and older. The Zynclave account never leaves the device through backup. -->
++<full-backup-content>
++    <exclude domain="file" path="zynclave/" />
++</full-backup-content>
+diff --color '--color=never' -ruN a/chrome/android/java/res/xml/tark_data_extraction_rules.xml b/chrome/android/java/res/xml/tark_data_extraction_rules.xml
+--- a/chrome/android/java/res/xml/tark_data_extraction_rules.xml	1970-01-01 05:30:00.000000000 +0530
++++ b/chrome/android/java/res/xml/tark_data_extraction_rules.xml	2026-10-26 12:03:20.763462137 +0530
+@@ -0,0 +1,16 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!--
++Copyright 2026 The Tark Authors
++Use of this source code is governed by a BSD-style license that can be
++found in the LICENSE file.
++-->
++
++<!-- Tark: Android 12 and newer. The Zynclave account is in neither cloud backup nor device transfer. -->
++<data-extraction-rules>
++    <cloud-backup>
++        <exclude domain="file" path="zynclave/" />
++    </cloud-backup>
++    <device-transfer>
++        <exclude domain="file" path="zynclave/" />
++    </device-transfer>
++</data-extraction-rules>
+diff --color '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/AuthStateStore.java b/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/AuthStateStore.java
+--- a/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/AuthStateStore.java	1970-01-01 05:30:00.000000000 +0530
++++ b/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/AuthStateStore.java	2026-10-26 12:05:40.952414195 +0530
+@@ -0,0 +1,239 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++package org.chromium.chrome.browser.tark.zynclave;
++
++import android.content.Context;
++import android.security.keystore.KeyGenParameterSpec;
++import android.security.keystore.KeyProperties;
++
++import org.json.JSONException;
++import org.json.JSONObject;
++
++import org.chromium.base.Log;
++import org.chromium.build.annotations.NullMarked;
++import org.chromium.build.annotations.Nullable;
++
++import java.io.File;
++import java.io.FileOutputStream;
++import java.io.IOException;
++import java.nio.charset.StandardCharsets;
++import java.nio.file.Files;
++import java.nio.file.StandardCopyOption;
++import java.security.GeneralSecurityException;
++import java.security.KeyStore;
++import java.util.Arrays;
++import java.util.Objects;
++
++import javax.crypto.Cipher;
++import javax.crypto.KeyGenerator;
++import javax.crypto.SecretKey;
++import javax.crypto.spec.GCMParameterSpec;
++
++/**
++ * Tark: Sign in with Zynclave's account store (spec §5.4). AppAuth's serialized state (the refresh
++ * token is in it) and the cached name and email are one JSON document, encrypted with AES-256-GCM
++ * under a non-exportable Android Keystore key and kept in {@code dir/account.bin} as a 12-byte IV
++ * followed by the ciphertext.
++ *
++ * <p>If the file can't be decrypted, or the key is gone or invalidated, the file is deleted, the
++ * key is dropped and the person is simply signed out. Nothing here throws on the read path. Calls
++ * are blocking: run them on the account executor, never on the UI thread.
++ */
++@NullMarked
++public class AuthStateStore {
++    private static final String TAG = "TarkZynclave";
++    private static final String KEY_ALIAS = "tark_zynclave_v1";
++    private static final String FILE_NAME = "account.bin";
++    private static final String TEMP_NAME = "account.bin.tmp";
++    private static final String TRANSFORMATION = "AES/GCM/NoPadding";
++    private static final int IV_BYTES = 12;
++    private static final int TAG_BITS = 128;
++    private static final int VERSION = 1;
++
++    /** What the store keeps: the AppAuth state JSON plus the cached userinfo. */
++    public static final class Stored {
++        private final String mAuthStateJson;
++        private final @Nullable String mName;
++        private final @Nullable String mEmail;
++
++        public Stored(String authStateJson, @Nullable String name, @Nullable String email) {
++            mAuthStateJson = authStateJson;
++            mName = name;
++            mEmail = email;
++        }
++
++        public String authStateJson() {
++            return mAuthStateJson;
++        }
++
++        public @Nullable String name() {
++            return mName;
++        }
++
++        public @Nullable String email() {
++            return mEmail;
++        }
++
++        @Override
++        public boolean equals(@Nullable Object other) {
++            if (this == other) return true;
++            if (!(other instanceof Stored)) return false;
++            Stored that = (Stored) other;
++            return mAuthStateJson.equals(that.mAuthStateJson)
++                    && Objects.equals(mName, that.mName)
++                    && Objects.equals(mEmail, that.mEmail);
++        }
++
++        @Override
++        public int hashCode() {
++            return Objects.hash(mAuthStateJson, mName, mEmail);
++        }
++    }
++
++    /** The encryption key's home, so tests can use a software key. */
++    public interface KeyProvider {
++        /** The existing key, or a new one if there is none. */
++        SecretKey getOrCreate() throws GeneralSecurityException;
++
++        /** Forgets the key. Never throws. */
++        void delete();
++    }
++
++    private final File mDir;
++    private final KeyProvider mKeys;
++
++    public AuthStateStore(File dir, KeyProvider keys) {
++        mDir = dir;
++        mKeys = keys;
++    }
++
++    /** The store for the app: {@code files/zynclave/} and the Keystore key {@code tark_zynclave_v1}. */
++    public static AuthStateStore create(Context context) {
++        return new AuthStateStore(
++                new File(context.getFilesDir(), "zynclave"), new KeystoreKeyProvider());
++    }
++
++    /** The stored account, or null if there is none or it can't be read (then it is cleared). */
++    public synchronized @Nullable Stored read() {
++        File file = new File(mDir, FILE_NAME);
++        if (!file.exists()) return null;
++        try {
++            byte[] blob = Files.readAllBytes(file.toPath());
++            if (blob.length <= IV_BYTES) throw new GeneralSecurityException("short file");
++            SecretKey key = mKeys.getOrCreate();
++            Cipher cipher = Cipher.getInstance(TRANSFORMATION);
++            cipher.init(
++                    Cipher.DECRYPT_MODE,
++                    key,
++                    new GCMParameterSpec(TAG_BITS, blob, 0, IV_BYTES));
++            byte[] plain = cipher.doFinal(blob, IV_BYTES, blob.length - IV_BYTES);
++            JSONObject json = new JSONObject(new String(plain, StandardCharsets.UTF_8));
++            if (json.getInt("v") != VERSION) throw new GeneralSecurityException("version");
++            return new Stored(
++                    json.getString("auth"), optString(json, "name"), optString(json, "email"));
++        } catch (GeneralSecurityException | JSONException | IOException | RuntimeException e) {
++            // Deliberately broad: any failure, a transient keystore error included, deletes the
++            // file and the key and so signs out. That is by design (spec §5.4): signing in again
++            // is cheap, and an account that can't be read must never half-work.
++            Log.i(TAG, "Account file unreadable (%s); signing out", e.getClass().getSimpleName());
++            clear();
++            mKeys.delete();
++            return null;
++        }
++    }
++
++    /**
++     * Encrypts and saves {@code stored}, through a temp file and a rename so a crash leaves either
++     * the old file or the new one.
++     *
++     * @throws IOException if the key or the disk fails; the previous file is left as it was.
++     */
++    public synchronized void write(Stored stored) throws IOException {
++        try {
++            JSONObject json = new JSONObject();
++            json.put("v", VERSION);
++            json.put("auth", stored.authStateJson());
++            json.put("name", stored.name());
++            json.put("email", stored.email());
++            byte[] plain = json.toString().getBytes(StandardCharsets.UTF_8);
++
++            Cipher cipher = Cipher.getInstance(TRANSFORMATION);
++            cipher.init(Cipher.ENCRYPT_MODE, mKeys.getOrCreate());
++            byte[] iv = cipher.getIV();
++            if (iv == null || iv.length != IV_BYTES) {
++                throw new GeneralSecurityException("unexpected IV");
++            }
++            byte[] sealed = cipher.doFinal(plain);
++            byte[] blob = new byte[IV_BYTES + sealed.length];
++            System.arraycopy(iv, 0, blob, 0, IV_BYTES);
++            System.arraycopy(sealed, 0, blob, IV_BYTES, sealed.length);
++            Arrays.fill(plain, (byte) 0);
++
++            if (!mDir.isDirectory() && !mDir.mkdirs()) throw new IOException("no directory");
++            File temp = new File(mDir, TEMP_NAME);
++            try (FileOutputStream out = new FileOutputStream(temp)) {
++                out.write(blob);
++                out.getFD().sync();
++            }
++            Files.move(
++                    temp.toPath(),
++                    new File(mDir, FILE_NAME).toPath(),
++                    StandardCopyOption.ATOMIC_MOVE,
++                    StandardCopyOption.REPLACE_EXISTING);
++        } catch (GeneralSecurityException | JSONException e) {
++            throw new IOException("could not encrypt the account", e);
++        }
++    }
++
++    /** Deletes the account file (and any leftover temp file). The key is kept. */
++    public synchronized void clear() {
++        new File(mDir, FILE_NAME).delete();
++        new File(mDir, TEMP_NAME).delete();
++    }
++
++    private static @Nullable String optString(JSONObject json, String name) {
++        return json.isNull(name) ? null : json.optString(name, null);
++    }
++
++    /** The Android Keystore key: AES-256-GCM, random IVs, no user authentication. */
++    private static class KeystoreKeyProvider implements KeyProvider {
++        private static final String PROVIDER = "AndroidKeyStore";
++
++        @Override
++        public SecretKey getOrCreate() throws GeneralSecurityException {
++            try {
++                KeyStore store = KeyStore.getInstance(PROVIDER);
++                store.load(null);
++                if (store.getKey(KEY_ALIAS, null) instanceof SecretKey existing) return existing;
++                KeyGenerator generator =
++                        KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, PROVIDER);
++                generator.init(
++                        new KeyGenParameterSpec.Builder(
++                                        KEY_ALIAS,
++                                        KeyProperties.PURPOSE_ENCRYPT
++                                                | KeyProperties.PURPOSE_DECRYPT)
++                                .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
++                                .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
++                                .setKeySize(256)
++                                .setRandomizedEncryptionRequired(true)
++                                .build());
++                return generator.generateKey();
++            } catch (IOException e) {
++                throw new GeneralSecurityException(e);
++            }
++        }
++
++        @Override
++        public void delete() {
++            try {
++                KeyStore store = KeyStore.getInstance(PROVIDER);
++                store.load(null);
++                store.deleteEntry(KEY_ALIAS);
++            } catch (GeneralSecurityException | IOException | RuntimeException e) {
++                Log.i(TAG, "Could not delete the key (%s)", e.getClass().getSimpleName());
++            }
++        }
++    }
++}
+diff --color '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/TarkZynclaveBuildConfig.template b/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/TarkZynclaveBuildConfig.template
+--- a/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/TarkZynclaveBuildConfig.template	1970-01-01 05:30:00.000000000 +0530
++++ b/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/TarkZynclaveBuildConfig.template	2026-10-26 12:05:40.927081632 +0530
+@@ -0,0 +1,27 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++package org.chromium.chrome.browser.tark.zynclave;
++
++/**
++ * Tark: the GN arg tark_zynclave_staging, for {@link ZynclaveConfig}. Each build gets the values
++ * of its own environment only: the staging client id and hosts exist only in a class generated
++ * with TARK_ZYNCLAVE_STAGING defined, so a production build never contains them (the release
++ * guard android/release/sign.py refuse_staging looks for the staging client id).
++ */
++public final class TarkZynclaveBuildConfig {
++#if defined(TARK_ZYNCLAVE_STAGING)
++    public static final boolean STAGING = true;
++    public static final String ISSUER = "https://auth.staging.zynclave.com/";
++    public static final String CLIENT_ID = "1664a81e-6fe5-4eb9-9869-ca0c7a7a04c4";
++    public static final String ACCOUNTS_HOST = "accounts.staging.zynclave.com";
++#else
++    public static final boolean STAGING = false;
++    public static final String ISSUER = "https://auth.zynclave.com/";
++    public static final String CLIENT_ID = "fa54f2e8-2dfe-4c73-8002-01caea05f849";
++    public static final String ACCOUNTS_HOST = "accounts.zynclave.com";
++#endif
++
++    private TarkZynclaveBuildConfig() {}
++}
+diff --color '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAccount.java b/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAccount.java
+--- a/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAccount.java	1970-01-01 05:30:00.000000000 +0530
++++ b/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAccount.java	2026-10-26 12:05:40.918196442 +0530
+@@ -0,0 +1,686 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++package org.chromium.chrome.browser.tark.zynclave;
++
++import android.app.Activity;
++import android.net.Uri;
++import android.util.Base64;
++
++import androidx.annotation.MainThread;
++import androidx.annotation.VisibleForTesting;
++import androidx.annotation.WorkerThread;
++
++import net.openid.appauth.AuthState;
++import net.openid.appauth.AuthorizationException;
++import net.openid.appauth.AuthorizationRequest;
++import net.openid.appauth.AuthorizationResponse;
++import net.openid.appauth.AuthorizationServiceConfiguration;
++import net.openid.appauth.TokenRequest;
++import net.openid.appauth.TokenResponse;
++
++import org.json.JSONException;
++
++import org.chromium.base.Callback;
++import org.chromium.base.ContextUtils;
++import org.chromium.base.Log;
++import org.chromium.base.ObserverList;
++import org.chromium.base.ResettersForTesting;
++import org.chromium.base.ThreadUtils;
++import org.chromium.build.annotations.NullMarked;
++import org.chromium.build.annotations.Nullable;
++import org.chromium.chrome.browser.tark.zynclave.AuthStateStore.Stored;
++
++import java.io.IOException;
++import java.lang.ref.WeakReference;
++import java.security.SecureRandom;
++import java.util.concurrent.Executor;
++import java.util.concurrent.Executors;
++import java.util.concurrent.atomic.AtomicInteger;
++import java.util.function.Supplier;
++
++/**
++ * Tark: the Zynclave Account Tark is signed in to (spec §5.3–5.5, handoff §2). A UI-thread
++ * singleton: every public method is called on the UI thread, and observers run there.
++ *
++ * <p>All network, crypto and file work runs on one serial background executor ({@code bg}), so a
++ * refresh, a sign-in and a sign-out never overlap and a rotated refresh token is always saved
++ * before the next use. The {@link AuthState} and the {@link AuthStateStore} belong to {@code bg}.
++ *
++ * <p>Nothing is read at startup: the store is read on {@code bg} the first time {@link #state},
++ * {@link #name}, {@link #email}, {@link #freshTokens} or {@link #signOut} is called. Until that
++ * read finishes the state is {@link State#SIGNED_OUT}; observers run after it.
++ *
++ * <p>Logs (tag {@code TarkZynclave}) name only state changes and error types: never a token, a
++ * code, an id token, a {@code sub} or a URL with a query.
++ */
++@NullMarked
++public final class ZynclaveAccount {
++    private static final String TAG = "TarkZynclave";
++
++    /** The intent extra on the sign-in Custom Tab: {@link #pendingAuthToken} (spec §5.3). */
++    public static final String EXTRA_AUTH_TOKEN = "org.chromium.chrome.browser.tark.ZYNCLAVE_AUTH";
++
++    /** The OAuth error a refresh ends with when the refresh token is no longer valid. */
++    private static final String INVALID_GRANT = "invalid_grant";
++
++    /** Discovery's revocation endpoint (RFC 7009), which AppAuth doesn't model. */
++    private static final String REVOCATION_ENDPOINT = "revocation_endpoint";
++
++    public enum State {
++        SIGNED_OUT,
++        SIGNING_IN,
++        SIGNED_IN,
++        /** The refresh token was refused (invalid_grant): signed out, the last name kept. */
++        NEEDS_SIGN_IN_AGAIN,
++    }
++
++    /** What userinfo said; either may be missing. */
++    public static final class Profile {
++        private final @Nullable String mName;
++        private final @Nullable String mEmail;
++
++        public Profile(@Nullable String name, @Nullable String email) {
++            mName = name;
++            mEmail = email;
++        }
++
++        public @Nullable String name() {
++            return mName;
++        }
++
++        public @Nullable String email() {
++            return mEmail;
++        }
++    }
++
++    /**
++     * AppAuth and HTTP, replaced in tests. {@link #authorize} and {@link #openCustomTab} run on
++     * the UI thread, the rest on {@code bg} (they block).
++     */
++    interface Backend {
++        /** The issuer's OpenID Connect discovery document. */
++        @WorkerThread
++        AuthorizationServiceConfiguration fetchConfig(Uri issuer) throws IOException;
++
++        /** The code exchange, with AppAuth's ID token checks. */
++        @WorkerThread
++        TokenResponse exchange(TokenRequest request) throws AuthorizationException;
++
++        /** A refresh-token grant. The response carries the rotated refresh token. */
++        @WorkerThread
++        TokenResponse refresh(TokenRequest request) throws AuthorizationException;
++
++        @WorkerThread
++        Profile userinfo(Uri endpoint, String accessToken) throws IOException;
++
++        /** RFC 7009: POST token and client_id to {@code endpoint}. */
++        @WorkerThread
++        void revoke(Uri endpoint, String clientId, String refreshToken) throws IOException;
++
++        /**
++         * Opens {@code request} in Tark's own Custom Tab, marked with {@code authToken}; the
++         * result comes to {@link ZynclaveAccount#onAuthorizationResult}.
++         *
++         * @return false if Tark isn't available as the Custom Tab browser (nothing is opened).
++         */
++        @MainThread
++        boolean authorize(Activity activity, AuthorizationRequest request, String authToken);
++
++        /** Opens {@code uri} in Tark's own Custom Tab (normal profile). */
++        @MainThread
++        void openCustomTab(@Nullable Activity activity, Uri uri);
++    }
++
++    private static @Nullable ZynclaveAccount sInstance;
++
++    private final Backend mBackend;
++    private final Supplier<AuthStateStore> mStoreFactory;
++    private final Executor mBg;
++    private final ZynclaveConfig mConfig;
++    private final ObserverList<Runnable> mObservers = new ObserverList<>();
++    private final ObserverList<Runnable> mFailureObservers = new ObserverList<>();
++    private final SecureRandom mRandom = new SecureRandom();
++
++    /** Bumped by every sign-out: bg work begun before it doesn't write or change state. */
++    private final AtomicInteger mGeneration = new AtomicInteger();
++
++    // UI thread.
++    private State mState = State.SIGNED_OUT;
++    private @Nullable String mName;
++    private @Nullable String mEmail;
++    private boolean mLoadStarted;
++    // The state to return to if a sign-in is cancelled or fails.
++    private State mStateBeforeSignIn = State.SIGNED_OUT;
++    private @Nullable String mPendingAuthToken;
++    private boolean mPendingPromptNone;
++
++    // Discovery, cached in memory and dropped on any sign-in failure (spec §5.3). Set on bg, read
++    // on the UI thread to build a retry.
++    private volatile @Nullable AuthorizationServiceConfiguration mServiceConfig;
++
++    // bg only.
++    private @Nullable AuthStateStore mStore;
++    private @Nullable AuthState mAuth;
++    private @Nullable String mStoredName;
++    private @Nullable String mStoredEmail;
++
++    private ZynclaveAccount(
++            Backend backend,
++            Supplier<AuthStateStore> storeFactory,
++            Executor bg,
++            ZynclaveConfig config) {
++        mBackend = backend;
++        mStoreFactory = storeFactory;
++        mBg = bg;
++        mConfig = config;
++    }
++
++    /** The account. Creating it does no I/O. */
++    @MainThread
++    public static ZynclaveAccount get() {
++        ThreadUtils.assertOnUiThread();
++        if (sInstance == null) {
++            Executor bg =
++                    Executors.newSingleThreadExecutor(
++                            runnable -> {
++                                Thread thread = new Thread(runnable, "TarkZynclave");
++                                thread.setDaemon(true);
++                                return thread;
++                            });
++            sInstance =
++                    new ZynclaveAccount(
++                            new ZynclaveAuthFlow.AppAuthBackend(),
++                            () -> AuthStateStore.create(ContextUtils.getApplicationContext()),
++                            bg,
++                            ZynclaveConfig.get());
++        }
++        return sInstance;
++    }
++
++    /** Makes {@link #get} return an account on {@code backend}, {@code store} and {@code bg}. */
++    @VisibleForTesting
++    static ZynclaveAccount forTesting(Backend backend, AuthStateStore store, Executor bg) {
++        ZynclaveAccount account =
++                new ZynclaveAccount(backend, () -> store, bg, ZynclaveConfig.get());
++        ZynclaveAccount old = sInstance;
++        sInstance = account;
++        ResettersForTesting.register(() -> sInstance = old);
++        return account;
++    }
++
++    // ---- State -------------------------------------------------------------------------------
++
++    @MainThread
++    public State state() {
++        ensureLoaded();
++        return mState;
++    }
++
++    /** The display name from userinfo; kept in NEEDS_SIGN_IN_AGAIN for the row. */
++    @MainThread
++    public @Nullable String name() {
++        ensureLoaded();
++        return mName;
++    }
++
++    @MainThread
++    public @Nullable String email() {
++        ensureLoaded();
++        return mEmail;
++    }
++
++    /** {@code observer} runs on the UI thread after every state, name or email change. */
++    @MainThread
++    public void addObserver(Runnable observer) {
++        mObservers.addObserver(observer);
++    }
++
++    @MainThread
++    public void removeObserver(Runnable observer) {
++        mObservers.removeObserver(observer);
++    }
++
++    /**
++     * {@code observer} runs once for each sign-in that failed (not one that was cancelled):
++     * whoever started it shows "Couldn't sign in. Try again." (IDS_TARK_ZYNCLAVE_SIGN_IN_FAILED).
++     */
++    @MainThread
++    public void addSignInFailureObserver(Runnable observer) {
++        mFailureObservers.addObserver(observer);
++    }
++
++    @MainThread
++    public void removeSignInFailureObserver(Runnable observer) {
++        mFailureObservers.removeObserver(observer);
++    }
++
++    /** The random token on the pending sign-in Custom Tab's intent; null when none is pending. */
++    @MainThread
++    public @Nullable String pendingAuthToken() {
++        return mPendingAuthToken;
++    }
++
++    // ---- Sign-in -----------------------------------------------------------------------------
++
++    /**
++     * Starts a sign-in in Tark's own Custom Tab, from {@code activity}. With {@code promptNone}
++     * it first asks without a page (prompt=none) and asks once more with the page if the server
++     * says the person has to sign in. Does nothing while signing in or signed in.
++     */
++    @MainThread
++    public void signIn(Activity activity, boolean promptNone) {
++        ThreadUtils.assertOnUiThread();
++        ensureLoaded();
++        if (mState == State.SIGNING_IN || mState == State.SIGNED_IN) return;
++        mStateBeforeSignIn = mState;
++        setState(State.SIGNING_IN);
++        WeakReference<Activity> activityRef = new WeakReference<>(activity);
++        int generation = mGeneration.get();
++        mBg.execute(
++                () -> {
++                    AuthorizationServiceConfiguration config = mServiceConfig;
++                    if (config == null) {
++                        try {
++                            config = mBackend.fetchConfig(mConfig.issuer());
++                            mServiceConfig = config;
++                        } catch (IOException | RuntimeException e) {
++                            Log.i(TAG, "discovery failed: %s", e.getClass().getSimpleName());
++                            ThreadUtils.postOnUiThread(() -> signInFailed(generation));
++                            return;
++                        }
++                    }
++                    AuthorizationServiceConfiguration fetched = config;
++                    ThreadUtils.postOnUiThread(
++                            () -> {
++                                if (generation != mGeneration.get()) return;
++                                Activity from = activityRef.get();
++                                if (from == null || from.isFinishing() || from.isDestroyed()) {
++                                    // The person left before the page could open: like a cancel.
++                                    signInCancelled();
++                                    return;
++                                }
++                                launch(from, fetched, promptNone);
++                            });
++                });
++    }
++
++    @MainThread
++    private void launch(
++            Activity activity, AuthorizationServiceConfiguration config, boolean promptNone) {
++        AuthorizationRequest request = ZynclaveAuthFlow.buildRequest(mConfig, config, promptNone);
++        String token = newAuthToken();
++        mPendingAuthToken = token;
++        mPendingPromptNone = promptNone;
++        if (!mBackend.authorize(activity, request, token)) {
++            Log.i(TAG, "no custom tab");
++            mPendingAuthToken = null;
++            signInFailed(mGeneration.get());
++        }
++    }
++
++    /**
++     * The Custom Tab's result, from {@link ZynclaveAuthActivity}: exactly one of {@code response}
++     * and {@code exception} is non-null. {@code activity} is where a prompt=none retry opens; the
++     * rest goes on without it.
++     */
++    @MainThread
++    void onAuthorizationResult(
++            @Nullable Activity activity,
++            @Nullable AuthorizationResponse response,
++            @Nullable AuthorizationException exception) {
++        ThreadUtils.assertOnUiThread();
++        ensureLoaded();
++        boolean wasPromptNone = mPendingPromptNone;
++        mPendingAuthToken = null;
++        mPendingPromptNone = false;
++        if (mState != State.SIGNING_IN) {
++            // Not pending here: this branch exists for AppAuth's process-restore delivery. The
++            // process died while the tab was open, and AppAuth kept the request and hands its
++            // result to the new process. A stray or replayed result can't sign anyone in:
++            // AppAuth's own state check (the request's state parameter against the response's)
++            // rejects it before it reaches this method.
++            if (mState == State.SIGNED_IN) return;
++            mStateBeforeSignIn = mState;
++            setState(State.SIGNING_IN);
++        }
++        if (response != null) {
++            exchange(response);
++            return;
++        }
++        if (isCancel(exception)) {
++            Log.i(TAG, "sign-in cancelled");
++            signInCancelled();
++            return;
++        }
++        AuthorizationServiceConfiguration config = mServiceConfig;
++        if (wasPromptNone
++                && ZynclaveAuthFlow.shouldRetryInteractive(exception)
++                && config != null
++                && activity != null
++                && !activity.isFinishing()) {
++            Log.i(TAG, "prompt=none needs the page");
++            launch(activity, config, /* promptNone= */ false);
++            return;
++        }
++        Log.i(TAG, "authorization failed: %s", errorType(exception));
++        signInFailed(mGeneration.get());
++    }
++
++    @MainThread
++    private void exchange(AuthorizationResponse response) {
++        int generation = mGeneration.get();
++        mBg.execute(
++                () -> {
++                    AuthState auth = new AuthState(response, null);
++                    try {
++                        TokenResponse tokens =
++                                mBackend.exchange(response.createTokenExchangeRequest());
++                        auth.update(tokens, null);
++                    } catch (AuthorizationException | RuntimeException e) {
++                        Log.i(TAG, "code exchange failed: %s", errorType(e));
++                        ThreadUtils.postOnUiThread(() -> signInFailed(generation));
++                        return;
++                    }
++                    Profile profile = fetchProfile(auth);
++                    if (generation != mGeneration.get()) return;
++                    try {
++                        store().write(
++                                        new Stored(
++                                                auth.jsonSerializeString(),
++                                                profile.name(),
++                                                profile.email()));
++                    } catch (IOException | RuntimeException e) {
++                        Log.i(TAG, "saving failed: %s", e.getClass().getSimpleName());
++                        ThreadUtils.postOnUiThread(() -> signInFailed(generation));
++                        return;
++                    }
++                    mAuth = auth;
++                    mStoredName = profile.name();
++                    mStoredEmail = profile.email();
++                    ThreadUtils.postOnUiThread(
++                            () -> {
++                                if (generation != mGeneration.get()) return;
++                                mName = profile.name();
++                                mEmail = profile.email();
++                                Log.i(TAG, "signed in");
++                                setState(State.SIGNED_IN);
++                            });
++                });
++    }
++
++    @WorkerThread
++    private Profile fetchProfile(AuthState auth) {
++        AuthorizationServiceConfiguration config = auth.getAuthorizationServiceConfiguration();
++        String accessToken = auth.getAccessToken();
++        @Nullable Uri endpoint =
++                config == null || config.discoveryDoc == null
++                        ? null
++                        : config.discoveryDoc.getUserinfoEndpoint();
++        if (endpoint == null || accessToken == null) return new Profile(null, null);
++        try {
++            return mBackend.userinfo(endpoint, accessToken);
++        } catch (IOException | RuntimeException e) {
++            // Signed in all the same; the row says "Zynclave Account".
++            Log.i(TAG, "userinfo failed: %s", e.getClass().getSimpleName());
++            return new Profile(null, null);
++        }
++    }
++
++    @MainThread
++    private void signInCancelled() {
++        if (mState != State.SIGNING_IN) return;
++        setState(mStateBeforeSignIn);
++    }
++
++    @MainThread
++    private void signInFailed(int generation) {
++        mServiceConfig = null; // Refetched next time.
++        if (generation != mGeneration.get() || mState != State.SIGNING_IN) return;
++        setState(mStateBeforeSignIn);
++        for (Runnable observer : mFailureObservers) observer.run();
++    }
++
++    private static boolean isCancel(@Nullable AuthorizationException exception) {
++        return exception == null
++                || (exception.type == AuthorizationException.TYPE_GENERAL_ERROR
++                        && exception.code
++                                == AuthorizationException.GeneralErrors.USER_CANCELED_AUTH_FLOW
++                                        .code);
++    }
++
++    // ---- Tokens ------------------------------------------------------------------------------
++
++    /**
++     * Gives {@code callback} (on the UI thread) a valid access token, refreshing it first if it
++     * has expired, or null: signed out, offline, or the refresh token was refused (then the state
++     * becomes NEEDS_SIGN_IN_AGAIN). The rotated refresh token is saved before the callback runs.
++     * No retries.
++     */
++    @MainThread
++    public void freshTokens(Callback<@Nullable String> callback) {
++        ThreadUtils.assertOnUiThread();
++        ensureLoaded();
++        int generation = mGeneration.get();
++        mBg.execute(
++                () -> {
++                    String token = freshTokensOnBg(generation);
++                    ThreadUtils.postOnUiThread(() -> callback.onResult(token));
++                });
++    }
++
++    @WorkerThread
++    private @Nullable String freshTokensOnBg(int generation) {
++        AuthState auth = mAuth;
++        if (auth == null || generation != mGeneration.get()) return null;
++        if (!auth.getNeedsTokenRefresh()) return auth.getAccessToken();
++        TokenResponse tokens;
++        try {
++            tokens = mBackend.refresh(auth.createTokenRefreshRequest());
++        } catch (AuthorizationException e) {
++            if (e.type == AuthorizationException.TYPE_OAUTH_TOKEN_ERROR
++                    && INVALID_GRANT.equals(e.error)) {
++                Log.i(TAG, "refresh refused: needs sign-in again");
++                if (generation == mGeneration.get() && mAuth == auth) {
++                    mAuth = null;
++                    store().clear();
++                    ThreadUtils.postOnUiThread(
++                            () -> {
++                                if (generation != mGeneration.get()) return;
++                                if (mState == State.SIGNED_IN) setState(State.NEEDS_SIGN_IN_AGAIN);
++                            });
++                }
++            } else {
++                Log.i(TAG, "refresh failed: %s", errorType(e));
++            }
++            return null;
++        } catch (RuntimeException e) {
++            Log.i(TAG, "refresh failed: %s", e.getClass().getSimpleName());
++            return null;
++        }
++        // The same object a sign-out on bg would read next, so a revoke uses the new token.
++        auth.update(tokens, null);
++        if (generation != mGeneration.get() || mAuth != auth) return null; // Signed out meanwhile.
++        try {
++            store().write(new Stored(auth.jsonSerializeString(), mStoredName, mStoredEmail));
++        } catch (IOException | RuntimeException e) {
++            // Kept in memory for this run; the next run may have to sign in again.
++            Log.i(TAG, "saving failed: %s", e.getClass().getSimpleName());
++        }
++        return auth.getAccessToken();
++    }
++
++    // ---- Sign-out ----------------------------------------------------------------------------
++
++    /**
++     * Signs Tark out at once: revokes the refresh token, then deletes the stored account (even if
++     * the revoke failed, e.g. offline). With {@code everywhere} it then opens the Zynclave
++     * end-session page in Tark's Custom Tab, from {@code forEndSession}, to end the web session
++     * too. No post-logout redirect: Zynclave shows its own page.
++     */
++    @MainThread
++    public void signOut(boolean everywhere, @Nullable Activity forEndSession) {
++        ThreadUtils.assertOnUiThread();
++        ensureLoaded();
++        mGeneration.incrementAndGet();
++        mPendingAuthToken = null;
++        mPendingPromptNone = false;
++        mName = null;
++        mEmail = null;
++        Log.i(TAG, "signing out");
++        setState(State.SIGNED_OUT);
++        @Nullable WeakReference<Activity> activityRef =
++                forEndSession == null ? null : new WeakReference<>(forEndSession);
++        mBg.execute(
++                () -> {
++                    AuthState auth = mAuth;
++                    mAuth = null;
++                    mStoredName = null;
++                    mStoredEmail = null;
++                    @Nullable Uri endSession = null;
++                    try {
++                        if (auth != null) {
++                            revoke(auth);
++                            if (everywhere) endSession = endSessionUri(auth, mConfig.clientId());
++                        }
++                    } finally {
++                        store().clear();
++                    }
++                    if (endSession == null) return;
++                    Uri uri = endSession;
++                    ThreadUtils.postOnUiThread(
++                            () ->
++                                    mBackend.openCustomTab(
++                                            activityRef == null ? null : activityRef.get(), uri));
++                });
++    }
++
++    @WorkerThread
++    private void revoke(AuthState auth) {
++        String refreshToken = auth.getRefreshToken();
++        AuthorizationServiceConfiguration config = auth.getAuthorizationServiceConfiguration();
++        if (refreshToken == null || config == null || config.discoveryDoc == null) return;
++        String endpoint = config.discoveryDoc.docJson.optString(REVOCATION_ENDPOINT, "");
++        if (endpoint.isEmpty()) return;
++        try {
++            mBackend.revoke(Uri.parse(endpoint), mConfig.clientId(), refreshToken);
++        } catch (IOException | RuntimeException e) {
++            // Signed out locally all the same; the token expires on its own.
++            Log.i(TAG, "revoke failed: %s", e.getClass().getSimpleName());
++        }
++    }
++
++    /**
++     * The end-session page, identified by client_id (OpenID Connect RP-Initiated Logout 1.0).
++     * Never id_token_hint: the URL opens in a normal-profile Custom Tab, so it lands in history,
++     * and no token may be in any URL (spec §5.5, review ruling 2026-10-26).
++     */
++    @WorkerThread
++    private static @Nullable Uri endSessionUri(AuthState auth, String clientId) {
++        AuthorizationServiceConfiguration config = auth.getAuthorizationServiceConfiguration();
++        if (config == null) return null;
++        @Nullable Uri endpoint = config.endSessionEndpoint;
++        if (endpoint == null && config.discoveryDoc != null) {
++            endpoint = config.discoveryDoc.getEndSessionEndpoint();
++        }
++        if (endpoint == null) return null;
++        return endpoint.buildUpon().appendQueryParameter("client_id", clientId).build();
++    }
++
++    // ---- Loading -----------------------------------------------------------------------------
++
++    @MainThread
++    private void ensureLoaded() {
++        if (mLoadStarted) return;
++        mLoadStarted = true;
++        int generation = mGeneration.get();
++        mBg.execute(
++                () -> {
++                    Stored stored = store().read();
++                    AuthState auth = null;
++                    if (stored != null) {
++                        auth = parse(stored.authStateJson());
++                        if (auth == null) {
++                            store().clear();
++                        } else {
++                            mStoredName = stored.name();
++                            mStoredEmail = stored.email();
++                        }
++                    }
++                    mAuth = auth;
++                    AuthState loaded = auth;
++                    String name = mStoredName;
++                    String email = mStoredEmail;
++                    ThreadUtils.postOnUiThread(
++                            () -> {
++                                if (loaded != null && generation == mGeneration.get()) {
++                                    if (mState == State.SIGNED_OUT) {
++                                        mName = name;
++                                        mEmail = email;
++                                        mState = State.SIGNED_IN;
++                                        Log.i(TAG, "loaded: signed in");
++                                    } else if (mState == State.SIGNING_IN
++                                            && mStateBeforeSignIn == State.SIGNED_OUT) {
++                                        // A sign-in started before the load finished, while
++                                        // state() still said signed out. The stored account
++                                        // is what it started from: a cancel or a failure goes
++                                        // back to it, and a completed sign-in replaces it.
++                                        mName = name;
++                                        mEmail = email;
++                                        mStateBeforeSignIn = State.SIGNED_IN;
++                                        Log.i(TAG, "loaded: signed in, sign-in pending");
++                                    }
++                                }
++                                notifyObservers();
++                            });
++                });
++    }
++
++    @WorkerThread
++    private static @Nullable AuthState parse(String json) {
++        try {
++            AuthState auth = AuthState.jsonDeserialize(json);
++            return auth.getRefreshToken() == null ? null : auth;
++        } catch (JSONException | RuntimeException e) {
++            Log.i(TAG, "stored account unreadable: %s", e.getClass().getSimpleName());
++            return null;
++        }
++    }
++
++    @WorkerThread
++    private AuthStateStore store() {
++        if (mStore == null) mStore = mStoreFactory.get();
++        return mStore;
++    }
++
++    // ---- Helpers -----------------------------------------------------------------------------
++
++    @MainThread
++    private void setState(State state) {
++        if (mState == state) {
++            notifyObservers();
++            return;
++        }
++        mState = state;
++        Log.i(TAG, "state %s", state);
++        notifyObservers();
++    }
++
++    @MainThread
++    private void notifyObservers() {
++        for (Runnable observer : mObservers) observer.run();
++    }
++
++    private String newAuthToken() {
++        byte[] bytes = new byte[16];
++        mRandom.nextBytes(bytes);
++        return Base64.encodeToString(bytes, Base64.URL_SAFE | Base64.NO_PADDING | Base64.NO_WRAP);
++    }
++
++    /** An exception's type for the log: AppAuth's type and code, never its description. */
++    private static String errorType(@Nullable Exception e) {
++        if (e instanceof AuthorizationException ae) return "appauth " + ae.type + "/" + ae.code;
++        return e == null ? "none" : e.getClass().getSimpleName();
++    }
++}
+diff --color '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAuthActivity.java b/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAuthActivity.java
+--- a/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAuthActivity.java	1970-01-01 05:30:00.000000000 +0530
++++ b/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAuthActivity.java	2026-10-26 12:05:40.946665903 +0530
+@@ -0,0 +1,85 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++package org.chromium.chrome.browser.tark.zynclave;
++
++import android.app.Activity;
++import android.content.ActivityNotFoundException;
++import android.content.Context;
++import android.content.Intent;
++import android.os.Bundle;
++
++import net.openid.appauth.AuthorizationException;
++import net.openid.appauth.AuthorizationResponse;
++
++import org.chromium.base.IntentUtils;
++import org.chromium.build.annotations.NullMarked;
++import org.chromium.build.annotations.Nullable;
++
++/**
++ * Tark: a translucent, non-exported activity that opens AppAuth's sign-in intent (its
++ * AuthorizationManagementActivity, which opens Tark's Custom Tab) for a result, and hands that
++ * result to {@link ZynclaveAccount}. It finishes as soon as the result is in; the account goes
++ * on without it.
++ */
++@NullMarked
++public class ZynclaveAuthActivity extends Activity {
++    private static final String EXTRA_AUTH_INTENT =
++            "org.chromium.chrome.browser.tark.zynclave.AUTH_INTENT";
++    private static final int REQUEST_AUTH = 1;
++
++    static Intent createIntent(Context context, Intent authIntent) {
++        return new Intent(context, ZynclaveAuthActivity.class)
++                .putExtra(EXTRA_AUTH_INTENT, authIntent);
++    }
++
++    @Override
++    protected void onCreate(@Nullable Bundle savedInstanceState) {
++        super.onCreate(savedInstanceState);
++        // Recreated (e.g. rotated) while AppAuth is open: its result still comes here.
++        if (savedInstanceState != null) return;
++        Intent authIntent = IntentUtils.safeGetParcelableExtra(getIntent(), EXTRA_AUTH_INTENT);
++        if (authIntent == null) {
++            deliver(null, null);
++            return;
++        }
++        try {
++            startActivityForResult(authIntent, REQUEST_AUTH);
++        } catch (ActivityNotFoundException e) {
++            deliver(
++                    null,
++                    AuthorizationException.fromTemplate(
++                            AuthorizationException.GeneralErrors.PROGRAM_CANCELED_AUTH_FLOW,
++                            null));
++        }
++    }
++
++    @Override
++    protected void onActivityResult(int requestCode, int resultCode, @Nullable Intent data) {
++        super.onActivityResult(requestCode, resultCode, data);
++        if (requestCode != REQUEST_AUTH) return;
++        AuthorizationResponse response = null;
++        AuthorizationException exception = null;
++        if (data != null) {
++            try {
++                response = AuthorizationResponse.fromIntent(data);
++                exception = AuthorizationException.fromIntent(data);
++            } catch (IllegalArgumentException e) {
++                exception =
++                        AuthorizationException.fromTemplate(
++                                AuthorizationException.GeneralErrors.JSON_DESERIALIZATION_ERROR,
++                                null);
++            }
++        }
++        if (response != null) exception = null;
++        // No data at all means the person backed out.
++        deliver(response, exception);
++    }
++
++    private void deliver(
++            @Nullable AuthorizationResponse response, @Nullable AuthorizationException exception) {
++        ZynclaveAccount.get().onAuthorizationResult(this, response, exception);
++        finish();
++    }
++}
+diff --color '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAuthFlow.java b/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAuthFlow.java
+--- a/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAuthFlow.java	1970-01-01 05:30:00.000000000 +0530
++++ b/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAuthFlow.java	2026-10-26 12:05:40.940144979 +0530
+@@ -0,0 +1,330 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++package org.chromium.chrome.browser.tark.zynclave;
++
++import android.app.Activity;
++import android.content.ActivityNotFoundException;
++import android.content.Context;
++import android.content.Intent;
++import android.net.Uri;
++
++import androidx.annotation.MainThread;
++import androidx.annotation.WorkerThread;
++import androidx.browser.customtabs.CustomTabsIntent;
++
++import net.openid.appauth.AppAuthConfiguration;
++import net.openid.appauth.AuthorizationException;
++import net.openid.appauth.AuthorizationRequest;
++import net.openid.appauth.AuthorizationService;
++import net.openid.appauth.AuthorizationServiceConfiguration;
++import net.openid.appauth.AuthorizationServiceDiscovery;
++import net.openid.appauth.NoClientAuthentication;
++import net.openid.appauth.ResponseTypeValues;
++import net.openid.appauth.TokenRequest;
++import net.openid.appauth.TokenResponse;
++import net.openid.appauth.connectivity.ConnectionBuilder;
++import net.openid.appauth.connectivity.DefaultConnectionBuilder;
++
++import org.json.JSONException;
++import org.json.JSONObject;
++
++import org.chromium.base.ContextUtils;
++import org.chromium.base.ThreadUtils;
++import org.chromium.build.annotations.NullMarked;
++import org.chromium.build.annotations.Nullable;
++
++import java.io.ByteArrayOutputStream;
++import java.io.IOException;
++import java.io.InputStream;
++import java.io.OutputStream;
++import java.net.HttpURLConnection;
++import java.net.URLEncoder;
++import java.nio.charset.StandardCharsets;
++import java.util.concurrent.CountDownLatch;
++import java.util.concurrent.TimeUnit;
++import java.util.concurrent.atomic.AtomicReference;
++
++/**
++ * Tark: Sign in with Zynclave's authorization request (spec §5.3): the code flow with PKCE (S256,
++ * AppAuth's default code verifier), a random state and nonce (AppAuth's defaults), the scopes
++ * {@code openid profile email offline_access} and Tark's redirect.
++ */
++@NullMarked
++public final class ZynclaveAuthFlow {
++    private ZynclaveAuthFlow() {}
++
++    /**
++     * The authorization request for {@code cfg}'s client at {@code svc}. With {@code promptNone}
++     * it asks for {@code prompt=none}: no page is shown, and the request fails instead if the
++     * person would have to sign in or consent (see {@link #shouldRetryInteractive}).
++     */
++    public static AuthorizationRequest buildRequest(
++            ZynclaveConfig cfg, AuthorizationServiceConfiguration svc, boolean promptNone) {
++        AuthorizationRequest.Builder builder =
++                new AuthorizationRequest.Builder(
++                                svc, cfg.clientId(), ResponseTypeValues.CODE, cfg.redirectUri())
++                        .setScopes(
++                                AuthorizationRequest.Scope.OPENID,
++                                AuthorizationRequest.Scope.PROFILE,
++                                AuthorizationRequest.Scope.EMAIL,
++                                AuthorizationRequest.Scope.OFFLINE_ACCESS);
++        if (promptNone) builder.setPrompt(AuthorizationRequest.Prompt.NONE);
++        return builder.build();
++    }
++
++    /**
++     * Whether a failed {@code prompt=none} request should be asked again with the sign-in page:
++     * only when the authorization server said the person has to sign in, interact or consent. Any
++     * other failure (access denied, network, a state mismatch) is final.
++     */
++    public static boolean shouldRetryInteractive(@Nullable AuthorizationException ex) {
++        if (ex == null || ex.type != AuthorizationException.TYPE_OAUTH_AUTHORIZATION_ERROR) {
++            return false;
++        }
++        // OpenID Connect Core §3.1.2.6: the errors a prompt=none request ends with when the
++        // person must act. AppAuth maps them to OTHER and keeps the server's string.
++        String error = ex.error;
++        return "login_required".equals(error)
++                || "interaction_required".equals(error)
++                || "consent_required".equals(error);
++    }
++
++    /** AppAuth's settings for Tark: the only browser it may open is Tark itself (spec §5.3). */
++    static AppAuthConfiguration appAuthConfiguration(Context context) {
++        String self = context.getPackageName();
++        return new AppAuthConfiguration.Builder()
++                .setBrowserMatcher(descriptor -> self.equals(descriptor.packageName))
++                .setConnectionBuilder(DefaultConnectionBuilder.INSTANCE)
++                .build();
++    }
++
++    /**
++     * A Custom Tab in Tark itself (normal profile): never another browser, never a WebView. The
++     * sign-in tab also carries {@code authToken}, which the redirect handling checks.
++     */
++    static CustomTabsIntent tarkCustomTab(Context context, @Nullable String authToken) {
++        CustomTabsIntent tab = new CustomTabsIntent.Builder().build();
++        tab.intent.setPackage(context.getPackageName());
++        if (authToken != null) tab.intent.putExtra(ZynclaveAccount.EXTRA_AUTH_TOKEN, authToken);
++        return tab;
++    }
++
++    /**
++     * The real {@link ZynclaveAccount.Backend}: AppAuth, and HttpURLConnection through its
++     * {@link ConnectionBuilder} (HTTPS only, with timeouts).
++     */
++    static final class AppAuthBackend implements ZynclaveAccount.Backend {
++        /** Longer than the connection builder's connect and read timeouts together. */
++        private static final long TOKEN_WAIT_SECONDS = 60;
++
++        private static final int MAX_BODY_BYTES = 64 * 1024;
++
++        private final ConnectionBuilder mConnections = DefaultConnectionBuilder.INSTANCE;
++        // For token requests only: it matches no browser, so it binds no Custom Tab service.
++        private @Nullable AuthorizationService mTokenService;
++
++        @Override
++        @WorkerThread
++        public AuthorizationServiceConfiguration fetchConfig(Uri issuer) throws IOException {
++            Uri uri =
++                    issuer.buildUpon()
++                            .appendPath(".well-known")
++                            .appendPath("openid-configuration")
++                            .build();
++            HttpURLConnection connection = mConnections.openConnection(uri);
++            try {
++                connection.setRequestMethod("GET");
++                connection.setRequestProperty("Accept", "application/json");
++                String body = readBody(connection);
++                return new AuthorizationServiceConfiguration(
++                        new AuthorizationServiceDiscovery(new JSONObject(body)));
++            } catch (JSONException | AuthorizationServiceDiscovery.MissingArgumentException e) {
++                throw new IOException("bad discovery document");
++            } finally {
++                connection.disconnect();
++            }
++        }
++
++        @Override
++        @WorkerThread
++        public TokenResponse exchange(TokenRequest request) throws AuthorizationException {
++            return tokenRequest(request);
++        }
++
++        @Override
++        @WorkerThread
++        public TokenResponse refresh(TokenRequest request) throws AuthorizationException {
++            return tokenRequest(request);
++        }
++
++        /**
++         * AppAuth's token request (which checks the ID token's iss, aud, exp, iat and nonce),
++         * started on the UI thread as AppAuth expects; this thread waits for its answer.
++         */
++        @WorkerThread
++        private TokenResponse tokenRequest(TokenRequest request) throws AuthorizationException {
++            CountDownLatch done = new CountDownLatch(1);
++            AtomicReference<@Nullable TokenResponse> response = new AtomicReference<>();
++            AtomicReference<@Nullable AuthorizationException> error = new AtomicReference<>();
++            ThreadUtils.postOnUiThread(
++                    () -> {
++                        try {
++                            tokenService()
++                                    .performTokenRequest(
++                                            request,
++                                            NoClientAuthentication.INSTANCE,
++                                            (tokens, ex) -> {
++                                                response.set(tokens);
++                                                error.set(ex);
++                                                done.countDown();
++                                            });
++                        } catch (RuntimeException e) {
++                            error.set(
++                                    AuthorizationException.fromTemplate(
++                                            AuthorizationException.GeneralErrors.NETWORK_ERROR,
++                                            null));
++                            done.countDown();
++                        }
++                    });
++            try {
++                if (!done.await(TOKEN_WAIT_SECONDS, TimeUnit.SECONDS)) {
++                    throw AuthorizationException.fromTemplate(
++                            AuthorizationException.GeneralErrors.NETWORK_ERROR, null);
++                }
++            } catch (InterruptedException e) {
++                Thread.currentThread().interrupt();
++                throw AuthorizationException.fromTemplate(
++                        AuthorizationException.GeneralErrors.NETWORK_ERROR, null);
++            }
++            TokenResponse tokens = response.get();
++            if (tokens != null) return tokens;
++            AuthorizationException ex = error.get();
++            throw ex != null
++                    ? ex
++                    : AuthorizationException.fromTemplate(
++                            AuthorizationException.GeneralErrors.SERVER_ERROR, null);
++        }
++
++        @MainThread
++        private AuthorizationService tokenService() {
++            if (mTokenService == null) {
++                mTokenService =
++                        new AuthorizationService(
++                                ContextUtils.getApplicationContext(),
++                                new AppAuthConfiguration.Builder()
++                                        .setBrowserMatcher(descriptor -> false)
++                                        .setConnectionBuilder(mConnections)
++                                        .build());
++            }
++            return mTokenService;
++        }
++
++        @Override
++        @WorkerThread
++        public ZynclaveAccount.Profile userinfo(Uri endpoint, String accessToken)
++                throws IOException {
++            HttpURLConnection connection = mConnections.openConnection(endpoint);
++            try {
++                connection.setRequestMethod("GET");
++                connection.setRequestProperty("Accept", "application/json");
++                connection.setRequestProperty("Authorization", "Bearer " + accessToken);
++                JSONObject json = new JSONObject(readBody(connection));
++                return new ZynclaveAccount.Profile(
++                        optNonEmpty(json, "name"), optNonEmpty(json, "email"));
++            } catch (JSONException e) {
++                throw new IOException("bad userinfo");
++            } finally {
++                connection.disconnect();
++            }
++        }
++
++        @Override
++        @WorkerThread
++        public void revoke(Uri endpoint, String clientId, String refreshToken)
++                throws IOException {
++            byte[] form =
++                    ("token="
++                                    + URLEncoder.encode(refreshToken, "UTF-8")
++                                    + "&token_type_hint=refresh_token"
++                                    + "&client_id="
++                                    + URLEncoder.encode(clientId, "UTF-8"))
++                            .getBytes(StandardCharsets.UTF_8);
++            HttpURLConnection connection = mConnections.openConnection(endpoint);
++            try {
++                connection.setRequestMethod("POST");
++                connection.setDoOutput(true);
++                connection.setRequestProperty(
++                        "Content-Type", "application/x-www-form-urlencoded");
++                connection.setFixedLengthStreamingMode(form.length);
++                try (OutputStream out = connection.getOutputStream()) {
++                    out.write(form);
++                }
++                int code = connection.getResponseCode();
++                if (code != HttpURLConnection.HTTP_OK) throw new IOException("revoke " + code);
++            } finally {
++                connection.disconnect();
++            }
++        }
++
++        @Override
++        @MainThread
++        public boolean authorize(
++                Activity activity, AuthorizationRequest request, String authToken) {
++            AuthorizationService service =
++                    new AuthorizationService(activity, appAuthConfiguration(activity));
++            Intent authIntent;
++            try {
++                authIntent =
++                        service.getAuthorizationRequestIntent(
++                                request, tarkCustomTab(activity, authToken));
++            } catch (ActivityNotFoundException e) {
++                return false;
++            } finally {
++                service.dispose();
++            }
++            activity.startActivity(ZynclaveAuthActivity.createIntent(activity, authIntent));
++            return true;
++        }
++
++        @Override
++        @MainThread
++        public void openCustomTab(@Nullable Activity activity, Uri uri) {
++            Context context =
++                    activity != null && !activity.isFinishing()
++                            ? activity
++                            : ContextUtils.getApplicationContext();
++            CustomTabsIntent tab = tarkCustomTab(context, null);
++            if (!(context instanceof Activity)) {
++                tab.intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
++            }
++            try {
++                tab.launchUrl(context, uri);
++            } catch (ActivityNotFoundException e) {
++                // Nothing to open it in; Tark is signed out all the same.
++            }
++        }
++
++        private static String readBody(HttpURLConnection connection) throws IOException {
++            int code = connection.getResponseCode();
++            if (code != HttpURLConnection.HTTP_OK) throw new IOException("http " + code);
++            try (InputStream in = connection.getInputStream()) {
++                ByteArrayOutputStream out = new ByteArrayOutputStream();
++                byte[] buffer = new byte[4096];
++                int n;
++                while ((n = in.read(buffer)) != -1) {
++                    out.write(buffer, 0, n);
++                    if (out.size() > MAX_BODY_BYTES) throw new IOException("too large");
++                }
++                return out.toString("UTF-8");
++            }
++        }
++
++        private static @Nullable String optNonEmpty(JSONObject json, String name) {
++            if (!json.has(name) || json.isNull(name)) return null;
++            String value = json.optString(name, "").trim();
++            return value.isEmpty() ? null : value;
++        }
++    }
++}
+diff --color '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveConfig.java b/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveConfig.java
+--- a/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveConfig.java	1970-01-01 05:30:00.000000000 +0530
++++ b/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveConfig.java	2026-10-26 12:05:40.911347641 +0530
+@@ -0,0 +1,80 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++package org.chromium.chrome.browser.tark.zynclave;
++
++import android.net.Uri;
++
++import androidx.annotation.VisibleForTesting;
++
++import org.chromium.build.annotations.NullMarked;
++
++/**
++ * Tark: the Zynclave Account that Sign in with Zynclave talks to (spec §5.1). Every published APK
++ * uses production; a test APK built with the GN arg tark_zynclave_staging uses staging. The values
++ * come from the generated TarkZynclaveBuildConfig, which holds one environment only.
++ */
++@NullMarked
++public final class ZynclaveConfig {
++    /** The redirect registered for both clients (scheme: Tark's package name). */
++    private static final String REDIRECT_URI = "com.gettarka.tarka:/oauth2redirect";
++
++    // The build's own environment only (TarkZynclaveBuildConfig.template): a production build has
++    // no staging values to choose.
++    private static final ZynclaveConfig BUILD =
++            new ZynclaveConfig(
++                    TarkZynclaveBuildConfig.STAGING,
++                    TarkZynclaveBuildConfig.ISSUER,
++                    TarkZynclaveBuildConfig.CLIENT_ID,
++                    TarkZynclaveBuildConfig.ACCOUNTS_HOST);
++
++    private final boolean mStaging;
++    private final Uri mIssuer;
++    private final String mClientId;
++    private final String mAccountsHost;
++    private final Uri mRedirectUri;
++
++    private ZynclaveConfig(boolean staging, String issuer, String clientId, String accountsHost) {
++        mStaging = staging;
++        mIssuer = Uri.parse(issuer);
++        mClientId = clientId;
++        mAccountsHost = accountsHost;
++        mRedirectUri = Uri.parse(REDIRECT_URI);
++    }
++
++    /** The build's environment. */
++    public static ZynclaveConfig get() {
++        return BUILD;
++    }
++
++    /** An environment with the test's own values; the build's real ones stay in {@link #get}. */
++    @VisibleForTesting
++    public static ZynclaveConfig forTesting(
++            boolean staging, String issuer, String clientId, String accountsHost) {
++        return new ZynclaveConfig(staging, issuer, clientId, accountsHost);
++    }
++
++    /** The OpenID Connect issuer (Hydra), with its trailing slash. */
++    public Uri issuer() {
++        return mIssuer;
++    }
++
++    /** Tark's public OAuth client (no secret: PKCE). */
++    public String clientId() {
++        return mClientId;
++    }
++
++    /** The host of the Zynclave Account web pages (handoff §2a). */
++    public String accountsHost() {
++        return mAccountsHost;
++    }
++
++    public Uri redirectUri() {
++        return mRedirectUri;
++    }
++
++    public boolean isStaging() {
++        return mStaging;
++    }
++}
+diff --color '--color=never' -ruN a/chrome/android/junit/BUILD.gn b/chrome/android/junit/BUILD.gn
+--- a/chrome/android/junit/BUILD.gn	2026-10-26 12:03:20.716389871 +0530
++++ b/chrome/android/junit/BUILD.gn	2026-10-26 12:03:20.769333723 +0530
+@@ -1423,6 +1423,22 @@
+     ]
+   }
+ 
++  # Tark: Sign in with Zynclave.
++  robolectric_library(
++      "chrome_junit_tests_org.chromium.chrome.browser.tark.zynclave") {
++    sources = [
++      "src/org/chromium/chrome/browser/tark/zynclave/AuthStateStoreTest.java",
++      "src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAuthFlowTest.java",
++      "src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAccountTest.java",
++      "src/org/chromium/chrome/browser/tark/zynclave/ZynclaveNoTokenLogsTest.java",
++    ]
++
++    deps = [
++      ":chrome_junit_tests_helper",
++      "//third_party/appauth:appauth_java",
++    ]
++  }
++
+   robolectric_library("chrome_junit_tests_org.chromium.chrome.browser.tasks") {
+     resources_package = "org.chromium.chrome.browser.tasks.tab_management"
+ 
+diff --color '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome/browser/tark/zynclave/AuthStateStoreTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/tark/zynclave/AuthStateStoreTest.java
+--- a/chrome/android/junit/src/org/chromium/chrome/browser/tark/zynclave/AuthStateStoreTest.java	1970-01-01 05:30:00.000000000 +0530
++++ b/chrome/android/junit/src/org/chromium/chrome/browser/tark/zynclave/AuthStateStoreTest.java	2026-10-26 12:05:40.892368375 +0530
+@@ -0,0 +1,179 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++package org.chromium.chrome.browser.tark.zynclave;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.assertNull;
++import static org.junit.Assert.assertTrue;
++
++import android.security.keystore.KeyPermanentlyInvalidatedException;
++
++import org.junit.Before;
++import org.junit.Rule;
++import org.junit.Test;
++import org.junit.rules.TemporaryFolder;
++import org.junit.runner.RunWith;
++import org.robolectric.annotation.Config;
++
++import org.chromium.base.test.BaseRobolectricTestRunner;
++import org.chromium.chrome.browser.tark.zynclave.AuthStateStore.KeyProvider;
++import org.chromium.chrome.browser.tark.zynclave.AuthStateStore.Stored;
++
++import java.io.File;
++import java.nio.charset.StandardCharsets;
++import java.nio.file.Files;
++import java.security.GeneralSecurityException;
++
++import javax.crypto.KeyGenerator;
++import javax.crypto.SecretKey;
++
++/** Tests for {@link AuthStateStore}, with a software key: Robolectric has no AndroidKeyStore. */
++@RunWith(BaseRobolectricTestRunner.class)
++@Config(manifest = Config.NONE)
++public class AuthStateStoreTest {
++    private static final String REFRESH_TOKEN = "rt-very-secret-refresh-token";
++    private static final String AUTH_JSON =
++            "{\"refreshToken\":\"" + REFRESH_TOKEN + "\",\"scope\":\"openid\"}";
++
++    /** An AES-256 key held in memory; counts the calls the store makes. */
++    private static class SoftwareKeys implements KeyProvider {
++        private SecretKey mKey;
++        int mDeleteCalls;
++
++        @Override
++        public SecretKey getOrCreate() throws GeneralSecurityException {
++            if (mKey == null) {
++                KeyGenerator generator = KeyGenerator.getInstance("AES");
++                generator.init(256);
++                mKey = generator.generateKey();
++            }
++            return mKey;
++        }
++
++        @Override
++        public void delete() {
++            mDeleteCalls++;
++            mKey = null;
++        }
++    }
++
++    @Rule public TemporaryFolder mTemp = new TemporaryFolder();
++
++    private File mDir;
++    private SoftwareKeys mKeys;
++    private AuthStateStore mStore;
++
++    @Before
++    public void setUp() {
++        mDir = new File(mTemp.getRoot(), "zynclave");
++        mKeys = new SoftwareKeys();
++        mStore = new AuthStateStore(mDir, mKeys);
++    }
++
++    private File accountFile() {
++        return new File(mDir, "account.bin");
++    }
++
++    @Test
++    public void testNothingStoredIsSignedOut() {
++        assertNull(mStore.read());
++        assertEquals(0, mKeys.mDeleteCalls);
++    }
++
++    @Test
++    public void testRoundTrip() throws Exception {
++        Stored saved = new Stored(AUTH_JSON, "Asha", "asha@example.com");
++        mStore.write(saved);
++        assertEquals(saved, mStore.read());
++
++        // A second store over the same file and key, as after a process restart.
++        assertEquals(saved, new AuthStateStore(mDir, mKeys).read());
++
++        Stored noProfile = new Stored(AUTH_JSON, null, null);
++        mStore.write(noProfile);
++        assertEquals(noProfile, mStore.read());
++        assertFalse(new File(mDir, "account.bin.tmp").exists());
++    }
++
++    @Test
++    public void testFileIsIvThenCiphertext() throws Exception {
++        mStore.write(new Stored(AUTH_JSON, null, null));
++        byte[] first = Files.readAllBytes(accountFile().toPath());
++        assertTrue(first.length > 12 + 16);
++        mStore.write(new Stored(AUTH_JSON, null, null));
++        byte[] second = Files.readAllBytes(accountFile().toPath());
++        // Same plaintext, different IV: the bytes differ.
++        assertFalse(java.util.Arrays.equals(first, second));
++    }
++
++    @Test
++    public void testUndecryptableIsSignedOut() throws Exception {
++        mStore.write(new Stored(AUTH_JSON, "Asha", "asha@example.com"));
++        byte[] bytes = Files.readAllBytes(accountFile().toPath());
++        bytes[bytes.length - 1] ^= 0x01;
++        Files.write(accountFile().toPath(), bytes);
++
++        assertNull(mStore.read());
++        assertFalse(accountFile().exists());
++        assertEquals(1, mKeys.mDeleteCalls);
++    }
++
++    @Test
++    public void testTruncatedFileIsSignedOut() throws Exception {
++        mStore.write(new Stored(AUTH_JSON, null, null));
++        Files.write(accountFile().toPath(), new byte[5]);
++
++        assertNull(mStore.read());
++        assertFalse(accountFile().exists());
++        assertEquals(1, mKeys.mDeleteCalls);
++    }
++
++    @Test
++    public void testKeyLostIsSignedOut() throws Exception {
++        mStore.write(new Stored(AUTH_JSON, "Asha", "asha@example.com"));
++        SoftwareKeys lost =
++                new SoftwareKeys() {
++                    @Override
++                    public SecretKey getOrCreate() throws GeneralSecurityException {
++                        throw new KeyPermanentlyInvalidatedException();
++                    }
++                };
++
++        assertNull(new AuthStateStore(mDir, lost).read());
++        assertFalse(accountFile().exists());
++        assertEquals(1, lost.mDeleteCalls);
++    }
++
++    @Test
++    public void testNewKeyCannotReadOldFile() throws Exception {
++        mStore.write(new Stored(AUTH_JSON, null, null));
++
++        assertNull(new AuthStateStore(mDir, new SoftwareKeys()).read());
++        assertFalse(accountFile().exists());
++    }
++
++    @Test
++    public void testNoPlaintextOnDisk() throws Exception {
++        mStore.write(new Stored(AUTH_JSON, "Asha", "asha@example.com"));
++        String onDisk =
++                new String(Files.readAllBytes(accountFile().toPath()), StandardCharsets.ISO_8859_1);
++
++        assertFalse(onDisk.contains(REFRESH_TOKEN));
++        assertFalse(onDisk.contains("Asha"));
++        assertFalse(onDisk.contains("asha@example.com"));
++        assertFalse(onDisk.contains("refreshToken"));
++    }
++
++    @Test
++    public void testClear() throws Exception {
++        mStore.write(new Stored(AUTH_JSON, "Asha", "asha@example.com"));
++        mStore.clear();
++
++        assertFalse(accountFile().exists());
++        assertNull(mStore.read());
++        mStore.clear();
++    }
++}
+diff --color '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAccountTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAccountTest.java
+--- a/chrome/android/junit/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAccountTest.java	1970-01-01 05:30:00.000000000 +0530
++++ b/chrome/android/junit/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAccountTest.java	2026-10-26 12:06:23.399241378 +0530
+@@ -0,0 +1,577 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++package org.chromium.chrome.browser.tark.zynclave;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.assertNotEquals;
++import static org.junit.Assert.assertNotNull;
++import static org.junit.Assert.assertNull;
++import static org.junit.Assert.assertTrue;
++
++import android.app.Activity;
++import android.net.Uri;
++
++import net.openid.appauth.AuthState;
++import net.openid.appauth.AuthorizationException;
++import net.openid.appauth.AuthorizationRequest;
++import net.openid.appauth.AuthorizationResponse;
++import net.openid.appauth.AuthorizationServiceConfiguration;
++import net.openid.appauth.AuthorizationServiceDiscovery;
++import net.openid.appauth.TokenRequest;
++import net.openid.appauth.TokenResponse;
++
++import org.json.JSONArray;
++import org.json.JSONObject;
++import org.junit.Before;
++import org.junit.Rule;
++import org.junit.Test;
++import org.junit.rules.TemporaryFolder;
++import org.junit.runner.RunWith;
++import org.robolectric.Robolectric;
++import org.robolectric.android.controller.ActivityController;
++import org.robolectric.annotation.Config;
++import org.robolectric.shadows.ShadowLooper;
++
++import org.chromium.base.test.BaseRobolectricTestRunner;
++import org.chromium.chrome.browser.tark.zynclave.AuthStateStore.KeyProvider;
++import org.chromium.chrome.browser.tark.zynclave.AuthStateStore.Stored;
++import org.chromium.chrome.browser.tark.zynclave.ZynclaveAccount.State;
++
++import java.io.File;
++import java.io.IOException;
++import java.security.GeneralSecurityException;
++import java.util.ArrayDeque;
++import java.util.ArrayList;
++import java.util.List;
++import java.util.concurrent.Executor;
++
++import javax.crypto.KeyGenerator;
++import javax.crypto.SecretKey;
++
++/** Tests for {@link ZynclaveAccount}, on a fake backend and a direct background executor. */
++@RunWith(BaseRobolectricTestRunner.class)
++@Config(manifest = Config.NONE)
++public class ZynclaveAccountTest {
++    static final String ISSUER = "https://auth.staging.zynclave.com/";
++    static final String USERINFO = "https://auth.staging.zynclave.com/userinfo";
++    static final String REVOKE = "https://auth.staging.zynclave.com/oauth2/revoke";
++    static final String END_SESSION = "https://auth.staging.zynclave.com/oauth2/sessions/logout";
++
++    /** An AES-256 key held in memory: Robolectric has no AndroidKeyStore. */
++    static class SoftwareKeys implements KeyProvider {
++        private SecretKey mKey;
++
++        @Override
++        public SecretKey getOrCreate() throws GeneralSecurityException {
++            if (mKey == null) {
++                KeyGenerator generator = KeyGenerator.getInstance("AES");
++                generator.init(256);
++                mKey = generator.generateKey();
++            }
++            return mKey;
++        }
++
++        @Override
++        public void delete() {
++            mKey = null;
++        }
++    }
++
++    /** A store that counts its reads. */
++    static class CountingStore extends AuthStateStore {
++        int mReads;
++
++        CountingStore(File dir) {
++            super(dir, new SoftwareKeys());
++        }
++
++        @Override
++        public synchronized Stored read() {
++            mReads++;
++            return super.read();
++        }
++    }
++
++    /** A Zynclave Account in memory: hands out tokens with the given values, counts calls. */
++    static class FakeBackend implements ZynclaveAccount.Backend {
++        String mCode = "CODE-1";
++        String mAccessToken = "AT-1";
++        String mRefreshToken = "RT-1";
++        String mIdToken = "IDT-1";
++        String mName = "Asha Rao";
++        String mEmail = "asha@example.com";
++
++        final List<AuthorizationRequest> mAuthorizeRequests = new ArrayList<>();
++        final List<String> mAuthTokens = new ArrayList<>();
++        final List<TokenRequest> mRefreshRequests = new ArrayList<>();
++        final List<String> mRevoked = new ArrayList<>();
++        final List<Uri> mOpened = new ArrayList<>();
++        int mFetchConfigCalls;
++        int mUserinfoCalls;
++        String mUserinfoToken;
++        Uri mUserinfoEndpoint;
++        boolean mAuthorizeSucceeds = true;
++        IOException mRevokeFails;
++        /** Refresh results, in order: a {@link Rotate} to answer or an exception to throw. */
++        final ArrayDeque<Object> mRefreshResults = new ArrayDeque<>();
++        /** Runs inside the next refresh, before it returns. */
++        Runnable mDuringRefresh;
++        /** What revoke saw in the store when it ran. */
++        Stored mStoredAtRevoke;
++        AuthStateStore mStore;
++
++        @Override
++        public AuthorizationServiceConfiguration fetchConfig(Uri issuer) throws IOException {
++            mFetchConfigCalls++;
++            try {
++                JSONObject doc =
++                        new JSONObject()
++                                .put("issuer", ISSUER)
++                                .put("authorization_endpoint", ISSUER + "oauth2/auth")
++                                .put("token_endpoint", ISSUER + "oauth2/token")
++                                .put("jwks_uri", ISSUER + ".well-known/jwks.json")
++                                .put("userinfo_endpoint", USERINFO)
++                                .put("revocation_endpoint", REVOKE)
++                                .put("end_session_endpoint", END_SESSION)
++                                .put("response_types_supported", new JSONArray().put("code"))
++                                .put("subject_types_supported", new JSONArray().put("public"))
++                                .put(
++                                        "id_token_signing_alg_values_supported",
++                                        new JSONArray().put("RS256"));
++                return new AuthorizationServiceConfiguration(
++                        new AuthorizationServiceDiscovery(doc));
++            } catch (Exception e) {
++                throw new AssertionError(e);
++            }
++        }
++
++        TokenResponse tokens(TokenRequest request, String accessToken, String refreshToken) {
++            return new TokenResponse.Builder(request)
++                    .setTokenType("Bearer")
++                    .setAccessToken(accessToken)
++                    .setRefreshToken(refreshToken)
++                    .setIdToken(mIdToken)
++                    // Already expired: the next freshTokens refreshes.
++                    .setAccessTokenExpirationTime(System.currentTimeMillis() - 3_600_000L)
++                    .build();
++        }
++
++        @Override
++        public TokenResponse exchange(TokenRequest request) {
++            assertEquals(mCode, request.authorizationCode);
++            return tokens(request, mAccessToken, mRefreshToken);
++        }
++
++        @Override
++        public TokenResponse refresh(TokenRequest request) throws AuthorizationException {
++            mRefreshRequests.add(request);
++            if (mDuringRefresh != null) {
++                Runnable during = mDuringRefresh;
++                mDuringRefresh = null;
++                during.run();
++            }
++            Object result = mRefreshResults.poll();
++            if (result instanceof AuthorizationException e) throw e;
++            if (result instanceof Rotate r) return tokens(request, r.accessToken, r.refreshToken);
++            throw new AssertionError("unexpected refresh");
++        }
++
++        @Override
++        public ZynclaveAccount.Profile userinfo(Uri endpoint, String accessToken) {
++            mUserinfoCalls++;
++            mUserinfoEndpoint = endpoint;
++            mUserinfoToken = accessToken;
++            return new ZynclaveAccount.Profile(mName, mEmail);
++        }
++
++        @Override
++        public void revoke(Uri endpoint, String clientId, String refreshToken)
++                throws IOException {
++            assertEquals(REVOKE, endpoint.toString());
++            mRevoked.add(clientId + " " + refreshToken);
++            if (mStore != null) mStoredAtRevoke = mStore.read();
++            if (mRevokeFails != null) throw mRevokeFails;
++        }
++
++        @Override
++        public boolean authorize(
++                Activity activity, AuthorizationRequest request, String authToken) {
++            mAuthorizeRequests.add(request);
++            mAuthTokens.add(authToken);
++            return mAuthorizeSucceeds;
++        }
++
++        @Override
++        public void openCustomTab(Activity activity, Uri uri) {
++            mOpened.add(uri);
++        }
++
++        AuthorizationRequest lastRequest() {
++            return mAuthorizeRequests.get(mAuthorizeRequests.size() - 1);
++        }
++
++        AuthorizationResponse successFor(AuthorizationRequest request) {
++            return new AuthorizationResponse.Builder(request)
++                    .setAuthorizationCode(mCode)
++                    .setState(request.state)
++                    .build();
++        }
++    }
++
++    /** A refresh's answer: new tokens, the refresh token rotated. */
++    static final class Rotate {
++        final String accessToken;
++        final String refreshToken;
++
++        Rotate(String accessToken, String refreshToken) {
++            this.accessToken = accessToken;
++            this.refreshToken = refreshToken;
++        }
++    }
++
++    static final Executor DIRECT = Runnable::run;
++
++    @Rule public TemporaryFolder mTemp = new TemporaryFolder();
++
++    private FakeBackend mBackend;
++    private CountingStore mStore;
++    private ZynclaveAccount mAccount;
++    private Activity mActivity;
++    private int mFailures;
++
++    @Before
++    public void setUp() {
++        mBackend = new FakeBackend();
++        mStore = new CountingStore(new File(mTemp.getRoot(), "zynclave"));
++        mBackend.mStore = mStore;
++        mAccount = ZynclaveAccount.forTesting(mBackend, mStore, DIRECT);
++        mAccount.addSignInFailureObserver(() -> mFailures++);
++        mActivity = Robolectric.buildActivity(Activity.class).setup().get();
++    }
++
++    private void signIn() {
++        mAccount.signIn(mActivity, false);
++        ShadowLooper.idleMainLooper();
++        AuthorizationRequest request = mBackend.lastRequest();
++        mAccount.onAuthorizationResult(mActivity, mBackend.successFor(request), null);
++        ShadowLooper.idleMainLooper();
++        assertEquals(State.SIGNED_IN, mAccount.state());
++    }
++
++    private String[] freshToken() {
++        String[] result = {"not called"};
++        mAccount.freshTokens(token -> result[0] = token);
++        ShadowLooper.idleMainLooper();
++        return result;
++    }
++
++    @Test
++    public void testSignInStoresAndFetchesUserinfo() {
++        mAccount.signIn(mActivity, false);
++        ShadowLooper.idleMainLooper();
++        assertEquals(State.SIGNING_IN, mAccount.state());
++        assertEquals(1, mBackend.mAuthorizeRequests.size());
++        String authToken = mBackend.mAuthTokens.get(0);
++        assertEquals(authToken, mAccount.pendingAuthToken());
++        assertNull(mBackend.lastRequest().prompt);
++
++        AuthorizationRequest request = mBackend.lastRequest();
++        mAccount.onAuthorizationResult(mActivity, mBackend.successFor(request), null);
++        ShadowLooper.idleMainLooper();
++
++        assertEquals(State.SIGNED_IN, mAccount.state());
++        assertNull(mAccount.pendingAuthToken());
++        assertEquals("Asha Rao", mAccount.name());
++        assertEquals("asha@example.com", mAccount.email());
++        assertEquals(1, mBackend.mUserinfoCalls);
++        assertEquals(USERINFO, mBackend.mUserinfoEndpoint.toString());
++        assertEquals("AT-1", mBackend.mUserinfoToken);
++        Stored stored = mStore.read();
++        assertNotNull(stored);
++        assertEquals("Asha Rao", stored.name());
++        assertEquals("asha@example.com", stored.email());
++        assertTrue(stored.authStateJson().contains("RT-1"));
++        assertEquals(0, mFailures);
++    }
++
++    @Test
++    public void testEachSignInHasANewAuthToken() {
++        mAccount.signIn(mActivity, false);
++        ShadowLooper.idleMainLooper();
++        mAccount.onAuthorizationResult(
++                mActivity, null, AuthorizationException.GeneralErrors.USER_CANCELED_AUTH_FLOW);
++        mAccount.signIn(mActivity, false);
++        ShadowLooper.idleMainLooper();
++        assertEquals(2, mBackend.mAuthTokens.size());
++        assertNotEquals(mBackend.mAuthTokens.get(0), mBackend.mAuthTokens.get(1));
++        assertTrue(mBackend.mAuthTokens.get(0).length() >= 20);
++    }
++
++    @Test
++    public void testCancelStaysSignedOutNoSnackbarLoop() {
++        mAccount.signIn(mActivity, false);
++        ShadowLooper.idleMainLooper();
++        mAccount.onAuthorizationResult(
++                mActivity, null, AuthorizationException.GeneralErrors.USER_CANCELED_AUTH_FLOW);
++        ShadowLooper.idleMainLooper();
++
++        assertEquals(State.SIGNED_OUT, mAccount.state());
++        assertEquals(0, mFailures);
++        assertEquals(1, mBackend.mAuthorizeRequests.size());
++        assertNull(mAccount.pendingAuthToken());
++        assertNull(mStore.read());
++    }
++
++    @Test
++    public void testPromptNoneFallsBackOnce() {
++        AuthorizationException loginRequired =
++                AuthorizationException.fromOAuthTemplate(
++                        AuthorizationException.AuthorizationRequestErrors.OTHER,
++                        "login_required",
++                        null,
++                        null);
++        mAccount.signIn(mActivity, true);
++        ShadowLooper.idleMainLooper();
++        assertEquals(1, mBackend.mAuthorizeRequests.size());
++        assertEquals("none", mBackend.lastRequest().prompt);
++
++        mAccount.onAuthorizationResult(mActivity, null, loginRequired);
++        ShadowLooper.idleMainLooper();
++        assertEquals(2, mBackend.mAuthorizeRequests.size());
++        assertNull(mBackend.lastRequest().prompt);
++        assertEquals(State.SIGNING_IN, mAccount.state());
++
++        mAccount.onAuthorizationResult(mActivity, null, loginRequired);
++        ShadowLooper.idleMainLooper();
++        assertEquals(2, mBackend.mAuthorizeRequests.size());
++        assertEquals(State.SIGNED_OUT, mAccount.state());
++        assertEquals(1, mFailures);
++    }
++
++    @Test
++    public void testNoCustomTabFailsOnce() {
++        mBackend.mAuthorizeSucceeds = false;
++        mAccount.signIn(mActivity, false);
++        ShadowLooper.idleMainLooper();
++        assertEquals(State.SIGNED_OUT, mAccount.state());
++        assertEquals(1, mFailures);
++        assertNull(mAccount.pendingAuthToken());
++    }
++
++    @Test
++    public void testFailedSignInRefetchesDiscovery() {
++        mAccount.signIn(mActivity, false);
++        ShadowLooper.idleMainLooper();
++        mAccount.onAuthorizationResult(
++                mActivity, null, AuthorizationException.AuthorizationRequestErrors.ACCESS_DENIED);
++        ShadowLooper.idleMainLooper();
++        assertEquals(1, mFailures);
++        mAccount.signIn(mActivity, false);
++        ShadowLooper.idleMainLooper();
++        assertEquals(2, mBackend.mFetchConfigCalls);
++    }
++
++    @Test
++    public void testRefreshRotationSaves() throws Exception {
++        signIn();
++        String before = mStore.read().authStateJson();
++        mBackend.mRefreshResults.add(new Rotate("AT-2", "RT-2"));
++        String[] token = freshToken();
++
++        assertEquals("AT-2", token[0]);
++        assertEquals(1, mBackend.mRefreshRequests.size());
++        assertEquals("RT-1", mBackend.mRefreshRequests.get(0).refreshToken);
++        String after = mStore.read().authStateJson();
++        assertNotEquals(before, after);
++        // The refresh token to use next is the rotated one (AppAuth keeps the old one only
++        // inside the last request).
++        assertEquals("RT-2", AuthState.jsonDeserialize(after).getRefreshToken());
++        assertEquals(State.SIGNED_IN, mAccount.state());
++    }
++
++    @Test
++    public void testInvalidGrantSignsOutNoRetry() {
++        signIn();
++        mBackend.mRefreshResults.add(AuthorizationException.TokenRequestErrors.INVALID_GRANT);
++        String[] token = freshToken();
++
++        assertNull(token[0]);
++        assertEquals(1, mBackend.mRefreshRequests.size());
++        assertEquals(State.NEEDS_SIGN_IN_AGAIN, mAccount.state());
++        assertEquals("Asha Rao", mAccount.name());
++        assertNull(mStore.read());
++
++        // Asking again doesn't refresh again: there is nothing left to refresh with.
++        assertNull(freshToken()[0]);
++        assertEquals(1, mBackend.mRefreshRequests.size());
++    }
++
++    @Test
++    public void testOfflineRefreshKeepsState() {
++        signIn();
++        String before = mStore.read().authStateJson();
++        mBackend.mRefreshResults.add(AuthorizationException.GeneralErrors.NETWORK_ERROR);
++        String[] token = freshToken();
++
++        assertNull(token[0]);
++        assertEquals(1, mBackend.mRefreshRequests.size());
++        assertEquals(State.SIGNED_IN, mAccount.state());
++        assertEquals(before, mStore.read().authStateJson());
++    }
++
++    @Test
++    public void testSignOutRevokesThenClears() {
++        signIn();
++        mAccount.signOut(false, null);
++        ShadowLooper.idleMainLooper();
++
++        assertEquals(1, mBackend.mRevoked.size());
++        assertEquals(ZynclaveConfig.get().clientId() + " RT-1", mBackend.mRevoked.get(0));
++        assertNotNull("revoked before the store was cleared", mBackend.mStoredAtRevoke);
++        assertNull(mStore.read());
++        assertEquals(State.SIGNED_OUT, mAccount.state());
++        assertNull(mAccount.name());
++        assertNull(mAccount.email());
++        assertTrue(mBackend.mOpened.isEmpty());
++    }
++
++    @Test
++    public void testSignOutEverywhereOpensEndSession() {
++        signIn();
++        mAccount.signOut(true, mActivity);
++        ShadowLooper.idleMainLooper();
++
++        assertEquals(1, mBackend.mRevoked.size());
++        assertEquals(1, mBackend.mOpened.size());
++        Uri uri = mBackend.mOpened.get(0);
++        assertEquals(END_SESSION, uri.buildUpon().clearQuery().build().toString());
++        // RP-initiated logout by client_id; no token in any URL (review ruling 2026-10-26).
++        assertEquals(ZynclaveConfig.get().clientId(), uri.getQueryParameter("client_id"));
++        assertNull(uri.getQueryParameter("id_token_hint"));
++        assertFalse(uri.toString().contains("IDT-1"));
++        assertNull(uri.getQueryParameter("post_logout_redirect_uri"));
++        assertNull(mStore.read());
++    }
++
++    @Test
++    public void testRevokeFailsStillSignedOut() {
++        signIn();
++        mBackend.mRevokeFails = new IOException("offline");
++        mAccount.signOut(false, null);
++        ShadowLooper.idleMainLooper();
++
++        assertEquals(1, mBackend.mRevoked.size());
++        assertNull(mStore.read());
++        assertEquals(State.SIGNED_OUT, mAccount.state());
++    }
++
++    @Test
++    public void testSignOutDuringRefreshStaysSignedOut() {
++        signIn();
++        // The person signs out while the refresh is on the network; its answer comes after.
++        mBackend.mDuringRefresh = () -> mAccount.signOut(false, null);
++        mBackend.mRefreshResults.add(new Rotate("AT-2", "RT-2"));
++        String[] token = freshToken();
++
++        assertNull(token[0]);
++        assertEquals(1, mBackend.mRefreshRequests.size());
++        assertNull(mStore.read());
++        assertEquals(State.SIGNED_OUT, mAccount.state());
++    }
++
++    @Test
++    public void testResultAfterActivityGoneStillStores() {
++        ActivityController<Activity> controller = Robolectric.buildActivity(Activity.class);
++        Activity activity = controller.setup().get();
++        mAccount.signIn(activity, false);
++        ShadowLooper.idleMainLooper();
++        AuthorizationRequest request = mBackend.lastRequest();
++        controller.pause().stop().destroy();
++
++        mAccount.onAuthorizationResult(null, mBackend.successFor(request), null);
++        ShadowLooper.idleMainLooper();
++
++        assertEquals(State.SIGNED_IN, mAccount.state());
++        assertNotNull(mStore.read());
++    }
++
++    @Test
++    public void testLoadNotOnUiThreadAtStartup() throws IOException {
++        // A signed-in account on disk.
++        CountingStore store = new CountingStore(new File(mTemp.getRoot(), "startup"));
++        store.write(new Stored(signedInJson(), "Asha Rao", null));
++        store.mReads = 0;
++        ArrayDeque<Runnable> bg = new ArrayDeque<>();
++        ZynclaveAccount account = ZynclaveAccount.forTesting(mBackend, store, bg::add);
++        int[] changes = {0};
++        account.addObserver(() -> changes[0]++);
++
++        assertEquals(0, store.mReads);
++        assertTrue(bg.isEmpty());
++
++        // The first question starts the read, on bg; until it's done the answer is signed out.
++        assertEquals(State.SIGNED_OUT, account.state());
++        assertEquals(0, store.mReads);
++        assertEquals(1, bg.size());
++
++        bg.poll().run();
++        assertEquals(1, store.mReads);
++        assertEquals(0, changes[0]);
++        ShadowLooper.idleMainLooper();
++        assertEquals(1, changes[0]);
++        assertEquals(State.SIGNED_IN, account.state());
++        assertEquals("Asha Rao", account.name());
++        assertTrue(bg.isEmpty());
++    }
++
++    @Test
++    public void testSignInBeforeLoadThenCancelRestoresSignedIn() throws IOException {
++        // A signed-in account on disk, not loaded yet: state() says signed out until it is.
++        CountingStore store = new CountingStore(new File(mTemp.getRoot(), "early"));
++        store.write(new Stored(signedInJson(), "Asha Rao", "asha@example.com"));
++        ArrayDeque<Runnable> bg = new ArrayDeque<>();
++        ZynclaveAccount account = ZynclaveAccount.forTesting(mBackend, store, bg::add);
++
++        // A tap before the load finished: the load and then the sign-in's discovery queue on bg.
++        account.signIn(mActivity, false);
++        assertEquals(State.SIGNING_IN, account.state());
++        while (!bg.isEmpty()) {
++            bg.poll().run();
++            ShadowLooper.idleMainLooper();
++        }
++        assertEquals(State.SIGNING_IN, account.state());
++
++        account.onAuthorizationResult(
++                mActivity, null, AuthorizationException.GeneralErrors.USER_CANCELED_AUTH_FLOW);
++        ShadowLooper.idleMainLooper();
++
++        // Back to the stored account, which still works.
++        assertEquals(State.SIGNED_IN, account.state());
++        assertEquals("Asha Rao", account.name());
++        assertEquals("asha@example.com", account.email());
++        assertNotNull(store.read());
++        // Its refresh token is live: a token request uses it.
++        mBackend.mRefreshResults.add(new Rotate("AT-2", "RT-2"));
++        String[] token = {"not called"};
++        account.freshTokens(t -> token[0] = t);
++        while (!bg.isEmpty()) bg.poll().run();
++        ShadowLooper.idleMainLooper();
++        assertEquals("AT-2", token[0]);
++        assertEquals("RT-1", mBackend.mRefreshRequests.get(0).refreshToken);
++    }
++
++    /** An AuthState's JSON as a sign-in leaves it, made through a throwaway account. */
++    private String signedInJson() {
++        CountingStore scratch = new CountingStore(new File(mTemp.getRoot(), "scratch"));
++        ZynclaveAccount account = ZynclaveAccount.forTesting(mBackend, scratch, DIRECT);
++        account.signIn(mActivity, false);
++        ShadowLooper.idleMainLooper();
++        account.onAuthorizationResult(
++                mActivity, mBackend.successFor(mBackend.lastRequest()), null);
++        ShadowLooper.idleMainLooper();
++        return scratch.read().authStateJson();
++    }
++}
+diff --color '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAuthFlowTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAuthFlowTest.java
+--- a/chrome/android/junit/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAuthFlowTest.java	1970-01-01 05:30:00.000000000 +0530
++++ b/chrome/android/junit/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAuthFlowTest.java	2026-10-26 12:05:40.905414347 +0530
+@@ -0,0 +1,137 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++package org.chromium.chrome.browser.tark.zynclave;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.assertNotEquals;
++import static org.junit.Assert.assertNotNull;
++import static org.junit.Assert.assertNull;
++import static org.junit.Assert.assertTrue;
++
++import android.net.Uri;
++
++import net.openid.appauth.AuthorizationException;
++import net.openid.appauth.AuthorizationException.AuthorizationRequestErrors;
++import net.openid.appauth.AuthorizationException.GeneralErrors;
++import net.openid.appauth.AuthorizationRequest;
++import net.openid.appauth.AuthorizationServiceConfiguration;
++
++import org.junit.Test;
++import org.junit.runner.RunWith;
++import org.robolectric.annotation.Config;
++
++import org.chromium.base.test.BaseRobolectricTestRunner;
++
++import java.util.Arrays;
++import java.util.HashSet;
++
++/** Tests for {@link ZynclaveAuthFlow}'s request and {@link ZynclaveConfig}'s environments. */
++@RunWith(BaseRobolectricTestRunner.class)
++@Config(manifest = Config.NONE)
++public class ZynclaveAuthFlowTest {
++    private static AuthorizationServiceConfiguration service(ZynclaveConfig cfg) {
++        return new AuthorizationServiceConfiguration(
++                cfg.issuer().buildUpon().appendPath("oauth2").appendPath("auth").build(),
++                cfg.issuer().buildUpon().appendPath("oauth2").appendPath("token").build());
++    }
++
++    private static AuthorizationException oauthError(String error) {
++        return AuthorizationException.fromOAuthTemplate(
++                AuthorizationRequestErrors.byString(error), error, null, null);
++    }
++
++    /** A test environment: made-up values, never a real client's. */
++    private static ZynclaveConfig testConfig(boolean staging) {
++        return ZynclaveConfig.forTesting(
++                staging,
++                "https://auth.example.test/",
++                "test-client-" + (staging ? "staging" : "production"),
++                "accounts.example.test");
++    }
++
++    @Test
++    public void testRequest() {
++        ZynclaveConfig cfg = testConfig(false);
++        assertFalse(cfg.isStaging());
++        assertEquals(Uri.parse("https://auth.example.test/"), cfg.issuer());
++        assertEquals("accounts.example.test", cfg.accountsHost());
++
++        AuthorizationRequest request =
++                ZynclaveAuthFlow.buildRequest(cfg, service(cfg), /* promptNone= */ false);
++        assertEquals("test-client-production", request.clientId);
++        assertEquals(Uri.parse("com.gettarka.tarka:/oauth2redirect"), request.redirectUri);
++        assertEquals("code", request.responseType);
++        assertEquals("openid profile email offline_access", request.scope);
++        assertEquals(
++                new HashSet<>(Arrays.asList("openid", "profile", "email", "offline_access")),
++                request.getScopeSet());
++        assertEquals("S256", request.codeVerifierChallengeMethod);
++        assertNotNull(request.codeVerifier);
++        assertNotNull(request.state);
++        assertNotNull(request.nonce);
++        assertNull(request.prompt);
++    }
++
++    @Test
++    public void testStagingConfigKeepsItsValues() {
++        ZynclaveConfig cfg = testConfig(true);
++        assertTrue(cfg.isStaging());
++        AuthorizationRequest request =
++                ZynclaveAuthFlow.buildRequest(cfg, service(cfg), /* promptNone= */ false);
++        assertEquals("test-client-staging", request.clientId);
++        assertEquals(Uri.parse("com.gettarka.tarka:/oauth2redirect"), request.redirectUri);
++    }
++
++    @Test
++    public void testBuildConfigIsOneEnvironment() {
++        // get() is the generated class's one environment; a production build has production's.
++        ZynclaveConfig cfg = ZynclaveConfig.get();
++        assertEquals(TarkZynclaveBuildConfig.STAGING, cfg.isStaging());
++        assertEquals(TarkZynclaveBuildConfig.CLIENT_ID, cfg.clientId());
++        assertEquals(Uri.parse(TarkZynclaveBuildConfig.ISSUER), cfg.issuer());
++        assertEquals(TarkZynclaveBuildConfig.ACCOUNTS_HOST, cfg.accountsHost());
++        if (!cfg.isStaging()) {
++            assertEquals(Uri.parse("https://auth.zynclave.com/"), cfg.issuer());
++            assertEquals("fa54f2e8-2dfe-4c73-8002-01caea05f849", cfg.clientId());
++            assertEquals("accounts.zynclave.com", cfg.accountsHost());
++        } else {
++            assertTrue(cfg.accountsHost().contains("staging"));
++        }
++    }
++
++    @Test
++    public void testEachRequestIsFresh() {
++        ZynclaveConfig cfg = testConfig(false);
++        AuthorizationRequest a = ZynclaveAuthFlow.buildRequest(cfg, service(cfg), false);
++        AuthorizationRequest b = ZynclaveAuthFlow.buildRequest(cfg, service(cfg), false);
++        assertNotEquals(a.state, b.state);
++        assertNotEquals(a.nonce, b.nonce);
++        assertNotEquals(a.codeVerifier, b.codeVerifier);
++    }
++
++    @Test
++    public void testPromptNone() {
++        ZynclaveConfig cfg = testConfig(false);
++        AuthorizationRequest request =
++                ZynclaveAuthFlow.buildRequest(cfg, service(cfg), /* promptNone= */ true);
++        assertEquals("none", request.prompt);
++        assertEquals("none", request.toUri().getQueryParameter("prompt"));
++    }
++
++    @Test
++    public void testRetryOnlyOnInteractionErrors() {
++        assertTrue(ZynclaveAuthFlow.shouldRetryInteractive(oauthError("login_required")));
++        assertTrue(ZynclaveAuthFlow.shouldRetryInteractive(oauthError("interaction_required")));
++        assertTrue(ZynclaveAuthFlow.shouldRetryInteractive(oauthError("consent_required")));
++
++        assertFalse(ZynclaveAuthFlow.shouldRetryInteractive(oauthError("access_denied")));
++        assertFalse(
++                ZynclaveAuthFlow.shouldRetryInteractive(AuthorizationRequestErrors.ACCESS_DENIED));
++        assertFalse(ZynclaveAuthFlow.shouldRetryInteractive(GeneralErrors.NETWORK_ERROR));
++        assertFalse(ZynclaveAuthFlow.shouldRetryInteractive(GeneralErrors.USER_CANCELED_AUTH_FLOW));
++        assertFalse(ZynclaveAuthFlow.shouldRetryInteractive(null));
++    }
++}
+diff --color '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveNoTokenLogsTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveNoTokenLogsTest.java
+--- a/chrome/android/junit/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveNoTokenLogsTest.java	1970-01-01 05:30:00.000000000 +0530
++++ b/chrome/android/junit/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveNoTokenLogsTest.java	2026-10-26 12:05:40.878063436 +0530
+@@ -0,0 +1,100 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++package org.chromium.chrome.browser.tark.zynclave;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.assertTrue;
++
++import android.app.Activity;
++
++import net.openid.appauth.AuthorizationException;
++
++import org.junit.Rule;
++import org.junit.Test;
++import org.junit.rules.TemporaryFolder;
++import org.junit.runner.RunWith;
++import org.robolectric.Robolectric;
++import org.robolectric.annotation.Config;
++import org.robolectric.shadows.ShadowLog;
++import org.robolectric.shadows.ShadowLooper;
++
++import org.chromium.base.test.BaseRobolectricTestRunner;
++import org.chromium.chrome.browser.tark.zynclave.ZynclaveAccount.State;
++import org.chromium.chrome.browser.tark.zynclave.ZynclaveAccountTest.CountingStore;
++import org.chromium.chrome.browser.tark.zynclave.ZynclaveAccountTest.FakeBackend;
++import org.chromium.chrome.browser.tark.zynclave.ZynclaveAccountTest.Rotate;
++
++import java.io.File;
++import java.io.IOException;
++import java.io.PrintWriter;
++import java.io.StringWriter;
++
++/** Sign-in, refresh and sign-out log nothing secret (spec §5.4). */
++@RunWith(BaseRobolectricTestRunner.class)
++@Config(manifest = Config.NONE)
++public class ZynclaveNoTokenLogsTest {
++    private static final String[] SECRETS = {
++        "RT-SECRET", "AT-SECRET", "CODE-SECRET", "IDT-SECRET", "SUB-SECRET"
++    };
++
++    @Rule public TemporaryFolder mTemp = new TemporaryFolder();
++
++    @Test
++    public void testNoSecretsInLogs() {
++        ShadowLog.clear();
++        FakeBackend backend = new FakeBackend();
++        backend.mCode = "CODE-SECRET";
++        backend.mAccessToken = "AT-SECRET";
++        backend.mRefreshToken = "RT-SECRET";
++        backend.mIdToken = "IDT-SECRET";
++        // userinfo's sub, as the name too: what the row shows may be logged by nothing either.
++        backend.mName = "SUB-SECRET";
++        CountingStore store = new CountingStore(new File(mTemp.getRoot(), "zynclave"));
++        backend.mStore = store;
++        ZynclaveAccount account =
++                ZynclaveAccount.forTesting(backend, store, ZynclaveAccountTest.DIRECT);
++        Activity activity = Robolectric.buildActivity(Activity.class).setup().get();
++
++        // Sign in.
++        account.signIn(activity, false);
++        ShadowLooper.idleMainLooper();
++        account.onAuthorizationResult(
++                activity, backend.successFor(backend.lastRequest()), null);
++        ShadowLooper.idleMainLooper();
++        assertEquals(State.SIGNED_IN, account.state());
++
++        // A refresh that rotates, one that fails offline, then sign out everywhere.
++        backend.mRefreshResults.add(new Rotate("AT-SECRET-2", "RT-SECRET-2"));
++        account.freshTokens(token -> {});
++        ShadowLooper.idleMainLooper();
++        backend.mRefreshResults.add(
++                AuthorizationException.GeneralErrors.NETWORK_ERROR);
++        account.freshTokens(token -> {});
++        ShadowLooper.idleMainLooper();
++        backend.mRevokeFails = new IOException("offline");
++        account.signOut(true, activity);
++        ShadowLooper.idleMainLooper();
++        assertEquals(State.SIGNED_OUT, account.state());
++        assertEquals(1, backend.mOpened.size());
++
++        boolean logged = false;
++        for (ShadowLog.LogItem item : ShadowLog.getLogs()) {
++            if (item.tag != null && item.tag.contains("TarkZynclave")) logged = true;
++            StringBuilder text = new StringBuilder().append(item.tag).append(' ').append(item.msg);
++            if (item.throwable != null) {
++                StringWriter trace = new StringWriter();
++                item.throwable.printStackTrace(new PrintWriter(trace));
++                text.append(' ').append(trace);
++            }
++            for (String secret : SECRETS) {
++                assertFalse(
++                        "log line has " + secret + " (level " + item.type + ")",
++                        text.toString().contains(secret));
++            }
++        }
++        assertTrue("the flow logged its state changes", logged);
++    }
++}
+diff --color '--color=never' -ruN a/chrome/browser/ui/android/strings/android_chrome_strings.grd b/chrome/browser/ui/android/strings/android_chrome_strings.grd
+--- a/chrome/browser/ui/android/strings/android_chrome_strings.grd	2026-10-26 12:03:20.709158193 +0530
++++ b/chrome/browser/ui/android/strings/android_chrome_strings.grd	2026-10-26 12:03:20.783598203 +0530
+@@ -1096,6 +1096,9 @@
+       <message name="IDS_TARK_CONNECTS_LISTS" desc="Tark: item in the list of services Tark connects to: the ad blocker's daily lists from Tark's site, with its host name.">
+         Tark's ad-blocking lists, once a day on Wi-Fi or every three days on mobile data (gettarka.com)
+       </message>
++      <message name="IDS_TARK_ZYNCLAVE_SIGN_IN_FAILED" desc="Tark: snackbar when Sign in with Zynclave failed (no connection, the Zynclave Account refused it, or Tark could not open its sign-in page). Not shown when the person closed the page.">
++        Couldn't sign in. Try again.
++      </message>
+       <message name="IDS_PASSWORD_MANAGER_SETTINGS_TITLE" desc="Title for the settings menu item leading to the Password Manager UI surface. This allows users to e.g. manage their saved passwords, toggle saving and auto-sign-in on/off, etc. [CHAR_LIMIT=32]">
+         Google Password Manager
+       </message>
+diff --color '--color=never' -ruN a/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb b/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb
+--- a/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb	2026-10-26 12:03:20.709945240 +0530
++++ b/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb	2026-10-26 12:03:20.791525762 +0530
+@@ -2208,4 +2208,5 @@
+ <translation id="5496611901216958278">यह <ph name="LANGUAGE"/> जैसा लगा</translation>
+ <translation id="2674490731131654801">अगली बार <ph name="LANGUAGE"/> इस्तेमाल करें</translation>
+ <translation id="2427661119626459258">यह <ph name="LANGUAGE"/> जैसा लगा। इस फ़ोन पर वॉइस सर्च के लिए <ph name="LANGUAGE_AGAIN"/> चाहिए।</translation>
++<translation id="8177895288802336498">साइन इन नहीं हो सका। फिर से कोशिश करें।</translation>
+ </translationbundle>
+\ No newline at end of file

@@ -29,6 +29,10 @@ SDK = pathlib.Path.home() / 'Library' / 'Android' / 'sdk'
 KEYSTORE = pathlib.Path.home() / '.config' / 'tark' / 'android-release.p12'
 PASSFILE = pathlib.Path.home() / '.config' / 'tark' / 'android-release.pass'
 ALIAS = 'tark'
+# The Zynclave staging OAuth client id (zynclave-account.patch). Only a test
+# APK (tark-build.sh --zynclave-staging) carries it; none may be released.
+STAGING_CLIENT_ID = b'1664a81e-6fe5-4eb9-9869-ca0c7a7a04c4'
+_DEX = re.compile(r'(?:base/dex/)?classes\d*\.dex')
 # The signature files of an old signer: jarsigner adds its own beside them.
 _VERSION_NAME = re.compile(r'\d+\.\d+\.\d+\.\d+-r\d{1,2}')
 _SIGNATURE = re.compile(r'^META-INF/([^/]+\.(SF|RSA|DSA|EC)|MANIFEST\.MF)$', re.IGNORECASE)
@@ -71,6 +75,14 @@ def _cert_sha256_of_keystore(keystore, passfile):
     return line.split(':', 1)[1].strip().replace(':', '').lower()
 
 
+def refuse_staging(path):
+    """A staging APK or bundle is never signed or published."""
+    with zipfile.ZipFile(path) as z:
+        for name in z.namelist():
+            if _DEX.fullmatch(name) and STAGING_CLIENT_ID in z.read(name):
+                raise ValueError(f'{path}: staging APK: not publishing')
+
+
 def sign_apk(apk_in, apk_out, keystore=KEYSTORE, passfile=PASSFILE):
     subprocess.run([_build_tool('apksigner'), 'sign', '--ks', str(keystore), '--ks-key-alias', ALIAS,
                     # PKCS12: the key's password is the store's. Given one file twice,
@@ -110,6 +122,8 @@ def sign_aab(aab_in, aab_out, keystore=KEYSTORE, passfile=PASSFILE):
 
 
 def release(apk, aab, outdir, keystore=KEYSTORE, passfile=PASSFILE):
+    refuse_staging(apk)
+    refuse_staging(aab)
     package, code, name = _badging(apk)
     if _bundle_badging(aab) != (package, code, name):
         raise ValueError(f'the APK and the bundle differ in package or version: {apk}, {aab}')
