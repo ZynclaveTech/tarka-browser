@@ -56,6 +56,11 @@ try {
     & "$repo\windows\ci\build_onnxruntime.ps1" -Out 'C:\ort-out' *>> $log
   }
   $env:TARK_ORT_DIR = 'C:\ort-out'
+  # WinSparkle without OpenSSL, Tark's updater (W2), likewise built once.
+  if (-not (Test-Path 'C:\winsparkle-out\WinSparkle.dll')) {
+    & "$repo\windows\ci\build_winsparkle.ps1" -Out 'C:\winsparkle-out' *>> $log
+  }
+  $env:TARK_WINSPARKLE_DIR = 'C:\winsparkle-out'
   Set-Location $work
   $vcvars = "$env:vs2022_install\VC\Auxiliary\Build\vcvars64.bat"
   $layered = 'python3 layered_build.py . --jobs 64'

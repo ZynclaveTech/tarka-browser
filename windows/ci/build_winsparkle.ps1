@@ -21,15 +21,20 @@ $Version = '0.9.4'
 $Sha256 = 'CD77040F828DCE0ADCF8F0205F776238197DEB24F5108BF01A3E5623B703A3B9'
 
 function Find-VsTool([string]$Pattern) {
-  $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
+  $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -products * -latest -property installationPath
   $tool = Get-ChildItem "$vs\$Pattern" | Select-Object -First 1
   if (-not $tool) { throw "$Pattern not found" }
   $tool.FullName
 }
 
 if (-not $CheckOnly) {
+  # git, nuget and MSBuild write progress to stderr, which Windows PowerShell
+  # turns into errors when a job redirects it (*>>); their exit codes are checked.
+  $ErrorActionPreference = 'Continue'
   $src = 'C:\winsparkle-src'
-  $zip = "$env:RUNNER_TEMP\WinSparkle-$Version-src.zip"
+  if (Test-Path $src) { Remove-Item -Recurse -Force $src }
+  $temp = if ($env:RUNNER_TEMP) { $env:RUNNER_TEMP } else { $env:TEMP }
+  $zip = "$temp\WinSparkle-$Version-src.zip"
   Invoke-WebRequest -UseBasicParsing -OutFile $zip `
     -Uri "https://github.com/vslavik/winsparkle/releases/download/v$Version/WinSparkle-$Version-src.zip"
   if ((Get-FileHash $zip -Algorithm SHA256).Hash -ne $Sha256) { throw "WinSparkle-$Version-src.zip has the wrong SHA-256" }
@@ -49,12 +54,19 @@ if (-not $CheckOnly) {
 
   # Gettext.Tools (the translations) and the WebView2 SDK (release notes),
   # at the versions packages.config pins.
-  nuget restore "$src\WinSparkle.sln" -PackagesDirectory "$src\packages" -NonInteractive
+  # GitHub's runners have nuget; Tark's build machine fetches it.
+  $nuget = (Get-Command nuget -ErrorAction SilentlyContinue).Source
+  if (-not $nuget) {
+    $nuget = "$temp\nuget.exe"
+    Invoke-WebRequest -UseBasicParsing -OutFile $nuget -Uri 'https://dist.nuget.org/win-x86-commandline/latest/nuget.exe'
+  }
+  & $nuget restore "$src\WinSparkle.sln" -PackagesDirectory "$src\packages" -NonInteractive
   if ($LASTEXITCODE) { throw 'nuget restore failed' }
 
   $msbuild = Find-VsTool 'MSBuild\Current\Bin\amd64\MSBuild.exe'
   & $msbuild $proj /m /nologo /v:minimal /p:Configuration=Release /p:Platform=x64
   if ($LASTEXITCODE) { throw 'WinSparkle build failed' }
+  $ErrorActionPreference = 'Stop'
 
   New-Item -ItemType Directory -Force "$Out\include" | Out-Null
   Copy-Item "$src\x64\Release\WinSparkle.dll" $Out
