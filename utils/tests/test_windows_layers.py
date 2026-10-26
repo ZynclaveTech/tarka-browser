@@ -103,19 +103,18 @@ class TestPlan(unittest.TestCase):
         (self.work / 'patches/ungoogled-chromium/windows/w.patch').write_text('windows w, changed\n')
         self.runner.steps.clear()
         steps = self.build()
-        self.assertEqual(steps[0], 'wipe')
-        self.assertEqual(steps[1:3], ['build.py:base', 'copy-base'])
+        self.assertEqual(steps[:5], ['stash-out', 'wipe', 'build.py:base', 'copy-base', 'restore-out'])
 
     def test_a_missing_base_copy_starts_again(self):
         self.build()
         self.runner.steps.clear()
-        self.assertEqual(self.build()[:3], ['wipe', 'build.py:base', 'copy-base'])
+        self.assertEqual(self.build()[:5], ['stash-out', 'wipe', 'build.py:base', 'copy-base', 'restore-out'])
 
     def test_a_tree_without_a_stamp_starts_again(self):
         # A run cut short after the base (or before it was copied) leaves a
         # tree but no stamp: it is wiped, never patched twice.
         (self.work / 'build' / 'src').mkdir(parents=True)
-        self.assertEqual(self.build()[:3], ['wipe', 'build.py:base', 'copy-base'])
+        self.assertEqual(self.build()[:5], ['stash-out', 'wipe', 'build.py:base', 'copy-base', 'restore-out'])
 
     def test_the_base_copy_keeps_links_as_links(self):
         # Chromium's tree has symbolic links; robocopy follows them without
@@ -128,7 +127,9 @@ class TestPlan(unittest.TestCase):
         self.build()
         (self.work / 'build' / 'src-base').mkdir(parents=True, exist_ok=True)
         self.runner.steps.clear()
+        # --fresh means from nothing: out goes too.
         self.assertEqual(self.build(fresh=True)[:3], ['wipe', 'build.py:base', 'copy-base'])
+        self.assertNotIn('restore-out', self.runner.steps)
 
     def test_patch_only_stops_before_gn(self):
         steps = self.build(patch_only=True)
@@ -141,6 +142,34 @@ class TestPlan(unittest.TestCase):
         backup.write_text('old')
         self.build()
         self.assertFalse(backup.exists())
+
+
+class TestKeepOut(unittest.TestCase):
+    """A new base keeps out/: ninja then recompiles only what the new base
+    and the layer changed (the tarball's files keep its times)."""
+
+    def test_out_survives_a_new_base(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            work = make_work(tmp)
+            obj = work / 'build' / 'src' / 'out' / 'Default' / 'a.obj'
+            obj.parent.mkdir(parents=True)
+            obj.write_text('object')
+            run = layered_build._system_runner(work, 1)
+            run('stash-out')
+            run('wipe')
+            # The base's own gn output, which the kept out replaces.
+            fresh = work / 'build' / 'src' / 'out' / 'Default' / 'build.ninja'
+            fresh.parent.mkdir(parents=True)
+            fresh.write_text('new')
+            run('restore-out')
+            self.assertEqual(obj.read_text(), 'object')
+            self.assertFalse(fresh.exists())
+            self.assertFalse((work / 'build' / 'out-keep').exists())
+
+    def test_restore_without_a_stash_is_a_no_op(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            work = make_work(tmp)
+            layered_build._system_runner(work, 1)('restore-out')
 
 
 class TestWipe(unittest.TestCase):

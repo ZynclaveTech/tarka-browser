@@ -16,7 +16,9 @@ back the base wherever the last layer changed it, build.py applies the layer
 (TARK_PHASE=layer), and every file that comes out as the last build had it
 keeps that build's time. build/src/out is kept, so ninja (build.py with
 TARK_PHASE=build) rebuilds only what the layer changed. A different base
-(or --fresh) wipes the tree, its copy and out, and starts again.
+wipes the tree and its copy and makes them again, but keeps out: the
+tarball's files keep its times, so ninja recompiles only what the new base
+and the layer changed. --fresh wipes out too.
 """
 
 import argparse
@@ -87,6 +89,7 @@ def _system_runner(work, jobs):
     layers = repo / 'android' / 'layers.py'
     src, base = work / 'build' / 'src', work / 'build' / 'src-base'
     record = work / 'build' / 'layers.json'
+    keep = work / 'build' / 'out-keep'
 
     def run(step, env=None):
         print(f'tark: {step} {(env or {}).get("TARK_PHASE", "")}'.rstrip(), flush=True)
@@ -101,6 +104,14 @@ def _system_runner(work, jobs):
                 raise subprocess.CalledProcessError(code, 'robocopy')
         elif step in ('reset', 'settle'):
             subprocess.run([sys.executable, str(layers), step, str(base), str(src), str(record)], check=True)
+        elif step == 'stash-out':
+            if (src / 'out').is_dir() and not keep.exists():
+                (src / 'out').rename(keep)
+        elif step == 'restore-out':
+            if keep.is_dir():
+                if (src / 'out').exists():
+                    _rmtree(src / 'out')
+                keep.rename(src / 'out')
         elif step == 'wipe':
             for p in (src, base):
                 if p.exists():
@@ -125,11 +136,17 @@ def run(work, fresh=False, patch_only=False, jobs=64, runner=None):
     else:
         # Anything left from an earlier run (a tree patched by its layer, or
         # one cut short before its stamp) is never patched again.
-        if have is not None or fresh or (build / 'src').exists() or (build / 'src-base').exists():
+        wipe = have is not None or fresh or (build / 'src').exists() or (build / 'src-base').exists()
+        keep_out = wipe and not fresh
+        if keep_out:
+            runner('stash-out')
+        if wipe:
             runner('wipe')
         stamp.unlink(missing_ok=True)
         runner('build.py', env={'TARK_PHASE': 'base'})
         runner('copy-base')
+        if keep_out:
+            runner('restore-out')
         stamp.write_text(want + '\n')
     # The layer is applied again: an earlier run's name-substitution backup is
     # stale (name_substitution.py refuses to overwrite it).
