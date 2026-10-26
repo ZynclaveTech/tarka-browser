@@ -50,6 +50,17 @@ try {
   # The last build's packages, so only this build's are uploaded.
   Get-ChildItem "$work\build" -File -ErrorAction SilentlyContinue |
     Where-Object { $_.Extension -in '.zip', '.exe' } | Remove-Item -Force
+  # ONNX Runtime with the static C runtime for live captions (W2), built once
+  # and kept on the machine's disk.
+  if (-not (Test-Path 'C:\ort-out\lib\onnxruntime.dll')) {
+    & "$repo\windows\ci\build_onnxruntime.ps1" -Out 'C:\ort-out' *>> $log
+  }
+  $env:TARK_ORT_DIR = 'C:\ort-out'
+  # WinSparkle without OpenSSL, Tark's updater (W2), likewise built once.
+  if (-not (Test-Path 'C:\winsparkle-out\WinSparkle.dll')) {
+    & "$repo\windows\ci\build_winsparkle.ps1" -Out 'C:\winsparkle-out' *>> $log
+  }
+  $env:TARK_WINSPARKLE_DIR = 'C:\winsparkle-out'
   Set-Location $work
   $vcvars = "$env:vs2022_install\VC\Auxiliary\Build\vcvars64.bat"
   $layered = 'python3 layered_build.py . --jobs 64'

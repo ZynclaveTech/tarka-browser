@@ -1,0 +1,58 @@
+--- a/chrome/installer/mini_installer/chrome.release
++++ b/chrome/installer/mini_installer/chrome.release
+@@ -45,6 +45,7 @@
+ locales\*.pak: %(VersionDir)s\Locales
+ indicxlit\xlit-model.bin: %(VersionDir)s\indicxlit\
+ indicxlit\xlit-words.bin: %(VersionDir)s\indicxlit\
++onnxruntime.dll: %(VersionDir)s\
+ 
+ #
+ # VisualElements sub-dir.
+--- a/chrome/tools/build/win/FILES.cfg
++++ b/chrome/tools/build/win/FILES.cfg
+@@ -744,6 +744,11 @@
+     'filename': 'indicxlit/xlit-words.bin',
+     'buildtype': ['official'],
+   },
++  # Tark: ONNX Runtime, which runs the live caption models (D4, W2).
++  {
++    'filename': 'onnxruntime.dll',
++    'buildtype': ['official'],
++  },
+   # IWA Key Distribution files:
+   {
+     'filename': 'IwaKeyDistribution/iwa-key-distribution.pb',
+--- a/components/tark_captions/BUILD.gn
++++ b/components/tark_captions/BUILD.gn
+@@ -3,8 +3,9 @@
+ # found in the LICENSE file.
+ 
+ # Tark's live captions engine (D4): IndicConformer (AI4Bharat, MIT) and
+-# Silero VAD (MIT) on ONNX Runtime, which is loaded at run time with
+-# dlopen() from Tark.app/Contents/Frameworks (see downloads-onnxruntime.ini).
++# Silero VAD (MIT) on ONNX Runtime, which is loaded at run time: on the Mac
++# with dlopen() from Tark.app/Contents/Frameworks (downloads-onnxruntime.ini),
++# on Windows from onnxruntime.dll next to chrome.dll (W2).
+ # Runs in the speech recognition utility process.
+ 
+ import("//testing/test.gni")
+@@ -71,6 +72,19 @@
+     "//third_party/sentencepiece",
+     "//ui/gfx/geometry",
+   ]
++  if (is_win) {
++    data_deps = [ ":onnxruntime_dll" ]
++  }
++}
++
++if (is_win) {
++  # ONNX Runtime built from source with the static C runtime
++  # (windows/ci/build_onnxruntime.ps1), next to chrome.dll; FILES.cfg and
++  # chrome.release put it into the zip and the installer.
++  copy("onnxruntime_dll") {
++    sources = [ "//third_party/tark_onnxruntime/lib/onnxruntime.dll" ]
++    outputs = [ "$root_out_dir/onnxruntime.dll" ]
++  }
+ }
+ 
+ # Tests read ONNX Runtime, the models and the test clips from the paths in
