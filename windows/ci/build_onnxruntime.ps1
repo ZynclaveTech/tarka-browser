@@ -32,11 +32,11 @@ if (-not $CheckOnly) {
   # git and build.py write progress to stderr, which Windows PowerShell turns
   # into errors when the job redirects it (*>>); their exit codes are checked.
   $ErrorActionPreference = 'Continue'
-  # Visual Studio's own CMake, when none is on PATH.
-  if (-not (Get-Command cmake -ErrorAction SilentlyContinue)) {
-    $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
-    $env:Path = "$vs\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin;" + $env:Path
-  }
+  # Visual Studio's own CMake (the build machine has no other), named
+  # outright: build.py looks for 'cmake' on PATH otherwise.
+  $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
+  $cmake = "$vs\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe"
+  if (-not (Test-Path $cmake)) { throw "no CMake at $cmake" }
   # A run cut short leaves a partial clone and build behind; start clean.
   foreach ($d in $src, $build) {
     if (Test-Path $d) { Remove-Item -Recurse -Force $d }
@@ -68,7 +68,7 @@ if (-not $CheckOnly) {
 
   python "$src\tools\ci_build\build.py" --build_dir $build --config Release --build_shared_lib `
     --parallel --skip_tests --skip_submodule_sync --compile_no_warning_as_error `
-    --enable_msvc_static_runtime --no_telemetry --cmake_generator 'Visual Studio 17 2022' `
+    --enable_msvc_static_runtime --no_telemetry --cmake_path $cmake --cmake_generator 'Visual Studio 17 2022' `
     --cmake_extra_defines onnxruntime_BUILD_UNIT_TESTS=OFF
   if ($LASTEXITCODE) { throw 'onnxruntime build failed' }
   $ErrorActionPreference = 'Stop'
