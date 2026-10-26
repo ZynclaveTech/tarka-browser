@@ -130,6 +130,13 @@ MSG
   # Tark: IndicXlit weights and word lists for the address bar (D1).
   _install_xlit
 
+  # Tark: the ad blocker. adblock-rust's crates (pinned sha256) and its
+  # built-in list bundle, checked against Tark's list-signing key
+  # (utils/adblock_lists.py; TARK_LISTS_DIR stands in for gettarka.com).
+  python3 "$_root_dir/android/adblock/crates.py" "$_src_dir" --cache "$_download_cache/crates"
+  python3 "$_root_dir/utils/adblock_lists.py" "$_src_dir/chrome/browser/tark_adblock/lists.zip" \
+    ${TARK_LISTS_DIR:+--lists-dir "$TARK_LISTS_DIR"}
+
   _fix_esbuild
   cd "$_src_dir"
   ./tools/gn/bootstrap/bootstrap.py -o out/Default/gn --skip-generate-buildfiles

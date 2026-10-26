@@ -95,6 +95,13 @@ def main():
     unpack_zips(ini, src)
     run(py, REPO / 'utils' / 'ublock_key.py', src / 'third_party' / 'ublock' / 'manifest.json',
         REPO / 'resources' / 'ublock' / 'key.txt')
+    # The ad blocker: adblock-rust's crates (pinned sha256) and its built-in
+    # list bundle, checked against Tark's list-signing key
+    # (utils/adblock_lists.py; TARK_LISTS_DIR stands in for gettarka.com).
+    run(py, REPO / 'android' / 'adblock' / 'crates.py', src, '--cache', CACHE / 'crates')
+    lists_dir = os.environ.get('TARK_LISTS_DIR')
+    run(py, REPO / 'utils' / 'adblock_lists.py', src / 'chrome' / 'browser' / 'tark_adblock' / 'lists.zip',
+        *(['--lists-dir', lists_dir] if lists_dir else []))
     # IndicXlit weights and word lists (utils/install_xlit.sh, under bash).
     env = dict(os.environ, _root_dir=REPO.as_posix(), _src_dir=src.as_posix(),
                _main_repo=CORE.as_posix(), _download_cache=CACHE.as_posix())
