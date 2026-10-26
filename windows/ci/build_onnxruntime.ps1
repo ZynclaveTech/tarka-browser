@@ -37,6 +37,7 @@ if (-not $CheckOnly) {
   $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -products * -latest -property installationPath
   $cmake = "$vs\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe"
   if (-not (Test-Path $cmake)) { throw "no CMake at $cmake" }
+  $ctest = Join-Path (Split-Path $cmake) 'ctest.exe'
   # A run cut short leaves a partial clone and build behind; start clean.
   foreach ($d in $src, $build) {
     if (Test-Path $d) { Remove-Item -Recurse -Force $d }
@@ -68,7 +69,7 @@ if (-not $CheckOnly) {
 
   python "$src\tools\ci_build\build.py" --build_dir $build --config Release --build_shared_lib `
     --parallel --skip_tests --skip_submodule_sync --compile_no_warning_as_error `
-    --enable_msvc_static_runtime --no_telemetry --cmake_path $cmake --cmake_generator 'Visual Studio 17 2022' `
+    --enable_msvc_static_runtime --no_telemetry --cmake_path $cmake --ctest_path $ctest --cmake_generator 'Visual Studio 17 2022' `
     --cmake_extra_defines onnxruntime_BUILD_UNIT_TESTS=OFF
   if ($LASTEXITCODE) { throw 'onnxruntime build failed' }
   $ErrorActionPreference = 'Stop'
