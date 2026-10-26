@@ -175,6 +175,35 @@ class Browser:
         return None
 
 
+# Finds an element by id through every shadow root (Settings is web
+# components all the way down).
+DEEP_FIND = """(id => { const walk = root => { const e = root.getElementById ? root.getElementById(id) : null;
+  if (e) return e; for (const n of root.querySelectorAll('*')) { if (n.shadowRoot) { const f = walk(n.shadowRoot);
+  if (f) return f; } } return null; }; return walk(document); })"""
+
+
+def settings_tab(timeout=30):
+    end = time.time() + timeout
+    while time.time() < end:
+        tabs = json.load(urllib.request.urlopen(f'http://127.0.0.1:{DEVTOOLS_PORT}/json'))
+        tab = next((t for t in tabs if t.get('url', '').startswith('chrome://settings')), None)
+        if tab:
+            return tab['webSocketDebuggerUrl']
+        time.sleep(1)
+    raise RuntimeError('no Settings tab')
+
+
+def toggle_state(ws, element_id, timeout=30):
+    """The checked state of Settings' toggle ELEMENT_ID, once it shows."""
+    end = time.time() + timeout
+    while time.time() < end:
+        got = evaluate(ws, f"(() => {{ const e = {DEEP_FIND}('{element_id}'); return e ? e.checked : null; }})()")
+        if got is not None:
+            return got
+        time.sleep(1)
+    return None
+
+
 def allow_ads(host):
     """Preferences with 'Block ads on this site' off for HOST:PORT
     (ContentSettingsType::ADS, stored as "subresource-filter")."""
@@ -196,6 +225,31 @@ def check(browser, page, expected, host):
 
 
 def run_case(app, name):
+    if name == 'settings_toggle':
+        # Settings' "Block ads and trackers" is the global switch: on by
+        # default; off, the test ad loads at once (no restart); on again, it
+        # is blocked again.
+        b = Browser(app)
+        try:
+            if not b.wait_ready():
+                print('FAIL  settings_toggle: the engine was never ready', flush=True)
+                return 1
+            b.open('chrome://settings/privacy')
+            ws = settings_tab()
+            on = toggle_state(ws, 'tarkAdblockToggle')
+            failed = on is not True
+            print(f'{"ok  " if on is True else "FAIL"}  settings_toggle: on by default ({on})', flush=True)
+            if on is None:
+                return failed
+            evaluate(ws, f"{DEEP_FIND}('tarkAdblockToggle').click()")
+            time.sleep(1)
+            failed += check(b, 'net.html', {'blocked': 'loaded'}, '127.0.0.1')
+            evaluate(ws, f"{DEEP_FIND}('tarkAdblockToggle').click()")
+            time.sleep(1)
+            failed += check(b, 'net.html', {'blocked': 'failed'}, '127.0.0.1')
+            return failed
+        finally:
+            b.close()
     if name == 'failopen':
         # Before the engine is ready nothing is blocked and pages still load.
         b = Browser(app, ['--tark-adblock-delay-compile=60'])

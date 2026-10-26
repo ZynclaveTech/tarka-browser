@@ -1,0 +1,261 @@
+--- a/chrome/app/settings_strings.grdp
++++ b/chrome/app/settings_strings.grdp
+@@ -587,8 +587,8 @@
+     <message name="IDS_SETTINGS_TARK_BLOCK_ADS" desc="Label of the first Privacy settings toggle, which turns the built-in ad and tracker blocker on or off.">
+       Block ads and trackers
+     </message>
+-    <message name="IDS_SETTINGS_TARK_BLOCK_ADS_DESC" desc="Description under the Block ads and trackers toggle: which blocker does it.">
+-      uBlock Origin, built in
++    <message name="IDS_SETTINGS_TARK_BLOCK_ADS_DESC" desc="Description under the Block ads and trackers toggle: which blocker does it and where its lists come from.">
++      Tark's own blocker, built in, with lists from Tark
+     </message>
+     <message name="IDS_SETTINGS_TARK_CLEAR_DATA" desc="Label of the Privacy settings row that opens the dialog to delete history, cookies and cache.">
+       Clear history and site data
+@@ -713,8 +713,8 @@
+     <message name="IDS_SETTINGS_TARK_CONNECTS_STORE" desc="Item in the list of services Tark connects to: the extension store. $1 is a list of host names.">
+       The Chrome Web Store, when you install an extension from it and to check those extensions for updates (<ph name="HOSTS">$1<ex>store.example.com</ex></ph>)
+     </message>
+-    <message name="IDS_SETTINGS_TARK_CONNECTS_UBLOCK" desc="Item in the list of services Tark connects to: the built-in ad blocker's filter lists. $1 is a list of host names.">
+-      uBlock Origin's filter-list sites, to keep its lists of ads and trackers current; turn off Block ads and trackers above to stop this (<ph name="HOSTS">$1<ex>lists.example.com</ex></ph>)
++    <message name="IDS_SETTINGS_TARK_CONNECTS_ADBLOCK_LISTS" desc="Item in the list of services Tark connects to: the built-in ad blocker's filter lists, signed by Tark. $1 is a list of host names.">
++      Tark's site, once a day, for the newest lists of ads and trackers; turn off Block ads and trackers above to stop this (<ph name="HOSTS">$1<ex>lists.example.com</ex></ph>)
+     </message>
+     <message name="IDS_SETTINGS_TARK_CONNECTS_WIDEVINE" desc="Item in the list of services Tark connects to: Google's DRM module server, used only if the user turns on protected video. $1 is a list of host names.">
+       Google's Widevine servers, only if you turn on protected video above (<ph name="HOSTS">$1<ex>update.example.com</ex></ph>)
+--- a/chrome/browser/resources/settings/privacy_page/privacy_page.html
++++ b/chrome/browser/resources/settings/privacy_page/privacy_page.html
+@@ -12,11 +12,11 @@
+       </settings-privacy-guide-dialog>
+     </template>
+     <!-- Tark: the built-in blocker, first on the page (spec 6.1). -->
+-    <settings-toggle-button id="tarkUblockToggle"
+-        pref="[[tarkUblockPref_]]" no-set-pref
++    <settings-toggle-button id="tarkAdblockToggle"
++        pref="[[tarkAdblockPref_]]" no-set-pref
+         label="$i18n{tarkBlockAds}"
+         sub-label="$i18n{tarkBlockAdsDesc}"
+-        on-settings-boolean-control-change="onTarkUblockChange_">
++        on-settings-boolean-control-change="onTarkAdblockChange_">
+     </settings-toggle-button>
+     <cr-link-row id="clearBrowsingData" class="hr"
+         start-icon="cr:delete"
+@@ -56,7 +56,7 @@
+       <div class="cr-row continuation secondary">$i18n{tarkConnectsIntro}</div>
+       <div class="cr-row continuation">$i18n{tarkConnectsShodhya}</div>
+       <div class="cr-row continuation">$i18n{tarkConnectsStore}</div>
+-      <div class="cr-row continuation">$i18n{tarkConnectsUblock}</div>
++      <div class="cr-row continuation">$i18n{tarkConnectsAdblockLists}</div>
+       <div class="cr-row continuation">$i18n{tarkConnectsWidevine}</div>
+       <div class="cr-row continuation">$i18n{tarkConnectsCaptions}</div>
+ <if expr="is_macosx">
+--- a/chrome/browser/resources/settings/privacy_page/privacy_page.ts
++++ b/chrome/browser/resources/settings/privacy_page/privacy_page.ts
+@@ -37,8 +37,8 @@
+ import {RouteObserverMixin, Router} from '../router.js';
+ import type {Route} from '../router.js';
+ import {SettingsViewMixin} from '../settings_page/settings_view_mixin.js';
+-import {CookieControlsMode} from '../site_settings/constants.js';
+-import {UBLOCK_ORIGIN_ID} from '../tark/tark_status.js';
++import {ContentSetting, ContentSettingsTypes, CookieControlsMode} from '../site_settings/constants.js';
++import {SiteSettingsBrowserProxyImpl} from '../site_settings/site_settings_browser_proxy.js';
+ 
+ import {HatsBrowserProxyImpl, TrustSafetyInteraction} from './hats_browser_proxy.js';
+ import {PrivacyGuideAvailabilityMixin} from './privacy_guide/privacy_guide_availability_mixin.js';
+@@ -70,13 +70,14 @@
+       showClearBrowsingDataDialog_: Boolean,
+       tarkConnectsExpanded_: {type: Boolean, value: false},
+ 
+-      // Tark: uBlock Origin's enabled state, shown as a pref so the row is a
++      // Tark: the ad blocker's global switch, the default of the ADS
++      // content setting (block = on), shown as a pref so the row is a
+       // settings-toggle-button like its neighbours.
+-      tarkUblockPref_: {
++      tarkAdblockPref_: {
+         type: Object,
+         value() {
+           return {
+-            key: 'tark.ublock_enabled',
++            key: 'tark.adblock_enabled',
+             type: chrome.settingsPrivate.PrefType.BOOLEAN,
+             value: true,
+           };
+@@ -118,7 +119,7 @@
+ 
+   declare private showClearBrowsingDataDialog_: boolean;
+   declare private tarkConnectsExpanded_: boolean;
+-  declare private tarkUblockPref_: chrome.settingsPrivate.PrefObject<boolean>;
++  declare private tarkAdblockPref_: chrome.settingsPrivate.PrefObject<boolean>;
+   declare private showPrivacyGuideDialog_: boolean;
+   declare private dbdDeletionConfirmationToastLabel_: string;
+   declare private shouldShowDbdDeletionConfirmationToast_: boolean;
+@@ -128,47 +129,27 @@
+ 
+   private metricsBrowserProxy_: MetricsBrowserProxy =
+       MetricsBrowserProxyImpl.getInstance();
+-  private tarkUblockChanged_ = (info: chrome.management.ExtensionInfo) => {
+-    if (info.id === UBLOCK_ORIGIN_ID) {
+-      this.setTarkUblockEnabled_(info.enabled);
+-    }
+-  };
+-
+   override connectedCallback() {
+     super.connectedCallback();
+-    chrome.management.onEnabled.addListener(this.tarkUblockChanged_);
+-    chrome.management.onDisabled.addListener(this.tarkUblockChanged_);
+-    this.refreshTarkUblock_();
+-  }
+-
+-  override disconnectedCallback() {
+-    super.disconnectedCallback();
+-    chrome.management.onEnabled.removeListener(this.tarkUblockChanged_);
+-    chrome.management.onDisabled.removeListener(this.tarkUblockChanged_);
++    this.refreshTarkAdblock_();
+   }
+ 
+-  private async refreshTarkUblock_() {
+-    try {
+-      const info = await chrome.management.get(UBLOCK_ORIGIN_ID);
+-      this.setTarkUblockEnabled_(info.enabled);
+-    } catch (e) {
+-      // Not installed: nothing is blocking.
+-      this.setTarkUblockEnabled_(false);
+-    }
+-  }
+-
+-  private setTarkUblockEnabled_(enabled: boolean) {
+-    this.tarkUblockPref_ = {...this.tarkUblockPref_, value: enabled};
++  private async refreshTarkAdblock_() {
++    const value = await SiteSettingsBrowserProxyImpl.getInstance()
++                      .getDefaultValueForContentType(ContentSettingsTypes.ADS);
++    this.tarkAdblockPref_ = {
++      ...this.tarkAdblockPref_,
++      value: value.setting !== ContentSetting.ALLOW,
++    };
+   }
+ 
+-  private async onTarkUblockChange_(e: CustomEvent<boolean>) {
++  private onTarkAdblockChange_(e: CustomEvent<boolean>) {
+     const enabled = (e.target as SettingsToggleButtonElement).checked;
+-    try {
+-      await chrome.management.setEnabled(UBLOCK_ORIGIN_ID, enabled);
+-    } finally {
+-      // Show what is true now, whether or not the change went through.
+-      this.refreshTarkUblock_();
+-    }
++    SiteSettingsBrowserProxyImpl.getInstance().setDefaultValueForContentType(
++        ContentSettingsTypes.ADS,
++        enabled ? ContentSetting.BLOCK : ContentSetting.ALLOW);
++    // Show what is true now.
++    this.refreshTarkAdblock_();
+   }
+ 
+   override currentRouteChanged(newRoute: Route, oldRoute?: Route) {
+--- a/chrome/browser/resources/settings/tark/tark_status.ts
++++ b/chrome/browser/resources/settings/tark/tark_status.ts
+@@ -5,7 +5,8 @@
+ /**
+  * @fileoverview How Tark is set up, for the settings home page and the
+  * section headers (spec 6.1). Read from the settings front end only: the
+- * search-engine list, chrome.management for uBlock Origin and extensions,
++ * search-engine list, the ADS content setting for the ad blocker,
++ * chrome.management for extensions,
+  * the colour-scheme mode, and prefs through chrome.settingsPrivate.
+  */
+ 
+@@ -13,9 +14,9 @@
+ import {addWebUiListener} from 'chrome://resources/js/cr.js';
+ 
+ import {SearchEnginesBrowserProxyImpl} from '../search_page/search_engines_browser_proxy.js';
++import {ContentSetting, ContentSettingsTypes} from '../site_settings/constants.js';
++import {SiteSettingsBrowserProxyImpl} from '../site_settings/site_settings_browser_proxy.js';
+ 
+-/** The built-in uBlock Origin (components/tark_ublock/extension_ids.h). */
+-export const UBLOCK_ORIGIN_ID = 'onfgfofhhcjllijjogonbaokaiokfgna';
+ 
+ export type TarkLook = 'system'|'light'|'dark';
+ 
+@@ -43,6 +44,8 @@
+   }
+   listening = true;
+   addWebUiListener('search-engines-changed', notify);
++  // The ad blocker's switch (the ADS default).
++  addWebUiListener('contentSettingCategoryChanged', notify);
+   chrome.settingsPrivate.onPrefsChanged.addListener(notify);
+   chrome.management.onInstalled.addListener(notify);
+   chrome.management.onUninstalled.addListener(notify);
+@@ -115,9 +118,11 @@
+ 
+ export async function getTarkStatus(): Promise<TarkStatus> {
+   listen();
+-  const [engines, ublock, all, downloads, languages] = await Promise.all([
++  const [engines, ads, all, downloads, languages] = await Promise.all([
+     SearchEnginesBrowserProxyImpl.getInstance().getSearchEnginesList(),
+-    chrome.management.get(UBLOCK_ORIGIN_ID).catch(() => null),
++    SiteSettingsBrowserProxyImpl.getInstance()
++        .getDefaultValueForContentType(ContentSettingsTypes.ADS)
++        .catch(() => null),
+     chrome.management.getAll().catch(() => []),
+     prefValue('download.default_directory'),
+     prefValue('intl.accept_languages'),
+@@ -127,7 +132,7 @@
+       engines.actives.find(e => e.default);
+   return {
+     search: engine ? engine.name : '',
+-    adsBlocked: !!ublock && ublock.enabled,
++    adsBlocked: !!ads && ads.setting !== ContentSetting.ALLOW,
+     look,
+     extensions: all.filter(e => e.type === 'extension').length,
+     downloads: folderName(typeof downloads === 'string' ? downloads : ''),
+--- a/chrome/browser/ui/webui/settings/tark_contacted_hosts.cc
++++ b/chrome/browser/ui/webui/settings/tark_contacted_hosts.cc
+@@ -22,11 +22,8 @@
+       {"tarkConnectsStore", IDS_SETTINGS_TARK_CONNECTS_STORE,
+        u"chromewebstore.google.com, clients2.google.com, "
+        u"clients2.googleusercontent.com"},
+-      {"tarkConnectsUblock", IDS_SETTINGS_TARK_CONNECTS_UBLOCK,
+-       u"ublockorigin.github.io, ublockorigin.pages.dev, cdn.jsdelivr.net, "
+-       u"raw.githubusercontent.com, malware-filter.gitlab.io, "
+-       u"malware-filter.pages.dev, curbengh.github.io, publicsuffix.org, "
+-       u"pgl.yoyo.org"},
++      {"tarkConnectsAdblockLists", IDS_SETTINGS_TARK_CONNECTS_ADBLOCK_LISTS,
++       u"gettarka.com"},
+       {"tarkConnectsWidevine", IDS_SETTINGS_TARK_CONNECTS_WIDEVINE,
+        u"update.googleapis.com, edgedl.me.gvt1.com"},
+       {"tarkConnectsCaptions", IDS_SETTINGS_TARK_CONNECTS_CAPTIONS,
+--- a/components/page_info/page_info.cc
++++ b/components/page_info/page_info.cc
+@@ -1410,6 +1410,16 @@
+   // Note |ContentSettingsType::ADS| will show up regardless of its default
+   // value when it has been activated on the current origin.
+   if (info.type == ContentSettingsType::ADS) {
++#if !BUILDFLAG(IS_ANDROID)
++    // Tark: ADS is Tark's ad blocker (Android has its own row). Shown on
++    // web pages while the blocker is on (its default is block): off here
++    // allows the site's ads.
++    if (site_url_.SchemeIsHTTPOrHTTPS() &&
++        GetContentSettings()->GetDefaultContentSetting(
++            ContentSettingsType::ADS) == CONTENT_SETTING_BLOCK) {
++      return true;
++    }
++#endif
+     if (!base::FeatureList::IsEnabled(
+             subresource_filter::kSafeBrowsingSubresourceFilter)) {
+       return false;
+--- a/components/site_settings_strings.grdp
++++ b/components/site_settings_strings.grdp
+@@ -1,11 +1,11 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <grit-part>
+   <!-- Site Settings common -->
+-  <message name="IDS_SITE_SETTINGS_TYPE_ADS" desc="This string is the name of the intrusive ads setting (visit chrome://settings/content and click 'Additional content settings').">
+-    Intrusive ads
++  <message name="IDS_SITE_SETTINGS_TYPE_ADS" desc="This string is the name of the ads setting: Tark's ad blocker, per site (visit chrome://settings/content and click 'Additional content settings').">
++    Ads
+   </message>
+-  <message name="IDS_SITE_SETTINGS_TYPE_ADS_MID_SENTENCE" desc="This string is the name of the intrusive ads setting (visit chrome://settings/content and click 'Additional content settings') when used mid-sentence.">
+-    intrusive ads
++  <message name="IDS_SITE_SETTINGS_TYPE_ADS_MID_SENTENCE" desc="This string is the name of the ads setting (Tark's ad blocker, per site) when used mid-sentence.">
++    ads
+   </message>
+   <message name="IDS_SITE_SETTINGS_TYPE_ANTI_ABUSE" desc="The label used for the anti-abuse site settings controls.">
+     Auto-verify
