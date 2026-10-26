@@ -157,14 +157,19 @@ class TestKeepOut(unittest.TestCase):
             run = layered_build._system_runner(work, 1)
             run('stash-out')
             run('wipe')
-            # The base's own gn output, which the kept out replaces.
+            # The base's own gn output (the new Chromium's build files)
+            # goes over the kept objects; the old build files would name
+            # files the new Chromium no longer makes.
             fresh = work / 'build' / 'src' / 'out' / 'Default' / 'build.ninja'
             fresh.parent.mkdir(parents=True)
             fresh.write_text('new')
+            old = work / 'build' / 'out-keep' / 'Default' / 'build.ninja'
+            old.write_text('old')
             run('restore-out')
             self.assertEqual(obj.read_text(), 'object')
-            self.assertFalse(fresh.exists())
+            self.assertEqual(fresh.read_text(), 'new')
             self.assertFalse((work / 'build' / 'out-keep').exists())
+            self.assertFalse((work / 'build' / 'out-fresh').exists())
 
     def test_restore_without_a_stash_is_a_no_op(self):
         with tempfile.TemporaryDirectory() as tmp:

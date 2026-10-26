@@ -108,10 +108,19 @@ def _system_runner(work, jobs):
             if (src / 'out').is_dir() and not keep.exists():
                 (src / 'out').rename(keep)
         elif step == 'restore-out':
+            # The kept objects, with the new base's gn output (its build
+            # files) laid over them: the old build files name files the new
+            # Chromium no longer makes.
             if keep.is_dir():
+                fresh = work / 'build' / 'out-fresh'
+                if fresh.exists():
+                    _rmtree(fresh)
                 if (src / 'out').exists():
-                    _rmtree(src / 'out')
+                    (src / 'out').rename(fresh)
                 keep.rename(src / 'out')
+                if fresh.exists():
+                    shutil.copytree(fresh, src / 'out', dirs_exist_ok=True)
+                    _rmtree(fresh)
         elif step == 'wipe':
             for p in (src, base):
                 if p.exists():
