@@ -29,6 +29,9 @@ function Find-Dumpbin {
 if (-not $CheckOnly) {
   $src = 'C:\ort-src'
   $build = 'C:\ort-build'
+  # git and build.py write progress to stderr, which Windows PowerShell turns
+  # into errors when the job redirects it (*>>); their exit codes are checked.
+  $ErrorActionPreference = 'Continue'
   # A run cut short leaves a partial clone and build behind; start clean.
   foreach ($d in $src, $build) {
     if (Test-Path $d) { Remove-Item -Recurse -Force $d }
@@ -63,6 +66,7 @@ if (-not $CheckOnly) {
     --enable_msvc_static_runtime --cmake_generator 'Visual Studio 17 2022' `
     --cmake_extra_defines onnxruntime_BUILD_UNIT_TESTS=OFF
   if ($LASTEXITCODE) { throw 'onnxruntime build failed' }
+  $ErrorActionPreference = 'Stop'
 
   New-Item -ItemType Directory -Force "$Out\include", "$Out\lib" | Out-Null
   Copy-Item "$build\Release\Release\onnxruntime.dll" "$Out\lib\"
