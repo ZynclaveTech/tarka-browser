@@ -24,6 +24,7 @@ import hashlib
 import os
 import pathlib
 import shutil
+import stat
 import subprocess
 import sys
 
@@ -63,6 +64,24 @@ def base_hash(work):
     return h.hexdigest()
 
 
+def _make_writable_and_retry(func, path, exc):
+    """rmtree's onexc: git's objects are read-only, which Windows refuses
+    to delete; make the entry (and its folder) writable and try again."""
+    for p in (os.path.dirname(path), path):
+        try:
+            os.chmod(p, stat.S_IWRITE | stat.S_IREAD | stat.S_IEXEC)
+        except OSError:
+            pass
+    func(path)
+
+
+def _rmtree(path):
+    if sys.version_info >= (3, 12):
+        shutil.rmtree(path, onexc=_make_writable_and_retry)
+    else:
+        shutil.rmtree(path, onerror=lambda f, p, e: _make_writable_and_retry(f, p, e[1]))
+
+
 def _system_runner(work, jobs):
     repo = pathlib.Path((work / 'tark_repo.txt').read_text(encoding='utf-8').strip())
     layers = repo / 'android' / 'layers.py'
@@ -85,7 +104,7 @@ def _system_runner(work, jobs):
         elif step == 'wipe':
             for p in (src, base):
                 if p.exists():
-                    shutil.rmtree(p)
+                    _rmtree(p)
             for f in ('base.stamp', 'layers.json', 'namesubs.tar'):
                 (work / 'build' / f).unlink(missing_ok=True)
         else:
