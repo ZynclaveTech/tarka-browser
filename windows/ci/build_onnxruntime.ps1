@@ -29,6 +29,10 @@ function Find-Dumpbin {
 if (-not $CheckOnly) {
   $src = 'C:\ort-src'
   $build = 'C:\ort-build'
+  # A run cut short leaves a partial clone and build behind; start clean.
+  foreach ($d in $src, $build) {
+    if (Test-Path $d) { Remove-Item -Recurse -Force $d }
+  }
   # LF line endings: ONNX Runtime patches what it downloads (cmake/patches)
   # with LF sources, and its .gitattributes (text=auto) would otherwise check
   # the patches out with Windows line endings, which then fail to apply.
