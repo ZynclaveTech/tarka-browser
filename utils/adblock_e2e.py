@@ -250,6 +250,28 @@ def run_case(app, name):
             return failed
         finally:
             b.close()
+    if name == 'update':
+        # The daily update from gettarka.com: a bundle newer than the
+        # built-in one is downloaded and taken, and the browser lives on.
+        b = Browser(app)
+        try:
+            if not b.wait_ready():
+                print('FAIL  update: the engine was never ready', flush=True)
+                return 1
+            end = time.time() + 90
+            log = ''
+            while time.time() < end and b.proc.poll() is None:
+                log = b.log.read_text(errors='replace')
+                if 'new lists downloaded' in log or 'list update refused' in log:
+                    break
+                time.sleep(1)
+            alive = b.proc.poll() is None
+            took = 'new lists downloaded' in log
+            print(f'{"ok  " if alive else "FAIL"}  update: the browser lives through the update', flush=True)
+            print(f'{"ok  " if took else "FAIL"}  update: new lists downloaded', flush=True)
+            return (not alive) + (not took)
+        finally:
+            b.close()
     if name == 'failopen':
         # Before the engine is ready nothing is blocked and pages still load.
         b = Browser(app, ['--tark-adblock-delay-compile=60'])

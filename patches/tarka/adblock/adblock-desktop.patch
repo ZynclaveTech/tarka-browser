@@ -425,7 +425,27 @@
  }
  
  base::Time ReadLastSuccess(const base::FilePath& dir) {
-@@ -133,7 +136,8 @@
+@@ -105,6 +108,19 @@
+   return std::string();
+ }
+ 
++// A downloaded bundle, read back and its temporary file deleted; nullopt if
++// the download failed or the file cannot be read within the size limit.
++std::optional<std::string> ReadAndDelete(const base::FilePath& path) {
++  if (path.empty()) {
++    return std::nullopt;
++  }
++  std::string zip;
++  const bool read =
++      base::ReadFileToStringWithMaxSize(path, &zip, kMaxBundleSize);
++  base::DeleteFile(path);
++  return read ? std::optional<std::string>(std::move(zip)) : std::nullopt;
++}
++
+ std::unique_ptr<network::SimpleURLLoader> MakeLoader(const GURL& url) {
+   auto request = std::make_unique<network::ResourceRequest>();
+   request->url = url;
+@@ -133,7 +149,8 @@
  }
  
  void Updater::MaybeCheck() {
@@ -435,6 +455,32 @@
      return;
    }
    checking_ = true;
+@@ -176,13 +193,22 @@
+     checking_ = false;
+     return;
+   }
++  // To a temporary file: a bundle may be larger than DownloadToString
++  // allows (5 MiB); read back off the UI thread.
+   loader_ = MakeLoader(GURL(std::string(kListsBase) + *file));
+-  loader_->DownloadToString(
++  loader_->DownloadToTempFile(
+       g_browser_process->system_network_context_manager()
+           ->GetSharedURLLoaderFactory()
+           .get(),
+-      base::BindOnce(&Updater::OnZip, weak_factory_.GetWeakPtr(),
+-                     std::move(*index)),
++      base::BindOnce(
++          [](base::WeakPtr<Updater> self, std::string index,
++             base::FilePath path) {
++            base::ThreadPool::PostTaskAndReplyWithResult(
++                FROM_HERE, {base::MayBlock(), base::TaskPriority::BEST_EFFORT},
++                base::BindOnce(&ReadAndDelete, path),
++                base::BindOnce(&Updater::OnZip, self, std::move(index)));
++          },
++          weak_factory_.GetWeakPtr(), std::move(*index)),
+       kMaxBundleSize);
+ }
+ 
 --- a/chrome/installer/mini_installer/chrome.release
 +++ b/chrome/installer/mini_installer/chrome.release
 @@ -47,6 +47,7 @@
