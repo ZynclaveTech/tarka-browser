@@ -56,8 +56,8 @@ diff --color '--color=never' -ruN a/chrome/android/java/res/xml/zynclave_account
 +</PreferenceScreen>
 diff --color '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAccountPreference.java b/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAccountPreference.java
 --- a/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAccountPreference.java	1970-01-01 05:30:00.000000000 +0530
-+++ b/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAccountPreference.java	2026-10-26 11:24:30.172399952 +0530
-@@ -0,0 +1,258 @@
++++ b/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAccountPreference.java	2026-10-26 12:00:00.000000000 +0530
+@@ -0,0 +1,276 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -84,6 +84,7 @@ diff --color '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/
 +
 +import com.google.android.material.color.MaterialColors;
 +
++import org.chromium.base.ResettersForTesting;
 +import org.chromium.build.annotations.NullMarked;
 +import org.chromium.build.annotations.Nullable;
 +import org.chromium.chrome.R;
@@ -123,6 +124,8 @@ diff --color '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/
 +        }
 +    }
 +
++    private static @Nullable Boolean sStagingForTesting;
++
 +    private final Runnable mStateObserver = this::refresh;
 +    private final Runnable mFailureObserver = this::onSignInFailed;
 +    private boolean mObserving;
@@ -132,6 +135,21 @@ diff --color '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/
 +        setPersistent(false);
 +        setOnPreferenceClickListener(p -> onRowClicked());
 +        refresh();
++    }
++
++    /**
++     * Whether this is a staging build (a test APK): the build's flag, unless a test chose, so the
++     * tests pass whichever way the APK under test was built.
++     */
++    static boolean isStaging() {
++        Boolean forTesting = sStagingForTesting;
++        return forTesting != null ? forTesting : ZynclaveConfig.get().isStaging();
++    }
++
++    @VisibleForTesting
++    static void setStagingForTesting(@Nullable Boolean staging) {
++        sStagingForTesting = staging;
++        ResettersForTesting.register(() -> sStagingForTesting = null);
 +    }
 +
 +    @Override
@@ -213,7 +231,7 @@ diff --color '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/
 +                        state,
 +                        account.name(),
 +                        account.email(),
-+                        ZynclaveConfig.get().isStaging());
++                        isStaging());
 +        setTitle(content.title());
 +        setSummary(content.summary());
 +        // Signed in, a tap opens the account page, as a Settings row with a fragment does.
@@ -318,7 +336,7 @@ diff --color '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/
 +}
 diff --color '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAccountSettings.java b/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAccountSettings.java
 --- a/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAccountSettings.java	1970-01-01 05:30:00.000000000 +0530
-+++ b/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAccountSettings.java	2026-10-26 11:24:30.171291490 +0530
++++ b/chrome/android/java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAccountSettings.java	2026-10-26 12:00:00.000000000 +0530
 @@ -0,0 +1,165 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
@@ -409,7 +427,7 @@ diff --color '--color=never' -ruN a/chrome/android/java/src/org/chromium/chrome/
 +                        State.SIGNED_IN,
 +                        account.name(),
 +                        account.email(),
-+                        ZynclaveConfig.get().isStaging());
++                        ZynclaveAccountPreference.isStaging());
 +        CharSequence summaryText = content.summary();
 +        summary.setSummary(
 +                summaryText == null ? content.title() : content.title() + "\n" + summaryText);
@@ -511,8 +529,8 @@ diff --color '--color=never' -ruN a/chrome/android/junit/BUILD.gn b/chrome/andro
    }
 diff --color '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAccountRowTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAccountRowTest.java
 --- a/chrome/android/junit/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAccountRowTest.java	1970-01-01 05:30:00.000000000 +0530
-+++ b/chrome/android/junit/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAccountRowTest.java	2026-10-26 11:24:30.165202178 +0530
-@@ -0,0 +1,451 @@
++++ b/chrome/android/junit/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAccountRowTest.java	2026-10-26 12:00:00.000000000 +0530
+@@ -0,0 +1,461 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -602,6 +620,8 @@ diff --color '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome
 +        mStore = new CountingStore(new File(mTemp.getRoot(), "zynclave"));
 +        mBackend.mStore = mStore;
 +        mAccount = ZynclaveAccount.forTesting(mBackend, mStore, ZynclaveAccountTest.DIRECT);
++        // The tests assert production's text, whichever way this APK was built.
++        ZynclaveAccountPreference.setStagingForTesting(false);
 +        mActivity = Robolectric.buildActivity(TestActivity.class).setup().get();
 +        mActivity.setTheme(R.style.Theme_BrowserUI_DayNight);
 +    }
@@ -610,6 +630,7 @@ diff --color '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome
 +    public void tearDown() {
 +        AlertDialog dialog = ZynclaveAccountSettings.getDialogForTesting();
 +        if (dialog != null) dialog.dismiss();
++        ZynclaveAccountPreference.setStagingForTesting(null);
 +    }
 +
 +    private void signIn() {
@@ -744,9 +765,16 @@ diff --color '--color=never' -ruN a/chrome/android/junit/src/org/chromium/chrome
 +                        ZynclaveAccountPreference.content(
 +                                        mActivity, State.SIGNED_IN, null, null, true)
 +                                .summary()));
-+        // A unit-test build is not a staging build: no label.
++    }
++
++    @Test
++    public void testRowStagingLabelFollowsTheEnvironment() {
 +        signIn();
-+        assertFalse(text(row().getSummary()).contains(label));
++        ZynclaveAccountPreference.setStagingForTesting(false);
++        assertFalse(text(row().getSummary()).contains("Zynclave staging"));
++
++        ZynclaveAccountPreference.setStagingForTesting(true);
++        assertEquals("asha@example.com · Zynclave staging", text(row().getSummary()));
 +    }
 +
 +    @Test
