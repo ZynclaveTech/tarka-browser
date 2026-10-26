@@ -143,6 +143,23 @@ class TestPlan(unittest.TestCase):
         self.assertFalse(backup.exists())
 
 
+class TestWipe(unittest.TestCase):
+    def test_wipe_removes_read_only_entries(self):
+        # git's objects (bindgen's checkout) are read-only, which rmtree
+        # cannot delete on Windows; a read-only folder fails it here too.
+        import os
+        import stat
+        with tempfile.TemporaryDirectory() as tmp:
+            work = make_work(tmp)
+            locked = work / 'build' / 'src' / 'third_party' / 'x' / '.git' / 'objects'
+            locked.mkdir(parents=True)
+            (locked / 'pack').write_text('object')
+            os.chmod(locked / 'pack', stat.S_IREAD)
+            os.chmod(locked, stat.S_IREAD | stat.S_IEXEC)
+            layered_build._system_runner(work, 1)('wipe')
+            self.assertFalse((work / 'build' / 'src').exists())
+
+
 class TestBuildPyPhases(unittest.TestCase):
     """Tark's local change to upstream's build.py: TARK_PHASE splits it."""
 
