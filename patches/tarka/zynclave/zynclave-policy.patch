@@ -1,6 +1,6 @@
 --- a/chrome/browser/tark_zynclave/zynclave_auth_unittest.cc
 +++ b/chrome/browser/tark_zynclave/zynclave_auth_unittest.cc
-@@ -455,3 +455,35 @@
+@@ -455,3 +455,85 @@
  
  }  // namespace
  }  // namespace tark_zynclave
@@ -32,6 +32,56 @@
 +  TestingPrefServiceSimple prefs;
 +  RegisterZynclavePrefs(prefs.registry());
 +  EXPECT_TRUE(prefs.GetBoolean(kAllowedPref));
++}
++
++}  // namespace
++}  // namespace tark_zynclave
++
++namespace tark_zynclave {
++namespace {
++
++// Final review I1: a sign-in still finishing when the person signs out (or
++// the policy turns sign-in off) must not sign them back in.
++TEST_F(TarkZynclaveAuth, SignOutDuringTheExchangeStaysSignedOut) {
++  auto auth = MakeAuth();
++  auto [state, nonce] = Start(*auth);
++  ASSERT_TRUE(auth->HandleRedirect(Redirect("code=c&state=" + state)));
++  task_env_.RunUntilIdle();
++  ASSERT_EQ(auth->state(), ZynclaveState::kSigningIn);
++  auth->SignOutLocally();
++  // The exchange is cancelled; even an answer arriving now changes nothing.
++  loaders_.SimulateResponseForPendingRequest(
++      issuer_.Url("oauth2/token"),
++      test::FakeIssuer::TokenJson(
++          "a", "r", issuer_.IdToken("client-1", nonce, base::Time::Now())));
++  task_env_.RunUntilIdle();
++  EXPECT_EQ(auth->state(), ZynclaveState::kSignedOut);
++  EXPECT_FALSE(auth->account());
++  EXPECT_TRUE(prefs_.GetString(kTokensPref).empty());
++}
++
++// Final review M3: a refresh answered after sign-out and a new sign-in does
++// not touch the new account.
++TEST_F(TarkZynclaveAuth, ALateRefreshDoesNotTouchANewSignIn) {
++  auto auth = MakeAuth();
++  SignIn(*auth, "access-1", "refresh-1");
++  task_env_.FastForwardBy(base::Hours(2));
++  base::test::TestFuture<std::optional<std::string>> token;
++  auth->GetAccessToken(token.GetCallback());
++  task_env_.RunUntilIdle();
++  ASSERT_EQ(TokenRequests(), 1);
++  auth->SignOutLocally();
++  EXPECT_EQ(token.Get(), std::nullopt);
++  // The old refresh comes back invalid: nothing changes now.
++  loaders_.SimulateResponseForPendingRequest(
++      issuer_.Url("oauth2/token"), R"({"error":"invalid_grant"})",
++      net::HTTP_BAD_REQUEST);
++  task_env_.RunUntilIdle();
++  EXPECT_EQ(auth->state(), ZynclaveState::kSignedOut);
++  SignIn(*auth, "access-9", "refresh-9");
++  base::test::TestFuture<std::optional<std::string>> fresh;
++  auth->GetAccessToken(fresh.GetCallback());
++  EXPECT_EQ(fresh.Get(), "access-9");
 +}
 +
 +}  // namespace

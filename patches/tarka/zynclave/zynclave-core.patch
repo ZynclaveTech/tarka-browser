@@ -1548,7 +1548,7 @@
 +#endif  // CHROME_BROWSER_TARK_ZYNCLAVE_TOKEN_CIPHER_H_
 --- /dev/null
 +++ b/chrome/browser/tark_zynclave/zynclave_auth.cc
-@@ -0,0 +1,579 @@
+@@ -0,0 +1,585 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -1971,9 +1971,10 @@
 +// Sign-out.
 +
 +void ZynclaveAuth::SignOut(bool everywhere) {
-+  if (tokens_) {
-+    Revoke(tokens_->refresh);
-+  }
++  std::string refresh = tokens_ ? tokens_->refresh : std::string();
++  // Forget first: it cancels whatever is in flight, the revoke included.
++  Forget(/*keep_account_for_sign_in_again=*/false);
++  Revoke(std::move(refresh));
 +  if (everywhere) {
 +    WithDiscovery(base::BindOnce(
 +        [](base::WeakPtr<ZynclaveAuth> self, bool ok) {
@@ -1987,7 +1988,6 @@
 +        },
 +        weak_factory_.GetWeakPtr()));
 +  }
-+  Forget(/*keep_account_for_sign_in_again=*/false);
 +}
 +
 +void ZynclaveAuth::SignOutLocally() {
@@ -2104,6 +2104,12 @@
 +}
 +
 +void ZynclaveAuth::Forget(bool keep_account_for_sign_in_again) {
++  // A code exchange or refresh still running must not bring the account
++  // back: drop its requests and its callbacks.
++  weak_factory_.InvalidateWeakPtrs();
++  fetches_.clear();
++  discovery_waiters_.clear();
++  refreshing_ = false;
 +  tokens_.reset();
 +  prefs_->ClearPref(kTokensPref);
 +  if (keep_account_for_sign_in_again && account_) {
