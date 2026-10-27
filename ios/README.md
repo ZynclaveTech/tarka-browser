@@ -5,7 +5,7 @@ iOS browser must use WebKit, so this is not a Chromium build.
 
 - `upstream.json`: the pinned firefox-ios tag and commit.
 - `series`, `patches/`: Tark's changes, applied in order.
-- `build.py fetch | patch | lists | engine | sim`: clone the tag into `build/ios/firefox-ios`,
+- `build.py fetch | patch | lists | engine | xlit | sim`: clone the tag into `build/ios/firefox-ios`,
   apply the series, bootstrap and build the Fennec scheme for the simulator
   (`build/ios/dd`).
 
@@ -39,3 +39,15 @@ answers with generic hide rules minus the page's exceptions
 from generic hiding, so check that on a real site. `adtest/index.html` checks blocking: serve it with
 `python3 -m http.server 8765 --bind 127.0.0.1` and type the address into
 Tark — `simctl openurl` opens http links in Safari, not Tark.
+
+## Your language (D1)
+
+`build.py xlit` assembles tark_xlit from the patches the Mac and Android build
+(`tark-xlit-component`, then Android's `xlit-android-files`), adds `xlit/`'s
+//base shim and C interface, and fills BrowserKit's TarkXlitCore target; it
+also turns `xlit/files.json` (Android's published files, content-addressed on
+gettarka.com/xlit/android/v1/) into the table the app checks downloads
+against. `xlit-rows.patch` adds the one-time "Type in हिन्दी?" offer, the
+verified download (Wi-Fi unless "Download now") and a row per ready language
+in the address bar. `xlit/build_host.sh` checks the engine on the Mac
+against `resources/xlit/golden.tsv` (1260/1260).
