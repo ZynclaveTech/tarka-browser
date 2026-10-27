@@ -7,7 +7,10 @@
     build.py fetch    clone upstream.json's tag into build/ios/firefox-ios
     build.py patch    put the tree back to the tag, apply ios/series in order
     build.py lists    the signed ad-block list bundle from gettarka.com, verified
-                      and converted to WebKit rules inside the tree
+                      and converted to WebKit rules and a serialized adblock-rust
+                      engine inside the tree
+    build.py engine   adblock-rust for iOS (ios/adblock) as an xcframework
+                      inside the tree
     build.py sim      bootstrap and build the Fennec scheme for the simulator
 
 The tree is never committed: Tark's changes are the patches in ios/patches,
@@ -29,6 +32,10 @@ LISTS_URL = 'https://gettarka.com/lists/android/v1/'
 LISTS_MAX_BYTES = 64 << 20
 ADBLOCK = ROOT / 'android' / 'adblock'
 TARK_LISTS = TREE / 'firefox-ios' / 'Client' / 'ContentBlocker' / 'TarkLists'
+ENGINE_CRATE = IOS / 'adblock'
+XCFRAMEWORK = TREE / 'BrowserKit' / 'TarkAdblockFFI.xcframework'
+# Device, and the Apple-silicon simulator.
+IOS_TARGETS = ('aarch64-apple-ios', 'aarch64-apple-ios-sim')
 
 
 def run(*args, cwd=None):
@@ -97,13 +104,29 @@ def lists():
     run(sys.executable, ADBLOCK / 'bundle.py', 'verify', bundle, index,
         '--pubkey', ADBLOCK / 'lists_pubkey.txt')
     run('cargo', 'build', '--release', '--manifest-path', ADBLOCK / 'listtool' / 'Cargo.toml')
-    run(ADBLOCK / 'listtool' / 'target' / 'release' / 'listtool', 'webkit', bundle, work / 'webkit')
+    listtool = ADBLOCK / 'listtool' / 'target' / 'release' / 'listtool'
+    run(listtool, 'webkit', bundle, work / 'webkit')
+    run(listtool, 'engine', bundle, work / 'engine')
     shutil.rmtree(TARK_LISTS, ignore_errors=True)
     TARK_LISTS.mkdir(parents=True)
     for rules in sorted((work / 'webkit').glob('tark-*.json')):
         # ContentBlocker loads bundled fxcb-*.json files as extra lists.
         shutil.copy(rules, TARK_LISTS / f'fxcb-{rules.name}')
         print('list', TARK_LISTS / f'fxcb-{rules.name}')
+    # For element hiding and scriptlets in the app (TarkCosmeticFilter).
+    shutil.copy(work / 'engine' / 'engine.dat', TARK_LISTS / 'tark-engine.dat')
+    shutil.copy(work / 'engine' / 'resources.json', TARK_LISTS / 'tark-resources.json')
+
+
+def engine():
+    manifest = ENGINE_CRATE / 'Cargo.toml'
+    args = []
+    for target in IOS_TARGETS:
+        run('cargo', 'build', '--release', '--locked', '--target', target, '--manifest-path', manifest)
+        lib = ENGINE_CRATE / 'target' / target / 'release' / 'libtark_adblock_ios.a'
+        args += ['-library', lib, '-headers', ENGINE_CRATE / 'include']
+    shutil.rmtree(XCFRAMEWORK, ignore_errors=True)
+    run('xcodebuild', '-create-xcframework', *args, '-output', XCFRAMEWORK)
 
 
 def sim():
@@ -115,11 +138,12 @@ def sim():
         '-destination', 'generic/platform=iOS Simulator',
         '-derivedDataPath', DERIVED,
         '-skipMacroValidation', '-skipPackagePluginValidation',
-        'CODE_SIGNING_ALLOWED=NO', 'build', cwd=TREE)
+        # Apple-silicon simulator only: TarkAdblockFFI has no x86_64 slice.
+        'ARCHS=arm64', 'CODE_SIGNING_ALLOWED=NO', 'build', cwd=TREE)
 
 
 if __name__ == '__main__':
-    steps = {'fetch': fetch, 'patch': patch, 'lists': lists, 'sim': sim}
+    steps = {'fetch': fetch, 'patch': patch, 'lists': lists, 'engine': engine, 'sim': sim}
     if len(sys.argv) != 2 or sys.argv[1] not in steps:
         sys.exit(__doc__)
     steps[sys.argv[1]]()

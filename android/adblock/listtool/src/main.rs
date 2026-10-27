@@ -14,6 +14,10 @@
 //!     script PAGE_URL TEXT     the page's injected scriptlets contain TEXT
 //!     hide PAGE_URL SELECTOR   the page's hide selectors contain SELECTOR
 //!   Exits 1 on any failure.
+//! listtool engine BUNDLE.zip OUT_DIR
+//!   Compiles the bundle as `check` does and writes OUT_DIR/engine.dat
+//!   (Engine::serialize) and OUT_DIR/resources.json, which Tark for iOS
+//!   loads in the app for element hiding and scriptlets.
 //! listtool webkit BUNDLE.zip OUT_DIR
 //!   Converts the bundle's network rules to WebKit content-blocker rules for
 //!   Tark for iOS: OUT_DIR/tark-N.json, each under WebKit's rule limit. Every
@@ -143,6 +147,26 @@ fn explain(bundle: &Path, extra: &str, items: &[&str]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+fn engine(bundle: &Path, out: &Path) -> ExitCode {
+    let mut zip = zip::ZipArchive::new(std::fs::File::open(bundle).unwrap()).unwrap();
+    let manifest: serde_json::Value = serde_json::from_str(&read_entry(&mut zip, "manifest.json")).unwrap();
+    let mut set = FilterSet::new(false);
+    for list in manifest["lists"].as_array().unwrap() {
+        let name = list["name"].as_str().unwrap();
+        let mask = list["permission"].as_u64().unwrap_or(0) as u8;
+        let text = read_entry(&mut zip, &format!("lists/{name}.txt"));
+        let opts = ParseOptions { permissions: PermissionMask::from_bits(mask), ..Default::default() };
+        set.add_filter_list(text, opts);
+    }
+    let resources = read_entry(&mut zip, "resources.json");
+    let dat = Engine::new_with_filter_set(set).serialize();
+    std::fs::create_dir_all(out).unwrap();
+    std::fs::write(out.join("engine.dat"), &dat).unwrap();
+    std::fs::write(out.join("resources.json"), resources).unwrap();
+    eprintln!("engine {} bytes", dat.len());
+    ExitCode::SUCCESS
+}
+
 /// WebKit refuses a content-blocker list with more rules than this.
 const WEBKIT_MAX_RULES: usize = 150_000;
 
@@ -191,8 +215,9 @@ fn main() -> ExitCode {
         [_, "check", bundle, canaries] => check(Path::new(bundle), Path::new(canaries)),
         [_, "explain", bundle, extra, items @ ..] => explain(Path::new(bundle), extra, items),
         [_, "webkit", bundle, out] => webkit(Path::new(bundle), Path::new(out)),
+        [_, "engine", bundle, out] => engine(Path::new(bundle), Path::new(out)),
         _ => {
-            eprintln!("usage: listtool resources --ubo DIR --out FILE | listtool check BUNDLE.zip CANARIES.txt | listtool webkit BUNDLE.zip OUT_DIR");
+            eprintln!("usage: listtool resources --ubo DIR --out FILE | listtool check BUNDLE.zip CANARIES.txt | listtool webkit|engine BUNDLE.zip OUT_DIR");
             ExitCode::from(2)
         }
     }

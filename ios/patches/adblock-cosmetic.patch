@@ -1,0 +1,303 @@
+diff --git a/BrowserKit/Package.swift b/BrowserKit/Package.swift
+index ee5fd07..61477f1 100644
+--- a/BrowserKit/Package.swift
++++ b/BrowserKit/Package.swift
+@@ -102,6 +102,13 @@ let package = Package(
+             exact: "0.11.0"),
+     ],
+     targets: [
++        // Tark: adblock-rust for iOS, built by ios/build.py engine.
++        .binaryTarget(
++            name: "TarkAdblockFFI",
++            path: "TarkAdblockFFI.xcframework"),
++        .target(
++            name: "TarkAdblock",
++            dependencies: ["TarkAdblockFFI"]),
+         .target(
+             name: "Shared",
+             dependencies: ["Common"],
+@@ -146,8 +153,11 @@ let package = Package(
+         ),
+         .target(
+             name: "Common",
++            // Tark: the in-app ad blocker rides on Common, which every app
++            // target already links.
+             dependencies: ["Dip",
+                            "SwiftyBeaver",
++                           "TarkAdblock",
+                            .product(name: "Sentry-Dynamic", package: "sentry-cocoa")],
+             swiftSettings: [
+                 .unsafeFlags(["-enable-testing"]),
+diff --git a/BrowserKit/Sources/TarkAdblock/TarkAdblockEngine.swift b/BrowserKit/Sources/TarkAdblock/TarkAdblockEngine.swift
+new file mode 100644
+index 0000000..a0f6d96
+--- /dev/null
++++ b/BrowserKit/Sources/TarkAdblock/TarkAdblockEngine.swift
+@@ -0,0 +1,79 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++import Foundation
++import TarkAdblockFFI
++
++/// Tark: adblock-rust in the app (the engine Tark for Android ships), for
++/// what WebKit's content blockers cannot do: hiding page elements with
++/// per-site exceptions, and scriptlets. All calls go through one serial
++/// queue; the engine is not thread-safe.
++public final class TarkAdblockEngine: @unchecked Sendable {
++    /// What one page gets: selectors to hide, generic-rule exceptions,
++    /// scriptlet code, and whether generic hiding is off for it.
++    public struct PageResources: Decodable, Sendable {
++        public let hideSelectors: [String]
++        public let exceptions: [String]
++        public let injectedScript: String
++        public let generichide: Bool
++
++        enum CodingKeys: String, CodingKey {
++            case hideSelectors = "hide_selectors"
++            case exceptions
++            case injectedScript = "injected_script"
++            case generichide
++        }
++    }
++
++    private let engine: OpaquePointer
++    private let queue = DispatchQueue(label: "com.gettarka.adblock.engine")
++
++    /// Loads `engine.dat` (serialized by listtool engine) and `resources.json`.
++    public init?(dat: Data, resourcesJSON: String) {
++        let pointer = dat.withUnsafeBytes { bytes in
++            resourcesJSON.withCString { resources in
++                tark_engine_new(bytes.bindMemory(to: UInt8.self).baseAddress, bytes.count, resources)
++            }
++        }
++        guard let pointer else { return nil }
++        engine = pointer
++    }
++
++    deinit {
++        tark_engine_free(engine)
++    }
++
++    public func pageResources(for url: URL, completion: @escaping @Sendable (PageResources?) -> Void) {
++        queue.async { [self] in
++            let json = Self.take(url.absoluteString.withCString { tark_url_cosmetic_resources(engine, $0) })
++            completion(json.flatMap { try? JSONDecoder().decode(PageResources.self, from: Data($0.utf8)) })
++        }
++    }
++
++    public func hiddenSelectors(classes: [String],
++                                ids: [String],
++                                exceptions: [String],
++                                completion: @escaping @Sendable ([String]) -> Void) {
++        queue.async { [self] in
++            let encode = { (list: [String]) in
++                String(data: (try? JSONEncoder().encode(list)) ?? Data("[]".utf8), encoding: .utf8) ?? "[]"
++            }
++            let json = encode(classes).withCString { c in
++                encode(ids).withCString { i in
++                    encode(exceptions).withCString { e in
++                        Self.take(tark_hidden_class_id_selectors(engine, c, i, e))
++                    }
++                }
++            }
++            completion(json.flatMap { try? JSONDecoder().decode([String].self, from: Data($0.utf8)) } ?? [])
++        }
++    }
++
++    /// Copies a string the library returned and frees it.
++    private static func take(_ pointer: UnsafeMutablePointer<CChar>?) -> String? {
++        guard let pointer else { return nil }
++        defer { tark_string_free(pointer) }
++        return String(cString: pointer)
++    }
++}
+diff --git a/firefox-ios/Client/ContentBlocker/ContentBlocker.swift b/firefox-ios/Client/ContentBlocker/ContentBlocker.swift
+index cb6218d..cba1c08 100644
+--- a/firefox-ios/Client/ContentBlocker/ContentBlocker.swift
++++ b/firefox-ios/Client/ContentBlocker/ContentBlocker.swift
+@@ -3,6 +3,7 @@
+ // file, You can obtain one at http://mozilla.org/MPL/2.0/
+ 
+ import WebKit
++import TarkAdblock
+ import Shared
+ import Common
+ import CryptoKit
+@@ -534,3 +535,150 @@ extension ContentBlocker {
+         }
+     }
+ }
++
++// MARK: - Tark element hiding and scriptlets
++
++/// Tark: hides page elements and runs scriptlets with adblock-rust in the app
++/// (TarkAdblockEngine), as Brave does on iOS; network blocking stays in
++/// WebKit's content blockers. A script in Firefox's isolated client world
++/// asks for the page's own hide rules and scriptlets, then reports the class
++/// and id names it sees; the engine answers with the generic hide rules for
++/// them, minus the page's exceptions. Off wherever blocking is off.
++@MainActor
++final class TarkCosmeticFilter: TabContentScript {
++    private static let messageName = "tarkCosmetic"
++
++    /// Loaded once, off the main thread, from the files `build.py lists`
++    /// bundles beside the WebKit rules.
++    private static let engine = Task.detached(priority: .utility) { () -> TarkAdblockEngine? in
++        guard let datURL = Bundle.main.url(forResource: "tark-engine", withExtension: "dat"),
++              let resourcesURL = Bundle.main.url(forResource: "tark-resources", withExtension: "json"),
++              let dat = try? Data(contentsOf: datURL),
++              let resources = try? String(contentsOf: resourcesURL, encoding: .utf8) else { return nil }
++        return TarkAdblockEngine(dat: dat, resourcesJSON: resources)
++    }
++
++    static let userScript = WKUserScript(source: script,
++                                         injectionTime: .atDocumentStart,
++                                         forMainFrameOnly: false,
++                                         in: .defaultClient)
++
++    private weak var tab: Tab?
++
++    init(tab: Tab) {
++        self.tab = tab
++    }
++
++    static func name() -> String {
++        return "TarkCosmeticFilter"
++    }
++
++    func scriptMessageHandlerNames() -> [String]? {
++        return [Self.messageName]
++    }
++
++    func prepareForDeinit() {}
++
++    func userContentController(_ userContentController: WKUserContentController,
++                               didReceiveScriptMessage message: WKScriptMessage) {
++        guard let body = message.body as? [String: Any],
++              let href = body["href"] as? String,
++              let url = URL(string: href),
++              url.scheme == "http" || url.scheme == "https",
++              let tab, tab.contentBlocker?.isEnabled == true,
++              !ContentBlocker.shared.isSafelisted(url: tab.url ?? url),
++              let webView = message.webView else { return }
++        let frame = message.frameInfo
++        switch body["kind"] as? String {
++        case "page":
++            Task {
++                guard let engine = await Self.engine.value else { return }
++                engine.pageResources(for: url) { resources in
++                    guard let resources else { return }
++                    Task { @MainActor [weak webView] in
++                        if !resources.injectedScript.isEmpty {
++                            webView?.evaluateJavaScript(resources.injectedScript, in: frame, in: .page)
++                        }
++                        let page: [String: Any] = ["hideSelectors": resources.hideSelectors,
++                                                   "exceptions": resources.exceptions,
++                                                   "generichide": resources.generichide]
++                        Self.call("page", with: page, in: webView, frame: frame)
++                    }
++                }
++            }
++        case "names":
++            let classes = body["classes"] as? [String] ?? []
++            let ids = body["ids"] as? [String] ?? []
++            let exceptions = body["exceptions"] as? [String] ?? []
++            Task {
++                guard let engine = await Self.engine.value else { return }
++                engine.hiddenSelectors(classes: classes, ids: ids, exceptions: exceptions) { selectors in
++                    guard !selectors.isEmpty else { return }
++                    Task { @MainActor [weak webView] in
++                        Self.call("hide", with: selectors, in: webView, frame: frame)
++                    }
++                }
++            }
++        default:
++            return
++        }
++    }
++
++    private static func call(_ function: String, with argument: Any, in webView: WKWebView?, frame: WKFrameInfo) {
++        guard let data = try? JSONSerialization.data(withJSONObject: argument),
++              let json = String(data: data, encoding: .utf8) else { return }
++        webView?.evaluateJavaScript("window.__tarkCosmetic && window.__tarkCosmetic.\(function)(\(json))",
++                                    in: frame,
++                                    in: .defaultClient)
++    }
++
++    private static let script = """
++    (function () {
++      if (window.__tarkCosmetic) { return; }
++      const send = (m) => { try { webkit.messageHandlers.tarkCosmetic.postMessage(m); } catch (e) {} };
++      const seenClasses = new Set(), seenIds = new Set(), classes = new Set(), ids = new Set();
++      let exceptions = [], generic = true, ready = false, timer = null, style = null;
++      const hide = (selectors) => {
++        if (!selectors.length) { return; }
++        if (!style) { style = document.createElement('style'); }
++        if (!style.isConnected) { (document.head || document.documentElement).appendChild(style); }
++        // One rule per selector: an invalid selector drops only its own rule.
++        style.textContent += selectors.map((s) => s + '{display:none!important}').join('\\n') + '\\n';
++      };
++      const note = (el) => {
++        if (el.id && !seenIds.has(el.id)) { seenIds.add(el.id); ids.add(el.id); }
++        if (el.classList) {
++          for (const c of el.classList) { if (!seenClasses.has(c)) { seenClasses.add(c); classes.add(c); } }
++        }
++      };
++      const flush = () => {
++        timer = null;
++        if (!ready || !generic || (!classes.size && !ids.size)) { return; }
++        send({ kind: 'names', href: location.href, classes: [...classes], ids: [...ids], exceptions });
++        classes.clear(); ids.clear();
++      };
++      const schedule = () => { if (!timer) { timer = setTimeout(flush, 100); } };
++      const scan = (root) => {
++        note(root);
++        if (root.querySelectorAll) { for (const el of root.querySelectorAll('[id],[class]')) { note(el); } }
++      };
++      window.__tarkCosmetic = {
++        page: (r) => {
++          exceptions = r.exceptions; generic = !r.generichide; ready = true;
++          hide(r.hideSelectors);
++          if (document.documentElement) { scan(document.documentElement); }
++          schedule();
++        },
++        hide,
++      };
++      new MutationObserver((mutations) => {
++        for (const m of mutations) {
++          if (m.type === 'attributes') { note(m.target); continue; }
++          for (const n of m.addedNodes) { if (n.nodeType === 1) { scan(n); } }
++        }
++        schedule();
++      }).observe(document, { childList: true, subtree: true, attributes: true, attributeFilter: ['class', 'id'] });
++      send({ kind: 'page', href: location.href });
++    })();
++    """
++}
+diff --git a/firefox-ios/Client/Frontend/Browser/BrowserViewController/Views/BrowserViewController.swift b/firefox-ios/Client/Frontend/Browser/BrowserViewController/Views/BrowserViewController.swift
+index d9f0270..3d37ca8 100644
+--- a/firefox-ios/Client/Frontend/Browser/BrowserViewController/Views/BrowserViewController.swift
++++ b/firefox-ios/Client/Frontend/Browser/BrowserViewController/Views/BrowserViewController.swift
+@@ -4339,6 +4339,7 @@ extension BrowserViewController: LegacyTabDelegate {
+         let blocker = FirefoxTabContentBlocker(tab: tab, prefs: profile.prefs)
+         tab.contentBlocker = blocker
+         tab.addContentScript(blocker, name: FirefoxTabContentBlocker.name())
++        tab.addContentScript(TarkCosmeticFilter(tab: tab), name: TarkCosmeticFilter.name())
+ 
+         tab.addContentScript(FocusHelper(tab: tab), name: FocusHelper.name())
+     }
+diff --git a/firefox-ios/Client/Frontend/TabContentsScripts/UserScriptManager.swift b/firefox-ios/Client/Frontend/TabContentsScripts/UserScriptManager.swift
+index 373669b..c2fd08d 100644
+--- a/firefox-ios/Client/Frontend/TabContentsScripts/UserScriptManager.swift
++++ b/firefox-ios/Client/Frontend/TabContentsScripts/UserScriptManager.swift
+@@ -115,6 +115,8 @@ class UserScriptManager {
+         // Start off by ensuring that any previously-added user scripts are
+         // removed to prevent the same script from being injected twice.
+         webView?.configuration.userContentController.removeAllUserScripts()
++        // Tark: element hiding and scriptlets (TarkCosmeticFilter).
++        webView?.configuration.userContentController.addUserScript(TarkCosmeticFilter.userScript)
+ 
+         // Inject all pre-compiled user scripts.
+         [(WKUserScriptInjectionTime.atDocumentStart, mainFrameOnly: false),
