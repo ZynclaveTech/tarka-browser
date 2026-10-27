@@ -50,6 +50,10 @@ int tark_xlit_looks_transliterable(const char* text);
 // with tark_xlit_string_free.
 char* tark_xlit_row_languages(const char* accept_languages);
 
+// Every language tark_xlit has, in its table order, as the same JSON array.
+// For Settings → Languages. Release with tark_xlit_string_free.
+char* tark_xlit_all_languages(void);
+
 // The Wikipedia language code for `query` (tark_xlit::WikipediaLanguage): "en"
 // for Latin text, else the first language in `accept_languages` written in the
 // query's script, else that script's default. Release with
