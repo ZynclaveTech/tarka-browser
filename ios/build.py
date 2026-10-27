@@ -14,6 +14,9 @@
     build.py xlit     the D1 transliteration engine, from the same patches the
                       Mac and Android build, with ios/xlit's //base shim and C
                       interface, as BrowserKit's TarkXlitCore target
+    build.py brand    the app icon sets (for iOS before 26) rendered from
+                      resources/branding/app-icon.svg; the Liquid Glass icons
+                      and the home header are in ios/patches/look-tark.patch
     build.py sim      bootstrap and build the Fennec scheme for the simulator
 
 The tree is never committed: Tark's changes are the patches in ios/patches,
@@ -49,6 +52,12 @@ XLIT_PATCHES = (
 )
 XLIT_SOURCES = ('blas.h', 'blas_accelerate.cc', 'languages.cc', 'languages.h', 'model.cc', 'model.h',
                 'transliterator.cc', 'transliterator.h', 'word_list.cc', 'word_list.h')
+BRAND_ICON = ROOT / 'resources' / 'branding' / 'app-icon.svg'
+BRAND_INK = '#12121c'
+# The icon sets the Fennec, Beta and Release builds use; the alternates people
+# choose in Settings → App Icon stay Firefox's until they are redrawn.
+ICON_SETS = ('AppIcon', 'AppIcon_Beta', 'AppIcon_Developer')
+ICONS = TREE / 'firefox-ios' / 'Client' / 'Assets' / 'AppIcons.xcassets'
 # Device, and the Apple-silicon simulator.
 IOS_TARGETS = ('aarch64-apple-ios', 'aarch64-apple-ios-sim')
 
@@ -178,6 +187,25 @@ enum TarkXlitFiles {{
 ''')
 
 
+def brand():
+    # iOS masks the corners itself, and App Store Connect refuses an icon with
+    # an alpha channel: the Mac icon's rounded square is drawn full-bleed and
+    # flattened onto its own ink. The tinted variant is grayscale, as iOS
+    # tints it. Each PNG keeps its size, so the sets' Contents.json stay as
+    # they are. Needs rsvg-convert (librsvg) and magick (ImageMagick).
+    square = DERIVED.parent / 'app-icon-square.svg'
+    square.parent.mkdir(parents=True, exist_ok=True)
+    square.write_text(BRAND_ICON.read_text().replace(' rx="226"', ''))
+    for name in ICON_SETS:
+        for png in sorted((ICONS / f'{name}.appiconset').glob('*.png')):
+            size = re.search(r'pixelWidth: (\d+)', out('sips', '-g', 'pixelWidth', png)).group(1)
+            run('rsvg-convert', '-w', size, '-h', size, square, '-o', png)
+            gray = ('-colorspace', 'Gray') if png.stem.endswith('-tinted') else ()
+            run('magick', png, '-background', BRAND_INK, '-alpha', 'remove', '-alpha', 'off', *gray, png)
+            if out('sips', '-g', 'hasAlpha', png).split()[-1] != 'no':
+                sys.exit(f'{png} still has an alpha channel')
+
+
 def sim():
     # No -sdk: it would build the package macros (host tools) for the
     # simulator too, and the compiler then cannot run them.
@@ -192,7 +220,7 @@ def sim():
 
 
 if __name__ == '__main__':
-    steps = {'fetch': fetch, 'patch': patch, 'lists': lists, 'engine': engine, 'xlit': xlit, 'sim': sim}
+    steps = {'fetch': fetch, 'patch': patch, 'lists': lists, 'engine': engine, 'xlit': xlit, 'brand': brand, 'sim': sim}
     if len(sys.argv) != 2 or sys.argv[1] not in steps:
         sys.exit(__doc__)
     steps[sys.argv[1]]()

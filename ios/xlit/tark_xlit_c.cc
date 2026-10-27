@@ -36,6 +36,16 @@ char* CopyToMalloc(const std::string& text) {
   return out;
 }
 
+// Tags and CLDR names are plain text without quotes or backslashes, so they
+// go into the JSON as they are.
+void AppendLanguage(std::string& json, const tark_xlit::Language& language) {
+  if (json.size() > 1) {
+    json += ",";
+  }
+  json += "{\"tag\":\"" + std::string(language.tag) + "\",\"name\":\"" +
+          base::UTF16ToUTF8(language.native_name) + "\"}";
+}
+
 }  // namespace
 
 extern "C" {
@@ -102,16 +112,19 @@ int tark_xlit_looks_transliterable(const char* text) {
 }
 
 char* tark_xlit_row_languages(const char* accept_languages) {
-  // Tags and CLDR names are plain text without quotes or backslashes, so
-  // they go into the JSON as they are.
   std::string json = "[";
   for (const tark_xlit::Language* language :
        tark_xlit::RowLanguages(accept_languages ? accept_languages : "")) {
-    if (json.size() > 1) {
-      json += ",";
-    }
-    json += "{\"tag\":\"" + std::string(language->tag) + "\",\"name\":\"" +
-            base::UTF16ToUTF8(language->native_name) + "\"}";
+    AppendLanguage(json, *language);
+  }
+  json += "]";
+  return CopyToMalloc(json);
+}
+
+char* tark_xlit_all_languages(void) {
+  std::string json = "[";
+  for (const tark_xlit::Language& language : tark_xlit::AllLanguages()) {
+    AppendLanguage(json, language);
   }
   json += "]";
   return CopyToMalloc(json);

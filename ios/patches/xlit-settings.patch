@@ -1,0 +1,422 @@
+diff --git a/BrowserKit/Sources/TarkXlit/TarkLanguagesViewController.swift b/BrowserKit/Sources/TarkXlit/TarkLanguagesViewController.swift
+new file mode 100644
+index 0000000..d176323
+--- /dev/null
++++ b/BrowserKit/Sources/TarkXlit/TarkLanguagesViewController.swift
+@@ -0,0 +1,145 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++import Network
++import UIKit
++
++/// Settings → Languages, as on Android: the switch for Indian-language
++/// suggestions in the address bar, where its download stands, and the
++/// languages (up to three) the suggestions are in.
++public final class TarkLanguagesViewController: UITableViewController {
++    private enum Section: Int, CaseIterable { case suggestions, languages }
++
++    private let all = TarkTransliteration.allLanguages()
++    private var chosen = TarkTransliteration.languages()
++    /// While the screen shows: a run that waited for Wi-Fi starts again when
++    /// the phone joins one.
++    private let pathMonitor = NWPathMonitor()
++
++    public init() {
++        super.init(style: .insetGrouped)
++        title = "Languages"
++    }
++
++    @available(*, unavailable)
++    required init?(coder: NSCoder) {
++        fatalError("init(coder:) has not been implemented")
++    }
++
++    override public func viewDidLoad() {
++        super.viewDidLoad()
++        // Posted on the main thread; removed with the controller.
++        NotificationCenter.default.addObserver(
++            self, selector: #selector(downloadsChanged), name: TarkTransliteration.didChangeNotification, object: nil
++        )
++        pathMonitor.pathUpdateHandler = { path in
++            guard path.status == .satisfied, !path.isExpensive, !path.isConstrained else { return }
++            Task { @MainActor in
++                if TarkTransliteration.downloadState() == .waitingForWiFi {
++                    TarkTransliteration.startDownloads(now: false)
++                }
++            }
++        }
++        pathMonitor.start(queue: DispatchQueue(label: "com.gettarka.xlit.settings.path"))
++    }
++
++    override public func viewWillAppear(_ animated: Bool) {
++        super.viewWillAppear(animated)
++        // After a relaunch nothing has run yet: the screen shows a real state.
++        TarkTransliteration.startDownloads(now: false)
++    }
++
++    override public func viewDidDisappear(_ animated: Bool) {
++        super.viewDidDisappear(animated)
++        if isMovingFromParent || isBeingDismissed { pathMonitor.cancel() }
++    }
++
++    override public func numberOfSections(in tableView: UITableView) -> Int {
++        return Section.allCases.count
++    }
++
++    override public func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
++        switch Section(rawValue: section) {
++        case .suggestions: return 1
++        case .languages: return TarkTransliteration.isOn ? all.count : 0
++        case nil: return 0
++        }
++    }
++
++    override public func tableView(_ tableView: UITableView, titleForFooterInSection section: Int) -> String? {
++        switch Section(rawValue: section) {
++        case .suggestions:
++            return "Type in English letters and get your language in the address bar. "
++                + "Tark downloads about 25 MB once from gettarka.com; what you type never leaves the phone."
++        case .languages:
++            return TarkTransliteration.isOn ? "Up to \(TarkTransliteration.maxLanguages)." : nil
++        case nil:
++            return nil
++        }
++    }
++
++    override public func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
++        let cell = UITableViewCell(style: .subtitle, reuseIdentifier: nil)
++        var content = cell.defaultContentConfiguration()
++        switch Section(rawValue: indexPath.section) {
++        case .suggestions:
++            content.text = "Indian-language suggestions"
++            content.secondaryText = Self.summary(TarkTransliteration.downloadState())
++            content.secondaryTextProperties.color = .secondaryLabel
++            let toggle = UISwitch()
++            toggle.isOn = TarkTransliteration.isOn
++            toggle.addTarget(self, action: #selector(switchChanged(_:)), for: .valueChanged)
++            cell.accessoryView = toggle
++            cell.selectionStyle = .none
++        case .languages:
++            let language = all[indexPath.row]
++            content.text = language.name
++            cell.accessoryType = chosen.contains(language) ? .checkmark : .none
++        case nil:
++            break
++        }
++        cell.contentConfiguration = content
++        return cell
++    }
++
++    override public func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
++        tableView.deselectRow(at: indexPath, animated: true)
++        guard Section(rawValue: indexPath.section) == .languages else { return }
++        let language = all[indexPath.row]
++        if let index = chosen.firstIndex(of: language) {
++            // One language always stays: with none there would be no rows.
++            guard chosen.count > 1 else { return }
++            chosen.remove(at: index)
++        } else {
++            guard chosen.count < TarkTransliteration.maxLanguages else { return }
++            chosen.append(language)
++        }
++        TarkTransliteration.setLanguages(chosen)
++        TarkTransliteration.startDownloads(now: false)
++        tableView.reloadSections(IndexSet(integersIn: 0..<Section.allCases.count), with: .none)
++    }
++
++    @objc
++    private func switchChanged(_ toggle: UISwitch) {
++        TarkTransliteration.isOn = toggle.isOn
++        TarkTransliteration.startDownloads(now: false)
++        tableView.reloadSections(IndexSet(integersIn: 0..<Section.allCases.count), with: .automatic)
++    }
++
++    @objc
++    private func downloadsChanged() {
++        tableView.reloadRows(at: [IndexPath(row: 0, section: Section.suggestions.rawValue)], with: .none)
++    }
++
++    static func summary(_ state: TarkTransliteration.DownloadState) -> String {
++        switch state {
++        case .off: return "Off"
++        case .notDownloaded: return "Not downloaded yet"
++        case .waitingForWiFi: return "Waiting for Wi-Fi"
++        case .failed: return "Couldn’t download. Tark tries again later."
++        case .downloading: return "Downloading…"
++        case .ready(let languages): return "Downloaded: " + languages.map(\.name).joined(separator: ", ")
++        }
++    }
++}
+diff --git a/BrowserKit/Sources/TarkXlit/TarkTransliteration.swift b/BrowserKit/Sources/TarkXlit/TarkTransliteration.swift
+index 3b0ba6a..22d55f8 100644
+--- a/BrowserKit/Sources/TarkXlit/TarkTransliteration.swift
++++ b/BrowserKit/Sources/TarkXlit/TarkTransliteration.swift
+@@ -31,15 +31,109 @@ public final class TarkTransliteration: @unchecked Sendable {
+         if let handle { tark_xlit_free(handle) }
+     }
+ 
+-    /// The languages to offer, best first, from iOS's preferred languages
+-    /// (tark_xlit::RowLanguages, as on the Mac and Android).
+-    public static func languages(preferred: [String] = Locale.preferredLanguages) -> [Language] {
++    /// The person's answer to the one-time offer, or Settings → Languages'
++    /// switch: "yes", "no", or nil before either.
++    public static let answerKey = "tark.xlit.answer"
++    /// The tags chosen in Settings → Languages, best first; unset follows the
++    /// phone's languages.
++    static let chosenKey = "tark.xlit.languages"
++    /// At most this many rows (tark_xlit kMaxRows).
++    public static let maxLanguages = 3
++
++    public static var isOn: Bool {
++        get { UserDefaults.standard.string(forKey: answerKey) == "yes" }
++        set { UserDefaults.standard.set(newValue ? "yes" : "no", forKey: answerKey) }
++    }
++
++    public static var hasAnswered: Bool {
++        return UserDefaults.standard.string(forKey: answerKey) != nil
++    }
++
++    /// The languages to offer, best first: the ones chosen in Settings, else
++    /// the phone's (tark_xlit::RowLanguages, as on the Mac and Android).
++    public static func languages() -> [Language] {
++        if let chosen = UserDefaults.standard.stringArray(forKey: chosenKey), !chosen.isEmpty {
++            let all = allLanguages()
++            return chosen.compactMap { tag in all.first { $0.tag == tag } }
++        }
++        return phoneLanguages()
++    }
++
++    public static func setLanguages(_ languages: [Language]) {
++        UserDefaults.standard.set(languages.prefix(maxLanguages).map(\.tag), forKey: chosenKey)
++    }
++
++    /// The Indian languages among iOS's preferred languages, Hindi if none.
++    public static func phoneLanguages(preferred: [String] = Locale.preferredLanguages) -> [Language] {
+         let acceptLanguages = preferred.joined(separator: ",")
+-        guard let json = acceptLanguages.withCString({ tark_xlit_row_languages($0) }) else { return [] }
++        return decode(acceptLanguages.withCString { tark_xlit_row_languages($0) })
++    }
++
++    /// Every language tark_xlit has, for Settings → Languages.
++    public static func allLanguages() -> [Language] {
++        return decode(tark_xlit_all_languages())
++    }
++
++    private static func decode(_ json: UnsafeMutablePointer<CChar>?) -> [Language] {
++        guard let json else { return [] }
+         defer { tark_xlit_string_free(json) }
+         return (try? JSONDecoder().decode([Language].self, from: Data(String(cString: json).utf8))) ?? []
+     }
+ 
++    /// Where the downloads stand, for Settings → Languages.
++    public enum DownloadState: Equatable {
++        /// On, with files missing and no run since the app started.
++        case notDownloaded
++        case off, waitingForWiFi, downloading, failed, ready([Language])
++    }
++
++    /// Posted on the main thread when a download run starts or ends.
++    public static let didChangeNotification = Notification.Name("TarkXlitDidChange")
++
++    @MainActor private static var downloading = false
++    /// How the last run ended short of every file, or nil: kept in memory, so
++    /// after a relaunch the state is `notDownloaded` until a run starts.
++    @MainActor private static var lastProblem: TarkXlitDownloader.Outcome?
++
++    @MainActor
++    public static func downloadState() -> DownloadState {
++        guard isOn else { return .off }
++        if downloading { return .downloading }
++        let ready = shared.readyLanguages()
++        if ready.count == languages().count { return .ready(ready) }
++        switch lastProblem {
++        case .waitingForWiFi: return .waitingForWiFi
++        case .failed: return .failed
++        case .ready, nil: return .notDownloaded
++        }
++    }
++
++    /// Downloads what the chosen languages still need. "Download now" (`now`)
++    /// ignores the Wi-Fi rule.
++    @MainActor
++    public static func startDownloads(now: Bool) {
++        guard isOn, !downloading else { return }
++        downloading = true
++        NotificationCenter.default.post(name: didChangeNotification, object: nil)
++        let tags = languages().map(\.tag)
++        Task.detached {
++            var problem: TarkXlitDownloader.Outcome?
++            for tag in tags {
++                let outcome = await shared.downloader.download(tag, now: now)
++                if outcome != .ready { problem = outcome }
++                // Without Wi-Fi the other languages would wait too.
++                if outcome == .waitingForWiFi { break }
++            }
++            await MainActor.run {
++                downloading = false
++                lastProblem = problem
++                NotificationCenter.default.post(name: didChangeNotification, object: nil)
++                // A language chosen while this run was going still needs its list.
++                if problem == nil, languages().map(\.tag) != tags { startDownloads(now: now) }
++            }
++        }
++    }
++
+     /// Whether `text` might be an Indian-language phrase typed in Latin letters.
+     public static func looksTransliterable(_ text: String) -> Bool {
+         return text.withCString { tark_xlit_looks_transliterable($0) } == 1
+diff --git a/BrowserKit/Sources/TarkXlit/TarkXlitDownloader.swift b/BrowserKit/Sources/TarkXlit/TarkXlitDownloader.swift
+index 495a21f..ea68f83 100644
+--- a/BrowserKit/Sources/TarkXlit/TarkXlitDownloader.swift
++++ b/BrowserKit/Sources/TarkXlit/TarkXlitDownloader.swift
+@@ -60,18 +60,26 @@ public final class TarkXlitDownloader: NSObject, @unchecked Sendable, URLSession
+         return true
+     }
+ 
++    public enum Outcome: Sendable {
++        case ready
++        /// Not tried: cellular or a constrained network, without "Download now".
++        case waitingForWiFi
++        /// Tried and did not get verified files.
++        case failed
++    }
++
+     /// Downloads what `tag` still needs. Cellular or a constrained network
+     /// waits unless `now` (the person chose "Download now").
+-    public func download(_ tag: String, now: Bool) async -> Bool {
+-        if !now, await !Self.isUnmeteredNetwork() { return false }
++    public func download(_ tag: String, now: Bool) async -> Outcome {
++        if !now, await !Self.isUnmeteredNetwork() { return .waitingForWiFi }
+         for name in [Self.modelName, Self.wordsName(tag)] where !isVerified(name) {
+             var done = false
+             for _ in 0..<Self.triesPerRun where !done {
+                 done = await fetch(name)
+             }
+-            if !done { return false }
++            if !done { return .failed }
+         }
+-        return isReady(tag)
++        return isReady(tag) ? .ready : .failed
+     }
+ 
+     private func fetch(_ name: String) async -> Bool {
+diff --git a/firefox-ios/Client/Frontend/Browser/Search/SearchViewModel.swift b/firefox-ios/Client/Frontend/Browser/Search/SearchViewModel.swift
+index 111cf4b..1bce42d 100644
+--- a/firefox-ios/Client/Frontend/Browser/Search/SearchViewModel.swift
++++ b/firefox-ios/Client/Frontend/Browser/Search/SearchViewModel.swift
+@@ -44,7 +44,6 @@ class SearchViewModel: FeatureFlaggable,
+     var tarkOffer: TarkTransliteration.Language?
+     /// Tark: the `@` source rows, by row text.
+     var tarkSourceRows: [String: TarkSource] = [:]
+-    @MainActor static var tarkDownloading = false
+     static var userAgent: String?
+     var searchFeature: FeatureHolder<Search>
+     private var searchTelemetry: SearchTelemetry
+@@ -581,9 +580,6 @@ fileprivate extension String {
+ // MARK: - Tark: your language (D1)
+ 
+ extension SearchViewModel {
+-    /// Whether the person has answered the one-time offer: "yes", "no", or nil.
+-    static let tarkXlitAnswerKey = "tark.xlit.answer"
+-
+     /// A language row or the offer row: neither fills the address bar.
+     func isTarkRow(_ row: String) -> Bool {
+         return tarkLabels[row] != nil || tarkSourceRows[row] != nil || row == tarkOfferText
+@@ -612,15 +608,17 @@ extension SearchViewModel {
+         }
+         guard !query.isEmpty, !query.looksLikeAURL(), TarkTransliteration.looksTransliterable(query) else { return }
+         let xlit = TarkTransliteration.shared
+-        let answer = UserDefaults.standard.string(forKey: Self.tarkXlitAnswerKey)
+-        if answer == nil, xlit.readyLanguages().isEmpty, let first = TarkTransliteration.languages().first {
++        if !TarkTransliteration.hasAnswered, xlit.readyLanguages().isEmpty,
++           let first = TarkTransliteration.languages().first {
+             tarkOffer = first
+             let at = min(1, suggestions?.count ?? 0)
+             if let text = tarkOfferText { suggestions?.insert(text, at: at) }
+             delegate?.reloadTableView()
+             return
+         }
+-        if answer == "yes" { startTarkDownload(now: false) }
++        // "Not now", or the switch in Settings → Languages turned off.
++        guard TarkTransliteration.isOn else { return }
++        TarkTransliteration.startDownloads(now: false)
+         xlit.rows(for: query) { [weak self] rows in
+             guard let self, self.searchQuery == query, !rows.isEmpty else { return }
+             var at = min(1, self.suggestions?.count ?? 0)
+@@ -658,22 +656,9 @@ extension SearchViewModel {
+     /// The person's answer to the offer. "Download now" ignores the Wi-Fi rule.
+     @MainActor
+     func answerTarkOffer(yes: Bool, now: Bool) {
+-        UserDefaults.standard.set(yes ? "yes" : "no", forKey: Self.tarkXlitAnswerKey)
++        TarkTransliteration.isOn = yes
+         if let offer = tarkOfferText { suggestions?.removeAll { $0 == offer } }
+         tarkOffer = nil
+-        if yes { startTarkDownload(now: now) }
+-    }
+-
+-    @MainActor
+-    private func startTarkDownload(now: Bool) {
+-        guard !Self.tarkDownloading else { return }
+-        Self.tarkDownloading = true
+-        let tags = TarkTransliteration.languages().map(\.tag)
+-        Task.detached {
+-            for tag in tags {
+-                _ = await TarkTransliteration.shared.downloader.download(tag, now: now)
+-            }
+-            await MainActor.run { Self.tarkDownloading = false }
+-        }
++        TarkTransliteration.startDownloads(now: now)
+     }
+ }
+diff --git a/firefox-ios/Client/Frontend/Settings/Main/AppSettingsTableViewController.swift b/firefox-ios/Client/Frontend/Settings/Main/AppSettingsTableViewController.swift
+index 841728b..9d0641f 100644
+--- a/firefox-ios/Client/Frontend/Settings/Main/AppSettingsTableViewController.swift
++++ b/firefox-ios/Client/Frontend/Settings/Main/AppSettingsTableViewController.swift
+@@ -6,6 +6,7 @@ import Common
+ import UIKit
+ import Shared
+ import Glean
++import TarkXlit
+ 
+ import struct MozillaAppServices.VisitObservation
+ 
+@@ -377,6 +378,7 @@ class AppSettingsTableViewController: SettingsTableViewController,
+                 searchEnginesManager: searchEnginesManager,
+                 theme: currentTheme()
+             ),
++            TarkLanguagesSetting(theme: currentTheme()),
+             NewTabPageSetting(settings: self, settingsDelegate: parentCoordinator),
+             HomeSetting(settings: self, settingsDelegate: parentCoordinator),
+             ThemeSetting(settings: self, settingsDelegate: parentCoordinator)
+@@ -684,3 +686,29 @@ class AppSettingsTableViewController: SettingsTableViewController,
+         return headerView
+     }
+ }
++
++/// Tark: Settings → Languages (the address bar's Indian-language suggestions).
++final class TarkLanguagesSetting: Setting {
++    override var accessoryView: UIImageView? {
++        guard let theme else { return nil }
++        return SettingDisclosureUtility.buildDisclosureIndicator(theme: theme)
++    }
++
++    override var style: UITableViewCell.CellStyle { return .value1 }
++
++    override var status: NSAttributedString? {
++        guard TarkTransliteration.isOn else { return NSAttributedString(string: "Off") }
++        return NSAttributedString(string: TarkTransliteration.languages().map(\.name).joined(separator: ", "))
++    }
++
++    init(theme: Theme) {
++        super.init(title: NSAttributedString(
++            string: "Languages",
++            attributes: [NSAttributedString.Key.foregroundColor: theme.colors.textPrimary]
++        ))
++    }
++
++    override func onClick(_ navigationController: UINavigationController?) {
++        navigationController?.pushViewController(TarkLanguagesViewController(), animated: true)
++    }
++}
