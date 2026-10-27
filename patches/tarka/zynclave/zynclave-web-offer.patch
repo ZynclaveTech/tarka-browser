@@ -428,7 +428,7 @@
 +#endif  // CHROME_BROWSER_TARK_ZYNCLAVE_WHOAMI_FETCHER_H_
 --- /dev/null
 +++ b/chrome/browser/tark_zynclave/zynclave_offer_bubble.cc
-@@ -0,0 +1,63 @@
+@@ -0,0 +1,75 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -439,8 +439,10 @@
 +#include <utility>
 +
 +#include "base/functional/callback.h"
++#include "base/logging.h"
 +#include "chrome/browser/ui/views/frame/browser_view.h"
 +#include "chrome/browser/ui/views/location_bar/location_bar_view.h"
++#include "chrome/browser/ui/views/location_bar/location_icon_view.h"
 +#include "chrome/grit/generated_resources.h"
 +#include "components/tabs/public/tab_interface.h"
 +#include "ui/base/l10n/l10n_util.h"
@@ -457,13 +459,20 @@
 +                             base::OnceClosure on_no_thanks) {
 +  tabs::TabInterface* tab = tabs::TabInterface::MaybeGetFromContents(contents);
 +  if (!tab || !tab->IsActivated() || !tab->GetBrowserWindowInterface()) {
++    VLOG(1) << "tark_zynclave offer: tab not active";
 +    return;
 +  }
 +  BrowserView* browser_view =
 +      BrowserView::GetBrowserViewForBrowser(tab->GetBrowserWindowInterface());
-+  views::View* anchor =
++  // Under the site icon at the start of the address bar.
++  LocationBarView* location_bar =
 +      browser_view ? browser_view->GetLocationBarView() : nullptr;
++  views::View* anchor = location_bar && location_bar->location_icon_view()
++                            ? static_cast<views::View*>(
++                                  location_bar->location_icon_view())
++                            : location_bar;
 +  if (!anchor || !anchor->GetWidget() || !anchor->GetWidget()->IsVisible()) {
++    VLOG(1) << "tark_zynclave offer: no address bar to anchor to";
 +    return;
 +  }
 +  std::u16string title =
@@ -486,6 +495,9 @@
 +          .Build();
 +  auto bubble = std::make_unique<views::BubbleDialogModelHost>(
 +      std::move(model), anchor, views::BubbleBorder::TOP_LEFT);
++  // It stays until the person answers: a click elsewhere on the page would
++  // otherwise close it before it is read, and it is offered once a run.
++  bubble->set_close_on_deactivate(false);
 +  views::BubbleDialogDelegate::CreateBubbleDeprecated(
 +      std::move(bubble), views::Widget::InitParams::NATIVE_WIDGET_OWNS_WIDGET)
 +      ->Show();
@@ -525,7 +537,7 @@
 +#endif  // CHROME_BROWSER_TARK_ZYNCLAVE_ZYNCLAVE_OFFER_BUBBLE_H_
 --- /dev/null
 +++ b/chrome/browser/tark_zynclave/zynclave_web_offer.cc
-@@ -0,0 +1,176 @@
+@@ -0,0 +1,185 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -536,6 +548,7 @@
 +#include <string>
 +
 +#include "base/functional/bind.h"
++#include "base/logging.h"
 +#include "base/no_destructor.h"
 +#include "base/strings/string_number_conversions.h"
 +#include "base/values.h"
@@ -612,6 +625,7 @@
 +  for (const GURL& url : handle->GetRedirectChain()) {
 +    if (IsAccountsUrl(url, host)) {
 +      marked_ = true;
++      VLOG(1) << "tark_zynclave offer: tab went through the account pages";
 +    }
 +  }
 +}
@@ -622,6 +636,7 @@
 +                     GetZynclaveConfig().accounts_host)) {
 +    return;
 +  }
++  VLOG(1) << "tark_zynclave offer: settling";
 +  settle_.Start(FROM_HERE, kSettle,
 +                base::BindOnce(&ZynclaveWebOffer::Check,
 +                               weak_factory_.GetWeakPtr()));
@@ -634,8 +649,10 @@
 +      ZynclaveSignInServiceFactory::GetForProfile(profile);
 +  if (checking_ || !service ||
 +      !MayCheck(service->allowed(), service->auth().state())) {
++    VLOG(1) << "tark_zynclave offer: no check (signed in, off or busy)";
 +    return;
 +  }
++  VLOG(1) << "tark_zynclave offer: whoami";
 +  checking_ = true;
 +  FetchWhoami(
 +      profile, GURL("https://" + GetZynclaveConfig().accounts_host + "/"),
@@ -644,6 +661,7 @@
 +
 +void ZynclaveWebOffer::OnWhoami(WhoamiResult who) {
 +  checking_ = false;
++  VLOG(1) << "tark_zynclave offer: whoami signed_in=" << who.signed_in;
 +  if (!who.signed_in) {
 +    return;
 +  }
@@ -657,12 +675,15 @@
 +  std::string hash = DeclineHash(Salt(prefs), who.id);
 +  for (const base::Value& declined : prefs->GetList(kDeclinedPref)) {
 +    if (declined.is_string() && declined.GetString() == hash) {
++      VLOG(1) << "tark_zynclave offer: declined before";
 +      return;
 +    }
 +  }
 +  if (!OfferedThisRun().insert(hash).second) {
++    VLOG(1) << "tark_zynclave offer: already offered in this run";
 +    return;
 +  }
++  VLOG(1) << "tark_zynclave offer: showing";
 +  std::string email = who.email;
 +  ShowZynclaveOfferBubble(
 +      web_contents(), OfferTitleName(who),
