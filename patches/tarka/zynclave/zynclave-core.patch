@@ -1,16 +1,27 @@
 --- a/chrome/browser/BUILD.gn
 +++ b/chrome/browser/BUILD.gn
-@@ -1677,6 +1677,7 @@
+@@ -1673,10 +1673,18 @@
+       "tark_adblock/tark_adblock_service.h",
+       "tark_adblock/tark_adblock_updater.cc",
+       "tark_adblock/tark_adblock_updater.h",
++      "tark_zynclave/zynclave_redirect_throttle.cc",
++      "tark_zynclave/zynclave_redirect_throttle.h",
++      "tark_zynclave/zynclave_sign_in_service.cc",
++      "tark_zynclave/zynclave_sign_in_service.h",
++      "tark_zynclave/zynclave_sign_in_service_factory.cc",
++      "tark_zynclave/zynclave_sign_in_service_factory.h",
+     ]
      deps += [
        "//chrome/browser/tark_adblock:bundle",
        "//chrome/browser/tark_adblock:switch",
++      "//chrome/browser/tark_zynclave:auth",
 +      "//chrome/browser/tark_zynclave:oidc",
        "//chrome/common/tark_adblock:mojom",
        "//third_party/brave_adblock",
      ]
 --- /dev/null
 +++ b/chrome/browser/tark_zynclave/BUILD.gn
-@@ -0,0 +1,57 @@
+@@ -0,0 +1,95 @@
 +# Copyright 2026 The Tark Authors
 +# Use of this source code is governed by a BSD-style license that can be
 +# found in the LICENSE file.
@@ -53,15 +64,53 @@
 +  ]
 +}
 +
++# The sign-in itself: discovery, the code exchange, token storage and
++# refresh, sign-out. The browser side (ZynclaveSignInService) gives it the
++# network, the encryption and the tab to open.
++static_library("auth") {
++  sources = [
++    "token_cipher.h",
++    "zynclave_auth.cc",
++    "zynclave_auth.h",
++    "zynclave_prefs.cc",
++    "zynclave_prefs.h",
++  ]
++  public_deps = [
++    ":oidc",
++    "//base",
++    "//components/prefs",
++    "//services/network/public/cpp",
++  ]
++  deps = [ "//net" ]
++}
++
++source_set("test_util") {
++  testonly = true
++  sources = [
++    "oidc_test_util.cc",
++    "oidc_test_util.h",
++  ]
++  deps = [
++    "//base",
++    "//crypto",
++  ]
++}
++
 +test("tark_zynclave_unittests") {
 +  sources = [
 +    "oidc_unittest.cc",
 +    "whoami_response_unittest.cc",
++    "zynclave_auth_unittest.cc",
 +  ]
 +  deps = [
++    ":auth",
 +    ":oidc",
++    ":test_util",
 +    "//base",
-+    "//base/test:run_all_unittests",
++    "//base/test:test_support",
++    "//components/prefs:test_support",
++    "//mojo/core/test:run_all_unittests",
++    "//services/network:test_support",
 +    "//crypto",
 +    "//net",
 +    "//testing/gtest",
@@ -70,10 +119,13 @@
 +}
 --- /dev/null
 +++ b/chrome/browser/tark_zynclave/DEPS
-@@ -0,0 +1,4 @@
+@@ -0,0 +1,7 @@
 +include_rules = [
 +  "+crypto",
 +  "+net/base",
++  "+components/prefs",
++  "+services/network/public",
++  "+services/network/test",
 +]
 --- /dev/null
 +++ b/chrome/browser/tark_zynclave/oidc.cc
@@ -1241,3 +1293,1907 @@
 +}  // namespace tark_zynclave
 +
 +#endif  // CHROME_BROWSER_TARK_ZYNCLAVE_ZYNCLAVE_CONFIG_H_
+--- a/chrome/browser/chrome_content_browser_client_navigation_throttles.cc
++++ b/chrome/browser/chrome_content_browser_client_navigation_throttles.cc
+@@ -2,6 +2,7 @@
+ // Use of this source code is governed by a BSD-style license that can be
+ // found in the LICENSE file.
+ 
++#include "chrome/browser/tark_zynclave/zynclave_redirect_throttle.h"
+ #include "chrome/browser/chrome_content_browser_client_navigation_throttles.h"
+ 
+ #include "base/command_line.h"
+@@ -287,6 +288,10 @@
+ void CreateAndAddChromeThrottlesForNavigation(
+     content::NavigationThrottleRegistry& registry) {
+   content::NavigationHandle& handle = registry.GetNavigationHandle();
++#if !BUILDFLAG(IS_ANDROID)
++  // Tark: Zynclave's sign-in redirect never leaves Tark.
++  tark_zynclave::ZynclaveRedirectThrottle::MaybeCreateAndAdd(registry);
++#endif
+   if (handle.IsInMainFrame()) {
+     // MetricsNavigationThrottle requires that it runs before
+     // NavigationThrottles that may delay or cancel navigations, so only
+--- a/chrome/browser/prefs/browser_prefs.cc
++++ b/chrome/browser/prefs/browser_prefs.cc
+@@ -87,6 +87,7 @@
+ #include "chrome/browser/signin/signin_promo_util.h"
+ #include "chrome/browser/ssl/ssl_config_service_manager.h"
+ #include "chrome/browser/tark_adblock/tark_adblock_profile.h"
++#include "chrome/browser/tark_zynclave/zynclave_prefs.h"
+ #include "chrome/browser/themes/theme_service.h"
+ #include "chrome/browser/tips/core/tips_prefs.h"
+ #include "chrome/browser/tracing/chrome_tracing_delegate.h"
+@@ -1858,6 +1859,7 @@
+   registry->RegisterBooleanPref(prefs::kRendererAccessibilityEnabled, true);
+   // Tark: the ad blocker (uBlock Origin's state, carried over once).
+   tark_adblock::RegisterProfilePrefs(registry);
++  tark_zynclave::RegisterZynclavePrefs(registry);
+   AccessibilityUIMessageHandler::RegisterProfilePrefs(registry);
+ #if !BUILDFLAG(IS_ANDROID) || BUILDFLAG(IS_DESKTOP_ANDROID)  // nocheck
+   ttc::AiOverlayDialogController::RegisterProfilePrefs(registry);
+--- a/chrome/browser/profiles/chrome_browser_main_extra_parts_profiles.cc
++++ b/chrome/browser/profiles/chrome_browser_main_extra_parts_profiles.cc
+@@ -257,6 +257,7 @@
+ #include "chrome/browser/sync/sync_service_factory.h"
+ #include "chrome/browser/sync/user_event_service_factory.h"
+ #include "chrome/browser/tab_group_sync/tab_group_sync_service_factory.h"
++#include "chrome/browser/tark_zynclave/zynclave_sign_in_service_factory.h"
+ #include "chrome/browser/themes/theme_service_factory.h"
+ #include "chrome/browser/tips/tips_service_factory.h"
+ #include "chrome/browser/translate/translate_ranker_factory.h"
+@@ -1581,6 +1582,7 @@
+   WebApkInstallServiceFactory::GetInstance();
+ #endif
+ 
++  tark_zynclave::ZynclaveSignInServiceFactory::GetInstance();
+   WebDataServiceFactory::GetInstance();
+   webrtc_event_logging::WebRtcEventLogManagerKeyedServiceFactory::GetInstance();
+ }
+--- /dev/null
++++ b/chrome/browser/tark_zynclave/oidc_test_util.cc
+@@ -0,0 +1,112 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/tark_zynclave/oidc_test_util.h"
++
++#include <vector>
++
++#include "base/base64url.h"
++#include "base/json/json_writer.h"
++#include "base/strings/strcat.h"
++#include "crypto/sign.h"
++
++namespace tark_zynclave::test {
++
++namespace {
++
++std::string B64(base::span<const uint8_t> bytes) {
++  std::string out;
++  base::Base64UrlEncode(bytes, base::Base64UrlEncodePolicy::OMIT_PADDING,
++                        &out);
++  return out;
++}
++
++std::string Json(const base::DictValue& dict) {
++  return base::WriteJson(dict).value();
++}
++
++}  // namespace
++
++FakeIssuer::FakeIssuer(std::string issuer)
++    : issuer_(std::move(issuer)),
++      key_(crypto::keypair::PrivateKey::GenerateRsa2048()) {}
++
++FakeIssuer::~FakeIssuer() = default;
++
++std::string FakeIssuer::Url(std::string_view path) const {
++  return base::StrCat({issuer_, path});
++}
++
++std::string FakeIssuer::DiscoveryJson() const {
++  base::DictValue d;
++  d.Set("issuer", issuer_);
++  d.Set("authorization_endpoint", Url("oauth2/auth"));
++  d.Set("token_endpoint", Url("oauth2/token"));
++  d.Set("userinfo_endpoint", Url("userinfo"));
++  d.Set("revocation_endpoint", Url("oauth2/revoke"));
++  d.Set("end_session_endpoint", Url("oauth2/sessions/logout"));
++  d.Set("jwks_uri", Url(".well-known/jwks.json"));
++  return Json(d);
++}
++
++std::string FakeIssuer::JwksJson() const {
++  crypto::keypair::PublicKey pub =
++      crypto::keypair::PublicKey::FromPrivateKey(key_);
++  base::DictValue jwk;
++  jwk.Set("kty", "RSA");
++  jwk.Set("alg", "RS256");
++  jwk.Set("use", "sig");
++  jwk.Set("kid", "k1");
++  jwk.Set("n", B64(pub.GetRsaModulus()));
++  jwk.Set("e", B64(pub.GetRsaExponent()));
++  base::ListValue keys;
++  keys.Append(std::move(jwk));
++  base::DictValue jwks;
++  jwks.Set("keys", std::move(keys));
++  return Json(jwks);
++}
++
++std::string FakeIssuer::IdToken(std::string_view client_id,
++                                std::string_view nonce,
++                                base::Time now,
++                                std::string_view sub,
++                                std::string_view email) const {
++  base::DictValue header;
++  header.Set("alg", "RS256");
++  header.Set("kid", "k1");
++  base::DictValue claims;
++  claims.Set("iss", issuer_);
++  claims.Set("aud", client_id);
++  claims.Set("sub", sub);
++  claims.Set("email", email);
++  claims.Set("nonce", nonce);
++  claims.Set("iat", now.InSecondsFSinceUnixEpoch());
++  claims.Set("exp", now.InSecondsFSinceUnixEpoch() + 600);
++  std::string input = base::StrCat({B64(base::as_byte_span(Json(header))),
++                                    ".",
++                                    B64(base::as_byte_span(Json(claims)))});
++  std::vector<uint8_t> sig = crypto::sign::Sign(
++      crypto::sign::RSA_PKCS1_SHA256, key_, base::as_byte_span(input));
++  return base::StrCat({input, ".", B64(sig)});
++}
++
++// static
++std::string FakeIssuer::TokenJson(std::string_view access,
++                                  std::string_view refresh,
++                                  std::string_view id_token,
++                                  int expires_in) {
++  base::DictValue d;
++  d.Set("access_token", access);
++  if (!refresh.empty()) {
++    d.Set("refresh_token", refresh);
++  }
++  if (!id_token.empty()) {
++    d.Set("id_token", id_token);
++  }
++  d.Set("expires_in", expires_in);
++  d.Set("token_type", "bearer");
++  return Json(d);
++}
++
++}  // namespace tark_zynclave::test
+--- /dev/null
++++ b/chrome/browser/tark_zynclave/oidc_test_util.h
+@@ -0,0 +1,50 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_TARK_ZYNCLAVE_OIDC_TEST_UTIL_H_
++#define CHROME_BROWSER_TARK_ZYNCLAVE_OIDC_TEST_UTIL_H_
++
++#include <string>
++#include <string_view>
++
++#include "base/time/time.h"
++#include "base/values.h"
++#include "crypto/keypair.h"
++
++namespace tark_zynclave::test {
++
++// A fake issuer for tests: its discovery document, JWKS, and ID tokens
++// signed with its own RSA key.
++class FakeIssuer {
++ public:
++  explicit FakeIssuer(std::string issuer = "https://auth.example.test/");
++  ~FakeIssuer();
++
++  const std::string& issuer() const { return issuer_; }
++  std::string Url(std::string_view path) const;
++
++  std::string DiscoveryJson() const;
++  std::string JwksJson() const;
++
++  // An ID token for `client_id`, with `nonce`, issued at `now`.
++  std::string IdToken(std::string_view client_id,
++                      std::string_view nonce,
++                      base::Time now,
++                      std::string_view sub = "pairwise-sub",
++                      std::string_view email = "asha@example.test") const;
++
++  // A token endpoint answer.
++  static std::string TokenJson(std::string_view access,
++                               std::string_view refresh,
++                               std::string_view id_token,
++                               int expires_in = 3600);
++
++ private:
++  std::string issuer_;
++  crypto::keypair::PrivateKey key_;
++};
++
++}  // namespace tark_zynclave::test
++
++#endif  // CHROME_BROWSER_TARK_ZYNCLAVE_OIDC_TEST_UTIL_H_
+--- /dev/null
++++ b/chrome/browser/tark_zynclave/token_cipher.h
+@@ -0,0 +1,25 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_TARK_ZYNCLAVE_TOKEN_CIPHER_H_
++#define CHROME_BROWSER_TARK_ZYNCLAVE_TOKEN_CIPHER_H_
++
++#include <optional>
++#include <string>
++#include <string_view>
++
++namespace tark_zynclave {
++
++// Encrypts the stored tokens. In the browser it is OSCrypt's (the Keychain
++// key on the Mac, DPAPI on Windows); tests use their own.
++class TokenCipher {
++ public:
++  virtual ~TokenCipher() = default;
++  virtual std::optional<std::string> Encrypt(std::string_view plain) = 0;
++  virtual std::optional<std::string> Decrypt(std::string_view cipher) = 0;
++};
++
++}  // namespace tark_zynclave
++
++#endif  // CHROME_BROWSER_TARK_ZYNCLAVE_TOKEN_CIPHER_H_
+--- /dev/null
++++ b/chrome/browser/tark_zynclave/zynclave_auth.cc
+@@ -0,0 +1,579 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/tark_zynclave/zynclave_auth.h"
++
++#include <utility>
++
++#include "base/base64.h"
++#include "base/functional/bind.h"
++#include "base/functional/callback_helpers.h"
++#include "base/json/json_reader.h"
++#include "base/json/json_writer.h"
++#include "base/logging.h"
++#include "base/strings/strcat.h"
++#include "base/strings/string_util.h"
++#include "base/values.h"
++#include "chrome/browser/tark_zynclave/token_cipher.h"
++#include "chrome/browser/tark_zynclave/zynclave_prefs.h"
++#include "components/prefs/pref_service.h"
++#include "net/base/url_util.h"
++#include "net/http/http_request_headers.h"
++#include "net/http/http_response_headers.h"
++#include "net/traffic_annotation/network_traffic_annotation.h"
++#include "services/network/public/cpp/resource_request.h"
++#include "services/network/public/cpp/shared_url_loader_factory.h"
++#include "services/network/public/cpp/simple_url_loader.h"
++#include "services/network/public/mojom/url_response_head.mojom.h"
++
++namespace tark_zynclave {
++
++namespace {
++
++constexpr net::NetworkTrafficAnnotationTag kTrafficAnnotation =
++    net::DefineNetworkTrafficAnnotation("tark_zynclave", R"(
++      semantics {
++        sender: "Sign in with Zynclave"
++        description:
++          "Signs the person in to Tark with their Zynclave Account: reads "
++          "Zynclave's OpenID configuration and signing keys, exchanges the "
++          "sign-in code for tokens, refreshes them, reads the account's name, "
++          "email and photo address, and revokes the tokens on sign-out."
++        trigger:
++          "Only after the person chooses to sign in, while they are signed "
++          "in and something needs the account, and when they sign out."
++        data:
++          "The OAuth client ID, the sign-in code and PKCE verifier, and the "
++          "refresh or access token. No cookies."
++        destination: OTHER
++        destination_other: "auth.zynclave.com"
++      }
++      policy {
++        cookies_allowed: NO
++        setting: "Settings > Profile > Sign out."
++        chrome_policy {
++          ZynclaveSignInAllowed {
++            ZynclaveSignInAllowed: false
++          }
++        }
++      })");
++
++constexpr base::TimeDelta kTimeout = base::Seconds(10);
++constexpr size_t kMaxBody = 64 * 1024;
++constexpr size_t kMaxJwks = 1024 * 1024;
++
++// Logged as the error type only, never with a token, code or account.
++void LogError(std::string_view what) {
++  VLOG(1) << "tark_zynclave: " << what;
++}
++
++}  // namespace
++
++struct ZynclaveAuth::InFlight {
++  std::unique_ptr<network::SimpleURLLoader> loader;
++  BodyCallback callback;
++};
++
++ZynclaveAuth::ZynclaveAuth(
++    const ZynclaveConfig& config,
++    PrefService* prefs,
++    scoped_refptr<network::SharedURLLoaderFactory> url_loaders,
++    OpenUrlCallback open_url)
++    : config_(config),
++      prefs_(prefs),
++      url_loaders_(std::move(url_loaders)),
++      open_url_(std::move(open_url)) {
++  LoadAccount();
++}
++
++ZynclaveAuth::~ZynclaveAuth() = default;
++
++void ZynclaveAuth::SetCipher(std::unique_ptr<TokenCipher> cipher) {
++  cipher_ = std::move(cipher);
++  if (tokens_) {
++    // Signed in before the cipher was ready: store now.
++    SaveTokens();
++  } else {
++    LoadTokens();
++  }
++  ServeTokenRequests();
++}
++
++base::CallbackListSubscription ZynclaveAuth::AddObserver(
++    base::RepeatingClosure observer) {
++  return observers_.Add(std::move(observer));
++}
++
++// Network.
++
++void ZynclaveAuth::Fetch(const GURL& url,
++                         std::optional<std::string> post_body,
++                         size_t max_bytes,
++                         BodyCallback callback) {
++  auto request = std::make_unique<network::ResourceRequest>();
++  request->url = url;
++  request->method = post_body ? "POST" : "GET";
++  request->credentials_mode = network::mojom::CredentialsMode::kOmit;
++  request->headers.SetHeader(net::HttpRequestHeaders::kAccept,
++                             "application/json");
++  if (url == (discovery_ ? discovery_->userinfo : GURL()) && tokens_) {
++    request->headers.SetHeader(net::HttpRequestHeaders::kAuthorization,
++                               base::StrCat({"Bearer ", tokens_->access}));
++  }
++  auto in_flight = std::make_unique<InFlight>();
++  in_flight->loader =
++      network::SimpleURLLoader::Create(std::move(request), kTrafficAnnotation);
++  if (post_body) {
++    in_flight->loader->AttachStringForUpload(
++        *post_body, "application/x-www-form-urlencoded");
++  }
++  in_flight->loader->SetTimeoutDuration(kTimeout);
++  in_flight->loader->SetAllowHttpErrorResults(true);
++  in_flight->callback = std::move(callback);
++  network::SimpleURLLoader* loader = in_flight->loader.get();
++  fetches_.push_front(std::move(in_flight));
++  loader->DownloadToString(
++      url_loaders_.get(),
++      base::BindOnce(&ZynclaveAuth::OnFetched, weak_factory_.GetWeakPtr(),
++                     fetches_.begin()),
++      max_bytes);
++}
++
++void ZynclaveAuth::OnFetched(std::list<std::unique_ptr<InFlight>>::iterator it,
++                             std::optional<std::string> body) {
++  std::unique_ptr<InFlight> done = std::move(*it);
++  fetches_.erase(it);
++  int status = 0;
++  if (done->loader->ResponseInfo() && done->loader->ResponseInfo()->headers) {
++    status = done->loader->ResponseInfo()->headers->response_code();
++  }
++  std::move(done->callback).Run(std::move(body), status);
++}
++
++void ZynclaveAuth::WithDiscovery(base::OnceCallback<void(bool ok)> callback) {
++  if (discovery_) {
++    std::move(callback).Run(true);
++    return;
++  }
++  discovery_waiters_.push_back(std::move(callback));
++  if (discovery_waiters_.size() > 1) {
++    return;
++  }
++  Fetch(config_.issuer.Resolve(".well-known/openid-configuration"),
++        std::nullopt, kMaxBody,
++        base::BindOnce(&ZynclaveAuth::OnDiscovery, weak_factory_.GetWeakPtr()));
++}
++
++void ZynclaveAuth::OnDiscovery(std::optional<std::string> body, int status) {
++  if (body && status == 200) {
++    discovery_ = ParseDiscovery(*body, config_.issuer);
++  }
++  if (!discovery_) {
++    LogError("discovery failed");
++  }
++  std::vector<base::OnceCallback<void(bool)>> waiters;
++  waiters.swap(discovery_waiters_);
++  for (auto& waiter : waiters) {
++    std::move(waiter).Run(discovery_.has_value());
++  }
++}
++
++// Sign-in.
++
++void ZynclaveAuth::StartSignIn(bool prompt_none, std::string expected_email) {
++  const base::Time now = base::Time::Now();
++  std::erase_if(pending_, [now](const auto& entry) {
++    return now - entry.second.first.created > kRequestLifetime;
++  });
++  WithDiscovery(base::BindOnce(&ZynclaveAuth::OpenSignInPage,
++                               weak_factory_.GetWeakPtr(), prompt_none,
++                               std::move(expected_email)));
++}
++
++void ZynclaveAuth::OpenSignInPage(bool prompt_none,
++                                  std::string expected_email,
++                                  bool ok) {
++  if (!ok) {
++    return;
++  }
++  PendingRequest request = NewRequest(prompt_none);
++  GURL url = AuthorizationUrl(*discovery_, config_, request);
++  std::string state = request.state;
++  pending_[state] = {std::move(request), std::move(expected_email)};
++  open_url_.Run(url);
++}
++
++bool ZynclaveAuth::HandleRedirect(const GURL& url) {
++  if (!IsRedirectUrl(url)) {
++    return false;
++  }
++  std::string state;
++  if (!net::GetValueForKeyInQuery(url, "state", &state)) {
++    return false;
++  }
++  auto it = pending_.find(state);
++  if (it == pending_.end()) {
++    return false;
++  }
++  auto [request, expected_email] = std::move(it->second);
++  pending_.erase(it);
++  if (base::Time::Now() - request.created > kRequestLifetime) {
++    return false;
++  }
++
++  std::string error;
++  if (net::GetValueForKeyInQuery(url, "error", &error)) {
++    if (request.prompt_none &&
++        (error == "login_required" || error == "interaction_required" ||
++         error == "consent_required" ||
++         error == "account_selection_required")) {
++      // Zynclave needs a screen after all: once more, with one.
++      StartSignIn(/*prompt_none=*/false, std::move(expected_email));
++    } else if (error != "access_denied") {
++      LogError("authorization error");
++    }
++    return true;
++  }
++  std::string code;
++  if (!net::GetValueForKeyInQuery(url, "code", &code) || code.empty()) {
++    return true;
++  }
++  OnCode(std::move(request), std::move(expected_email), std::move(code));
++  return true;
++}
++
++void ZynclaveAuth::OnCode(PendingRequest request,
++                          std::string expected_email,
++                          std::string code) {
++  state_before_exchange_ =
++      state_ == ZynclaveState::kSigningIn ? state_before_exchange_ : state_;
++  SetState(ZynclaveState::kSigningIn);
++  const std::string body = TokenRequestBody(config_, code, request.verifier);
++  Fetch(discovery_->token, body, kMaxBody,
++        base::BindOnce(&ZynclaveAuth::OnTokens, weak_factory_.GetWeakPtr(),
++                       std::move(request), std::move(expected_email)));
++}
++
++void ZynclaveAuth::OnTokens(PendingRequest request,
++                            std::string expected_email,
++                            std::optional<std::string> body,
++                            int status) {
++  TokenResponse tokens =
++      body ? ParseTokenResponse(*body) : TokenResponse{.error = "network"};
++  if (!tokens.error.empty() || tokens.refresh.empty() ||
++      tokens.id_token.empty()) {
++    LogError("code exchange failed");
++    SignInFailed();
++    return;
++  }
++  Fetch(discovery_->jwks, std::nullopt, kMaxJwks,
++        base::BindOnce(&ZynclaveAuth::OnJwks, weak_factory_.GetWeakPtr(),
++                       std::move(request), std::move(expected_email),
++                       std::move(tokens)));
++}
++
++void ZynclaveAuth::OnJwks(PendingRequest request,
++                          std::string expected_email,
++                          TokenResponse tokens,
++                          std::optional<std::string> body,
++                          int status) {
++  const base::Time now = base::Time::Now();
++  std::optional<IdClaims> claims;
++  if (body && status == 200) {
++    claims =
++        VerifyIdToken(tokens.id_token, *body, config_, request.nonce, now);
++  }
++  if (!claims) {
++    LogError("ID token refused");
++    Revoke(tokens.refresh);
++    SignInFailed();
++    return;
++  }
++  Tokens kept{tokens.access, tokens.refresh, now + tokens.expires_in};
++  // userinfo needs the new access token; hold it until the account is read.
++  std::optional<Tokens> previous = std::move(tokens_);
++  tokens_ = kept;
++  Fetch(discovery_->userinfo, std::nullopt, kMaxBody,
++        base::BindOnce(&ZynclaveAuth::OnUserinfo, weak_factory_.GetWeakPtr(),
++                       std::move(expected_email), std::move(*claims),
++                       std::move(kept)));
++  tokens_ = std::move(previous);
++}
++
++void ZynclaveAuth::OnUserinfo(std::string expected_email,
++                              IdClaims claims,
++                              Tokens tokens,
++                              std::optional<std::string> body,
++                              int status) {
++  std::optional<Userinfo> info;
++  if (body && status == 200) {
++    info = ParseUserinfo(*body);
++  }
++  if (!info || info->sub != claims.sub) {
++    LogError("userinfo failed");
++    Revoke(tokens.refresh);
++    SignInFailed();
++    return;
++  }
++  if (!expected_email.empty() &&
++      !base::EqualsCaseInsensitiveASCII(info->email, expected_email)) {
++    // Not the account the person said yes to on "Sign in to Tark as X?".
++    LogError("account changed during sign-in");
++    Revoke(tokens.refresh);
++    SignInFailed();
++    return;
++  }
++  account_ = std::move(*info);
++  tokens_ = std::move(tokens);
++  SaveAccount();
++  SaveTokens();
++  SetState(ZynclaveState::kSignedIn);
++  ServeTokenRequests();
++}
++
++void ZynclaveAuth::SignInFailed() {
++  SetState(state_before_exchange_);
++}
++
++// Tokens.
++
++void ZynclaveAuth::GetAccessToken(TokenCallback callback) {
++  if (state_ != ZynclaveState::kSignedIn) {
++    std::move(callback).Run(std::nullopt);
++    return;
++  }
++  token_waiters_.push_back(std::move(callback));
++  ServeTokenRequests();
++}
++
++void ZynclaveAuth::ServeTokenRequests() {
++  if (token_waiters_.empty() || refreshing_) {
++    return;
++  }
++  if (state_ != ZynclaveState::kSignedIn) {
++    FinishTokenRequests(std::nullopt);
++    return;
++  }
++  if (!tokens_) {
++    // Still waiting for the cipher to read them.
++    return;
++  }
++  if (tokens_->expiry - base::Time::Now() > kRefreshMargin) {
++    FinishTokenRequests(tokens_->access);
++    return;
++  }
++  Refresh();
++}
++
++void ZynclaveAuth::Refresh() {
++  refreshing_ = true;
++  WithDiscovery(base::BindOnce(
++      [](base::WeakPtr<ZynclaveAuth> self, bool ok) {
++        if (!self) {
++          return;
++        }
++        if (!ok || !self->tokens_) {
++          self->refreshing_ = false;
++          self->FinishTokenRequests(std::nullopt);
++          return;
++        }
++        self->Fetch(self->discovery_->token,
++                    RefreshRequestBody(self->config_, self->tokens_->refresh),
++                    kMaxBody,
++                    base::BindOnce(&ZynclaveAuth::OnRefreshed, self));
++      },
++      weak_factory_.GetWeakPtr()));
++}
++
++void ZynclaveAuth::OnRefreshed(std::optional<std::string> body, int status) {
++  refreshing_ = false;
++  TokenResponse response =
++      body ? ParseTokenResponse(*body) : TokenResponse{.error = "network"};
++  if (response.error == "invalid_grant") {
++    LogError("refresh token no longer valid");
++    Forget(/*keep_account_for_sign_in_again=*/true);
++    return;
++  }
++  if (!response.error.empty() || !tokens_) {
++    LogError("refresh failed");
++    FinishTokenRequests(std::nullopt);
++    return;
++  }
++  tokens_->access = response.access;
++  if (!response.refresh.empty()) {
++    tokens_->refresh = response.refresh;
++  }
++  tokens_->expiry = base::Time::Now() + response.expires_in;
++  SaveTokens();
++  FinishTokenRequests(tokens_->access);
++}
++
++void ZynclaveAuth::FinishTokenRequests(std::optional<std::string> access) {
++  std::vector<TokenCallback> waiters;
++  waiters.swap(token_waiters_);
++  for (auto& waiter : waiters) {
++    std::move(waiter).Run(access);
++  }
++}
++
++// Sign-out.
++
++void ZynclaveAuth::SignOut(bool everywhere) {
++  if (tokens_) {
++    Revoke(tokens_->refresh);
++  }
++  if (everywhere) {
++    WithDiscovery(base::BindOnce(
++        [](base::WeakPtr<ZynclaveAuth> self, bool ok) {
++          if (!self || !ok) {
++            return;
++          }
++          // RP-initiated logout by client_id: no token in the URL.
++          self->open_url_.Run(net::AppendQueryParameter(
++              self->discovery_->end_session, "client_id",
++              self->config_.client_id));
++        },
++        weak_factory_.GetWeakPtr()));
++  }
++  Forget(/*keep_account_for_sign_in_again=*/false);
++}
++
++void ZynclaveAuth::SignOutLocally() {
++  pending_.clear();
++  Forget(/*keep_account_for_sign_in_again=*/false);
++}
++
++void ZynclaveAuth::Revoke(std::string refresh_token) {
++  if (refresh_token.empty()) {
++    return;
++  }
++  WithDiscovery(base::BindOnce(
++      [](base::WeakPtr<ZynclaveAuth> self, std::string refresh_token,
++         bool ok) {
++        if (!self || !ok) {
++          return;
++        }
++        // Best effort: signed out here whatever Zynclave answers.
++        self->Fetch(self->discovery_->revocation,
++                    RevokeRequestBody(self->config_, refresh_token), kMaxBody,
++                    base::DoNothing());
++      },
++      weak_factory_.GetWeakPtr(), std::move(refresh_token)));
++}
++
++// Storage.
++
++void ZynclaveAuth::LoadAccount() {
++  const base::DictValue& saved = prefs_->GetDict(kAccountPref);
++  const std::string* sub = saved.FindString("sub");
++  if (!sub || sub->empty()) {
++    return;
++  }
++  const bool needs_sign_in_again =
++      saved.FindBool("needs_sign_in_again").value_or(false);
++  if (!needs_sign_in_again && prefs_->GetString(kTokensPref).empty()) {
++    prefs_->ClearPref(kAccountPref);
++    return;
++  }
++  Userinfo info;
++  info.sub = *sub;
++  if (const std::string* name = saved.FindString("name")) {
++    info.name = *name;
++  }
++  if (const std::string* email = saved.FindString("email")) {
++    info.email = *email;
++  }
++  if (const std::string* picture = saved.FindString("picture")) {
++    info.picture = GURL(*picture);
++  }
++  account_ = std::move(info);
++  state_ = needs_sign_in_again ? ZynclaveState::kNeedsSignInAgain
++                               : ZynclaveState::kSignedIn;
++}
++
++void ZynclaveAuth::LoadTokens() {
++  if (!cipher_ || state_ != ZynclaveState::kSignedIn || tokens_) {
++    return;
++  }
++  const std::string& stored = prefs_->GetString(kTokensPref);
++  std::string encrypted;
++  std::optional<std::string> plain;
++  if (base::Base64Decode(stored, &encrypted)) {
++    plain = cipher_->Decrypt(encrypted);
++  }
++  std::optional<base::DictValue> dict;
++  if (plain) {
++    dict = base::JSONReader::ReadDict(*plain, base::JSON_PARSE_RFC);
++  }
++  const std::string* access = dict ? dict->FindString("access") : nullptr;
++  const std::string* refresh = dict ? dict->FindString("refresh") : nullptr;
++  std::optional<double> expiry = dict ? dict->FindDouble("expiry") : std::nullopt;
++  if (!access || !refresh || refresh->empty() || !expiry) {
++    // The Keychain key changed or the data is damaged: signed out.
++    LogError("stored tokens unreadable");
++    Forget(/*keep_account_for_sign_in_again=*/false);
++    return;
++  }
++  tokens_ = Tokens{*access, *refresh,
++                   base::Time::FromSecondsSinceUnixEpoch(*expiry)};
++}
++
++void ZynclaveAuth::SaveTokens() {
++  if (!tokens_ || !cipher_) {
++    return;
++  }
++  base::DictValue dict;
++  dict.Set("access", tokens_->access);
++  dict.Set("refresh", tokens_->refresh);
++  dict.Set("expiry", tokens_->expiry.InSecondsFSinceUnixEpoch());
++  std::optional<std::string> encrypted =
++      cipher_->Encrypt(base::WriteJson(dict).value_or(""));
++  if (!encrypted) {
++    LogError("could not encrypt tokens");
++    return;
++  }
++  prefs_->SetString(kTokensPref, base::Base64Encode(*encrypted));
++}
++
++void ZynclaveAuth::SaveAccount() {
++  if (!account_) {
++    prefs_->ClearPref(kAccountPref);
++    return;
++  }
++  base::DictValue dict;
++  dict.Set("sub", account_->sub);
++  dict.Set("name", account_->name);
++  dict.Set("email", account_->email);
++  dict.Set("picture", account_->picture.possibly_invalid_spec());
++  if (state_ == ZynclaveState::kNeedsSignInAgain) {
++    dict.Set("needs_sign_in_again", true);
++  }
++  prefs_->SetDict(kAccountPref, std::move(dict));
++}
++
++void ZynclaveAuth::Forget(bool keep_account_for_sign_in_again) {
++  tokens_.reset();
++  prefs_->ClearPref(kTokensPref);
++  if (keep_account_for_sign_in_again && account_) {
++    state_ = ZynclaveState::kNeedsSignInAgain;
++    SaveAccount();
++  } else {
++    account_.reset();
++    prefs_->ClearPref(kAccountPref);
++    state_ = ZynclaveState::kSignedOut;
++  }
++  state_before_exchange_ = state_;
++  FinishTokenRequests(std::nullopt);
++  observers_.Notify();
++}
++
++void ZynclaveAuth::SetState(ZynclaveState state) {
++  if (state_ == state) {
++    return;
++  }
++  state_ = state;
++  observers_.Notify();
++}
++
++}  // namespace tark_zynclave
+--- /dev/null
++++ b/chrome/browser/tark_zynclave/zynclave_auth.h
+@@ -0,0 +1,181 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_TARK_ZYNCLAVE_ZYNCLAVE_AUTH_H_
++#define CHROME_BROWSER_TARK_ZYNCLAVE_ZYNCLAVE_AUTH_H_
++
++#include <list>
++#include <map>
++#include <memory>
++#include <optional>
++#include <string>
++#include <vector>
++
++#include "base/callback_list.h"
++#include "base/functional/callback.h"
++#include "base/memory/raw_ptr.h"
++#include "base/memory/scoped_refptr.h"
++#include "base/memory/weak_ptr.h"
++#include "base/time/time.h"
++#include "chrome/browser/tark_zynclave/oidc.h"
++#include "chrome/browser/tark_zynclave/zynclave_config.h"
++#include "url/gurl.h"
++
++class PrefService;
++
++namespace network {
++class SharedURLLoaderFactory;
++class SimpleURLLoader;
++}  // namespace network
++
++namespace tark_zynclave {
++
++class TokenCipher;
++
++enum class ZynclaveState {
++  kSignedOut,
++  kSigningIn,
++  kSignedIn,
++  kNeedsSignInAgain,
++};
++
++// One profile's Zynclave sign-in: the OAuth round trip (the page opens in a
++// normal tab; the redirect comes back through HandleRedirect), the encrypted
++// tokens in the profile's prefs, refresh, and sign-out. All on the UI thread.
++// Tokens are never logged and never put in a URL.
++class ZynclaveAuth {
++ public:
++  using OpenUrlCallback = base::RepeatingCallback<void(const GURL&)>;
++  using TokenCallback =
++      base::OnceCallback<void(std::optional<std::string> access_token)>;
++
++  // A pending request older than this is forgotten.
++  static constexpr base::TimeDelta kRequestLifetime = base::Minutes(10);
++  // Refresh when the access token has less than this left.
++  static constexpr base::TimeDelta kRefreshMargin = base::Seconds(60);
++
++  ZynclaveAuth(const ZynclaveConfig& config,
++               PrefService* prefs,
++               scoped_refptr<network::SharedURLLoaderFactory> url_loaders,
++               OpenUrlCallback open_url);
++  ZynclaveAuth(const ZynclaveAuth&) = delete;
++  ZynclaveAuth& operator=(const ZynclaveAuth&) = delete;
++  ~ZynclaveAuth();
++
++  // The token store's encryption, once OSCrypt is ready. Token requests
++  // made before wait for it; stored tokens it cannot decrypt sign out.
++  void SetCipher(std::unique_ptr<TokenCipher> cipher);
++
++  ZynclaveState state() const { return state_; }
++  // The signed-in account (also kept while it needs signing in again).
++  const Userinfo* account() const {
++    return account_ ? &*account_ : nullptr;
++  }
++
++  // Opens Zynclave's sign-in page. `prompt_none` asks Zynclave to use its
++  // web session without a screen ("Sign in to Tark as X?"); if it needs one,
++  // the page opens once more without. `expected_email`, when set, is the
++  // account the person agreed to: a different one is signed out again.
++  void StartSignIn(bool prompt_none, std::string expected_email = {});
++
++  // The redirect from a tab. True if it answered a request pending here.
++  bool HandleRedirect(const GURL& url);
++
++  // A fresh access token, refreshing if it has under a minute left. One
++  // refresh at a time: callers asking meanwhile get its result.
++  void GetAccessToken(TokenCallback callback);
++
++  // Revokes the refresh token (best effort) and forgets the account here.
++  // `everywhere` also opens Zynclave's end-session page in a tab.
++  void SignOut(bool everywhere);
++
++  // Forgets the account without telling Zynclave (the policy turned off).
++  void SignOutLocally();
++
++  base::CallbackListSubscription AddObserver(base::RepeatingClosure observer);
++
++ private:
++  struct Tokens {
++    std::string access;
++    std::string refresh;
++    base::Time expiry;
++  };
++  struct InFlight;
++  using BodyCallback =
++      base::OnceCallback<void(std::optional<std::string> body, int status)>;
++
++  void Fetch(const GURL& url,
++             std::optional<std::string> post_body,
++             size_t max_bytes,
++             BodyCallback callback);
++  void OnFetched(std::list<std::unique_ptr<InFlight>>::iterator it,
++                 std::optional<std::string> body);
++
++  // Discovery, then the JWKS, cached in memory; a failure clears them.
++  void WithDiscovery(base::OnceCallback<void(bool ok)> callback);
++  void OnDiscovery(std::optional<std::string> body, int status);
++
++  void OpenSignInPage(bool prompt_none, std::string expected_email, bool ok);
++  void OnCode(PendingRequest request,
++              std::string expected_email,
++              std::string code);
++  void OnTokens(PendingRequest request,
++                std::string expected_email,
++                std::optional<std::string> body,
++                int status);
++  void OnJwks(PendingRequest request,
++              std::string expected_email,
++              TokenResponse tokens,
++              std::optional<std::string> body,
++              int status);
++  void OnUserinfo(std::string expected_email,
++                  IdClaims claims,
++                  Tokens tokens,
++                  std::optional<std::string> body,
++                  int status);
++  void SignInFailed();
++  void Revoke(std::string refresh_token);
++  void ServeTokenRequests();
++
++  void Refresh();
++  void OnRefreshed(std::optional<std::string> body, int status);
++  void FinishTokenRequests(std::optional<std::string> access);
++
++  void LoadAccount();
++  void LoadTokens();
++  void SaveTokens();
++  void SaveAccount();
++  void Forget(bool keep_account_for_sign_in_again);
++  void SetState(ZynclaveState state);
++
++  const ZynclaveConfig config_;
++  const raw_ptr<PrefService> prefs_;
++  scoped_refptr<network::SharedURLLoaderFactory> url_loaders_;
++  OpenUrlCallback open_url_;
++  std::unique_ptr<TokenCipher> cipher_;
++
++  ZynclaveState state_ = ZynclaveState::kSignedOut;
++  std::optional<Userinfo> account_;
++  std::optional<Tokens> tokens_;
++
++  std::optional<Discovery> discovery_;
++  std::vector<base::OnceCallback<void(bool)>> discovery_waiters_;
++
++  // Pending requests by state, with the email the person agreed to.
++  std::map<std::string, std::pair<PendingRequest, std::string>> pending_;
++
++  // What the state was before a code exchange, to go back to on failure.
++  ZynclaveState state_before_exchange_ = ZynclaveState::kSignedOut;
++
++  std::vector<TokenCallback> token_waiters_;
++  bool refreshing_ = false;
++
++  std::list<std::unique_ptr<InFlight>> fetches_;
++  base::RepeatingClosureList observers_;
++  base::WeakPtrFactory<ZynclaveAuth> weak_factory_{this};
++};
++
++}  // namespace tark_zynclave
++
++#endif  // CHROME_BROWSER_TARK_ZYNCLAVE_ZYNCLAVE_AUTH_H_
+--- /dev/null
++++ b/chrome/browser/tark_zynclave/zynclave_auth_unittest.cc
+@@ -0,0 +1,457 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/tark_zynclave/zynclave_auth.h"
++
++#include <memory>
++#include <optional>
++#include <string>
++#include <vector>
++
++#include "base/memory/raw_ptr.h"
++#include "base/strings/strcat.h"
++#include "base/test/task_environment.h"
++#include "base/test/test_future.h"
++#include "chrome/browser/tark_zynclave/oidc.h"
++#include "chrome/browser/tark_zynclave/oidc_test_util.h"
++#include "chrome/browser/tark_zynclave/token_cipher.h"
++#include "chrome/browser/tark_zynclave/zynclave_config.h"
++#include "chrome/browser/tark_zynclave/zynclave_prefs.h"
++#include "components/prefs/testing_pref_service.h"
++#include "net/base/url_util.h"
++#include "net/http/http_status_code.h"
++#include "services/network/public/cpp/weak_wrapper_shared_url_loader_factory.h"
++#include "services/network/test/test_url_loader_factory.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace tark_zynclave {
++namespace {
++
++// Reversible and visibly not the plain text; can be told to fail.
++class FakeCipher : public TokenCipher {
++ public:
++  std::optional<std::string> Encrypt(std::string_view plain) override {
++    std::string out = "enc:";
++    for (char c : plain) {
++      out.push_back(static_cast<char>(c ^ 0x5a));
++    }
++    return out;
++  }
++  std::optional<std::string> Decrypt(std::string_view cipher) override {
++    if (broken || !cipher.starts_with("enc:")) {
++      return std::nullopt;
++    }
++    std::string out;
++    for (char c : cipher.substr(4)) {
++      out.push_back(static_cast<char>(c ^ 0x5a));
++    }
++    return out;
++  }
++  bool broken = false;
++};
++
++std::string Query(const GURL& url, std::string_view key) {
++  std::string value;
++  return net::GetValueForKeyInQuery(url, key, &value) ? value : "<absent>";
++}
++
++class TarkZynclaveAuth : public testing::Test {
++ protected:
++  TarkZynclaveAuth()
++      : config_{GURL("https://auth.example.test/"), "client-1",
++                "accounts.example.test", false},
++        factory_(base::MakeRefCounted<
++                 network::WeakWrapperSharedURLLoaderFactory>(&loaders_)) {
++    RegisterZynclavePrefs(prefs_.registry());
++    loaders_.AddResponse(issuer_.Url(".well-known/openid-configuration"),
++                         issuer_.DiscoveryJson());
++    loaders_.AddResponse(issuer_.Url(".well-known/jwks.json"),
++                         issuer_.JwksJson());
++    loaders_.AddResponse(
++        issuer_.Url("userinfo"),
++        R"({"sub":"pairwise-sub","name":"Asha Rao","email":"asha@example.test",)"
++        R"("picture":"https://lh3.googleusercontent.com/a/x"})");
++  }
++
++  std::unique_ptr<ZynclaveAuth> MakeAuth(bool cipher_ready = true) {
++    auto auth = std::make_unique<ZynclaveAuth>(
++        config_, &prefs_, factory_,
++        base::BindRepeating(&TarkZynclaveAuth::Opened, base::Unretained(this)));
++    if (cipher_ready) {
++      auth->SetCipher(std::make_unique<FakeCipher>());
++    }
++    return auth;
++  }
++
++  void Opened(const GURL& url) { opened_.push_back(url); }
++
++  // Starts a sign-in and returns the state and nonce it put in the tab.
++  std::pair<std::string, std::string> Start(ZynclaveAuth& auth,
++                                            bool prompt_none = false) {
++    size_t before = opened_.size();
++    auth.StartSignIn(prompt_none);
++    task_env_.RunUntilIdle();
++    EXPECT_EQ(opened_.size(), before + 1);
++    const GURL& url = opened_.back();
++    return {Query(url, "state"), Query(url, "nonce")};
++  }
++
++  GURL Redirect(std::string_view query) {
++    return GURL(base::StrCat({kRedirectUri, "?", query}));
++  }
++
++  void SignIn(ZynclaveAuth& auth,
++              std::string_view access = "access-1",
++              std::string_view refresh = "refresh-1",
++              int expires_in = 3600) {
++    auto [state, nonce] = Start(auth);
++    ASSERT_TRUE(auth.HandleRedirect(
++        Redirect(base::StrCat({"code=c0de&state=", state}))));
++    task_env_.RunUntilIdle();
++    ASSERT_TRUE(loaders_.SimulateResponseForPendingRequest(
++        issuer_.Url("oauth2/token"),
++        test::FakeIssuer::TokenJson(
++            access, refresh,
++            issuer_.IdToken("client-1", nonce, base::Time::Now()),
++            expires_in)));
++    task_env_.RunUntilIdle();
++    ASSERT_EQ(auth.state(), ZynclaveState::kSignedIn);
++  }
++
++  int TokenRequests() {
++    int count = 0;
++    for (const auto& request : *loaders_.pending_requests()) {
++      if (request.request.url == GURL(issuer_.Url("oauth2/token"))) {
++        ++count;
++      }
++    }
++    return count;
++  }
++
++  base::test::TaskEnvironment task_env_{
++      base::test::TaskEnvironment::TimeSource::MOCK_TIME};
++  ZynclaveConfig config_;
++  test::FakeIssuer issuer_;
++  TestingPrefServiceSimple prefs_;
++  network::TestURLLoaderFactory loaders_;
++  scoped_refptr<network::SharedURLLoaderFactory> factory_;
++  std::vector<GURL> opened_;
++};
++
++TEST_F(TarkZynclaveAuth, SignInExchangesCodeAndStoresEncrypted) {
++  auto auth = MakeAuth();
++  EXPECT_EQ(auth->state(), ZynclaveState::kSignedOut);
++  SignIn(*auth);
++  ASSERT_TRUE(auth->account());
++  EXPECT_EQ(auth->account()->sub, "pairwise-sub");
++  EXPECT_EQ(auth->account()->name, "Asha Rao");
++  const std::string stored = prefs_.GetString(kTokensPref);
++  EXPECT_FALSE(stored.empty());
++  EXPECT_EQ(stored.find("refresh-1"), std::string::npos);
++  EXPECT_EQ(stored.find("access-1"), std::string::npos);
++
++  // A new start (relaunch) reads the account back.
++  auto again = MakeAuth();
++  EXPECT_EQ(again->state(), ZynclaveState::kSignedIn);
++  base::test::TestFuture<std::optional<std::string>> token;
++  again->GetAccessToken(token.GetCallback());
++  EXPECT_EQ(token.Get(), "access-1");
++}
++
++TEST_F(TarkZynclaveAuth, TheTokenRequestHasPkceAndNoSecret) {
++  auto auth = MakeAuth();
++  auto [state, nonce] = Start(*auth);
++  ASSERT_TRUE(auth->HandleRedirect(Redirect("code=c0de&state=" + state)));
++  task_env_.RunUntilIdle();
++  ASSERT_EQ(TokenRequests(), 1);
++  const network::ResourceRequest& request =
++      loaders_.pending_requests()->back().request;
++  EXPECT_EQ(request.method, "POST");
++  EXPECT_EQ(request.credentials_mode, network::mojom::CredentialsMode::kOmit);
++  std::string body(request.request_body->elements()
++                       ->at(0)
++                       .As<network::DataElementBytes>()
++                       .AsStringPiece());
++  EXPECT_NE(body.find("grant_type=authorization_code"), std::string::npos);
++  EXPECT_NE(body.find("code_verifier="), std::string::npos);
++  EXPECT_NE(body.find("client_id=client-1"), std::string::npos);
++  EXPECT_EQ(body.find("client_secret"), std::string::npos);
++}
++
++TEST_F(TarkZynclaveAuth, UnknownStateIsIgnored) {
++  auto auth = MakeAuth();
++  Start(*auth);
++  EXPECT_FALSE(auth->HandleRedirect(Redirect("code=x&state=not-ours")));
++  EXPECT_FALSE(auth->HandleRedirect(Redirect("code=x")));
++  task_env_.RunUntilIdle();
++  EXPECT_EQ(TokenRequests(), 0);
++  EXPECT_NE(auth->state(), ZynclaveState::kSignedIn);
++}
++
++TEST_F(TarkZynclaveAuth, ExpiredPendingStateIsIgnored) {
++  auto auth = MakeAuth();
++  auto [state, nonce] = Start(*auth);
++  task_env_.FastForwardBy(base::Minutes(10) + base::Seconds(1));
++  EXPECT_FALSE(auth->HandleRedirect(Redirect("code=x&state=" + state)));
++  task_env_.RunUntilIdle();
++  EXPECT_EQ(TokenRequests(), 0);
++  EXPECT_EQ(auth->state(), ZynclaveState::kSignedOut);
++}
++
++TEST_F(TarkZynclaveAuth, AStateIsUsedOnce) {
++  auto auth = MakeAuth();
++  SignIn(*auth);
++  // The same redirect again (a reload, a replay) is not ours any more.
++  EXPECT_FALSE(auth->HandleRedirect(Redirect("code=c0de&state=x")));
++}
++
++TEST_F(TarkZynclaveAuth, CancelStaysSignedOut) {
++  auto auth = MakeAuth();
++  auto [state, nonce] = Start(*auth);
++  EXPECT_TRUE(
++      auth->HandleRedirect(Redirect("error=access_denied&state=" + state)));
++  task_env_.RunUntilIdle();
++  EXPECT_EQ(auth->state(), ZynclaveState::kSignedOut);
++  EXPECT_EQ(opened_.size(), 1u);
++}
++
++TEST_F(TarkZynclaveAuth, PromptNoneFallsBackOnce) {
++  auto auth = MakeAuth();
++  auto [state, nonce] = Start(*auth, /*prompt_none=*/true);
++  EXPECT_EQ(Query(opened_.back(), "prompt"), "none");
++  EXPECT_TRUE(
++      auth->HandleRedirect(Redirect("error=login_required&state=" + state)));
++  task_env_.RunUntilIdle();
++  ASSERT_EQ(opened_.size(), 2u);
++  EXPECT_EQ(Query(opened_.back(), "prompt"), "<absent>");
++  std::string second = Query(opened_.back(), "state");
++  EXPECT_TRUE(
++      auth->HandleRedirect(Redirect("error=login_required&state=" + second)));
++  task_env_.RunUntilIdle();
++  EXPECT_EQ(opened_.size(), 2u);
++  EXPECT_EQ(auth->state(), ZynclaveState::kSignedOut);
++}
++
++TEST_F(TarkZynclaveAuth, ABadIdTokenDoesNotSignIn) {
++  auto auth = MakeAuth();
++  auto [state, nonce] = Start(*auth);
++  loaders_.AddResponse(
++      issuer_.Url("oauth2/token"),
++      test::FakeIssuer::TokenJson(
++          "a", "r", issuer_.IdToken("client-1", "other-nonce",
++                                    base::Time::Now())));
++  ASSERT_TRUE(auth->HandleRedirect(Redirect("code=c&state=" + state)));
++  task_env_.RunUntilIdle();
++  EXPECT_EQ(auth->state(), ZynclaveState::kSignedOut);
++  EXPECT_TRUE(prefs_.GetString(kTokensPref).empty());
++}
++
++TEST_F(TarkZynclaveAuth, ValidTokenIsReturnedWithoutARequest) {
++  auto auth = MakeAuth();
++  SignIn(*auth);
++  base::test::TestFuture<std::optional<std::string>> token;
++  auth->GetAccessToken(token.GetCallback());
++  EXPECT_EQ(token.Get(), "access-1");
++  EXPECT_EQ(TokenRequests(), 0);
++}
++
++TEST_F(TarkZynclaveAuth, RefreshWhenExpiringWithin60s) {
++  auto auth = MakeAuth();
++  SignIn(*auth);
++  task_env_.FastForwardBy(base::Seconds(3600 - 59));
++  base::test::TestFuture<std::optional<std::string>> token;
++  auth->GetAccessToken(token.GetCallback());
++  task_env_.RunUntilIdle();
++  ASSERT_EQ(TokenRequests(), 1);
++  loaders_.SimulateResponseForPendingRequest(
++      issuer_.Url("oauth2/token"),
++      test::FakeIssuer::TokenJson("access-2", "refresh-2", ""));
++  EXPECT_EQ(token.Get(), "access-2");
++}
++
++TEST_F(TarkZynclaveAuth, RotatedRefreshTokenIsSaved) {
++  auto auth = MakeAuth();
++  SignIn(*auth);
++  const std::string before = prefs_.GetString(kTokensPref);
++  task_env_.FastForwardBy(base::Hours(2));
++  base::test::TestFuture<std::optional<std::string>> token;
++  auth->GetAccessToken(token.GetCallback());
++  task_env_.RunUntilIdle();
++  loaders_.SimulateResponseForPendingRequest(
++      issuer_.Url("oauth2/token"),
++      test::FakeIssuer::TokenJson("access-2", "refresh-2", ""));
++  ASSERT_EQ(token.Get(), "access-2");
++  EXPECT_NE(prefs_.GetString(kTokensPref), before);
++  // The next refresh sends the rotated token.
++  task_env_.FastForwardBy(base::Hours(2));
++  base::test::TestFuture<std::optional<std::string>> next;
++  auth->GetAccessToken(next.GetCallback());
++  task_env_.RunUntilIdle();
++  ASSERT_EQ(TokenRequests(), 1);
++  const auto& request = loaders_.pending_requests()->back().request;
++  std::string body(request.request_body->elements()
++                       ->at(0)
++                       .As<network::DataElementBytes>()
++                       .AsStringPiece());
++  EXPECT_NE(body.find("refresh_token=refresh-2"), std::string::npos);
++}
++
++TEST_F(TarkZynclaveAuth, ConcurrentRefreshSendsOneRequest) {
++  auto auth = MakeAuth();
++  SignIn(*auth);
++  task_env_.FastForwardBy(base::Hours(2));
++  base::test::TestFuture<std::optional<std::string>> one;
++  base::test::TestFuture<std::optional<std::string>> two;
++  auth->GetAccessToken(one.GetCallback());
++  auth->GetAccessToken(two.GetCallback());
++  task_env_.RunUntilIdle();
++  EXPECT_EQ(TokenRequests(), 1);
++  loaders_.SimulateResponseForPendingRequest(
++      issuer_.Url("oauth2/token"),
++      test::FakeIssuer::TokenJson("access-2", "refresh-2", ""));
++  EXPECT_EQ(one.Get(), "access-2");
++  EXPECT_EQ(two.Get(), "access-2");
++}
++
++TEST_F(TarkZynclaveAuth, InvalidGrantNeedsSignInAgain) {
++  auto auth = MakeAuth();
++  SignIn(*auth);
++  task_env_.FastForwardBy(base::Hours(2));
++  base::test::TestFuture<std::optional<std::string>> token;
++  auth->GetAccessToken(token.GetCallback());
++  task_env_.RunUntilIdle();
++  loaders_.SimulateResponseForPendingRequest(
++      issuer_.Url("oauth2/token"), R"({"error":"invalid_grant"})",
++      net::HTTP_BAD_REQUEST);
++  EXPECT_EQ(token.Get(), std::nullopt);
++  EXPECT_EQ(auth->state(), ZynclaveState::kNeedsSignInAgain);
++  EXPECT_TRUE(prefs_.GetString(kTokensPref).empty());
++  // The name stays for "Sign in again", and survives a relaunch.
++  ASSERT_TRUE(auth->account());
++  EXPECT_EQ(MakeAuth()->state(), ZynclaveState::kNeedsSignInAgain);
++}
++
++TEST_F(TarkZynclaveAuth, OfflineRefreshKeepsTheAccount) {
++  auto auth = MakeAuth();
++  SignIn(*auth);
++  task_env_.FastForwardBy(base::Hours(2));
++  base::test::TestFuture<std::optional<std::string>> token;
++  auth->GetAccessToken(token.GetCallback());
++  task_env_.RunUntilIdle();
++  loaders_.SimulateResponseForPendingRequest(
++      GURL(issuer_.Url("oauth2/token")),
++      network::URLLoaderCompletionStatus(net::ERR_INTERNET_DISCONNECTED),
++      network::mojom::URLResponseHead::New(), "");
++  EXPECT_EQ(token.Get(), std::nullopt);
++  EXPECT_EQ(auth->state(), ZynclaveState::kSignedIn);
++  EXPECT_FALSE(prefs_.GetString(kTokensPref).empty());
++}
++
++TEST_F(TarkZynclaveAuth, TokenWaitsForTheCipher) {
++  {
++    auto auth = MakeAuth();
++    SignIn(*auth);
++  }
++  auto auth = MakeAuth(/*cipher_ready=*/false);
++  EXPECT_EQ(auth->state(), ZynclaveState::kSignedIn);
++  base::test::TestFuture<std::optional<std::string>> token;
++  auth->GetAccessToken(token.GetCallback());
++  task_env_.RunUntilIdle();
++  EXPECT_FALSE(token.IsReady());
++  auth->SetCipher(std::make_unique<FakeCipher>());
++  EXPECT_EQ(token.Get(), "access-1");
++}
++
++TEST_F(TarkZynclaveAuth, UndecryptableStoreMeansSignedOut) {
++  {
++    auto auth = MakeAuth();
++    SignIn(*auth);
++  }
++  auto auth = MakeAuth(/*cipher_ready=*/false);
++  auto cipher = std::make_unique<FakeCipher>();
++  cipher->broken = true;
++  auth->SetCipher(std::move(cipher));
++  EXPECT_EQ(auth->state(), ZynclaveState::kSignedOut);
++  EXPECT_FALSE(auth->account());
++  EXPECT_TRUE(prefs_.GetString(kTokensPref).empty());
++}
++
++TEST_F(TarkZynclaveAuth, SignOutRevokesAndClearsEvenIfRevokeFails) {
++  auto auth = MakeAuth();
++  SignIn(*auth);
++  auth->SignOut(/*everywhere=*/false);
++  EXPECT_EQ(auth->state(), ZynclaveState::kSignedOut);
++  EXPECT_FALSE(auth->account());
++  EXPECT_TRUE(prefs_.GetString(kTokensPref).empty());
++  EXPECT_TRUE(prefs_.GetDict(kAccountPref).empty());
++  task_env_.RunUntilIdle();
++  ASSERT_EQ(loaders_.NumPending(), 1);
++  const auto& request = loaders_.pending_requests()->back().request;
++  EXPECT_EQ(request.url, GURL(issuer_.Url("oauth2/revoke")));
++  std::string body(request.request_body->elements()
++                       ->at(0)
++                       .As<network::DataElementBytes>()
++                       .AsStringPiece());
++  EXPECT_NE(body.find("token=refresh-1"), std::string::npos);
++  EXPECT_NE(body.find("client_id=client-1"), std::string::npos);
++  loaders_.SimulateResponseForPendingRequest(
++      issuer_.Url("oauth2/revoke"), "", net::HTTP_SERVICE_UNAVAILABLE);
++  EXPECT_EQ(auth->state(), ZynclaveState::kSignedOut);
++  EXPECT_EQ(opened_.size(), 1u);  // only the sign-in tab
++}
++
++TEST_F(TarkZynclaveAuth, SignOutEverywhereOpensEndSessionWithClientIdOnly) {
++  auto auth = MakeAuth();
++  SignIn(*auth);
++  auth->SignOut(/*everywhere=*/true);
++  task_env_.RunUntilIdle();
++  ASSERT_EQ(opened_.size(), 2u);
++  const GURL& url = opened_.back();
++  EXPECT_EQ(url.path(), "/oauth2/sessions/logout");
++  EXPECT_EQ(Query(url, "client_id"), "client-1");
++  EXPECT_EQ(url.query().find("id_token"), std::string::npos);
++  EXPECT_EQ(url.query().find("refresh"), std::string::npos);
++}
++
++TEST_F(TarkZynclaveAuth, EmailMismatchAfterOfferSignsOut) {
++  auto auth = MakeAuth();
++  auth->StartSignIn(/*prompt_none=*/true, "someone-else@example.test");
++  task_env_.RunUntilIdle();
++  std::string state = Query(opened_.back(), "state");
++  std::string nonce = Query(opened_.back(), "nonce");
++  loaders_.AddResponse(
++      issuer_.Url("oauth2/token"),
++      test::FakeIssuer::TokenJson(
++          "a", "r", issuer_.IdToken("client-1", nonce, base::Time::Now())));
++  ASSERT_TRUE(auth->HandleRedirect(Redirect("code=c&state=" + state)));
++  task_env_.RunUntilIdle();
++  EXPECT_EQ(auth->state(), ZynclaveState::kSignedOut);
++  EXPECT_TRUE(prefs_.GetString(kTokensPref).empty());
++}
++
++TEST_F(TarkZynclaveAuth, DiscoveryFailureOpensNothing) {
++  loaders_.ClearResponses();
++  loaders_.AddResponse(issuer_.Url(".well-known/openid-configuration"), "",
++                       net::HTTP_INTERNAL_SERVER_ERROR);
++  auto auth = MakeAuth();
++  auth->StartSignIn(false);
++  task_env_.RunUntilIdle();
++  EXPECT_TRUE(opened_.empty());
++  EXPECT_EQ(auth->state(), ZynclaveState::kSignedOut);
++}
++
++TEST_F(TarkZynclaveAuth, ObserversHearChanges) {
++  auto auth = MakeAuth();
++  int changes = 0;
++  auto subscription = auth->AddObserver(
++      base::BindRepeating([](int* n) { ++*n; }, &changes));
++  SignIn(*auth);
++  EXPECT_GT(changes, 0);
++  int before = changes;
++  auth->SignOut(false);
++  EXPECT_GT(changes, before);
++}
++
++}  // namespace
++}  // namespace tark_zynclave
+--- /dev/null
++++ b/chrome/browser/tark_zynclave/zynclave_prefs.cc
+@@ -0,0 +1,19 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/tark_zynclave/zynclave_prefs.h"
++
++#include "components/prefs/pref_registry_simple.h"
++
++namespace tark_zynclave {
++
++void RegisterZynclavePrefs(PrefRegistrySimple* registry) {
++  registry->RegisterStringPref(kTokensPref, std::string());
++  registry->RegisterDictionaryPref(kAccountPref);
++  registry->RegisterListPref(kDeclinedPref);
++  registry->RegisterStringPref(kSaltPref, std::string());
++  registry->RegisterBooleanPref(kAllowedPref, true);
++}
++
++}  // namespace tark_zynclave
+--- /dev/null
++++ b/chrome/browser/tark_zynclave/zynclave_prefs.h
+@@ -0,0 +1,27 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_TARK_ZYNCLAVE_ZYNCLAVE_PREFS_H_
++#define CHROME_BROWSER_TARK_ZYNCLAVE_ZYNCLAVE_PREFS_H_
++
++class PrefRegistrySimple;
++
++namespace tark_zynclave {
++
++// Base64 of the encrypted {refresh, access, expiry}. Never synced.
++inline constexpr char kTokensPref[] = "tark.zynclave.tokens";
++// The account as shown: sub, name, email, picture, and whether it needs
++// signing in again. Not secret; never synced.
++inline constexpr char kAccountPref[] = "tark.zynclave.account";
++// Salted SHA-256 hashes of accounts declined at "Sign in to Tark as X?".
++inline constexpr char kDeclinedPref[] = "tark.zynclave.declined";
++inline constexpr char kSaltPref[] = "tark.zynclave.salt";
++// The ZynclaveSignInAllowed policy.
++inline constexpr char kAllowedPref[] = "tark.zynclave.allowed";
++
++void RegisterZynclavePrefs(PrefRegistrySimple* registry);
++
++}  // namespace tark_zynclave
++
++#endif  // CHROME_BROWSER_TARK_ZYNCLAVE_ZYNCLAVE_PREFS_H_
+--- /dev/null
++++ b/chrome/browser/tark_zynclave/zynclave_redirect_throttle.cc
+@@ -0,0 +1,81 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/tark_zynclave/zynclave_redirect_throttle.h"
++
++#include <memory>
++
++#include "base/functional/bind.h"
++#include "base/task/single_thread_task_runner.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/tark_zynclave/oidc.h"
++#include "chrome/browser/tark_zynclave/zynclave_sign_in_service.h"
++#include "chrome/browser/tark_zynclave/zynclave_sign_in_service_factory.h"
++#include "content/public/browser/navigation_handle.h"
++#include "content/public/browser/navigation_throttle_registry.h"
++#include "content/public/browser/web_contents.h"
++
++namespace tark_zynclave {
++
++namespace {
++
++void CloseTab(base::WeakPtr<content::WebContents> contents) {
++  if (contents) {
++    contents->ClosePage();
++  }
++}
++
++}  // namespace
++
++// static
++void ZynclaveRedirectThrottle::MaybeCreateAndAdd(
++    content::NavigationThrottleRegistry& registry) {
++  registry.AddThrottle(std::make_unique<ZynclaveRedirectThrottle>(registry));
++}
++
++ZynclaveRedirectThrottle::ZynclaveRedirectThrottle(
++    content::NavigationThrottleRegistry& registry)
++    : content::NavigationThrottle(registry) {}
++
++ZynclaveRedirectThrottle::~ZynclaveRedirectThrottle() = default;
++
++content::NavigationThrottle::ThrottleCheckResult
++ZynclaveRedirectThrottle::WillStartRequest() {
++  return Check();
++}
++
++content::NavigationThrottle::ThrottleCheckResult
++ZynclaveRedirectThrottle::WillRedirectRequest() {
++  return Check();
++}
++
++const char* ZynclaveRedirectThrottle::GetNameForLogging() {
++  return "ZynclaveRedirectThrottle";
++}
++
++content::NavigationThrottle::ThrottleCheckResult
++ZynclaveRedirectThrottle::Check() {
++  content::NavigationHandle* handle = navigation_handle();
++  if (!IsRedirectUrl(handle->GetURL())) {
++    return PROCEED;
++  }
++  content::WebContents* contents = handle->GetWebContents();
++  Profile* profile =
++      contents ? Profile::FromBrowserContext(contents->GetBrowserContext())
++               : nullptr;
++  // Incognito and Guest have no service; other frames are never ours.
++  ZynclaveSignInService* service =
++      profile && handle->IsInPrimaryMainFrame()
++          ? ZynclaveSignInServiceFactory::GetForProfile(profile)
++          : nullptr;
++  if (service && service->allowed() &&
++      service->auth().HandleRedirect(handle->GetURL())) {
++    // The sign-in tab has done its job.
++    base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
++        FROM_HERE, base::BindOnce(&CloseTab, contents->GetWeakPtr()));
++  }
++  return CANCEL_AND_IGNORE;
++}
++
++}  // namespace tark_zynclave
+--- /dev/null
++++ b/chrome/browser/tark_zynclave/zynclave_redirect_throttle.h
+@@ -0,0 +1,40 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_TARK_ZYNCLAVE_ZYNCLAVE_REDIRECT_THROTTLE_H_
++#define CHROME_BROWSER_TARK_ZYNCLAVE_ZYNCLAVE_REDIRECT_THROTTLE_H_
++
++#include "content/public/browser/navigation_throttle.h"
++
++namespace content {
++class NavigationThrottleRegistry;
++}
++
++namespace tark_zynclave {
++
++// Catches com.gettarka.tarka:/oauth2redirect in any tab, as a link or as a
++// redirect from Zynclave. It is always cancelled, so it never reaches the
++// operating system's handler or the history. In a normal profile's main
++// frame it is handed to that profile's sign-in, which takes it only if its
++// state is one it is waiting for; then the tab closes.
++class ZynclaveRedirectThrottle : public content::NavigationThrottle {
++ public:
++  static void MaybeCreateAndAdd(content::NavigationThrottleRegistry& registry);
++
++  explicit ZynclaveRedirectThrottle(
++      content::NavigationThrottleRegistry& registry);
++  ~ZynclaveRedirectThrottle() override;
++
++  // content::NavigationThrottle:
++  ThrottleCheckResult WillStartRequest() override;
++  ThrottleCheckResult WillRedirectRequest() override;
++  const char* GetNameForLogging() override;
++
++ private:
++  ThrottleCheckResult Check();
++};
++
++}  // namespace tark_zynclave
++
++#endif  // CHROME_BROWSER_TARK_ZYNCLAVE_ZYNCLAVE_REDIRECT_THROTTLE_H_
+--- /dev/null
++++ b/chrome/browser/tark_zynclave/zynclave_sign_in_service.cc
+@@ -0,0 +1,105 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/tark_zynclave/zynclave_sign_in_service.h"
++
++#include <utility>
++
++#include "base/functional/bind.h"
++#include "chrome/browser/browser_process.h"
++#include "chrome/browser/net/system_network_context_manager.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/tark_zynclave/token_cipher.h"
++#include "chrome/browser/tark_zynclave/zynclave_prefs.h"
++#include "chrome/browser/ui/navigator/browser_navigator.h"
++#include "chrome/browser/ui/navigator/browser_navigator_params.h"
++#include "components/os_crypt/async/browser/os_crypt_async.h"
++#include "components/os_crypt/async/common/encryptor.h"
++#include "components/prefs/pref_service.h"
++#include "services/network/public/cpp/shared_url_loader_factory.h"
++#include "ui/base/page_transition_types.h"
++#include "ui/base/window_open_disposition.h"
++
++namespace tark_zynclave {
++
++namespace {
++
++// OSCrypt: the Keychain-held key on the Mac, DPAPI on Windows.
++class OsCryptCipher : public TokenCipher {
++ public:
++  explicit OsCryptCipher(scoped_refptr<os_crypt_async::Encryptor> encryptor)
++      : encryptor_(std::move(encryptor)) {}
++
++  std::optional<std::string> Encrypt(std::string_view plain) override {
++    std::string out;
++    if (!encryptor_->EncryptString(std::string(plain), &out)) {
++      return std::nullopt;
++    }
++    return out;
++  }
++
++  std::optional<std::string> Decrypt(std::string_view cipher) override {
++    std::string out;
++    if (!encryptor_->DecryptString(std::string(cipher), &out)) {
++      return std::nullopt;
++    }
++    return out;
++  }
++
++ private:
++  scoped_refptr<os_crypt_async::Encryptor> encryptor_;
++};
++
++}  // namespace
++
++ZynclaveSignInService::ZynclaveSignInService(Profile* profile)
++    : profile_(profile) {
++  auth_ = std::make_unique<ZynclaveAuth>(
++      GetZynclaveConfig(), profile->GetPrefs(),
++      // The system network context: no cookies, nothing of the profile.
++      g_browser_process->system_network_context_manager()
++          ->GetSharedURLLoaderFactory(),
++      base::BindRepeating(&ZynclaveSignInService::OpenUrl,
++                          base::Unretained(this)));
++  g_browser_process->os_crypt_async()->GetInstance(base::BindOnce(
++      &ZynclaveSignInService::OnEncryptor, weak_factory_.GetWeakPtr()));
++  pref_changes_.Init(profile->GetPrefs());
++  pref_changes_.Add(kAllowedPref,
++                    base::BindRepeating(&ZynclaveSignInService::OnAllowedChanged,
++                                        base::Unretained(this)));
++  OnAllowedChanged();
++}
++
++ZynclaveSignInService::~ZynclaveSignInService() = default;
++
++bool ZynclaveSignInService::allowed() const {
++  return profile_->GetPrefs()->GetBoolean(kAllowedPref);
++}
++
++void ZynclaveSignInService::Shutdown() {
++  pref_changes_.RemoveAll();
++  weak_factory_.InvalidateWeakPtrs();
++}
++
++void ZynclaveSignInService::OnEncryptor(
++    scoped_refptr<os_crypt_async::Encryptor> encryptor) {
++  auth_->SetCipher(std::make_unique<OsCryptCipher>(std::move(encryptor)));
++}
++
++void ZynclaveSignInService::OnAllowedChanged() {
++  if (!allowed() && auth_->state() != ZynclaveState::kSignedOut) {
++    auth_->SignOutLocally();
++  }
++}
++
++void ZynclaveSignInService::OpenUrl(const GURL& url) {
++  // A new foreground tab of this profile: the Zynclave session cookie lands
++  // here, never in Incognito, a popup or a web view.
++  NavigateParams params(profile_, url, ui::PAGE_TRANSITION_AUTO_TOPLEVEL);
++  params.disposition = WindowOpenDisposition::NEW_FOREGROUND_TAB;
++  params.window_action = NavigateParams::WindowAction::kShowWindow;
++  Navigate(&params);
++}
++
++}  // namespace tark_zynclave
+--- /dev/null
++++ b/chrome/browser/tark_zynclave/zynclave_sign_in_service.h
+@@ -0,0 +1,56 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_TARK_ZYNCLAVE_ZYNCLAVE_SIGN_IN_SERVICE_H_
++#define CHROME_BROWSER_TARK_ZYNCLAVE_ZYNCLAVE_SIGN_IN_SERVICE_H_
++
++#include <memory>
++
++#include "base/memory/raw_ptr.h"
++#include "base/memory/scoped_refptr.h"
++#include "base/memory/weak_ptr.h"
++#include "chrome/browser/tark_zynclave/zynclave_auth.h"
++#include "components/keyed_service/core/keyed_service.h"
++#include "components/prefs/pref_change_registrar.h"
++
++class Profile;
++
++namespace os_crypt_async {
++class Encryptor;
++}
++
++namespace tark_zynclave {
++
++// A normal profile's Zynclave account. There is none for Incognito or
++// Guest (ZynclaveSignInServiceFactory), so nothing Zynclave ever runs there.
++// Nothing happens at startup beyond reading prefs: no request until the
++// person signs in or something needs the account.
++class ZynclaveSignInService : public KeyedService {
++ public:
++  explicit ZynclaveSignInService(Profile* profile);
++  ZynclaveSignInService(const ZynclaveSignInService&) = delete;
++  ZynclaveSignInService& operator=(const ZynclaveSignInService&) = delete;
++  ~ZynclaveSignInService() override;
++
++  ZynclaveAuth& auth() { return *auth_; }
++  // False when the ZynclaveSignInAllowed policy turns sign-in off.
++  bool allowed() const;
++
++  // KeyedService:
++  void Shutdown() override;
++
++ private:
++  void OpenUrl(const GURL& url);
++  void OnEncryptor(scoped_refptr<os_crypt_async::Encryptor> encryptor);
++  void OnAllowedChanged();
++
++  const raw_ptr<Profile> profile_;
++  std::unique_ptr<ZynclaveAuth> auth_;
++  PrefChangeRegistrar pref_changes_;
++  base::WeakPtrFactory<ZynclaveSignInService> weak_factory_{this};
++};
++
++}  // namespace tark_zynclave
++
++#endif  // CHROME_BROWSER_TARK_ZYNCLAVE_ZYNCLAVE_SIGN_IN_SERVICE_H_
+--- /dev/null
++++ b/chrome/browser/tark_zynclave/zynclave_sign_in_service_factory.cc
+@@ -0,0 +1,38 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/tark_zynclave/zynclave_sign_in_service_factory.h"
++
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/tark_zynclave/zynclave_sign_in_service.h"
++
++namespace tark_zynclave {
++
++// static
++ZynclaveSignInService* ZynclaveSignInServiceFactory::GetForProfile(
++    Profile* profile) {
++  return static_cast<ZynclaveSignInService*>(
++      GetInstance()->GetServiceForBrowserContext(profile, /*create=*/true));
++}
++
++// static
++ZynclaveSignInServiceFactory* ZynclaveSignInServiceFactory::GetInstance() {
++  static base::NoDestructor<ZynclaveSignInServiceFactory> instance;
++  return instance.get();
++}
++
++ZynclaveSignInServiceFactory::ZynclaveSignInServiceFactory()
++    : ProfileKeyedServiceFactory("ZynclaveSignInService",
++                                 ProfileSelections::BuildForRegularProfile()) {}
++
++ZynclaveSignInServiceFactory::~ZynclaveSignInServiceFactory() = default;
++
++std::unique_ptr<KeyedService>
++ZynclaveSignInServiceFactory::BuildServiceInstanceForBrowserContext(
++    content::BrowserContext* context) const {
++  return std::make_unique<ZynclaveSignInService>(
++      Profile::FromBrowserContext(context));
++}
++
++}  // namespace tark_zynclave
+--- /dev/null
++++ b/chrome/browser/tark_zynclave/zynclave_sign_in_service_factory.h
+@@ -0,0 +1,35 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_TARK_ZYNCLAVE_ZYNCLAVE_SIGN_IN_SERVICE_FACTORY_H_
++#define CHROME_BROWSER_TARK_ZYNCLAVE_ZYNCLAVE_SIGN_IN_SERVICE_FACTORY_H_
++
++#include "base/no_destructor.h"
++#include "chrome/browser/profiles/profile_keyed_service_factory.h"
++
++class Profile;
++
++namespace tark_zynclave {
++
++class ZynclaveSignInService;
++
++// Normal profiles only: GetForProfile is null for Incognito and Guest.
++class ZynclaveSignInServiceFactory : public ProfileKeyedServiceFactory {
++ public:
++  static ZynclaveSignInService* GetForProfile(Profile* profile);
++  static ZynclaveSignInServiceFactory* GetInstance();
++
++ private:
++  friend base::NoDestructor<ZynclaveSignInServiceFactory>;
++
++  ZynclaveSignInServiceFactory();
++  ~ZynclaveSignInServiceFactory() override;
++
++  std::unique_ptr<KeyedService> BuildServiceInstanceForBrowserContext(
++      content::BrowserContext* context) const override;
++};
++
++}  // namespace tark_zynclave
++
++#endif  // CHROME_BROWSER_TARK_ZYNCLAVE_ZYNCLAVE_SIGN_IN_SERVICE_FACTORY_H_
