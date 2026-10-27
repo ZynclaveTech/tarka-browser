@@ -49,6 +49,13 @@ class TestAndroidSeries(unittest.TestCase):
         self.assertFalse(series.desktop_only('tarka/captionsx/a.patch', {'tarka/captions/'}))
         self.assertTrue(series.desktop_only('tarka/updater/sparkle.patch', {'tarka/updater/sparkle.patch'}))
 
+    def test_desktop_zynclave_sign_in_stays_off_android(self):
+        # Android signs in with its own patches (android/patches/zynclave-*);
+        # the desktop ones would add the same chrome/browser/tark_zynclave files.
+        self.assertIn('tarka/zynclave/', self.skip)
+        self.assertTrue([e for e in self.tark if e.startswith('tarka/zynclave/')])
+        self.assertFalse([e for e in self.series if e.startswith('tarka/zynclave/')])
+
     def test_locales_fix_is_android_only(self):
         self.assertIn('android/locales-android-branch.patch', self.series)
         self.assertNotIn('android/locales-android-branch.patch',
