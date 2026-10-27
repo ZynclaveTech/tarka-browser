@@ -49,6 +49,13 @@ int tark_xlit_looks_transliterable(const char* text);
 // {"tag": "hi", "name": "हिन्दी"}. Empty array when none is Indian. Release
 // with tark_xlit_string_free.
 char* tark_xlit_row_languages(const char* accept_languages);
+
+// The Wikipedia language code for `query` (tark_xlit::WikipediaLanguage): "en"
+// for Latin text, else the first language in `accept_languages` written in the
+// query's script, else that script's default. Release with
+// tark_xlit_string_free; NULL on a NULL query.
+char* tark_xlit_wikipedia_language(const char* query,
+                                   const char* accept_languages);
 void tark_xlit_string_free(char* text);
 void tark_xlit_free(TarkXlit* handle);
 
