@@ -85,6 +85,10 @@ MSG
   if ! $resume; then
     "$_root_dir/retrieve_and_unpack_resource.py" -d -g "$_arch"
     python3 "$_main_repo/utils/prune_binaries.py" "$_src_dir" "$_main_repo/pruning.list"
+    # Toolchains and TypeScript before the patches: fix-typescript-lib-dom.patch
+    # changes a file from the TypeScript download.
+    mkdir -p "$_src_dir/third_party/llvm-build/Release+Asserts" "$_src_dir/third_party/rust-toolchain/bin"
+    "$_root_dir/retrieve_and_unpack_resource.py" -p "$_arch"
 
     # Apply ungoogled-chromium's patches, then ours, through quilt so that
     # build/src/.pc exists and new patches can be made with quilt new/refresh.
@@ -112,8 +116,6 @@ MSG
   cp "$_root_dir"/resources/fonts/inter-latin*.woff2 "$_src_dir/ui/webui/resources/fonts/"
 
   _write_gn_args
-  mkdir -p "$_src_dir/third_party/llvm-build/Release+Asserts" "$_src_dir/third_party/rust-toolchain/bin"
-  "$_root_dir/retrieve_and_unpack_resource.py" -p "$_arch"
 
   # Tark: Sparkle 2, the updater (M5); installed into the app when it is signed.
   python3 "$_main_repo/utils/downloads.py" retrieve -i "$_root_dir/downloads-sparkle.ini" -c "$_download_cache"
