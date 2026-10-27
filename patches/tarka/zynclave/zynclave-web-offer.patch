@@ -1,0 +1,788 @@
+--- a/chrome/app/settings_strings.grdp
++++ b/chrome/app/settings_strings.grdp
+@@ -741,6 +741,21 @@
+     <message name="IDS_SETTINGS_TARK_CONNECTS_ZYNCLAVE" desc="Item in the list of services Tark connects to: Zynclave, the optional account. $1 is a list of host names.">
+       Zynclave, only when you sign in to Tark, while you are signed in, or after you visit Zynclave's account pages; your account photo comes from Zynclave or Google (<ph name="HOSTS">$1<ex>accounts.example.com</ex></ph>)
+     </message>
++    <message name="IDS_TARK_ZYNCLAVE_OFFER_TITLE" desc="Title of the bubble under the address bar offering to sign Tark in with the Zynclave account the person is signed in to on the web. $1 is the account's name or email.">
++      Sign in to Tark as <ph name="NAME">$1<ex>Asha Rao</ex></ph>?
++    </message>
++    <message name="IDS_TARK_ZYNCLAVE_OFFER_TITLE_GENERIC" desc="Title of the same bubble when the account has no name or email.">
++      Sign in to Tark with your Zynclave account?
++    </message>
++    <message name="IDS_TARK_ZYNCLAVE_OFFER_BODY" desc="Text of the bubble offering to sign Tark in with Zynclave.">
++      Use your Zynclave account in Tark to sync bookmarks and settings.
++    </message>
++    <message name="IDS_TARK_ZYNCLAVE_OFFER_SIGN_IN" desc="Button in the bubble: sign Tark in with this Zynclave account.">
++      Sign in
++    </message>
++    <message name="IDS_TARK_ZYNCLAVE_OFFER_NO_THANKS" desc="Button in the bubble: don't sign in, and don't offer this account again.">
++      No thanks
++    </message>
+     <message name="IDS_SETTINGS_TARK_ZYNCLAVE_SIGN_IN" desc="Title of the account card in Settings > Profile when no Zynclave account is signed in.">
+       Sign in with Zynclave
+     </message>
+--- a/chrome/browser/tark_zynclave/BUILD.gn
++++ b/chrome/browser/tark_zynclave/BUILD.gn
+@@ -80,6 +80,48 @@
+   ]
+ }
+ 
++# "Sign in to Tark as X?": which pages count, the declined accounts' hashes.
++static_library("web_offer_rules") {
++  sources = [
++    "web_offer_rules.cc",
++    "web_offer_rules.h",
++  ]
++  public_deps = [
++    ":auth",
++    ":oidc",
++    "//base",
++    "//url",
++  ]
++  deps = [ "//crypto" ]
++}
++
++# The tab helper and its bubble. Built into the browser (it uses the
++# browser window and the profile's service); only its rules have unit tests.
++source_set("web_offer") {
++  sources = [
++    "whoami_fetcher.cc",
++    "whoami_fetcher.h",
++    "zynclave_offer_bubble.cc",
++    "zynclave_offer_bubble.h",
++    "zynclave_web_offer.cc",
++    "zynclave_web_offer.h",
++  ]
++  deps = [
++    ":auth",
++    ":web_offer_rules",
++    "//base",
++    "//chrome/app:generated_resources",
++    "//components/prefs",
++    "//components/tabs:public",
++    "//content/public/browser",
++    "//crypto",
++    "//net",
++    "//services/network/public/cpp",
++    "//ui/base",
++    "//ui/views",
++  ]
++}
++
+ source_set("test_util") {
+   testonly = true
+   sources = [
+@@ -98,8 +140,10 @@
+     "whoami_response_unittest.cc",
+     "zynclave_auth_unittest.cc",
+     "zynclave_avatar_unittest.cc",
++    "web_offer_rules_unittest.cc",
+   ]
+   deps = [
++    ":web_offer_rules",
+     ":auth",
+     ":avatar",
+     "//skia",
+--- /dev/null
++++ b/chrome/browser/tark_zynclave/web_offer_rules.cc
+@@ -0,0 +1,58 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/tark_zynclave/web_offer_rules.h"
++
++#include "base/strings/string_number_conversions.h"
++#include "base/strings/string_util.h"
++#include "base/strings/utf_string_conversions.h"
++#include "chrome/browser/tark_zynclave/oidc.h"
++#include "chrome/browser/tark_zynclave/zynclave_auth.h"
++#include "crypto/hash.h"
++#include "url/gurl.h"
++
++namespace tark_zynclave {
++
++bool IsAccountsUrl(const GURL& url, std::string_view accounts_host) {
++  return url.is_valid() && url.SchemeIs(url::kHttpsScheme) &&
++         url.host() == accounts_host;
++}
++
++bool IsSignInScreen(const GURL& url, std::string_view accounts_host) {
++  if (!IsAccountsUrl(url, accounts_host)) {
++    return false;
++  }
++  const std::string_view path = url.path();
++  for (std::string_view screen :
++       {"/login", "/registration", "/recovery", "/verification", "/error"}) {
++    if (path == screen ||
++        (path.starts_with(screen) && path.size() > screen.size() &&
++         path[screen.size()] == '/')) {
++      return true;
++    }
++  }
++  return path.starts_with("/oauth/");
++}
++
++std::string DeclineHash(std::string_view salt, std::string_view identity_id) {
++  std::string input(salt);
++  input.push_back('\0');
++  input.append(identity_id);
++  return base::ToLowerASCII(base::HexEncode(crypto::hash::Sha256(input)));
++}
++
++bool MayCheck(bool allowed, ZynclaveState state) {
++  return allowed && (state == ZynclaveState::kSignedOut ||
++                     state == ZynclaveState::kNeedsSignInAgain);
++}
++
++std::u16string OfferTitleName(const WhoamiResult& who) {
++  std::string name = CleanDisplayText(who.name, 40);
++  if (name.empty()) {
++    name = CleanDisplayText(who.email, 64);
++  }
++  return base::UTF8ToUTF16(name);
++}
++
++}  // namespace tark_zynclave
+--- /dev/null
++++ b/chrome/browser/tark_zynclave/web_offer_rules.h
+@@ -0,0 +1,39 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_TARK_ZYNCLAVE_WEB_OFFER_RULES_H_
++#define CHROME_BROWSER_TARK_ZYNCLAVE_WEB_OFFER_RULES_H_
++
++#include <string>
++#include <string_view>
++
++#include "chrome/browser/tark_zynclave/whoami_response.h"
++
++class GURL;
++
++namespace tark_zynclave {
++
++enum class ZynclaveState;
++
++// A page of the Zynclave Account on the web (https://<accounts host>/...).
++bool IsAccountsUrl(const GURL& url, std::string_view accounts_host);
++
++// One of its sign-in screens (/login, /registration, /recovery,
++// /verification, /error, /oauth/...): the offer never shows over them.
++bool IsSignInScreen(const GURL& url, std::string_view accounts_host);
++
++// What "No thanks" keeps: SHA-256 of a per-profile salt and the account's
++// identity id, in hex. The id itself is never stored.
++std::string DeclineHash(std::string_view salt, std::string_view identity_id);
++
++// Whether a whoami check may run at all.
++bool MayCheck(bool allowed, ZynclaveState state);
++
++// The name for "Sign in to Tark as {name}?": the account's name, else its
++// email, cleaned; empty for the generic title.
++std::u16string OfferTitleName(const WhoamiResult& who);
++
++}  // namespace tark_zynclave
++
++#endif  // CHROME_BROWSER_TARK_ZYNCLAVE_WEB_OFFER_RULES_H_
+--- /dev/null
++++ b/chrome/browser/tark_zynclave/web_offer_rules_unittest.cc
+@@ -0,0 +1,74 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/tark_zynclave/web_offer_rules.h"
++
++#include "chrome/browser/tark_zynclave/zynclave_auth.h"
++#include "testing/gtest/include/gtest/gtest.h"
++#include "url/gurl.h"
++
++namespace tark_zynclave {
++namespace {
++
++constexpr char kHost[] = "accounts.example.test";
++
++TEST(TarkZynclaveWebOffer, AccountsPages) {
++  EXPECT_TRUE(IsAccountsUrl(GURL("https://accounts.example.test/"), kHost));
++  EXPECT_TRUE(
++      IsAccountsUrl(GURL("https://accounts.example.test/settings"), kHost));
++  EXPECT_FALSE(IsAccountsUrl(GURL("http://accounts.example.test/"), kHost));
++  EXPECT_FALSE(IsAccountsUrl(GURL("https://example.test/"), kHost));
++  EXPECT_FALSE(
++      IsAccountsUrl(GURL("https://accounts.example.test.evil/"), kHost));
++}
++
++TEST(TarkZynclaveWebOffer, SignInScreens) {
++  for (const char* path :
++       {"/login", "/login/", "/login?flow=1", "/registration", "/recovery",
++        "/verification", "/error", "/oauth/consent", "/oauth/login"}) {
++    EXPECT_TRUE(IsSignInScreen(
++        GURL(std::string("https://accounts.example.test") + path), kHost))
++        << path;
++  }
++  for (const char* path : {"/", "/settings", "/loginx", "/sessions"}) {
++    EXPECT_FALSE(IsSignInScreen(
++        GURL(std::string("https://accounts.example.test") + path), kHost))
++        << path;
++  }
++  // Another site's /login is not Zynclave's sign-in screen.
++  EXPECT_FALSE(IsSignInScreen(GURL("https://shodhya.com/login"), kHost));
++}
++
++TEST(TarkZynclaveWebOffer, DeclineHashIsSaltedAndStable) {
++  const std::string a = DeclineHash("salt-1", "identity");
++  EXPECT_EQ(a, DeclineHash("salt-1", "identity"));
++  EXPECT_NE(a, DeclineHash("salt-2", "identity"));
++  EXPECT_NE(a, DeclineHash("salt-1", "other"));
++  EXPECT_EQ(a.size(), 64u);
++  EXPECT_EQ(a.find("identity"), std::string::npos);
++}
++
++TEST(TarkZynclaveWebOffer, ChecksOnlyWhenNotSignedIn) {
++  EXPECT_TRUE(MayCheck(/*allowed=*/true, ZynclaveState::kSignedOut));
++  EXPECT_TRUE(MayCheck(true, ZynclaveState::kNeedsSignInAgain));
++  EXPECT_FALSE(MayCheck(true, ZynclaveState::kSignedIn));
++  EXPECT_FALSE(MayCheck(true, ZynclaveState::kSigningIn));
++  EXPECT_FALSE(MayCheck(/*allowed=*/false, ZynclaveState::kSignedOut));
++}
++
++TEST(TarkZynclaveWebOffer, BubbleTitle) {
++  WhoamiResult who;
++  who.name = "Asha";
++  who.email = "asha@example.test";
++  EXPECT_EQ(OfferTitleName(who), u"Asha");
++  who.name.clear();
++  EXPECT_EQ(OfferTitleName(who), u"asha@example.test");
++  who.email.clear();
++  EXPECT_EQ(OfferTitleName(who), u"");
++  who.name = "Ev‮il";
++  EXPECT_EQ(OfferTitleName(who), u"Evil");
++}
++
++}  // namespace
++}  // namespace tark_zynclave
+--- /dev/null
++++ b/chrome/browser/tark_zynclave/whoami_fetcher.cc
+@@ -0,0 +1,125 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/tark_zynclave/whoami_fetcher.h"
++
++#include <memory>
++#include <optional>
++#include <string>
++#include <utility>
++
++#include "base/functional/bind.h"
++#include "base/functional/callback.h"
++#include "base/location.h"
++#include "base/task/sequenced_task_runner.h"
++#include "base/time/time.h"
++#include "chrome/browser/profiles/profile.h"
++#include "content/public/browser/browser_thread.h"
++#include "content/public/browser/storage_partition.h"
++#include "net/base/isolation_info.h"
++#include "net/cookies/site_for_cookies.h"
++#include "net/http/http_request_headers.h"
++#include "net/http/http_response_headers.h"
++#include "net/traffic_annotation/network_traffic_annotation.h"
++#include "services/network/public/cpp/resource_request.h"
++#include "services/network/public/cpp/shared_url_loader_factory.h"
++#include "services/network/public/cpp/simple_url_loader.h"
++#include "services/network/public/mojom/fetch_api.mojom-shared.h"
++#include "services/network/public/mojom/url_response_head.mojom.h"
++#include "url/gurl.h"
++#include "url/origin.h"
++#include "url/url_constants.h"
++
++namespace tark_zynclave {
++
++namespace {
++
++constexpr base::TimeDelta kTimeout = base::Seconds(10);
++constexpr char kWhoamiPath[] = "/sessions/whoami";
++
++constexpr net::NetworkTrafficAnnotationTag kTrafficAnnotation =
++    net::DefineNetworkTrafficAnnotation("tark_zynclave_whoami", R"(
++      semantics {
++        sender: "Tark: Sign in with Zynclave"
++        description:
++          "Asks the Zynclave Account whether the person is signed in to it on "
++          "the web in this profile, so that Tark can offer \"Sign in to Tark "
++          "as <name>?\". The name and email in the answer are shown on that "
++          "offer only; nothing is stored."
++        trigger: "Once, after a normal (not private) tab went through the "
++          "Zynclave Account's pages and then stayed on a page that is not a "
++          "sign-in screen for 3 seconds, while Tark is not signed in. Never "
++          "in private tabs, never polled."
++        data: "The profile's cookies for the Zynclave Account, sent by the "
++          "browser as for any request to that site."
++        destination: OTHER
++      }
++      policy {
++        cookies_allowed: YES
++        cookies_store: "user"
++        setting: "Choosing No thanks stops the offer for that account; "
++          "private tabs never make this request."
++        policy_exception_justification: "Tark has no enterprise policies."
++      })");
++
++void OnDownloaded(std::unique_ptr<network::SimpleURLLoader> loader,
++                  WhoamiCallback callback,
++                  std::optional<std::string> body) {
++  const network::mojom::URLResponseHead* head = loader->ResponseInfo();
++  const int status =
++      head && head->headers ? head->headers->response_code() : 0;
++  if (status != 200 || !body) {
++    std::move(callback).Run(WhoamiResult());
++    return;
++  }
++  std::move(callback).Run(ParseWhoami(*body));
++}
++
++}  // namespace
++
++void FetchWhoami(Profile* profile,
++                 const GURL& accounts_origin,
++                 WhoamiCallback callback) {
++  DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
++  // Private tabs: no request at all (handoff §2a). Java attaches no observer
++  // to them either; this is the second check.
++  if (!profile || profile->IsOffTheRecord() || !accounts_origin.is_valid() ||
++      !accounts_origin.SchemeIs(url::kHttpsScheme)) {
++    base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++        FROM_HERE, base::BindOnce(std::move(callback), WhoamiResult()));
++    return;
++  }
++  const url::Origin origin = url::Origin::Create(accounts_origin);
++  auto request = std::make_unique<network::ResourceRequest>();
++  request->url = origin.GetURL().Resolve(kWhoamiPath);
++  request->method = "GET";
++  // The browser attaches the profile's cookies for the accounts site, as a
++  // first-party request from that site would get them.
++  request->credentials_mode = network::mojom::CredentialsMode::kInclude;
++  request->site_for_cookies = net::SiteForCookies::FromOrigin(origin);
++  request->request_initiator = origin;
++  request->trusted_params = network::ResourceRequest::TrustedParams();
++  request->trusted_params->isolation_info = net::IsolationInfo::Create(
++      net::IsolationInfo::RequestType::kOther, origin, origin,
++      net::SiteForCookies::FromOrigin(origin));
++  // whoami answers in place; a redirect is not a session.
++  request->redirect_mode = network::mojom::RedirectMode::kError;
++  request->headers.SetHeader(net::HttpRequestHeaders::kAccept,
++                             "application/json");
++
++  std::unique_ptr<network::SimpleURLLoader> loader =
++      network::SimpleURLLoader::Create(std::move(request), kTrafficAnnotation);
++  loader->SetTimeoutDuration(kTimeout);
++  // A 401 is an answer, not an error to retry; its body is not read.
++  network::SimpleURLLoader* raw_loader = loader.get();
++  scoped_refptr<network::SharedURLLoaderFactory> factory =
++      profile->GetDefaultStoragePartition()
++          ->GetURLLoaderFactoryForBrowserProcess();
++  raw_loader->DownloadToString(
++      factory.get(),
++      base::BindOnce(&OnDownloaded, std::move(loader), std::move(callback)),
++      kMaxWhoamiBytes);
++}
++
++}  // namespace tark_zynclave
+--- /dev/null
++++ b/chrome/browser/tark_zynclave/whoami_fetcher.h
+@@ -0,0 +1,31 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_TARK_ZYNCLAVE_WHOAMI_FETCHER_H_
++#define CHROME_BROWSER_TARK_ZYNCLAVE_WHOAMI_FETCHER_H_
++
++#include "base/functional/callback_forward.h"
++#include "chrome/browser/tark_zynclave/whoami_response.h"
++
++class GURL;
++class Profile;
++
++namespace tark_zynclave {
++
++using WhoamiCallback = base::OnceCallback<void(WhoamiResult)>;
++
++// "Sign in to Tark as X?" (spec §5.6): whether the Zynclave Account has a web
++// session in `profile`, from GET <accounts_origin>/sessions/whoami in that
++// profile's own network context, so the browser sends the profile's cookies
++// (Tark never reads them). An off-the-record profile makes no request and
++// answers not signed in. Anything but a 200 with a session (401, an error, a
++// redirect, a timeout after 10 s, a body over 64 KB) is not signed in.
++// `callback` runs on the UI thread, never synchronously.
++void FetchWhoami(Profile* profile,
++                 const GURL& accounts_origin,
++                 WhoamiCallback callback);
++
++}  // namespace tark_zynclave
++
++#endif  // CHROME_BROWSER_TARK_ZYNCLAVE_WHOAMI_FETCHER_H_
+--- /dev/null
++++ b/chrome/browser/tark_zynclave/zynclave_offer_bubble.cc
+@@ -0,0 +1,63 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/tark_zynclave/zynclave_offer_bubble.h"
++
++#include <memory>
++#include <utility>
++
++#include "base/functional/callback.h"
++#include "chrome/browser/ui/views/frame/browser_view.h"
++#include "chrome/browser/ui/views/location_bar/location_bar_view.h"
++#include "chrome/grit/generated_resources.h"
++#include "components/tabs/public/tab_interface.h"
++#include "ui/base/l10n/l10n_util.h"
++#include "ui/base/models/dialog_model.h"
++#include "ui/views/bubble/bubble_dialog_delegate_view.h"
++#include "ui/views/bubble/bubble_dialog_model_host.h"
++#include "ui/views/widget/widget.h"
++
++namespace tark_zynclave {
++
++void ShowZynclaveOfferBubble(content::WebContents* contents,
++                             const std::u16string& name,
++                             base::OnceClosure on_sign_in,
++                             base::OnceClosure on_no_thanks) {
++  tabs::TabInterface* tab = tabs::TabInterface::MaybeGetFromContents(contents);
++  if (!tab || !tab->IsActivated() || !tab->GetBrowserWindowInterface()) {
++    return;
++  }
++  BrowserView* browser_view =
++      BrowserView::GetBrowserViewForBrowser(tab->GetBrowserWindowInterface());
++  views::View* anchor =
++      browser_view ? browser_view->GetLocationBarView() : nullptr;
++  if (!anchor || !anchor->GetWidget() || !anchor->GetWidget()->IsVisible()) {
++    return;
++  }
++  std::u16string title =
++      name.empty()
++          ? l10n_util::GetStringUTF16(IDS_TARK_ZYNCLAVE_OFFER_TITLE_GENERIC)
++          : l10n_util::GetStringFUTF16(IDS_TARK_ZYNCLAVE_OFFER_TITLE, name);
++  auto model =
++      ui::DialogModel::Builder()
++          .SetTitle(std::move(title))
++          .AddParagraph(ui::DialogModelLabel(
++              l10n_util::GetStringUTF16(IDS_TARK_ZYNCLAVE_OFFER_BODY)))
++          .AddOkButton(std::move(on_sign_in),
++                       ui::DialogModel::Button::Params().SetLabel(
++                           l10n_util::GetStringUTF16(
++                               IDS_TARK_ZYNCLAVE_OFFER_SIGN_IN)))
++          .AddCancelButton(std::move(on_no_thanks),
++                           ui::DialogModel::Button::Params().SetLabel(
++                               l10n_util::GetStringUTF16(
++                                   IDS_TARK_ZYNCLAVE_OFFER_NO_THANKS)))
++          .Build();
++  auto bubble = std::make_unique<views::BubbleDialogModelHost>(
++      std::move(model), anchor, views::BubbleBorder::TOP_LEFT);
++  views::BubbleDialogDelegate::CreateBubbleDeprecated(
++      std::move(bubble), views::Widget::InitParams::NATIVE_WIDGET_OWNS_WIDGET)
++      ->Show();
++}
++
++}  // namespace tark_zynclave
+--- /dev/null
++++ b/chrome/browser/tark_zynclave/zynclave_offer_bubble.h
+@@ -0,0 +1,28 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_TARK_ZYNCLAVE_ZYNCLAVE_OFFER_BUBBLE_H_
++#define CHROME_BROWSER_TARK_ZYNCLAVE_ZYNCLAVE_OFFER_BUBBLE_H_
++
++#include <string>
++
++#include "base/functional/callback_forward.h"
++
++namespace content {
++class WebContents;
++}
++
++namespace tark_zynclave {
++
++// "Sign in to Tark as {name}?" under the address bar of the tab's window,
++// with [Sign in] and [No thanks]. Not shown if the tab is not the active
++// one. Closing it any other way decides nothing.
++void ShowZynclaveOfferBubble(content::WebContents* contents,
++                             const std::u16string& name,
++                             base::OnceClosure on_sign_in,
++                             base::OnceClosure on_no_thanks);
++
++}  // namespace tark_zynclave
++
++#endif  // CHROME_BROWSER_TARK_ZYNCLAVE_ZYNCLAVE_OFFER_BUBBLE_H_
+--- /dev/null
++++ b/chrome/browser/tark_zynclave/zynclave_web_offer.cc
+@@ -0,0 +1,167 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/tark_zynclave/zynclave_web_offer.h"
++
++#include <set>
++#include <string>
++
++#include "base/functional/bind.h"
++#include "base/no_destructor.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/values.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/tark_zynclave/web_offer_rules.h"
++#include "chrome/browser/tark_zynclave/whoami_fetcher.h"
++#include "chrome/browser/tark_zynclave/zynclave_config.h"
++#include "chrome/browser/tark_zynclave/zynclave_offer_bubble.h"
++#include "chrome/browser/tark_zynclave/zynclave_prefs.h"
++#include "chrome/browser/tark_zynclave/zynclave_sign_in_service.h"
++#include "chrome/browser/tark_zynclave/zynclave_sign_in_service_factory.h"
++#include "components/prefs/pref_service.h"
++#include "components/prefs/scoped_user_pref_update.h"
++#include "content/public/browser/navigation_handle.h"
++#include "content/public/browser/web_contents.h"
++#include "crypto/random.h"
++
++namespace tark_zynclave {
++
++namespace {
++
++// Accounts offered in this run (by hash): at most once each.
++std::set<std::string>& OfferedThisRun() {
++  static base::NoDestructor<std::set<std::string>> offered;
++  return *offered;
++}
++
++Profile* ProfileOf(content::WebContents* contents) {
++  return Profile::FromBrowserContext(contents->GetBrowserContext());
++}
++
++// The profile's salt for "No thanks" hashes, made on first use.
++std::string Salt(PrefService* prefs) {
++  std::string salt = prefs->GetString(kSaltPref);
++  if (salt.empty()) {
++    salt = base::HexEncode(crypto::RandBytesAsVector(16));
++    prefs->SetString(kSaltPref, salt);
++  }
++  return salt;
++}
++
++}  // namespace
++
++// static
++void ZynclaveWebOffer::MaybeCreateForWebContents(
++    content::WebContents* contents) {
++  Profile* profile = ProfileOf(contents);
++  // No service for Incognito or Guest: no observer, no whoami, no offer.
++  if (!profile || profile->IsOffTheRecord() ||
++      !ZynclaveSignInServiceFactory::GetForProfile(profile)) {
++    return;
++  }
++  CreateForWebContents(contents);
++}
++
++ZynclaveWebOffer::ZynclaveWebOffer(content::WebContents* contents)
++    : content::WebContentsObserver(contents),
++      content::WebContentsUserData<ZynclaveWebOffer>(*contents) {}
++
++ZynclaveWebOffer::~ZynclaveWebOffer() = default;
++
++void ZynclaveWebOffer::DidStartNavigation(content::NavigationHandle* handle) {
++  if (handle->IsInPrimaryMainFrame() && !handle->IsSameDocument()) {
++    settle_.Stop();
++  }
++}
++
++void ZynclaveWebOffer::DidFinishNavigation(content::NavigationHandle* handle) {
++  if (!handle->IsInPrimaryMainFrame() || !handle->HasCommitted() ||
++      handle->IsSameDocument()) {
++    return;
++  }
++  const std::string& host = GetZynclaveConfig().accounts_host;
++  for (const GURL& url : handle->GetRedirectChain()) {
++    if (IsAccountsUrl(url, host)) {
++      marked_ = true;
++    }
++  }
++}
++
++void ZynclaveWebOffer::DidStopLoading() {
++  if (!marked_ ||
++      IsSignInScreen(web_contents()->GetLastCommittedURL(),
++                     GetZynclaveConfig().accounts_host)) {
++    return;
++  }
++  settle_.Start(FROM_HERE, kSettle,
++                base::BindOnce(&ZynclaveWebOffer::Check,
++                               weak_factory_.GetWeakPtr()));
++}
++
++void ZynclaveWebOffer::Check() {
++  marked_ = false;
++  Profile* profile = ProfileOf(web_contents());
++  ZynclaveSignInService* service =
++      ZynclaveSignInServiceFactory::GetForProfile(profile);
++  if (checking_ || !service ||
++      !MayCheck(service->allowed(), service->auth().state())) {
++    return;
++  }
++  checking_ = true;
++  FetchWhoami(
++      profile, GURL("https://" + GetZynclaveConfig().accounts_host + "/"),
++      base::BindOnce(&ZynclaveWebOffer::OnWhoami, weak_factory_.GetWeakPtr()));
++}
++
++void ZynclaveWebOffer::OnWhoami(WhoamiResult who) {
++  checking_ = false;
++  if (!who.signed_in) {
++    return;
++  }
++  Profile* profile = ProfileOf(web_contents());
++  ZynclaveSignInService* service =
++      ZynclaveSignInServiceFactory::GetForProfile(profile);
++  if (!service || !MayCheck(service->allowed(), service->auth().state())) {
++    return;
++  }
++  PrefService* prefs = profile->GetPrefs();
++  std::string hash = DeclineHash(Salt(prefs), who.id);
++  for (const base::Value& declined : prefs->GetList(kDeclinedPref)) {
++    if (declined.is_string() && declined.GetString() == hash) {
++      return;
++    }
++  }
++  if (!OfferedThisRun().insert(hash).second) {
++    return;
++  }
++  std::string email = who.email;
++  ShowZynclaveOfferBubble(
++      web_contents(), OfferTitleName(who),
++      base::BindOnce(
++          [](base::WeakPtr<content::WebContents> contents, std::string email) {
++            if (!contents) {
++              return;
++            }
++            if (ZynclaveSignInService* s =
++                    ZynclaveSignInServiceFactory::GetForProfile(
++                        ProfileOf(contents.get()))) {
++              // Zynclave's web session, no screen; once more with one if
++              // it needs it. A different account comes back signed out.
++              s->auth().StartSignIn(/*prompt_none=*/true, email);
++            }
++          },
++          web_contents()->GetWeakPtr(), std::move(email)),
++      base::BindOnce(&ZynclaveWebOffer::Decline, weak_factory_.GetWeakPtr(),
++                     std::move(hash)));
++}
++
++void ZynclaveWebOffer::Decline(std::string hash) {
++  ScopedListPrefUpdate update(ProfileOf(web_contents())->GetPrefs(),
++                              kDeclinedPref);
++  update->Append(std::move(hash));
++}
++
++WEB_CONTENTS_USER_DATA_KEY_IMPL(ZynclaveWebOffer);
++
++}  // namespace tark_zynclave
+--- /dev/null
++++ b/chrome/browser/tark_zynclave/zynclave_web_offer.h
+@@ -0,0 +1,59 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_TARK_ZYNCLAVE_ZYNCLAVE_WEB_OFFER_H_
++#define CHROME_BROWSER_TARK_ZYNCLAVE_ZYNCLAVE_WEB_OFFER_H_
++
++#include "base/memory/weak_ptr.h"
++#include "base/timer/timer.h"
++#include "chrome/browser/tark_zynclave/whoami_response.h"
++#include "content/public/browser/web_contents_observer.h"
++#include "content/public/browser/web_contents_user_data.h"
++
++namespace tark_zynclave {
++
++// "Sign in to Tark as X?" (handoff §2a, as Android's §5.6). A normal
++// profile's tab that goes through the Zynclave Account's pages is marked;
++// when it then rests for 3 seconds on a page that is not a sign-in screen,
++// Tark asks Zynclave once (whoami, with this profile's cookies) whether the
++// person is signed in there, and offers to sign Tark in as that account.
++// Never in Incognito or Guest (not attached), never while signed in, never
++// for an account declined with "No thanks", at most once per account per
++// run, and never without the person's click.
++class ZynclaveWebOffer : public content::WebContentsObserver,
++                         public content::WebContentsUserData<ZynclaveWebOffer> {
++ public:
++  static constexpr base::TimeDelta kSettle = base::Seconds(3);
++
++  // Attaches to tabs of normal profiles only.
++  static void MaybeCreateForWebContents(content::WebContents* contents);
++
++  ZynclaveWebOffer(const ZynclaveWebOffer&) = delete;
++  ZynclaveWebOffer& operator=(const ZynclaveWebOffer&) = delete;
++  ~ZynclaveWebOffer() override;
++
++  // content::WebContentsObserver:
++  void DidStartNavigation(content::NavigationHandle* handle) override;
++  void DidFinishNavigation(content::NavigationHandle* handle) override;
++  void DidStopLoading() override;
++
++ private:
++  friend class content::WebContentsUserData<ZynclaveWebOffer>;
++  explicit ZynclaveWebOffer(content::WebContents* contents);
++
++  void Check();
++  void OnWhoami(WhoamiResult who);
++  void Decline(std::string hash);
++
++  bool marked_ = false;
++  bool checking_ = false;
++  base::OneShotTimer settle_;
++  base::WeakPtrFactory<ZynclaveWebOffer> weak_factory_{this};
++
++  WEB_CONTENTS_USER_DATA_KEY_DECL();
++};
++
++}  // namespace tark_zynclave
++
++#endif  // CHROME_BROWSER_TARK_ZYNCLAVE_ZYNCLAVE_WEB_OFFER_H_
+--- a/chrome/browser/ui/BUILD.gn
++++ b/chrome/browser/ui/BUILD.gn
+@@ -1591,6 +1591,7 @@
+   deps = [
+     "//chrome/browser/tark_captions",
+     "//chrome/browser/ui/views/tark_captions:caption_box",
++    "//chrome/browser/tark_zynclave:web_offer",
+     ":browser_element_identifiers",
+     ":browser_otr_state",
+     ":browser_ui_prefs",
+--- a/chrome/browser/ui/tab_helpers.cc
++++ b/chrome/browser/ui/tab_helpers.cc
+@@ -74,6 +74,7 @@
+ #include "chrome/browser/ui/recently_audible_helper.h"
+ #if BUILDFLAG(IS_MAC) || BUILDFLAG(IS_WIN)
+ #include "chrome/browser/tark_captions/call_captions_tab_helper.h"
++#include "chrome/browser/tark_zynclave/zynclave_web_offer.h"
+ #endif
+ #include "chrome/browser/ui/search_engines/search_engine_tab_helper.h"
+ #include "chrome/browser/ui/tab_contents/core_tab_helper.h"
+@@ -462,6 +463,10 @@
+   // Tark (D4): call detection and the call's captions.
+   CallCaptionsTabHelper::CreateForWebContents(web_contents);
+ #endif
++#if !BUILDFLAG(IS_ANDROID)
++  // Tark: "Sign in to Tark as X?" (normal profiles only).
++  tark_zynclave::ZynclaveWebOffer::MaybeCreateForWebContents(web_contents);
++#endif
+ #if BUILDFLAG(IS_ANDROID)
+   RequestDesktopSiteWebContentsObserverAndroid::CreateForWebContents(
+       web_contents);
