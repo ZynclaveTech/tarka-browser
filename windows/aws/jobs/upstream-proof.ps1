@@ -6,7 +6,7 @@
 # Chromium tag, to prove the build machine's toolchain before any Tark
 # patch is involved. Artifacts and the log go to the job's S3 prefix; the
 # machine shuts down (stops) at the end, success or not.
-param([string]$Bucket, [string]$Prefix, [string]$Tag = '155.0.8059.39-1.1')
+param([string]$Bucket, [string]$Prefix, [string]$Tag = '156.0.8078.47-1.1')
 $ErrorActionPreference = 'Continue'
 # Windows PowerShell 5.1 redirects (*>>) as UTF-16; logs are read on the Mac.
 $PSDefaultParameterValues['Out-File:Encoding'] = 'utf8'

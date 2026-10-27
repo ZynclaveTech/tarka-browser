@@ -34,7 +34,7 @@ class TestWindowsWorkdir(unittest.TestCase):
 
     def test_upstream_files_and_hook(self):
         for name in ('build.py', 'package.py', 'flags.windows.gn', 'downloads.ini',
-                     'tark_post_patch.py', 'tark_repo.txt'):
+                     'tark_post_patch.py', 'tark_repo.txt', 'layered_build.py'):
             self.assertTrue((self.work / name).is_file(), name)
         self.assertIn('tark_post_patch.py', (self.work / 'build.py').read_text())
         self.assertEqual((self.work / 'tark_repo.txt').read_text().strip(), str(REPO))
@@ -76,6 +76,12 @@ class TestWindowsWorkdir(unittest.TestCase):
         chromium = (REPO / 'ungoogled-chromium' / 'chromium_version.txt').read_text().strip()
         revision = (REPO / 'revision.txt').read_text().strip()
         self.assertEqual(package.tark_stem(outputs), 'Tark-%s-%s-x64' % (chromium, revision))
+
+    def test_ninja_first_list_has_no_comments(self):
+        first = (self.work / 'tark_ninja_first.txt').read_text().split()
+        self.assertEqual(first, lines(REPO / 'windows' / 'ninja-first.txt'))
+        self.assertIn('components/tark_captions:tark_captions', first)
+        self.assertFalse([w for w in first if w.startswith('#')])
 
     def test_rerun_keeps_build_dir(self):
         marker = self.work / 'build' / 'keep.txt'

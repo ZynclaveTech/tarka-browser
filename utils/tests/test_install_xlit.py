@@ -143,7 +143,7 @@ class TestWiring(unittest.TestCase):
         # Run after Tark's own downloads are unpacked, before gn.
         for script in ('dev.sh', 'build.sh'):
             text = read(script)
-            self.assertLess(text.index('ublock_key.py'), text.index('\n  _install_xlit\n' if script == 'dev.sh' else '\n_install_xlit\n'))
+            self.assertLess(text.index('downloads-onnxruntime.ini'), text.index('\n  _install_xlit\n' if script == 'dev.sh' else '\n_install_xlit\n'))
 
     def test_ini_is_retrieve_only(self):
         ini = configparser.ConfigParser(interpolation=None)

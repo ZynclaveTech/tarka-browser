@@ -1,0 +1,902 @@
+--- a/chrome/BUILD.gn
++++ b/chrome/BUILD.gn
+@@ -1399,6 +1399,7 @@
+       ":swiftshader_binaries",
+       ":tark_xlit_resources",
+       ":widevine_cdm_library",
++      "//chrome/browser/tark_adblock:lists_bundle_data",
+       "//chrome/browser/web_applications/isolated_web_apps/key_distribution/preload:component_bundle",
+     ]
+ 
+--- a/chrome/browser/BUILD.gn
++++ b/chrome/browser/BUILD.gn
+@@ -1654,11 +1654,13 @@
+     }
+   }
+ 
+-  if (is_android) {
++  if (is_android || is_mac || is_win) {
+     # Tark's ad blocker (A2, spec §4).
+     sources += [
+       "tark_adblock/tark_adblock_cosmetic_resources.cc",
+       "tark_adblock/tark_adblock_cosmetic_resources.h",
++      "tark_adblock/tark_adblock_profile.cc",
++      "tark_adblock/tark_adblock_profile.h",
+       "tark_adblock/tark_adblock_proxying_url_loader_factory.cc",
+       "tark_adblock/tark_adblock_proxying_url_loader_factory.h",
+       "tark_adblock/tark_adblock_service.cc",
+@@ -1668,6 +1670,7 @@
+     ]
+     deps += [
+       "//chrome/browser/tark_adblock:bundle",
++      "//chrome/browser/tark_adblock:switch",
+       "//chrome/common/tark_adblock:mojom",
+       "//third_party/brave_adblock",
+     ]
+--- a/chrome/browser/chrome_browser_main.cc
++++ b/chrome/browser/chrome_browser_main.cc
+@@ -71,6 +71,8 @@
+ #include "chrome/browser/sessions/chrome_serialized_navigation_driver.h"
+ #include "chrome/browser/shell_integration.h"
+ #include "chrome/browser/startup_data.h"
++#include "chrome/browser/tark_adblock/tark_adblock_profile.h"
++#include "chrome/browser/tark_adblock/tark_adblock_service.h"
+ #include "chrome/browser/translate/chrome_translate_client.h"
+ #include "chrome/browser/translate/translate_service.h"
+ #include "chrome/browser/ui/actions/chrome_actions.h"
+@@ -1612,6 +1614,11 @@
+     chrome_extra_part->PostProfileInit(profile, is_initial_profile);
+   }
+ 
++#if !BUILDFLAG(IS_ANDROID)
++  // Tark: uBlock Origin's on/off state becomes the ad blocker's.
++  tark_adblock::MaybeMigrateFromUblock(profile);
++#endif
++
+ #if BUILDFLAG(IS_WIN)
+   // Verify that the profile is not on a network share and if so prepare to show
+   // notification to the user.
+@@ -1731,6 +1738,13 @@
+ 
+   browser_process_->browser_policy_connector()->OnBrowserStarted();
+ 
++#if !BUILDFLAG(IS_ANDROID)
++  // Tark: start the ad blocker; it compiles its lists in the background and
++  // blocks nothing until it is ready (Android starts it in
++  // chrome_browser_main_android.cc).
++  tark_adblock::AdblockService::Get();
++#endif
++
+ #if BUILDFLAG(ENABLE_PROCESS_SINGLETON)
+   // Allow ProcessSingleton to process messages.
+   // This is done here instead of just relying on the main message loop's start
+--- a/chrome/browser/tark_adblock/BUILD.gn
++++ b/chrome/browser/tark_adblock/BUILD.gn
+@@ -23,15 +23,37 @@
+     "//third_party/boringssl",
+     "//third_party/zlib/google:zip",
+   ]
++  # zip_reader.h includes zlib.h through minizip: the Mac and Android SDKs
++  # have one of their own, Windows does not.
++  deps += [ "//third_party/zlib" ]
++
++  # The built-in list bundle next to the module on Windows (base::DIR_ASSETS
++  # is chrome.dll's folder); the installer lists it in chrome.release.
++  if (is_win) {
++    data_deps = [ ":lists_copy" ]
++  }
++}
++
++# The global switch's pure parts (uBlock Origin's state, carried over).
++static_library("switch") {
++  sources = [
++    "tark_adblock_switch.cc",
++    "tark_adblock_switch.h",
++  ]
++  deps = [ "//base" ]
+ }
+ 
+ if (!is_android) {
+   # For the build machine only: an Android variant would be an APK, and its
+   # runner script would collide with this one's.
+   test("tark_adblock_unittests") {
+-    sources = [ "tark_adblock_bundle_unittest.cc" ]
++    sources = [
++      "tark_adblock_bundle_unittest.cc",
++      "tark_adblock_switch_unittest.cc",
++    ]
+     deps = [
+       ":bundle",
++      ":switch",
+       "//base",
+       "//base/test:run_all_unittests",
+       "//testing/gtest",
+@@ -48,6 +70,25 @@
+   }
+ }
+ 
++if (is_mac) {
++  # The list bundle the Mac app ships, in its framework's Resources
++  # (base::DIR_ASSETS): build.sh and dev.sh put the newest signed desktop
++  # bundle here as lists.zip before every build.
++  bundle_data("lists_bundle_data") {
++    sources = [ "lists.zip" ]
++    outputs = [ "{{bundle_resources_dir}}/tark_adblock/{{source_file_part}}" ]
++  }
++}
++
++if (is_win) {
++  # The list bundle beside chrome.exe (base::DIR_ASSETS), and in the
++  # installer (chrome.release): tark_post_patch.py puts it here.
++  copy("lists_copy") {
++    sources = [ "lists.zip" ]
++    outputs = [ "$root_out_dir/tark_adblock/{{source_file_part}}" ]
++  }
++}
++
+ if (is_android) {
+   # The list bundle the APK ships: android/build.sh puts the newest signed
+   # bundle here as lists.zip before every build.
+--- a/chrome/browser/tark_adblock/tark_adblock_bundle.cc
++++ b/chrome/browser/tark_adblock/tark_adblock_bundle.cc
+@@ -10,10 +10,12 @@
+ 
+ #include "base/base64.h"
+ #include "base/containers/span.h"
++#include "base/files/file_util.h"
+ #include "base/json/json_reader.h"
+ #include "base/notreached.h"
+ #include "base/strings/string_number_conversions.h"
+ #include "base/values.h"
++#include "build/build_config.h"
+ #include "crypto/sha2.h"
+ #include "third_party/boringssl/src/include/openssl/curve25519.h"
+ #include "third_party/zlib/google/zip_reader.h"
+@@ -84,6 +86,9 @@
+     return std::nullopt;
+   }
+   bundle.created = *created;
++  if (const std::string* platform = manifest->FindString("platform")) {
++    bundle.platform = *platform;
++  }
+   for (const base::Value& item : *lists) {
+     const base::DictValue* list = item.GetIfDict();
+     const std::string* name = list ? list->FindString("name") : nullptr;
+@@ -170,9 +175,42 @@
+   if (!bundle || bundle->created <= current_created) {
+     return "not newer than the current bundle";
+   }
++  if (!PlatformAccepted(bundle->platform)) {
++    return "built for another platform";
++  }
+   return std::string();
+ }
+ 
++bool PlatformAccepted(std::string_view platform) {
++#if BUILDFLAG(IS_ANDROID)
++  constexpr std::string_view kThisPlatform = "android";
++#else
++  constexpr std::string_view kThisPlatform = "desktop";
++#endif
++  return platform.empty() || platform == kThisPlatform;
++}
++
++Network ClassifyConnection(bool connected, bool cellular) {
++  if (!connected) {
++    return Network::kNone;
++  }
++#if BUILDFLAG(IS_ANDROID)
++  return cellular ? Network::kMetered : Network::kUnmetered;
++#else
++  return Network::kUnmetered;
++#endif
++}
++
++std::string ReadBuiltInBundleFile(const base::FilePath& assets_dir) {
++  std::string data;
++  const base::FilePath path =
++      assets_dir.AppendASCII("tark_adblock").AppendASCII("lists.zip");
++  if (!base::ReadFileToStringWithMaxSize(path, &data, kMaxBundleSize)) {
++    return std::string();
++  }
++  return data;
++}
++
+ bool ValidBundleFileName(std::string_view name) {
+   if (name.size() != 18 || !name.starts_with("lists-") ||
+       !name.ends_with(".zip")) {
+--- a/chrome/browser/tark_adblock/tark_adblock_bundle.h
++++ b/chrome/browser/tark_adblock/tark_adblock_bundle.h
+@@ -14,6 +14,7 @@
+ #include <vector>
+ 
+ #include "base/containers/span.h"
++#include "base/files/file_path.h"
+ #include "base/time/time.h"
+ 
+ namespace tark_adblock {
+@@ -42,6 +43,9 @@
+   std::string resources_json;
+   // Lower-case hex sha256 of the zip's bytes.
+   std::string sha256;
++  // The platform the bundle was built for ("android", "desktop"); empty in
++  // bundles from before it was recorded.
++  std::string platform;
+ };
+ 
+ // Reads a bundle; nullopt when it is not a complete format-1 bundle.
+@@ -64,6 +68,19 @@
+ // mobile data, never with no connection.
+ bool UpdateDue(base::Time last_success, base::Time now, Network network);
+ 
++// What the update schedule treats a connection as. On Android a cellular
++// connection is metered; desktop (Mac and Windows) has none to wait for.
++Network ClassifyConnection(bool connected, bool cellular);
++
++// The list bundle built into a desktop app: ASSETS_DIR/tark_adblock/lists.zip
++// (base::DIR_ASSETS), read whole. Empty when it is missing or larger than
++// kMaxBundleSize; ReadBundle() refuses anything that is not a bundle.
++std::string ReadBuiltInBundleFile(const base::FilePath& assets_dir);
++
++// Whether a bundle for PLATFORM may be used here: this platform's, or one
++// that names none (from before the platform was recorded).
++bool PlatformAccepted(std::string_view platform);
++
+ // Whether a downloaded bundle may replace the current one: CheckIndex's
+ // checks and a manifest newer than `current_created` (no going back). Empty
+ // when it may, else why not.
+--- a/chrome/browser/tark_adblock/tark_adblock_bundle_unittest.cc
++++ b/chrome/browser/tark_adblock/tark_adblock_bundle_unittest.cc
+@@ -11,6 +11,8 @@
+ #include <string_view>
+ 
+ #include "base/containers/span.h"
++#include "base/files/file_util.h"
++#include "base/files/scoped_temp_dir.h"
+ #include "base/strings/string_view_util.h"
+ #include "base/strings/string_util.h"
+ #include "base/time/time.h"
+@@ -192,5 +194,64 @@
+   EXPECT_FALSE(ValidBundleFileName("lists-2026102a.zip"));
+ }
+ 
++// Desktop (Mac and Windows) has no metered connections to wait for: a day
++// after the last update, whatever the connection.
++TEST(TarkAdblockBundleTest, DesktopConnectionsAreUnmetered) {
++  EXPECT_EQ(ClassifyConnection(/*connected=*/true, /*cellular=*/true),
++            Network::kUnmetered);
++  EXPECT_EQ(ClassifyConnection(/*connected=*/true, /*cellular=*/false),
++            Network::kUnmetered);
++  EXPECT_EQ(ClassifyConnection(/*connected=*/false, /*cellular=*/false),
++            Network::kNone);
++}
++
++TEST(TarkAdblockBundleTest, DesktopUpdateDueAfter24h) {
++  const base::Time now = base::Time::Now();
++  const Network network = ClassifyConnection(/*connected=*/true,
++                                             /*cellular=*/true);
++  EXPECT_TRUE(UpdateDue(now - base::Hours(25), now, network));
++  EXPECT_FALSE(UpdateDue(now - base::Hours(23), now, network));
++}
++
++// The bundle built into a desktop app sits in its assets folder.
++TEST(TarkAdblockBundleTest, BuiltInBundleIsVerified) {
++  base::ScopedTempDir assets;
++  ASSERT_TRUE(assets.CreateUniqueTempDir());
++  ASSERT_TRUE(base::CreateDirectory(assets.GetPath().AppendASCII("tark_adblock")));
++  const base::FilePath zip =
++      assets.GetPath().AppendASCII("tark_adblock").AppendASCII("lists.zip");
++  ASSERT_TRUE(base::WriteFile(zip, Zip()));
++  std::optional<Bundle> bundle =
++      ReadBundle(ReadBuiltInBundleFile(assets.GetPath()));
++  ASSERT_TRUE(bundle);
++  EXPECT_EQ(bundle->lists.size(), 2u);
++
++  // A truncated file is no bundle: the service stays fail-open.
++  ASSERT_TRUE(base::WriteFile(zip, Zip().substr(0, Zip().size() / 2)));
++  EXPECT_FALSE(ReadBundle(ReadBuiltInBundleFile(assets.GetPath())));
++}
++
++TEST(TarkAdblockBundleTest, NoBuiltInBundleIsEmpty) {
++  base::ScopedTempDir assets;
++  ASSERT_TRUE(assets.CreateUniqueTempDir());
++  EXPECT_EQ(ReadBuiltInBundleFile(assets.GetPath()), "");
++}
++
++// Both platforms' bundles are signed with the same key; the platform in the
++// manifest keeps one from standing in for the other. Bundles from before it
++// name none and are still accepted.
++TEST(TarkAdblockBundleTest, OnlyThisPlatformsBundleIsAccepted) {
++  EXPECT_TRUE(PlatformAccepted(""));
++  EXPECT_TRUE(PlatformAccepted("desktop"));
++  EXPECT_FALSE(PlatformAccepted("android"));
++  EXPECT_FALSE(PlatformAccepted("ios"));
++}
++
++TEST(TarkAdblockBundleTest, TheFixtureNamesNoPlatform) {
++  std::optional<Bundle> bundle = ReadBundle(Zip());
++  ASSERT_TRUE(bundle);
++  EXPECT_EQ(bundle->platform, "");
++}
++
+ }  // namespace
+ }  // namespace tark_adblock
+--- a/chrome/browser/tark_adblock/tark_adblock_service.cc
++++ b/chrome/browser/tark_adblock/tark_adblock_service.cc
+@@ -9,7 +9,10 @@
+ #include <string_view>
+ #include <utility>
+ 
++#include "build/build_config.h"
++#if BUILDFLAG(IS_ANDROID)
+ #include "base/android/apk_assets.h"
++#endif
+ #include "base/command_line.h"
+ #include "base/containers/span.h"
+ #include "base/strings/string_view_util.h"
+@@ -43,7 +46,9 @@
+ // The crate the compiled engine cache belongs to (android/adblock/crates.py):
+ // a cached engine from another version is never loaded.
+ constexpr char kCrateVersion[] = "adblock 0.13.3";
++#if BUILDFLAG(IS_ANDROID)
+ constexpr char kApkBundle[] = "assets/tark_adblock/lists.zip";
++#endif
+ // Test hooks, read from Chrome's command line (on a phone only through
+ // /data/local/tmp/chrome-command-line, which only debug builds or a debug
+ // app read): an extra list with permission 1, and a delayed compile.
+@@ -54,7 +59,16 @@
+   return std::vector<uint8_t>(text.begin(), text.end());
+ }
+ 
+-std::string ReadApkBundle() {
++// The list bundle built into the app: the APK's asset on Android, the file in
++// the app's assets folder (base::DIR_ASSETS) on Mac and Windows.
++std::string ReadBuiltInBundle() {
++#if !BUILDFLAG(IS_ANDROID)
++  base::FilePath assets;
++  if (!base::PathService::Get(base::DIR_ASSETS, &assets)) {
++    return std::string();
++  }
++  return ReadBuiltInBundleFile(assets);
++#else
+   base::MemoryMappedFile::Region region =
+       base::MemoryMappedFile::Region::kWholeFile;
+   const int fd = base::android::OpenApkAsset(kApkBundle, &region);
+@@ -66,6 +80,7 @@
+     return std::string();
+   }
+   return std::string(base::as_string_view(file.bytes()));
++#endif
+ }
+ 
+ }  // namespace
+@@ -91,9 +106,13 @@
+     adblock::set_domain_resolver();
+ 
+     LoadResult result;
+-    std::optional<Bundle> bundle = ReadBundle(ReadApkBundle());
++    std::optional<Bundle> bundle = ReadBundle(ReadBuiltInBundle());
+     if (bundle) {
++#if BUILDFLAG(IS_ANDROID)
+       result.source = "apk";
++#else
++      result.source = "built-in";
++#endif
+     }
+     std::string zip;
+     std::string index;
+--- a/chrome/browser/tark_adblock/tark_adblock_updater.cc
++++ b/chrome/browser/tark_adblock/tark_adblock_updater.cc
+@@ -17,6 +17,7 @@
+ #include "chrome/browser/browser_process.h"
+ #include "chrome/browser/net/system_network_context_manager.h"
+ #include "chrome/browser/tark_adblock/tark_adblock_bundle.h"
++#include "chrome/browser/tark_adblock/tark_adblock_profile.h"
+ #include "net/base/network_change_notifier.h"
+ #include "net/traffic_annotation/network_traffic_annotation.h"
+ #include "services/network/public/cpp/resource_request.h"
+@@ -29,7 +30,13 @@
+ 
+ namespace {
+ 
++// Android's bundle, and the one Mac and Windows share (uBO's env_mobile
++// blocks left out; android/adblock/bundle.py --platform).
++#if BUILDFLAG(IS_ANDROID)
+ constexpr char kListsBase[] = "https://gettarka.com/lists/android/v1/";
++#else
++constexpr char kListsBase[] = "https://gettarka.com/lists/desktop/v1/";
++#endif
+ constexpr size_t kMaxIndexSize = 64 * 1024;
+ 
+ constexpr net::NetworkTrafficAnnotationTag kTrafficAnnotation =
+@@ -55,14 +62,10 @@
+ 
+ Network CurrentNetwork() {
+   const auto type = net::NetworkChangeNotifier::GetConnectionType();
+-  if (type == net::NetworkChangeNotifier::CONNECTION_NONE) {
+-    return Network::kNone;
+-  }
+-  if (type == net::NetworkChangeNotifier::CONNECTION_WIFI ||
+-      type == net::NetworkChangeNotifier::CONNECTION_ETHERNET) {
+-    return Network::kUnmetered;
+-  }
+-  return Network::kMetered;
++  return ClassifyConnection(
++      type != net::NetworkChangeNotifier::CONNECTION_NONE,
++      type != net::NetworkChangeNotifier::CONNECTION_WIFI &&
++          type != net::NetworkChangeNotifier::CONNECTION_ETHERNET);
+ }
+ 
+ base::Time ReadLastSuccess(const base::FilePath& dir) {
+@@ -105,6 +108,19 @@
+   return std::string();
+ }
+ 
++// A downloaded bundle, read back and its temporary file deleted; nullopt if
++// the download failed or the file cannot be read within the size limit.
++std::optional<std::string> ReadAndDelete(const base::FilePath& path) {
++  if (path.empty()) {
++    return std::nullopt;
++  }
++  std::string zip;
++  const bool read =
++      base::ReadFileToStringWithMaxSize(path, &zip, kMaxBundleSize);
++  base::DeleteFile(path);
++  return read ? std::optional<std::string>(std::move(zip)) : std::nullopt;
++}
++
+ std::unique_ptr<network::SimpleURLLoader> MakeLoader(const GURL& url) {
+   auto request = std::make_unique<network::ResourceRequest>();
+   request->url = url;
+@@ -133,7 +149,8 @@
+ }
+ 
+ void Updater::MaybeCheck() {
+-  if (checking_) {
++  // Blocking off everywhere ("Block ads and trackers"): no list downloads.
++  if (checking_ || !DownloadsWanted()) {
+     return;
+   }
+   checking_ = true;
+@@ -176,13 +193,22 @@
+     checking_ = false;
+     return;
+   }
++  // To a temporary file: a bundle may be larger than DownloadToString
++  // allows (5 MiB); read back off the UI thread.
+   loader_ = MakeLoader(GURL(std::string(kListsBase) + *file));
+-  loader_->DownloadToString(
++  loader_->DownloadToTempFile(
+       g_browser_process->system_network_context_manager()
+           ->GetSharedURLLoaderFactory()
+           .get(),
+-      base::BindOnce(&Updater::OnZip, weak_factory_.GetWeakPtr(),
+-                     std::move(*index)),
++      base::BindOnce(
++          [](base::WeakPtr<Updater> self, std::string index,
++             base::FilePath path) {
++            base::ThreadPool::PostTaskAndReplyWithResult(
++                FROM_HERE, {base::MayBlock(), base::TaskPriority::BEST_EFFORT},
++                base::BindOnce(&ReadAndDelete, path),
++                base::BindOnce(&Updater::OnZip, self, std::move(index)));
++          },
++          weak_factory_.GetWeakPtr(), std::move(*index)),
+       kMaxBundleSize);
+ }
+ 
+--- a/chrome/installer/mini_installer/chrome.release
++++ b/chrome/installer/mini_installer/chrome.release
+@@ -47,6 +47,7 @@
+ indicxlit\xlit-words.bin: %(VersionDir)s\indicxlit\
+ onnxruntime.dll: %(VersionDir)s\
+ WinSparkle.dll: %(VersionDir)s\
++tark_adblock\lists.zip: %(VersionDir)s\tark_adblock\
+ 
+ #
+ # VisualElements sub-dir.
+--- a/chrome/renderer/BUILD.gn
++++ b/chrome/renderer/BUILD.gn
+@@ -396,6 +396,16 @@
+     ]
+   }
+ 
++  # Tark: the ad blocker's hiding rules and scriptlets on Mac and Windows
++  # too (Android lists them above).
++  if (is_mac || is_win) {
++    sources += [
++      "tark_adblock/tark_adblock_frame_observer.cc",
++      "tark_adblock/tark_adblock_frame_observer.h",
++    ]
++    deps += [ "//chrome/common/tark_adblock:mojom" ]
++  }
++
+   if (is_chromeos) {
+     sources += [
+       "ash_merge_session_loader_throttle.cc",
+--- a/chrome/tools/build/win/FILES.cfg
++++ b/chrome/tools/build/win/FILES.cfg
+@@ -754,6 +754,11 @@
+     'filename': 'WinSparkle.dll',
+     'buildtype': ['official'],
+   },
++  # Tark: the ad blocker's built-in list bundle.
++  {
++    'filename': 'tark_adblock/lists.zip',
++    'buildtype': ['official'],
++  },
+   # IWA Key Distribution files:
+   {
+     'filename': 'IwaKeyDistribution/iwa-key-distribution.pb',
+--- a/chrome/browser/chrome_content_browser_client.cc
++++ b/chrome/browser/chrome_content_browser_client.cc
+@@ -6961,6 +6961,11 @@
+   if (!frame) {
+     return false;
+   }
++  // Tark: once the ad blocker is ready it checks every frame's WebSockets
++  // (CreateWebSocket()), extensions or not.
++  if (tark_adblock::AdblockService::Get()->IsReady()) {
++    return true;
++  }
+   const auto* web_request_api =
+       extensions::BrowserContextKeyedAPIFactory<extensions::WebRequestAPI>::Get(
+           frame->GetBrowserContext());
+@@ -7008,14 +7013,43 @@
+   if (!frame) {
+     return;
+   }
+-  auto* web_request_api =
+-      extensions::BrowserContextKeyedAPIFactory<extensions::WebRequestAPI>::Get(
+-          frame->GetBrowserContext());
+-
+-  DCHECK(web_request_api);
+-  web_request_api->ProxyWebSocket(
+-      frame, std::move(factory), url, site_for_cookies, user_agent,
+-      std::move(handshake_client), std::move(options.header_client));
++  // Tark: the ad blocker first. A blocked socket never connects; an allowed
++  // one goes through WebRequest's proxy when an extension may want it, and
++  // straight to the network otherwise.
++  tark_adblock::ProxyingURLLoaderFactory::CheckWebSocket(
++      frame, url,
++      base::BindOnce(
++          [](content::GlobalRenderFrameHostId frame_id,
++             WebSocketFactory factory, const GURL& url,
++             const net::SiteForCookies& site_for_cookies,
++             const std::optional<std::string>& user_agent,
++             mojo::PendingRemote<network::mojom::WebSocketHandshakeClient>
++                 handshake_client,
++             mojo::PendingRemote<network::mojom::TrustedHeaderClient>
++                 header_client,
++             bool blocked) {
++            content::RenderFrameHost* frame =
++                content::RenderFrameHost::FromID(frame_id);
++            if (blocked || !frame) {
++              return;
++            }
++            auto* web_request_api = extensions::BrowserContextKeyedAPIFactory<
++                extensions::WebRequestAPI>::Get(frame->GetBrowserContext());
++            if (web_request_api &&
++                web_request_api->MayHaveProxiesForFrame(frame)) {
++              web_request_api->ProxyWebSocket(
++                  frame, std::move(factory), url, site_for_cookies,
++                  user_agent, std::move(handshake_client),
++                  std::move(header_client));
++              return;
++            }
++            std::move(factory).Run(url, {}, std::move(handshake_client),
++                                   mojo::NullRemote(),
++                                   std::move(header_client));
++          },
++          frame->GetGlobalId(), std::move(factory), url, site_for_cookies,
++          user_agent, std::move(handshake_client),
++          std::move(options.header_client)));
+ #else
+   // Tark (A2): see WillInterceptWebSocket().
+   tark_adblock::ProxyingURLLoaderFactory::MaybeConnectWebSocket(
+--- a/chrome/browser/tark_adblock/tark_adblock_proxying_url_loader_factory.cc
++++ b/chrome/browser/tark_adblock/tark_adblock_proxying_url_loader_factory.cc
+@@ -373,34 +373,50 @@
+         handshake_client,
+     mojo::PendingRemote<network::mojom::TrustedHeaderClient> header_client) {
+   DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
+-  auto connect = base::BindOnce(
+-      [](content::ContentBrowserClient::WebSocketFactory factory,
+-         const GURL& url,
+-         mojo::PendingRemote<network::mojom::WebSocketHandshakeClient>
+-             handshake_client,
+-         mojo::PendingRemote<network::mojom::TrustedHeaderClient>
+-             header_client,
+-         BlockResult result) {
+-        // A blocked socket never connects: dropping the handshake client
+-        // fails it in the page.
+-        if (result.block) {
+-          return;
+-        }
+-        std::move(factory).Run(url, {}, std::move(handshake_client),
+-                               mojo::NullRemote(), std::move(header_client));
+-      },
+-      std::move(factory), url, std::move(handshake_client),
+-      std::move(header_client));
++  CheckWebSocket(
++      frame, url,
++      base::BindOnce(
++          [](content::ContentBrowserClient::WebSocketFactory factory,
++             const GURL& url,
++             mojo::PendingRemote<network::mojom::WebSocketHandshakeClient>
++                 handshake_client,
++             mojo::PendingRemote<network::mojom::TrustedHeaderClient>
++                 header_client,
++             bool blocked) {
++            // A blocked socket never connects: dropping the handshake client
++            // fails it in the page.
++            if (blocked) {
++              return;
++            }
++            std::move(factory).Run(url, {}, std::move(handshake_client),
++                                   mojo::NullRemote(),
++                                   std::move(header_client));
++          },
++          std::move(factory), url, std::move(handshake_client),
++          std::move(header_client)));
++}
++
++// static
++void ProxyingURLLoaderFactory::CheckWebSocket(
++    content::RenderFrameHost* frame,
++    const GURL& url,
++    base::OnceCallback<void(bool blocked)> done) {
++  DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
+   const HostContentSettingsMap* settings =
+       HostContentSettingsMapFactory::GetForProfile(frame->GetBrowserContext());
+   if (!url.SchemeIsWSOrWSS() ||
+       AdsAllowed(settings,
+                  frame->GetOutermostMainFrame()->GetLastCommittedOrigin())) {
+-    std::move(connect).Run(BlockResult());
++    std::move(done).Run(false);
+     return;
+   }
+-  AdblockService::Get()->ShouldBlock(url, frame->GetLastCommittedOrigin(),
+-                                     "websocket", "GET", std::move(connect));
++  AdblockService::Get()->ShouldBlock(
++      url, frame->GetLastCommittedOrigin(), "websocket", "GET",
++      base::BindOnce(
++          [](base::OnceCallback<void(bool)> done, BlockResult result) {
++            std::move(done).Run(result.block);
++          },
++          std::move(done)));
+ }
+ 
+ ProxyingURLLoaderFactory::ProxyingURLLoaderFactory(
+--- a/chrome/browser/tark_adblock/tark_adblock_proxying_url_loader_factory.h
++++ b/chrome/browser/tark_adblock/tark_adblock_proxying_url_loader_factory.h
+@@ -61,6 +61,13 @@
+       const net::IsolationInfo& isolation_info,
+       network::URLLoaderFactoryBuilder& factory_builder);
+ 
++  // Whether the engine blocks the WebSocket `frame` opens to `url`: `done`
++  // gets true for a blocked one (never for a site the person turned
++  // blocking off for, or before the engine is ready).
++  static void CheckWebSocket(content::RenderFrameHost* frame,
++                             const GURL& url,
++                             base::OnceCallback<void(bool blocked)> done);
++
+   // Checks a WebSocket a frame opens; connects it through `factory` unless
+   // the engine blocks it (then the handshake client is dropped).
+   static void MaybeConnectWebSocket(
+--- a/chrome/browser/prefs/browser_prefs.cc
++++ b/chrome/browser/prefs/browser_prefs.cc
+@@ -86,6 +86,7 @@
+ #include "chrome/browser/signin/chrome_signin_client.h"
+ #include "chrome/browser/signin/signin_promo_util.h"
+ #include "chrome/browser/ssl/ssl_config_service_manager.h"
++#include "chrome/browser/tark_adblock/tark_adblock_profile.h"
+ #include "chrome/browser/themes/theme_service.h"
+ #include "chrome/browser/tips/core/tips_prefs.h"
+ #include "chrome/browser/tracing/chrome_tracing_delegate.h"
+@@ -1855,6 +1856,8 @@
+   // User prefs. Please keep this list alphabetized.
+   AccessibilityLabelsService::RegisterProfilePrefs(registry);
+   registry->RegisterBooleanPref(prefs::kRendererAccessibilityEnabled, true);
++  // Tark: the ad blocker (uBlock Origin's state, carried over once).
++  tark_adblock::RegisterProfilePrefs(registry);
+   AccessibilityUIMessageHandler::RegisterProfilePrefs(registry);
+ #if !BUILDFLAG(IS_ANDROID) || BUILDFLAG(IS_DESKTOP_ANDROID)  // nocheck
+   ttc::AiOverlayDialogController::RegisterProfilePrefs(registry);
+--- /dev/null
++++ b/chrome/browser/tark_adblock/tark_adblock_profile.cc
+@@ -0,0 +1,58 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/tark_adblock/tark_adblock_profile.h"
++
++#include "build/build_config.h"
++#include "chrome/browser/browser_process.h"
++#include "chrome/browser/content_settings/host_content_settings_map_factory.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/profiles/profile_manager.h"
++#include "chrome/browser/tark_adblock/tark_adblock_switch.h"
++#include "components/content_settings/core/browser/host_content_settings_map.h"
++#include "components/pref_registry/pref_registry_syncable.h"
++#include "components/prefs/pref_service.h"
++
++namespace tark_adblock {
++
++void RegisterProfilePrefs(user_prefs::PrefRegistrySyncable* registry) {
++  registry->RegisterBooleanPref(kMigratedFromUblockPref, false);
++}
++
++void MaybeMigrateFromUblock(Profile* profile) {
++  PrefService* prefs = profile->GetPrefs();
++  if (profile->IsOffTheRecord() || prefs->GetBoolean(kMigratedFromUblockPref)) {
++    return;
++  }
++  prefs->SetBoolean(kMigratedFromUblockPref, true);
++  if (UblockWasOff(prefs->GetDict("extensions.settings"))) {
++    HostContentSettingsMapFactory::GetForProfile(profile)
++        ->SetDefaultContentSetting(ContentSettingsType::ADS,
++                                   CONTENT_SETTING_ALLOW);
++  }
++}
++
++bool DownloadsWanted() {
++#if BUILDFLAG(IS_ANDROID)
++  return true;
++#else
++  ProfileManager* manager = g_browser_process->profile_manager();
++  if (!manager) {
++    return false;
++  }
++  for (Profile* profile : manager->GetLoadedProfiles()) {
++    if (profile->IsOffTheRecord()) {
++      continue;
++    }
++    if (HostContentSettingsMapFactory::GetForProfile(profile)
++            ->GetDefaultContentSetting(ContentSettingsType::ADS) !=
++        CONTENT_SETTING_ALLOW) {
++      return true;
++    }
++  }
++  return false;
++#endif
++}
++
++}  // namespace tark_adblock
+--- /dev/null
++++ b/chrome/browser/tark_adblock/tark_adblock_profile.h
+@@ -0,0 +1,36 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_TARK_ADBLOCK_TARK_ADBLOCK_PROFILE_H_
++#define CHROME_BROWSER_TARK_ADBLOCK_TARK_ADBLOCK_PROFILE_H_
++
++class Profile;
++
++namespace user_prefs {
++class PrefRegistrySyncable;
++}
++
++namespace tark_adblock {
++
++// "Block ads and trackers" is ContentSettingsType::ADS's default: block (the
++// default) means blocking on; allow means off. Per-site exceptions are the
++// site switch. Both are read on every request, so a change applies at once.
++
++// Set once uBlock Origin's state has been carried over.
++inline constexpr char kMigratedFromUblockPref[] =
++    "tark_adblock.migrated_from_ublock";
++
++void RegisterProfilePrefs(user_prefs::PrefRegistrySyncable* registry);
++
++// On a profile's first start after uBlock Origin left Tark's Mac and Windows
++// builds: whoever had it switched off keeps blocking off. Runs once.
++void MaybeMigrateFromUblock(Profile* profile);
++
++// Whether any loaded profile (not Incognito) has blocking on: list downloads
++// wait otherwise.
++bool DownloadsWanted();
++
++}  // namespace tark_adblock
++
++#endif  // CHROME_BROWSER_TARK_ADBLOCK_TARK_ADBLOCK_PROFILE_H_
+--- /dev/null
++++ b/chrome/browser/tark_adblock/tark_adblock_switch.cc
+@@ -0,0 +1,24 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/tark_adblock/tark_adblock_switch.h"
++
++namespace tark_adblock {
++
++bool UblockWasOff(const base::DictValue& extension_settings) {
++  const base::DictValue* ublock = extension_settings.FindDict(kUblockExtensionId);
++  if (!ublock) {
++    return false;
++  }
++  const base::Value* reasons = ublock->Find("disable_reasons");
++  if (!reasons) {
++    return false;
++  }
++  if (reasons->is_list()) {
++    return !reasons->GetList().empty();
++  }
++  return reasons->is_int() && reasons->GetInt() != 0;
++}
++
++}  // namespace tark_adblock
+--- /dev/null
++++ b/chrome/browser/tark_adblock/tark_adblock_switch.h
+@@ -0,0 +1,23 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_TARK_ADBLOCK_TARK_ADBLOCK_SWITCH_H_
++#define CHROME_BROWSER_TARK_ADBLOCK_TARK_ADBLOCK_SWITCH_H_
++
++#include "base/values.h"
++
++namespace tark_adblock {
++
++// uBlock Origin's id while Tark's Mac and Windows builds shipped it as a
++// component extension (resources/ublock/id.txt).
++inline constexpr char kUblockExtensionId[] = "onfgfofhhcjllijjogonbaokaiokfgna";
++
++// Whether uBlock Origin was switched off in a profile, from that profile's
++// "extensions.settings": its entry carries disable reasons (a list, or a bit
++// mask in older profiles).
++bool UblockWasOff(const base::DictValue& extension_settings);
++
++}  // namespace tark_adblock
++
++#endif  // CHROME_BROWSER_TARK_ADBLOCK_TARK_ADBLOCK_SWITCH_H_
+--- /dev/null
++++ b/chrome/browser/tark_adblock/tark_adblock_switch_unittest.cc
+@@ -0,0 +1,42 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/tark_adblock/tark_adblock_switch.h"
++
++#include "base/json/json_reader.h"
++#include "base/values.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace tark_adblock {
++namespace {
++
++base::DictValue Settings(std::string_view json) {
++  return base::JSONReader::ReadDict(json, base::JSON_PARSE_RFC).value();
++}
++
++// "Block ads and trackers" used to switch uBlock Origin (a component
++// extension) on and off; whoever had it off keeps blocking off.
++TEST(TarkAdblockSwitchTest, UblockOffIsCarriedOver) {
++  EXPECT_TRUE(UblockWasOff(Settings(
++      R"({"onfgfofhhcjllijjogonbaokaiokfgna": {"disable_reasons": [1]}})")));
++  // Older profiles store the reasons as a bit mask.
++  EXPECT_TRUE(UblockWasOff(Settings(
++      R"({"onfgfofhhcjllijjogonbaokaiokfgna": {"disable_reasons": 1}})")));
++}
++
++TEST(TarkAdblockSwitchTest, UblockOnOrAbsentLeavesBlockingOn) {
++  EXPECT_FALSE(UblockWasOff(Settings(R"({})")));
++  EXPECT_FALSE(UblockWasOff(Settings(
++      R"({"onfgfofhhcjllijjogonbaokaiokfgna": {"state": 1}})")));
++  EXPECT_FALSE(UblockWasOff(Settings(
++      R"({"onfgfofhhcjllijjogonbaokaiokfgna": {"disable_reasons": []}})")));
++  EXPECT_FALSE(UblockWasOff(Settings(
++      R"({"onfgfofhhcjllijjogonbaokaiokfgna": {"disable_reasons": 0}})")));
++  // Another extension switched off says nothing about uBlock.
++  EXPECT_FALSE(UblockWasOff(Settings(
++      R"({"aaaabbbbccccddddeeeeffffgggghhhh": {"disable_reasons": [1]}})")));
++}
++
++}  // namespace
++}  // namespace tark_adblock

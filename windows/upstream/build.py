@@ -72,6 +72,27 @@ def _run_build_process(*args, **kwargs):
                    **kwargs)
 
 
+def _tark_known_ninja_targets(out_dir, wanted):
+    """Tark: the entries of `wanted` this build knows, so an unknown one
+    cannot stop ninja: `path.cc^` when some target compiles ../../path.cc,
+    `dir:name` when build.ninja has that phony target."""
+    sources, phonies = set(), set()
+    for ninja_file in out_dir.rglob('*.ninja'):
+        for line in ninja_file.read_text(encoding=ENCODING, errors='replace').splitlines():
+            if line.startswith('build '):
+                head, _, rest = line[len('build '):].partition(': ')
+                if rest.startswith('phony'):
+                    phonies.add(head.replace('$:', ':'))
+                else:
+                    sources.update(p for p in rest.split()[1:] if p.startswith('../../'))
+    known = [w for w in wanted
+             if (w.endswith('^') and w[:-1] in sources) or (not w.endswith('^') and w in phonies)]
+    for w in wanted:
+        if w not in known:
+            print('tark: not a target of this build, skipped first:', w)
+    return known
+
+
 def _run_build_process_timeout(*args, timeout):
     """
     Runs the subprocess with the correct environment variables for building
@@ -108,6 +129,21 @@ def _make_tmp_paths():
     tmp_path = Path(os.environ['TEMP'])
     if not tmp_path.exists():
         tmp_path.mkdir()
+
+
+def _tark_substitute_and_hook(args, source_tree):
+    """Domain substitution, then Tark's own steps (tark_post_patch.py; a
+    local change to upstream, see windows/README.md), before gn gen."""
+    domain_substitution_list = (_ROOT_DIR / 'ungoogled-chromium' / 'domain_substitution.list') if args.tarball else (_ROOT_DIR  / 'domain_substitution.list')
+    domain_substitution.apply_substitution(
+        _ROOT_DIR / 'ungoogled-chromium' / 'domain_regex.list',
+        domain_substitution_list,
+        source_tree,
+        None
+    )
+    _tark_hook = _ROOT_DIR / 'tark_post_patch.py'
+    if _tark_hook.exists():
+        subprocess.run([sys.executable, str(_tark_hook), str(source_tree)], check=True)
 
 
 def main():
@@ -156,7 +192,27 @@ def main():
     source_tree = _ROOT_DIR / 'build' / 'src'
     downloads_cache = _ROOT_DIR / 'build' / 'download_cache'
 
-    if not args.ci or not (source_tree / 'BUILD.gn').exists():
+    # Tark (local change to upstream, see windows/README.md): TARK_PHASE runs
+    # one layer of windows/layered_build.py's build. base: everything but
+    # Tark's layer and ninja (the tarball, the downloads, the core and Windows
+    # patches, the Rust toolchain, args.gn, gn, bindgen); layer: only Tark's
+    # patches, domain substitution and Tark's hook; build: ninja, each earlier
+    # step skipped when already done, as with --ci but without its time
+    # limit. Unset: upstream's flow.
+    tark_phase = os.environ.get('TARK_PHASE')
+    done_ok = args.ci or tark_phase == 'build'
+
+    if tark_phase == 'layer':
+        tark_series = (_ROOT_DIR / 'patches' / 'series').read_text(encoding=ENCODING).splitlines()
+        patches.apply_patches(
+            [_ROOT_DIR / 'patches' / e.strip() for e in tark_series if e.strip().startswith('tarka/')],
+            source_tree,
+            patch_bin_path=(source_tree / _PATCH_BIN_RELPATH)
+        )
+        _tark_substitute_and_hook(args, source_tree)
+        return
+
+    if tark_phase == 'base' or (tark_phase is None and (not args.ci or not (source_tree / 'BUILD.gn').exists())):
         # Setup environment
         source_tree.mkdir(parents=True, exist_ok=True)
         downloads_cache.mkdir(parents=True, exist_ok=True)
@@ -226,27 +282,25 @@ def main():
             source_tree,
             patch_bin_path=(source_tree / _PATCH_BIN_RELPATH)
         )
-        # Then Windows-specific patches
-        patches.apply_patches(
-            patches.generate_patches_from_series(_ROOT_DIR / 'patches', resolve=True),
-            source_tree,
-            patch_bin_path=(source_tree / _PATCH_BIN_RELPATH)
-        )
+        # Then Windows-specific patches (and, outside Tark's layered build,
+        # Tark's after them).
+        if tark_phase == 'base':
+            platform_series = (_ROOT_DIR / 'patches' / 'series').read_text(encoding=ENCODING).splitlines()
+            patches.apply_patches(
+                [_ROOT_DIR / 'patches' / e.strip() for e in platform_series
+                 if e.strip() and not e.strip().startswith(('#', 'tarka/'))],
+                source_tree,
+                patch_bin_path=(source_tree / _PATCH_BIN_RELPATH)
+            )
+        else:
+            patches.apply_patches(
+                patches.generate_patches_from_series(_ROOT_DIR / 'patches', resolve=True),
+                source_tree,
+                patch_bin_path=(source_tree / _PATCH_BIN_RELPATH)
+            )
+        if tark_phase != 'base':
+            _tark_substitute_and_hook(args, source_tree)
 
-        # Substitute domains
-        domain_substitution_list = (_ROOT_DIR / 'ungoogled-chromium' / 'domain_substitution.list') if args.tarball else (_ROOT_DIR  / 'domain_substitution.list')
-        domain_substitution.apply_substitution(
-            _ROOT_DIR / 'ungoogled-chromium' / 'domain_regex.list',
-            domain_substitution_list,
-            source_tree,
-            None
-        )
-
-        # Tark (local change to upstream, see windows/README.md): Tark's own
-        # steps after patching and domain substitution, before gn gen.
-        _tark_hook = _ROOT_DIR / 'tark_post_patch.py'
-        if _tark_hook.exists():
-            subprocess.run([sys.executable, str(_tark_hook), str(source_tree)], check=True)
 
     # Check if rust-toolchain folder has been populated
     HOST_CPU_IS_64BIT = sys.maxsize > 2**32
@@ -255,7 +309,7 @@ def main():
     RUST_DIR_SRC86 = source_tree / 'third_party' / 'rust-toolchain-x86'
     RUST_DIR_SRCARM = source_tree / 'third_party' / 'rust-toolchain-arm'
     RUST_FLAG_FILE = RUST_DIR_DST / 'INSTALLED_VERSION'
-    if not args.ci or not RUST_FLAG_FILE.exists():
+    if not done_ok or not RUST_FLAG_FILE.exists():
         # Directories to copy from source to target folder
         DIRS_TO_COPY = ['bin', 'lib']
 
@@ -284,7 +338,7 @@ def main():
         with open(RUST_FLAG_FILE, 'w') as f:
             subprocess.run([source_tree / 'third_party' / 'rust-toolchain-x64' / 'rustc' / 'bin' / 'rustc.exe', '--version'], stdout=f)
 
-    if not args.ci or not (source_tree / 'out/Default').exists():
+    if not done_ok or not (source_tree / 'out/Default').exists():
         # Output args.gn
         (source_tree / 'out/Default').mkdir(parents=True)
         gn_flags = (_ROOT_DIR / 'ungoogled-chromium' / 'flags.gn').read_text(encoding=ENCODING)
@@ -312,7 +366,7 @@ def main():
     # Enter source tree to run build commands
     os.chdir(source_tree)
 
-    if not args.ci or not os.path.exists('out\\Default\\gn.exe'):
+    if not done_ok or not os.path.exists('out\\Default\\gn.exe'):
         # Run GN bootstrap
         _run_build_process(
             sys.executable, 'tools\\gn\\bootstrap\\bootstrap.py', '-o', 'out\\Default\\gn.exe',
@@ -321,30 +375,63 @@ def main():
         # Run gn gen
         _run_build_process('out\\Default\\gn.exe', 'gen', 'out\\Default', '--fail-on-unused-args')
 
-    if not args.ci or not os.path.exists('third_party\\rust-toolchain\\bin\\bindgen.exe'):
+    if not done_ok or not os.path.exists('third_party\\rust-toolchain\\bin\\bindgen.exe'):
         # Build bindgen
         _run_build_process(
             sys.executable,
             'tools\\rust\\build_bindgen.py', '--skip-test')
 
     # Ninja commandline
+    # Tark: the base ends here, before ninja; the Rust toolchain, bindgen and
+    # gn are part of it, so a layer reset never gives them new times.
+    if tark_phase == 'base':
+        return
+
     ninja_commandline = ['third_party\\ninja\\ninja.exe']
     if args.thread_count is not None:
         ninja_commandline.append('-j')
         ninja_commandline.append(args.thread_count)
     ninja_commandline.append('-C')
     ninja_commandline.append('out\\Default')
+    # Tark (local change to upstream, see windows/README.md): ninja first
+    # builds the targets and files in tark_ninja_first.txt, so that a compile
+    # error in Tark's code shows within the first stage, not a day in; Tark's
+    # Windows test binaries are built with the browser.
+    _tark_first = _ROOT_DIR / 'tark_ninja_first.txt'
+    first_commandlines = []
+    if _tark_first.exists():
+        first = _tark_known_ninja_targets(
+            Path('out') / 'Default', _tark_first.read_text(encoding=ENCODING).split())
+        # The command goes through cmd.exe, whose lines hold at most 8191
+        # characters: several ninja calls of at most 6000.
+        chunk = []
+        for target in first:
+            if chunk and len(' '.join(map('"{}"'.format, ninja_commandline + chunk + [target]))) > 6000:
+                first_commandlines.append(ninja_commandline + chunk)
+                chunk = []
+            chunk.append(target)
+        if chunk:
+            first_commandlines.append(ninja_commandline + chunk)
     ninja_commandline.append('chrome')
     ninja_commandline.append('chromedriver')
     ninja_commandline.append('mini_installer')
+    ninja_commandline.append('tark_captions_unittests')
+    ninja_commandline.append('tark_speech_unittests')
 
     # Run ninja
     if args.ci:
-        _run_build_process_timeout(*ninja_commandline, timeout=3.5*60*60)
-        # package
+        # Both passes share the stage's 3.5 hours (TARK_NINJA_HOURS: less for
+        # the first stage, which also unpacks and patches the source).
+        deadline = time.monotonic() + float(os.environ.get('TARK_NINJA_HOURS', '3.5'))*60*60
+        for first_commandline in first_commandlines:
+            _run_build_process_timeout(*first_commandline, timeout=max(60, deadline - time.monotonic()))
+        _run_build_process_timeout(*ninja_commandline, timeout=max(60, deadline - time.monotonic()))
+        # package (Tark: a failed package fails the build)
         os.chdir(_ROOT_DIR)
-        subprocess.run([sys.executable, 'package.py', '--cpu-arch', '32bit' if args.x86 else 'arm' if args.arm else '64bit'])
+        subprocess.run([sys.executable, 'package.py', '--cpu-arch', '32bit' if args.x86 else 'arm' if args.arm else '64bit'], check=True)
     else:
+        for first_commandline in first_commandlines:
+            _run_build_process(*first_commandline)
         _run_build_process(*ninja_commandline)
 
 

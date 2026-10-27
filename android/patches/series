@@ -42,7 +42,8 @@ download-extension-util-include.patch
 # settings launchers, none of which ungoogled builds. A Tark file gives them
 # stand-ins that read Safe Browsing as off; the remaining callers of removed
 # code (suspicious-notification UKM, the tips agent's enhanced-protection
-# check, password reuse detection) drop or guard the call.
+# check and, since 156, the tips feature's enhanced-protection tip, password
+# reuse detection) drop or guard the call.
 safe-browsing-android-link.patch
 #
 # Direct APK ≤ 195 MB (the user's decisions: 130 MB on 2026-10-20, then 180
@@ -58,6 +59,12 @@ direct-apk-size.patch
 # Java at startup) hit its CHECK and crashed every start. Tark uses no Google
 # accounts: seeding is skipped when credentials were never loaded.
 signin-android-no-account-seeding.patch
+#
+# Chromium 156 takes version_info's version on Android from the APK's
+# version name. Tark's ("156.0.8078.47-r1", android/release/version.py) is
+# not a base::Version, so variations setup hit a CHECK at every start; the
+# version is Chromium's again, as on desktop.
+version-info-chromium-version.patch
 #
 # ungoogled stops registering the sign-in prefs; Android's first run reads
 # signin.allowed and PrefService CHECKs on an unregistered pref. It is
@@ -128,45 +135,43 @@ private-tab-button.patch
 # Every settings screen draws hairline dividers between rows.
 look-settings.patch
 #
-# A2: adblock-rust 0.13.3 in Chromium's Rust crates. Chromium's Cargo.toml,
-# Cargo.lock and gnrt_config.toml gain adblock and its ten new dependencies
+# A2's engine patches are shared (patches/tarka/adblock/, applied before this
+# series on every platform): adblock-crates, adblock-engine, adblock-network,
+# adblock-cosmetic. Their notes stay here.
+#
+# A2: adblock-rust 0.13.3 in Chromium's Rust crates (tarka/adblock/).
+# Chromium's Cargo.toml, Cargo.lock and gnrt_config.toml gain adblock and its
+# ten new dependencies
 # (configured as brave-core does), with the BUILD.gn files gnrt generates for
 # them; regex, which Chromium ships only to tests, becomes shippable; bitflags
 # and serde gain the features adblock asks for. The crates' sources are put in
 # place by android/adblock/crates.py (pinned sha256), with two crate patches
 # recorded here: adblock uses Chromium's thiserror 2 and drops the url crate
 # (one unused error conversion); seahash gets the MIT licence it declares.
-adblock-crates.patch
 #
-# A2: the ad blocker's engine. Brave's cxx bridge to adblock-rust (trimmed),
+# A2: the ad blocker's engine (tarka/adblock/adblock-engine.patch). Brave's cxx bridge to adblock-rust (trimmed),
 # its domain resolver and redirect stub response go to third_party/
 # brave_adblock (MPL-2.0); Tark's service compiles the newest list bundle
 # (the APK's asset or a verified download) on its own sequence, caches the
 # compiled engine, and blocks nothing until it is ready. Its updater fetches
 # the daily signed bundle from gettarka.com (a day on Wi-Fi, three on mobile
 # data); the bundle and update rules have unit tests built for the build
-# machine (android/build.sh runs them).
-adblock-engine.patch
+# machine (android/build.sh runs them). Android's own hooks: the list bundle
+# as an APK asset, and the service's start in chrome_browser_main_android.cc.
+adblock-android.patch
 #
-# A2: Android has no extensions, so uBlock Origin's resource pak (Tark's
-# shared patches add it on every platform) is left out of Android's paks; the
-# engine-level blocker replaces it.
-adblock-no-ublock-pak.patch
-#
-# A2: ad requests blocked before they leave. A proxying URLLoaderFactory
+# A2: ad requests blocked before they leave (tarka/adblock/). A proxying URLLoaderFactory
 # (modelled on Chromium's signin one) sits in front of every page, frame and
 # worker factory; the engine's answer fails a request as uBlock Origin does
 # (ERR_BLOCKED_BY_CLIENT, element collapsed) or serves its $redirect stub, and
 # redirects are checked again. Frames' WebSockets are checked too. A site the
 # person turned blocking off for (ADS = allow) passes untouched.
-adblock-network.patch
 #
-# A2: hiding rules and scriptlets. Each frame asks the browser (synchronously,
+# A2: hiding rules and scriptlets (tarka/adblock/). Each frame asks the browser (synchronously,
 # at commit) for its page's resources; at document start, before the page's
 # own scripts, the scriptlets run in the page's world and the hide selectors
 # become a user stylesheet; a collector in an isolated world reports class
 # and id names, and their generic hide rules follow.
-adblock-cosmetic.patch
 #
 # A2: "Block ads on this site" in the page info sheet (English and Hindi);
 # off stores ADS = allow for the site, which the proxy and the cosmetic
@@ -174,8 +179,9 @@ adblock-cosmetic.patch
 adblock-site-switch.patch
 #
 # The Mac's "What Tark connects to" (spec §5.3) in Privacy and security:
-# Shodhya, and gettarka.com for the ad blocker's lists, in plain words,
-# English and Hindi.
+# Shodhya, Zynclave's sign-in (only when the user signs in or visits its
+# account pages) and gettarka.com for the ad blocker's lists, in plain
+# words, English and Hindi.
 look-connects.patch
 #
 # The Mac's offline new tab page (spec §13, left for later at A4): online a
@@ -344,3 +350,36 @@ voice-languages.patch
 # snackbar naming it. Nothing changes without the person's tap; private
 # tabs never store a site language.
 voice-language-detect.patch
+#
+# Sign in with Zynclave (spec: Android Zynclave sign-in, §5.2): AppAuth for
+# Android 0.11.1 as third_party/appauth (Apache-2.0, in about:credits). Its
+# sources are put in place by android/appauth/fetch.py (pinned sha256); only
+# net.openid.appauth is compiled.
+appauth-library.patch
+#
+# Sign in with Zynclave: the account. The production client in every
+# published APK, staging only with the GN arg tark_zynclave_staging (a test
+# APK); the authorization request is the code flow with PKCE (S256), scopes
+# openid profile email offline_access, Tark's redirect.
+zynclave-account.patch
+#
+# Sign in with Zynclave: the redirect from Tark's own sign-in Custom Tab
+# (com.gettarka.tarka:/oauth2redirect) goes to AppAuth instead of loading in
+# the tab; only that tab, only for the pending request's token.
+zynclave-redirect.patch
+#
+# Sign in with Zynclave: Settings. The account row under the header
+# look-settings.patch adds ("Sign in with Zynclave", or the name and email
+# once signed in), the account page with Sign out, and its dialog (also sign
+# out of Zynclave websites in Tark?). A failed sign-in says so in the
+# Settings snackbar.
+zynclave-settings-row.patch
+#
+# Sign in with Zynclave: "Sign in to Tark as X?". A normal tab that went
+# through the Zynclave Account's pages, then stays 3 s on a page that is not a
+# sign-in screen, asks the profile's web session once (a native GET of
+# /sessions/whoami with the profile's cookies, which Tark never reads); a
+# session shows a sheet once per account per run (English and Hindi), Sign in
+# runs the sign-in with prompt=none, No thanks keeps a salted hash of the
+# account. Private tabs get no observer and make no request.
+zynclave-web-offer.patch
