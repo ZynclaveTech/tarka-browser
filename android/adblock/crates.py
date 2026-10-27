@@ -7,7 +7,7 @@ crates (A2, spec §4).
 
     python3 android/adblock/crates.py SRC [--cache DIR]
 
-android/patches/adblock-crates.patch adds the crates to Chromium's
+patches/tarka/adblock/adblock-crates.patch adds the crates to Chromium's
 Cargo.toml, Cargo.lock and gnrt_config.toml, with the BUILD.gn files gnrt
 generates for them; this puts their sources in
 third_party/rust/chromium_crates_io/vendor/<name>-<epoch>, as gnrt vendor

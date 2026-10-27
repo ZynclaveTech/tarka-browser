@@ -1,15 +1,14 @@
 diff --color -ruN a/content/public/android/BUILD.gn b/content/public/android/BUILD.gn
 --- a/content/public/android/BUILD.gn
 +++ b/content/public/android/BUILD.gn
-@@ -752,6 +752,7 @@
+@@ -742,6 +742,7 @@
      "junit/src/org/chromium/content/browser/GestureListenerManagerImplUnitTest.java",
      "junit/src/org/chromium/content/browser/ScreenOrientationProviderImplTest.java",
      "junit/src/org/chromium/content/browser/SpareChildConnectionTest.java",
 +    "junit/src/org/chromium/content/browser/SpeechRecognitionImplTest.java",
      "junit/src/org/chromium/content/browser/WindowEventObserverManagerTest.java",
      "junit/src/org/chromium/content/browser/accessibility/AccessibilityNodeInfoBuilderTest.java",
-     "junit/src/org/chromium/content/browser/androidoverlay/DialogOverlayCoreTest.java",
-diff --color -ruN a/content/public/android/java/src/org/chromium/content/browser/SpeechRecognitionImpl.java b/content/public/android/java/src/org/chromium/content/browser/SpeechRecognitionImpl.java
+     "junit/src/org/chromium/content/browser/accessibility/AccessibilityNodeInfoUtilsUnitTest.java",
 --- a/content/public/android/java/src/org/chromium/content/browser/SpeechRecognitionImpl.java
 +++ b/content/public/android/java/src/org/chromium/content/browser/SpeechRecognitionImpl.java
 @@ -6,48 +6,86 @@
@@ -52,9 +51,10 @@ diff --color -ruN a/content/public/android/java/src/org/chromium/content/browser
  
  import java.util.ArrayList;
 -import java.util.List;
-+import java.util.Locale;
- 
+-
 -/** Implementation of {@link SpeechRecognition}. */
++import java.util.Locale;
++
 +/**
 + * Implementation of {@link SpeechRecognition}.
 + *
@@ -141,8 +141,7 @@ diff --color -ruN a/content/public/android/java/src/org/chromium/content/browser
          @Override
          public void onError(int error) {
 -            int code = SpeechRecognitionErrorCode.NONE;
-+            if (mNativeSpeechRecognizerImplAndroid == 0) return;
- 
+-
 -            // Translate Android SpeechRecognizer errors to Web Speech API errors.
 -            switch (error) {
 -                case SpeechRecognizer.ERROR_AUDIO:
@@ -169,13 +168,15 @@ diff --color -ruN a/content/public/android/java/src/org/chromium/content/browser
 -                default:
 -                    assert false;
 -                    return;
+-            }
++            if (mNativeSpeechRecognizerImplAndroid == 0) return;
+ 
 +            int code = mapError(error);
 +            LanguageDelegate delegate = sLanguageDelegate;
 +            if (code == SpeechRecognitionErrorCode.LANGUAGE_NOT_SUPPORTED && delegate != null) {
 +                delegate.onLanguageMissing(
 +                        mLanguage, Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU);
-             }
--
++            }
 +            // Every error ends the session, so the page never waits on one that Android dropped.
              terminate(code);
          }
@@ -195,27 +196,13 @@ diff --color -ruN a/content/public/android/java/src/org/chromium/content/browser
      public static boolean initialize() {
 -        Context context = ContextUtils.getApplicationContext();
 -        if (!SpeechRecognizer.isRecognitionAvailable(context)) return false;
-+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return false;
-+        return getRecognizerFactory()
-+                .isOnDeviceRecognitionAvailable(ContextUtils.getApplicationContext());
-+    }
-+
-+    /**
-+     * Sets the delegate told when a session fails for a language the device lacks.
-+     *
-+     * @param delegate The delegate, or null for none.
-+     */
-+    public static void setLanguageDelegate(@Nullable LanguageDelegate delegate) {
-+        sLanguageDelegate = delegate;
-+    }
- 
+-
 -        sRecognitionProvider = createRecognitionProvider();
 -        if (sRecognitionProvider == null) return false;
 -        return true;
-+    @VisibleForTesting
-+    static void setRecognizerFactoryForTesting(@Nullable RecognizerFactory factory) {
-+        sRecognizerFactoryForTesting = factory;
-+        ResettersForTesting.register(() -> sRecognizerFactoryForTesting = null);
++        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return false;
++        return getRecognizerFactory()
++                .isOnDeviceRecognitionAvailable(ContextUtils.getApplicationContext());
      }
  
 -    /** Returns null if there is no Google LLC provided RecognitionService available on device. */
@@ -225,10 +212,13 @@ diff --color -ruN a/content/public/android/java/src/org/chromium/content/browser
 -        } else {
 -            return getComponent(AGSA_PACKAGE_NAME, AGSA_MIN_VERSION);
 -        }
-+    @VisibleForTesting
-+    static void resetForTesting() {
-+        sLiveSession = null;
-+        sLanguageDelegate = null;
++    /**
++     * Sets the delegate told when a session fails for a language the device lacks.
++     *
++     * @param delegate The delegate, or null for none.
++     */
++    public static void setLanguageDelegate(@Nullable LanguageDelegate delegate) {
++        sLanguageDelegate = delegate;
      }
  
 -    @SuppressLint("WrongConstant")
@@ -240,9 +230,19 @@ diff --color -ruN a/content/public/android/java/src/org/chromium/content/browser
 -
 -        for (ResolveInfo resolve : list) {
 -            ServiceInfo service = resolve.serviceInfo;
--
++    @VisibleForTesting
++    static void setRecognizerFactoryForTesting(@Nullable RecognizerFactory factory) {
++        sRecognizerFactoryForTesting = factory;
++        ResettersForTesting.register(() -> sRecognizerFactoryForTesting = null);
++    }
+ 
 -            if (!service.packageName.equals(packageName)) continue;
--
++    @VisibleForTesting
++    static void resetForTesting() {
++        sLiveSession = null;
++        sLanguageDelegate = null;
++    }
+ 
 -            // No need to verify package version if packageMinVersion != -1.
 -            if (packageMinVersion != -1) {
 -                if (PackageUtils.getPackageVersion(service.packageName) < packageMinVersion) {
@@ -366,7 +366,6 @@ diff --color -ruN a/content/public/android/java/src/org/chromium/content/browser
      @CalledByNative
 -    private void startRecognition(String language, boolean continuous, boolean interimResults) {
 -        if (mRecognizer == null) return;
--
 +    @VisibleForTesting
 +    void startRecognition(String language, boolean continuous, boolean interimResults) {
 +        if (mNativeSpeechRecognizerImplAndroid == 0 || mRecognizer != null) return;
@@ -385,7 +384,7 @@ diff --color -ruN a/content/public/android/java/src/org/chromium/content/browser
 +        mRecognizer = recognizer;
 +        sLiveSession = this;
 +        recognizer.setRecognitionListener(mListener);
-+
+ 
 +        // The page's lang, else the phone's.
 +        mLanguage =
 +                TextUtils.isEmpty(language) ? Locale.getDefault().toLanguageTag() : language;
@@ -418,7 +417,6 @@ diff --color -ruN a/content/public/android/java/src/org/chromium/content/browser
          if (mRecognizer == null) return;
  
          mRecognizer.cancel();
-diff --color -ruN a/content/public/android/junit/src/org/chromium/content/browser/SpeechRecognitionImplTest.java b/content/public/android/junit/src/org/chromium/content/browser/SpeechRecognitionImplTest.java
 --- /dev/null
 +++ b/content/public/android/junit/src/org/chromium/content/browser/SpeechRecognitionImplTest.java
 @@ -0,0 +1,262 @@

@@ -1,0 +1,66 @@
+--- a/chrome/browser/ui/webui/cr_components/searchbox/searchbox_handler.cc
++++ b/chrome/browser/ui/webui/cr_components/searchbox/searchbox_handler.cc
+@@ -139,7 +139,7 @@
+ constexpr int kPromptWidthBuffer = 40;
+ 
+ // The AutocompleteMatch::additional_info key that the Indian-language rows
+-// (TarkTransliterationProvider, macOS only) carry; the provider's header is not
++// (TarkTransliterationProvider, macOS and Windows) carry; the provider's header is not
+ // included here as this file is built on every platform.
+ constexpr char kTransliterationLanguageInfoKey[] = "tark_xlit_lang";
+ 
+--- a/components/omnibox/browser/BUILD.gn
++++ b/components/omnibox/browser/BUILD.gn
+@@ -516,9 +516,9 @@
+     deps += [ "//components/vector_icons" ]
+   }
+ 
+-  # Indian-language rows worked out on the device; //components/tark_xlit is
+-  # macOS-only.
+-  if (is_mac) {
++  # Indian-language rows worked out on the device; //components/tark_xlit
++  # runs on Accelerate on the Mac and Eigen on Windows.
++  if (is_mac || is_win) {
+     sources += [
+       "tark_transliteration_provider.cc",
+       "tark_transliteration_provider.h",
+--- a/components/omnibox/browser/autocomplete_classifier.cc
++++ b/components/omnibox/browser/autocomplete_classifier.cc
+@@ -70,7 +70,7 @@
+            : AutocompleteProvider::Type::kNone) |
+       AutocompleteProvider::Type::kContextualSearch |
+       // Indian-language rows; AutocompleteController builds the provider on
+-      // macOS only.
++      // macOS and Windows.
+       AutocompleteProvider::Type::kQueryTile |
+ #elif !BUILDFLAG(IS_DESKTOP_ANDROID)
+       AutocompleteProvider::Type::kClipboard |
+--- a/components/omnibox/browser/autocomplete_controller.cc
++++ b/components/omnibox/browser/autocomplete_controller.cc
+@@ -119,7 +119,7 @@
+ #include "components/open_from_clipboard/clipboard_recent_content_generic.h"
+ #endif
+ 
+-#if BUILDFLAG(IS_MAC)
++#if BUILDFLAG(IS_MAC) || BUILDFLAG(IS_WIN)
+ #include "components/omnibox/browser/tark_transliteration_provider.h"
+ #endif
+ 
+@@ -1270,7 +1270,7 @@
+           return (keyword_turl->starter_pack_id() ==
+                   template_url_starter_pack_data::StarterPackId::kTabs);
+ 
+-#if BUILDFLAG(IS_MAC)
++#if BUILDFLAG(IS_MAC) || BUILDFLAG(IS_WIN)
+         // Indian-language rows (TarkTransliterationProvider): web sources
+         // only, never @bookmarks, @history or @tabs.
+         case AutocompleteProvider::Type::kQueryTile:
+@@ -1448,7 +1448,7 @@
+     contextual_search_provider_ = contextual_search_provider.get();
+     providers_.push_back(std::move(contextual_search_provider));
+   }
+-#if BUILDFLAG(IS_MAC)
++#if BUILDFLAG(IS_MAC) || BUILDFLAG(IS_WIN)
+   // Type::kQueryTile is unused on desktop; it carries the Indian-language rows
+   // so that no provider type has to be added.
+   if (provider_types &

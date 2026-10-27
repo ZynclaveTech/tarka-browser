@@ -295,3 +295,32 @@ class TestAndroidConfig(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TestSharedAdblock(unittest.TestCase):
+    """Desktop ad blocker, Task 2: the A2 engine patches are shared (Mac,
+    Windows and Android apply them); Android keeps its own hooks in
+    android/patches/adblock-android.patch, after them."""
+
+    SHARED = ['tarka/adblock/adblock-crates.patch', 'tarka/adblock/adblock-engine.patch',
+              'tarka/adblock/adblock-network.patch', 'tarka/adblock/adblock-cosmetic.patch']
+
+    def test_adblock_patches_shared(self):
+        import series  # noqa: E402
+        out = series.series(REPO)
+        positions = [out.index(e) for e in self.SHARED]
+        self.assertEqual(positions, sorted(positions))
+        self.assertLess(positions[-1], out.index('android/adblock-android.patch'))
+        android = lines(ANDROID / 'patches' / 'series')
+        for e in self.SHARED:
+            self.assertNotIn(e.split('/')[-1], android)
+            self.assertTrue((REPO / 'patches' / e).is_file(), e)
+
+    def test_android_hooks_stay_android_only(self):
+        hooks = (ANDROID / 'patches' / 'adblock-android.patch').read_text()
+        self.assertIn('+++ b/chrome/browser/chrome_browser_main_android.cc', hooks)
+        self.assertIn('+++ b/chrome/android/BUILD.gn', hooks)
+        for e in self.SHARED:
+            text = (REPO / 'patches' / e).read_text()
+            self.assertNotIn('chrome_browser_main_android.cc', text)
+            self.assertNotIn('+++ b/chrome/android/BUILD.gn', text)

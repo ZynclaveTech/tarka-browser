@@ -1,3 +1,77 @@
+--- a/chrome/android/java/res/xml/privacy_preferences.xml
++++ b/chrome/android/java/res/xml/privacy_preferences.xml
+@@ -56,6 +56,9 @@
+     <org.chromium.components.browser_ui.settings.TextMessagePreference
+         android:key="tark_connects_lists"
+         android:summary="@string/tark_connects_lists" />
++    <org.chromium.components.browser_ui.settings.TextMessagePreference
++        android:key="tark_connects_xlit"
++        android:summary="@string/tark_connects_xlit" />
+ 
+     <org.chromium.components.browser_ui.settings.ChromeBasePreferenceCategory
+         android:key="security_section"
+--- a/chrome/browser/BUILD.gn
++++ b/chrome/browser/BUILD.gn
+@@ -1673,6 +1673,20 @@
+     ]
+   }
+ 
++  if (is_android) {
++    # Tark's Indian-language suggestions: the download of the model and word
++    # lists (A3, spec §5).
++    sources += [
++      "tark_xlit/android/tark_xlit_bridge.cc",
++      "tark_xlit/xlit_download_service.cc",
++      "tark_xlit/xlit_download_service.h",
++    ]
++    deps += [
++      "//chrome/browser/tark_xlit:files",
++      "//chrome/browser/tark_xlit/android:jni_headers",
++    ]
++  }
++
+   if (is_android) {
+     sources += [
+       "after_startup_task_utils_android.cc",
+--- a/chrome/browser/chrome_browser_main_android.cc
++++ b/chrome/browser/chrome_browser_main_android.cc
+@@ -24,6 +24,7 @@
+ #include "chrome/browser/data_saver/data_saver.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/tark_adblock/tark_adblock_service.h"
++#include "chrome/browser/tark_xlit/xlit_download_service.h"
+ #include "chrome/browser/webauthn/android/cable_module_android.h"
+ #include "components/crash/content/browser/child_exit_observer_android.h"
+ #include "components/crash/content/browser/child_process_crash_observer_android.h"
+@@ -123,6 +124,10 @@
+   // background and blocks nothing until it is ready.
+   tark_adblock::AdblockService::Get();
+ 
++  // Tark (A3): finds the Indian-language suggestions' downloaded files, and
++  // resumes a download the person said yes to. Fetches nothing otherwise.
++  tark_xlit::XlitDownloadService::Get();
++
+   scudo_purge_coordinator_ =
+       base::android::ScudoPurgeCoordinator::CreateIfEnabled();
+ 
+--- a/chrome/browser/prefs/browser_prefs.cc
++++ b/chrome/browser/prefs/browser_prefs.cc
+@@ -275,6 +275,7 @@
+ 
+ #if BUILDFLAG(IS_ANDROID)
+ #include "chrome/browser/accessibility/accessibility_prefs/android/accessibility_prefs_controller.h"
++#include "chrome/browser/tark_xlit/xlit_download_service.h"
+ #include "chrome/browser/android/ntp/recent_tabs_page_prefs.h"
+ #include "chrome/browser/android/oom_intervention/oom_intervention_decider.h"
+ #include "chrome/browser/android/preferences/browser_prefs_android.h"
+@@ -1525,6 +1526,7 @@
+   // keep this list alphabetized.
+   tark::RegisterWidevineLocalStatePrefs(registry);
+ #if BUILDFLAG(IS_ANDROID)
++  tark_xlit::XlitDownloadService::RegisterPrefs(registry);
+   accessibility::AccessibilityPrefsController::RegisterLocalStatePrefs(
+       registry);
+ #endif
 --- /dev/null
 +++ b/chrome/browser/tark_xlit/BUILD.gn
 @@ -0,0 +1,45 @@
@@ -54,624 +128,207 @@
 +  "+crypto",
 +]
 --- /dev/null
-+++ b/chrome/browser/tark_xlit/xlit_files.h
-@@ -0,0 +1,99 @@
++++ b/chrome/browser/tark_xlit/android/BUILD.gn
+@@ -0,0 +1,32 @@
++# Copyright 2026 The Tark Authors
++# Use of this source code is governed by a BSD-style license that can be
++# found in the LICENSE file.
++
++import("//build/config/android/rules.gni")
++import("//third_party/jni_zero/jni_zero.gni")
++
++# Tark for Android (A3): the address bar's offer to download the
++# Indian-language suggestions, and Settings' switch, talk to
++# //chrome/browser/tark_xlit:download_service through this.
++android_library("java") {
++  srcjar_deps = [ ":jni_headers" ]
++  sources = [
++    "java/src/org/chromium/chrome/browser/tark_xlit/TarkXlitBridge.java",
++    "java/src/org/chromium/chrome/browser/tark_xlit/TarkXlitOffer.java",
++  ]
++  deps = [
++    "//build/android:build_java",
++    "//chrome/browser/ui/android/strings:ui_strings_grd",
++    "//components/browser_ui/styles/android:java_resources",
++    "//components/browser_ui/widget/android:java_resources",
++    "//third_party/androidx:androidx_appcompat_appcompat_java",
++    "//third_party/jni_zero:jni_zero_java",
++  ]
++  resources_package = "org.chromium.chrome.browser.tark_xlit"
++}
++
++generate_jni("jni_headers") {
++  sources = [
++    "java/src/org/chromium/chrome/browser/tark_xlit/TarkXlitBridge.java",
++  ]
++}
+--- /dev/null
++++ b/chrome/browser/tark_xlit/android/java/src/org/chromium/chrome/browser/tark_xlit/TarkXlitBridge.java
+@@ -0,0 +1,71 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
 +
-+#ifndef CHROME_BROWSER_TARK_XLIT_XLIT_FILES_H_
-+#define CHROME_BROWSER_TARK_XLIT_XLIT_FILES_H_
++package org.chromium.chrome.browser.tark_xlit;
++
++import org.jni_zero.JNINamespace;
++import org.jni_zero.JniType;
++import org.jni_zero.NativeMethods;
++
++import org.chromium.build.annotations.NullMarked;
++
++/**
++ * Tark for Android (A3): the download of the Indian-language suggestions' model and word lists
++ * (chrome/browser/tark_xlit/xlit_download_service.h), for the address bar's offer and Settings.
++ */
++@JNINamespace("tark_xlit")
++@NullMarked
++public final class TarkXlitBridge {
++    /** OfferState in components/tark_xlit/languages.h. */
++    public static final int NOT_ASKED = 0;
++
++    public static final int ACCEPTED = 1;
++    public static final int DECLINED = 2;
++
++    private TarkXlitBridge() {}
++
++    /** Download the person's row languages: on Wi-Fi, or now on any network. */
++    public static void accept(boolean now) {
++        TarkXlitBridgeJni.get().accept(now);
++    }
++
++    /** No suggestions and no offer; the files stay. */
++    public static void decline() {
++        TarkXlitBridgeJni.get().decline();
++    }
++
++    public static int getOfferState() {
++        return TarkXlitBridgeJni.get().getOfferState();
++    }
++
++    /** The languages whose word list is in place, by their own names ("हिन्दी"). */
++    public static String[] getDownloadedLanguageNames() {
++        return TarkXlitBridgeJni.get().getDownloadedLanguageNames();
++    }
++
++    public static boolean isWaitingForWifi() {
++        return TarkXlitBridgeJni.get().isWaitingForWifi();
++    }
++
++    /** Bytes still to download for {@code tag}, or for the row languages if it is empty. */
++    public static long getDownloadSize(String tag) {
++        return TarkXlitBridgeJni.get().getDownloadSize(tag);
++    }
++
++    @NativeMethods
++    interface Natives {
++        void accept(boolean now);
++
++        void decline();
++
++        int getOfferState();
++
++        @JniType("std::vector<std::string>")
++        String[] getDownloadedLanguageNames();
++
++        boolean isWaitingForWifi();
++
++        long getDownloadSize(@JniType("std::string") String tag);
++    }
++}
+--- /dev/null
++++ b/chrome/browser/tark_xlit/android/java/src/org/chromium/chrome/browser/tark_xlit/TarkXlitOffer.java
+@@ -0,0 +1,42 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++package org.chromium.chrome.browser.tark_xlit;
++
++import android.content.Context;
++import android.text.format.Formatter;
++
++import androidx.appcompat.app.AlertDialog;
++
++import org.chromium.build.annotations.NullMarked;
++
++/**
++ * Tark for Android (A3, spec §5): what the address bar's "Type in हिन्दी?" row opens. It asks once
++ * whether to download the suggestions, on Wi-Fi (the default) or now; "No thanks" hides the row,
++ * and Settings > Languages turns it on later.
++ */
++@NullMarked
++public final class TarkXlitOffer {
++    private TarkXlitOffer() {}
++
++    /**
++     * @param tag The row language, such as "hi".
++     * @param languageName Its own name, such as "हिन्दी".
++     */
++    public static void show(Context context, String tag, String languageName) {
++        String size = Formatter.formatShortFileSize(context, TarkXlitBridge.getDownloadSize(tag));
++        new AlertDialog.Builder(context, R.style.ThemeOverlay_BrowserUI_AlertDialog)
++                .setTitle(context.getString(R.string.tark_xlit_offer, languageName))
++                .setMessage(context.getString(R.string.tark_xlit_offer_message, languageName, size))
++                .setPositiveButton(
++                        R.string.tark_xlit_download_on_wifi,
++                        (dialog, which) -> TarkXlitBridge.accept(/* now= */ false))
++                .setNeutralButton(
++                        R.string.tark_xlit_download_now,
++                        (dialog, which) -> TarkXlitBridge.accept(/* now= */ true))
++                .setNegativeButton(
++                        R.string.tark_xlit_no_thanks, (dialog, which) -> TarkXlitBridge.decline())
++                .show();
++    }
++}
+--- /dev/null
++++ b/chrome/browser/tark_xlit/android/tark_xlit_bridge.cc
+@@ -0,0 +1,45 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
 +
 +#include <cstdint>
 +#include <string>
-+#include <string_view>
 +#include <vector>
 +
-+#include "base/containers/span.h"
++#include "base/android/jni_array.h"
++#include "base/android/jni_string.h"
++#include "chrome/browser/tark_xlit/xlit_download_service.h"
 +
-+namespace base {
-+class FilePath;
-+}  // namespace base
-+
-+namespace tark_xlit {
-+
-+// Tark for Android (A3, spec §5): the IndicXlit files the phone downloads from
-+// gettarka.com, each pinned in the APK by its size and sha256
-+// (android/xlit/files.py writes the table, xlit_files.inc, at build time).
-+struct XlitFile {
-+  std::string_view name;
-+  int64_t size;
-+  std::string_view sha256;  // Lower-case hex.
-+};
-+
-+inline constexpr char kModelFileName[] = "xlit-model.bin";
-+
-+// Every file, the model and one word list per language.
-+base::span<const XlitFile> AllFiles();
-+const XlitFile* FindFile(std::string_view name);
-+// "xlit-words-<tag>.bin".
-+std::string WordsFileName(std::string_view tag);
-+// Where `file` is published: content-addressed, so a URL never changes what
-+// it serves. https://gettarka.com/xlit/android/v1/<sha256>.bin
-+std::string FileUrl(const XlitFile& file);
-+
-+// Whether `path` is `file`: its size, then its sha256. A file that is not is
-+// deleted. Blocking.
-+bool VerifyFile(const base::FilePath& path, const XlitFile& file);
-+
-+// Beside each checked file, "<name>.sha256" records the hash it was checked
-+// against, so that a start trusts it without hashing it again, and a file
-+// from an older table (same name and size, other bytes) is not trusted.
-+// Blocking.
-+bool WriteRecord(const base::FilePath& path, const XlitFile& file);
-+
-+// A download attempt's own file: "<name>.<generation>.part". A check that is
-+// still running for an earlier attempt never touches a newer one's.
-+std::string PartFileName(std::string_view name, uint64_t generation);
-+
-+// What is in `dir`, by name: the table's files of the right size whose record
-+// names the table's hash (one without a record is hashed once, and gets one).
-+// Deletes what a download left unfinished (*.part), table files of the wrong
-+// size or hash, and IndicXlit files the table does not name (a language an
-+// older APK listed). Blocking.
-+std::vector<std::string> ScanDirectory(const base::FilePath& dir);
-+
-+// The files to download for the languages `tags`, the model first, leaving out
-+// the files in `present` and tags with no word list.
-+std::vector<const XlitFile*> Missing(const std::vector<std::string>& present,
-+                                     const std::vector<std::string>& tags);
-+// Their total size in bytes.
-+int64_t DownloadSize(const std::vector<std::string>& present,
-+                     const std::vector<std::string>& tags);
-+
-+// Whether rows can work: the model and at least one word list are present.
-+bool Ready(const std::vector<std::string>& present);
-+
-+enum class Network { kNone, kUnmetered, kMetered };
-+// Whether a download may start: on Wi-Fi or Ethernet, or on mobile data when
-+// the person chose "Download now".
-+bool ShouldStartNow(Network network, bool now);
-+
-+// At most three tries of a failed file per run of the browser. Once spent
-+// (or after a redirect, Exhaust()), nothing is fetched again until Reset():
-+// the person says yes again, or adds a language. A network change alone never
-+// resets it.
-+class Attempts {
-+ public:
-+  bool TryAgain();
-+  void Exhaust() { exhausted_ = true; }
-+  bool exhausted() const { return exhausted_; }
-+  void Reset() {
-+    count_ = 0;
-+    exhausted_ = false;
-+  }
-+
-+ private:
-+  int count_ = 0;
-+  bool exhausted_ = false;
-+};
-+
-+}  // namespace tark_xlit
-+
-+#endif  // CHROME_BROWSER_TARK_XLIT_XLIT_FILES_H_
---- /dev/null
-+++ b/chrome/browser/tark_xlit/xlit_files.cc
-@@ -0,0 +1,185 @@
-+// Copyright 2026 The Tark Authors
-+// Use of this source code is governed by a BSD-style license that can be
-+// found in the LICENSE file.
-+
-+#include "chrome/browser/tark_xlit/xlit_files.h"
-+
-+#include <algorithm>
-+#include <array>
-+#include <optional>
-+
-+#include "base/files/file.h"
-+#include "base/files/file_enumerator.h"
-+#include "base/files/file_path.h"
-+#include "base/files/file_util.h"
-+#include "base/strings/strcat.h"
-+#include "base/strings/string_number_conversions.h"
-+#include "crypto/hash.h"
++// Must come after all headers that specialize FromJniType() / ToJniType().
++#include "chrome/browser/tark_xlit/android/jni_headers/TarkXlitBridge_jni.h"
 +
 +namespace tark_xlit {
 +
-+namespace {
-+
-+constexpr XlitFile kFiles[] = {
-+#include "chrome/browser/tark_xlit/xlit_files.inc"
-+};
-+
-+constexpr char kFilesBase[] = "https://gettarka.com/xlit/android/v1/";
-+
-+// The sha256 of the file at `path`, read in pieces, as lower-case hex.
-+std::optional<std::string> HashFile(const base::FilePath& path) {
-+  base::File file(path, base::File::FLAG_OPEN | base::File::FLAG_READ);
-+  if (!file.IsValid()) {
-+    return std::nullopt;
-+  }
-+  crypto::hash::Hasher hasher(crypto::hash::kSha256);
-+  std::array<uint8_t, 64 * 1024> buffer;
-+  while (true) {
-+    const std::optional<size_t> read = file.ReadAtCurrentPos(buffer);
-+    if (!read) {
-+      return std::nullopt;
-+    }
-+    if (*read == 0) {
-+      break;
-+    }
-+    hasher.Update(base::span(buffer).first(*read));
-+  }
-+  std::array<uint8_t, crypto::hash::kSha256Size> digest;
-+  hasher.Finish(digest);
-+  return base::HexEncodeLower(digest);
++static void JNI_TarkXlitBridge_Accept(bool now) {
++  XlitDownloadService::Get().Accept(now);
 +}
 +
-+}  // namespace
-+
-+base::span<const XlitFile> AllFiles() {
-+  return kFiles;
++static void JNI_TarkXlitBridge_Decline() {
++  XlitDownloadService::Get().Decline();
 +}
 +
-+const XlitFile* FindFile(std::string_view name) {
-+  const auto it = std::ranges::find(kFiles, name, &XlitFile::name);
-+  return it == std::end(kFiles) ? nullptr : &*it;
++static int32_t JNI_TarkXlitBridge_GetOfferState() {
++  return static_cast<int32_t>(XlitDownloadService::Get().offer_state());
 +}
 +
-+std::string WordsFileName(std::string_view tag) {
-+  return base::StrCat({"xlit-words-", tag, ".bin"});
++static std::vector<std::string>
++JNI_TarkXlitBridge_GetDownloadedLanguageNames() {
++  return XlitDownloadService::Get().DownloadedLanguageNames();
 +}
 +
-+std::string FileUrl(const XlitFile& file) {
-+  return base::StrCat({kFilesBase, file.sha256, ".bin"});
++static bool JNI_TarkXlitBridge_IsWaitingForWifi() {
++  return XlitDownloadService::Get().IsWaitingForWifi();
 +}
 +
-+bool VerifyFile(const base::FilePath& path, const XlitFile& file) {
-+  std::optional<int64_t> size = base::GetFileSize(path);
-+  bool ok = size && *size == file.size;
-+  if (ok) {
-+    const std::optional<std::string> hash = HashFile(path);
-+    ok = hash && *hash == file.sha256;
-+  }
-+  if (!ok) {
-+    base::DeleteFile(path);
-+  }
-+  return ok;
-+}
-+
-+std::vector<std::string> ScanDirectory(const base::FilePath& dir) {
-+  std::vector<std::string> present;
-+  base::FileEnumerator files(dir, /*recursive=*/false,
-+                             base::FileEnumerator::FILES);
-+  for (base::FilePath path = files.Next(); !path.empty(); path = files.Next()) {
-+    const std::string name = path.BaseName().MaybeAsASCII();
-+    if (name.ends_with(".part")) {
-+      base::DeleteFile(path);
-+      continue;
-+    }
-+    if (name.ends_with(".sha256")) {
-+      continue;  // Read with its file below.
-+    }
-+    const XlitFile* file = FindFile(name);
-+    const base::FilePath record = path.AddExtensionASCII("sha256");
-+    if (!file) {
-+      // An IndicXlit file this APK's table does not name.
-+      if (name.starts_with("xlit-") && name.ends_with(".bin")) {
-+        base::DeleteFile(path);
-+        base::DeleteFile(record);
-+      }
-+      continue;
-+    }
-+    std::string recorded;
-+    bool ok = files.GetInfo().GetSize() == file->size;
-+    if (ok && !(base::ReadFileToStringWithMaxSize(record, &recorded, 64) &&
-+                recorded == file->sha256)) {
-+      // No record, or one from another table: check the bytes once.
-+      ok = VerifyFile(path, *file) && WriteRecord(path, *file);
-+    }
-+    if (!ok) {
-+      base::DeleteFile(path);
-+      base::DeleteFile(record);
-+      continue;
-+    }
-+    present.push_back(name);
-+  }
-+  std::ranges::sort(present);
-+  return present;
-+}
-+
-+std::vector<const XlitFile*> Missing(const std::vector<std::string>& present,
-+                                     const std::vector<std::string>& tags) {
-+  std::vector<const XlitFile*> missing;
-+  auto add = [&](std::string_view name) {
-+    const XlitFile* file = FindFile(name);
-+    if (file && !std::ranges::contains(present, name) &&
-+        !std::ranges::contains(missing, file)) {
-+      missing.push_back(file);
-+    }
-+  };
-+  add(kModelFileName);
-+  for (const std::string& tag : tags) {
-+    add(WordsFileName(tag));
-+  }
-+  return missing;
-+}
-+
-+int64_t DownloadSize(const std::vector<std::string>& present,
-+                     const std::vector<std::string>& tags) {
-+  int64_t total = 0;
-+  for (const XlitFile* file : Missing(present, tags)) {
-+    total += file->size;
-+  }
-+  return total;
-+}
-+
-+bool Ready(const std::vector<std::string>& present) {
-+  return std::ranges::contains(present, kModelFileName) &&
-+         std::ranges::any_of(present, [](const std::string& name) {
-+           return name.starts_with("xlit-words-");
-+         });
-+}
-+
-+bool ShouldStartNow(Network network, bool now) {
-+  switch (network) {
-+    case Network::kNone:
-+      return false;
-+    case Network::kUnmetered:
-+      return true;
-+    case Network::kMetered:
-+      return now;
-+  }
-+  return false;
-+}
-+
-+bool Attempts::TryAgain() {
-+  if (++count_ > 3) {
-+    exhausted_ = true;
-+  }
-+  return !exhausted_;
-+}
-+
-+std::string PartFileName(std::string_view name, uint64_t generation) {
-+  return base::StrCat({name, ".", base::NumberToString(generation), ".part"});
-+}
-+
-+bool WriteRecord(const base::FilePath& path, const XlitFile& file) {
-+  return base::WriteFile(path.AddExtensionASCII("sha256"), file.sha256);
++static int64_t JNI_TarkXlitBridge_GetDownloadSize(const std::string& tag) {
++  return XlitDownloadService::Get().DownloadSize(tag);
 +}
 +
 +}  // namespace tark_xlit
---- /dev/null
-+++ b/chrome/browser/tark_xlit/xlit_files_unittest.cc
-@@ -0,0 +1,214 @@
-+// Copyright 2026 The Tark Authors
-+// Use of this source code is governed by a BSD-style license that can be
-+// found in the LICENSE file.
 +
-+#include "chrome/browser/tark_xlit/xlit_files.h"
-+
-+#include <string>
-+#include <vector>
-+
-+#include "base/files/file_path.h"
-+#include "base/files/file_util.h"
-+#include "base/files/scoped_temp_dir.h"
-+#include "testing/gtest/include/gtest/gtest.h"
-+
-+namespace tark_xlit {
-+namespace {
-+
-+// sha256("abc").
-+constexpr char kAbcSha256[] =
-+    "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
-+
-+class TarkXlitFilesTest : public testing::Test {
-+ protected:
-+  void SetUp() override { ASSERT_TRUE(dir_.CreateUniqueTempDir()); }
-+  base::FilePath Write(std::string_view name, std::string_view data) {
-+    const base::FilePath path = dir_.GetPath().AppendASCII(name);
-+    EXPECT_TRUE(base::WriteFile(path, data));
-+    return path;
-+  }
-+  base::ScopedTempDir dir_;
-+};
-+
-+TEST_F(TarkXlitFilesTest, TheTableHasTheModelAndEveryLanguage) {
-+  ASSERT_TRUE(FindFile(kModelFileName));
-+  for (const char* tag : {"hi", "ta", "bn", "gom", "ur"}) {
-+    EXPECT_TRUE(FindFile(WordsFileName(tag))) << tag;
-+  }
-+  EXPECT_FALSE(FindFile(WordsFileName("si")));
-+  for (const XlitFile& file : AllFiles()) {
-+    EXPECT_GT(file.size, 0) << file.name;
-+    EXPECT_EQ(file.sha256.size(), 64u) << file.name;
-+  }
-+}
-+
-+TEST_F(TarkXlitFilesTest, AMatchingFileIsKept) {
-+  const XlitFile file{"x.bin", 3, kAbcSha256};
-+  const base::FilePath path = Write("x.bin", "abc");
-+  EXPECT_TRUE(VerifyFile(path, file));
-+  EXPECT_TRUE(base::PathExists(path));
-+}
-+
-+TEST_F(TarkXlitFilesTest, HashMismatchDeletesFile) {
-+  const XlitFile file{"x.bin", 3, kAbcSha256};
-+  const base::FilePath path = Write("x.bin", "abd");
-+  EXPECT_FALSE(VerifyFile(path, file));
-+  EXPECT_FALSE(base::PathExists(path));
-+}
-+
-+TEST_F(TarkXlitFilesTest, SizeMismatchDeletesFile) {
-+  const XlitFile file{"x.bin", 3, kAbcSha256};
-+  const base::FilePath path = Write("x.bin", "abcd");
-+  EXPECT_FALSE(VerifyFile(path, file));
-+  EXPECT_FALSE(base::PathExists(path));
-+  EXPECT_FALSE(VerifyFile(dir_.GetPath().AppendASCII("missing.bin"), file));
-+}
-+
-+TEST_F(TarkXlitFilesTest, PartialFileIsIgnoredAndRemoved) {
-+  const XlitFile* model = FindFile(kModelFileName);
-+  ASSERT_TRUE(model);
-+  const base::FilePath part = Write("xlit-model.bin.part", "half");
-+  Write("unrelated.txt", "x");
-+  EXPECT_TRUE(ScanDirectory(dir_.GetPath()).empty());
-+  EXPECT_FALSE(base::PathExists(part));
-+  EXPECT_TRUE(base::PathExists(dir_.GetPath().AppendASCII("unrelated.txt")));
-+}
-+
-+TEST_F(TarkXlitFilesTest, ScanKeepsOnlyFilesOfTheRightSize) {
-+  // A file of the wrong size is from an older table or was cut short.
-+  const base::FilePath words = Write(WordsFileName("hi"), "too short");
-+  EXPECT_TRUE(ScanDirectory(dir_.GetPath()).empty());
-+  EXPECT_FALSE(base::PathExists(words));
-+}
-+
-+TEST_F(TarkXlitFilesTest, MissingListsOnlyTheAbsent) {
-+  const std::vector<std::string> tags = {"hi", "ta", "xx"};
-+  std::vector<const XlitFile*> missing = Missing({}, tags);
-+  ASSERT_EQ(missing.size(), 3u);
-+  EXPECT_EQ(missing[0]->name, kModelFileName);  // The model first.
-+  EXPECT_EQ(missing[1]->name, WordsFileName("hi"));
-+  EXPECT_EQ(missing[2]->name, WordsFileName("ta"));
-+
-+  missing = Missing({std::string(kModelFileName), WordsFileName("hi")}, tags);
-+  ASSERT_EQ(missing.size(), 1u);
-+  EXPECT_EQ(missing[0]->name, WordsFileName("ta"));
-+}
-+
-+TEST_F(TarkXlitFilesTest, ReadyNeedsTheModelAndAWordList) {
-+  EXPECT_FALSE(Ready({}));
-+  EXPECT_FALSE(Ready({std::string(kModelFileName)}));
-+  EXPECT_FALSE(Ready({WordsFileName("hi")}));
-+  EXPECT_TRUE(Ready({std::string(kModelFileName), WordsFileName("hi")}));
-+}
-+
-+TEST_F(TarkXlitFilesTest, WaitsForWifi) {
-+  EXPECT_FALSE(ShouldStartNow(Network::kNone, /*now=*/false));
-+  EXPECT_FALSE(ShouldStartNow(Network::kNone, /*now=*/true));
-+  EXPECT_FALSE(ShouldStartNow(Network::kMetered, /*now=*/false));
-+  EXPECT_TRUE(ShouldStartNow(Network::kMetered, /*now=*/true));
-+  EXPECT_TRUE(ShouldStartNow(Network::kUnmetered, /*now=*/false));
-+}
-+
-+TEST_F(TarkXlitFilesTest, RetriesAtMostThreeTimes) {
-+  Attempts attempts;
-+  EXPECT_TRUE(attempts.TryAgain());
-+  EXPECT_TRUE(attempts.TryAgain());
-+  EXPECT_TRUE(attempts.TryAgain());
-+  EXPECT_FALSE(attempts.TryAgain());
-+  attempts.Reset();
-+  EXPECT_TRUE(attempts.TryAgain());
-+}
-+
-+TEST_F(TarkXlitFilesTest, DownloadSizeCountsOnlyWhatIsMissing) {
-+  const int64_t model = FindFile(kModelFileName)->size;
-+  const int64_t hi = FindFile(WordsFileName("hi"))->size;
-+  EXPECT_EQ(DownloadSize({}, {"hi"}), model + hi);
-+  EXPECT_EQ(DownloadSize({std::string(kModelFileName)}, {"hi"}), hi);
-+}
-+
-+TEST_F(TarkXlitFilesTest, UrlIsContentAddressed) {
-+  const XlitFile file{"x.bin", 3, kAbcSha256};
-+  EXPECT_EQ(FileUrl(file),
-+            "https://gettarka.com/xlit/android/v1/" + std::string(kAbcSha256) +
-+                ".bin");
-+}
-+
-+// Settings > Languages: a language added after saying yes downloads its list;
-+// one removed keeps its file.
-+TEST_F(TarkXlitFilesTest, AddedLanguageDownloadsItsList) {
-+  const std::vector<std::string> present = {std::string(kModelFileName),
-+                                            WordsFileName("hi")};
-+  std::vector<const XlitFile*> missing = Missing(present, {"hi", "ta"});
-+  ASSERT_EQ(missing.size(), 1u);
-+  EXPECT_EQ(missing[0]->name, WordsFileName("ta"));
-+}
-+
-+TEST_F(TarkXlitFilesTest, RemovedLanguageKeepsItsFile) {
-+  const XlitFile* ta = FindFile(WordsFileName("ta"));
-+  ASSERT_TRUE(ta);
-+  // ScanDirectory checks sizes only; a list no longer wanted stays.
-+  Write(WordsFileName("ta"), std::string(static_cast<size_t>(ta->size), '\0'));
-+  Write(WordsFileName("ta") + ".sha256", ta->sha256);
-+  EXPECT_EQ(ScanDirectory(dir_.GetPath()),
-+            std::vector<std::string>{WordsFileName("ta")});
-+  EXPECT_TRUE(Missing({WordsFileName("ta")}, {"hi"}).size() == 2u);
-+}
-+
-+// Final review (A3): the budget holds across network changes, a stale check
-+// never touches a newer attempt's file, a file on the phone is trusted only
-+// with a matching record of its hash, and lists the table does not name go.
-+TEST_F(TarkXlitFilesTest, AnExhaustedBudgetStaysExhaustedUntilReset) {
-+  Attempts attempts;
-+  EXPECT_FALSE(attempts.exhausted());
-+  for (int i = 0; i < 3; ++i) {
-+    EXPECT_TRUE(attempts.TryAgain());
-+  }
-+  EXPECT_FALSE(attempts.TryAgain());
-+  EXPECT_TRUE(attempts.exhausted());
-+  attempts.Reset();
-+  EXPECT_FALSE(attempts.exhausted());
-+  attempts.Exhaust();  // A redirect: no more tries this run.
-+  EXPECT_TRUE(attempts.exhausted());
-+}
-+
-+TEST_F(TarkXlitFilesTest, EachAttemptWritesItsOwnPartFile) {
-+  EXPECT_NE(PartFileName("xlit-model.bin", 1), PartFileName("xlit-model.bin", 2));
-+  EXPECT_TRUE(PartFileName("xlit-words-hi.bin", 7).ends_with(".part"));
-+  EXPECT_TRUE(PartFileName("xlit-words-hi.bin", 7).starts_with("xlit-words-hi.bin."));
-+}
-+
-+TEST_F(TarkXlitFilesTest, ScanTrustsAVerifiedRecord) {
-+  const XlitFile* hi = FindFile(WordsFileName("hi"));
-+  ASSERT_TRUE(hi);
-+  // Right size, wrong bytes, but a record says it was checked: trusted
-+  // without hashing (the record is written only after a check).
-+  Write(hi->name, std::string(static_cast<size_t>(hi->size), 'x'));
-+  Write(std::string(hi->name) + ".sha256", hi->sha256);
-+  EXPECT_EQ(ScanDirectory(dir_.GetPath()), std::vector<std::string>{std::string(hi->name)});
-+}
-+
-+TEST_F(TarkXlitFilesTest, ScanDeletesASameSizeFileFromAnOlderTable) {
-+  const XlitFile* hi = FindFile(WordsFileName("hi"));
-+  ASSERT_TRUE(hi);
-+  const base::FilePath path = Write(hi->name, std::string(static_cast<size_t>(hi->size), 'x'));
-+  Write(std::string(hi->name) + ".sha256", std::string(64, '0'));  // Another table's hash.
-+  EXPECT_TRUE(ScanDirectory(dir_.GetPath()).empty());
-+  EXPECT_FALSE(base::PathExists(path));
-+}
-+
-+TEST_F(TarkXlitFilesTest, ScanHashesAFileWithoutARecordOnce) {
-+  const XlitFile* hi = FindFile(WordsFileName("hi"));
-+  ASSERT_TRUE(hi);
-+  const base::FilePath path = Write(hi->name, std::string(static_cast<size_t>(hi->size), 'x'));
-+  EXPECT_TRUE(ScanDirectory(dir_.GetPath()).empty());  // Wrong bytes: hashed, deleted.
-+  EXPECT_FALSE(base::PathExists(path));
-+}
-+
-+TEST_F(TarkXlitFilesTest, ScanDeletesWordListsNotInTheTable) {
-+  const base::FilePath stray = Write("xlit-words-xx.bin", "old");
-+  EXPECT_TRUE(ScanDirectory(dir_.GetPath()).empty());
-+  EXPECT_FALSE(base::PathExists(stray));
-+}
-+
-+}  // namespace
-+}  // namespace tark_xlit
---- /dev/null
-+++ b/chrome/browser/tark_xlit/xlit_download_service.h
-@@ -0,0 +1,109 @@
-+// Copyright 2026 The Tark Authors
-+// Use of this source code is governed by a BSD-style license that can be
-+// found in the LICENSE file.
-+
-+#ifndef CHROME_BROWSER_TARK_XLIT_XLIT_DOWNLOAD_SERVICE_H_
-+#define CHROME_BROWSER_TARK_XLIT_XLIT_DOWNLOAD_SERVICE_H_
-+
-+#include <memory>
-+#include <string>
-+#include <vector>
-+
-+#include "base/files/file_path.h"
-+#include "base/memory/weak_ptr.h"
-+#include "base/no_destructor.h"
-+#include "base/sequence_checker.h"
-+#include "base/timer/timer.h"
-+#include "chrome/browser/tark_xlit/xlit_files.h"
-+#include "components/prefs/pref_change_registrar.h"
-+#include "components/tark_xlit/languages.h"
-+#include "net/base/network_change_notifier.h"
-+
-+class PrefRegistrySimple;
-+
-+namespace network {
-+class SimpleURLLoader;
-+}  // namespace network
-+
-+namespace tark_xlit {
-+
-+// Local state: OfferState (components/tark_xlit/languages.h), and whether the
-+// person chose "Download now" for the download that is not finished.
-+inline constexpr char kOfferStatePref[] = "tark.xlit.offer";
-+inline constexpr char kCellularOkPref[] = "tark.xlit.cellular_ok";
-+
-+// Tark for Android (A3, spec §5): downloads IndicXlit's model and the word
-+// lists of the person's Indian languages into the app's data directory, after
-+// they say yes, on Wi-Fi unless they chose "Now". One per browser process, on
-+// the UI thread. Nothing is fetched until the person accepts; nothing is ever
-+// fetched while typing.
-+class XlitDownloadService
-+    : public net::NetworkChangeNotifier::NetworkChangeObserver {
-+ public:
-+  static void RegisterPrefs(PrefRegistrySimple* registry);
-+  // Created at browser start (chrome_browser_main_android.cc).
-+  static XlitDownloadService& Get();
-+
-+  XlitDownloadService(const XlitDownloadService&) = delete;
-+  XlitDownloadService& operator=(const XlitDownloadService&) = delete;
-+
-+  // The person said yes (the offer row's dialog, or the switch in Settings →
-+  // Languages): their row languages, on Wi-Fi, or now on any network.
-+  void Accept(bool now);
-+  // The person said no, or turned the switch off: no rows, no offer row. The
-+  // files stay, so that turning it on again is instant.
-+  void Decline();
-+
-+  OfferState offer_state() const;
-+  // The languages whose word list is in place, by tag.
-+  std::vector<std::string> DownloadedLanguages() const;
-+  // The same, by their own names ("हिन्दी"), in UTF-8, for Settings.
-+  std::vector<std::string> DownloadedLanguageNames() const;
-+  // Accepted, something left to download, and waiting for Wi-Fi.
-+  bool IsWaitingForWifi() const;
-+  // Bytes still to download for the row languages, or for `tag` if given.
-+  int64_t DownloadSize(const std::string& tag) const;
-+
-+ private:
-+  friend class base::NoDestructor<XlitDownloadService>;
-+  XlitDownloadService();
-+  ~XlitDownloadService() override;
-+
-+  // NetworkChangeObserver:
-+  void OnNetworkChanged(
-+      net::NetworkChangeNotifier::ConnectionType type) override;
-+
-+  void OnScanned(std::vector<std::string> present);
-+  // The person's row languages (RowLanguages of the profile's accept
-+  // languages), by tag.
-+  std::vector<std::string> WantedTags() const;
-+  void OnAcceptLanguagesChanged();
-+  // Watches the profile's accept languages once a profile is loaded.
-+  void EnsureObservingLanguages();
-+  // Starts the next missing file if allowed; no-op while one is running.
-+  void MaybeDownloadNext();
-+  void OnDownloaded(uint64_t generation,
-+                    const XlitFile* file,
-+                    base::FilePath part);
-+  void OnVerified(uint64_t generation, const XlitFile* file, bool ok);
-+  void UpdateFilesReady();
-+
-+  SEQUENCE_CHECKER(sequence_checker_);
-+  const base::FilePath dir_;
-+  bool scanned_ = false;
-+  std::vector<std::string> present_;
-+  std::unique_ptr<network::SimpleURLLoader> loader_;
-+  // The file `loader_` (or the check after it) is working on.
-+  const XlitFile* current_ = nullptr;
-+  // Which attempt `current_` belongs to: each download, Accept() and
-+  // Decline() start a new one, and a reply for an older one is dropped.
-+  uint64_t generation_ = 0;
-+  Attempts attempts_;
-+  base::OneShotTimer retry_timer_;
-+  PrefChangeRegistrar accept_languages_;
-+  base::WeakPtrFactory<XlitDownloadService> weak_factory_{this};
-+};
-+
-+}  // namespace tark_xlit
-+
-+#endif  // CHROME_BROWSER_TARK_XLIT_XLIT_DOWNLOAD_SERVICE_H_
++DEFINE_JNI(TarkXlitBridge)
 --- /dev/null
 +++ b/chrome/browser/tark_xlit/xlit_download_service.cc
 @@ -0,0 +1,372 @@
@@ -1048,269 +705,624 @@
 +
 +}  // namespace tark_xlit
 --- /dev/null
-+++ b/chrome/browser/tark_xlit/android/BUILD.gn
-@@ -0,0 +1,32 @@
-+# Copyright 2026 The Tark Authors
-+# Use of this source code is governed by a BSD-style license that can be
-+# found in the LICENSE file.
-+
-+import("//build/config/android/rules.gni")
-+import("//third_party/jni_zero/jni_zero.gni")
-+
-+# Tark for Android (A3): the address bar's offer to download the
-+# Indian-language suggestions, and Settings' switch, talk to
-+# //chrome/browser/tark_xlit:download_service through this.
-+android_library("java") {
-+  srcjar_deps = [ ":jni_headers" ]
-+  sources = [
-+    "java/src/org/chromium/chrome/browser/tark_xlit/TarkXlitBridge.java",
-+    "java/src/org/chromium/chrome/browser/tark_xlit/TarkXlitOffer.java",
-+  ]
-+  deps = [
-+    "//build/android:build_java",
-+    "//chrome/browser/ui/android/strings:ui_strings_grd",
-+    "//components/browser_ui/styles/android:java_resources",
-+    "//components/browser_ui/widget/android:java_resources",
-+    "//third_party/androidx:androidx_appcompat_appcompat_java",
-+    "//third_party/jni_zero:jni_zero_java",
-+  ]
-+  resources_package = "org.chromium.chrome.browser.tark_xlit"
-+}
-+
-+generate_jni("jni_headers") {
-+  sources = [
-+    "java/src/org/chromium/chrome/browser/tark_xlit/TarkXlitBridge.java",
-+  ]
-+}
---- /dev/null
-+++ b/chrome/browser/tark_xlit/android/tark_xlit_bridge.cc
-@@ -0,0 +1,45 @@
++++ b/chrome/browser/tark_xlit/xlit_download_service.h
+@@ -0,0 +1,109 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
 +
-+#include <cstdint>
++#ifndef CHROME_BROWSER_TARK_XLIT_XLIT_DOWNLOAD_SERVICE_H_
++#define CHROME_BROWSER_TARK_XLIT_XLIT_DOWNLOAD_SERVICE_H_
++
++#include <memory>
 +#include <string>
 +#include <vector>
 +
-+#include "base/android/jni_array.h"
-+#include "base/android/jni_string.h"
-+#include "chrome/browser/tark_xlit/xlit_download_service.h"
++#include "base/files/file_path.h"
++#include "base/memory/weak_ptr.h"
++#include "base/no_destructor.h"
++#include "base/sequence_checker.h"
++#include "base/timer/timer.h"
++#include "chrome/browser/tark_xlit/xlit_files.h"
++#include "components/prefs/pref_change_registrar.h"
++#include "components/tark_xlit/languages.h"
++#include "net/base/network_change_notifier.h"
 +
-+// Must come after all headers that specialize FromJniType() / ToJniType().
-+#include "chrome/browser/tark_xlit/android/jni_headers/TarkXlitBridge_jni.h"
++class PrefRegistrySimple;
++
++namespace network {
++class SimpleURLLoader;
++}  // namespace network
 +
 +namespace tark_xlit {
 +
-+static void JNI_TarkXlitBridge_Accept(bool now) {
-+  XlitDownloadService::Get().Accept(now);
-+}
++// Local state: OfferState (components/tark_xlit/languages.h), and whether the
++// person chose "Download now" for the download that is not finished.
++inline constexpr char kOfferStatePref[] = "tark.xlit.offer";
++inline constexpr char kCellularOkPref[] = "tark.xlit.cellular_ok";
 +
-+static void JNI_TarkXlitBridge_Decline() {
-+  XlitDownloadService::Get().Decline();
-+}
++// Tark for Android (A3, spec §5): downloads IndicXlit's model and the word
++// lists of the person's Indian languages into the app's data directory, after
++// they say yes, on Wi-Fi unless they chose "Now". One per browser process, on
++// the UI thread. Nothing is fetched until the person accepts; nothing is ever
++// fetched while typing.
++class XlitDownloadService
++    : public net::NetworkChangeNotifier::NetworkChangeObserver {
++ public:
++  static void RegisterPrefs(PrefRegistrySimple* registry);
++  // Created at browser start (chrome_browser_main_android.cc).
++  static XlitDownloadService& Get();
 +
-+static int32_t JNI_TarkXlitBridge_GetOfferState() {
-+  return static_cast<int32_t>(XlitDownloadService::Get().offer_state());
-+}
++  XlitDownloadService(const XlitDownloadService&) = delete;
++  XlitDownloadService& operator=(const XlitDownloadService&) = delete;
 +
-+static std::vector<std::string>
-+JNI_TarkXlitBridge_GetDownloadedLanguageNames() {
-+  return XlitDownloadService::Get().DownloadedLanguageNames();
-+}
++  // The person said yes (the offer row's dialog, or the switch in Settings →
++  // Languages): their row languages, on Wi-Fi, or now on any network.
++  void Accept(bool now);
++  // The person said no, or turned the switch off: no rows, no offer row. The
++  // files stay, so that turning it on again is instant.
++  void Decline();
 +
-+static bool JNI_TarkXlitBridge_IsWaitingForWifi() {
-+  return XlitDownloadService::Get().IsWaitingForWifi();
-+}
++  OfferState offer_state() const;
++  // The languages whose word list is in place, by tag.
++  std::vector<std::string> DownloadedLanguages() const;
++  // The same, by their own names ("हिन्दी"), in UTF-8, for Settings.
++  std::vector<std::string> DownloadedLanguageNames() const;
++  // Accepted, something left to download, and waiting for Wi-Fi.
++  bool IsWaitingForWifi() const;
++  // Bytes still to download for the row languages, or for `tag` if given.
++  int64_t DownloadSize(const std::string& tag) const;
 +
-+static int64_t JNI_TarkXlitBridge_GetDownloadSize(const std::string& tag) {
-+  return XlitDownloadService::Get().DownloadSize(tag);
-+}
++ private:
++  friend class base::NoDestructor<XlitDownloadService>;
++  XlitDownloadService();
++  ~XlitDownloadService() override;
++
++  // NetworkChangeObserver:
++  void OnNetworkChanged(
++      net::NetworkChangeNotifier::ConnectionType type) override;
++
++  void OnScanned(std::vector<std::string> present);
++  // The person's row languages (RowLanguages of the profile's accept
++  // languages), by tag.
++  std::vector<std::string> WantedTags() const;
++  void OnAcceptLanguagesChanged();
++  // Watches the profile's accept languages once a profile is loaded.
++  void EnsureObservingLanguages();
++  // Starts the next missing file if allowed; no-op while one is running.
++  void MaybeDownloadNext();
++  void OnDownloaded(uint64_t generation,
++                    const XlitFile* file,
++                    base::FilePath part);
++  void OnVerified(uint64_t generation, const XlitFile* file, bool ok);
++  void UpdateFilesReady();
++
++  SEQUENCE_CHECKER(sequence_checker_);
++  const base::FilePath dir_;
++  bool scanned_ = false;
++  std::vector<std::string> present_;
++  std::unique_ptr<network::SimpleURLLoader> loader_;
++  // The file `loader_` (or the check after it) is working on.
++  const XlitFile* current_ = nullptr;
++  // Which attempt `current_` belongs to: each download, Accept() and
++  // Decline() start a new one, and a reply for an older one is dropped.
++  uint64_t generation_ = 0;
++  Attempts attempts_;
++  base::OneShotTimer retry_timer_;
++  PrefChangeRegistrar accept_languages_;
++  base::WeakPtrFactory<XlitDownloadService> weak_factory_{this};
++};
 +
 +}  // namespace tark_xlit
 +
-+DEFINE_JNI(TarkXlitBridge)
++#endif  // CHROME_BROWSER_TARK_XLIT_XLIT_DOWNLOAD_SERVICE_H_
 --- /dev/null
-+++ b/chrome/browser/tark_xlit/android/java/src/org/chromium/chrome/browser/tark_xlit/TarkXlitBridge.java
-@@ -0,0 +1,71 @@
++++ b/chrome/browser/tark_xlit/xlit_files.cc
+@@ -0,0 +1,185 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
 +
-+package org.chromium.chrome.browser.tark_xlit;
++#include "chrome/browser/tark_xlit/xlit_files.h"
 +
-+import org.jni_zero.JNINamespace;
-+import org.jni_zero.JniType;
-+import org.jni_zero.NativeMethods;
++#include <algorithm>
++#include <array>
++#include <optional>
 +
-+import org.chromium.build.annotations.NullMarked;
++#include "base/files/file.h"
++#include "base/files/file_enumerator.h"
++#include "base/files/file_path.h"
++#include "base/files/file_util.h"
++#include "base/strings/strcat.h"
++#include "base/strings/string_number_conversions.h"
++#include "crypto/hash.h"
 +
-+/**
-+ * Tark for Android (A3): the download of the Indian-language suggestions' model and word lists
-+ * (chrome/browser/tark_xlit/xlit_download_service.h), for the address bar's offer and Settings.
-+ */
-+@JNINamespace("tark_xlit")
-+@NullMarked
-+public final class TarkXlitBridge {
-+    /** OfferState in components/tark_xlit/languages.h. */
-+    public static final int NOT_ASKED = 0;
++namespace tark_xlit {
 +
-+    public static final int ACCEPTED = 1;
-+    public static final int DECLINED = 2;
++namespace {
 +
-+    private TarkXlitBridge() {}
++constexpr XlitFile kFiles[] = {
++#include "chrome/browser/tark_xlit/xlit_files.inc"
++};
 +
-+    /** Download the person's row languages: on Wi-Fi, or now on any network. */
-+    public static void accept(boolean now) {
-+        TarkXlitBridgeJni.get().accept(now);
++constexpr char kFilesBase[] = "https://gettarka.com/xlit/android/v1/";
++
++// The sha256 of the file at `path`, read in pieces, as lower-case hex.
++std::optional<std::string> HashFile(const base::FilePath& path) {
++  base::File file(path, base::File::FLAG_OPEN | base::File::FLAG_READ);
++  if (!file.IsValid()) {
++    return std::nullopt;
++  }
++  crypto::hash::Hasher hasher(crypto::hash::kSha256);
++  std::array<uint8_t, 64 * 1024> buffer;
++  while (true) {
++    const std::optional<size_t> read = file.ReadAtCurrentPos(buffer);
++    if (!read) {
++      return std::nullopt;
 +    }
-+
-+    /** No suggestions and no offer; the files stay. */
-+    public static void decline() {
-+        TarkXlitBridgeJni.get().decline();
++    if (*read == 0) {
++      break;
 +    }
-+
-+    public static int getOfferState() {
-+        return TarkXlitBridgeJni.get().getOfferState();
-+    }
-+
-+    /** The languages whose word list is in place, by their own names ("हिन्दी"). */
-+    public static String[] getDownloadedLanguageNames() {
-+        return TarkXlitBridgeJni.get().getDownloadedLanguageNames();
-+    }
-+
-+    public static boolean isWaitingForWifi() {
-+        return TarkXlitBridgeJni.get().isWaitingForWifi();
-+    }
-+
-+    /** Bytes still to download for {@code tag}, or for the row languages if it is empty. */
-+    public static long getDownloadSize(String tag) {
-+        return TarkXlitBridgeJni.get().getDownloadSize(tag);
-+    }
-+
-+    @NativeMethods
-+    interface Natives {
-+        void accept(boolean now);
-+
-+        void decline();
-+
-+        int getOfferState();
-+
-+        @JniType("std::vector<std::string>")
-+        String[] getDownloadedLanguageNames();
-+
-+        boolean isWaitingForWifi();
-+
-+        long getDownloadSize(@JniType("std::string") String tag);
-+    }
++    hasher.Update(base::span(buffer).first(*read));
++  }
++  std::array<uint8_t, crypto::hash::kSha256Size> digest;
++  hasher.Finish(digest);
++  return base::HexEncodeLower(digest);
 +}
++
++}  // namespace
++
++base::span<const XlitFile> AllFiles() {
++  return kFiles;
++}
++
++const XlitFile* FindFile(std::string_view name) {
++  const auto it = std::ranges::find(kFiles, name, &XlitFile::name);
++  return it == std::end(kFiles) ? nullptr : &*it;
++}
++
++std::string WordsFileName(std::string_view tag) {
++  return base::StrCat({"xlit-words-", tag, ".bin"});
++}
++
++std::string FileUrl(const XlitFile& file) {
++  return base::StrCat({kFilesBase, file.sha256, ".bin"});
++}
++
++bool VerifyFile(const base::FilePath& path, const XlitFile& file) {
++  std::optional<int64_t> size = base::GetFileSize(path);
++  bool ok = size && *size == file.size;
++  if (ok) {
++    const std::optional<std::string> hash = HashFile(path);
++    ok = hash && *hash == file.sha256;
++  }
++  if (!ok) {
++    base::DeleteFile(path);
++  }
++  return ok;
++}
++
++std::vector<std::string> ScanDirectory(const base::FilePath& dir) {
++  std::vector<std::string> present;
++  base::FileEnumerator files(dir, /*recursive=*/false,
++                             base::FileEnumerator::FILES);
++  for (base::FilePath path = files.Next(); !path.empty(); path = files.Next()) {
++    const std::string name = path.BaseName().MaybeAsASCII();
++    if (name.ends_with(".part")) {
++      base::DeleteFile(path);
++      continue;
++    }
++    if (name.ends_with(".sha256")) {
++      continue;  // Read with its file below.
++    }
++    const XlitFile* file = FindFile(name);
++    const base::FilePath record = path.AddExtensionASCII("sha256");
++    if (!file) {
++      // An IndicXlit file this APK's table does not name.
++      if (name.starts_with("xlit-") && name.ends_with(".bin")) {
++        base::DeleteFile(path);
++        base::DeleteFile(record);
++      }
++      continue;
++    }
++    std::string recorded;
++    bool ok = files.GetInfo().GetSize() == file->size;
++    if (ok && !(base::ReadFileToStringWithMaxSize(record, &recorded, 64) &&
++                recorded == file->sha256)) {
++      // No record, or one from another table: check the bytes once.
++      ok = VerifyFile(path, *file) && WriteRecord(path, *file);
++    }
++    if (!ok) {
++      base::DeleteFile(path);
++      base::DeleteFile(record);
++      continue;
++    }
++    present.push_back(name);
++  }
++  std::ranges::sort(present);
++  return present;
++}
++
++std::vector<const XlitFile*> Missing(const std::vector<std::string>& present,
++                                     const std::vector<std::string>& tags) {
++  std::vector<const XlitFile*> missing;
++  auto add = [&](std::string_view name) {
++    const XlitFile* file = FindFile(name);
++    if (file && !std::ranges::contains(present, name) &&
++        !std::ranges::contains(missing, file)) {
++      missing.push_back(file);
++    }
++  };
++  add(kModelFileName);
++  for (const std::string& tag : tags) {
++    add(WordsFileName(tag));
++  }
++  return missing;
++}
++
++int64_t DownloadSize(const std::vector<std::string>& present,
++                     const std::vector<std::string>& tags) {
++  int64_t total = 0;
++  for (const XlitFile* file : Missing(present, tags)) {
++    total += file->size;
++  }
++  return total;
++}
++
++bool Ready(const std::vector<std::string>& present) {
++  return std::ranges::contains(present, kModelFileName) &&
++         std::ranges::any_of(present, [](const std::string& name) {
++           return name.starts_with("xlit-words-");
++         });
++}
++
++bool ShouldStartNow(Network network, bool now) {
++  switch (network) {
++    case Network::kNone:
++      return false;
++    case Network::kUnmetered:
++      return true;
++    case Network::kMetered:
++      return now;
++  }
++  return false;
++}
++
++bool Attempts::TryAgain() {
++  if (++count_ > 3) {
++    exhausted_ = true;
++  }
++  return !exhausted_;
++}
++
++std::string PartFileName(std::string_view name, uint64_t generation) {
++  return base::StrCat({name, ".", base::NumberToString(generation), ".part"});
++}
++
++bool WriteRecord(const base::FilePath& path, const XlitFile& file) {
++  return base::WriteFile(path.AddExtensionASCII("sha256"), file.sha256);
++}
++
++}  // namespace tark_xlit
 --- /dev/null
-+++ b/chrome/browser/tark_xlit/android/java/src/org/chromium/chrome/browser/tark_xlit/TarkXlitOffer.java
-@@ -0,0 +1,42 @@
++++ b/chrome/browser/tark_xlit/xlit_files.h
+@@ -0,0 +1,99 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
 +
-+package org.chromium.chrome.browser.tark_xlit;
++#ifndef CHROME_BROWSER_TARK_XLIT_XLIT_FILES_H_
++#define CHROME_BROWSER_TARK_XLIT_XLIT_FILES_H_
 +
-+import android.content.Context;
-+import android.text.format.Formatter;
++#include <cstdint>
++#include <string>
++#include <string_view>
++#include <vector>
 +
-+import androidx.appcompat.app.AlertDialog;
++#include "base/containers/span.h"
 +
-+import org.chromium.build.annotations.NullMarked;
++namespace base {
++class FilePath;
++}  // namespace base
 +
-+/**
-+ * Tark for Android (A3, spec §5): what the address bar's "Type in हिन्दी?" row opens. It asks once
-+ * whether to download the suggestions, on Wi-Fi (the default) or now; "No thanks" hides the row,
-+ * and Settings > Languages turns it on later.
-+ */
-+@NullMarked
-+public final class TarkXlitOffer {
-+    private TarkXlitOffer() {}
++namespace tark_xlit {
 +
-+    /**
-+     * @param tag The row language, such as "hi".
-+     * @param languageName Its own name, such as "हिन्दी".
-+     */
-+    public static void show(Context context, String tag, String languageName) {
-+        String size = Formatter.formatShortFileSize(context, TarkXlitBridge.getDownloadSize(tag));
-+        new AlertDialog.Builder(context, R.style.ThemeOverlay_BrowserUI_AlertDialog)
-+                .setTitle(context.getString(R.string.tark_xlit_offer, languageName))
-+                .setMessage(context.getString(R.string.tark_xlit_offer_message, languageName, size))
-+                .setPositiveButton(
-+                        R.string.tark_xlit_download_on_wifi,
-+                        (dialog, which) -> TarkXlitBridge.accept(/* now= */ false))
-+                .setNeutralButton(
-+                        R.string.tark_xlit_download_now,
-+                        (dialog, which) -> TarkXlitBridge.accept(/* now= */ true))
-+                .setNegativeButton(
-+                        R.string.tark_xlit_no_thanks, (dialog, which) -> TarkXlitBridge.decline())
-+                .show();
-+    }
-+}
---- a/chrome/browser/BUILD.gn
-+++ b/chrome/browser/BUILD.gn
-@@ -1656,6 +1656,20 @@
-   }
- 
-   if (is_android) {
-+    # Tark's Indian-language suggestions: the download of the model and word
-+    # lists (A3, spec §5).
-+    sources += [
-+      "tark_xlit/android/tark_xlit_bridge.cc",
-+      "tark_xlit/xlit_download_service.cc",
-+      "tark_xlit/xlit_download_service.h",
-+    ]
-+    deps += [
-+      "//chrome/browser/tark_xlit:files",
-+      "//chrome/browser/tark_xlit/android:jni_headers",
-+    ]
++// Tark for Android (A3, spec §5): the IndicXlit files the phone downloads from
++// gettarka.com, each pinned in the APK by its size and sha256
++// (android/xlit/files.py writes the table, xlit_files.inc, at build time).
++struct XlitFile {
++  std::string_view name;
++  int64_t size;
++  std::string_view sha256;  // Lower-case hex.
++};
++
++inline constexpr char kModelFileName[] = "xlit-model.bin";
++
++// Every file, the model and one word list per language.
++base::span<const XlitFile> AllFiles();
++const XlitFile* FindFile(std::string_view name);
++// "xlit-words-<tag>.bin".
++std::string WordsFileName(std::string_view tag);
++// Where `file` is published: content-addressed, so a URL never changes what
++// it serves. https://gettarka.com/xlit/android/v1/<sha256>.bin
++std::string FileUrl(const XlitFile& file);
++
++// Whether `path` is `file`: its size, then its sha256. A file that is not is
++// deleted. Blocking.
++bool VerifyFile(const base::FilePath& path, const XlitFile& file);
++
++// Beside each checked file, "<name>.sha256" records the hash it was checked
++// against, so that a start trusts it without hashing it again, and a file
++// from an older table (same name and size, other bytes) is not trusted.
++// Blocking.
++bool WriteRecord(const base::FilePath& path, const XlitFile& file);
++
++// A download attempt's own file: "<name>.<generation>.part". A check that is
++// still running for an earlier attempt never touches a newer one's.
++std::string PartFileName(std::string_view name, uint64_t generation);
++
++// What is in `dir`, by name: the table's files of the right size whose record
++// names the table's hash (one without a record is hashed once, and gets one).
++// Deletes what a download left unfinished (*.part), table files of the wrong
++// size or hash, and IndicXlit files the table does not name (a language an
++// older APK listed). Blocking.
++std::vector<std::string> ScanDirectory(const base::FilePath& dir);
++
++// The files to download for the languages `tags`, the model first, leaving out
++// the files in `present` and tags with no word list.
++std::vector<const XlitFile*> Missing(const std::vector<std::string>& present,
++                                     const std::vector<std::string>& tags);
++// Their total size in bytes.
++int64_t DownloadSize(const std::vector<std::string>& present,
++                     const std::vector<std::string>& tags);
++
++// Whether rows can work: the model and at least one word list are present.
++bool Ready(const std::vector<std::string>& present);
++
++enum class Network { kNone, kUnmetered, kMetered };
++// Whether a download may start: on Wi-Fi or Ethernet, or on mobile data when
++// the person chose "Download now".
++bool ShouldStartNow(Network network, bool now);
++
++// At most three tries of a failed file per run of the browser. Once spent
++// (or after a redirect, Exhaust()), nothing is fetched again until Reset():
++// the person says yes again, or adds a language. A network change alone never
++// resets it.
++class Attempts {
++ public:
++  bool TryAgain();
++  void Exhaust() { exhausted_ = true; }
++  bool exhausted() const { return exhausted_; }
++  void Reset() {
++    count_ = 0;
++    exhausted_ = false;
 +  }
 +
-+  if (is_android) {
-     sources += [
-       "after_startup_task_utils_android.cc",
-       "browser_process_platform_part_android.cc",
---- a/chrome/browser/chrome_browser_main_android.cc
-+++ b/chrome/browser/chrome_browser_main_android.cc
-@@ -20,6 +20,7 @@
- #include "chrome/browser/data_saver/data_saver.h"
- #include "chrome/browser/profiles/profile.h"
- #include "chrome/browser/tark_adblock/tark_adblock_service.h"
-+#include "chrome/browser/tark_xlit/xlit_download_service.h"
- #include "chrome/browser/webauthn/android/cable_module_android.h"
- #include "components/crash/content/browser/child_exit_observer_android.h"
- #include "components/crash/content/browser/child_process_crash_observer_android.h"
-@@ -118,6 +119,10 @@
-   // Tark: start the ad blocker (spec §4); it compiles its lists in the
-   // background and blocks nothing until it is ready.
-   tark_adblock::AdblockService::Get();
++ private:
++  int count_ = 0;
++  bool exhausted_ = false;
++};
 +
-+  // Tark (A3): finds the Indian-language suggestions' downloaded files, and
-+  // resumes a download the person said yes to. Fetches nothing otherwise.
-+  tark_xlit::XlitDownloadService::Get();
- }
- 
- void ChromeBrowserMainPartsAndroid::ShowMissingLocaleMessageBox() {
---- a/chrome/browser/prefs/browser_prefs.cc
-+++ b/chrome/browser/prefs/browser_prefs.cc
-@@ -275,6 +275,7 @@
- 
- #if BUILDFLAG(IS_ANDROID)
- #include "chrome/browser/accessibility/accessibility_prefs/android/accessibility_prefs_controller.h"
-+#include "chrome/browser/tark_xlit/xlit_download_service.h"
- #include "chrome/browser/android/ntp/recent_tabs_page_prefs.h"
- #include "chrome/browser/android/oom_intervention/oom_intervention_decider.h"
- #include "chrome/browser/android/preferences/browser_prefs_android.h"
-@@ -1417,6 +1418,7 @@
-   // keep this list alphabetized.
-   tark::RegisterWidevineLocalStatePrefs(registry);
- #if BUILDFLAG(IS_ANDROID)
-+  tark_xlit::XlitDownloadService::RegisterPrefs(registry);
-   accessibility::AccessibilityPrefsController::RegisterLocalStatePrefs(
-       registry);
- #endif
++}  // namespace tark_xlit
++
++#endif  // CHROME_BROWSER_TARK_XLIT_XLIT_FILES_H_
+--- /dev/null
++++ b/chrome/browser/tark_xlit/xlit_files_unittest.cc
+@@ -0,0 +1,214 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/tark_xlit/xlit_files.h"
++
++#include <string>
++#include <vector>
++
++#include "base/files/file_path.h"
++#include "base/files/file_util.h"
++#include "base/files/scoped_temp_dir.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace tark_xlit {
++namespace {
++
++// sha256("abc").
++constexpr char kAbcSha256[] =
++    "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
++
++class TarkXlitFilesTest : public testing::Test {
++ protected:
++  void SetUp() override { ASSERT_TRUE(dir_.CreateUniqueTempDir()); }
++  base::FilePath Write(std::string_view name, std::string_view data) {
++    const base::FilePath path = dir_.GetPath().AppendASCII(name);
++    EXPECT_TRUE(base::WriteFile(path, data));
++    return path;
++  }
++  base::ScopedTempDir dir_;
++};
++
++TEST_F(TarkXlitFilesTest, TheTableHasTheModelAndEveryLanguage) {
++  ASSERT_TRUE(FindFile(kModelFileName));
++  for (const char* tag : {"hi", "ta", "bn", "gom", "ur"}) {
++    EXPECT_TRUE(FindFile(WordsFileName(tag))) << tag;
++  }
++  EXPECT_FALSE(FindFile(WordsFileName("si")));
++  for (const XlitFile& file : AllFiles()) {
++    EXPECT_GT(file.size, 0) << file.name;
++    EXPECT_EQ(file.sha256.size(), 64u) << file.name;
++  }
++}
++
++TEST_F(TarkXlitFilesTest, AMatchingFileIsKept) {
++  const XlitFile file{"x.bin", 3, kAbcSha256};
++  const base::FilePath path = Write("x.bin", "abc");
++  EXPECT_TRUE(VerifyFile(path, file));
++  EXPECT_TRUE(base::PathExists(path));
++}
++
++TEST_F(TarkXlitFilesTest, HashMismatchDeletesFile) {
++  const XlitFile file{"x.bin", 3, kAbcSha256};
++  const base::FilePath path = Write("x.bin", "abd");
++  EXPECT_FALSE(VerifyFile(path, file));
++  EXPECT_FALSE(base::PathExists(path));
++}
++
++TEST_F(TarkXlitFilesTest, SizeMismatchDeletesFile) {
++  const XlitFile file{"x.bin", 3, kAbcSha256};
++  const base::FilePath path = Write("x.bin", "abcd");
++  EXPECT_FALSE(VerifyFile(path, file));
++  EXPECT_FALSE(base::PathExists(path));
++  EXPECT_FALSE(VerifyFile(dir_.GetPath().AppendASCII("missing.bin"), file));
++}
++
++TEST_F(TarkXlitFilesTest, PartialFileIsIgnoredAndRemoved) {
++  const XlitFile* model = FindFile(kModelFileName);
++  ASSERT_TRUE(model);
++  const base::FilePath part = Write("xlit-model.bin.part", "half");
++  Write("unrelated.txt", "x");
++  EXPECT_TRUE(ScanDirectory(dir_.GetPath()).empty());
++  EXPECT_FALSE(base::PathExists(part));
++  EXPECT_TRUE(base::PathExists(dir_.GetPath().AppendASCII("unrelated.txt")));
++}
++
++TEST_F(TarkXlitFilesTest, ScanKeepsOnlyFilesOfTheRightSize) {
++  // A file of the wrong size is from an older table or was cut short.
++  const base::FilePath words = Write(WordsFileName("hi"), "too short");
++  EXPECT_TRUE(ScanDirectory(dir_.GetPath()).empty());
++  EXPECT_FALSE(base::PathExists(words));
++}
++
++TEST_F(TarkXlitFilesTest, MissingListsOnlyTheAbsent) {
++  const std::vector<std::string> tags = {"hi", "ta", "xx"};
++  std::vector<const XlitFile*> missing = Missing({}, tags);
++  ASSERT_EQ(missing.size(), 3u);
++  EXPECT_EQ(missing[0]->name, kModelFileName);  // The model first.
++  EXPECT_EQ(missing[1]->name, WordsFileName("hi"));
++  EXPECT_EQ(missing[2]->name, WordsFileName("ta"));
++
++  missing = Missing({std::string(kModelFileName), WordsFileName("hi")}, tags);
++  ASSERT_EQ(missing.size(), 1u);
++  EXPECT_EQ(missing[0]->name, WordsFileName("ta"));
++}
++
++TEST_F(TarkXlitFilesTest, ReadyNeedsTheModelAndAWordList) {
++  EXPECT_FALSE(Ready({}));
++  EXPECT_FALSE(Ready({std::string(kModelFileName)}));
++  EXPECT_FALSE(Ready({WordsFileName("hi")}));
++  EXPECT_TRUE(Ready({std::string(kModelFileName), WordsFileName("hi")}));
++}
++
++TEST_F(TarkXlitFilesTest, WaitsForWifi) {
++  EXPECT_FALSE(ShouldStartNow(Network::kNone, /*now=*/false));
++  EXPECT_FALSE(ShouldStartNow(Network::kNone, /*now=*/true));
++  EXPECT_FALSE(ShouldStartNow(Network::kMetered, /*now=*/false));
++  EXPECT_TRUE(ShouldStartNow(Network::kMetered, /*now=*/true));
++  EXPECT_TRUE(ShouldStartNow(Network::kUnmetered, /*now=*/false));
++}
++
++TEST_F(TarkXlitFilesTest, RetriesAtMostThreeTimes) {
++  Attempts attempts;
++  EXPECT_TRUE(attempts.TryAgain());
++  EXPECT_TRUE(attempts.TryAgain());
++  EXPECT_TRUE(attempts.TryAgain());
++  EXPECT_FALSE(attempts.TryAgain());
++  attempts.Reset();
++  EXPECT_TRUE(attempts.TryAgain());
++}
++
++TEST_F(TarkXlitFilesTest, DownloadSizeCountsOnlyWhatIsMissing) {
++  const int64_t model = FindFile(kModelFileName)->size;
++  const int64_t hi = FindFile(WordsFileName("hi"))->size;
++  EXPECT_EQ(DownloadSize({}, {"hi"}), model + hi);
++  EXPECT_EQ(DownloadSize({std::string(kModelFileName)}, {"hi"}), hi);
++}
++
++TEST_F(TarkXlitFilesTest, UrlIsContentAddressed) {
++  const XlitFile file{"x.bin", 3, kAbcSha256};
++  EXPECT_EQ(FileUrl(file),
++            "https://gettarka.com/xlit/android/v1/" + std::string(kAbcSha256) +
++                ".bin");
++}
++
++// Settings > Languages: a language added after saying yes downloads its list;
++// one removed keeps its file.
++TEST_F(TarkXlitFilesTest, AddedLanguageDownloadsItsList) {
++  const std::vector<std::string> present = {std::string(kModelFileName),
++                                            WordsFileName("hi")};
++  std::vector<const XlitFile*> missing = Missing(present, {"hi", "ta"});
++  ASSERT_EQ(missing.size(), 1u);
++  EXPECT_EQ(missing[0]->name, WordsFileName("ta"));
++}
++
++TEST_F(TarkXlitFilesTest, RemovedLanguageKeepsItsFile) {
++  const XlitFile* ta = FindFile(WordsFileName("ta"));
++  ASSERT_TRUE(ta);
++  // ScanDirectory checks sizes only; a list no longer wanted stays.
++  Write(WordsFileName("ta"), std::string(static_cast<size_t>(ta->size), '\0'));
++  Write(WordsFileName("ta") + ".sha256", ta->sha256);
++  EXPECT_EQ(ScanDirectory(dir_.GetPath()),
++            std::vector<std::string>{WordsFileName("ta")});
++  EXPECT_TRUE(Missing({WordsFileName("ta")}, {"hi"}).size() == 2u);
++}
++
++// Final review (A3): the budget holds across network changes, a stale check
++// never touches a newer attempt's file, a file on the phone is trusted only
++// with a matching record of its hash, and lists the table does not name go.
++TEST_F(TarkXlitFilesTest, AnExhaustedBudgetStaysExhaustedUntilReset) {
++  Attempts attempts;
++  EXPECT_FALSE(attempts.exhausted());
++  for (int i = 0; i < 3; ++i) {
++    EXPECT_TRUE(attempts.TryAgain());
++  }
++  EXPECT_FALSE(attempts.TryAgain());
++  EXPECT_TRUE(attempts.exhausted());
++  attempts.Reset();
++  EXPECT_FALSE(attempts.exhausted());
++  attempts.Exhaust();  // A redirect: no more tries this run.
++  EXPECT_TRUE(attempts.exhausted());
++}
++
++TEST_F(TarkXlitFilesTest, EachAttemptWritesItsOwnPartFile) {
++  EXPECT_NE(PartFileName("xlit-model.bin", 1), PartFileName("xlit-model.bin", 2));
++  EXPECT_TRUE(PartFileName("xlit-words-hi.bin", 7).ends_with(".part"));
++  EXPECT_TRUE(PartFileName("xlit-words-hi.bin", 7).starts_with("xlit-words-hi.bin."));
++}
++
++TEST_F(TarkXlitFilesTest, ScanTrustsAVerifiedRecord) {
++  const XlitFile* hi = FindFile(WordsFileName("hi"));
++  ASSERT_TRUE(hi);
++  // Right size, wrong bytes, but a record says it was checked: trusted
++  // without hashing (the record is written only after a check).
++  Write(hi->name, std::string(static_cast<size_t>(hi->size), 'x'));
++  Write(std::string(hi->name) + ".sha256", hi->sha256);
++  EXPECT_EQ(ScanDirectory(dir_.GetPath()), std::vector<std::string>{std::string(hi->name)});
++}
++
++TEST_F(TarkXlitFilesTest, ScanDeletesASameSizeFileFromAnOlderTable) {
++  const XlitFile* hi = FindFile(WordsFileName("hi"));
++  ASSERT_TRUE(hi);
++  const base::FilePath path = Write(hi->name, std::string(static_cast<size_t>(hi->size), 'x'));
++  Write(std::string(hi->name) + ".sha256", std::string(64, '0'));  // Another table's hash.
++  EXPECT_TRUE(ScanDirectory(dir_.GetPath()).empty());
++  EXPECT_FALSE(base::PathExists(path));
++}
++
++TEST_F(TarkXlitFilesTest, ScanHashesAFileWithoutARecordOnce) {
++  const XlitFile* hi = FindFile(WordsFileName("hi"));
++  ASSERT_TRUE(hi);
++  const base::FilePath path = Write(hi->name, std::string(static_cast<size_t>(hi->size), 'x'));
++  EXPECT_TRUE(ScanDirectory(dir_.GetPath()).empty());  // Wrong bytes: hashed, deleted.
++  EXPECT_FALSE(base::PathExists(path));
++}
++
++TEST_F(TarkXlitFilesTest, ScanDeletesWordListsNotInTheTable) {
++  const base::FilePath stray = Write("xlit-words-xx.bin", "old");
++  EXPECT_TRUE(ScanDirectory(dir_.GetPath()).empty());
++  EXPECT_FALSE(base::PathExists(stray));
++}
++
++}  // namespace
++}  // namespace tark_xlit
 --- a/chrome/browser/ui/android/strings/android_chrome_strings.grd
 +++ b/chrome/browser/ui/android/strings/android_chrome_strings.grd
 @@ -864,6 +864,21 @@
@@ -1337,7 +1349,7 @@
        </message>
 --- a/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb
 +++ b/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb
-@@ -2162,4 +2162,8 @@
+@@ -2148,4 +2148,8 @@
  <translation id="3441881045024360042">Shodhya, खोज, खोज के सुझावों और नए टैब पेज के लिए (shodhya.com, api.shodhya.com)</translation>
  <translation id="4695926840610114405">Tark की विज्ञापन ब्लॉक करने वाली सूचियां, Wi-Fi पर दिन में एक बार या मोबाइल डेटा पर हर तीन दिन में (gettarka.com)</translation>
  <translation id="8102292694969518018"><ph name="LANGUAGE"/> में टाइप करें?</translation>
@@ -1347,15 +1359,3 @@
 +<translation id="8533623660476485480">भारतीय भाषाओं के सुझाव, आपके मांगने पर एक बार डाउनलोड (gettarka.com)</translation>
  </translationbundle>
 \ No newline at end of file
---- a/chrome/android/java/res/xml/privacy_preferences.xml
-+++ b/chrome/android/java/res/xml/privacy_preferences.xml
-@@ -56,6 +56,9 @@
-     <org.chromium.components.browser_ui.settings.TextMessagePreference
-         android:key="tark_connects_lists"
-         android:summary="@string/tark_connects_lists" />
-+    <org.chromium.components.browser_ui.settings.TextMessagePreference
-+        android:key="tark_connects_xlit"
-+        android:summary="@string/tark_connects_xlit" />
- 
-     <org.chromium.components.browser_ui.settings.ChromeBasePreferenceCategory
-         android:key="security_section"

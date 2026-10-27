@@ -1,0 +1,385 @@
+--- a/chrome/app/chrome_command_ids.h
++++ b/chrome/app/chrome_command_ids.h
+@@ -241,6 +241,8 @@
+ #define IDC_DEV_TOOLS_INSPECT           40023
+ #define IDC_UPGRADE_DIALOG              40024
+ #define IDC_SHOW_HISTORY_CLUSTERS_SIDE_PANEL 40025
++// Tark (W2): Help > Check for Updates…, WinSparkle on Windows.
++#define IDC_TARK_CHECK_FOR_UPDATES      40026
+ #define IDC_PROFILING_ENABLED           40028
+ #define IDC_EXTENSION_ERRORS            40031
+ #define IDC_SHOW_AVATAR_MENU            40134
+--- a/chrome/app/tark_pages_strings.grdp
++++ b/chrome/app/tark_pages_strings.grdp
+@@ -81,4 +81,9 @@
+       Tark <ph name="VERSION">$1<ex>155.0.8059.39</ex></ph>, built on Chromium for Windows.
+     </message>
+   </if>
++  <if expr="is_win">
++    <message name="IDS_TARK_WIN_CHECK_FOR_UPDATES" desc="Windows app menu item, under About Tark: check gettarka.com for a new version of Tark now.">
++      Check for updates
++    </message>
++  </if>
+ </grit-part>
+--- a/chrome/browser/BUILD.gn
++++ b/chrome/browser/BUILD.gn
+@@ -1441,6 +1441,11 @@
+       "platform_util_win.cc",
+       "process_singleton_win.cc",
+       "shell_integration_win.cc",
++
++      # Tark (W2): the updater, WinSparkle.
++      "tark_updater/tark_revision.h",
++      "tark_updater/tark_updater_win.cc",
++      "tark_updater/tark_updater_win.h",
+     ]
+ 
+     libs = [
+@@ -1453,6 +1458,7 @@
+     deps += [
+       ":font_prewarmer_tab_helper",
+       ":fullscreen",
++      "//chrome/browser/tark_updater:winsparkle_dll",
+       "//chrome/app:chrome_exe_main_exports",
+       "//chrome/app/theme:chrome_unscaled_resources_grit",
+       "//chrome/browser/install_verification:impl",
+--- a/chrome/browser/chrome_browser_main_win.cc
++++ b/chrome/browser/chrome_browser_main_win.cc
+@@ -65,6 +65,7 @@
+ #include "chrome/browser/profiles/profile_manager.h"
+ #include "chrome/browser/profiles/profile_shortcut_manager.h"
+ #include "chrome/browser/shell_integration_win.h"
++#include "chrome/browser/tark_updater/tark_updater_win.h"
+ #include "chrome/browser/ui/accessibility_util.h"
+ #include "chrome/browser/ui/simple_message_box.h"
+ #include "chrome/browser/ui/uninstall_browser_prompt.h"
+@@ -654,6 +655,7 @@
+ 
+ void ChromeBrowserMainPartsWin::PostMainMessageLoopRun() {
+   base::ImportantFileWriterCleaner::GetInstance().Stop();
++  tark_updater::Stop();
+ 
+   ChromeBrowserMainParts::PostMainMessageLoopRun();
+ }
+@@ -713,6 +715,9 @@
+ 
+   InitializeChromeElf();
+ 
++  // Tark (W2): WinSparkle checks gettarka.com for updates.
++  tark_updater::Start();
++
+ #if BUILDFLAG(USE_GOOGLE_UPDATE_INTEGRATION)
+   if constexpr (kShouldRecordActiveUse) {
+     did_run_updater_.emplace();
+--- /dev/null
++++ b/chrome/browser/tark_updater/BUILD.gn
+@@ -0,0 +1,15 @@
++# Copyright 2026 The Tark Authors
++# Use of this source code is governed by a BSD-style license that can be
++# found in the LICENSE file.
++
++# Tark's Windows updater (W2). The code is in //chrome/browser
++# (tark_updater_win.cc); this puts WinSparkle.dll, built without OpenSSL by
++# windows/ci/build_winsparkle.ps1, next to chrome.dll. FILES.cfg and
++# chrome.release put it into the zip and the installer.
++
++assert(is_win)
++
++copy("winsparkle_dll") {
++  sources = [ "//third_party/tark_winsparkle/WinSparkle.dll" ]
++  outputs = [ "$root_out_dir/WinSparkle.dll" ]
++}
+--- /dev/null
++++ b/chrome/browser/tark_updater/tark_updater_win.cc
+@@ -0,0 +1,185 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/tark_updater/tark_updater_win.h"
++
++#include <windows.h>
++
++#include <memory>
++#include <string>
++#include <vector>
++
++#include "base/check.h"
++#include "base/files/file_path.h"
++#include "base/functional/bind.h"
++#include "base/location.h"
++#include "base/logging.h"
++#include "base/path_service.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/strings/utf_string_conversions.h"
++#include "base/task/single_thread_task_runner.h"
++#include "base/version.h"
++#include "base/version_info/version_info.h"
++#include "chrome/browser/lifetime/application_lifetime.h"
++#include "chrome/browser/tark_updater/tark_revision.h"
++#include "content/public/browser/browser_task_traits.h"
++#include "content/public/browser/browser_thread.h"
++
++namespace tark_updater {
++
++namespace {
++
++// The feed and key, as utils/install_sparkle.sh sets them for the Mac.
++constexpr char kAppcastUrl[] = "https://gettarka.com/appcast-windows.xml";
++constexpr char kEdDsaPublicKey[] = "jifHjeHnUyao+9lgJ+TZ/mDQuNhOmXw/gNfI7uJKmQk=";
++// HKCU, apart from Chromium's own keys.
++constexpr char kRegistryPath[] = "Software\\Tark\\WinSparkle";
++constexpr int kCheckIntervalSeconds = 24 * 60 * 60;
++
++using VoidFn = void(__cdecl*)();
++using CanShutdownFn = int(__cdecl*)();
++using StringFn = void(__cdecl*)(const char*);
++using KeyFn = int(__cdecl*)(const char*);
++using DetailsFn = void(__cdecl*)(const wchar_t*, const wchar_t*, const wchar_t*);
++using WideFn = void(__cdecl*)(const wchar_t*);
++using IntFn = void(__cdecl*)(int);
++using SetCanShutdownFn = void(__cdecl*)(CanShutdownFn);
++using SetShutdownRequestFn = void(__cdecl*)(VoidFn);
++
++struct WinSparkle {
++  HMODULE dll = nullptr;
++  VoidFn init = nullptr;
++  VoidFn cleanup = nullptr;
++  VoidFn check_update_with_ui = nullptr;
++  StringFn set_appcast_url = nullptr;
++  KeyFn set_eddsa_public_key = nullptr;
++  DetailsFn set_app_details = nullptr;
++  WideFn set_app_build_version = nullptr;
++  StringFn set_registry_path = nullptr;
++  IntFn set_automatic_check_for_updates = nullptr;
++  IntFn set_update_check_interval = nullptr;
++  SetCanShutdownFn set_can_shutdown_callback = nullptr;
++  SetShutdownRequestFn set_shutdown_request_callback = nullptr;
++};
++
++// Set and cleared on the UI thread only.
++WinSparkle* g_winsparkle = nullptr;
++
++template <typename Fn>
++bool Resolve(HMODULE dll, const char* name, Fn* fn) {
++  *fn = reinterpret_cast<Fn>(::GetProcAddress(dll, name));
++  return *fn != nullptr;
++}
++
++// WinSparkle asks from its own thread, after the installer has downloaded and
++// its signature has checked out. Tark closes like any other quit: pages may
++// still ask to stay, and then the installer waits for Tark to close.
++int __cdecl CanShutdown() {
++  return TRUE;
++}
++
++void __cdecl ShutdownRequest() {
++  content::GetUIThreadTaskRunner({})->PostTask(
++      FROM_HERE, base::BindOnce(&chrome::AttemptExit));
++}
++
++// "155.0.8059.39 (9)" to show, and "8059.39.9" to compare with the feed's
++// sparkle:version, as CFBundleVersion is on the Mac (BUILD.PATCH.REVISION).
++std::wstring DisplayVersion() {
++  return base::UTF8ToWide(std::string(version_info::GetVersionNumber()) +
++                          " (" + TARK_REVISION + ")");
++}
++
++std::wstring BuildVersion() {
++  const std::vector<uint32_t>& parts = version_info::GetVersion().components();
++  CHECK_EQ(parts.size(), 4u);
++  return base::UTF8ToWide(base::NumberToString(parts[2]) + "." +
++                          base::NumberToString(parts[3]) + "." + TARK_REVISION);
++}
++
++}  // namespace
++
++void Start() {
++  DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
++  if (g_winsparkle) {
++    return;
++  }
++  base::FilePath dir;
++  if (!base::PathService::Get(base::DIR_MODULE, &dir)) {
++    return;
++  }
++  // From Tark's own folder only; WinSparkle's own imports are system DLLs.
++  HMODULE dll = ::LoadLibraryExW(
++      dir.Append(L"WinSparkle.dll").value().c_str(), nullptr,
++      LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
++  if (!dll) {
++    LOG(WARNING) << "Tark updates are off: WinSparkle.dll did not load";
++    return;
++  }
++  auto ws = std::make_unique<WinSparkle>();
++  ws->dll = dll;
++  const bool resolved =
++      Resolve(dll, "win_sparkle_init", &ws->init) &&
++      Resolve(dll, "win_sparkle_cleanup", &ws->cleanup) &&
++      Resolve(dll, "win_sparkle_check_update_with_ui",
++              &ws->check_update_with_ui) &&
++      Resolve(dll, "win_sparkle_set_appcast_url", &ws->set_appcast_url) &&
++      Resolve(dll, "win_sparkle_set_eddsa_public_key",
++              &ws->set_eddsa_public_key) &&
++      Resolve(dll, "win_sparkle_set_app_details", &ws->set_app_details) &&
++      Resolve(dll, "win_sparkle_set_app_build_version",
++              &ws->set_app_build_version) &&
++      Resolve(dll, "win_sparkle_set_registry_path", &ws->set_registry_path) &&
++      Resolve(dll, "win_sparkle_set_automatic_check_for_updates",
++              &ws->set_automatic_check_for_updates) &&
++      Resolve(dll, "win_sparkle_set_update_check_interval",
++              &ws->set_update_check_interval) &&
++      Resolve(dll, "win_sparkle_set_can_shutdown_callback",
++              &ws->set_can_shutdown_callback) &&
++      Resolve(dll, "win_sparkle_set_shutdown_request_callback",
++              &ws->set_shutdown_request_callback);
++  // Without the key WinSparkle would check nothing; Tark's build refuses
++  // unsigned updates anyway, but never start it without one.
++  if (!resolved || !ws->set_eddsa_public_key(kEdDsaPublicKey)) {
++    LOG(WARNING) << "Tark updates are off: WinSparkle.dll is not usable";
++    ::FreeLibrary(dll);
++    return;
++  }
++  ws->set_registry_path(kRegistryPath);
++  ws->set_appcast_url(kAppcastUrl);
++  ws->set_app_details(L"Tark", L"Tark", DisplayVersion().c_str());
++  ws->set_app_build_version(BuildVersion().c_str());
++  ws->set_automatic_check_for_updates(1);
++  ws->set_update_check_interval(kCheckIntervalSeconds);
++  ws->set_can_shutdown_callback(&CanShutdown);
++  ws->set_shutdown_request_callback(&ShutdownRequest);
++  ws->init();
++  g_winsparkle = ws.release();
++}
++
++void Stop() {
++  DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
++  if (!g_winsparkle) {
++    return;
++  }
++  // Joins WinSparkle's threads. The DLL stays loaded: they are gone, and
++  // nothing calls into it after this.
++  g_winsparkle->cleanup();
++  delete g_winsparkle;
++  g_winsparkle = nullptr;
++}
++
++bool IsRunning() {
++  DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
++  return g_winsparkle != nullptr;
++}
++
++void CheckForUpdatesWithUi() {
++  DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
++  if (g_winsparkle) {
++    g_winsparkle->check_update_with_ui();
++  }
++}
++
++}  // namespace tark_updater
+--- /dev/null
++++ b/chrome/browser/tark_updater/tark_updater_win.h
+@@ -0,0 +1,30 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_TARK_UPDATER_TARK_UPDATER_WIN_H_
++#define CHROME_BROWSER_TARK_UPDATER_TARK_UPDATER_WIN_H_
++
++// Tark's Windows updater (W2): WinSparkle, built without OpenSSL
++// (windows/ci/build_winsparkle.ps1) and loaded from WinSparkle.dll next to
++// chrome.dll. It checks gettarka.com/appcast-windows.xml once a day and runs
++// only installers signed with Tark's EdDSA key, the Mac's Sparkle key.
++namespace tark_updater {
++
++// Loads and starts WinSparkle; called on the UI thread once the browser has
++// started. Without WinSparkle.dll, or if WinSparkle rejects the key, Tark runs
++// without updates.
++void Start();
++
++// Stops WinSparkle's threads; called on the UI thread before shutdown.
++void Stop();
++
++// Whether Start() set WinSparkle up, so "Check for Updates…" can work.
++bool IsRunning();
++
++// "Check for Updates…": checks now and shows WinSparkle's window.
++void CheckForUpdatesWithUi();
++
++}  // namespace tark_updater
++
++#endif  // CHROME_BROWSER_TARK_UPDATER_TARK_UPDATER_WIN_H_
+--- a/chrome/browser/ui/toolbar/app_menu_model.cc
++++ b/chrome/browser/ui/toolbar/app_menu_model.cc
+@@ -187,6 +187,7 @@
+ #include "base/time/time.h"
+ #include "base/win/shortcut.h"
+ #include "base/win/windows_version.h"
++#include "chrome/browser/tark_updater/tark_updater_win.h"
+ #include "content/public/browser/gpu_data_manager.h"
+ #endif
+ 
+@@ -1134,6 +1135,13 @@
+         password_manager::prefs::kPasswordsPrefWithNewLabelUsed, true);
+   }
+ 
++#if BUILDFLAG(IS_WIN)
++  if (command_id == IDC_TARK_CHECK_FOR_UPDATES) {
++    tark_updater::CheckForUpdatesWithUi();
++    return;
++  }
++#endif
++
+   LogMenuMetrics(command_id);
+ 
+   switch (command_id) {
+@@ -1872,6 +1880,10 @@
+       return IncognitoModePrefs::IsIncognitoTypeAllowed(
+           browser_->GetProfile(),
+           IncognitoModePrefs::IncognitoModeType::kStandard);
++#if BUILDFLAG(IS_WIN)
++    case IDC_TARK_CHECK_FOR_UPDATES:
++      return tark_updater::IsRunning();
++#endif
+     default:
+       return chrome::IsCommandEnabled(browser_, command_id);
+   }
+@@ -2240,6 +2252,13 @@
+                                    features::IsRoundedIconsEnabled()
+                                        ? vector_icons::kInfoIcon
+                                        : vector_icons::kInfoRefreshOldIcon);
++#if BUILDFLAG(IS_WIN)
++  // Tark (W2): WinSparkle's check, under About, when it is running.
++  if (tark_updater::IsRunning()) {
++    AddItemWithStringId(IDC_TARK_CHECK_FOR_UPDATES,
++                        IDS_TARK_WIN_CHECK_FOR_UPDATES);
++  }
++#endif
+ #endif
+ #endif
+ 
+--- a/chrome/installer/mini_installer/chrome.release
++++ b/chrome/installer/mini_installer/chrome.release
+@@ -46,6 +46,7 @@
+ indicxlit\xlit-model.bin: %(VersionDir)s\indicxlit\
+ indicxlit\xlit-words.bin: %(VersionDir)s\indicxlit\
+ onnxruntime.dll: %(VersionDir)s\
++WinSparkle.dll: %(VersionDir)s\
+ 
+ #
+ # VisualElements sub-dir.
+--- a/chrome/tools/build/win/FILES.cfg
++++ b/chrome/tools/build/win/FILES.cfg
+@@ -749,6 +749,11 @@
+     'filename': 'onnxruntime.dll',
+     'buildtype': ['official'],
+   },
++  # Tark: WinSparkle, which updates Tark from gettarka.com (W2).
++  {
++    'filename': 'WinSparkle.dll',
++    'buildtype': ['official'],
++  },
+   # IWA Key Distribution files:
+   {
+     'filename': 'IwaKeyDistribution/iwa-key-distribution.pb',

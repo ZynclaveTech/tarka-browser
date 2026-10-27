@@ -154,9 +154,9 @@ class TestRowsPatch(unittest.TestCase):
 
     def test_classifier_adds_query_tile_on_android(self):
         classifier = self.section('components/omnibox/browser/autocomplete_classifier.cc')
-        # Right after TYPE_TAB_GROUP, which only the Android block lists.
-        self.assertIn(' AutocompleteProvider::TYPE_TAB_GROUP |\n+      // Tark (A3): Indian-language rows, as on macOS.\n'
-                      '+      AutocompleteProvider::TYPE_QUERY_TILE |', classifier)
+        # Right after Type::kTabGroup, which only the Android block lists.
+        self.assertIn(' AutocompleteProvider::Type::kTabGroup |\n+      // Tark (A3): Indian-language rows, as on macOS.\n'
+                      '+      AutocompleteProvider::Type::kQueryTile |', classifier)
 
     def test_provider_waits_for_the_download(self):
         provider = self.section('components/omnibox/browser/tark_transliteration_provider.cc')

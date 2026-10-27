@@ -419,7 +419,7 @@ def write_file(path, data):
 
 # --- commands ---------------------------------------------------------------
 
-def refresh(data_dir, chromium_src=None, prodversion='155.0.8059.39', allow_older=False,
+def refresh(data_dir, chromium_src=None, prodversion='156.0.8078.47', allow_older=False,
             log=print):
     if chromium_src:
         for component in (CRL_SET, PKI_METADATA):
@@ -582,7 +582,7 @@ def main():
     sub = parser.add_subparsers(dest='command', required=True)
     p = sub.add_parser('refresh')
     p.add_argument('--chromium-src', help='check Chromium\'s component key pins against ours')
-    p.add_argument('--prodversion', default='155.0.8059.39')
+    p.add_argument('--prodversion', default='156.0.8078.47')
     p.add_argument('--allow-older', action='store_true')
     p = sub.add_parser('install')
     p.add_argument('tree')

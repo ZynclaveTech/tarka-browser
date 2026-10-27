@@ -1,17 +1,17 @@
 --- a/chrome/android/BUILD.gn
 +++ b/chrome/android/BUILD.gn
-@@ -473,6 +473,7 @@
-       "//chrome/browser/ntp_customization:java",
+@@ -474,6 +474,7 @@
        "//chrome/browser/ntp_customization:public_java",
        "//chrome/browser/omaha/android:java",
+       "//chrome/browser/omaha/android:ui_java",
 +      "//chrome/browser/tark_captions_android/android:java",
        "//chrome/browser/open_in_app/android:java",
        "//chrome/browser/optimization_guide/android:java",
        "//chrome/browser/page_content_annotations:java",
 --- a/chrome/android/chrome_java_resources.gni
 +++ b/chrome/android/chrome_java_resources.gni
-@@ -408,6 +408,9 @@
-   "java/res/drawable/tab_indicator.xml",
+@@ -402,6 +402,9 @@
+   "java/res/drawable/tab_position_vertical_preview.xml",
    "java/res/drawable/tablet_black_24dp.xml",
    "java/res/drawable/tablet_recent_tab_empty_state_illustration.xml",
 +  "java/res/drawable/tark_caption_chip.xml",
@@ -20,7 +20,7 @@
    "java/res/drawable/tark_ntp_mark.xml",
    "java/res/drawable/task_spark_24dp.xml",
    "java/res/drawable/text_cursor_lowend.xml",
-@@ -619,6 +622,7 @@
+@@ -614,6 +617,7 @@
    "java/res/layout/tab_switcher_action_menu_layout.xml",
    "java/res/layout/tab_switcher_module_container.xml",
    "java/res/layout/tab_switcher_view_holder.xml",
@@ -30,7 +30,7 @@
    "java/res/layout/tips_promo_detail_sheet.xml",
 --- a/chrome/android/chrome_java_sources.gni
 +++ b/chrome/android/chrome_java_sources.gni
-@@ -979,6 +979,7 @@
+@@ -973,6 +973,7 @@
    "java/src/org/chromium/chrome/browser/page_info/PageInfoHistoryController.java",
    "java/src/org/chromium/chrome/browser/page_info/SiteSettingsHelper.java",
    "java/src/org/chromium/chrome/browser/page_info/TarkAdblockSiteSwitch.java",
@@ -261,19 +261,19 @@
 +</LinearLayout>
 --- a/chrome/android/java/res/xml/privacy_preferences.xml
 +++ b/chrome/android/java/res/xml/privacy_preferences.xml
-@@ -60,6 +60,9 @@
+@@ -59,6 +59,9 @@
+     <org.chromium.components.browser_ui.settings.TextMessagePreference
          android:key="tark_connects_xlit"
          android:summary="@string/tark_connects_xlit" />
-     <org.chromium.components.browser_ui.settings.TextMessagePreference
++    <org.chromium.components.browser_ui.settings.TextMessagePreference
 +        android:key="tark_connects_captions"
 +        android:summary="@string/tark_connects_captions" />
-+    <org.chromium.components.browser_ui.settings.TextMessagePreference
+     <org.chromium.components.browser_ui.settings.TextMessagePreference
          android:key="tark_connects_update"
          android:summary="@string/tark_connects_update" />
- 
 --- a/chrome/android/java/src/org/chromium/chrome/browser/app/ChromeActivity.java
 +++ b/chrome/android/java/src/org/chromium/chrome/browser/app/ChromeActivity.java
-@@ -216,6 +216,7 @@
+@@ -222,6 +222,7 @@
  import org.chromium.chrome.browser.toolbar.ControlContainer;
  import org.chromium.chrome.browser.toolbar.ToolbarManager;
  import org.chromium.chrome.browser.translate.TranslateBridge;
@@ -281,25 +281,25 @@
  import org.chromium.chrome.browser.ui.BottomContainer;
  import org.chromium.chrome.browser.ui.ChromeActivitySnackbarHelper;
  import org.chromium.chrome.browser.ui.RootUiCoordinator;
-@@ -445,6 +446,8 @@
-     private DisplayAndroidObserver mDisplayAndroidObserver;
+@@ -465,6 +466,8 @@
+     private @Nullable DisplayAndroidObserver mDisplayAndroidObserver;
  
-     @Nullable private BottomContainer mBottomContainer;
+     private @Nullable BottomContainer mBottomContainer;
 +    // Tark: live captions' bar, in the bottom container.
-+    @Nullable private TarkCaptionBarCoordinator mTarkCaptionBar;
++    private @Nullable TarkCaptionBarCoordinator mTarkCaptionBar;
  
-     private LaunchCauseMetrics mLaunchCauseMetrics;
+     private @Nullable LaunchCauseMetrics mLaunchCauseMetrics;
  
-@@ -754,6 +757,8 @@
+@@ -780,6 +783,8 @@
                      getBrowserControlsManager(),
-                     getWindowAndroid().getApplicationBottomInsetTracker().getSupplier(),
+                     windowAndroid.getApplicationBottomInsetTracker().getSupplier(),
                      getEdgeToEdgeSupplier());
 +            mTarkCaptionBar =
 +                    new TarkCaptionBarCoordinator(this, mBottomContainer, mActivityTabProvider);
  
              ShareDelegate shareDelegate =
                      new ShareDelegateImpl(
-@@ -2052,6 +2057,10 @@
+@@ -2083,6 +2088,10 @@
          mTabModelSelectorSupplier.destroy();
          EphemeralTabCoordinatorSupplier.destroy(mEphemeralTabCoordinatorSupplier);
  
@@ -1176,7 +1176,7 @@
 +}
 --- a/chrome/browser/ui/android/strings/android_chrome_strings.grd
 +++ b/chrome/browser/ui/android/strings/android_chrome_strings.grd
-@@ -844,6 +844,96 @@
+@@ -876,6 +876,96 @@
        <message name="IDS_TARK_XLIT_NO_THANKS" desc="Tark: button in the Indian-language suggestions dialog: do not download, and stop offering. [CHAR_LIMIT=24]">
          No thanks
        </message>
@@ -1325,7 +1325,7 @@
          android:key="image_descriptions"
 --- a/components/browser_ui/strings/android/browser_ui_strings.grd
 +++ b/components/browser_ui/strings/android/browser_ui_strings.grd
-@@ -1008,6 +1008,9 @@
+@@ -1012,6 +1012,9 @@
        <message name="IDS_ACCESSIBILITY_CAPTIONS_TITLE" desc="Title of the preference that allows the user to update caption settings.">
          Captions
        </message>
@@ -1337,7 +1337,7 @@
        </message>
 --- a/components/browser_ui/strings/android/translations/browser_ui_strings_hi.xtb
 +++ b/components/browser_ui/strings/android/translations/browser_ui_strings_hi.xtb
-@@ -796,4 +796,5 @@
+@@ -798,4 +798,5 @@
  <translation id="961930410699694996">इस बार जगह की जानकारी ऐक्सेस करने की अनुमति दी गई</translation>
  <translation id="967624055006145463">सेव किया गया डेटा</translation>
  <translation id="969975166333045662">साइट को V8 ऑप्टिमाइज़र का इस्तेमाल करने से रोकें.</translation>

@@ -1,12 +1,14 @@
 """Tark for Android r2: the A5 review's stale update offer, the screen-sharing
 foreground service Tark cannot use, and Tark's mark on the media
 notification."""
-import json
 import pathlib
+import sys
 import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 PATCHES = ROOT / 'android' / 'patches'
+sys.path.insert(0, str(ROOT / 'android' / 'release'))
+import version  # noqa: E402
 
 
 def added(patch):
@@ -87,8 +89,10 @@ class TestMediaNotificationMark(unittest.TestCase):
 
 class TestRevision(unittest.TestCase):
     def test_r2(self):
-        # r2's changes are in every later revision; release.json only counts up.
-        self.assertGreaterEqual(json.loads((ROOT / 'android' / 'release.json').read_text())['revision'], 2)
+        # r2's changes are in every later release, on any later Chromium too:
+        # the version code only counts up.
+        _, code = version.from_repo(ROOT)
+        self.assertGreaterEqual(code, version.version_code('155.0.8059.39', 2))
 
 
 if __name__ == '__main__':
