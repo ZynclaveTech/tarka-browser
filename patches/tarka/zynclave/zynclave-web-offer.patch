@@ -24,7 +24,7 @@
      </message>
 --- a/chrome/browser/tark_zynclave/BUILD.gn
 +++ b/chrome/browser/tark_zynclave/BUILD.gn
-@@ -80,6 +80,48 @@
+@@ -80,6 +80,51 @@
    ]
  }
  
@@ -59,6 +59,9 @@
 +    ":web_offer_rules",
 +    "//base",
 +    "//chrome/app:generated_resources",
++    "//chrome/browser/profiles:profile",
++    "//chrome/browser/ui/views/frame:browser_view_header",
++    "//chrome/browser/ui/views/location_bar",
 +    "//components/prefs",
 +    "//components/tabs:public",
 +    "//content/public/browser",
@@ -73,7 +76,7 @@
  source_set("test_util") {
    testonly = true
    sources = [
-@@ -98,8 +140,10 @@
+@@ -98,8 +143,10 @@
      "whoami_response_unittest.cc",
      "zynclave_auth_unittest.cc",
      "zynclave_avatar_unittest.cc",
@@ -428,7 +431,7 @@
 +#endif  // CHROME_BROWSER_TARK_ZYNCLAVE_WHOAMI_FETCHER_H_
 --- /dev/null
 +++ b/chrome/browser/tark_zynclave/zynclave_offer_bubble.cc
-@@ -0,0 +1,76 @@
+@@ -0,0 +1,119 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -438,7 +441,10 @@
 +#include <memory>
 +#include <utility>
 +
++#include "base/callback_list.h"
++#include "base/functional/bind.h"
 +#include "base/functional/callback.h"
++#include "base/memory/raw_ptr.h"
 +#include "base/logging.h"
 +#include "chrome/browser/ui/views/frame/browser_view.h"
 +#include "chrome/browser/ui/views/location_bar/location_bar_view.h"
@@ -450,8 +456,47 @@
 +#include "ui/views/bubble/bubble_dialog_delegate_view.h"
 +#include "ui/views/bubble/bubble_dialog_model_host.h"
 +#include "ui/views/widget/widget.h"
++#include "ui/views/widget/widget_observer.h"
 +
 +namespace tark_zynclave {
++
++namespace {
++
++// Closes the bubble when its tab stops being the one shown (another tab, or
++// the tab closed), so it never sits over a page it is not about. Owned by
++// the bubble's widget's lifetime: deletes itself when the widget goes.
++class CloseWithTab : public views::WidgetObserver {
++ public:
++  CloseWithTab(tabs::TabInterface* tab, views::Widget* widget)
++      : widget_(widget) {
++    widget_->AddObserver(this);
++    deactivate_ = tab->RegisterWillDeactivate(base::BindRepeating(
++        &CloseWithTab::Close, base::Unretained(this)));
++    detach_ = tab->RegisterWillDetach(base::BindRepeating(
++        [](CloseWithTab* self, tabs::TabInterface* tab,
++           tabs::TabInterface::DetachReason) { self->Close(tab); },
++        base::Unretained(this)));
++  }
++
++  // views::WidgetObserver:
++  void OnWidgetDestroying(views::Widget* widget) override {
++    widget_->RemoveObserver(this);
++    delete this;
++  }
++
++ private:
++  void Close(tabs::TabInterface*) {
++    deactivate_ = {};
++    detach_ = {};
++    widget_->Close();  // decides nothing, like any other close
++  }
++
++  raw_ptr<views::Widget> widget_;
++  base::CallbackListSubscription deactivate_;
++  base::CallbackListSubscription detach_;
++};
++
++}  // namespace
 +
 +bool ShowZynclaveOfferBubble(content::WebContents* contents,
 +                             const std::u16string& name,
@@ -498,9 +543,10 @@
 +  // It stays until the person answers: a click elsewhere on the page would
 +  // otherwise close it before it is read, and it is offered once a run.
 +  bubble->set_close_on_deactivate(false);
-+  views::BubbleDialogDelegate::CreateBubbleDeprecated(
-+      std::move(bubble), views::Widget::InitParams::NATIVE_WIDGET_OWNS_WIDGET)
-+      ->Show();
++  views::Widget* widget = views::BubbleDialogDelegate::CreateBubbleDeprecated(
++      std::move(bubble), views::Widget::InitParams::NATIVE_WIDGET_OWNS_WIDGET);
++  new CloseWithTab(tab, widget);
++  widget->Show();
 +  return true;
 +}
 +
@@ -538,7 +584,7 @@
 +#endif  // CHROME_BROWSER_TARK_ZYNCLAVE_ZYNCLAVE_OFFER_BUBBLE_H_
 --- /dev/null
 +++ b/chrome/browser/tark_zynclave/zynclave_web_offer.cc
-@@ -0,0 +1,189 @@
+@@ -0,0 +1,191 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -559,8 +605,10 @@
 +#include "chrome/browser/tark_zynclave/zynclave_config.h"
 +#include "chrome/browser/tark_zynclave/zynclave_offer_bubble.h"
 +#include "chrome/browser/tark_zynclave/zynclave_prefs.h"
-+#include "chrome/browser/tark_zynclave/zynclave_sign_in_service.h"
-+#include "chrome/browser/tark_zynclave/zynclave_sign_in_service_factory.h"
++// The service is built into //chrome/browser:core, which depends on this
++// target; a dep back would be a cycle.
++#include "chrome/browser/tark_zynclave/zynclave_sign_in_service.h"  // nogncheck
++#include "chrome/browser/tark_zynclave/zynclave_sign_in_service_factory.h"  // nogncheck
 +#include "components/prefs/pref_service.h"
 +#include "components/prefs/scoped_user_pref_update.h"
 +#include "content/public/browser/navigation_handle.h"

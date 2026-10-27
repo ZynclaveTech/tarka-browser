@@ -129,7 +129,7 @@
 +]
 --- /dev/null
 +++ b/chrome/browser/tark_zynclave/oidc.cc
-@@ -0,0 +1,396 @@
+@@ -0,0 +1,399 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -381,8 +381,11 @@
 +  if (const std::string* id_token = doc->FindString("id_token")) {
 +    response.id_token = *id_token;
 +  }
++  // Without a lifetime, assume a short one rather than refreshing on every
++  // request.
++  const double expires_in = doc->FindDouble("expires_in").value_or(0);
 +  response.expires_in =
-+      base::Seconds(doc->FindDouble("expires_in").value_or(0));
++      expires_in > 0 ? base::Seconds(expires_in) : base::Minutes(5);
 +  return response;
 +}
 +
@@ -474,7 +477,7 @@
 +    info.name = CleanDisplayText(*name, 40);
 +  }
 +  if (const std::string* email = doc->FindString("email")) {
-+    info.email = CleanDisplayText(*email, 64);
++    info.email = CleanDisplayText(*email, 254);  // RFC 5321's longest
 +  }
 +  if (const std::string* picture = doc->FindString("picture")) {
 +    info.picture = GURL(*picture);
@@ -643,7 +646,7 @@
 +#endif  // CHROME_BROWSER_TARK_ZYNCLAVE_OIDC_H_
 --- /dev/null
 +++ b/chrome/browser/tark_zynclave/oidc_unittest.cc
-@@ -0,0 +1,395 @@
+@@ -0,0 +1,411 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -995,7 +998,23 @@
 +  EXPECT_EQ(u->name.find('\a'), std::string::npos);
 +  EXPECT_EQ(u->name.substr(0, 5), "Evil ");
 +  EXPECT_LE(u->name.size(), 40u);
-+  EXPECT_LE(u->email.size(), 64u);
++  EXPECT_LE(u->email.size(), 254u);
++}
++
++TEST(TarkZynclaveOidc, UserinfoKeepsALongEmailWhole) {
++  const std::string email = std::string(90, 'e') + "@example.test";
++  std::optional<Userinfo> u =
++      ParseUserinfo(R"({"sub":"s","email":")" + email + R"("})");
++  ASSERT_TRUE(u);
++  EXPECT_EQ(u->email, email);
++}
++
++TEST(TarkZynclaveOidc, TokenResponseWithoutExpiryLastsFiveMinutes) {
++  TokenResponse r = ParseTokenResponse(R"({"access_token":"a"})");
++  EXPECT_EQ(r.expires_in, base::Minutes(5));
++  EXPECT_EQ(ParseTokenResponse(R"({"access_token":"a","expires_in":0})")
++                .expires_in,
++            base::Minutes(5));
 +}
 +
 +TEST(TarkZynclaveOidc, AvatarHosts) {
@@ -1548,7 +1567,7 @@
 +#endif  // CHROME_BROWSER_TARK_ZYNCLAVE_TOKEN_CIPHER_H_
 --- /dev/null
 +++ b/chrome/browser/tark_zynclave/zynclave_auth.cc
-@@ -0,0 +1,585 @@
+@@ -0,0 +1,601 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -1875,6 +1894,16 @@
 +    SignInFailed();
 +    return;
 +  }
++  if (tokens_ && tokens_->refresh != tokens.refresh) {
++    // Signed in again: the old refresh token is not needed any more.
++    Revoke(tokens_->refresh);
++  }
++  if (refreshing_) {
++    // The refresh still running is for the old tokens; its waiters get the
++    // new ones below.
++    ++refresh_generation_;
++    refreshing_ = false;
++  }
 +  account_ = std::move(*info);
 +  tokens_ = std::move(tokens);
 +  SaveAccount();
@@ -1932,12 +1961,18 @@
 +        self->Fetch(self->discovery_->token,
 +                    RefreshRequestBody(self->config_, self->tokens_->refresh),
 +                    kMaxBody,
-+                    base::BindOnce(&ZynclaveAuth::OnRefreshed, self));
++                    base::BindOnce(&ZynclaveAuth::OnRefreshed, self,
++                                   self->refresh_generation_));
 +      },
 +      weak_factory_.GetWeakPtr()));
 +}
 +
-+void ZynclaveAuth::OnRefreshed(std::optional<std::string> body, int status) {
++void ZynclaveAuth::OnRefreshed(int generation,
++                               std::optional<std::string> body,
++                               int status) {
++  if (generation != refresh_generation_) {
++    return;  // for tokens a newer sign-in replaced
++  }
 +  refreshing_ = false;
 +  TokenResponse response =
 +      body ? ParseTokenResponse(*body) : TokenResponse{.error = "network"};
@@ -2136,7 +2171,7 @@
 +}  // namespace tark_zynclave
 --- /dev/null
 +++ b/chrome/browser/tark_zynclave/zynclave_auth.h
-@@ -0,0 +1,181 @@
+@@ -0,0 +1,185 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -2278,7 +2313,9 @@
 +  void ServeTokenRequests();
 +
 +  void Refresh();
-+  void OnRefreshed(std::optional<std::string> body, int status);
++  void OnRefreshed(int generation,
++                   std::optional<std::string> body,
++                   int status);
 +  void FinishTokenRequests(std::optional<std::string> access);
 +
 +  void LoadAccount();
@@ -2309,6 +2346,8 @@
 +
 +  std::vector<TokenCallback> token_waiters_;
 +  bool refreshing_ = false;
++  // Bumped when a sign-in replaces the tokens a refresh was started with.
++  int refresh_generation_ = 0;
 +
 +  std::list<std::unique_ptr<InFlight>> fetches_;
 +  base::RepeatingClosureList observers_;
