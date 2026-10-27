@@ -63,7 +63,7 @@
  ]
 --- /dev/null
 +++ b/chrome/browser/tark_zynclave/zynclave_avatar.cc
-@@ -0,0 +1,211 @@
+@@ -0,0 +1,224 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -218,6 +218,7 @@
 +void ZynclaveAvatar::OnFetched(GURL url, std::optional<std::string> body) {
 +  loader_.reset();
 +  if (!body || body->empty()) {
++    Forget(url);
 +    return;
 +  }
 +  decoder_.Run(std::move(*body),
@@ -229,13 +230,18 @@
 +void ZynclaveAvatar::OnDecoded(GURL url,
 +                               bool from_disk,
 +                               const SkBitmap& bitmap) {
-+  if (url != url_ || bitmap.drawsNothing()) {
++  if (url != url_) {
++    return;
++  }
++  if (bitmap.drawsNothing()) {
++    Forget(url);
 +    return;
 +  }
 +  std::optional<std::vector<uint8_t>> png =
 +      gfx::PNGCodec::EncodeBGRASkBitmap(bitmap,
 +                                        /*discard_transparency=*/false);
 +  if (!png) {
++    Forget(url);
 +    return;
 +  }
 +  png_.assign(png->begin(), png->end());
@@ -255,6 +261,13 @@
 +            dir_, url.spec(), png_));
 +  }
 +  on_changed_.Run(gfx::Image::CreateFrom1xBitmap(bitmap));
++}
++
++void ZynclaveAvatar::Forget(const GURL& url) {
++  // The next Update() with the same picture tries again.
++  if (url == url_) {
++    url_ = GURL();
++  }
 +}
 +
 +void ZynclaveAvatar::Clear() {
@@ -277,7 +290,7 @@
 +}  // namespace tark_zynclave
 --- /dev/null
 +++ b/chrome/browser/tark_zynclave/zynclave_avatar.h
-@@ -0,0 +1,89 @@
+@@ -0,0 +1,90 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -348,6 +361,7 @@
 +  };
 +  void OnStored(GURL url, std::optional<Stored> stored);
 +  void Fetch(GURL url);
++  void Forget(const GURL& url);
 +  void OnFetched(GURL url, std::optional<std::string> body);
 +  void OnDecoded(GURL url, bool from_disk, const SkBitmap& bitmap);
 +  void Clear();
@@ -369,7 +383,7 @@
 +#endif  // CHROME_BROWSER_TARK_ZYNCLAVE_ZYNCLAVE_AVATAR_H_
 --- /dev/null
 +++ b/chrome/browser/tark_zynclave/zynclave_avatar_unittest.cc
-@@ -0,0 +1,139 @@
+@@ -0,0 +1,169 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -383,6 +397,7 @@
 +#include "base/functional/callback_helpers.h"
 +#include "base/files/scoped_temp_dir.h"
 +#include "base/test/task_environment.h"
++#include "net/http/http_status_code.h"
 +#include "chrome/browser/tark_zynclave/oidc.h"
 +#include "services/network/public/cpp/weak_wrapper_shared_url_loader_factory.h"
 +#include "services/network/test/test_url_loader_factory.h"
@@ -491,6 +506,35 @@
 +  EXPECT_TRUE(avatar_->DataUrl().empty());
 +  EXPECT_FALSE(base::PathExists(File()));
 +  EXPECT_EQ(changes_, 0);
++}
++
++TEST_F(TarkZynclaveAvatar, AFailedFetchIsTriedAgain) {
++  const char kUrl[] = "https://lh6.googleusercontent.com/a/x";
++  loaders_.AddResponse(kUrl, "", net::HTTP_INTERNAL_SERVER_ERROR);
++  Userinfo account = Account(kUrl);
++  avatar_->Update(&account);
++  task_env_.RunUntilIdle();
++  EXPECT_EQ(changes_, 0);
++
++  loaders_.AddResponse(kUrl, Png());
++  avatar_->Update(&account);
++  task_env_.RunUntilIdle();
++  EXPECT_EQ(loaders_.total_requests(), 2u);
++  EXPECT_EQ(changes_, 1);
++}
++
++TEST_F(TarkZynclaveAvatar, ABrokenImageIsTriedAgain) {
++  const char kUrl[] = "https://lh6.googleusercontent.com/a/y";
++  loaders_.AddResponse(kUrl, "not an image");
++  Userinfo account = Account(kUrl);
++  avatar_->Update(&account);
++  task_env_.RunUntilIdle();
++
++  loaders_.AddResponse(kUrl, Png());
++  avatar_->Update(&account);
++  task_env_.RunUntilIdle();
++  EXPECT_EQ(loaders_.total_requests(), 2u);
++  EXPECT_EQ(changes_, 1);
 +}
 +
 +TEST_F(TarkZynclaveAvatar, SignOutDeletesAvatar) {
