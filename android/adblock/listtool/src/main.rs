@@ -14,6 +14,13 @@
 //!     script PAGE_URL TEXT     the page's injected scriptlets contain TEXT
 //!     hide PAGE_URL SELECTOR   the page's hide selectors contain SELECTOR
 //!   Exits 1 on any failure.
+//! listtool webkit BUNDLE.zip OUT_DIR
+//!   Converts the bundle's network rules to WebKit content-blocker rules for
+//!   Tark for iOS: OUT_DIR/tark-N.json, each under WebKit's rule limit. Every
+//!   file repeats all exception rules after its own block rules, since an
+//!   exception only applies within the list it is compiled in. Hide rules are
+//!   left out, as Brave does for iOS: WebKit cannot express their per-site
+//!   exceptions, and generic ones blank whole sites.
 
 use adblock::lists::{FilterSet, ParseOptions};
 use adblock::request::Request;
@@ -136,14 +143,56 @@ fn explain(bundle: &Path, extra: &str, items: &[&str]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// WebKit refuses a content-blocker list with more rules than this.
+const WEBKIT_MAX_RULES: usize = 150_000;
+
+fn webkit(bundle: &Path, out: &Path) -> ExitCode {
+    use adblock::content_blocking::CbType;
+    let mut zip = zip::ZipArchive::new(std::fs::File::open(bundle).unwrap()).unwrap();
+    let manifest: serde_json::Value = serde_json::from_str(&read_entry(&mut zip, "manifest.json")).unwrap();
+    // Content-blocking conversion needs the raw lines, kept only in debug mode.
+    let mut set = FilterSet::new(true);
+    let mut lines = 0;
+    let network_only = adblock::lists::RuleTypes::NetworkOnly;
+    for list in manifest["lists"].as_array().unwrap() {
+        let name = list["name"].as_str().unwrap();
+        let mask = list["permission"].as_u64().unwrap_or(0) as u8;
+        let text = read_entry(&mut zip, &format!("lists/{name}.txt"));
+        lines += text.lines().count();
+        let opts = ParseOptions {
+            permissions: PermissionMask::from_bits(mask),
+            rule_types: network_only,
+            ..Default::default()
+        };
+        set.add_filter_list(text, opts);
+    }
+    let (rules, used) = set.into_content_blocking().expect("debug filter set");
+    let (exceptions, blocks): (Vec<_>, Vec<_>) =
+        rules.into_iter().partition(|r| matches!(r.action.typ, CbType::IgnorePreviousRules));
+    let room = WEBKIT_MAX_RULES - exceptions.len();
+    std::fs::create_dir_all(out).unwrap();
+    let chunks: Vec<_> = blocks.chunks(room).collect();
+    for (i, chunk) in chunks.iter().enumerate() {
+        let mut file: Vec<_> = chunk.to_vec();
+        file.extend(exceptions.iter().cloned());
+        std::fs::write(out.join(format!("tark-{i}.json")), serde_json::to_string(&file).unwrap()).unwrap();
+    }
+    eprintln!(
+        "{lines} lines, {} converted: {} block rules, {} exceptions, {} files",
+        used.len(), blocks.len(), exceptions.len(), chunks.len()
+    );
+    ExitCode::SUCCESS
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     match args.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
         [_, "resources", "--ubo", ubo, "--out", out] => resources(Path::new(ubo), Path::new(out)),
         [_, "check", bundle, canaries] => check(Path::new(bundle), Path::new(canaries)),
         [_, "explain", bundle, extra, items @ ..] => explain(Path::new(bundle), extra, items),
+        [_, "webkit", bundle, out] => webkit(Path::new(bundle), Path::new(out)),
         _ => {
-            eprintln!("usage: listtool resources --ubo DIR --out FILE | listtool check BUNDLE.zip CANARIES.txt");
+            eprintln!("usage: listtool resources --ubo DIR --out FILE | listtool check BUNDLE.zip CANARIES.txt | listtool webkit BUNDLE.zip OUT_DIR");
             ExitCode::from(2)
         }
     }

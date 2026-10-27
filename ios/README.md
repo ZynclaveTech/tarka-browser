@@ -19,3 +19,15 @@ builds log every URLSession host as `TarkNet allow|block host`. Rust
 components (viaduct) do not use URLSession: they are switched off where they
 start (`services-off.patch`), and Remote Settings points at a closed local
 port.
+
+## Ads blocked
+
+`build.py lists` downloads the signed list bundle Tark for Android uses
+(gettarka.com/lists/android/v1/), verifies it with `lists_pubkey.txt`, and
+converts its network rules to WebKit content-blocker rules with
+`listtool webkit` (adblock-rust's conversion, as Brave does for iOS). The
+rules ship in the app as `fxcb-tark-N.json` and apply in Standard mode.
+Hide rules and scriptlets are not in WebKit's rules: they need adblock-rust
+in the app (next). `adtest/index.html` checks blocking: serve it with
+`python3 -m http.server 8765 --bind 127.0.0.1` and type the address into
+Tark — `simctl openurl` opens http links in Safari, not Tark.

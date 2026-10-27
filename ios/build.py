@@ -6,6 +6,8 @@
 
     build.py fetch    clone upstream.json's tag into build/ios/firefox-ios
     build.py patch    put the tree back to the tag, apply ios/series in order
+    build.py lists    the signed ad-block list bundle from gettarka.com, verified
+                      and converted to WebKit rules inside the tree
     build.py sim      bootstrap and build the Fennec scheme for the simulator
 
 The tree is never committed: Tark's changes are the patches in ios/patches,
@@ -13,13 +15,20 @@ listed in ios/series, so moving to a new Firefox release means rebasing them.
 """
 import json
 import pathlib
+import re
+import shutil
 import subprocess
 import sys
+import urllib.request
 
 IOS = pathlib.Path(__file__).resolve().parent
 ROOT = IOS.parent
 TREE = ROOT / 'build' / 'ios' / 'firefox-ios'
 DERIVED = ROOT / 'build' / 'ios' / 'dd'
+LISTS_URL = 'https://gettarka.com/lists/android/v1/'
+LISTS_MAX_BYTES = 64 << 20
+ADBLOCK = ROOT / 'android' / 'adblock'
+TARK_LISTS = TREE / 'firefox-ios' / 'Client' / 'ContentBlocker' / 'TarkLists'
 
 
 def run(*args, cwd=None):
@@ -62,6 +71,41 @@ def patch():
         print('applied', name)
 
 
+def _download(url):
+    with urllib.request.urlopen(url) as response:
+        data = response.read(LISTS_MAX_BYTES + 1)
+    if len(data) > LISTS_MAX_BYTES:
+        sys.exit(f'{url} is larger than {LISTS_MAX_BYTES} bytes')
+    return data
+
+
+def lists():
+    # The same signed bundle Tark for Android uses; listtool converts what
+    # WebKit can express (network rules, hide rules, exceptions).
+    work = ROOT / 'build' / 'ios' / 'lists'
+    shutil.rmtree(work, ignore_errors=True)
+    work.mkdir(parents=True)
+    index = work / 'latest.json'
+    index.write_bytes(_download(LISTS_URL + 'latest.json'))
+    # The index is not trusted until the bundle verifies: its file name only
+    # picks the URL, and the download goes to a fixed local name.
+    name = json.loads(index.read_text())['file']
+    if not re.fullmatch(r'lists-[0-9a-f]+\.zip', name):
+        sys.exit(f'unexpected bundle name in latest.json: {name!r}')
+    bundle = work / 'bundle.zip'
+    bundle.write_bytes(_download(LISTS_URL + name))
+    run(sys.executable, ADBLOCK / 'bundle.py', 'verify', bundle, index,
+        '--pubkey', ADBLOCK / 'lists_pubkey.txt')
+    run('cargo', 'build', '--release', '--manifest-path', ADBLOCK / 'listtool' / 'Cargo.toml')
+    run(ADBLOCK / 'listtool' / 'target' / 'release' / 'listtool', 'webkit', bundle, work / 'webkit')
+    shutil.rmtree(TARK_LISTS, ignore_errors=True)
+    TARK_LISTS.mkdir(parents=True)
+    for rules in sorted((work / 'webkit').glob('tark-*.json')):
+        # ContentBlocker loads bundled fxcb-*.json files as extra lists.
+        shutil.copy(rules, TARK_LISTS / f'fxcb-{rules.name}')
+        print('list', TARK_LISTS / f'fxcb-{rules.name}')
+
+
 def sim():
     # No -sdk: it would build the package macros (host tools) for the
     # simulator too, and the compiler then cannot run them.
@@ -75,7 +119,7 @@ def sim():
 
 
 if __name__ == '__main__':
-    steps = {'fetch': fetch, 'patch': patch, 'sim': sim}
+    steps = {'fetch': fetch, 'patch': patch, 'lists': lists, 'sim': sim}
     if len(sys.argv) != 2 or sys.argv[1] not in steps:
         sys.exit(__doc__)
     steps[sys.argv[1]]()
