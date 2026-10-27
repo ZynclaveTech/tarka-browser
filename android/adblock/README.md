@@ -20,6 +20,8 @@ Tark for Android blocks ads with Brave's adblock-rust inside the browser
 - `listtool/` (Rust, the browser's adblock-rust 0.13.3): `resources`
   assembles uBO's redirect resources; `check` compiles a bundle and checks
   `canaries.txt` — a bundle that fails is never published.
+  `webkit` converts a bundle's network rules to WebKit content-blocker
+  JSON for Tark for iOS (`ios/build.py lists`).
 
     cargo build --release --manifest-path android/adblock/listtool/Cargo.toml
     python3 android/adblock/bundle.py build --out build/adblock
