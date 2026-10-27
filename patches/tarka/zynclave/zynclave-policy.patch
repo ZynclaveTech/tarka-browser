@@ -1,0 +1,96 @@
+--- a/chrome/browser/tark_zynclave/zynclave_auth_unittest.cc
++++ b/chrome/browser/tark_zynclave/zynclave_auth_unittest.cc
+@@ -455,3 +455,35 @@
+ 
+ }  // namespace
+ }  // namespace tark_zynclave
++
++namespace tark_zynclave {
++namespace {
++
++// The ZynclaveSignInAllowed policy turned off: forgotten here, no request.
++TEST_F(TarkZynclaveAuth, PolicyOffSignsOutLocally) {
++  auto auth = MakeAuth();
++  SignIn(*auth);
++  auth->SignOutLocally();
++  task_env_.RunUntilIdle();
++  EXPECT_EQ(auth->state(), ZynclaveState::kSignedOut);
++  EXPECT_FALSE(auth->account());
++  EXPECT_TRUE(prefs_.GetString(kTokensPref).empty());
++  EXPECT_EQ(loaders_.NumPending(), 0);
++  EXPECT_EQ(opened_.size(), 1u);
++}
++
++TEST_F(TarkZynclaveAuth, PolicyOffForgetsPendingSignIns) {
++  auto auth = MakeAuth();
++  auto [state, nonce] = Start(*auth);
++  auth->SignOutLocally();
++  EXPECT_FALSE(auth->HandleRedirect(Redirect("code=c&state=" + state)));
++}
++
++TEST(TarkZynclavePrefs, AllowedByDefault) {
++  TestingPrefServiceSimple prefs;
++  RegisterZynclavePrefs(prefs.registry());
++  EXPECT_TRUE(prefs.GetBoolean(kAllowedPref));
++}
++
++}  // namespace
++}  // namespace tark_zynclave
+--- a/chrome/browser/policy/configuration_policy_handler_list_factory.cc
++++ b/chrome/browser/policy/configuration_policy_handler_list_factory.cc
+@@ -2,6 +2,7 @@
+ // Use of this source code is governed by a BSD-style license that can be
+ // found in the LICENSE file.
+ 
++#include "chrome/browser/tark_zynclave/zynclave_prefs.h"
+ #include "chrome/browser/policy/configuration_policy_handler_list_factory.h"
+ 
+ #include <limits.h>
+@@ -535,6 +536,9 @@
+   { key::kRemoteDebuggingAllowed,
+     prefs::kDevToolsRemoteDebuggingAllowed,
+     base::Value::Type::BOOLEAN },
++  { key::kZynclaveSignInAllowed,
++    tark_zynclave::kAllowedPref,
++    base::Value::Type::BOOLEAN },
+ // Policies for all platforms - End
+ #if BUILDFLAG(IS_ANDROID)
+   { key::kAccessibilityPerformanceFilteringAllowed,
+--- a/components/policy/resources/templates/policies.yaml
++++ b/components/policy/resources/templates/policies.yaml
+@@ -1488,6 +1488,7 @@
+   1487: DeviceMaxUserProfiles
+   1488: ""
+   1489: LaunchOnStartupEnabled
++  1490: ZynclaveSignInAllowed
+ 
+ atomic_groups:
+   1: Homepage
+--- /dev/null
++++ b/components/policy/resources/templates/policy_definitions/Miscellaneous/ZynclaveSignInAllowed.yaml
+@@ -0,0 +1,25 @@
++caption: Allow Sign in with Zynclave
++default: true
++desc: |-
++  Controls whether people can sign in to <ph name="PRODUCT_NAME">$1<ex>Google Chrome</ex></ph> with a Zynclave Account.
++
++  When this policy is set to Enabled or not set, people can sign in from Settings > Profile, and <ph name="PRODUCT_NAME">$1<ex>Google Chrome</ex></ph> may offer to sign in after they visit Zynclave's account pages.
++
++  When this policy is set to Disabled, there is no sign-in, no offer and no request to Zynclave, and an account already signed in is signed out on this device.
++example_value: false
++features:
++  dynamic_refresh: true
++  per_profile: true
++items:
++- caption: Allow signing in with a Zynclave Account
++  value: true
++- caption: Do not allow signing in with a Zynclave Account
++  value: false
++owners:
++- file://components/policy/OWNERS
++schema:
++  type: boolean
++supported_on:
++- chrome.*:156-
++tags: []
++type: main

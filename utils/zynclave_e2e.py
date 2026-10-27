@@ -5,7 +5,7 @@
 """End-to-end checks of desktop Sign in with Zynclave on the Mac.
 
     zynclave_e2e.py APP [CASES...]
-        cases: card_signed_out sign_in_page stray_redirect
+        cases: card_signed_out sign_in_page stray_redirect policy_known
 
 Launches APP (a dev build, so Zynclave staging) on a fresh profile with
 DevTools on a local port, as utils/adblock_e2e.py does, and checks:
@@ -16,6 +16,7 @@ DevTools on a local port, as utils/adblock_e2e.py does, and checks:
                    com.gettarka.tarka:/oauth2redirect?code=x&state=y does
                    nothing: the tab stays where it was, no tab opens, and
                    Tark stays signed out.
+  policy_known     chrome://policy knows ZynclaveSignInAllowed.
 Prints "ok …" / "FAIL …"; exits 1 if any check fails.
 """
 
@@ -121,6 +122,21 @@ def run_case(app, name):
             text = card_text(e2e.settings_tab())
             failed += report(bool(text) and 'Sign in with Zynclave' in text, f'{name} still signed out')
             return failed
+        if name == 'policy_known':
+            browser.open('chrome://policy/')
+            # All text, through shadow roots, after ticking "Show policies
+            # with no value set".
+            script = ("(() => { const all = []; const walk = r => { for (const n of r.querySelectorAll('*')) {"
+                      " if (n.id === 'show-unset' && !n.checked) n.click();"
+                      " if (n.shadowRoot) walk(n.shadowRoot); } all.push(r.textContent || ''); };"
+                      " walk(document); return all.join(' ').includes('ZynclaveSignInAllowed'); })()")
+            end = time.time() + 40
+            while time.time() < end:
+                tab = next((t for t in tabs() if t.get('url', '').startswith('chrome://policy')), None)
+                if tab and e2e.evaluate(tab['webSocketDebuggerUrl'], script):
+                    return report(True, name)
+                time.sleep(2)
+            return report(False, name, 'not listed')
         return report(False, name, 'unknown case')
     finally:
         browser.close()
@@ -129,7 +145,7 @@ def run_case(app, name):
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument('app')
-    ap.add_argument('cases', nargs='*', default=['card_signed_out', 'sign_in_page', 'stray_redirect'])
+    ap.add_argument('cases', nargs='*', default=['card_signed_out', 'sign_in_page', 'stray_redirect', 'policy_known'])
     args = ap.parse_args(argv)
     socketserver.ThreadingTCPServer.allow_reuse_address = True
     server = socketserver.ThreadingTCPServer(('127.0.0.1', PORT), StrayHandler)
