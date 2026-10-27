@@ -1,0 +1,464 @@
+diff --git a/BrowserKit/Package.swift b/BrowserKit/Package.swift
+index 61477f1..17564c5 100644
+--- a/BrowserKit/Package.swift
++++ b/BrowserKit/Package.swift
+@@ -109,6 +109,23 @@ let package = Package(
+         .target(
+             name: "TarkAdblock",
+             dependencies: ["TarkAdblockFFI"]),
++        // Tark: D1 transliteration (tark_xlit, the C++ the Mac and Android ship)
++        // behind ios/xlit's //base shim and C interface; build.py xlit fills
++        // Sources/TarkXlitCore.
++        .target(
++            name: "TarkXlitCore",
++            exclude: ["shim/base"],
++            publicHeadersPath: "include",
++            cxxSettings: [
++                .headerSearchPath("engine"),
++                .headerSearchPath("shim"),
++                // Classic CBLAS: the new LAPACK headers need iOS 16.4.
++                .unsafeFlags(["-std=c++20", "-Wno-deprecated-declarations"]),
++            ],
++            linkerSettings: [.linkedFramework("Accelerate")]),
++        .target(
++            name: "TarkXlit",
++            dependencies: ["TarkXlitCore"]),
+         .target(
+             name: "Shared",
+             dependencies: ["Common"],
+@@ -158,6 +175,7 @@ let package = Package(
+             dependencies: ["Dip",
+                            "SwiftyBeaver",
+                            "TarkAdblock",
++                           "TarkXlit",
+                            .product(name: "Sentry-Dynamic", package: "sentry-cocoa")],
+             swiftSettings: [
+                 .unsafeFlags(["-enable-testing"]),
+diff --git a/BrowserKit/Sources/TarkXlit/TarkTransliteration.swift b/BrowserKit/Sources/TarkXlit/TarkTransliteration.swift
+new file mode 100644
+index 0000000..3b0ba6a
+--- /dev/null
++++ b/BrowserKit/Sources/TarkXlit/TarkTransliteration.swift
+@@ -0,0 +1,92 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++import Foundation
++import TarkXlitCore
++
++/// Tark: D1 for the address bar. Type `namaste`, get नमस्ते in the Indian
++/// languages chosen from the phone's languages (Hindi if none), computed on
++/// the phone by tark_xlit; nothing typed leaves the phone. The files come
++/// from TarkXlitDownloader after the person says yes once.
++public final class TarkTransliteration: @unchecked Sendable {
++    public struct Language: Decodable, Equatable, Sendable {
++        public let tag: String
++        public let name: String
++    }
++
++    public struct Row: Sendable {
++        public let text: String
++        public let language: Language
++    }
++
++    public static let shared = TarkTransliteration()
++
++    public let downloader = TarkXlitDownloader()
++    private let queue = DispatchQueue(label: "com.gettarka.xlit")
++    private var handle: OpaquePointer?
++    private var loadedTags: [String] = []
++
++    deinit {
++        if let handle { tark_xlit_free(handle) }
++    }
++
++    /// The languages to offer, best first, from iOS's preferred languages
++    /// (tark_xlit::RowLanguages, as on the Mac and Android).
++    public static func languages(preferred: [String] = Locale.preferredLanguages) -> [Language] {
++        let acceptLanguages = preferred.joined(separator: ",")
++        guard let json = acceptLanguages.withCString({ tark_xlit_row_languages($0) }) else { return [] }
++        defer { tark_xlit_string_free(json) }
++        return (try? JSONDecoder().decode([Language].self, from: Data(String(cString: json).utf8))) ?? []
++    }
++
++    /// Whether `text` might be an Indian-language phrase typed in Latin letters.
++    public static func looksTransliterable(_ text: String) -> Bool {
++        return text.withCString { tark_xlit_looks_transliterable($0) } == 1
++    }
++
++    /// The languages whose files are downloaded and checked.
++    public func readyLanguages() -> [Language] {
++        return Self.languages().filter { downloader.isReady($0.tag) }
++    }
++
++    /// `input` in each ready language, best language first. Off the main
++    /// thread; the completion runs there.
++    public func rows(for input: String, completion: @escaping @MainActor @Sendable ([Row]) -> Void) {
++        queue.async { [self] in
++            let languages = readyLanguages()
++            guard !languages.isEmpty, Self.looksTransliterable(input), let handle = load(languages) else {
++                Task { @MainActor in completion([]) }
++                return
++            }
++            let rows: [Row] = languages.compactMap { language in
++                let phrase = input.withCString { text in
++                    language.tag.withCString { tag in tark_xlit_phrase(handle, text, tag) }
++                }
++                guard let phrase else { return nil }
++                defer { tark_xlit_string_free(phrase) }
++                return Row(text: String(cString: phrase), language: language)
++            }
++            Task { @MainActor in completion(rows) }
++        }
++    }
++
++    /// The engine over the model and these languages' word lists, loaded
++    /// again only when the set of languages changes. On `queue`.
++    private func load(_ languages: [Language]) -> OpaquePointer? {
++        let tags = languages.map(\.tag)
++        if let handle, tags == loadedTags { return handle }
++        if let handle { tark_xlit_free(handle) }
++        handle = nil
++        let model = downloader.path(TarkXlitDownloader.modelName).path
++        let words = tags.map { downloader.path(TarkXlitDownloader.wordsName($0)).path }
++        let pointers = words.map { strdup($0) }
++        defer { pointers.forEach { free($0) } }
++        let constPointers = pointers.map { UnsafePointer<CChar>($0) }
++        handle = constPointers.withUnsafeBufferPointer { buffer in
++            model.withCString { tark_xlit_new($0, buffer.baseAddress, buffer.count) }
++        }
++        loadedTags = handle == nil ? [] : tags
++        return handle
++    }
++}
+diff --git a/BrowserKit/Sources/TarkXlit/TarkXlitDownloader.swift b/BrowserKit/Sources/TarkXlit/TarkXlitDownloader.swift
+new file mode 100644
+index 0000000..495a21f
+--- /dev/null
++++ b/BrowserKit/Sources/TarkXlit/TarkXlitDownloader.swift
+@@ -0,0 +1,124 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++import CryptoKit
++import Foundation
++import Network
++
++/// Tark: the IndicXlit files, as Tark for Android downloads them (A3): the
++/// shared model and one word list per language, content-addressed on
++/// gettarka.com and checked against the size and sha256 compiled into the
++/// app (TarkXlitFiles). A file that does not match is deleted.
++public final class TarkXlitDownloader: NSObject, @unchecked Sendable, URLSessionTaskDelegate {
++    public static let baseURL = URL(string: "https://gettarka.com/xlit/android/v1/")!
++    static let modelName = "xlit-model.bin"
++    private static let triesPerRun = 3
++
++    public static func wordsName(_ tag: String) -> String {
++        return "xlit-words-\(tag).bin"
++    }
++
++    /// Application Support/tark-xlit, kept out of backups.
++    public let directory: URL
++    private lazy var session = URLSession(configuration: .ephemeral, delegate: self, delegateQueue: nil)
++
++    public init(directory: URL? = nil) {
++        let base = directory ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
++            .appendingPathComponent("tark-xlit", isDirectory: true)
++        try? FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
++        var values = URLResourceValues()
++        values.isExcludedFromBackup = true
++        var excluded = base
++        try? excluded.setResourceValues(values)
++        self.directory = base
++    }
++
++    public func path(_ name: String) -> URL {
++        return directory.appendingPathComponent(name)
++    }
++
++    /// The files `tag` needs, all present and checked.
++    public func isReady(_ tag: String) -> Bool {
++        return [Self.modelName, Self.wordsName(tag)].allSatisfy(isVerified)
++    }
++
++    /// Whether the file is there with the size and hash the app pins. A
++    /// "<name>.sha256" record beside it saves hashing it on every start.
++    func isVerified(_ name: String) -> Bool {
++        guard let pinned = TarkXlitFiles.table[name] else { return false }
++        let file = path(name)
++        let record = path(name + ".sha256")
++        guard let attributes = try? FileManager.default.attributesOfItem(atPath: file.path),
++              (attributes[.size] as? NSNumber)?.int64Value == pinned.size else { return false }
++        if (try? String(contentsOf: record, encoding: .utf8)) == pinned.sha256 { return true }
++        guard Self.sha256(of: file) == pinned.sha256 else {
++            try? FileManager.default.removeItem(at: file)
++            return false
++        }
++        try? pinned.sha256.write(to: record, atomically: true, encoding: .utf8)
++        return true
++    }
++
++    /// Downloads what `tag` still needs. Cellular or a constrained network
++    /// waits unless `now` (the person chose "Download now").
++    public func download(_ tag: String, now: Bool) async -> Bool {
++        if !now, await !Self.isUnmeteredNetwork() { return false }
++        for name in [Self.modelName, Self.wordsName(tag)] where !isVerified(name) {
++            var done = false
++            for _ in 0..<Self.triesPerRun where !done {
++                done = await fetch(name)
++            }
++            if !done { return false }
++        }
++        return isReady(tag)
++    }
++
++    private func fetch(_ name: String) async -> Bool {
++        guard let pinned = TarkXlitFiles.table[name] else { return false }
++        let url = Self.baseURL.appendingPathComponent("\(pinned.sha256).bin")
++        guard let (temporary, response) = try? await session.download(from: url),
++              (response as? HTTPURLResponse)?.statusCode == 200 else { return false }
++        defer { try? FileManager.default.removeItem(at: temporary) }
++        guard Self.sha256(of: temporary) == pinned.sha256 else { return false }
++        let file = path(name)
++        try? FileManager.default.removeItem(at: file)
++        guard (try? FileManager.default.moveItem(at: temporary, to: file)) != nil else { return false }
++        try? pinned.sha256.write(to: path(name + ".sha256"), atomically: true, encoding: .utf8)
++        return true
++    }
++
++    /// Never follows a redirect: the files come from gettarka.com only.
++    public func urlSession(_ session: URLSession,
++                           task: URLSessionTask,
++                           willPerformHTTPRedirection response: HTTPURLResponse,
++                           newRequest request: URLRequest) async -> URLRequest? {
++        return nil
++    }
++
++    static func sha256(of file: URL) -> String? {
++        guard let handle = try? FileHandle(forReadingFrom: file) else { return nil }
++        defer { try? handle.close() }
++        var hasher = SHA256()
++        while let chunk = try? handle.read(upToCount: 1 << 20), !chunk.isEmpty {
++            hasher.update(data: chunk)
++        }
++        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
++    }
++
++    static func isUnmeteredNetwork() async -> Bool {
++        await withCheckedContinuation { continuation in
++            let monitor = NWPathMonitor()
++            // The handler can run more than once; only the first answers. It
++            // runs on the monitor's serial queue, so the flag needs no lock.
++            nonisolated(unsafe) var answered = false
++            monitor.pathUpdateHandler = { path in
++                guard !answered else { return }
++                answered = true
++                monitor.cancel()
++                continuation.resume(returning: path.status == .satisfied && !path.isExpensive && !path.isConstrained)
++            }
++            monitor.start(queue: DispatchQueue(label: "com.gettarka.xlit.path"))
++        }
++    }
++}
+diff --git a/firefox-ios/Client/Frontend/Browser/Search/SearchViewController.swift b/firefox-ios/Client/Frontend/Browser/Search/SearchViewController.swift
+index 5335039..525be30 100644
+--- a/firefox-ios/Client/Frontend/Browser/Search/SearchViewController.swift
++++ b/firefox-ios/Client/Frontend/Browser/Search/SearchViewController.swift
+@@ -486,6 +486,10 @@ class SearchViewController: SiteTableViewController,
+                   let suggestion = suggestions[safe: indexPath.row],
+                   let url = defaultEngine.searchURLForQuery(suggestion)
+             else { return }
++            if suggestion == viewModel.tarkOfferText {
++                presentTarkOffer()
++                return
++            }
+ 
+             let extras = [
+                 ExtraKey.recordSearchLocation.rawValue: SearchLocation.suggestion,
+@@ -677,7 +681,9 @@ class SearchViewController: SiteTableViewController,
+             return viewModel.shouldShowTrendingSearches ? viewModel.trendingSearches.count : 0
+         case .searchSuggestions:
+             guard let count = viewModel.suggestions?.count else { return 0 }
+-            return count < 4 ? count : 4
++            // Tark: room for the language rows and the offer row.
++            let tarkRows = viewModel.tarkLabels.count + (viewModel.tarkOffer == nil ? 0 : 1)
++            return min(count, 4 + tarkRows)
+         case .openedTabs:
+             return !viewModel.isZeroSearchState ? viewModel.filteredOpenedTabs.count : 0
+         case .remoteTabs:
+@@ -706,7 +712,8 @@ class SearchViewController: SiteTableViewController,
+             let suggestion = viewModel.historySites[indexPath.item]
+             searchDelegate?.searchViewController(self, didHighlightText: suggestion.url, search: false)
+         case .searchSuggestions:
+-            guard let suggestion = viewModel.suggestions?[indexPath.item] else { return }
++            guard let suggestion = viewModel.suggestions?[indexPath.item],
++                  suggestion != viewModel.tarkOfferText else { return }
+             searchDelegate?.searchViewController(self, didHighlightText: suggestion, search: false)
+         case .remoteTabs:
+             let suggestion = viewModel.remoteClientTabs[indexPath.item]
+@@ -773,10 +780,11 @@ class SearchViewController: SiteTableViewController,
+             if let site = viewModel.suggestions?[indexPath.row] {
+                 let oneLineCellViewModel = oneLineCellModelForSearch(
+                     with: site,
+-                    shouldShowAccessoryView: indexPath.row > 0
++                    shouldShowAccessoryView: indexPath.row > 0 && !viewModel.isTarkRow(site)
+                 )
+                 oneLineCell.configure(viewModel: oneLineCellViewModel)
+-                if Locale.current.languageCode == "en",
++                showTarkLanguage(of: site, in: oneLineCell)
++                if Locale.current.languageCode == "en", viewModel.tarkLabels[site] == nil,
+                    let attributedString = getAttributedBoldSearchSuggestions(
+                     searchPhrase: site,
+                     query: viewModel.savedQuery
+@@ -1065,3 +1073,45 @@ private class ButtonScrollView: UIScrollView {
+         return true
+     }
+ }
++
++// MARK: - Tark: the one-time offer to type in your language
++
++extension SearchViewController {
++    /// A language row shows its language at the edge.
++    func showTarkLanguage(of row: String, in cell: OneLineTableViewCell) {
++        guard let language = viewModel.tarkLabels[row] else { return }
++        let label = UILabel()
++        label.text = language
++        label.font = .preferredFont(forTextStyle: .footnote)
++        label.textColor = .secondaryLabel
++        label.sizeToFit()
++        cell.accessoryView = label
++    }
++
++    func presentTarkOffer() {
++        guard let language = viewModel.tarkOffer else { return }
++        let sheet = UIAlertController(
++            title: "Type in \(language.name)?",
++            message: "Tark downloads about 25 MB once from gettarka.com. What you type is turned "
++                + "into \(language.name) on your phone and never sent anywhere.",
++            preferredStyle: .actionSheet)
++        sheet.addAction(UIAlertAction(title: "Download on Wi-Fi", style: .default) { [weak self] _ in
++            self?.viewModel.answerTarkOffer(yes: true, now: false)
++            self?.reloadData()
++        })
++        sheet.addAction(UIAlertAction(title: "Download now", style: .default) { [weak self] _ in
++            self?.viewModel.answerTarkOffer(yes: true, now: true)
++            self?.reloadData()
++        })
++        sheet.addAction(UIAlertAction(title: "Not now", style: .cancel) { [weak self] _ in
++            self?.viewModel.answerTarkOffer(yes: false, now: false)
++            self?.reloadData()
++        })
++        if traitCollection.userInterfaceIdiom == .pad, let popover = sheet.popoverPresentationController {
++            popover.sourceView = view
++            popover.sourceRect = CGRect(x: view.bounds.midX, y: view.bounds.midY, width: 0, height: 0)
++            popover.permittedArrowDirections = []
++        }
++        present(sheet, animated: true)
++    }
++}
+diff --git a/firefox-ios/Client/Frontend/Browser/Search/SearchViewModel.swift b/firefox-ios/Client/Frontend/Browser/Search/SearchViewModel.swift
+index 51bfa89..4ca7ed8 100644
+--- a/firefox-ios/Client/Frontend/Browser/Search/SearchViewModel.swift
++++ b/firefox-ios/Client/Frontend/Browser/Search/SearchViewModel.swift
+@@ -6,6 +6,7 @@ import Foundation
+ import Storage
+ import Shared
+ import Common
++import TarkXlit
+ import class MozillaAppServices.FeatureHolder
+ 
+ protocol SearchViewDelegate: AnyObject {
+@@ -36,6 +37,11 @@ class SearchViewModel: FeatureFlaggable,
+     var recentSearches = [String]()
+     let model: SearchEnginesManager
+     var suggestions: [String]? = []
++    /// Tark: language names of the transliteration rows, by row text.
++    var tarkLabels: [String: String] = [:]
++    /// Tark: the language the one-time offer row is for, while it shows.
++    var tarkOffer: TarkTransliteration.Language?
++    @MainActor static var tarkDownloading = false
+     static var userAgent: String?
+     var searchFeature: FeatureHolder<Search>
+     private var searchTelemetry: SearchTelemetry
+@@ -292,6 +298,7 @@ class SearchViewModel: FeatureFlaggable,
+                 self.savedQuery = tempSearchQuery
+                 self.searchTelemetry.savedQuery = tempSearchQuery
+                 self.delegate?.reloadTableView()
++                self.addTarkRows(for: tempSearchQuery)
+             }
+         })
+     }
+@@ -561,3 +568,71 @@ fileprivate extension String {
+         return self.contains("/") && !self.contains(" ")
+     }
+ }
++
++// MARK: - Tark: your language (D1)
++
++extension SearchViewModel {
++    /// Whether the person has answered the one-time offer: "yes", "no", or nil.
++    static let tarkXlitAnswerKey = "tark.xlit.answer"
++
++    /// A language row or the offer row: neither fills the address bar.
++    func isTarkRow(_ row: String) -> Bool {
++        return tarkLabels[row] != nil || row == tarkOfferText
++    }
++
++    /// The offer row's text, "Type in हिन्दी?", when it shows.
++    var tarkOfferText: String? {
++        return tarkOffer.map { "Type in \($0.name)?" }
++    }
++
++    /// Adds, after the row for what was typed, the phrase in each ready
++    /// Indian language, or the one-time offer row while nothing is ready.
++    @MainActor
++    func addTarkRows(for query: String) {
++        tarkLabels = [:]
++        tarkOffer = nil
++        guard !query.isEmpty, !query.looksLikeAURL(), TarkTransliteration.looksTransliterable(query) else { return }
++        let xlit = TarkTransliteration.shared
++        let answer = UserDefaults.standard.string(forKey: Self.tarkXlitAnswerKey)
++        if answer == nil, xlit.readyLanguages().isEmpty, let first = TarkTransliteration.languages().first {
++            tarkOffer = first
++            let at = min(1, suggestions?.count ?? 0)
++            if let text = tarkOfferText { suggestions?.insert(text, at: at) }
++            delegate?.reloadTableView()
++            return
++        }
++        if answer == "yes" { startTarkDownload(now: false) }
++        xlit.rows(for: query) { [weak self] rows in
++            guard let self, self.searchQuery == query, !rows.isEmpty else { return }
++            var at = min(1, self.suggestions?.count ?? 0)
++            for row in rows where row.text != query && self.suggestions?.contains(row.text) == false {
++                self.suggestions?.insert(row.text, at: at)
++                self.tarkLabels[row.text] = row.language.name
++                at += 1
++            }
++            self.delegate?.reloadTableView()
++        }
++    }
++
++    /// The person's answer to the offer. "Download now" ignores the Wi-Fi rule.
++    @MainActor
++    func answerTarkOffer(yes: Bool, now: Bool) {
++        UserDefaults.standard.set(yes ? "yes" : "no", forKey: Self.tarkXlitAnswerKey)
++        if let offer = tarkOfferText { suggestions?.removeAll { $0 == offer } }
++        tarkOffer = nil
++        if yes { startTarkDownload(now: now) }
++    }
++
++    @MainActor
++    private func startTarkDownload(now: Bool) {
++        guard !Self.tarkDownloading else { return }
++        Self.tarkDownloading = true
++        let tags = TarkTransliteration.languages().map(\.tag)
++        Task.detached {
++            for tag in tags {
++                _ = await TarkTransliteration.shared.downloader.download(tag, now: now)
++            }
++            await MainActor.run { Self.tarkDownloading = false }
++        }
++    }
++}
