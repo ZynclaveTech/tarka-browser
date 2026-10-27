@@ -1,0 +1,733 @@
+--- a/chrome/browser/BUILD.gn
++++ b/chrome/browser/BUILD.gn
+@@ -1684,6 +1684,7 @@
+       "//chrome/browser/tark_adblock:bundle",
+       "//chrome/browser/tark_adblock:switch",
+       "//chrome/browser/tark_zynclave:auth",
++      "//chrome/browser/tark_zynclave:avatar",
+       "//chrome/browser/tark_zynclave:oidc",
+       "//chrome/common/tark_adblock:mojom",
+       "//third_party/brave_adblock",
+--- a/chrome/browser/tark_zynclave/BUILD.gn
++++ b/chrome/browser/tark_zynclave/BUILD.gn
+@@ -60,6 +60,26 @@
+   deps = [ "//net" ]
+ }
+ 
++# The account photo: fetched without cookies, decoded out of process, kept
++# as a PNG in the profile.
++static_library("avatar") {
++  sources = [
++    "zynclave_avatar.cc",
++    "zynclave_avatar.h",
++  ]
++  public_deps = [
++    ":oidc",
++    "//base",
++    "//services/network/public/cpp",
++    "//ui/gfx",
++  ]
++  deps = [
++    "//net",
++    "//services/data_decoder/public/cpp",
++    "//skia",
++  ]
++}
++
+ source_set("test_util") {
+   testonly = true
+   sources = [
+@@ -77,9 +97,13 @@
+     "oidc_unittest.cc",
+     "whoami_response_unittest.cc",
+     "zynclave_auth_unittest.cc",
++    "zynclave_avatar_unittest.cc",
+   ]
+   deps = [
+     ":auth",
++    ":avatar",
++    "//skia",
++    "//ui/gfx",
+     ":oidc",
+     ":test_util",
+     "//base",
+--- a/chrome/browser/tark_zynclave/DEPS
++++ b/chrome/browser/tark_zynclave/DEPS
+@@ -4,4 +4,7 @@
+   "+components/prefs",
+   "+services/network/public",
+   "+services/network/test",
++  "+services/data_decoder/public",
++  "+third_party/skia/include",
++  "+ui/gfx",
+ ]
+--- /dev/null
++++ b/chrome/browser/tark_zynclave/zynclave_avatar.cc
+@@ -0,0 +1,211 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/tark_zynclave/zynclave_avatar.h"
++
++#include <utility>
++
++#include "base/base64.h"
++#include "base/files/file_util.h"
++#include "base/files/important_file_writer.h"
++#include "base/functional/bind.h"
++#include "base/strings/strcat.h"
++#include "base/task/thread_pool.h"
++#include "chrome/browser/tark_zynclave/oidc.h"
++#include "net/traffic_annotation/network_traffic_annotation.h"
++#include "services/data_decoder/public/cpp/decode_image.h"
++#include "services/network/public/cpp/resource_request.h"
++#include "services/network/public/cpp/shared_url_loader_factory.h"
++#include "services/network/public/cpp/simple_url_loader.h"
++#include "third_party/skia/include/core/SkBitmap.h"
++#include "ui/gfx/codec/png_codec.h"
++#include "ui/gfx/image/image.h"
++
++namespace tark_zynclave {
++
++namespace {
++
++constexpr net::NetworkTrafficAnnotationTag kTrafficAnnotation =
++    net::DefineNetworkTrafficAnnotation("tark_zynclave_avatar", R"(
++      semantics {
++        sender: "Sign in with Zynclave"
++        description:
++          "Downloads the signed-in Zynclave account's photo, shown on the "
++          "profile button and in Settings."
++        trigger: "After signing in, when the account's photo changes."
++        data: "None: no cookies, no token; the photo's address only."
++        destination: OTHER
++        destination_other:
++          "Zynclave's avatar host or lh3-lh6.googleusercontent.com"
++      }
++      policy {
++        cookies_allowed: NO
++        setting: "Settings > Profile > Sign out."
++        chrome_policy {
++          ZynclaveSignInAllowed {
++            ZynclaveSignInAllowed: false
++          }
++        }
++      })");
++
++constexpr size_t kMaxBytes = 512 * 1024;
++
++base::FilePath Folder(const base::FilePath& profile_dir) {
++  return profile_dir.AppendASCII("Tark Zynclave");
++}
++
++std::optional<std::string> ReadFile(const base::FilePath& path) {
++  std::string text;
++  if (!base::ReadFileToStringWithMaxSize(path, &text, kMaxBytes * 4)) {
++    return std::nullopt;
++  }
++  return text;
++}
++
++// In the data decoder's process: the bytes come from the web.
++void DecodeIsolated(std::string bytes,
++                    base::OnceCallback<void(const SkBitmap&)> callback) {
++  data_decoder::DecodeImageIsolated(
++      base::as_byte_span(bytes), data_decoder::mojom::ImageCodec::kDefault,
++      /*shrink_to_fit=*/true, kMaxBytes * 4, gfx::Size(), std::move(callback));
++}
++
++}  // namespace
++
++ZynclaveAvatar::ZynclaveAvatar(
++    scoped_refptr<network::SharedURLLoaderFactory> url_loaders,
++    const base::FilePath& profile_dir,
++    ChangedCallback on_changed,
++    Decoder decoder)
++    : url_loaders_(std::move(url_loaders)),
++      dir_(Folder(profile_dir)),
++      on_changed_(std::move(on_changed)),
++      decoder_(decoder ? std::move(decoder) : base::BindRepeating(&DecodeIsolated)),
++      files_(base::ThreadPool::CreateSequencedTaskRunner(
++          {base::MayBlock(), base::TaskPriority::BEST_EFFORT,
++           base::TaskShutdownBehavior::BLOCK_SHUTDOWN})) {}
++
++ZynclaveAvatar::~ZynclaveAvatar() = default;
++
++std::string ZynclaveAvatar::DataUrl() const {
++  if (png_.empty()) {
++    return std::string();
++  }
++  return base::StrCat({"data:image/png;base64,", base::Base64Encode(png_)});
++}
++
++void ZynclaveAvatar::Update(const Userinfo* account) {
++  if (!account || !AllowedAvatarUrl(account->picture)) {
++    Clear();
++    return;
++  }
++  if (account->picture == url_) {
++    return;  // shown, or on its way
++  }
++  url_ = account->picture;
++  loader_.reset();
++  weak_factory_.InvalidateWeakPtrs();
++  // The photo kept from last time, if it is this one.
++  files_->PostTaskAndReplyWithResult(
++      FROM_HERE,
++      base::BindOnce(
++          [](base::FilePath dir) -> std::optional<Stored> {
++            std::optional<std::string> url = ReadFile(dir.AppendASCII("url"));
++            std::optional<std::string> png =
++                ReadFile(dir.AppendASCII("avatar.png"));
++            if (!url || !png) {
++              return std::nullopt;
++            }
++            return Stored{std::move(*url), std::move(*png)};
++          },
++          dir_),
++      base::BindOnce(&ZynclaveAvatar::OnStored, weak_factory_.GetWeakPtr(),
++                     url_));
++}
++
++void ZynclaveAvatar::OnStored(GURL url, std::optional<Stored> stored) {
++  if (stored && stored->url == url.spec()) {
++    decoder_.Run(std::move(stored->png),
++                 base::BindOnce(&ZynclaveAvatar::OnDecoded,
++                                weak_factory_.GetWeakPtr(), url,
++                                /*from_disk=*/true));
++    return;
++  }
++  Fetch(std::move(url));
++}
++
++void ZynclaveAvatar::Fetch(GURL url) {
++  auto request = std::make_unique<network::ResourceRequest>();
++  request->url = url;
++  request->credentials_mode = network::mojom::CredentialsMode::kOmit;
++  loader_ =
++      network::SimpleURLLoader::Create(std::move(request), kTrafficAnnotation);
++  loader_->SetTimeoutDuration(base::Seconds(20));
++  loader_->DownloadToString(
++      url_loaders_.get(),
++      base::BindOnce(&ZynclaveAvatar::OnFetched, weak_factory_.GetWeakPtr(),
++                     url),
++      kMaxBytes);
++}
++
++void ZynclaveAvatar::OnFetched(GURL url, std::optional<std::string> body) {
++  loader_.reset();
++  if (!body || body->empty()) {
++    return;
++  }
++  decoder_.Run(std::move(*body),
++               base::BindOnce(&ZynclaveAvatar::OnDecoded,
++                              weak_factory_.GetWeakPtr(), url,
++                              /*from_disk=*/false));
++}
++
++void ZynclaveAvatar::OnDecoded(GURL url,
++                               bool from_disk,
++                               const SkBitmap& bitmap) {
++  if (url != url_ || bitmap.drawsNothing()) {
++    return;
++  }
++  std::optional<std::vector<uint8_t>> png =
++      gfx::PNGCodec::EncodeBGRASkBitmap(bitmap,
++                                        /*discard_transparency=*/false);
++  if (!png) {
++    return;
++  }
++  png_.assign(png->begin(), png->end());
++  if (!from_disk) {
++    files_->PostTask(
++        FROM_HERE,
++        base::BindOnce(
++            [](base::FilePath dir, std::string url, std::string png) {
++              if (!base::CreateDirectory(dir)) {
++                return;
++              }
++              base::ImportantFileWriter::WriteFileAtomically(
++                  dir.AppendASCII("avatar.png"), png);
++              base::ImportantFileWriter::WriteFileAtomically(
++                  dir.AppendASCII("url"), url);
++            },
++            dir_, url.spec(), png_));
++  }
++  on_changed_.Run(gfx::Image::CreateFrom1xBitmap(bitmap));
++}
++
++void ZynclaveAvatar::Clear() {
++  loader_.reset();
++  weak_factory_.InvalidateWeakPtrs();
++  const bool had_photo = !png_.empty();
++  url_ = GURL();
++  png_.clear();
++  files_->PostTask(FROM_HERE,
++                   base::BindOnce(
++                       [](base::FilePath dir) {
++                         base::DeletePathRecursively(dir);
++                       },
++                       dir_));
++  if (had_photo) {
++    on_changed_.Run(gfx::Image());
++  }
++}
++
++}  // namespace tark_zynclave
+--- /dev/null
++++ b/chrome/browser/tark_zynclave/zynclave_avatar.h
+@@ -0,0 +1,89 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_TARK_ZYNCLAVE_ZYNCLAVE_AVATAR_H_
++#define CHROME_BROWSER_TARK_ZYNCLAVE_ZYNCLAVE_AVATAR_H_
++
++#include <memory>
++#include <optional>
++#include <string>
++#include <vector>
++
++#include "base/files/file_path.h"
++#include "base/functional/callback.h"
++#include "base/memory/scoped_refptr.h"
++#include "base/memory/weak_ptr.h"
++#include "base/task/sequenced_task_runner.h"
++#include "url/gurl.h"
++
++class SkBitmap;
++
++namespace gfx {
++class Image;
++}
++
++namespace network {
++class SharedURLLoaderFactory;
++class SimpleURLLoader;
++}  // namespace network
++
++namespace tark_zynclave {
++
++struct Userinfo;
++
++// The signed-in account's photo. Fetched from userinfo's picture only when
++// it is on the Zynclave avatar CDN or Google's lh3-lh6, without cookies, at
++// most 512 KB; decoded out of process and kept, re-encoded as PNG, in
++// <profile>/Tark Zynclave/avatar.png. Deleted on sign-out.
++class ZynclaveAvatar {
++ public:
++  // Called with the new photo, or an empty image when there is none.
++  using ChangedCallback = base::RepeatingCallback<void(const gfx::Image&)>;
++
++  // Decodes image bytes into a bitmap (empty on failure). By default the
++  // data decoder service, out of process; tests give their own.
++  using DecodeCallback = base::OnceCallback<void(const SkBitmap&)>;
++  using Decoder =
++      base::RepeatingCallback<void(std::string bytes, DecodeCallback)>;
++
++  ZynclaveAvatar(scoped_refptr<network::SharedURLLoaderFactory> url_loaders,
++                 const base::FilePath& profile_dir,
++                 ChangedCallback on_changed,
++                 Decoder decoder = {});
++  ZynclaveAvatar(const ZynclaveAvatar&) = delete;
++  ZynclaveAvatar& operator=(const ZynclaveAvatar&) = delete;
++  ~ZynclaveAvatar();
++
++  // The account changed (null: signed out).
++  void Update(const Userinfo* account);
++
++  // data:image/png;base64,..., or empty.
++  std::string DataUrl() const;
++
++ private:
++  struct Stored {
++    std::string url;
++    std::string png;
++  };
++  void OnStored(GURL url, std::optional<Stored> stored);
++  void Fetch(GURL url);
++  void OnFetched(GURL url, std::optional<std::string> body);
++  void OnDecoded(GURL url, bool from_disk, const SkBitmap& bitmap);
++  void Clear();
++
++  scoped_refptr<network::SharedURLLoaderFactory> url_loaders_;
++  const base::FilePath dir_;
++  ChangedCallback on_changed_;
++  Decoder decoder_;
++  scoped_refptr<base::SequencedTaskRunner> files_;
++
++  GURL url_;  // the photo being shown or fetched
++  std::string png_;
++  std::unique_ptr<network::SimpleURLLoader> loader_;
++  base::WeakPtrFactory<ZynclaveAvatar> weak_factory_{this};
++};
++
++}  // namespace tark_zynclave
++
++#endif  // CHROME_BROWSER_TARK_ZYNCLAVE_ZYNCLAVE_AVATAR_H_
+--- /dev/null
++++ b/chrome/browser/tark_zynclave/zynclave_avatar_unittest.cc
+@@ -0,0 +1,139 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/tark_zynclave/zynclave_avatar.h"
++
++#include <string>
++#include <vector>
++
++#include "base/files/file_util.h"
++#include "base/functional/callback_helpers.h"
++#include "base/files/scoped_temp_dir.h"
++#include "base/test/task_environment.h"
++#include "chrome/browser/tark_zynclave/oidc.h"
++#include "services/network/public/cpp/weak_wrapper_shared_url_loader_factory.h"
++#include "services/network/test/test_url_loader_factory.h"
++#include "testing/gtest/include/gtest/gtest.h"
++#include "third_party/skia/include/core/SkBitmap.h"
++#include "ui/gfx/codec/png_codec.h"
++#include "ui/gfx/image/image.h"
++
++namespace tark_zynclave {
++namespace {
++
++std::string Png() {
++  SkBitmap bitmap;
++  bitmap.allocN32Pixels(8, 8);
++  bitmap.eraseColor(SK_ColorRED);
++  std::optional<std::vector<uint8_t>> png =
++      gfx::PNGCodec::EncodeBGRASkBitmap(bitmap, /*discard_transparency=*/false);
++  return std::string(png->begin(), png->end());
++}
++
++// In-process PNG only; production decodes out of process.
++void DecodePng(std::string bytes,
++               base::OnceCallback<void(const SkBitmap&)> callback) {
++  std::move(callback).Run(gfx::PNGCodec::Decode(base::as_byte_span(bytes)));
++}
++
++class TarkZynclaveAvatar : public testing::Test {
++ protected:
++  TarkZynclaveAvatar() {
++    EXPECT_TRUE(dir_.CreateUniqueTempDir());
++    avatar_ = std::make_unique<ZynclaveAvatar>(
++        base::MakeRefCounted<network::WeakWrapperSharedURLLoaderFactory>(
++            &loaders_),
++        dir_.GetPath(),
++        base::BindRepeating([](int* n, const gfx::Image&) { ++*n; },
++                            &changes_),
++        base::BindRepeating(&DecodePng));
++  }
++
++  Userinfo Account(std::string_view picture) {
++    Userinfo info;
++    info.sub = "s";
++    info.picture = GURL(picture);
++    return info;
++  }
++
++  base::FilePath File() const {
++    return dir_.GetPath().AppendASCII("Tark Zynclave").AppendASCII(
++        "avatar.png");
++  }
++
++  base::test::TaskEnvironment task_env_;
++  base::ScopedTempDir dir_;
++  network::TestURLLoaderFactory loaders_;
++  int changes_ = 0;
++  std::unique_ptr<ZynclaveAvatar> avatar_;
++};
++
++TEST_F(TarkZynclaveAvatar, AvatarUrlRefusedIsNotFetched) {
++  Userinfo account = Account("https://evil.example.test/a.png");
++  avatar_->Update(&account);
++  task_env_.RunUntilIdle();
++  EXPECT_EQ(loaders_.NumPending(), 0);
++  EXPECT_EQ(loaders_.total_requests(), 0u);
++  EXPECT_TRUE(avatar_->DataUrl().empty());
++}
++
++TEST_F(TarkZynclaveAvatar, FetchesDecodesAndKeepsThePhoto) {
++  const char kUrl[] = "https://lh3.googleusercontent.com/a/x";
++  loaders_.AddResponse(kUrl, Png());
++  Userinfo account = Account(kUrl);
++  avatar_->Update(&account);
++  task_env_.RunUntilIdle();
++  ASSERT_EQ(loaders_.total_requests(), 1u);
++  EXPECT_EQ(loaders_.GetPendingRequest(0) ? 1 : 0, 0);
++  EXPECT_EQ(changes_, 1);
++  EXPECT_TRUE(avatar_->DataUrl().starts_with("data:image/png;base64,"));
++  EXPECT_TRUE(base::PathExists(File()));
++
++  // A relaunch reads it back without a request.
++  ZynclaveAvatar again(
++      base::MakeRefCounted<network::WeakWrapperSharedURLLoaderFactory>(
++          &loaders_),
++      dir_.GetPath(), base::DoNothing(), base::BindRepeating(&DecodePng));
++  again.Update(&account);
++  task_env_.RunUntilIdle();
++  EXPECT_EQ(loaders_.total_requests(), 1u);
++  EXPECT_FALSE(again.DataUrl().empty());
++}
++
++TEST_F(TarkZynclaveAvatar, TheRequestHasNoCookies) {
++  Userinfo account = Account("https://cdn.zynclave.com/u/1.png");
++  avatar_->Update(&account);
++  task_env_.RunUntilIdle();
++  ASSERT_EQ(loaders_.NumPending(), 1);
++  EXPECT_EQ(loaders_.pending_requests()->back().request.credentials_mode,
++            network::mojom::CredentialsMode::kOmit);
++}
++
++TEST_F(TarkZynclaveAvatar, ABrokenImageIsIgnored) {
++  const char kUrl[] = "https://lh4.googleusercontent.com/a/x";
++  loaders_.AddResponse(kUrl, "not an image");
++  Userinfo account = Account(kUrl);
++  avatar_->Update(&account);
++  task_env_.RunUntilIdle();
++  EXPECT_TRUE(avatar_->DataUrl().empty());
++  EXPECT_FALSE(base::PathExists(File()));
++  EXPECT_EQ(changes_, 0);
++}
++
++TEST_F(TarkZynclaveAvatar, SignOutDeletesAvatar) {
++  const char kUrl[] = "https://lh5.googleusercontent.com/a/x";
++  loaders_.AddResponse(kUrl, Png());
++  Userinfo account = Account(kUrl);
++  avatar_->Update(&account);
++  task_env_.RunUntilIdle();
++  ASSERT_TRUE(base::PathExists(File()));
++  avatar_->Update(nullptr);
++  task_env_.RunUntilIdle();
++  EXPECT_FALSE(base::PathExists(File()));
++  EXPECT_TRUE(avatar_->DataUrl().empty());
++  EXPECT_EQ(changes_, 2);
++}
++
++}  // namespace
++}  // namespace tark_zynclave
+--- a/chrome/browser/tark_zynclave/zynclave_sign_in_service.cc
++++ b/chrome/browser/tark_zynclave/zynclave_sign_in_service.cc
+@@ -8,6 +8,9 @@
+ 
+ #include "base/functional/bind.h"
+ #include "chrome/browser/browser_process.h"
++#include "chrome/browser/profiles/profile_attributes_entry.h"
++#include "chrome/browser/profiles/profile_attributes_storage.h"
++#include "chrome/browser/profiles/profile_manager.h"
+ #include "chrome/browser/net/system_network_context_manager.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/tark_zynclave/token_cipher.h"
+@@ -17,6 +20,7 @@
+ #include "components/os_crypt/async/browser/os_crypt_async.h"
+ #include "components/os_crypt/async/common/encryptor.h"
+ #include "components/prefs/pref_service.h"
++#include "ui/gfx/image/image.h"
+ #include "services/network/public/cpp/shared_url_loader_factory.h"
+ #include "ui/base/page_transition_types.h"
+ #include "ui/base/window_open_disposition.h"
+@@ -62,6 +66,15 @@
+           ->GetSharedURLLoaderFactory(),
+       base::BindRepeating(&ZynclaveSignInService::OpenUrl,
+                           base::Unretained(this)));
++  avatar_ = std::make_unique<ZynclaveAvatar>(
++      g_browser_process->system_network_context_manager()
++          ->GetSharedURLLoaderFactory(),
++      profile->GetPath(),
++      base::BindRepeating(&ZynclaveSignInService::OnPhotoChanged,
++                          base::Unretained(this)));
++  account_subscription_ = auth_->AddObserver(base::BindRepeating(
++      &ZynclaveSignInService::OnAccountChanged, base::Unretained(this)));
++  OnAccountChanged();
+   g_browser_process->os_crypt_async()->GetInstance(base::BindOnce(
+       &ZynclaveSignInService::OnEncryptor, weak_factory_.GetWeakPtr()));
+   pref_changes_.Init(profile->GetPrefs());
+@@ -78,10 +91,50 @@
+ }
+ 
+ void ZynclaveSignInService::Shutdown() {
++  account_subscription_ = {};
+   pref_changes_.RemoveAll();
+   weak_factory_.InvalidateWeakPtrs();
+ }
+ 
++std::string ZynclaveSignInService::PhotoDataUrl() const {
++  return avatar_->DataUrl();
++}
++
++bool ZynclaveSignInService::HasAccount() const {
++  return allowed() && auth_->account() &&
++         auth_->state() != ZynclaveState::kSignedOut;
++}
++
++void ZynclaveSignInService::OnAccountChanged() {
++  avatar_->Update(HasAccount() ? auth_->account() : nullptr);
++  observers_.Notify();
++}
++
++base::CallbackListSubscription ZynclaveSignInService::AddObserver(
++    base::RepeatingClosure observer) {
++  return observers_.Add(std::move(observer));
++}
++
++void ZynclaveSignInService::OnPhotoChanged(const gfx::Image& photo) {
++  // The profile's picture: the profile button, the profile menu and the
++  // profile picker all show it, as they do a Google account's.
++  ProfileManager* manager = g_browser_process->profile_manager();
++  ProfileAttributesEntry* entry =
++      manager ? manager->GetProfileAttributesStorage()
++                    .GetProfileAttributesWithPath(profile_->GetPath())
++              : nullptr;
++  if (entry) {
++    if (photo.IsEmpty()) {
++      entry->SetIsUsingGAIAPicture(false);
++      entry->SetGAIAPicture(std::string(), gfx::Image());
++    } else {
++      entry->SetGAIAPicture("tark-zynclave", photo);
++      entry->SetIsUsingGAIAPicture(true);
++    }
++  }
++  observers_.Notify();
++}
++
+ void ZynclaveSignInService::OnEncryptor(
+     scoped_refptr<os_crypt_async::Encryptor> encryptor) {
+   auth_->SetCipher(std::make_unique<OsCryptCipher>(std::move(encryptor)));
+@@ -91,6 +144,7 @@
+   if (!allowed() && auth_->state() != ZynclaveState::kSignedOut) {
+     auth_->SignOutLocally();
+   }
++  OnAccountChanged();
+ }
+ 
+ void ZynclaveSignInService::OpenUrl(const GURL& url) {
+--- a/chrome/browser/tark_zynclave/zynclave_sign_in_service.h
++++ b/chrome/browser/tark_zynclave/zynclave_sign_in_service.h
+@@ -7,10 +7,12 @@
+ 
+ #include <memory>
+ 
++#include "base/callback_list.h"
+ #include "base/memory/raw_ptr.h"
+ #include "base/memory/scoped_refptr.h"
+ #include "base/memory/weak_ptr.h"
+ #include "chrome/browser/tark_zynclave/zynclave_auth.h"
++#include "chrome/browser/tark_zynclave/zynclave_avatar.h"
+ #include "components/keyed_service/core/keyed_service.h"
+ #include "components/prefs/pref_change_registrar.h"
+ 
+@@ -37,6 +39,15 @@
+   // False when the ZynclaveSignInAllowed policy turns sign-in off.
+   bool allowed() const;
+ 
++  // The account photo as a data: URL for Settings, or empty.
++  std::string PhotoDataUrl() const;
++
++  // Signed in (or needing to sign in again): the profile button shows.
++  bool HasAccount() const;
++
++  // The account, its state or its photo changed.
++  base::CallbackListSubscription AddObserver(base::RepeatingClosure observer);
++
+   // KeyedService:
+   void Shutdown() override;
+ 
+@@ -44,10 +55,15 @@
+   void OpenUrl(const GURL& url);
+   void OnEncryptor(scoped_refptr<os_crypt_async::Encryptor> encryptor);
+   void OnAllowedChanged();
++  void OnAccountChanged();
++  void OnPhotoChanged(const gfx::Image& photo);
+ 
+   const raw_ptr<Profile> profile_;
+   std::unique_ptr<ZynclaveAuth> auth_;
++  std::unique_ptr<ZynclaveAvatar> avatar_;
++  base::CallbackListSubscription account_subscription_;
+   PrefChangeRegistrar pref_changes_;
++  base::RepeatingClosureList observers_;
+   base::WeakPtrFactory<ZynclaveSignInService> weak_factory_{this};
+ };
+ 
+--- a/chrome/browser/ui/views/toolbar/toolbar_view.cc
++++ b/chrome/browser/ui/views/toolbar/toolbar_view.cc
+@@ -2,6 +2,8 @@
+ // Use of this source code is governed by a BSD-style license that can be
+ // found in the LICENSE file.
+ 
++#include "chrome/browser/tark_zynclave/zynclave_sign_in_service.h"
++#include "chrome/browser/tark_zynclave/zynclave_sign_in_service_factory.h"
+ #include "chrome/browser/ui/views/toolbar/toolbar_view.h"
+ 
+ #include <algorithm>
+@@ -796,10 +798,24 @@
+     // downloads and menu (spec 5.1); the profile button shows only where it
+     // says something — "Private" in a private window, and in a guest
+     // window. --show-avatar-button=always brings it back.
+-    if (sab_value.empty())
++    tark_zynclave::ZynclaveSignInService* zynclave =
++        tark_zynclave::ZynclaveSignInServiceFactory::GetForProfile(
++            browser_->GetProfile());
++    if (sab_value.empty()) {
+       show_avatar_toolbar_button = browser_->GetProfile()->IsIncognitoProfile() ||
+-                                   browser_->GetProfile()->IsGuestSession();
+-    else if (sab_value == "always")
++                                   browser_->GetProfile()->IsGuestSession() ||
++                                   (zynclave && zynclave->HasAccount());
++      if (zynclave) {
++        zynclave_subscription_ = zynclave->AddObserver(base::BindRepeating(
++            [](ToolbarView* toolbar,
++               tark_zynclave::ZynclaveSignInService* service) {
++              if (toolbar->avatar_) {
++                toolbar->avatar_->SetVisible(service->HasAccount());
++              }
++            },
++            base::Unretained(this), base::Unretained(zynclave)));
++      }
++    } else if (sab_value == "always")
+       show_avatar_toolbar_button = true;
+     else if (sab_value == "incognito-and-guest")
+       show_avatar_toolbar_button = browser_->GetProfile()->IsIncognitoProfile() ||
+--- a/chrome/browser/ui/views/toolbar/toolbar_view.h
++++ b/chrome/browser/ui/views/toolbar/toolbar_view.h
+@@ -9,6 +9,7 @@
+ #include <optional>
+ #include <vector>
+ 
++#include "base/callback_list.h"
+ #include "base/gtest_prod_util.h"
+ #include "base/memory/raw_ptr.h"
+ #include "base/memory/weak_ptr.h"
+@@ -445,6 +446,9 @@
+   // `toolbar_webview_->GetPinnedActionsContainer()`.
+   raw_ptr<PinnedToolbarActions> pinned_toolbar_actions_ = nullptr;
+   raw_ptr<AvatarToolbarButton> avatar_ = nullptr;
++  // Tark: the profile button also shows while this profile is signed in to
++  // Zynclave, with the account's photo.
++  base::CallbackListSubscription zynclave_subscription_;
+   raw_ptr<MediaToolbarButton> media_button_ = nullptr;
+   raw_ptr<BrowserAppMenuButton> app_menu_button_ = nullptr;
+   raw_ptr<views::View> tab_well_ = nullptr;
+--- a/chrome/browser/ui/webui/settings/tark_zynclave_handler.cc
++++ b/chrome/browser/ui/webui/settings/tark_zynclave_handler.cc
+@@ -87,7 +87,7 @@
+ 
+ void TarkZynclaveHandler::OnJavascriptAllowed() {
+   if (tark_zynclave::ZynclaveSignInService* s = service()) {
+-    account_subscription_ = s->auth().AddObserver(base::BindRepeating(
++    account_subscription_ = s->AddObserver(base::BindRepeating(
+         &TarkZynclaveHandler::OnAccountChanged, base::Unretained(this)));
+   }
+ }
+@@ -110,8 +110,7 @@
+   const tark_zynclave::Userinfo* info = s ? s->auth().account() : nullptr;
+   account.Set("name", info ? info->name : std::string());
+   account.Set("email", info ? info->email : std::string());
+-  // The photo comes with the avatar cache (zynclave-ui.patch).
+-  account.Set("photo", std::string());
++  account.Set("photo", s ? s->PhotoDataUrl() : std::string());
+   return account;
+ }
+ 
