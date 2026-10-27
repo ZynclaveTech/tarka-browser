@@ -1,13 +1,14 @@
 diff --git a/BrowserKit/Sources/TarkXlit/TarkLanguagesViewController.swift b/BrowserKit/Sources/TarkXlit/TarkLanguagesViewController.swift
 new file mode 100644
-index 0000000..cd34bce
+index 0000000..d176323
 --- /dev/null
 +++ b/BrowserKit/Sources/TarkXlit/TarkLanguagesViewController.swift
-@@ -0,0 +1,119 @@
+@@ -0,0 +1,145 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
 +
++import Network
 +import UIKit
 +
 +/// Settings → Languages, as on Android: the switch for Indian-language
@@ -18,6 +19,9 @@ index 0000000..cd34bce
 +
 +    private let all = TarkTransliteration.allLanguages()
 +    private var chosen = TarkTransliteration.languages()
++    /// While the screen shows: a run that waited for Wi-Fi starts again when
++    /// the phone joins one.
++    private let pathMonitor = NWPathMonitor()
 +
 +    public init() {
 +        super.init(style: .insetGrouped)
@@ -35,6 +39,26 @@ index 0000000..cd34bce
 +        NotificationCenter.default.addObserver(
 +            self, selector: #selector(downloadsChanged), name: TarkTransliteration.didChangeNotification, object: nil
 +        )
++        pathMonitor.pathUpdateHandler = { path in
++            guard path.status == .satisfied, !path.isExpensive, !path.isConstrained else { return }
++            Task { @MainActor in
++                if TarkTransliteration.downloadState() == .waitingForWiFi {
++                    TarkTransliteration.startDownloads(now: false)
++                }
++            }
++        }
++        pathMonitor.start(queue: DispatchQueue(label: "com.gettarka.xlit.settings.path"))
++    }
++
++    override public func viewWillAppear(_ animated: Bool) {
++        super.viewWillAppear(animated)
++        // After a relaunch nothing has run yet: the screen shows a real state.
++        TarkTransliteration.startDownloads(now: false)
++    }
++
++    override public func viewDidDisappear(_ animated: Bool) {
++        super.viewDidDisappear(animated)
++        if isMovingFromParent || isBeingDismissed { pathMonitor.cancel() }
 +    }
 +
 +    override public func numberOfSections(in tableView: UITableView) -> Int {
@@ -117,17 +141,19 @@ index 0000000..cd34bce
 +    static func summary(_ state: TarkTransliteration.DownloadState) -> String {
 +        switch state {
 +        case .off: return "Off"
++        case .notDownloaded: return "Not downloaded yet"
 +        case .waitingForWiFi: return "Waiting for Wi-Fi"
++        case .failed: return "Couldn’t download. Tark tries again later."
 +        case .downloading: return "Downloading…"
 +        case .ready(let languages): return "Downloaded: " + languages.map(\.name).joined(separator: ", ")
 +        }
 +    }
 +}
 diff --git a/BrowserKit/Sources/TarkXlit/TarkTransliteration.swift b/BrowserKit/Sources/TarkXlit/TarkTransliteration.swift
-index 3b0ba6a..b0b31d2 100644
+index 3b0ba6a..22d55f8 100644
 --- a/BrowserKit/Sources/TarkXlit/TarkTransliteration.swift
 +++ b/BrowserKit/Sources/TarkXlit/TarkTransliteration.swift
-@@ -31,15 +31,98 @@ public final class TarkTransliteration: @unchecked Sendable {
+@@ -31,15 +31,109 @@ public final class TarkTransliteration: @unchecked Sendable {
          if let handle { tark_xlit_free(handle) }
      }
  
@@ -186,14 +212,18 @@ index 3b0ba6a..b0b31d2 100644
  
 +    /// Where the downloads stand, for Settings → Languages.
 +    public enum DownloadState: Equatable {
-+        case off, waitingForWiFi, downloading, ready([Language])
++        /// On, with files missing and no run since the app started.
++        case notDownloaded
++        case off, waitingForWiFi, downloading, failed, ready([Language])
 +    }
 +
-+    /// Posted on the main thread when a download run ends.
++    /// Posted on the main thread when a download run starts or ends.
 +    public static let didChangeNotification = Notification.Name("TarkXlitDidChange")
 +
 +    @MainActor private static var downloading = false
-+    @MainActor private static var waiting = false
++    /// How the last run ended short of every file, or nil: kept in memory, so
++    /// after a relaunch the state is `notDownloaded` until a run starts.
++    @MainActor private static var lastProblem: TarkXlitDownloader.Outcome?
 +
 +    @MainActor
 +    public static func downloadState() -> DownloadState {
@@ -201,7 +231,11 @@ index 3b0ba6a..b0b31d2 100644
 +        if downloading { return .downloading }
 +        let ready = shared.readyLanguages()
 +        if ready.count == languages().count { return .ready(ready) }
-+        return waiting ? .waitingForWiFi : .downloading
++        switch lastProblem {
++        case .waitingForWiFi: return .waitingForWiFi
++        case .failed: return .failed
++        case .ready, nil: return .notDownloaded
++        }
 +    }
 +
 +    /// Downloads what the chosen languages still need. "Download now" (`now`)
@@ -210,19 +244,22 @@ index 3b0ba6a..b0b31d2 100644
 +    public static func startDownloads(now: Bool) {
 +        guard isOn, !downloading else { return }
 +        downloading = true
++        NotificationCenter.default.post(name: didChangeNotification, object: nil)
 +        let tags = languages().map(\.tag)
 +        Task.detached {
-+            var allDone = true
++            var problem: TarkXlitDownloader.Outcome?
 +            for tag in tags {
-+                let done = await shared.downloader.download(tag, now: now)
-+                allDone = allDone && done
++                let outcome = await shared.downloader.download(tag, now: now)
++                if outcome != .ready { problem = outcome }
++                // Without Wi-Fi the other languages would wait too.
++                if outcome == .waitingForWiFi { break }
 +            }
 +            await MainActor.run {
 +                downloading = false
-+                waiting = !allDone && !now
++                lastProblem = problem
 +                NotificationCenter.default.post(name: didChangeNotification, object: nil)
 +                // A language chosen while this run was going still needs its list.
-+                if allDone, languages().map(\.tag) != tags { startDownloads(now: now) }
++                if problem == nil, languages().map(\.tag) != tags { startDownloads(now: now) }
 +            }
 +        }
 +    }
@@ -230,6 +267,41 @@ index 3b0ba6a..b0b31d2 100644
      /// Whether `text` might be an Indian-language phrase typed in Latin letters.
      public static func looksTransliterable(_ text: String) -> Bool {
          return text.withCString { tark_xlit_looks_transliterable($0) } == 1
+diff --git a/BrowserKit/Sources/TarkXlit/TarkXlitDownloader.swift b/BrowserKit/Sources/TarkXlit/TarkXlitDownloader.swift
+index 495a21f..ea68f83 100644
+--- a/BrowserKit/Sources/TarkXlit/TarkXlitDownloader.swift
++++ b/BrowserKit/Sources/TarkXlit/TarkXlitDownloader.swift
+@@ -60,18 +60,26 @@ public final class TarkXlitDownloader: NSObject, @unchecked Sendable, URLSession
+         return true
+     }
+ 
++    public enum Outcome: Sendable {
++        case ready
++        /// Not tried: cellular or a constrained network, without "Download now".
++        case waitingForWiFi
++        /// Tried and did not get verified files.
++        case failed
++    }
++
+     /// Downloads what `tag` still needs. Cellular or a constrained network
+     /// waits unless `now` (the person chose "Download now").
+-    public func download(_ tag: String, now: Bool) async -> Bool {
+-        if !now, await !Self.isUnmeteredNetwork() { return false }
++    public func download(_ tag: String, now: Bool) async -> Outcome {
++        if !now, await !Self.isUnmeteredNetwork() { return .waitingForWiFi }
+         for name in [Self.modelName, Self.wordsName(tag)] where !isVerified(name) {
+             var done = false
+             for _ in 0..<Self.triesPerRun where !done {
+                 done = await fetch(name)
+             }
+-            if !done { return false }
++            if !done { return .failed }
+         }
+-        return isReady(tag)
++        return isReady(tag) ? .ready : .failed
+     }
+ 
+     private func fetch(_ name: String) async -> Bool {
 diff --git a/firefox-ios/Client/Frontend/Browser/Search/SearchViewModel.swift b/firefox-ios/Client/Frontend/Browser/Search/SearchViewModel.swift
 index 111cf4b..1bce42d 100644
 --- a/firefox-ios/Client/Frontend/Browser/Search/SearchViewModel.swift

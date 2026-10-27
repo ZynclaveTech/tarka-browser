@@ -53,6 +53,7 @@ XLIT_PATCHES = (
 XLIT_SOURCES = ('blas.h', 'blas_accelerate.cc', 'languages.cc', 'languages.h', 'model.cc', 'model.h',
                 'transliterator.cc', 'transliterator.h', 'word_list.cc', 'word_list.h')
 BRAND_ICON = ROOT / 'resources' / 'branding' / 'app-icon.svg'
+BRAND_INK = '#12121c'
 # The icon sets the Fennec, Beta and Release builds use; the alternates people
 # choose in Settings → App Icon stay Firefox's until they are redrawn.
 ICON_SETS = ('AppIcon', 'AppIcon_Beta', 'AppIcon_Developer')
@@ -187,12 +188,22 @@ enum TarkXlitFiles {{
 
 
 def brand():
-    # Each PNG is redrawn at its own size, so the sets' Contents.json stay as
-    # they are. Needs rsvg-convert (Homebrew librsvg).
+    # iOS masks the corners itself, and App Store Connect refuses an icon with
+    # an alpha channel: the Mac icon's rounded square is drawn full-bleed and
+    # flattened onto its own ink. The tinted variant is grayscale, as iOS
+    # tints it. Each PNG keeps its size, so the sets' Contents.json stay as
+    # they are. Needs rsvg-convert (librsvg) and magick (ImageMagick).
+    square = DERIVED.parent / 'app-icon-square.svg'
+    square.parent.mkdir(parents=True, exist_ok=True)
+    square.write_text(BRAND_ICON.read_text().replace(' rx="226"', ''))
     for name in ICON_SETS:
         for png in sorted((ICONS / f'{name}.appiconset').glob('*.png')):
             size = re.search(r'pixelWidth: (\d+)', out('sips', '-g', 'pixelWidth', png)).group(1)
-            run('rsvg-convert', '-w', size, '-h', size, BRAND_ICON, '-o', png)
+            run('rsvg-convert', '-w', size, '-h', size, square, '-o', png)
+            gray = ('-colorspace', 'Gray') if png.stem.endswith('-tinted') else ()
+            run('magick', png, '-background', BRAND_INK, '-alpha', 'remove', '-alpha', 'off', *gray, png)
+            if out('sips', '-g', 'hasAlpha', png).split()[-1] != 'no':
+                sys.exit(f'{png} still has an alpha channel')
 
 
 def sim():
