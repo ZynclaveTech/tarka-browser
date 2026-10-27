@@ -1,0 +1,44 @@
+diff --git a/firefox-ios/Client/Frontend/Home/Homepage/TopSites/TopSitesManager.swift b/firefox-ios/Client/Frontend/Home/Homepage/TopSites/TopSitesManager.swift
+index 9c50906..366019f 100644
+--- a/firefox-ios/Client/Frontend/Home/Homepage/TopSites/TopSitesManager.swift
++++ b/firefox-ios/Client/Frontend/Home/Homepage/TopSites/TopSitesManager.swift
+@@ -88,9 +88,15 @@ final class TopSitesManager: TopSitesManagerInterface, UserFeaturePreferenceProv
+         let updatedSpaceCount = getUpdatedSpaceCount(with: googleTopSite, and: availableSpaceCount)
+         let sponsoredSites = filterSponsoredSites(unifiedTiles: sponsoredSites, with: updatedSpaceCount, and: otherSites)
+ 
+-        let totalTopSites = googleTopSite + sponsoredSites + otherSites
++        // Tark: the @ source tiles come first, so visited sites never push them
++        // out of the rows shown; they share no domain with the sites after them.
++        let isSource = { (tile: TopSiteConfiguration) in
++            DefaultSuggestedSites.tarkSourceKeyword(of: tile.site.url) != nil
++        }
++        let sourceTiles = otherSites.filter(isSource)
++        let totalTopSites = googleTopSite + sponsoredSites + otherSites.filter { !isSource($0) }
+ 
+-        let uniqueSites = removeDuplicates(for: totalTopSites)
++        let uniqueSites = sourceTiles + removeDuplicates(for: totalTopSites)
+         return Array(uniqueSites.prefix(maxTopSites))
+     }
+ 
+diff --git a/firefox-ios/Providers/TopSitesProvider.swift b/firefox-ios/Providers/TopSitesProvider.swift
+index 27f2f5b..5426c07 100644
+--- a/firefox-ios/Providers/TopSitesProvider.swift
++++ b/firefox-ios/Providers/TopSitesProvider.swift
+@@ -149,11 +149,12 @@ final class TopSitesProviderImplementation: TopSitesProvider, FeatureFlaggable {
+         let defaultSites = defaultTopSites(prefs)
+         // Create PinnedSite objects. Used by the view layer to tell top sites apart
+         let pinnedSites: [Site] = pinnedSites.map({ Site.createPinnedSite(fromSite: $0) })
+-        // Merge default top sites with a user's top sites.
+-        let mergedSites = sites.union(defaultSites, f: unionOnURL)
+-        // Filter out duplicates in merged sites, but do not remove duplicates within pinned sites
+-        let duplicateFreeList = pinnedSites.union(mergedSites, f: unionOnURL).filter { !$0.isPinnedSite }
+-        let allSites = pinnedSites + duplicateFreeList
++        // Tark: the default tiles are the @ sources. A visited page on the same
++        // site (openstreetmap.org for @maps) must not replace one, so they stay
++        // out of the merge and are always added.
++        // Filter out duplicates in the user's sites, but do not remove duplicates within pinned sites
++        let duplicateFreeList = pinnedSites.union(sites, f: unionOnURL).filter { !$0.isPinnedSite }
++        let allSites = pinnedSites + duplicateFreeList + defaultSites
+ 
+         // Favour top sites from defaultSites as they have better favicons. But keep PinnedSites
+         let newSites = allSites.map { site -> Site in

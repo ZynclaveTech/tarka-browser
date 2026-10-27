@@ -54,8 +54,8 @@ XLIT_SOURCES = ('blas.h', 'blas_accelerate.cc', 'languages.cc', 'languages.h', '
                 'transliterator.cc', 'transliterator.h', 'word_list.cc', 'word_list.h')
 BRAND_ICON = ROOT / 'resources' / 'branding' / 'app-icon.svg'
 BRAND_INK = '#12121c'
-# The icon sets the Fennec, Beta and Release builds use; the alternates people
-# choose in Settings → App Icon stay Firefox's until they are redrawn.
+# The icon sets the Fennec, Beta and Release builds use. Firefox's alternate
+# icons are not shipped (no Settings → App Icon in Tark).
 ICON_SETS = ('AppIcon', 'AppIcon_Beta', 'AppIcon_Developer')
 ICONS = TREE / 'firefox-ios' / 'Client' / 'Assets' / 'AppIcons.xcassets'
 # Device, and the Apple-silicon simulator.
