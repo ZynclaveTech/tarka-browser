@@ -117,6 +117,15 @@ char* tark_xlit_row_languages(const char* accept_languages) {
   return CopyToMalloc(json);
 }
 
+char* tark_xlit_wikipedia_language(const char* query,
+                                   const char* accept_languages) {
+  if (!query) {
+    return nullptr;
+  }
+  return CopyToMalloc(tark_xlit::WikipediaLanguage(
+      base::UTF8ToUTF16(query), accept_languages ? accept_languages : ""));
+}
+
 void tark_xlit_string_free(char* text) {
   std::free(text);
 }

@@ -1,0 +1,300 @@
+diff --git a/BrowserKit/Package.swift b/BrowserKit/Package.swift
+index 17564c5..39ffbc4 100644
+--- a/BrowserKit/Package.swift
++++ b/BrowserKit/Package.swift
+@@ -126,6 +126,11 @@ let package = Package(
+         .target(
+             name: "TarkXlit",
+             dependencies: ["TarkXlitCore"]),
++        // Tark: the address bar's `@` sources (@wiki, @maps, ...), the Mac's
++        // starter pack entries.
++        .target(
++            name: "TarkSources",
++            dependencies: ["TarkXlit"]),
+         .target(
+             name: "Shared",
+             dependencies: ["Common"],
+@@ -175,6 +180,7 @@ let package = Package(
+             dependencies: ["Dip",
+                            "SwiftyBeaver",
+                            "TarkAdblock",
++                           "TarkSources",
+                            "TarkXlit",
+                            .product(name: "Sentry-Dynamic", package: "sentry-cocoa")],
+             swiftSettings: [
+diff --git a/BrowserKit/Sources/TarkSources/TarkSources.swift b/BrowserKit/Sources/TarkSources/TarkSources.swift
+new file mode 100644
+index 0000000..b85b59e
+--- /dev/null
++++ b/BrowserKit/Sources/TarkSources/TarkSources.swift
+@@ -0,0 +1,82 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++import Foundation
++import TarkXlit
++
++/// A web source reached by typing `@` and its keyword in the address bar, as
++/// on the Mac (patches/tarka/omnibox-sources). Names are proper nouns and are
++/// not translated.
++public struct TarkSource: Equatable, Sendable {
++    /// Without the leading `@`.
++    public let keyword: String
++    public let name: String
++    /// `{searchTerms}` is the query; `{tark:wikiLang}` the Wikipedia language.
++    let searchTemplate: String
++
++    /// The address that searches this source for `query`.
++    public func searchURL(for query: String) -> URL? {
++        let terms = query.addingPercentEncoding(withAllowedCharacters: Self.termCharacters) ?? query
++        var url = searchTemplate.replacingOccurrences(of: "{searchTerms}", with: terms)
++        if url.contains("{tark:wikiLang}") {
++            url = url.replacingOccurrences(of: "{tark:wikiLang}",
++                                           with: TarkTransliteration.wikipediaLanguage(for: query))
++        }
++        return URL(string: url)
++    }
++
++    private static let termCharacters: CharacterSet = {
++        var allowed = CharacterSet.urlQueryAllowed
++        allowed.remove(charactersIn: "&+=?#/")
++        return allowed
++    }()
++}
++
++public enum TarkSources {
++    /// In the order the address bar lists them; the same as the Mac's.
++    public static let all: [TarkSource] = [
++        TarkSource(keyword: "wiki", name: "Wikipedia",
++                   searchTemplate: "https://www.wikipedia.org/search-redirect.php"
++                       + "?family=wikipedia&language={tark:wikiLang}&search={searchTerms}"),
++        TarkSource(keyword: "maps", name: "OpenStreetMap",
++                   searchTemplate: "https://www.openstreetmap.org/search?query={searchTerms}"),
++        TarkSource(keyword: "gov", name: "India.gov.in",
++                   searchTemplate: "https://www.india.gov.in/search?search={searchTerms}"),
++        // IRCTC has no linkable search; the term stays in the fragment, which
++        // never leaves the phone.
++        TarkSource(keyword: "irctc", name: "IRCTC",
++                   searchTemplate: "https://www.irctc.co.in/nget/train-search#{searchTerms}"),
++        TarkSource(keyword: "kanoon", name: "Indian Kanoon",
++                   searchTemplate: "https://indiankanoon.org/search/?formInput={searchTerms}"),
++        TarkSource(keyword: "yt", name: "YouTube",
++                   searchTemplate: "https://www.youtube.com/results?search_query={searchTerms}"),
++        TarkSource(keyword: "dict", name: "Wiktionary",
++                   searchTemplate: "https://en.wiktionary.org/w/index.php?search={searchTerms}"),
++        TarkSource(keyword: "archive", name: "Internet Archive",
++                   searchTemplate: "https://archive.org/search?query={searchTerms}"),
++        TarkSource(keyword: "flipkart", name: "Flipkart",
++                   searchTemplate: "https://www.flipkart.com/search?q={searchTerms}"),
++        TarkSource(keyword: "amazon", name: "Amazon India",
++                   searchTemplate: "https://www.amazon.in/s?k={searchTerms}"),
++    ]
++
++    /// The sources to list while `text` is `@` and part of a keyword, with
++    /// no space yet: "@" lists them all, "@a" lists @archive and @amazon.
++    public static func candidates(for text: String) -> [TarkSource] {
++        guard text.hasPrefix("@"), !text.contains(where: \.isWhitespace) else { return [] }
++        let typed = text.dropFirst().lowercased()
++        return all.filter { $0.keyword.hasPrefix(typed) }
++    }
++
++    /// The source and query of `text` written as "@keyword query", or nil.
++    /// An empty query opens nothing: "@wiki " alone still waits for a query.
++    public static func match(_ text: String) -> (source: TarkSource, query: String)? {
++        guard text.hasPrefix("@"),
++              let space = text.firstIndex(where: \.isWhitespace) else { return nil }
++        let keyword = text[text.index(after: text.startIndex)..<space].lowercased()
++        let query = text[space...].trimmingCharacters(in: .whitespacesAndNewlines)
++        guard !query.isEmpty, let source = all.first(where: { $0.keyword == keyword }) else { return nil }
++        return (source, query)
++    }
++}
+diff --git a/BrowserKit/Sources/TarkXlit/TarkWikipediaLanguage.swift b/BrowserKit/Sources/TarkXlit/TarkWikipediaLanguage.swift
+new file mode 100644
+index 0000000..106cc4f
+--- /dev/null
++++ b/BrowserKit/Sources/TarkXlit/TarkWikipediaLanguage.swift
+@@ -0,0 +1,21 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++import Foundation
++import TarkXlitCore
++
++extension TarkTransliteration {
++    /// The Wikipedia language code for `query`: "en" for Latin text, else the
++    /// first of the user's languages written in the query's script, else that
++    /// script's default ("hi" for Devanagari).
++    public static func wikipediaLanguage(for query: String,
++                                         preferred: [String] = Locale.preferredLanguages) -> String {
++        let acceptLanguages = preferred.joined(separator: ",")
++        guard let code = query.withCString({ q in
++            acceptLanguages.withCString { tark_xlit_wikipedia_language(q, $0) }
++        }) else { return "en" }
++        defer { tark_xlit_string_free(code) }
++        return String(cString: code)
++    }
++}
+diff --git a/firefox-ios/Client/Frontend/Browser/BrowserViewController/Views/BrowserViewController.swift b/firefox-ios/Client/Frontend/Browser/BrowserViewController/Views/BrowserViewController.swift
+index 3d37ca8..895c43e 100644
+--- a/firefox-ios/Client/Frontend/Browser/BrowserViewController/Views/BrowserViewController.swift
++++ b/firefox-ios/Client/Frontend/Browser/BrowserViewController/Views/BrowserViewController.swift
+@@ -17,6 +17,7 @@ import SummarizeKit
+ import ActivityKit
+ import Glean
+ import QuickAnswersKit
++import TarkSources
+ 
+ import class Account.RustFirefoxAccounts
+ import class MozillaAppServices.BookmarkFolderData
+@@ -3213,6 +3214,11 @@ class BrowserViewController: UIViewController,
+     }
+ 
+     func submitSearchText(_ text: String, forTab tab: Tab) {
++        // Tark: "@wiki namaste" searches the source, not the search engine.
++        if let match = TarkSources.match(text), let url = match.source.searchURL(for: match.query) {
++            finishEditingAndSubmit(url, visitType: VisitType.typed, forTab: tab)
++            return
++        }
+         guard let engine = searchEnginesManager.defaultEngine,
+               let searchURL = engine.searchURLForQuery(text)
+         else {
+diff --git a/firefox-ios/Client/Frontend/Browser/Search/SearchViewController.swift b/firefox-ios/Client/Frontend/Browser/Search/SearchViewController.swift
+index 525be30..d660509 100644
+--- a/firefox-ios/Client/Frontend/Browser/Search/SearchViewController.swift
++++ b/firefox-ios/Client/Frontend/Browser/Search/SearchViewController.swift
+@@ -7,6 +7,7 @@ import Shared
+ import Storage
+ import Common
+ import SiteImageView
++import TarkSources
+ 
+ protocol SearchViewControllerDelegate: AnyObject {
+     @MainActor
+@@ -490,6 +491,16 @@ class SearchViewController: SiteTableViewController,
+                 presentTarkOffer()
+                 return
+             }
++            if let source = viewModel.tarkSourceRows[suggestion] {
++                // "@wiki namaste" opens Wikipedia; "@wiki" waits for a query.
++                if let match = TarkSources.match(suggestion), let url = match.source.searchURL(for: match.query) {
++                    selectedIndexPath = indexPath
++                    searchDelegate?.searchViewController(self, didSelectURL: url, searchTerm: nil)
++                } else {
++                    appendSearch(with: "@" + source.keyword)
++                }
++                return
++            }
+ 
+             let extras = [
+                 ExtraKey.recordSearchLocation.rawValue: SearchLocation.suggestion,
+@@ -681,8 +692,9 @@ class SearchViewController: SiteTableViewController,
+             return viewModel.shouldShowTrendingSearches ? viewModel.trendingSearches.count : 0
+         case .searchSuggestions:
+             guard let count = viewModel.suggestions?.count else { return 0 }
+-            // Tark: room for the language rows and the offer row.
+-            let tarkRows = viewModel.tarkLabels.count + (viewModel.tarkOffer == nil ? 0 : 1)
++            // Tark: room for the language rows, the source rows and the offer row.
++            let tarkRows = viewModel.tarkLabels.count + viewModel.tarkSourceRows.count
++                + (viewModel.tarkOffer == nil ? 0 : 1)
+             return min(count, 4 + tarkRows)
+         case .openedTabs:
+             return !viewModel.isZeroSearchState ? viewModel.filteredOpenedTabs.count : 0
+@@ -784,7 +796,7 @@ class SearchViewController: SiteTableViewController,
+                 )
+                 oneLineCell.configure(viewModel: oneLineCellViewModel)
+                 showTarkLanguage(of: site, in: oneLineCell)
+-                if Locale.current.languageCode == "en", viewModel.tarkLabels[site] == nil,
++                if Locale.current.languageCode == "en", viewModel.tarkEdgeLabel(site) == nil,
+                    let attributedString = getAttributedBoldSearchSuggestions(
+                     searchPhrase: site,
+                     query: viewModel.savedQuery
+@@ -1077,9 +1089,9 @@ private class ButtonScrollView: UIScrollView {
+ // MARK: - Tark: the one-time offer to type in your language
+ 
+ extension SearchViewController {
+-    /// A language row shows its language at the edge.
++    /// A language row shows its language at the edge, a source row its source.
+     func showTarkLanguage(of row: String, in cell: OneLineTableViewCell) {
+-        guard let language = viewModel.tarkLabels[row] else { return }
++        guard let language = viewModel.tarkEdgeLabel(row) else { return }
+         let label = UILabel()
+         label.text = language
+         label.font = .preferredFont(forTextStyle: .footnote)
+diff --git a/firefox-ios/Client/Frontend/Browser/Search/SearchViewModel.swift b/firefox-ios/Client/Frontend/Browser/Search/SearchViewModel.swift
+index 4ca7ed8..57fc375 100644
+--- a/firefox-ios/Client/Frontend/Browser/Search/SearchViewModel.swift
++++ b/firefox-ios/Client/Frontend/Browser/Search/SearchViewModel.swift
+@@ -6,6 +6,7 @@ import Foundation
+ import Storage
+ import Shared
+ import Common
++import TarkSources
+ import TarkXlit
+ import class MozillaAppServices.FeatureHolder
+ 
+@@ -41,6 +42,8 @@ class SearchViewModel: FeatureFlaggable,
+     var tarkLabels: [String: String] = [:]
+     /// Tark: the language the one-time offer row is for, while it shows.
+     var tarkOffer: TarkTransliteration.Language?
++    /// Tark: the `@` source rows, by row text.
++    var tarkSourceRows: [String: TarkSource] = [:]
+     @MainActor static var tarkDownloading = false
+     static var userAgent: String?
+     var searchFeature: FeatureHolder<Search>
+@@ -577,7 +580,12 @@ extension SearchViewModel {
+ 
+     /// A language row or the offer row: neither fills the address bar.
+     func isTarkRow(_ row: String) -> Bool {
+-        return tarkLabels[row] != nil || row == tarkOfferText
++        return tarkLabels[row] != nil || tarkSourceRows[row] != nil || row == tarkOfferText
++    }
++
++    /// What a Tark row shows at its edge: its language or its source's name.
++    func tarkEdgeLabel(_ row: String) -> String? {
++        return tarkLabels[row] ?? tarkSourceRows[row]?.name
+     }
+ 
+     /// The offer row's text, "Type in हिन्दी?", when it shows.
+@@ -591,6 +599,11 @@ extension SearchViewModel {
+     func addTarkRows(for query: String) {
+         tarkLabels = [:]
+         tarkOffer = nil
++        tarkSourceRows = [:]
++        if query.hasPrefix("@") {
++            addTarkSourceRows(for: query)
++            return
++        }
+         guard !query.isEmpty, !query.looksLikeAURL(), TarkTransliteration.looksTransliterable(query) else { return }
+         let xlit = TarkTransliteration.shared
+         let answer = UserDefaults.standard.string(forKey: Self.tarkXlitAnswerKey)
+@@ -614,6 +627,27 @@ extension SearchViewModel {
+         }
+     }
+ 
++    /// "@wiki namaste" labels the row for what was typed with its source;
++    /// "@" and part of a keyword lists the matching sources first.
++    @MainActor
++    private func addTarkSourceRows(for query: String) {
++        if let match = TarkSources.match(query) {
++            if suggestions?.contains(query) == false { suggestions?.insert(query, at: 0) }
++            tarkSourceRows[query] = match.source
++        } else {
++            for (at, source) in TarkSources.candidates(for: query).enumerated() {
++                let row = "@" + source.keyword
++                suggestions?.removeAll { $0 == row }
++                // The index first: reading `suggestions` inside its own
++                // insert is an exclusivity violation (a crash).
++                let index = min(at, suggestions?.count ?? 0)
++                suggestions?.insert(row, at: index)
++                tarkSourceRows[row] = source
++            }
++        }
++        delegate?.reloadTableView()
++    }
++
+     /// The person's answer to the offer. "Download now" ignores the Wi-Fi rule.
+     @MainActor
+     func answerTarkOffer(yes: Bool, now: Bool) {
