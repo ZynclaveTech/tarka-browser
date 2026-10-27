@@ -49,6 +49,13 @@ mkdir -p "$_src_dir/out/Default"
 
 # Apply patches and substitutions
 python3 "$_main_repo/utils/prune_binaries.py" "$_src_dir" "$_main_repo/pruning.list"
+# Toolchains and TypeScript before the patches: fix-typescript-lib-dom.patch
+# changes a file from the TypeScript download.
+mkdir -p "$_src_dir/third_party/llvm-build/Release+Asserts"
+mkdir -p "$_src_dir/third_party/rust-toolchain/bin"
+
+"$_root_dir/retrieve_and_unpack_resource.py" -p $_arch
+
 python3 "$_main_repo/utils/patches.py" apply "$_src_dir" "$_main_repo/patches" "$_root_dir/patches"
 
 # Tark leaves the Chrome Web Store's files unsubstituted (utils/domain_substitution_skip.txt).
@@ -84,11 +91,6 @@ fi
 if ! $clone; then
   echo 'chrome_pgo_phase=0' >> "$_src_dir/out/Default/args.gn"
 fi
-
-mkdir -p "$_src_dir/third_party/llvm-build/Release+Asserts"
-mkdir -p "$_src_dir/third_party/rust-toolchain/bin"
-
-"$_root_dir/retrieve_and_unpack_resource.py" -p $_arch
 
 # Tark: Sparkle 2, the updater (M5); installed into the app when it is signed.
 python3 "$_main_repo/utils/downloads.py" retrieve -i "$_root_dir/downloads-sparkle.ini" -c "$_download_cache"
