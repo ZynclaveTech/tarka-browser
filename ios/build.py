@@ -15,6 +15,7 @@ listed in ios/series, so moving to a new Firefox release means rebasing them.
 """
 import json
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
@@ -25,6 +26,7 @@ ROOT = IOS.parent
 TREE = ROOT / 'build' / 'ios' / 'firefox-ios'
 DERIVED = ROOT / 'build' / 'ios' / 'dd'
 LISTS_URL = 'https://gettarka.com/lists/android/v1/'
+LISTS_MAX_BYTES = 64 << 20
 ADBLOCK = ROOT / 'android' / 'adblock'
 TARK_LISTS = TREE / 'firefox-ios' / 'Client' / 'ContentBlocker' / 'TarkLists'
 
@@ -69,6 +71,14 @@ def patch():
         print('applied', name)
 
 
+def _download(url):
+    with urllib.request.urlopen(url) as response:
+        data = response.read(LISTS_MAX_BYTES + 1)
+    if len(data) > LISTS_MAX_BYTES:
+        sys.exit(f'{url} is larger than {LISTS_MAX_BYTES} bytes')
+    return data
+
+
 def lists():
     # The same signed bundle Tark for Android uses; listtool converts what
     # WebKit can express (network rules, hide rules, exceptions).
@@ -76,10 +86,14 @@ def lists():
     shutil.rmtree(work, ignore_errors=True)
     work.mkdir(parents=True)
     index = work / 'latest.json'
-    index.write_bytes(urllib.request.urlopen(LISTS_URL + 'latest.json').read())
+    index.write_bytes(_download(LISTS_URL + 'latest.json'))
+    # The index is not trusted until the bundle verifies: its file name only
+    # picks the URL, and the download goes to a fixed local name.
     name = json.loads(index.read_text())['file']
-    bundle = work / name
-    bundle.write_bytes(urllib.request.urlopen(LISTS_URL + name).read())
+    if not re.fullmatch(r'lists-[0-9a-f]+\.zip', name):
+        sys.exit(f'unexpected bundle name in latest.json: {name!r}')
+    bundle = work / 'bundle.zip'
+    bundle.write_bytes(_download(LISTS_URL + name))
     run(sys.executable, ADBLOCK / 'bundle.py', 'verify', bundle, index,
         '--pubkey', ADBLOCK / 'lists_pubkey.txt')
     run('cargo', 'build', '--release', '--manifest-path', ADBLOCK / 'listtool' / 'Cargo.toml')
