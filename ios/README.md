@@ -10,3 +10,12 @@ iOS browser must use WebKit, so this is not a Chromium build.
   (`build/ios/dd`).
 
 Builds with Xcode 26.4.1 although firefox-v159.0 names 26.5.
+
+## Nothing sent home
+
+`netcheck.sh DEVICE SECONDS` lists the outside addresses the app's own
+process connects to after a fresh install; idle, it must list none. Debug
+builds log every URLSession host as `TarkNet allow|block host`. Rust
+components (viaduct) do not use URLSession: they are switched off where they
+start (`services-off.patch`), and Remote Settings points at a closed local
+port.
