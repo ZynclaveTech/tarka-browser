@@ -1,6 +1,6 @@
 --- a/chrome/browser/tark_zynclave/zynclave_auth_unittest.cc
 +++ b/chrome/browser/tark_zynclave/zynclave_auth_unittest.cc
-@@ -455,3 +455,85 @@
+@@ -455,3 +455,138 @@
  
  }  // namespace
  }  // namespace tark_zynclave
@@ -82,6 +82,59 @@
 +  base::test::TestFuture<std::optional<std::string>> fresh;
 +  auth->GetAccessToken(fresh.GetCallback());
 +  EXPECT_EQ(fresh.Get(), "access-9");
++}
++
++TEST_F(TarkZynclaveAuth, SigningInAgainRevokesTheOldRefreshToken) {
++  auto auth = MakeAuth();
++  SignIn(*auth, "access-1", "refresh-1");
++  SignIn(*auth, "access-2", "refresh-2");
++  task_env_.RunUntilIdle();
++  bool revoked = false;
++  for (const auto& pending : *loaders_.pending_requests()) {
++    if (pending.request.url != GURL(issuer_.Url("oauth2/revoke"))) {
++      continue;
++    }
++    std::string body(pending.request.request_body->elements()
++                         ->at(0)
++                         .As<network::DataElementBytes>()
++                         .AsStringPiece());
++    revoked |= body.find("token=refresh-1") != std::string::npos;
++  }
++  EXPECT_TRUE(revoked);
++}
++
++TEST_F(TarkZynclaveAuth, ASignInDuringARefreshAnswersItsWaiters) {
++  auto auth = MakeAuth();
++  SignIn(*auth, "access-1", "refresh-1");
++  task_env_.FastForwardBy(base::Hours(2));
++  base::test::TestFuture<std::optional<std::string>> token;
++  auth->GetAccessToken(token.GetCallback());
++  task_env_.RunUntilIdle();
++  ASSERT_EQ(TokenRequests(), 1);
++  // A new sign-in finishes before the old refresh answers.
++  auto [state, nonce] = Start(*auth);
++  ASSERT_TRUE(auth->HandleRedirect(
++      Redirect(base::StrCat({"code=c0de&state=", state}))));
++  task_env_.RunUntilIdle();
++  ASSERT_EQ(TokenRequests(), 2);
++  // The newest token request is the code exchange.
++  network::TestURLLoaderFactory::PendingRequest* exchange =
++      &loaders_.pending_requests()->back();
++  loaders_.SimulateResponseWithoutRemovingFromPendingList(
++      exchange,
++      test::FakeIssuer::TokenJson(
++          "access-9", "refresh-9",
++          issuer_.IdToken("client-1", nonce, base::Time::Now()), 3600));
++  task_env_.RunUntilIdle();
++  EXPECT_EQ(token.Get(), "access-9");
++  // The old refresh answers late: the new tokens stay.
++  loaders_.SimulateResponseWithoutRemovingFromPendingList(
++      &loaders_.pending_requests()->front(),
++      test::FakeIssuer::TokenJson("access-old", "", "", 3600));
++  task_env_.RunUntilIdle();
++  base::test::TestFuture<std::optional<std::string>> after;
++  auth->GetAccessToken(after.GetCallback());
++  EXPECT_EQ(after.Get(), "access-9");
 +}
 +
 +}  // namespace

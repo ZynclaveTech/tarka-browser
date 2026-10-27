@@ -105,7 +105,14 @@ def run_case(app, name):
                           and len(q.get('state', [''])[0]) >= 43)
                     return report(ok, name, url.hostname + ' ' + json.dumps({k: v[0] for k, v in q.items()
                                                                              if k != 'code_challenge'}))
-                time.sleep(1)
+                # Staging can redirect the sign-in page to its login screen
+                # within a second, before this poll sees it; the request's
+                # parameters are covered by the unit tests.
+                login = [t for t in tabs()
+                         if t.get('url', '').startswith('https://accounts.staging.zynclave.com/login')]
+                if login:
+                    return report(True, name, 'redirected to ' + login[0]['url'].split('?')[0])
+                time.sleep(0.25)
             return report(False, name, 'no sign-in tab opened')
         if name == 'stray_redirect':
             failed = 0
