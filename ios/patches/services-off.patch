@@ -1,0 +1,267 @@
+diff --git a/BrowserKit/Sources/Common/Logger/Wrapper/SentryWrapper.swift b/BrowserKit/Sources/Common/Logger/Wrapper/SentryWrapper.swift
+index 21a5ebf..719b1c8 100644
+--- a/BrowserKit/Sources/Common/Logger/Wrapper/SentryWrapper.swift
++++ b/BrowserKit/Sources/Common/Logger/Wrapper/SentryWrapper.swift
+@@ -34,7 +34,7 @@ public final class DefaultSentry: SentryWrapper {
+     }
+ 
+     public func startWithConfigureOptions(configure options: @escaping (Options) -> Void) {
+-        SentrySDK.start(configureOptions: options)
++        // Tark: Sentry is never started, so crash reports are never sent.
+     }
+ 
+     public func captureMessage(message: String, with scopeBlock: @escaping (Scope) -> Void) {
+diff --git a/firefox-ios/Client/Application/AppDelegate+PushNotifications.swift b/firefox-ios/Client/Application/AppDelegate+PushNotifications.swift
+index 859fe97..7e78a20 100644
+--- a/firefox-ios/Client/Application/AppDelegate+PushNotifications.swift
++++ b/firefox-ios/Client/Application/AppDelegate+PushNotifications.swift
+@@ -41,10 +41,7 @@ extension AppDelegate {
+ 
+         NotificationCenter.default.addObserver(forName: .RegisterForPushNotifications, object: nil, queue: .main) { _ in
+             Task { @MainActor in
+-                let settings = await UNUserNotificationCenter.current().notificationSettings()
+-                if settings.authorizationStatus != .denied {
+-                    UIApplication.shared.registerForRemoteNotifications()
+-                }
++                // Tark: never registers with Mozilla's push service.
+             }
+         }
+ 
+diff --git a/firefox-ios/Client/Application/AppDelegate.swift b/firefox-ios/Client/Application/AppDelegate.swift
+index 0ca91c9..589e23d 100644
+--- a/firefox-ios/Client/Application/AppDelegate.swift
++++ b/firefox-ios/Client/Application/AppDelegate.swift
+@@ -76,6 +76,9 @@ class AppDelegate: UIResponder,
+                                                nightlyAppVersion: AppConstants.nightlyAppVersion,
+                                                sharedContainerIdentifier: AppInfo.sharedContainerIdentifier)
+ 
++        // Tark: before anything can open a connection.
++        TarkNetworkGuard.install()
++
+         // Set-up Rust network stack. Note that this has to be called
+         // before any Application Services component gets used.
+         Viaduct.shared.initialize(userAgent: UserAgent.fxaUserAgent)
+@@ -131,7 +134,7 @@ class AppDelegate: UIResponder,
+         pushNotificationSetup()
+         appLaunchUtil?.setUpPostLaunchDependencies()
+         backgroundWorkUtility = BackgroundFetchAndProcessingUtility()
+-        backgroundWorkUtility?.registerUtility(BackgroundSyncUtility(profile: profile, application: application))
++        // Tark: no background Sync.
+         backgroundWorkUtility?.registerUtility(BackgroundNotificationSurfaceUtility())
+         suggestBackgroundUtility = BackgroundFirefoxSuggestIngestUtility(firefoxSuggest: profile.firefoxSuggest)
+ 
+@@ -473,3 +476,74 @@ extension AppDelegate {
+         return configuration
+     }
+ }
++
++// MARK: - Tark network guard
++
++/// Tark: refuses every request the app makes with URLSession to Mozilla's
++/// services, as a backstop to switching them off at their source. Pages in
++/// WKWebView are not affected. Rust components (viaduct) bypass URLSession
++/// and are switched off where they start.
++final class TarkNetworkGuard: URLProtocol {
++    static let blockedDomains = [
++        "mozilla.org", "mozilla.com", "mozilla.net", "mozaws.net", "mozgcp.net",
++        "allizom.org", "firefox.com", "getpocket.com", "sentry.io"
++    ]
++
++    static func isBlocked(_ host: String) -> Bool {
++        let host = host.lowercased()
++        return blockedDomains.contains { host == $0 || host.hasSuffix("." + $0) }
++    }
++
++    override class func canInit(with request: URLRequest) -> Bool {
++        guard let host = request.url?.host else { return false }
++        let blocked = isBlocked(host)
++        #if MOZ_CHANNEL_developer
++        DefaultLogger.shared.log("TarkNet \(blocked ? "block" : "allow") \(host)", level: .info, category: .lifecycle)
++        #endif
++        return blocked
++    }
++
++    override class func canonicalRequest(for request: URLRequest) -> URLRequest {
++        return request
++    }
++
++    override func startLoading() {
++        client?.urlProtocol(self, didFailWithError: URLError(.notConnectedToInternet))
++    }
++
++    override func stopLoading() {}
++
++    /// Puts the guard in front of the shared session and of every session
++    /// made from the default or ephemeral configuration.
++    static func install() {
++        URLProtocol.registerClass(TarkNetworkGuard.self)
++        let pairs = [
++            ("defaultSessionConfiguration", #selector(URLSessionConfiguration.tarkDefault)),
++            ("ephemeralSessionConfiguration", #selector(URLSessionConfiguration.tarkEphemeral))
++        ]
++        for (name, replacement) in pairs {
++            guard let original = class_getClassMethod(URLSessionConfiguration.self, NSSelectorFromString(name)),
++                  let swapped = class_getClassMethod(URLSessionConfiguration.self, replacement) else { continue }
++            method_exchangeImplementations(original, swapped)
++        }
++        #if MOZ_CHANNEL_developer
++        DefaultLogger.shared.log("TarkNet installed, default config guarded: \(URLSessionConfiguration.default.protocolClasses?.first == TarkNetworkGuard.self)", level: .info, category: .lifecycle)
++        #endif
++    }
++}
++
++extension URLSessionConfiguration {
++    // After install() these selectors run the original implementations.
++    @objc class func tarkDefault() -> URLSessionConfiguration {
++        return Self.guarded(tarkDefault())
++    }
++
++    @objc class func tarkEphemeral() -> URLSessionConfiguration {
++        return Self.guarded(tarkEphemeral())
++    }
++
++    private class func guarded(_ configuration: URLSessionConfiguration) -> URLSessionConfiguration {
++        configuration.protocolClasses = [TarkNetworkGuard.self] + (configuration.protocolClasses ?? [])
++        return configuration
++    }
++}
+diff --git a/firefox-ios/Client/Experiments/Experiments.swift b/firefox-ios/Client/Experiments/Experiments.swift
+index 7788564..a1d4900 100644
+--- a/firefox-ios/Client/Experiments/Experiments.swift
++++ b/firefox-ios/Client/Experiments/Experiments.swift
+@@ -319,7 +319,7 @@ enum Experiments {
+ 
+         // This does its work on another thread, downloading the experiment recipes
+         // for the next run. It should be the last thing we do before returning.
+-        nimbus.fetchExperiments()
++        // Tark: experiments are never fetched; features keep their built-in defaults.
+     }
+ 
+     /// Maps each feature ID to the branch slug the user is enrolled in. Features the user is not enrolled in are
+diff --git a/firefox-ios/Client/FeatureFlags/FeatureFlagsProvider.swift b/firefox-ios/Client/FeatureFlags/FeatureFlagsProvider.swift
+index 98aae6b..f29918a 100644
+--- a/firefox-ios/Client/FeatureFlags/FeatureFlagsProvider.swift
++++ b/firefox-ios/Client/FeatureFlags/FeatureFlagsProvider.swift
+@@ -27,10 +27,22 @@ final class FeatureFlagsProvider: FeatureFlagProviding, @unchecked Sendable {
+ 
+     /// Used for checking the status of a feature flag from the feature flag backend
+     func isEnabled(_ flag: FeatureFlagID) -> Bool {
++        if Self.tarkOff.contains(flag) { return false }
+         return backendLayer.checkNimbusConfigFor(flag, with: prefs)
+     }
+ 
+     /// Used specifically for overriding the status of a feature flag from the backend.
++    /// Tark: features that send data to Mozilla or Google, or that need
++    /// Mozilla's servers to work, are off whatever Nimbus or prefs say.
++    static let tarkOff: Set<FeatureFlagID> = [
++        .adsClient, .firefoxSuggestFeature, .googleLens, .hntSponsoredShortcuts,
++        .homepageStoryCategories, .hostedSummarizer, .hostedSummarizerShakeGesture,
++        .hostedSummarizerToolbarEntrypoint, .microsurvey, .relayIntegration,
++        .reportBrokenSite, .sentFromFirefox, .sentFromFirefoxTreatmentA,
++        .summarizerAppAttestAuth, .translation, .translationLanguagePicker,
++        .trendingSearches, .tosFeature, .touFeature, .vpnFeature
++    ]
++
+     func setDebugOverride(_ flag: FeatureFlagID, to value: Bool) {
+         guard let debugKey = flag.debugKey else { return }
+         prefs.setBool(value, forKey: debugKey)
+diff --git a/firefox-ios/Client/FeatureFlags/UserFeaturePreferenceManager.swift b/firefox-ios/Client/FeatureFlags/UserFeaturePreferenceManager.swift
+index 592106c..b532430 100644
+--- a/firefox-ios/Client/FeatureFlags/UserFeaturePreferenceManager.swift
++++ b/firefox-ios/Client/FeatureFlags/UserFeaturePreferenceManager.swift
+@@ -39,6 +39,8 @@ final class UserFeaturePreferenceManager: UserFeaturePreferring, @unchecked Send
+     // MARK: - Generic bool preferences
+ 
+     func getPreferenceFor(_ flag: FeatureFlagID) -> Bool {
++        // Tark: a user preference cannot turn on a feature Tark keeps off.
++        if FeatureFlagsProvider.tarkOff.contains(flag) { return false }
+         guard let key = flag.userPrefsKey else {
+             return checkDefaultValue(for: flag)
+         }
+diff --git a/firefox-ios/Client/IntroScreenManager.swift b/firefox-ios/Client/IntroScreenManager.swift
+index 6b22170..fa79d0f 100644
+--- a/firefox-ios/Client/IntroScreenManager.swift
++++ b/firefox-ios/Client/IntroScreenManager.swift
+@@ -21,7 +21,9 @@ struct IntroScreenManager: FeatureFlaggable, IntroScreenManagerProtocol {
+     var prefs: Prefs
+ 
+     var shouldShowIntroScreen: Bool {
+-        prefs.intForKey(PrefsKeys.IntroSeen) == nil
++        // Tark: Firefox's welcome (Mozilla's terms, data sharing, account
++        // sign-in) is never shown.
++        false
+     }
+ 
+     func didSeeIntroScreen() {
+diff --git a/firefox-ios/Client/Telemetry/TelemetryWrapper.swift b/firefox-ios/Client/Telemetry/TelemetryWrapper.swift
+index 673101f..68fae04 100644
+--- a/firefox-ios/Client/Telemetry/TelemetryWrapper.swift
++++ b/firefox-ios/Client/Telemetry/TelemetryWrapper.swift
+@@ -93,10 +93,7 @@ class TelemetryWrapper: TelemetryWrapperProtocol,
+         migratePathComponentInDocumentsDirectory("MozTelemetry-Default-mobile-event", to: .cachesDirectory)
+         migratePathComponentInDocumentsDirectory("eventArray-MozTelemetry-Default-mobile-event.json", to: .cachesDirectory)
+ 
+-        let sendUsageData = profile.prefs.boolForKey(AppConstants.prefSendUsageData) ?? true
+-
+-        // Initialize Glean
+-        initGlean(profile, sendUsageData: sendUsageData)
++        // Tark: Glean is never started, so no usage data is recorded or sent.
+     }
+ 
+     /// Never follows `prefSendUsageData`: `usage-reporting` is `follows_collection_enabled: false`.
+diff --git a/firefox-ios/Providers/Profile.swift b/firefox-ios/Providers/Profile.swift
+index 255e10c..0d84dea 100644
+--- a/firefox-ios/Providers/Profile.swift
++++ b/firefox-ios/Providers/Profile.swift
+@@ -23,6 +23,7 @@ import enum MozillaAppServices.SyncReason
+ import enum MozillaAppServices.VisitType
+ import func MozillaAppServices.setLogger
+ import func MozillaAppServices.setMaxLevel
++
+ import func MozillaAppServices.getLocaleTag
+ import struct MozillaAppServices.HistoryMigrationResult
+ import struct MozillaAppServices.SyncParams
+@@ -31,6 +32,9 @@ import struct MozillaAppServices.VisitObservation
+ import struct MozillaAppServices.PendingCommand
+ import struct MozillaAppServices.RemoteSettingsConfig
+ 
++/// Tark: see `firefoxSuggest`.
++private let tarkFirefoxSuggestOff = true
++
+ // TODO: FXIOS-14225 - SyncManager shouldn't be Sendable
+ public protocol SyncManager: Sendable {
+     var isSyncing: Bool { get }
+@@ -659,10 +663,10 @@ open class BrowserProfile: Profile,
+     }()
+ 
+     lazy var remoteSettingsService: RemoteSettingsService = {
+-        let remoteSettingsEnvironmentKey = prefs.stringForKey(PrefsKeys.RemoteSettings.remoteSettingsEnvironment) ?? ""
+-        let remoteSettingsEnvironment = RemoteSettingsEnvironment(rawValue: remoteSettingsEnvironmentKey) ?? .prod
+-        let remoteSettingsServer = remoteSettingsEnvironment.toRemoteSettingsServer()
+-        let bucketName = (remoteSettingsServer == .prod ? "main" : "main-preview")
++        // Tark: Remote Settings never reaches Mozilla. The server is a closed
++        // local port, so the Rust components use only what ships in the app.
++        let remoteSettingsServer = RemoteSettingsServer.custom(url: "http://127.0.0.1:9")
++        let bucketName = "main"
+         let config = RemoteSettingsConfig(
+             server: remoteSettingsServer,
+             bucketName: bucketName,
+@@ -678,8 +682,7 @@ open class BrowserProfile: Profile,
+         }
+         let service = remoteSettingsServiceFactory(path, config)
+         #if !MOZ_TARGET_NOTIFICATIONSERVICE && !MOZ_TARGET_SHARETO && !MOZ_TARGET_CREDENTIAL_PROVIDER
+-        service.setTelemetry(telemetry: RemoteSettingsGleanTelemetry())
+-        serviceSyncCoordinator = RemoteSettingsServiceSyncCoordinator(service: service, prefs: prefs)
++        // Tark: no Remote Settings telemetry and no periodic sync.
+         #endif
+         return service
+     }()
+@@ -687,6 +690,8 @@ open class BrowserProfile: Profile,
+     private(set) var serviceSyncCoordinator: RemoteSettingsServiceSyncCoordinator?
+ 
+     lazy var firefoxSuggest: RustFirefoxSuggestProtocol? = {
++        // Tark: Firefox Suggest needs Mozilla's servers, so it is never created.
++        if tarkFirefoxSuggestOff { return nil }
+         do {
+             let cacheFileURL = try FileManager.default.url(
+                 for: .cachesDirectory,
