@@ -64,7 +64,9 @@ must git -C "$repo/ungoogled-chromium" fetch --quiet origin "$SUB"
 must git -C "$repo/ungoogled-chromium" checkout --quiet --detach "$SUB"
 echo "submodule $SUB" >> "$log"
 
-(( fresh )) && rm -rf "$work/build/src"
+# The name substitution backup goes with the tree: --sub refuses to run
+# when it exists.
+(( fresh )) && rm -rf "$work/build/src" "$work/build/namesubs.tar"
 must python3 "$repo/linux/prepare_workdir.py" "$repo" "$work"
 
 # Upstream builds in its own Debian image (system Node, tsc, esbuild, Go).

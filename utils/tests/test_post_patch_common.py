@@ -80,6 +80,19 @@ class TestPostPatchSteps(unittest.TestCase):
         # desktop, captions on or not.
         self.assertEqual(steps(module, self.src, monkey), COMMON + ['onnxruntime'])
 
+    def test_onnxruntime_only_installs_once(self):
+        module = load('linux', self.work('l'))
+        calls = []
+        module.run = lambda *a, **k: calls.append(a)
+        module.install_onnxruntime(self.src)
+        self.assertEqual(len(calls), 2)  # retrieve, unpack
+        header = self.src / 'third_party' / 'tark_onnxruntime' / 'include' / 'onnxruntime_c_api.h'
+        header.parent.mkdir(parents=True)
+        header.write_text('// api')
+        calls.clear()
+        module.install_onnxruntime(self.src)
+        self.assertEqual(calls, [])
+
     def test_inter_is_copied(self):
         module = load('linux', self.work('l'))
         module.common.run = lambda *a, **k: None

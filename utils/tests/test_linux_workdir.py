@@ -40,6 +40,13 @@ class TestLinuxWorkdir(unittest.TestCase):
         self.assertIn('tark_post_patch.py', (self.work / 'scripts' / 'build.sh').read_text())
         self.assertEqual((self.work / 'tark_repo.txt').read_text().strip(), str(REPO))
 
+    def test_onnxruntime_runs_on_every_build(self):
+        # A tree kept from before Tark's steps installed ONNX Runtime skips
+        # those steps (.tark.stamp); its headers must still arrive.
+        text = (self.work / 'scripts' / 'build.sh').read_text()
+        self.assertIn('tark_post_patch.py" --onnxruntime-only', text)
+        self.assertGreater(text.index('--onnxruntime-only'), text.index('.tark.stamp'))
+
     def test_tarks_gn_args_follow_upstreams(self):
         flags = lines(self.work / 'flags.linux.gn')
         upstream = lines(REPO / 'linux' / 'upstream' / 'flags.linux.gn')

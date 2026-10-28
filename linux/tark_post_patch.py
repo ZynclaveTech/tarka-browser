@@ -32,6 +32,8 @@ def install_onnxruntime(src):
     """Microsoft's ONNX Runtime release (linux/downloads-onnxruntime.ini,
     pinned by sha256) into SRC/third_party/tark_onnxruntime, as dev.sh does
     on the Mac: components/tark_captions builds against its headers."""
+    if (src / 'third_party' / 'tark_onnxruntime' / 'include' / 'onnxruntime_c_api.h').is_file():
+        return
     ini = REPO / 'linux' / 'downloads-onnxruntime.ini'
     downloads = CORE / 'utils' / 'downloads.py'
     run(sys.executable, downloads, 'retrieve', '-i', ini, '-c', CACHE)
@@ -47,9 +49,13 @@ def main_for(src):
 
 
 def main():
-    if len(sys.argv) != 2:
-        sys.exit('usage: tark_post_patch.py SOURCE_TREE')
-    main_for(pathlib.Path(sys.argv[1]).resolve())
+    args = sys.argv[1:]
+    if args[:1] == ['--onnxruntime-only'] and len(args) == 2:
+        install_onnxruntime(pathlib.Path(args[1]).resolve())
+        return
+    if len(args) != 1:
+        sys.exit('usage: tark_post_patch.py [--onnxruntime-only] SOURCE_TREE')
+    main_for(pathlib.Path(args[0]).resolve())
 
 
 if __name__ == '__main__':

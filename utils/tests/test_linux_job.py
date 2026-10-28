@@ -62,6 +62,11 @@ class TestLinuxJob(unittest.TestCase):
         self.assertNotEqual(clear, -1)
         self.assertLess(clear, text.find('package_tarball.sh" "$repo"'))
 
+    def test_fresh_also_drops_the_name_substitution_backup(self):
+        # name_substitution.py --sub refuses to run when its backup exists.
+        text = JOB.read_text()
+        self.assertIn('rm -rf "$work/build/src" "$work/build/namesubs.tar"', text)
+
     def test_refuses_below_150_gb_free(self):
         r = run(self.root, free_gb=149)
         self.assertNotEqual(r.returncode, 0)

@@ -25,6 +25,9 @@ if [ ! -f "${_src_dir}/.tark.stamp" ]; then
     python3 "${_root}/tark_post_patch.py" "${_src_dir}"
     touch "${_src_dir}/.tark.stamp"
 fi
+# ONNX Runtime's headers on every build: a tree kept from before Tark's steps
+# installed them skips those steps.
+python3 "${_root}/tark_post_patch.py" --onnxruntime-only "${_src_dir}"
 write_gn_args
 fix_tool_downloading
 setup_toolchain

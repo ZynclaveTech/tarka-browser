@@ -12,7 +12,8 @@ Design and plan: tarka-notes `specs/2026-10-28-tark-linux-design.md`,
   patches and packaging at the tag in `upstream/UPSTREAM_COMMIT`
   (BSD-3-Clause, `upstream/LICENSE`). One local change, in
   `scripts/build.sh`: after patches and domain substitution it runs
-  `tark_post_patch.py` once (`.tark.stamp`). When bumping upstream, copy the
+  `tark_post_patch.py` once (`.tark.stamp`), then its ONNX Runtime step on
+  every build (`--onnxruntime-only`, skipped when the headers are there). When bumping upstream, copy the
   new files over and re-add it.
 - `prepare_workdir.py REPO WORKDIR` — assembles the folder `scripts/build.sh`
   runs in: upstream's files, this repo's `ungoogled-chromium` core, Tark's
