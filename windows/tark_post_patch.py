@@ -18,19 +18,17 @@ live captions (D4, W2).
 import os
 import pathlib
 import shutil
-import subprocess
 import sys
 
 WORK = pathlib.Path(__file__).resolve().parent
 REPO = pathlib.Path((WORK / 'tark_repo.txt').read_text(encoding='utf-8').strip())
 CORE = WORK / 'ungoogled-chromium'
 CACHE = WORK / 'build' / 'download_cache'
+sys.path.insert(0, str(REPO / 'utils'))
+import tark_post_patch_common as common  # noqa: E402
+run = common.run
+
 BASH = os.environ.get('TARK_BASH', r'C:\Program Files\Git\bin\bash.exe' if os.name == 'nt' else 'bash')
-
-
-def run(*args, **kwargs):
-    print('tark:', ' '.join(str(a) for a in args), flush=True)
-    subprocess.run([str(a) for a in args], check=True, **kwargs)
 
 
 def install_onnxruntime(ort_dir, src):
@@ -99,46 +97,22 @@ def install_winsparkle(ws_dir, src):
     print(f'tark: WinSparkle {version} from {ws_dir}; revision {revision}', flush=True)
 
 
-def main():
-    if len(sys.argv) != 2:
-        sys.exit('usage: tark_post_patch.py SOURCE_TREE')
-    src = pathlib.Path(sys.argv[1]).resolve()
-    py = sys.executable
-
-    # Product name in UI strings (backup kept for a reset, as on the Mac).
-    run(py, REPO / 'utils' / 'name_substitution.py', '--sub', '-t', src,
-        '--backup-path', WORK / 'build' / 'namesubs.tar')
-    # The mark, wherever Chromium ships a logo file the manifest names.
-    run(py, REPO / 'utils' / 'install_branding.py', REPO / 'resources' / 'branding' / 'mark', src)
-    # Certificate trust data: CT log list, Chrome Root Store, CRLSet (resources/trust).
-    run(py, REPO / 'utils' / 'trust_data.py', 'install', src,
-        '--domain-regex', CORE / 'domain_regex.list')
-    # Inter for WebUI pages, served as chrome://resources/fonts/.
-    fonts = src / 'ui' / 'webui' / 'resources' / 'fonts'
-    fonts.mkdir(parents=True, exist_ok=True)
-    for woff in (REPO / 'resources' / 'fonts').glob('inter-latin*.woff2'):
-        shutil.copy2(woff, fonts / woff.name)
-    # The ad blocker: adblock-rust's crates (pinned sha256) and its built-in
-    # list bundle, checked against Tark's list-signing key
-    # (utils/adblock_lists.py; TARK_LISTS_DIR stands in for gettarka.com).
-    run(py, REPO / 'android' / 'adblock' / 'crates.py', src, '--cache', CACHE / 'crates')
-    lists_dir = os.environ.get('TARK_LISTS_DIR')
-    run(py, REPO / 'utils' / 'adblock_lists.py', src / 'chrome' / 'browser' / 'tark_adblock' / 'lists.zip',
-        *(['--lists-dir', lists_dir] if lists_dir else []))
-    # IndicXlit weights and word lists (utils/install_xlit.sh, under bash).
-    env = dict(os.environ, _root_dir=REPO.as_posix(), _src_dir=src.as_posix(),
-               _main_repo=CORE.as_posix(), _download_cache=CACHE.as_posix())
-    run(BASH, '-c', 'source "$_root_dir/utils/install_xlit.sh" && _install_xlit', env=env)
+def main_for(src):
+    common.before_platform(REPO, CORE, CACHE, WORK, src, BASH)
     # Live captions (W2): ONNX Runtime built from source with the static C
-    # runtime (TARK_ORT_DIR, from windows/ci/build_onnxruntime.ps1), and the
-    # captions' about:credits entries, as build.sh does on the Mac.
+    # runtime (TARK_ORT_DIR, from windows/ci/build_onnxruntime.ps1).
     install_onnxruntime(pathlib.Path(os.environ.get('TARK_ORT_DIR', '')), src)
     # The updater (W2): WinSparkle built without OpenSSL
     # (TARK_WINSPARKLE_DIR, from windows/ci/build_winsparkle.ps1).
     install_winsparkle(pathlib.Path(os.environ.get('TARK_WINSPARKLE_DIR', '')), src)
-    run(BASH, '-c', 'source "$_root_dir/utils/install_captions_credits.sh" && _install_captions_credits',
-        env=env)
+    common.after_platform(REPO, CORE, CACHE, src, BASH)
     print('tark: post-patch steps done', flush=True)
+
+
+def main():
+    if len(sys.argv) != 2:
+        sys.exit('usage: tark_post_patch.py SOURCE_TREE')
+    main_for(pathlib.Path(sys.argv[1]).resolve())
     if os.environ.get('TARK_STOP_BEFORE_GN') == '1':
         # The patch-only job: every patch applied and Tark's steps ran; stop
         # build.py here, before gn gen and the compile.
