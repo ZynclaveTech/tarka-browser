@@ -115,8 +115,9 @@ if (( code == 0 )); then
   bash "$repo/linux/package_tarball.sh" "$repo" "$work/build/src/out/Default" "$L/out" >> "$log" 2>&1 || code=1
 fi
 if (( code == 0 )); then
-  # The window picture needs Xvfb and ImageMagick; without them it is skipped.
-  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q xvfb imagemagick >> "$log" 2>&1 || true
+  # The window picture needs Xvfb and ImageMagick (without them it is skipped);
+  # the Zynclave checks need websocket-client.
+  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q xvfb imagemagick python3-websocket >> "$log" 2>&1 || true
   bash "$repo/linux/check_build.sh" "$L/out" "$L/checks" >> "$log" 2>&1 || code=1
   for f in "$L"/checks/*; do upload "$f" "checks/$(basename "$f")"; done
 fi
