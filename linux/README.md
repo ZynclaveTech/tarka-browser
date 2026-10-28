@@ -47,6 +47,14 @@ details ONNX Runtime sizes its threads from. `run_tests.sh` builds and runs
 the captions, speech and transliteration unit tests on the build machine,
 and ONNX Runtime running Silero VAD.
 
+Updates (L3, L4): the .deb adds Tark's apt repository (gettarka.com/apt,
+signed by "Tark Linux packages", 3F98 7B3C 7BB6 A9F2 FAA6  E693 C137 471A
+1994 EA7B), so apt upgrade brings new versions. The tarball's Tark
+(`tarka/linux/update-notice.patch`) reads gettarka.com/linux/latest.json a
+minute after start and once a day, and offers "Update Tark…" under About when
+a newer Tark is out; it never replaces its own files. Tark in /opt/tark (the
+.deb's) does not check.
+
 Still Mac and Windows only, on purpose:
 
 - **Apple's caption languages** (English, Spanish, …): macOS's own speech.

@@ -85,6 +85,13 @@ class TestLinuxJob(unittest.TestCase):
         install = text.find('linux/check_deb.sh')
         self.assertTrue(0 < tarball < deb < install, (tarball, deb, install))
 
+    def test_checks_zynclave_sign_in_on_the_tarball(self):
+        text = JOB.read_text()
+        tarball = text.find('package_tarball.sh" "$repo"')
+        zynclave = text.find('python3 "$repo/utils/zynclave_e2e.py"')
+        self.assertTrue(0 < tarball < zynclave, (tarball, zynclave))
+        self.assertIn('--production', text[zynclave:zynclave + 200])
+
     def test_refuses_below_150_gb_free(self):
         r = run(self.root, free_gb=149)
         self.assertNotEqual(r.returncode, 0)

@@ -2,13 +2,15 @@
 # Copyright 2026 The Tark Authors
 # Use of this source code is governed by a BSD-style license that can be
 # found in the LICENSE file.
-"""End-to-end checks of desktop Sign in with Zynclave on the Mac.
+"""End-to-end checks of desktop Sign in with Zynclave (Mac, Linux).
 
-    zynclave_e2e.py APP [CASES...]
+    zynclave_e2e.py APP [CASES...] [--production]
         cases: card_signed_out sign_in_page stray_redirect policy_known
 
-Launches APP (a dev build, so Zynclave staging) on a fresh profile with
-DevTools on a local port, as utils/adblock_e2e.py does, and checks:
+Launches APP (Tark.app, or on Linux the tarball's folder; a dev build uses
+Zynclave staging, a release build with --production the real one) on a
+fresh profile with DevTools on a local port, as utils/adblock_e2e.py does,
+and checks:
   card_signed_out  Settings > Profile shows "Sign in with Zynclave".
   sign_in_page     Its button opens Zynclave's sign-in page in a new tab,
                    with this platform's client, PKCE S256 and the redirect.
@@ -33,6 +35,16 @@ import urllib.request
 import adblock_e2e as e2e
 
 STRAY = 'com.gettarka.tarka:/oauth2redirect?code=x&state=y'
+
+
+def servers(production):
+    """Zynclave's sign-in host, Tark's client (Mac and Linux) and the login
+    screen: staging for dev builds, production for release builds (L4)."""
+    if production:
+        return {'auth': 'auth.zynclave.com', 'client_id': 'f6beeeca-b521-4360-a39e-48257675b6c1',
+                'login': 'https://accounts.zynclave.com/login'}
+    return {'auth': 'auth.staging.zynclave.com', 'client_id': '254e0cf8-e515-4ea8-846c-86b5510c5499',
+            'login': 'https://accounts.staging.zynclave.com/login'}
 PORT = 8011
 
 
@@ -75,7 +87,8 @@ def report(ok, name, detail=''):
     return 0 if ok else 1
 
 
-def run_case(app, name):
+def run_case(app, name, production=False):
+    zynclave = servers(production)
     browser = e2e.Browser(app)
     try:
         if not browser.wait_ready():
@@ -97,8 +110,8 @@ def run_case(app, name):
                 if auth:
                     url = urllib.parse.urlparse(auth[0]['url'])
                     q = urllib.parse.parse_qs(url.query)
-                    ok = (url.hostname == 'auth.staging.zynclave.com'
-                          and q.get('client_id') == ['254e0cf8-e515-4ea8-846c-86b5510c5499']
+                    ok = (url.hostname == zynclave['auth']
+                          and q.get('client_id') == [zynclave['client_id']]
                           and q.get('redirect_uri') == ['com.gettarka.tarka:/oauth2redirect']
                           and q.get('code_challenge_method') == ['S256']
                           and q.get('scope') == ['openid profile email offline_access']
@@ -109,7 +122,7 @@ def run_case(app, name):
                 # within a second, before this poll sees it; the request's
                 # parameters are covered by the unit tests.
                 login = [t for t in tabs()
-                         if t.get('url', '').startswith('https://accounts.staging.zynclave.com/login')]
+                         if t.get('url', '').startswith(zynclave['login'])]
                 if login:
                     return report(True, name, 'redirected to ' + login[0]['url'].split('?')[0])
                 time.sleep(0.25)
@@ -153,13 +166,15 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument('app')
     ap.add_argument('cases', nargs='*', default=['card_signed_out', 'sign_in_page', 'stray_redirect', 'policy_known'])
+    ap.add_argument('--production', action='store_true',
+                    help="a release build: production Zynclave (a dev build uses staging)")
     args = ap.parse_args(argv)
     socketserver.ThreadingTCPServer.allow_reuse_address = True
     server = socketserver.ThreadingTCPServer(('127.0.0.1', PORT), StrayHandler)
     server.daemon_threads = True
     threading.Thread(target=server.serve_forever, daemon=True).start()
     try:
-        failed = sum(run_case(args.app, c) for c in args.cases)
+        failed = sum(run_case(args.app, c, args.production) for c in args.cases)
     finally:
         server.shutdown()
     return 1 if failed else 0
