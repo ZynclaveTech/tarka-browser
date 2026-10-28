@@ -196,14 +196,39 @@ def brand():
     square = DERIVED.parent / 'app-icon-square.svg'
     square.parent.mkdir(parents=True, exist_ok=True)
     square.write_text(BRAND_ICON.read_text().replace(' rx="226"', ''))
-    for name in ICON_SETS:
-        for png in sorted((ICONS / f'{name}.appiconset').glob('*.png')):
+    # The "Open in Tark" share action has its own icon set.
+    action_icons = TREE / 'firefox-ios' / 'Extensions' / 'ActionExtension' / 'Media.xcassets' / 'AppIconExtension-iOS.appiconset'
+    for folder in [ICONS / f'{name}.appiconset' for name in ICON_SETS] + [action_icons]:
+        for png in sorted(folder.glob('*.png')):
             size = re.search(r'pixelWidth: (\d+)', out('sips', '-g', 'pixelWidth', png)).group(1)
             run('rsvg-convert', '-w', size, '-h', size, square, '-o', png)
             gray = ('-colorspace', 'Gray') if png.stem.endswith('-tinted') else ()
             run('magick', png, '-background', BRAND_INK, '-alpha', 'remove', '-alpha', 'off', *gray, png)
             if out('sips', '-g', 'hasAlpha', png).split()[-1] != 'no':
                 sys.exit(f'{png} still has an alpha channel')
+    glyphs()
+
+
+# Toolbar glyphs drawn for Tark (I5d): the tabs button as a box taller than
+# wide (Firefox's is wide and flat), and the menu mark filling its square.
+TOOLBAR_GLYPHS = {
+    'tabLarge.imageset/tabLarge.pdf':
+        '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">'
+        '<rect x="2.5" y="1" width="19" height="22" rx="4.5" fill="none" stroke="#000" stroke-width="2"/></svg>',
+    'tarkMenuMark.imageset/tarkMenuMark.pdf':
+        '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 44 44">'
+        '<circle cx="9" cy="32" r="8" fill="#e8705a"/><circle cx="35" cy="32" r="8" fill="#4338ca"/>'
+        '<circle cx="22" cy="12" r="8" fill="#e0a33a"/></svg>',
+}
+
+
+def glyphs():
+    images = TREE / 'firefox-ios' / 'Client' / 'Assets' / 'Images.xcassets'
+    for path, svg in TOOLBAR_GLYPHS.items():
+        source = DERIVED.parent / (pathlib.Path(path).stem + '.svg')
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_text(svg)
+        run('rsvg-convert', '-f', 'pdf', source, '-o', images / path)
 
 
 def sim():
