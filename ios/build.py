@@ -22,6 +22,7 @@
 The tree is never committed: Tark's changes are the patches in ios/patches,
 listed in ios/series, so moving to a new Firefox release means rebasing them.
 """
+import datetime
 import json
 import pathlib
 import re
@@ -251,6 +252,8 @@ def archive():
         '-allowProvisioningUpdates',
         'DEVELOPMENT_TEAM=UMTJNNPK6C', 'CODE_SIGN_STYLE=Automatic',
         'PROVISIONING_PROFILE_SPECIFIER=', 'CODE_SIGN_IDENTITY=Apple Development',
+        # Each upload needs a higher build number: the UTC minute it was built.
+        'TARK_BUILD=' + datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%d%H%M'),
         'archive', cwd=TREE)
 
 
