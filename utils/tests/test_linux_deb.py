@@ -63,7 +63,8 @@ class TestLinuxDeb(unittest.TestCase):
                      './usr/share/applications/tark.desktop',
                      './usr/share/icons/hicolor/256x256/apps/tark.png',
                      './usr/share/icons/hicolor/16x16/apps/tark.png',
-                     './etc/apparmor.d/tark'):
+                     './etc/apparmor.d/tark',
+                     './opt/tark/tark-archive-keyring.gpg'):
             self.assertIn(path, listing)
         self.assertRegex(listing, r'\./usr/bin/tark -> /opt/tark/tark')
 
@@ -78,6 +79,12 @@ class TestLinuxDeb(unittest.TestCase):
         apparmor = (out / 'etc/apparmor.d/tark').read_text()
         self.assertIn('/opt/tark/chrome', apparmor)
         self.assertIn('userns,', apparmor)
+
+    def test_carries_tarks_package_key(self):
+        out = pathlib.Path(self.tmp.name) / 'k'
+        subprocess.run(['dpkg-deb', '-x', str(self.deb), str(out)], check=True)
+        self.assertEqual((out / 'opt/tark/tark-archive-keyring.gpg').read_bytes(),
+                         (REPO / 'linux/deb/tark-archive-keyring.gpg').read_bytes())
 
     def test_launcher_names_the_desktop_entry(self):
         out = pathlib.Path(self.tmp.name) / 'y'

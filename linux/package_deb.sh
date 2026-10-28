@@ -34,6 +34,9 @@ chmod 755 "$root/opt/tark/tark"
 ln -s /opt/tark/tark "$root/usr/bin/tark"
 install -m 644 "$deb/tark.desktop" "$root/usr/share/applications/tark.desktop"
 install -m 644 "$deb/apparmor" "$root/etc/apparmor.d/tark"
+# Tark's apt repository key (Tark Linux packages <packages@gettarka.com>,
+# 3F98 7B3C 7BB6 A9F2 FAA6  E693 C137 471A 1994 EA7B); postinst installs it.
+install -m 644 "$deb/tark-archive-keyring.gpg" "$root/opt/tark/tark-archive-keyring.gpg"
 for size in 16 24 48 64 128 256; do
   mkdir -p "$root/usr/share/icons/hicolor/${size}x${size}/apps"
   install -m 644 "$src/chrome/app/theme/chromium/product_logo_$size.png" \
