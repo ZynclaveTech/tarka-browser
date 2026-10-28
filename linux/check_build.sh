@@ -27,7 +27,7 @@ run=$(mktemp -d)
 trap 'rm -rf "$run"' EXIT
 tar -xJf "$tarball" -C "$run"
 app=$(ls -d "$run"/Tark-*/)
-for f in tark chrome indicxlit/xlit-model.bin indicxlit/xlit-words.bin; do
+for f in tark chrome indicxlit/xlit-model.bin indicxlit/xlit-words.bin tark_adblock/lists.zip; do
   [[ -e $app/$f ]] || fail contents "no $f"
 done
 grep -q "^FAIL contents" "$txt" || ok contents
