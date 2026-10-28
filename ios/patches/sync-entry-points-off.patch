@@ -1,0 +1,144 @@
+diff --git a/firefox-ios/Client/Coordinators/TabTray/TabTrayCoordinator.swift b/firefox-ios/Client/Coordinators/TabTray/TabTrayCoordinator.swift
+index 7e9657d..1d41d24 100644
+--- a/firefox-ios/Client/Coordinators/TabTray/TabTrayCoordinator.swift
++++ b/firefox-ios/Client/Coordinators/TabTray/TabTrayCoordinator.swift
+@@ -44,6 +44,7 @@ final class TabTrayCoordinator: BaseCoordinator,
+     }
+ 
+     private func initializeTabTrayViewController(panelType: TabTrayPanelType) {
++        let panelType = panelType == .syncedTabs ? .tabs : panelType
+         let tabTrayViewController = TabTrayViewController(panelType: panelType, windowUUID: tabManager.windowUUID)
+         router.setRootViewController(tabTrayViewController)
+         self.tabTrayViewController = tabTrayViewController
+@@ -54,6 +55,7 @@ final class TabTrayCoordinator: BaseCoordinator,
+     }
+ 
+     func start(with tabTraySection: TabTrayPanelType) {
++        let tabTraySection = tabTraySection == .syncedTabs ? .tabs : tabTraySection
+         tabTrayViewController?.setupOpenPanel(panelType: tabTraySection)
+         // Build the tray and populate the selected panel now, before `present` kicks off the transition.
+         tabTrayViewController?.preloadSelectedPanelForPresentation()
+@@ -67,14 +69,13 @@ final class TabTrayCoordinator: BaseCoordinator,
+         let privateTabsPanel = TabDisplayPanelViewController(isPrivateMode: true,
+                                                              windowUUID: windowUUID,
+                                                              dragAndDropDelegate: dragAndDropDelegate)
+-        let syncTabs = RemoteTabsPanel(windowUUID: windowUUID)
+-
++        // Tark: no synced-tabs panel (no Firefox account or Sync).
+         let panels: [UIViewController]
+         // Panels order is different for the experiment
+         if tabTrayUtils.shouldDisplayExperimentUI() {
+-            panels = [privateTabsPanel, regularTabsPanel, syncTabs]
++            panels = [privateTabsPanel, regularTabsPanel]
+         } else {
+-            panels = [regularTabsPanel, privateTabsPanel, syncTabs]
++            panels = [regularTabsPanel, privateTabsPanel]
+         }
+ 
+         return panels.map {
+diff --git a/firefox-ios/Client/Frontend/Browser/BrowserViewController/Views/BrowserViewController.swift b/firefox-ios/Client/Frontend/Browser/BrowserViewController/Views/BrowserViewController.swift
+index d2b1525..5617d71 100644
+--- a/firefox-ios/Client/Frontend/Browser/BrowserViewController/Views/BrowserViewController.swift
++++ b/firefox-ios/Client/Frontend/Browser/BrowserViewController/Views/BrowserViewController.swift
+@@ -3295,6 +3295,9 @@ class BrowserViewController: UIViewController,
+     func presentSignInViewController(_ fxaOptions: FxALaunchParams,
+                                      flowType: FxAPageType = .emailLoginFlow,
+                                      referringPage: ReferringPage = .none) {
++        // Tark: no Firefox account or Sync; links, cards and menus that ask for
++        // the sign-in page open nothing.
++        return
+         let windowManager: WindowManager = AppContainer.shared.resolve()
+         windowManager.postWindowEvent(event: .syncMenuOpened, windowUUID: windowUUID)
+         let vcToPresent = FirefoxAccountSignInViewController.getSignInOrFxASettingsVC(
+@@ -3312,6 +3315,8 @@ class BrowserViewController: UIViewController,
+     }
+ 
+     func presentPairingViewController(_ pairingURL: URL) {
++        // Tark: no Firefox account, so no device pairing.
++        return
+         // Without an account manager the web view never loads its first page, so the modal would
+         // present empty with no error and no way out. A cold-launch deep link can arrive before the
+         // account manager finishes initializing, so wait for it rather than dropping the route.
+diff --git a/firefox-ios/Client/Frontend/Browser/Tabs/Views/TabTrayViewController.swift b/firefox-ios/Client/Frontend/Browser/Tabs/Views/TabTrayViewController.swift
+index 1bf492d..73dae9c 100644
+--- a/firefox-ios/Client/Frontend/Browser/Tabs/Views/TabTrayViewController.swift
++++ b/firefox-ios/Client/Frontend/Browser/Tabs/Views/TabTrayViewController.swift
+@@ -125,9 +125,9 @@ final class TabTrayViewController: UIViewController,
+ 
+     private lazy var experimentSegmentControl: TabTraySelectorView = {
+         let selectedIndex = experimentConvertSelectedIndex()
++        // Tark: no synced-tabs panel.
+         let titles = [TabTrayPanelType.privateTabs.label,
+-                      TabTrayPanelType.tabs.label,
+-                      TabTrayPanelType.syncedTabs.label]
++                      TabTrayPanelType.tabs.label]
+         let selector = TabTraySelectorView(selectedIndex: selectedIndex,
+                                            theme: retrieveTheme(),
+                                            buttonTitles: titles)
+@@ -141,8 +141,7 @@ final class TabTrayViewController: UIViewController,
+     private lazy var experimentiPadSegmentControl: TabTrayiPadSelectorView = {
+         let selectedIndex = experimentConvertSelectedIndex()
+         let titles = [TabTrayPanelType.privateTabs.label,
+-                      TabTrayPanelType.tabs.label,
+-                      TabTrayPanelType.syncedTabs.label]
++                      TabTrayPanelType.tabs.label]
+         let selector = TabTrayiPadSelectorView(selectedIndex: selectedIndex,
+                                                theme: retrieveTheme(),
+                                                buttonTitles: titles)
+@@ -176,14 +175,12 @@ final class TabTrayViewController: UIViewController,
+     var segmentControlItems: [Any] {
+         let iPhoneItems = [
+             TabTrayPanelType.tabs.image!.overlayWith(image: countLabel),
+-            TabTrayPanelType.privateTabs.image!,
+-            TabTrayPanelType.syncedTabs.image!
++            TabTrayPanelType.privateTabs.image!
+         ]
+ 
+         let regularLayoutItems = [
+             TabTrayPanelType.tabs.label,
+             TabTrayPanelType.privateTabs.label,
+-            TabTrayPanelType.syncedTabs.label,
+         ]
+ 
+         return isRegularLayout ? regularLayoutItems : iPhoneItems
+diff --git a/firefox-ios/Client/Frontend/Home/Homepage/Redux/HomepageMiddleware.swift b/firefox-ios/Client/Frontend/Home/Homepage/Redux/HomepageMiddleware.swift
+index 77d8a95..2f02cb0 100644
+--- a/firefox-ios/Client/Frontend/Home/Homepage/Redux/HomepageMiddleware.swift
++++ b/firefox-ios/Client/Frontend/Home/Homepage/Redux/HomepageMiddleware.swift
+@@ -262,11 +262,6 @@ final class HomepageMiddleware: FeatureFlaggable, Notifiable {
+                 actionType: HomepageMiddlewareActionType.jumpBackInLocalTabsUpdated
+             )
+         )
+-        store.dispatch(
+-            HomepageAction(
+-                windowUUID: windowUUID,
+-                actionType: HomepageMiddlewareActionType.jumpBackInRemoteTabsUpdated
+-            )
+-        )
++        // Tark: no synced tabs in Jump Back In (no Firefox account or Sync).
+     }
+ }
+diff --git a/firefox-ios/Client/Frontend/Share/ShareManager.swift b/firefox-ios/Client/Frontend/Share/ShareManager.swift
+index 3aad40f..ac4bd11 100644
+--- a/firefox-ios/Client/Frontend/Share/ShareManager.swift
++++ b/firefox-ios/Client/Frontend/Share/ShareManager.swift
+@@ -131,18 +131,7 @@ class ShareManager: NSObject, FeatureFlaggable {
+ 
+         // Set up the "Send to Device" activity, which shares URLs between a Firefox account user's synced devices. We can
+         // only share URLs to real websites, not internal `file://` URLs.
+-        switch shareType {
+-        case .file(_, let remoteURL):
+-            // Some downloaded files may have an associated remote URL (if the file was just downloaded in the tab).
+-            // Files which are shared from the Downloads Panel will NOT have any associated remote URL (we don't store that
+-            // history).
+-            if let remoteURL {
+-                appActivities.append(SendToDeviceActivity(activityType: .sendToDevice, url: remoteURL))
+-            }
+-        default:
+-            appActivities.append(SendToDeviceActivity(activityType: .sendToDevice, url: shareType.wrappedURL))
+-        }
+-
++        // Tark: no Firefox account, so no "Send to Device".
+         return appActivities
+     }
+ }

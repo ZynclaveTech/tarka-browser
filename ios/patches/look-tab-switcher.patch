@@ -1,0 +1,117 @@
+diff --git a/firefox-ios/Client/Frontend/Browser/Tabs/Views/CustomSelectorView/TabTraySelectorView.swift b/firefox-ios/Client/Frontend/Browser/Tabs/Views/CustomSelectorView/TabTraySelectorView.swift
+index f6d3a4a..8760e85 100644
+--- a/firefox-ios/Client/Frontend/Browser/Tabs/Views/CustomSelectorView/TabTraySelectorView.swift
++++ b/firefox-ios/Client/Frontend/Browser/Tabs/Views/CustomSelectorView/TabTraySelectorView.swift
+@@ -144,7 +144,8 @@ class TabTraySelectorView: UIView, ThemeApplicable {
+             stackView.centerYAnchor.constraint(equalTo: containerView.centerYAnchor),
+             selectionBackgroundView.heightAnchor.constraint(equalTo: stackView.heightAnchor),
+             selectionBackgroundView.centerYAnchor.constraint(equalTo: stackView.centerYAnchor),
+-            selectionBackgroundView.centerXAnchor.constraint(equalTo: containerView.centerXAnchor)
++            // Tark: the choices stay centred as one pill; the highlight moves.
++            stackView.centerXAnchor.constraint(equalTo: containerView.centerXAnchor)
+         ])
+ 
+         if #available(iOS 26, *) {
+@@ -204,11 +205,9 @@ class TabTraySelectorView: UIView, ThemeApplicable {
+         )
+         selectionBackgroundWidthConstraint?.isActive = true
+ 
+-        // Ensure the stack view is positioned so the selected button is centered
+-        let buttonCenter = selectedButton.convert(selectedButton.bounds.center, to: containerView)
+-        let offset = stackView.frame.midX - buttonCenter.x
+-        stackViewOffsetConstraint = stackView.centerXAnchor.constraint(
+-            equalTo: containerView.centerXAnchor, constant: offset
++        // Tark: the highlight sits under the selected choice.
++        stackViewOffsetConstraint = selectionBackgroundView.centerXAnchor.constraint(
++            equalTo: selectedButton.centerXAnchor
+         )
+         stackViewOffsetConstraint?.isActive = true
+     }
+@@ -347,11 +346,11 @@ class TabTraySelectorView: UIView, ThemeApplicable {
+         let fromCenter = fromButton.convert(fromButton.bounds.center, to: containerView)
+         let toCenter = toButton.convert(toButton.bounds.center, to: containerView)
+         let interpolatedX = fromCenter.x + (toCenter.x - fromCenter.x) * progress
+-        let offset = stackView.frame.midX - interpolatedX
+ 
++        // Tark: move the highlight, not the choices.
+         stackViewOffsetConstraint?.isActive = false
+-        stackViewOffsetConstraint = stackView.centerXAnchor.constraint(
+-            equalTo: containerView.centerXAnchor, constant: offset
++        stackViewOffsetConstraint = selectionBackgroundView.centerXAnchor.constraint(
++            equalTo: containerView.leadingAnchor, constant: interpolatedX
+         )
+         stackViewOffsetConstraint?.isActive = true
+ 
+diff --git a/firefox-ios/Client/Frontend/Browser/Tabs/Views/ExperimentTabCell.swift b/firefox-ios/Client/Frontend/Browser/Tabs/Views/ExperimentTabCell.swift
+index a00e3d0..6fcdc8d 100644
+--- a/firefox-ios/Client/Frontend/Browser/Tabs/Views/ExperimentTabCell.swift
++++ b/firefox-ios/Client/Frontend/Browser/Tabs/Views/ExperimentTabCell.swift
+@@ -278,43 +278,6 @@ final class ExperimentTabCell: UICollectionViewCell, ThemeApplicable, ReusableCe
+         }
+     }
+ 
+-    private func addExternalBorder(to view: UIView, color: UIColor, width: CGFloat) {
+-        borderLayer = CAShapeLayer()
+-
+-        let borderRect = view.bounds.insetBy(dx: -width / 3, dy: -width / 3)
+-
+-        borderLayer.path = UIBezierPath(
+-            roundedRect: borderRect,
+-            cornerRadius: UX.cornerRadius
+-        ).cgPath
+-
+-        borderLayer.fillColor = UIColor.clear.cgColor
+-        borderLayer.strokeColor = color.cgColor
+-        borderLayer.lineWidth = width
+-        borderLayer.frame = view.bounds
+-        borderLayer.name = UX.borderLayerName
+-        borderLayer.needsDisplayOnBoundsChange = true
+-
+-        view.clipsToBounds = false
+-
+-        removeExternalBorder(from: view)
+-
+-        view.layer.addSublayer(borderLayer)
+-    }
+-
+-    private func gradientBorderImage(size: CGSize, colors: [CGColor]) -> UIImage {
+-        let renderer = UIGraphicsImageRenderer(size: size)
+-        return renderer.image { context in
+-            guard let gradient = CGGradient(colorsSpace: CGColorSpaceCreateDeviceRGB(),
+-                                            colors: colors as CFArray,
+-                                            locations: nil) else { return }
+-            context.cgContext.drawLinearGradient(gradient,
+-                                                 start: .zero,
+-                                                 end: CGPoint(x: size.width, y: size.height),
+-                                                 options: [])
+-        }
+-    }
+-
+     private func redrawExternalBorder() {
+         let width = borderLayer.lineWidth
+         let borderRect = backgroundHolder.bounds.insetBy(dx: -width / 3, dy: -width / 3)
+@@ -332,19 +295,12 @@ final class ExperimentTabCell: UICollectionViewCell, ThemeApplicable, ReusableCe
+     }
+ 
+     func setSelectedState(isPrivate: Bool, theme: Theme) {
+-        // We are using a non-CALayer borderWidth for unselected cells for reduced graphics processing
+-        // we zero that value here when we are in the selected state to assign the CAShapeLayer
+-        backgroundHolder.layer.borderWidth = UX.zeroBorderWidth
+-
+-        if theme.isNova {
+-            let gradientColor = UIColor(patternImage: gradientBorderImage(size: backgroundHolder.bounds.size,
+-                                                                          colors: theme.colors.gradientBorder.cgColors))
+-            addExternalBorder(to: backgroundHolder, color: gradientColor, width: UX.selectedBorderWidth)
+-            return
+-        }
+-
++        // Tark: the current tab is framed in solid indigo as the card's own border
++        // (no gradient, no outer layer), as on Android.
++        removeExternalBorder(from: backgroundHolder)
+         let borderColor = isPrivate ? theme.colors.borderAccentPrivate : theme.colors.borderAccent
+-        addExternalBorder(to: backgroundHolder, color: borderColor, width: UX.selectedBorderWidth)
++        backgroundHolder.layer.borderColor = borderColor.cgColor
++        backgroundHolder.layer.borderWidth = UX.selectedBorderWidth
+     }
+ 
+     func setUnselectedState(theme: Theme) {
