@@ -24,9 +24,13 @@ run() {  # NAME PROGRAM ARGS...
   local name=$1 program=$2; shift 2
   "$out/$program" --gtest_output="xml:$report/$name.xml" "$@" > "$report/$name.log" 2>&1
   local code=$?
-  # Chromium's test launcher ends with its own line; gtest in one process with
-  # its summary.
-  if (( code != 0 )) || ! grep -qE '^SUCCESS: all tests passed\.|^\[  PASSED  \] [1-9]' "$report/$name.log"; then
+  # Chromium's test launcher ends with its own line, gtest in one process with
+  # its summary; the XML must also count at least one test, since the launcher
+  # reports success when a filter matches none.
+  local ran
+  ran=$(grep -o '<testsuites[^>]* tests="[0-9]*"' "$report/$name.xml" 2>/dev/null | grep -o '[0-9]*"$' | tr -d '"')
+  if (( code != 0 )) || (( ${ran:-0} < 1 )) ||
+      ! grep -qE '^SUCCESS: all tests passed\.|^\[  PASSED  \] [1-9]' "$report/$name.log"; then
     echo "FAIL $name (exit $code)"; fails=$((fails + 1))
   else
     echo "ok $name: $(grep '^\[  PASSED  \]' "$report/$name.log")"

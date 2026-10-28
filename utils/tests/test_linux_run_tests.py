@@ -11,13 +11,19 @@ REPO = pathlib.Path(__file__).resolve().parents[2]
 SCRIPT = REPO / 'linux' / 'run_tests.sh'
 
 
-def program(path, text, code=0):
-    path.write_text(f'#!/bin/sh\ncat <<"OUT"\n{text}\nOUT\nexit {code}\n')
+def program(path, text, code=0, tests=1):
+    """A stand-in test program: prints TEXT, writes a gtest XML with TESTS
+    tests where --gtest_output asks, exits CODE."""
+    path.write_text(
+        '#!/bin/sh\n'
+        'for a in "$@"; do case $a in --gtest_output=xml:*) '
+        f'echo \'<testsuites tests="{tests}" failures="0"/>\' > "${{a#--gtest_output=xml:}}";; esac; done\n'
+        f'cat <<"OUT"\n{text}\nOUT\nexit {code}\n')
     path.chmod(0o755)
 
 
 class TestRunTests(unittest.TestCase):
-    def run_with(self, captions, captions_code=0):
+    def run_with(self, captions, captions_code=0, captions_tests=1):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         root = pathlib.Path(tmp.name)
@@ -26,7 +32,7 @@ class TestRunTests(unittest.TestCase):
         fonts = root / 'src' / 'third_party' / 'test_fonts' / 'test_fonts'
         fonts.mkdir(parents=True)
         (fonts / 'Ahem.ttf').write_text('font')
-        program(out / 'tark_captions_unittests', captions, captions_code)
+        program(out / 'tark_captions_unittests', captions, captions_code, captions_tests)
         program(out / 'tark_speech_unittests', '[1/1] A.B (0 ms)\nSUCCESS: all tests passed.')
         program(out / 'tark_xlit_unittests', '[==========] 2 tests ran.\n[  PASSED  ] 2 tests.')
         bin_dir = root / 'bin'
@@ -45,6 +51,10 @@ class TestRunTests(unittest.TestCase):
 
     def test_a_failing_program_fails(self):
         self.assertIn('FAIL captions', self.run_with('1 test failed', 1))
+
+    def test_success_with_no_test_run_fails(self):
+        out = self.run_with('SUCCESS: all tests passed.', captions_tests=0)
+        self.assertIn('FAIL captions', out)
 
     def test_no_summary_fails(self):
         self.assertIn('FAIL captions', self.run_with('nothing ran'))
