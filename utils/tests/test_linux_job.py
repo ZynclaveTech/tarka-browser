@@ -33,6 +33,11 @@ class TestLinuxJob(unittest.TestCase):
         self.assertIn(f'work {self.root}/linux/tl', r.stdout)
         self.assertIn(f'repo {self.root}/linux/repo', r.stdout)
 
+    def test_package_only_skips_the_build(self):
+        r = run(self.root, '--package-only')
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn('package only', r.stdout)
+
     def test_never_names_androids_folders(self):
         text = JOB.read_text()
         for android in ('/tark/work', '/tark/repo', '$ROOT/work', '$ROOT/repo'):

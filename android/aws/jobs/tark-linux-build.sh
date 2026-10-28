@@ -3,7 +3,7 @@
 # Use of this source code is governed by a BSD-style license that can be
 # found in the LICENSE file.
 #
-#   tark-linux-build.sh BUCKET PREFIX SUBMODULE_COMMIT [--fresh] [--dry-run]
+#   tark-linux-build.sh BUCKET PREFIX SUBMODULE_COMMIT [--fresh] [--package-only] [--dry-run]
 #
 # L1: build Tark for Linux x64 on the Android build machine, from the source
 # andbuild.sh put in S3, in upstream's Docker image (linux/upstream/docker).
@@ -12,12 +12,14 @@
 # job lock, so it never touches Android's checkout or runs beside its build.
 # The tarball, its sha256, the checks and the log go to the job's S3 prefix;
 # the machine powers off at the end unless another build is running.
+# --package-only: package and check the build already on the machine (upstream's
+# build.sh deletes out/ first, so a re-run would compile everything again).
 # --dry-run (the Mac's test): the lock and disk checks, then the plan only.
 set -uo pipefail
 B=$1; P=$2; SUB=$3; shift 3
-fresh=0; dry=0
+fresh=0; dry=0; package_only=0
 for a in "$@"; do
-  case $a in --fresh) fresh=1;; --dry-run) dry=1;; esac
+  case $a in --fresh) fresh=1;; --dry-run) dry=1;; --package-only) package_only=1;; esac
 done
 ROOT=${TARK_ROOT:-/tark}
 L=$ROOT/linux
@@ -41,6 +43,7 @@ if (( dry )); then
   echo "repo $repo"
   echo "work $work"
   echo "free ${free} GB"
+  (( package_only )) && echo "package only"
   exit 0
 fi
 
@@ -64,31 +67,36 @@ must git -C "$repo/ungoogled-chromium" fetch --quiet origin "$SUB"
 must git -C "$repo/ungoogled-chromium" checkout --quiet --detach "$SUB"
 echo "submodule $SUB" >> "$log"
 
-# The name substitution backup goes with the tree: --sub refuses to run
-# when it exists.
-(( fresh )) && rm -rf "$work/build/src" "$work/build/namesubs.tar"
-must python3 "$repo/linux/prepare_workdir.py" "$repo" "$work"
+if (( package_only )); then
+  code=0
+  echo "package only: the build already on the machine" >> "$log"
+else
+  # The name substitution backup goes with the tree: --sub refuses to run
+  # when it exists.
+  (( fresh )) && rm -rf "$work/build/src" "$work/build/namesubs.tar"
+  must python3 "$repo/linux/prepare_workdir.py" "$repo" "$work"
 
-# Upstream builds in its own Debian image (system Node, tsc, esbuild, Go).
-# Its Dockerfile needs BuildKit (COPY --chmod): Ubuntu's docker-buildx.
-if ! command -v docker >/dev/null || ! sudo docker buildx version >/dev/null 2>&1; then
-  must sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q docker.io docker-buildx
+  # Upstream builds in its own Debian image (system Node, tsc, esbuild, Go).
+  # Its Dockerfile needs BuildKit (COPY --chmod): Ubuntu's docker-buildx.
+  if ! command -v docker >/dev/null || ! sudo docker buildx version >/dev/null 2>&1; then
+    must sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q docker.io docker-buildx
+  fi
+  must sudo docker buildx build --load -q -t tark-linux-builder -f "$work/docker/build.Dockerfile" "$work/docker"
+
+  # The ad blocker's list bundle staged in s3://BUCKET/lists/, as for Android.
+  rm -rf "$L/lists" && mkdir -p "$L/lists"
+  lists=()
+  if aws s3 cp --quiet --recursive "s3://$B/lists/" "$L/lists/" && [[ -f $L/lists/latest.json ]]; then
+    lists=(-e TARK_LISTS_DIR="$L/lists")
+  fi
+
+  # The repo and the lists are mounted at their own paths: tark_repo.txt names
+  # the repo's path, which the container must see the same.
+  timeout 8h sudo docker run --rm -u "$(id -u):$(id -g)" \
+    -v "$work:/repo" -v "$repo:$repo:ro" -v "$L/lists:$L/lists:ro" "${lists[@]}" \
+    tark-linux-builder bash /repo/scripts/build.sh >> "$log" 2>&1
+  code=$?
 fi
-must sudo docker buildx build --load -q -t tark-linux-builder -f "$work/docker/build.Dockerfile" "$work/docker"
-
-# The ad blocker's list bundle staged in s3://BUCKET/lists/, as for Android.
-rm -rf "$L/lists" && mkdir -p "$L/lists"
-lists=()
-if aws s3 cp --quiet --recursive "s3://$B/lists/" "$L/lists/" && [[ -f $L/lists/latest.json ]]; then
-  lists=(-e TARK_LISTS_DIR="$L/lists")
-fi
-
-# The repo and the lists are mounted at their own paths: tark_repo.txt names
-# the repo's path, which the container must see the same.
-timeout 8h sudo docker run --rm -u "$(id -u):$(id -g)" \
-  -v "$work:/repo" -v "$repo:$repo:ro" -v "$L/lists:$L/lists:ro" "${lists[@]}" \
-  tark-linux-builder bash /repo/scripts/build.sh >> "$log" 2>&1
-code=$?
 echo "build exit $code" >> "$log"
 
 # An earlier run's tarball or checks must never pass as this job's.
