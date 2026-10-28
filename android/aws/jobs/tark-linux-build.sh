@@ -120,8 +120,21 @@ if (( code == 0 )); then
   bash "$repo/linux/check_build.sh" "$L/out" "$L/checks" >> "$log" 2>&1 || code=1
   for f in "$L"/checks/*; do upload "$f" "checks/$(basename "$f")"; done
 fi
+# L3: the .deb, from the tarball as people get it, then installed and started
+# in a clean Ubuntu.
 if (( code == 0 )); then
-  for f in "$L"/out/*.tar.xz "$L"/out/*.sha256; do upload "$f" "$(basename "$f")"; done
+  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q dpkg-dev >> "$log" 2>&1 || true
+  unpacked=$(mktemp -d)
+  tar -xJf "$L"/out/Tark-*-x64-linux.tar.xz -C "$unpacked" &&
+    bash "$repo/linux/package_deb.sh" "$repo" "$unpacked"/Tark-*/ "$work/build/src" "$L/out" >> "$log" 2>&1 || code=1
+  rm -rf "$unpacked"
+fi
+if (( code == 0 )); then
+  bash "$repo/linux/check_deb.sh" "$L/out" "$L/checks" >> "$log" 2>&1 || code=1
+  upload "$L/checks/deb-checks.txt" checks/deb-checks.txt
+fi
+if (( code == 0 )); then
+  for f in "$L"/out/*.tar.xz "$L"/out/*.sha256 "$L"/out/*.deb; do upload "$f" "$(basename "$f")"; done
 fi
 echo "exit $code" >> "$log"
 exit $code

@@ -78,6 +78,13 @@ class TestLinuxJob(unittest.TestCase):
         self.assertNotEqual(tests, -1)
         self.assertLess(tests, text.find('package_tarball.sh" "$repo"'))
 
+    def test_makes_and_installs_the_deb_after_the_tarball(self):
+        text = JOB.read_text()
+        tarball = text.find('package_tarball.sh" "$repo"')
+        deb = text.find('package_deb.sh" "$repo"')
+        install = text.find('linux/check_deb.sh')
+        self.assertTrue(0 < tarball < deb < install, (tarball, deb, install))
+
     def test_refuses_below_150_gb_free(self):
         r = run(self.root, free_gb=149)
         self.assertNotEqual(r.returncode, 0)
