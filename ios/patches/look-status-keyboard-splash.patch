@@ -1,0 +1,73 @@
+diff --git a/firefox-ios/Client/Application/LaunchScreen.xib b/firefox-ios/Client/Application/LaunchScreen.xib
+index b390a2f..3d2bfdd 100644
+--- a/firefox-ios/Client/Application/LaunchScreen.xib
++++ b/firefox-ios/Client/Application/LaunchScreen.xib
+@@ -14,7 +14,7 @@
+             <rect key="frame" x="0.0" y="0.0" width="480" height="480"/>
+             <autoresizingMask key="autoresizingMask" widthSizable="YES" heightSizable="YES"/>
+             <subviews>
+-                <imageView userInteractionEnabled="NO" contentMode="scaleToFill" horizontalHuggingPriority="251" verticalHuggingPriority="251" image="tarkMark" translatesAutoresizingMaskIntoConstraints="NO" id="8jg-1f-0sB">
++                <imageView userInteractionEnabled="NO" contentMode="scaleAspectFit" horizontalHuggingPriority="251" verticalHuggingPriority="251" image="tarkMark" translatesAutoresizingMaskIntoConstraints="NO" id="8jg-1f-0sB">
+                     <rect key="frame" x="175" y="175" width="130" height="130"/>
+                     <constraints>
+                         <constraint firstAttribute="width" constant="130" id="V8U-lj-86g"/>
+diff --git a/firefox-ios/Client/Frontend/Browser/BrowserViewController/Views/BrowserViewController.swift b/firefox-ios/Client/Frontend/Browser/BrowserViewController/Views/BrowserViewController.swift
+index 262146e..655d46f 100644
+--- a/firefox-ios/Client/Frontend/Browser/BrowserViewController/Views/BrowserViewController.swift
++++ b/firefox-ios/Client/Frontend/Browser/BrowserViewController/Views/BrowserViewController.swift
+@@ -673,9 +673,8 @@ class BrowserViewController: UIViewController,
+         if isBottomSearchBar {
+             header.isClearBackground = false
+ 
+-            let isFxHomeTab = tabManager.selectedTab?.isFxHomeTab ?? false
+-            let offset = scrollOffset ?? statusBarOverlay.scrollOffset
+-            topBlurView.alpha = isFxHomeTab ? offset : 1
++            // Tark: no glass under the status bar; the overlay paints it in the page's Paper colour.
++            topBlurView.alpha = 0
+         } else {
+             header.isClearBackground = true
+             topBlurView.alpha = 1
+@@ -1853,7 +1852,8 @@ class BrowserViewController: UIViewController,
+ 
+     private func getKeyboardSpacerHeight(keyboardHeight: CGFloat) -> CGFloat {
+         let toolBarHeight = navigationToolbarContainer.isHidden ? 0 : UIConstants.BottomToolbarHeight
+-        let spacerHeight = keyboardHeight - toolBarHeight
++        // Tark: the home-indicator inset under the one-row bar also sits behind the keyboard.
++        let spacerHeight = keyboardHeight - toolBarHeight - (tarkBottomInsetHeight?.constant ?? 0)
+         return spacerHeight
+     }
+ 
+diff --git a/firefox-ios/Client/Frontend/Components/StatusBarOverlay.swift b/firefox-ios/Client/Frontend/Components/StatusBarOverlay.swift
+index 5f600c1..e77ee21 100644
+--- a/firefox-ios/Client/Frontend/Components/StatusBarOverlay.swift
++++ b/firefox-ios/Client/Frontend/Components/StatusBarOverlay.swift
+@@ -86,7 +86,7 @@ final class StatusBarOverlay: UIView,
+     }
+ 
+     func showOverlay(animated: Bool) {
+-        let backgroundAlpha = toolbarHelper.novaToolbarGlassEffectAlpha
++        let backgroundAlpha = isBottomSearchBar ? 1 : toolbarHelper.novaToolbarGlassEffectAlpha
+ 
+         guard animated else {
+             scrollDelegate?.homepageScrollViewDidScroll(scrollOffset: 1.0)
+@@ -132,8 +132,9 @@ final class StatusBarOverlay: UIView,
+     }
+ 
+     private func updateStatusBarAlpha(isHomepage: Bool, needsNoStatusBar: Bool) {
+-        let backgroundAlpha = toolbarHelper.novaToolbarGlassEffectAlpha
+-        if needsNoStatusBar {
++        // Tark: with the bar at the bottom the status bar is solid Paper, one surface with the page.
++        let backgroundAlpha = isBottomSearchBar ? 1 : toolbarHelper.novaToolbarGlassEffectAlpha
++        if needsNoStatusBar && !isBottomSearchBar {
+             let alpha = scrollOffset > backgroundAlpha ? backgroundAlpha : scrollOffset
+             backgroundColor = savedBackgroundColor?.withAlphaComponent(alpha)
+         } else {
+@@ -144,7 +145,7 @@ final class StatusBarOverlay: UIView,
+     // MARK: - ThemeApplicable
+ 
+     func applyTheme(theme: Theme) {
+-        savedBackgroundColor = theme.colors.layerSurfaceLow
++        savedBackgroundColor = theme.colors.layer1
+         let isHomepage: Bool = savedIsHomepage ?? false
+         let needsNoStatusBar = needsNoStatusBar(isHomepage: isHomepage)
+         updateStatusBarAlpha(isHomepage: isHomepage, needsNoStatusBar: needsNoStatusBar)
