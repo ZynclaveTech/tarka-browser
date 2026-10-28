@@ -54,6 +54,14 @@ class TestLinuxJob(unittest.TestCase):
         finally:
             holder.kill()
 
+    def test_clears_earlier_output_before_packaging(self):
+        # A tarball left by an earlier run must never be checked or uploaded
+        # as this job's.
+        text = JOB.read_text()
+        clear = text.find('rm -rf "$L/out" "$L/checks"')
+        self.assertNotEqual(clear, -1)
+        self.assertLess(clear, text.find('package_tarball.sh" "$repo"'))
+
     def test_refuses_below_150_gb_free(self):
         r = run(self.root, free_gb=149)
         self.assertNotEqual(r.returncode, 0)

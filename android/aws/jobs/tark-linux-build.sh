@@ -88,6 +88,8 @@ timeout 8h sudo docker run --rm -u "$(id -u):$(id -g)" \
 code=$?
 echo "build exit $code" >> "$log"
 
+# An earlier run's tarball or checks must never pass as this job's.
+rm -rf "$L/out" "$L/checks"
 if (( code == 0 )); then
   bash "$repo/linux/package_tarball.sh" "$repo" "$work/build/src/out/Default" "$L/out" >> "$log" 2>&1 || code=1
 fi
