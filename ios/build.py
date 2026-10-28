@@ -14,6 +14,10 @@
     build.py xlit     the D1 transliteration engine, from the same patches the
                       Mac and Android build, with ios/xlit's //base shim and C
                       interface, as BrowserKit's TarkXlitCore target
+    build.py translate  page translation's engine (tark_captions' translator,
+                      the same patches the Mac and Android build) with upstream
+                      SentencePiece and ONNX Runtime for iOS, both pinned, as
+                      BrowserKit's TarkTranslateCore target
     build.py brand    the app icon sets (for iOS before 26) rendered from
                       resources/branding/app-icon.svg; the Liquid Glass icons
                       and the home header are in ios/patches/look-tark.patch
@@ -53,6 +57,22 @@ XLIT_PATCHES = (
 )
 XLIT_SOURCES = ('blas.h', 'blas_accelerate.cc', 'languages.cc', 'languages.h', 'model.cc', 'model.h',
                 'transliterator.cc', 'transliterator.h', 'word_list.cc', 'word_list.h')
+TRANSLATE = IOS / 'translate'
+TRANSLATE_CORE = TREE / 'BrowserKit' / 'Sources' / 'TarkTranslateCore'
+ORT_XCFRAMEWORK = TREE / 'BrowserKit' / 'OnnxRuntime.xcframework'
+# Microsoft's onnxruntime-c pod: a static xcframework (no 1.31.0 for iOS yet).
+ORT_URL = 'https://download.onnxruntime.ai/pod-archive-onnxruntime-c-1.30.0.zip'
+ORT_SHA256 = 'e6f1670c14406fd9f082bb400ab197a9b0a9646058ca6366e440642e2b54a2ea'
+# The release before SentencePiece needed all of abseil; it bundles
+# protobuf-lite and the bit of abseil it uses (Chromium's copy uses Chromium's).
+SPM_URL = 'https://github.com/google/sentencepiece/archive/refs/tags/v0.2.0.tar.gz'
+SPM_SHA256 = '9970f0a0afee1648890293321665e5b2efa04eaec9f1671fcf8048f456f5bb86'
+# The translator's files and what they include (asr_model has the language
+# codes and brings the mel frontend).
+TRANSLATE_SOURCES = ('translation_engine', 'indic_text', 'english_text', 'model_source', 'ort_runtime',
+                     'asr_model', 'mel_frontend')
+SPM_RUNTIME = ('bpe_model', 'char_model', 'error', 'filesystem', 'model_factory', 'model_interface',
+               'normalizer', 'sentencepiece_processor', 'unigram_model', 'util', 'word_model')
 BRAND_ICON = ROOT / 'resources' / 'branding' / 'app-icon.svg'
 BRAND_INK = '#12121c'
 # The icon sets the Fennec, Beta and Release builds use. Firefox's alternate
@@ -188,6 +208,77 @@ enum TarkXlitFiles {{
 ''')
 
 
+def _fetch_pinned(url, sha256, dest):
+    # Kept between runs; re-downloaded only when missing or different.
+    import hashlib
+    if dest.exists() and hashlib.sha256(dest.read_bytes()).hexdigest() == sha256:
+        return
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_suffix('.part')
+    with urllib.request.urlopen(url) as response, open(tmp, 'wb') as out:
+        shutil.copyfileobj(response, out)
+    digest = hashlib.sha256(tmp.read_bytes()).hexdigest()
+    if digest != sha256:
+        tmp.unlink()
+        sys.exit(f'{url}: sha256 {digest}, expected {sha256}')
+    tmp.replace(dest)
+
+
+def translate():
+    work = ROOT / 'build' / 'ios'
+    # ONNX Runtime: the pinned pod, unpacked into BrowserKit as a binary target.
+    ort_zip = work / 'onnxruntime' / 'ort.zip'
+    _fetch_pinned(ORT_URL, ORT_SHA256, ort_zip)
+    ort = work / 'onnxruntime' / 'x'
+    shutil.rmtree(ort, ignore_errors=True)
+    run('unzip', '-q', ort_zip, '-d', ort)
+    shutil.rmtree(ORT_XCFRAMEWORK, ignore_errors=True)
+    shutil.copytree(ort / 'onnxruntime.xcframework', ORT_XCFRAMEWORK, symlinks=True)
+    # SentencePiece: the pinned release.
+    spm_tar = work / 'sentencepiece-0.2.0.tar.gz'
+    _fetch_pinned(SPM_URL, SPM_SHA256, spm_tar)
+    spm = work / 'sentencepiece-0.2.0'
+    shutil.rmtree(spm, ignore_errors=True)
+    run('tar', 'xzf', spm_tar, '-C', work)
+    # The translator: every tark_captions patch in the Mac's series order, in a
+    # repository of its own (as xlit).
+    src = work / 'translate-src'
+    shutil.rmtree(src, ignore_errors=True)
+    src.mkdir(parents=True)
+    run('git', 'init', '-q', cwd=src)
+    for line in (ROOT / 'patches' / 'series').read_text().splitlines():
+        if line.startswith('tarka/captions/'):
+            run('git', 'apply', '--include=components/tark_captions/*', ROOT / 'patches' / line, cwd=src)
+    # The target: engine, SentencePiece's runtime, pffft, the shim, the C interface.
+    shutil.rmtree(TRANSLATE_CORE, ignore_errors=True)
+    engine = TRANSLATE_CORE / 'engine' / 'components' / 'tark_captions'
+    engine.mkdir(parents=True)
+    for name in TRANSLATE_SOURCES:
+        for ext in ('.cc', '.h'):
+            shutil.copy(src / 'components' / 'tark_captions' / (name + ext), engine)
+    shutil.copytree(TRANSLATE / 'third_party' / 'pffft', TRANSLATE_CORE / 'engine' / 'third_party' / 'pffft')
+    spm_out = TRANSLATE_CORE / 'spm'
+    (spm_out / 'src' / 'builtin_pb').mkdir(parents=True)
+    for header in (spm / 'src').glob('*.h'):
+        shutil.copy(header, spm_out / 'src')
+    for name in SPM_RUNTIME:
+        shutil.copy(spm / 'src' / (name + '.cc'), spm_out / 'src')
+    for f in (spm / 'src' / 'builtin_pb').iterdir():
+        shutil.copy(f, spm_out / 'src' / 'builtin_pb')
+    for part in ('protobuf-lite', 'absl', 'darts_clone', 'esaxx'):
+        shutil.copytree(spm / 'third_party' / part, spm_out / 'third_party' / part)
+    # protobuf-lite's Windows file is not part of an Apple build.
+    (spm_out / 'third_party' / 'protobuf-lite' / 'io_win32.cc').unlink()
+    shutil.copy(spm / 'LICENSE', spm_out / 'LICENSE')
+    (spm_out / 'config.h').write_text('#pragma once\n#define VERSION "0.2.0"\n'
+                                      '#define PACKAGE "sentencepiece"\n#define PACKAGE_STRING "sentencepiece"\n')
+    shutil.copytree(TRANSLATE / 'shim', TRANSLATE_CORE / 'shim')
+    shutil.copytree(ort / 'Headers', TRANSLATE_CORE / 'ort')
+    shutil.copy(TRANSLATE / 'tark_translate_c.cc', TRANSLATE_CORE)
+    (TRANSLATE_CORE / 'include').mkdir()
+    shutil.copy(TRANSLATE / 'tark_translate_c.h', TRANSLATE_CORE / 'include')
+
+
 def brand():
     # iOS masks the corners itself, and App Store Connect refuses an icon with
     # an alpha channel: the Mac icon's rounded square is drawn full-bleed and
@@ -271,7 +362,7 @@ def sim():
 
 
 if __name__ == '__main__':
-    steps = {'fetch': fetch, 'patch': patch, 'lists': lists, 'engine': engine, 'xlit': xlit, 'brand': brand, 'sim': sim, 'archive': archive}
+    steps = {'fetch': fetch, 'patch': patch, 'lists': lists, 'engine': engine, 'xlit': xlit, 'translate': translate, 'brand': brand, 'sim': sim, 'archive': archive}
     if len(sys.argv) != 2 or sys.argv[1] not in steps:
         sys.exit(__doc__)
     steps[sys.argv[1]]()
