@@ -7,14 +7,15 @@
 #
 # L2: builds and runs Tark's own unit tests on Linux, in upstream's build
 # image after the browser build: captions (with ONNX Runtime itself loaded,
-# as Windows' verify.ps1 does), the speech service, transliteration. Each
-# program's results go to REPORT/<name>.xml and its output to REPORT/<name>.log;
+# as Windows' verify.ps1 does), the speech service, transliteration, the
+# update notice. Each program's results go to REPORT/<name>.xml and its output
+# to REPORT/<name>.log;
 # any failure, or a program that runs no test, fails the script.
 set -uo pipefail
 src=$1; report=$2
 out=$src/out/Default
 mkdir -p "$report"
-programs="tark_captions_unittests tark_speech_unittests tark_xlit_unittests"
+programs="tark_captions_unittests tark_speech_unittests tark_xlit_unittests tark_updater_unittests"
 # The test programs need Chromium's test fonts, which the lite tarball leaves out.
 python3 "$(dirname "$0")/fetch_test_fonts.py" "$src" || exit 1
 ninja -C "$out" $programs || exit 1
@@ -39,6 +40,7 @@ run() {  # NAME PROGRAM ARGS...
 run captions tark_captions_unittests
 run speech tark_speech_unittests
 run xlit tark_xlit_unittests
+run updater tark_updater_unittests
 # ONNX Runtime itself, loaded from where the browser loads it, running a real
 # model (Silero VAD, as Windows' verify.ps1 does). None may be skipped.
 models=$report/models

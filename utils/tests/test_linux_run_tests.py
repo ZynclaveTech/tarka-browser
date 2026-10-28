@@ -35,6 +35,7 @@ class TestRunTests(unittest.TestCase):
         program(out / 'tark_captions_unittests', captions, captions_code, captions_tests)
         program(out / 'tark_speech_unittests', '[1/1] A.B (0 ms)\nSUCCESS: all tests passed.')
         program(out / 'tark_xlit_unittests', '[==========] 2 tests ran.\n[  PASSED  ] 2 tests.')
+        program(out / 'tark_updater_unittests', '[1/1] A.B (0 ms)\nSUCCESS: all tests passed.')
         bin_dir = root / 'bin'
         bin_dir.mkdir()
         program(bin_dir / 'ninja', '')
@@ -48,6 +49,7 @@ class TestRunTests(unittest.TestCase):
         self.assertIn('ok captions', out)
         self.assertIn('ok speech', out)
         self.assertIn('ok xlit', out)
+        self.assertIn('ok updater', out)
 
     def test_a_failing_program_fails(self):
         self.assertIn('FAIL captions', self.run_with('1 test failed', 1))

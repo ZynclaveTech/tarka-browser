@@ -94,6 +94,17 @@ class TestPostPatchSteps(unittest.TestCase):
         module.install_onnxruntime(self.src)
         self.assertEqual(calls, [])
 
+    def test_linux_writes_tarks_revision(self):
+        # The update notice compares it with gettarka.com/linux/latest.json.
+        module = load('linux', self.work('l'))
+        module.common.run = lambda *a, **k: None
+        module.run = lambda *a, **k: None
+        module.install_onnxruntime = lambda *a: None
+        module.main_for(self.src)
+        header = (self.src / 'chrome/browser/tark_updater/tark_revision.h').read_text()
+        revision = (REPO / 'revision.txt').read_text().strip()
+        self.assertIn(f'#define TARK_REVISION "{revision}"', header)
+
     def test_inter_is_copied(self):
         module = load('linux', self.work('l'))
         module.common.run = lambda *a, **k: None

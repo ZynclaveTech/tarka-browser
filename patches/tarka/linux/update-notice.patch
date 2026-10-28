@@ -1,0 +1,468 @@
+--- a/chrome/app/tark_pages_strings.grdp
++++ b/chrome/app/tark_pages_strings.grdp
+@@ -83,4 +83,9 @@
+       Check for updates
+     </message>
+   </if>
++  <if expr="is_linux">
++    <message name="IDS_TARK_LINUX_UPDATE_AVAILABLE" desc="Linux app menu item, under About Tark, shown when gettarka.com has a newer Tark for Linux than the one running (the tarball's): opens the download page.">
++      Update Tark…
++    </message>
++  </if>
+ </grit-part>
+--- a/chrome/browser/BUILD.gn
++++ b/chrome/browser/BUILD.gn
+@@ -1643,6 +1643,14 @@
+       "//ui/linux:display_server_utils",
+     ]
+ 
++    # Tark (L4): the tarball's update notice.
++    sources += [
++      "tark_updater/tark_revision.h",
++      "tark_updater/tark_updater_linux.cc",
++      "tark_updater/tark_updater_linux.h",
++    ]
++    deps += [ "//chrome/browser/tark_updater:linux_update_notice" ]
++
+     if (use_dbus) {
+       sources += [
+         "dbus_memory_pressure_evaluator_linux.cc",
+--- a/chrome/browser/chrome_browser_main_linux.cc
++++ b/chrome/browser/chrome_browser_main_linux.cc
+@@ -37,6 +37,7 @@
+ #if BUILDFLAG(USE_DBUS) && !BUILDFLAG(IS_CHROMEOS)
+ #include "chrome/browser/dbus_memory_pressure_evaluator_linux.h"
+ #include "chrome/browser/lifetime/session_end_listener_linux.h"
++#include "chrome/browser/tark_updater/tark_updater_linux.h"
+ #endif
+ 
+ #if !BUILDFLAG(IS_CHROMEOS)
+@@ -104,6 +105,8 @@
+         std::make_unique<DbusMemoryPressureEvaluatorLinux>(
+             monitor->CreateVoter()));
+   }
++  // Tark (L4): the tarball's daily check for a newer Tark.
++  tark_updater::StartLinuxUpdateNotice();
+   ChromeBrowserMainPartsPosix::PostBrowserStart();
+ }
+ #endif  // BUILDFLAG(USE_DBUS) && !BUILDFLAG(IS_CHROMEOS)
+--- a/chrome/browser/tark_updater/BUILD.gn
++++ b/chrome/browser/tark_updater/BUILD.gn
+@@ -2,14 +2,41 @@
+ # Use of this source code is governed by a BSD-style license that can be
+ # found in the LICENSE file.
+ 
++import("//testing/test.gni")
++
+ # Tark's Windows updater (W2). The code is in //chrome/browser
+ # (tark_updater_win.cc); this puts WinSparkle.dll, built without OpenSSL by
+ # windows/ci/build_winsparkle.ps1, next to chrome.dll. FILES.cfg and
+ # chrome.release put it into the zip and the installer.
++if (is_win) {
++  copy("winsparkle_dll") {
++    sources = [ "//third_party/tark_winsparkle/WinSparkle.dll" ]
++    outputs = [ "$root_out_dir/WinSparkle.dll" ]
++  }
++}
+ 
+-assert(is_win)
++# Tark for Linux's update notice (L4): the rules, with no browser in them.
++# The daily check is in //chrome/browser (tark_updater_linux.cc).
++if (is_linux) {
++  source_set("linux_update_notice") {
++    sources = [
++      "linux_update_notice.cc",
++      "linux_update_notice.h",
++    ]
++    deps = [
++      "//base",
++      "//url",
++    ]
++  }
+ 
+-copy("winsparkle_dll") {
+-  sources = [ "//third_party/tark_winsparkle/WinSparkle.dll" ]
+-  outputs = [ "$root_out_dir/WinSparkle.dll" ]
++  test("tark_updater_unittests") {
++    sources = [ "linux_update_notice_unittest.cc" ]
++    deps = [
++      ":linux_update_notice",
++      "//base",
++      "//base/test:run_all_unittests",
++      "//testing/gtest",
++      "//url",
++    ]
++  }
+ }
+--- /dev/null
++++ b/chrome/browser/tark_updater/linux_update_notice.cc
+@@ -0,0 +1,43 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/tark_updater/linux_update_notice.h"
++
++#include "base/json/json_reader.h"
++#include "base/values.h"
++
++namespace tark_updater {
++
++std::optional<LinuxRelease> ParseLatest(std::string_view json) {
++  std::optional<base::Value> value = base::JSONReader::Read(json);
++  if (!value || !value->is_dict()) {
++    return std::nullopt;
++  }
++  const base::DictValue& dict = value->GetDict();
++  const std::string* version = dict.FindString("version");
++  std::optional<int> revision = dict.FindInt("revision");
++  const std::string* url = dict.FindString("url");
++  if (!version || !revision || !url || *revision < 1) {
++    return std::nullopt;
++  }
++  LinuxRelease release{base::Version(*version), *revision, GURL(*url)};
++  if (!release.version.IsValid() || !release.url.is_valid() ||
++      !release.url.SchemeIs("https") || release.url.host() != "gettarka.com") {
++    return std::nullopt;
++  }
++  return release;
++}
++
++bool IsNewer(const LinuxRelease& latest,
++             const base::Version& version,
++             int revision) {
++  const int order = latest.version.CompareTo(version);
++  return order > 0 || (order == 0 && latest.revision > revision);
++}
++
++bool ShouldCheck(const base::FilePath& exe_dir) {
++  return exe_dir != base::FilePath("/opt/tark");
++}
++
++}  // namespace tark_updater
+--- /dev/null
++++ b/chrome/browser/tark_updater/linux_update_notice.h
+@@ -0,0 +1,44 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_TARK_UPDATER_LINUX_UPDATE_NOTICE_H_
++#define CHROME_BROWSER_TARK_UPDATER_LINUX_UPDATE_NOTICE_H_
++
++#include <optional>
++#include <string_view>
++
++#include "base/files/file_path.h"
++#include "base/version.h"
++#include "url/gurl.h"
++
++// Tark for Linux's update notice (L4), the part with no browser in it. The
++// tarball's Tark reads gettarka.com/linux/latest.json once a day and, when a
++// newer Tark is out, offers "Update Tark…" in its menu; it never replaces its
++// own files. The .deb's Tark (in /opt/tark) is updated by apt instead.
++namespace tark_updater {
++
++// gettarka.com/linux/latest.json:
++//   {"version": "156.0.8078.47", "revision": 2, "url": "https://gettarka.com/linux/"}
++struct LinuxRelease {
++  base::Version version;  // Chromium's.
++  int revision = 0;       // Tark's on that Chromium (revision.txt).
++  GURL url;               // The download page, on gettarka.com over HTTPS.
++};
++
++// The feed, or nothing if it is malformed or points anywhere but
++// https://gettarka.com.
++std::optional<LinuxRelease> ParseLatest(std::string_view json);
++
++// Whether `latest` is newer than the running Tark: a newer Chromium, or a
++// newer revision of the same one.
++bool IsNewer(const LinuxRelease& latest,
++             const base::Version& version,
++             int revision);
++
++// Whether Tark running from `exe_dir` should check: not the .deb's.
++bool ShouldCheck(const base::FilePath& exe_dir);
++
++}  // namespace tark_updater
++
++#endif  // CHROME_BROWSER_TARK_UPDATER_LINUX_UPDATE_NOTICE_H_
+--- /dev/null
++++ b/chrome/browser/tark_updater/linux_update_notice_unittest.cc
+@@ -0,0 +1,63 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/tark_updater/linux_update_notice.h"
++
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace tark_updater {
++namespace {
++
++constexpr char kLatest[] =
++    R"({"version": "156.0.8078.47", "revision": 2,
++        "url": "https://gettarka.com/linux/"})";
++
++TEST(TarkLinuxUpdateNotice, ParsesTheFeed) {
++  std::optional<LinuxRelease> latest = ParseLatest(kLatest);
++  ASSERT_TRUE(latest);
++  EXPECT_EQ(latest->version, base::Version("156.0.8078.47"));
++  EXPECT_EQ(latest->revision, 2);
++  EXPECT_EQ(latest->url, GURL("https://gettarka.com/linux/"));
++}
++
++TEST(TarkLinuxUpdateNotice, NewerRevisionOfTheSameChromium) {
++  LinuxRelease latest = *ParseLatest(kLatest);
++  EXPECT_TRUE(IsNewer(latest, base::Version("156.0.8078.47"), 1));
++  EXPECT_FALSE(IsNewer(latest, base::Version("156.0.8078.47"), 2));
++  EXPECT_FALSE(IsNewer(latest, base::Version("156.0.8078.47"), 3));
++}
++
++TEST(TarkLinuxUpdateNotice, NewerChromiumWinsOverRevision) {
++  LinuxRelease latest = *ParseLatest(kLatest);
++  EXPECT_TRUE(IsNewer(latest, base::Version("155.0.8059.39"), 9));
++  EXPECT_FALSE(IsNewer(latest, base::Version("157.0.1.1"), 1));
++}
++
++TEST(TarkLinuxUpdateNotice, RefusesMalformedFeeds) {
++  EXPECT_FALSE(ParseLatest(""));
++  EXPECT_FALSE(ParseLatest("not json"));
++  EXPECT_FALSE(ParseLatest(R"({"version": "156.0.8078.47"})"));
++  EXPECT_FALSE(ParseLatest(
++      R"({"version": "x", "revision": 2, "url": "https://gettarka.com/linux/"})"));
++  EXPECT_FALSE(ParseLatest(
++      R"({"version": "156.0.8078.47", "revision": 0, "url": "https://gettarka.com/linux/"})"));
++}
++
++TEST(TarkLinuxUpdateNotice, OnlyGettarkaPagesOverHttps) {
++  EXPECT_FALSE(ParseLatest(
++      R"({"version": "156.0.8078.47", "revision": 2, "url": "http://gettarka.com/linux/"})"));
++  EXPECT_FALSE(ParseLatest(
++      R"({"version": "156.0.8078.47", "revision": 2, "url": "https://evil.example/"})"));
++  EXPECT_FALSE(ParseLatest(
++      R"({"version": "156.0.8078.47", "revision": 2, "url": "https://gettarka.com.evil.example/"})"));
++}
++
++TEST(TarkLinuxUpdateNotice, OnlyTheTarballChecks) {
++  EXPECT_FALSE(ShouldCheck(base::FilePath("/opt/tark")));
++  EXPECT_TRUE(ShouldCheck(base::FilePath("/home/a/Tark-156.0.8078.47-1-x64-linux")));
++  EXPECT_TRUE(ShouldCheck(base::FilePath("/opt/tark-old")));
++}
++
++}  // namespace
++}  // namespace tark_updater
+--- /dev/null
++++ b/chrome/browser/tark_updater/tark_updater_linux.cc
+@@ -0,0 +1,129 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/tark_updater/tark_updater_linux.h"
++
++#include <memory>
++#include <optional>
++#include <string>
++#include <utility>
++
++#include "base/base_paths.h"
++#include "base/files/file_path.h"
++#include "base/functional/bind.h"
++#include "base/no_destructor.h"
++#include "base/path_service.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/timer/timer.h"
++#include "base/version.h"
++#include "chrome/browser/browser_process.h"
++#include "chrome/browser/net/system_network_context_manager.h"
++#include "chrome/browser/tark_updater/linux_update_notice.h"
++#include "chrome/browser/tark_updater/tark_revision.h"
++#include "components/version_info/version_info.h"
++#include "net/traffic_annotation/network_traffic_annotation.h"
++#include "services/network/public/cpp/resource_request.h"
++#include "services/network/public/cpp/shared_url_loader_factory.h"
++#include "services/network/public/cpp/simple_url_loader.h"
++#include "services/network/public/mojom/fetch_api.mojom-shared.h"
++
++namespace tark_updater {
++
++namespace {
++
++constexpr char kLatestUrl[] = "https://gettarka.com/linux/latest.json";
++constexpr size_t kMaxLatestSize = 4 * 1024;
++
++constexpr net::NetworkTrafficAnnotationTag kTrafficAnnotation =
++    net::DefineNetworkTrafficAnnotation("tark_linux_update_notice", R"(
++      semantics {
++        sender: "Tark for Linux update notice"
++        description:
++          "Reads which Tark for Linux is the newest from gettarka.com, so the "
++          "tarball's Tark can offer Update Tark in its menu. Tark installed "
++          "from the .deb is updated by apt and does not ask."
++        trigger: "A minute after start, then once a day while Tark runs."
++        data: "None: no cookies, no identifiers, no query string."
++        destination: OTHER
++        destination_other: "gettarka.com"
++      }
++      policy {
++        cookies_allowed: NO
++        setting: "None."
++        policy_exception_justification: "Tark has no enterprise policies."
++      })");
++
++class Checker {
++ public:
++  void Start() {
++    first_.Start(FROM_HERE, base::Minutes(1),
++                 base::BindOnce(&Checker::Check, base::Unretained(this)));
++    daily_.Start(FROM_HERE, base::Days(1),
++                 base::BindRepeating(&Checker::Check, base::Unretained(this)));
++  }
++
++  const GURL& url() const { return url_; }
++
++ private:
++  void Check() {
++    if (loader_) {
++      return;
++    }
++    auto request = std::make_unique<network::ResourceRequest>();
++    request->url = GURL(kLatestUrl);
++    request->method = "GET";
++    request->credentials_mode = network::mojom::CredentialsMode::kOmit;
++    loader_ = network::SimpleURLLoader::Create(std::move(request),
++                                               kTrafficAnnotation);
++    loader_->DownloadToString(
++        g_browser_process->system_network_context_manager()
++            ->GetSharedURLLoaderFactory()
++            .get(),
++        base::BindOnce(&Checker::OnLatest, base::Unretained(this)),
++        kMaxLatestSize);
++  }
++
++  void OnLatest(std::optional<std::string> body) {
++    loader_.reset();
++    if (!body) {
++      return;  // Offline or gettarka.com down: the next check tries again.
++    }
++    std::optional<LinuxRelease> latest = ParseLatest(*body);
++    int revision = 0;
++    if (!latest || !base::StringToInt(TARK_REVISION, &revision)) {
++      return;
++    }
++    url_ = IsNewer(*latest, base::Version(version_info::GetVersionNumber()),
++                   revision)
++               ? latest->url
++               : GURL();
++  }
++
++  base::OneShotTimer first_;
++  base::RepeatingTimer daily_;
++  std::unique_ptr<network::SimpleURLLoader> loader_;
++  GURL url_;
++};
++
++Checker& GetChecker() {
++  static base::NoDestructor<Checker> checker;
++  return *checker;
++}
++
++}  // namespace
++
++void StartLinuxUpdateNotice() {
++  base::FilePath exe_dir;
++  if (!base::PathService::Get(base::DIR_EXE, &exe_dir) ||
++      !ShouldCheck(exe_dir)) {
++    return;
++  }
++  GetChecker().Start();
++}
++
++const GURL& LinuxUpdateUrl() {
++  return GetChecker().url();
++}
++
++}  // namespace tark_updater
+--- /dev/null
++++ b/chrome/browser/tark_updater/tark_updater_linux.h
+@@ -0,0 +1,23 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_TARK_UPDATER_TARK_UPDATER_LINUX_H_
++#define CHROME_BROWSER_TARK_UPDATER_TARK_UPDATER_LINUX_H_
++
++#include "url/gurl.h"
++
++// Tark for Linux's update notice (L4; linux_update_notice.h has the rules).
++namespace tark_updater {
++
++// Starts the daily check of gettarka.com/linux/latest.json, unless this is the
++// .deb's Tark, which apt updates. Called on the UI thread after start-up.
++void StartLinuxUpdateNotice();
++
++// The download page of a newer Tark, or an empty GURL: the app menu offers
++// "Update Tark…" while it is not empty.
++const GURL& LinuxUpdateUrl();
++
++}  // namespace tark_updater
++
++#endif  // CHROME_BROWSER_TARK_UPDATER_TARK_UPDATER_LINUX_H_
+--- a/chrome/browser/ui/toolbar/app_menu_model.cc
++++ b/chrome/browser/ui/toolbar/app_menu_model.cc
+@@ -191,6 +191,11 @@
+ #include "content/public/browser/gpu_data_manager.h"
+ #endif
+ 
++#if BUILDFLAG(IS_LINUX)
++#include "chrome/browser/tark_updater/tark_updater_linux.h"
++#include "chrome/browser/ui/singleton_tabs.h"
++#endif
++
+ using base::UserMetricsAction;
+ using content::WebContents;
+ 
+@@ -1141,6 +1146,15 @@
+     return;
+   }
+ #endif
++#if BUILDFLAG(IS_LINUX)
++  // Tark (L4): the download page of the newer Tark.
++  if (command_id == IDC_TARK_CHECK_FOR_UPDATES) {
++    if (!tark_updater::LinuxUpdateUrl().is_empty()) {
++      ShowSingletonTab(browser_, tark_updater::LinuxUpdateUrl());
++    }
++    return;
++  }
++#endif
+ 
+   LogMenuMetrics(command_id);
+ 
+@@ -1884,6 +1898,10 @@
+     case IDC_TARK_CHECK_FOR_UPDATES:
+       return tark_updater::IsRunning();
+ #endif
++#if BUILDFLAG(IS_LINUX)
++    case IDC_TARK_CHECK_FOR_UPDATES:
++      return !tark_updater::LinuxUpdateUrl().is_empty();
++#endif
+     default:
+       return chrome::IsCommandEnabled(browser_, command_id);
+   }
+@@ -2259,6 +2277,13 @@
+                         IDS_TARK_WIN_CHECK_FOR_UPDATES);
+   }
+ #endif
++#if BUILDFLAG(IS_LINUX)
++  // Tark (L4): the tarball's notice, under About, when a newer Tark is out.
++  if (!tark_updater::LinuxUpdateUrl().is_empty()) {
++    AddItemWithStringId(IDC_TARK_CHECK_FOR_UPDATES,
++                        IDS_TARK_LINUX_UPDATE_AVAILABLE);
++  }
++#endif
+ #endif
+ #endif
+ 

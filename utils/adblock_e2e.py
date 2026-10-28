@@ -106,6 +106,15 @@ def ublock_off_profile(app, keep=None):
     return b.profile
 
 
+def binary_of(app):
+    """Tark's binary: Tark.app's on the Mac, the tarball folder's tark
+    launcher on Linux (L4)."""
+    app = pathlib.Path(app)
+    if app.is_dir() and (app / 'tark').is_file():
+        return app / 'tark'
+    return app / 'Contents' / 'MacOS' / app.stem
+
+
 class Browser:
     def __init__(self, app, extra_flags=(), prefs=None, profile=None, keep_profile=False):
         self.keep_profile = keep_profile or profile is not None
@@ -114,7 +123,7 @@ class Browser:
             (self.profile / 'Default').mkdir(parents=True, exist_ok=True)
             (self.profile / 'Default' / 'Preferences').write_text(json.dumps(prefs))
         self.log = self.profile / 'tark.log'
-        binary = pathlib.Path(app) / 'Contents' / 'MacOS' / pathlib.Path(app).stem
+        binary = binary_of(app)
         self.proc = subprocess.Popen(
             [str(binary), f'--user-data-dir={self.profile}', '--use-mock-keychain', '--no-first-run',
              '--enable-logging=stderr', '--v=0', f'--remote-debugging-port={DEVTOOLS_PORT}',

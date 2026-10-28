@@ -120,6 +120,19 @@ if (( code == 0 )); then
   bash "$repo/linux/check_build.sh" "$L/out" "$L/checks" >> "$log" 2>&1 || code=1
   for f in "$L"/checks/*; do upload "$f" "checks/$(basename "$f")"; done
 fi
+# L4: Sign in with Zynclave on the tarball's Tark, against production
+# Zynclave (a release build), under Xvfb: the Settings card, the sign-in page,
+# stray redirects ignored, the policy known (utils/zynclave_e2e.py).
+if (( code == 0 )); then
+  unpacked=$(mktemp -d)
+  tar -xJf "$L"/out/Tark-*-x64-linux.tar.xz -C "$unpacked"
+  timeout 15m xvfb-run -a -s "-screen 0 1280x800x24" \
+    python3 "$repo/utils/zynclave_e2e.py" "$(ls -d "$unpacked"/Tark-*/)" --production \
+    > "$L/checks/zynclave.txt" 2>&1 || code=1
+  cat "$L/checks/zynclave.txt" >> "$log"
+  upload "$L/checks/zynclave.txt" checks/zynclave.txt
+  rm -rf "$unpacked"
+fi
 # L3: the .deb, from the tarball as people get it, then installed and started
 # in a clean Ubuntu.
 if (( code == 0 )); then

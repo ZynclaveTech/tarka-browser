@@ -40,9 +40,26 @@ def install_onnxruntime(src):
     run(sys.executable, downloads, 'unpack', '-i', ini, '-c', CACHE, src)
 
 
+def write_revision(src):
+    """Tark's revision (revision.txt) for the update notice, which compares it
+    with gettarka.com/linux/latest.json (chrome/browser/tark_updater)."""
+    revision = (REPO / 'revision.txt').read_text(encoding='utf-8').strip()
+    if not revision.isdigit():
+        sys.exit(f"tark: revision.txt holds '{revision}', not a number")
+    header = src / 'chrome' / 'browser' / 'tark_updater' / 'tark_revision.h'
+    header.parent.mkdir(parents=True, exist_ok=True)
+    header.write_text(
+        '// Written by linux/tark_post_patch.py from revision.txt.\n'
+        '#ifndef CHROME_BROWSER_TARK_UPDATER_TARK_REVISION_H_\n'
+        '#define CHROME_BROWSER_TARK_UPDATER_TARK_REVISION_H_\n\n'
+        f'#define TARK_REVISION "{revision}"\n\n'
+        '#endif  // CHROME_BROWSER_TARK_UPDATER_TARK_REVISION_H_\n', encoding='utf-8')
+
+
 def main_for(src):
     common.before_platform(REPO, CORE, CACHE, WORK, src, BASH)
     install_onnxruntime(src)
+    write_revision(src)
     common.after_platform(REPO, CORE, CACHE, src, BASH)
     print('tark: post-patch steps done', flush=True)
 
