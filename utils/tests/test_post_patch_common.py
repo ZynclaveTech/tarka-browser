@@ -66,9 +66,9 @@ class TestPostPatchSteps(unittest.TestCase):
         self.assertEqual(steps(module, self.src, monkey),
                          COMMON + ['onnxruntime', 'winsparkle', 'install_captions_credits.sh'])
 
-    def test_linux_runs_the_common_steps_without_the_captions_credits(self):
-        # Live captions are not on Linux yet (no ONNX Runtime until L2), so
-        # about:credits must not list what they run on.
+    def test_linux_runs_the_common_steps_then_onnxruntime_and_the_credits(self):
+        # Live captions run on Linux (L2): about:credits lists ONNX Runtime
+        # and the models, after ONNX Runtime is in place.
         module = load('linux', self.work('l'))
 
         def monkey(m, run, seen):
@@ -78,7 +78,8 @@ class TestPostPatchSteps(unittest.TestCase):
 
         # ONNX Runtime's headers: components/tark_captions builds on every
         # desktop, captions on or not.
-        self.assertEqual(steps(module, self.src, monkey), COMMON + ['onnxruntime'])
+        self.assertEqual(steps(module, self.src, monkey),
+                         COMMON + ['onnxruntime', 'install_captions_credits.sh'])
 
     def test_onnxruntime_only_installs_once(self):
         module = load('linux', self.work('l'))

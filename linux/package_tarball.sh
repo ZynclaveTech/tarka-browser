@@ -7,8 +7,8 @@
 #
 # L1: Tark-<chromium>-<revision>-x64-linux.tar.xz from the build's
 # out/Default (upstream's scripts/package.sh file list, without chromedriver
-# and the AppImage, plus IndicXlit's files), one top folder of the same name
-# with a `tark` launcher, and its .sha256 for `sha256sum -c`.
+# and the AppImage, plus IndicXlit's files and ONNX Runtime), one top folder
+# of the same name with a `tark` launcher, and its .sha256 for `sha256sum -c`.
 set -euo pipefail
 repo=$1; out=$2; dest=$3
 chromium=$(cat "$repo/ungoogled-chromium/chromium_version.txt")
@@ -17,7 +17,7 @@ stem="Tark-$chromium-$revision-x64-linux"
 
 files="chrome chrome_100_percent.pak chrome_200_percent.pak chrome_crashpad_handler
 chrome-wrapper icudtl.dat libEGL.so libGLESv2.so libqt5_shim.so libqt6_shim.so
-libvk_swiftshader.so libvulkan.so.1 locales indicxlit product_logo_48.png
+libvk_swiftshader.so libvulkan.so.1 libonnxruntime.so.1 locales indicxlit product_logo_48.png
 resources.pak v8_context_snapshot.bin vk_swiftshader_icd.json"
 # The default-browser helpers: packed when the build made them.
 optional="xdg-mime xdg-settings"

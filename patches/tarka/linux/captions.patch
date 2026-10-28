@@ -1,0 +1,295 @@
+--- a/chrome/browser/resources/settings/BUILD.gn
++++ b/chrome/browser/resources/settings/BUILD.gn
+@@ -533,7 +533,7 @@
+     ]
+   }
+ 
+-  if (is_mac || is_win) {
++  if (is_mac || is_win || is_linux) {
+     ts_files += [
+       "a11y_page/tark_live_captions_page.html.ts",
+       "a11y_page/tark_live_captions_page.ts",
+--- a/chrome/browser/resources/settings/a11y_page/a11y_page.html.ts
++++ b/chrome/browser/resources/settings/a11y_page/a11y_page.html.ts
+@@ -20,7 +20,7 @@
+         </cr-link-row>
+ </if>
+ 
+-<if expr="is_macosx or is_win">
++<if expr="is_macosx or is_win or is_linux">
+         <cr-link-row id="tarkLiveCaptions" class="hr"
+             label="$i18n{tarkLiveCaptionsTitle}"
+             sub-label="$i18n{tarkLiveCaptionsRowSublabel}"
+--- a/chrome/browser/resources/settings/a11y_page/a11y_page.ts
++++ b/chrome/browser/resources/settings/a11y_page/a11y_page.ts
+@@ -177,7 +177,7 @@
+     return anyAxAnnotationsFeatureEnabled && this.hasScreenReader_;
+   }
+ 
+-  // <if expr="is_macosx or is_win">
++  // <if expr="is_macosx or is_win or is_linux">
+   protected onTarkLiveCaptionsClick_() {
+     Router.getInstance().navigateTo(routes.TARK_LIVE_CAPTIONS);
+   }
+--- a/chrome/browser/resources/settings/a11y_page/a11y_page_index.html.ts
++++ b/chrome/browser/resources/settings/a11y_page/a11y_page_index.html.ts
+@@ -20,7 +20,7 @@
+       route-path="${this.routes_.CAPTIONS.path}">
+   </settings-captions-page>
+ </if>
+-<if expr="is_macosx or is_win">
++<if expr="is_macosx or is_win or is_linux">
+   <settings-tark-live-captions-page slot="view" id="tarkLiveCaptions"
+       data-parent-view-id="parent"
+       route-path="${this.routes_.TARK_LIVE_CAPTIONS.path}">
+--- a/chrome/browser/resources/settings/a11y_page/a11y_page_index.ts
++++ b/chrome/browser/resources/settings/a11y_page/a11y_page_index.ts
+@@ -8,7 +8,7 @@
+ import './captions_page.js';
+ 
+ // </if>
+-// <if expr="is_macosx or is_win">
++// <if expr="is_macosx or is_win or is_linux">
+ import './tark_live_captions_page.js';
+ // </if>
+ 
+@@ -67,7 +67,7 @@
+           this.$.viewManager.switchView(
+               'parent', 'no-animation', 'no-animation');
+           break;
+-        // <if expr="is_macosx or is_win">
++        // <if expr="is_macosx or is_win or is_linux">
+         case routes.TARK_LIVE_CAPTIONS:
+           this.$.viewManager.switchView(
+               'tarkLiveCaptions', 'no-animation', 'no-animation');
+--- a/chrome/browser/resources/settings/route.ts
++++ b/chrome/browser/resources/settings/route.ts
+@@ -284,7 +284,7 @@
+     // <if expr="is_linux">
+     r.CAPTIONS = r.ACCESSIBILITY.createChild('/captions');
+     // </if>
+-    // <if expr="is_macosx or is_win">
++    // <if expr="is_macosx or is_win or is_linux">
+     // Tark (D4): live captions for calls.
+     r.TARK_LIVE_CAPTIONS = r.ACCESSIBILITY.createChild('/liveCaptions');
+     // </if>
+--- a/chrome/browser/speech/chrome_speech_recognition_service.cc
++++ b/chrome/browser/speech/chrome_speech_recognition_service.cc
+@@ -21,6 +21,10 @@
+ #include "base/path_service.h"
+ #include "content/public/browser/service_process_host_passkeys.h"
+ #endif
++#if BUILDFLAG(IS_LINUX)
++#include "base/base_paths.h"
++#include "base/path_service.h"
++#endif
+ #include "chrome/browser/browser_process.h"
+ #include "chrome/browser/component_updater/soda_language_pack_component_installer.h"
+ #include "chrome/browser/optimization_guide/optimization_guide_keyed_service.h"
+@@ -293,6 +297,14 @@
+           // the engine's later load by the same path finds it loaded.
+           .WithPreloadedLibraries({binary_path},
+                                   content::ServiceProcessHostPreloadLibraries::GetPassKey())
++#elif BUILDFLAG(IS_LINUX)
++          // Linux (L2): the speech process's pre-sandbox hook loads ONNX
++          // Runtime and lets the sandbox read the models folder
++          // (content/utility/speech/speech_recognition_sandbox_hook_linux.cc,
++          // which reads these two switches).
++          .WithExtraCommandLineSwitchKeyValues(
++              {{"tark-captions-ort", binary_path.value()},
++               {"tark-captions-models", models_dir.value()}})
+ #endif
+           .Pass());
+ 
+@@ -315,7 +327,7 @@
+ 
+ // static
+ base::FilePath ChromeSpeechRecognitionService::TarkCaptionsModelsDir() {
+-#if BUILDFLAG(IS_MAC) || BUILDFLAG(IS_WIN)
++#if BUILDFLAG(IS_MAC) || BUILDFLAG(IS_WIN) || BUILDFLAG(IS_LINUX)
+   base::FilePath user_data;
+   if (!chrome::GetDefaultUserDataDirectory(&user_data)) {
+     return base::FilePath();
+@@ -340,6 +352,13 @@
+     return base::FilePath();
+   }
+   return module_dir.Append(FILE_PATH_LITERAL("onnxruntime.dll"));
++#elif BUILDFLAG(IS_LINUX)
++  // Next to the chrome binary, by its soname (components/tark_captions).
++  base::FilePath module_dir;
++  if (!base::PathService::Get(base::DIR_MODULE, &module_dir)) {
++    return base::FilePath();
++  }
++  return module_dir.Append("libonnxruntime.so.1");
+ #else
+   return base::FilePath();
+ #endif
+--- a/chrome/browser/ui/tab_helpers.cc
++++ b/chrome/browser/ui/tab_helpers.cc
+@@ -72,7 +72,7 @@
+ #include "chrome/browser/ui/passwords/manage_passwords_ui_controller.h"
+ #include "chrome/browser/ui/prefs/prefs_tab_helper.h"
+ #include "chrome/browser/ui/recently_audible_helper.h"
+-#if BUILDFLAG(IS_MAC) || BUILDFLAG(IS_WIN)
++#if BUILDFLAG(IS_MAC) || BUILDFLAG(IS_WIN) || BUILDFLAG(IS_LINUX)
+ #include "chrome/browser/tark_captions/call_captions_tab_helper.h"
+ #endif
+ #if !BUILDFLAG(IS_ANDROID)
+@@ -461,7 +461,7 @@
+   }
+   PrefsTabHelper::CreateForWebContents(web_contents);
+   RecentlyAudibleHelper::CreateForWebContents(web_contents);
+-#if BUILDFLAG(IS_MAC) || BUILDFLAG(IS_WIN)
++#if BUILDFLAG(IS_MAC) || BUILDFLAG(IS_WIN) || BUILDFLAG(IS_LINUX)
+   // Tark (D4): call detection and the call's captions.
+   CallCaptionsTabHelper::CreateForWebContents(web_contents);
+ #endif
+--- a/chrome/browser/ui/views/frame/browser_view.cc
++++ b/chrome/browser/ui/views/frame/browser_view.cc
+@@ -1117,7 +1117,7 @@
+   SetLayoutManager(nullptr);
+ 
+   tab_search_bubble_host_.reset();
+-#if BUILDFLAG(IS_MAC) || BUILDFLAG(IS_WIN)
++#if BUILDFLAG(IS_MAC) || BUILDFLAG(IS_WIN) || BUILDFLAG(IS_LINUX)
+   tark_caption_pill_.reset();
+ #endif
+ 
+@@ -5212,7 +5212,7 @@
+   fallback_popup_anchor_ = std::make_unique<views::ViewSubregionAnchor>(
+       kFallbackPopupAnchorElementId, *this);
+ 
+-#if BUILDFLAG(IS_MAC) || BUILDFLAG(IS_WIN)
++#if BUILDFLAG(IS_MAC) || BUILDFLAG(IS_WIN) || BUILDFLAG(IS_LINUX)
+   // Tark (D4): the call captions pill.
+   if (GetIsNormalType()) {
+     tark_caption_pill_ = std::make_unique<TarkCaptionPillController>(this);
+--- a/chrome/browser/ui/views/frame/browser_view.h
++++ b/chrome/browser/ui/views/frame/browser_view.h
+@@ -1218,7 +1218,7 @@
+ 
+   std::unique_ptr<TabSearchBubbleHost> tab_search_bubble_host_;
+ 
+-#if BUILDFLAG(IS_MAC) || BUILDFLAG(IS_WIN)
++#if BUILDFLAG(IS_MAC) || BUILDFLAG(IS_WIN) || BUILDFLAG(IS_LINUX)
+   // Tark (D4): the call captions pill.
+   std::unique_ptr<TarkCaptionPillController> tark_caption_pill_;
+ #endif
+--- a/chrome/browser/ui/webui/settings/settings_ui.cc
++++ b/chrome/browser/ui/webui/settings/settings_ui.cc
+@@ -4,7 +4,7 @@
+ 
+ #include "chrome/browser/ui/webui/settings/settings_ui.h"
+ 
+-#if BUILDFLAG(IS_MAC) || BUILDFLAG(IS_WIN)
++#if BUILDFLAG(IS_MAC) || BUILDFLAG(IS_WIN) || BUILDFLAG(IS_LINUX)
+ #include "chrome/browser/ui/webui/settings/tark_live_captions_handler.h"
+ #endif
+ #include "chrome/browser/ui/webui/settings/tark_zynclave_handler.h"
+@@ -313,7 +313,7 @@
+ #if BUILDFLAG(IS_MAC)
+   AddSettingsPageUIHandler(std::make_unique<MacSystemSettingsHandler>());
+ #endif
+-#if BUILDFLAG(IS_MAC) || BUILDFLAG(IS_WIN)
++#if BUILDFLAG(IS_MAC) || BUILDFLAG(IS_WIN) || BUILDFLAG(IS_LINUX)
+   AddSettingsPageUIHandler(std::make_unique<TarkLiveCaptionsHandler>());
+ #endif
+   AddSettingsPageUIHandler(std::make_unique<TarkZynclaveHandler>(profile));
+--- a/components/tark_captions/BUILD.gn
++++ b/components/tark_captions/BUILD.gn
+@@ -81,6 +81,18 @@
+   if (is_win) {
+     data_deps = [ ":onnxruntime_dll" ]
+   }
++  if (is_linux) {
++    data_deps = [ ":onnxruntime_so" ]
++  }
++}
++
++if (is_linux) {
++  # Microsoft's release (linux/downloads-onnxruntime.ini), next to the chrome
++  # binary by its soname; linux/package_tarball.sh packs it (L2).
++  copy("onnxruntime_so") {
++    sources = [ "//third_party/tark_onnxruntime/lib/libonnxruntime.so.1.31.0" ]
++    outputs = [ "$root_out_dir/libonnxruntime.so.1" ]
++  }
+ }
+ 
+ if (is_win) {
+--- a/content/utility/speech/speech_recognition_sandbox_hook_linux.cc
++++ b/content/utility/speech/speech_recognition_sandbox_hook_linux.cc
+@@ -6,7 +6,13 @@
+ 
+ #include <dlfcn.h>
+ 
++#include <utility>
++#include <vector>
++
++#include "base/command_line.h"
++#include "base/files/file_path.h"
+ #include "base/files/file_util.h"
++#include "base/logging.h"
+ #include "components/soda/buildflags.h"
+ #include "components/soda/constants.h"
+ #include "sandbox/linux/syscall_broker/broker_command.h"
+@@ -49,6 +55,36 @@
+   return permissions;
+ }
+ 
++// Tark (L2): Tark's captions engine runs in this process instead of SODA.
++// The browser names ONNX Runtime and the captions models folder in these
++// switches (chrome/browser/speech/chrome_speech_recognition_service.cc).
++constexpr char kTarkCaptionsOrt[] = "tark-captions-ort";
++constexpr char kTarkCaptionsModels[] = "tark-captions-models";
++
++// Loads ONNX Runtime before the sandbox: the engine's later load by the same
++// path finds it loaded. Returns what the sandbox must still let it read: the
++// models folder, and the CPU details ONNX Runtime sizes its threads from.
++std::vector<BrokerFilePermission> TarkCaptionsPreSandbox() {
++  const base::CommandLine& command_line =
++      *base::CommandLine::ForCurrentProcess();
++  std::vector<BrokerFilePermission> permissions;
++  const base::FilePath ort = command_line.GetSwitchValuePath(kTarkCaptionsOrt);
++  if (!ort.empty() &&
++      !dlopen(ort.value().c_str(), RTLD_NOW | RTLD_GLOBAL | RTLD_NODELETE)) {
++    LOG(ERROR) << "Tark captions: ONNX Runtime not loaded from " << ort;
++  }
++  const base::FilePath models =
++      command_line.GetSwitchValuePath(kTarkCaptionsModels);
++  if (!models.empty() && models.IsAbsolute()) {
++    permissions.push_back(BrokerFilePermission::ReadOnlyRecursive(
++        models.AsEndingWithSeparator().value()));
++  }
++  permissions.push_back(BrokerFilePermission::ReadOnly("/proc/cpuinfo"));
++  permissions.push_back(
++      BrokerFilePermission::ReadOnlyRecursive("/sys/devices/system/cpu/"));
++  return permissions;
++}
++
+ }  // namespace
+ 
+ bool SpeechRecognitionPreSandboxHook(
+@@ -61,9 +97,11 @@
+   DCHECK(soda_test_library);
+ #endif
+ 
+-  void* soda_library = dlopen(GetSodaBinaryPath().value().c_str(),
+-                              RTLD_NOW | RTLD_GLOBAL | RTLD_NODELETE);
+-  DCHECK(soda_library);
++  // Tark: no SODA; Tark's captions engine instead.
++  std::vector<BrokerFilePermission> permissions = GetSodaFilePermissions();
++  for (BrokerFilePermission& permission : TarkCaptionsPreSandbox()) {
++    permissions.push_back(std::move(permission));
++  }
+ 
+   auto* instance = sandbox::policy::SandboxLinux::GetInstance();
+   instance->StartBrokerProcess(MakeBrokerCommandSet({
+@@ -72,7 +110,7 @@
+                                    sandbox::syscall_broker::COMMAND_READLINK,
+                                    sandbox::syscall_broker::COMMAND_STAT,
+                                }),
+-                               GetSodaFilePermissions(), options);
++                               std::move(permissions), options);
+   instance->EngageNamespaceSandboxIfPossible();
+ 
+   return true;

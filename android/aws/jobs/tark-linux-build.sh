@@ -99,6 +99,16 @@ else
 fi
 echo "build exit $code" >> "$log"
 
+# Tark's unit tests (captions with ONNX Runtime, speech, transliteration),
+# built and run in the build image on the same tree.
+if (( code == 0 )); then
+  rm -rf "$L/tests" && mkdir -p "$L/tests"
+  timeout 2h sudo docker run --rm -u "$(id -u):$(id -g)" \
+    -v "$work:/repo" -v "$repo:$repo:ro" -v "$L/tests:$L/tests" \
+    tark-linux-builder bash "$repo/linux/run_tests.sh" /repo/build/src "$L/tests" >> "$log" 2>&1 || code=1
+  for f in "$L"/tests/*; do upload "$f" "tests/$(basename "$f")"; done
+  echo "tests exit $code" >> "$log"
+fi
 # An earlier run's tarball or checks must never pass as this job's.
 rm -rf "$L/out" "$L/checks"
 if (( code == 0 )); then

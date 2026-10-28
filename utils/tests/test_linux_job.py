@@ -72,6 +72,12 @@ class TestLinuxJob(unittest.TestCase):
         text = JOB.read_text()
         self.assertIn('rm -rf "$work/build/src" "$work/build/namesubs.tar"', text)
 
+    def test_runs_the_captions_tests_before_packaging(self):
+        text = JOB.read_text()
+        tests = text.find('linux/run_tests.sh')
+        self.assertNotEqual(tests, -1)
+        self.assertLess(tests, text.find('package_tarball.sh" "$repo"'))
+
     def test_refuses_below_150_gb_free(self):
         r = run(self.root, free_gb=149)
         self.assertNotEqual(r.returncode, 0)
