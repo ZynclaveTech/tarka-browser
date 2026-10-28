@@ -68,10 +68,11 @@ echo "submodule $SUB" >> "$log"
 must python3 "$repo/linux/prepare_workdir.py" "$repo" "$work"
 
 # Upstream builds in its own Debian image (system Node, tsc, esbuild, Go).
-if ! command -v docker >/dev/null; then
-  must sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q docker.io
+# Its Dockerfile needs BuildKit (COPY --chmod): Ubuntu's docker-buildx.
+if ! command -v docker >/dev/null || ! sudo docker buildx version >/dev/null 2>&1; then
+  must sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q docker.io docker-buildx
 fi
-must sudo docker build -q -t tark-linux-builder -f "$work/docker/build.Dockerfile" "$work/docker"
+must sudo docker buildx build --load -q -t tark-linux-builder -f "$work/docker/build.Dockerfile" "$work/docker"
 
 # The ad blocker's list bundle staged in s3://BUCKET/lists/, as for Android.
 rm -rf "$L/lists" && mkdir -p "$L/lists"
