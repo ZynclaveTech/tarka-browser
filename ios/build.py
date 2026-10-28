@@ -207,6 +207,10 @@ def brand():
             if out('sips', '-g', 'hasAlpha', png).split()[-1] != 'no':
                 sys.exit(f'{png} still has an alpha channel')
     glyphs()
+    # Firefox's alternate-icon previews (Settings → App Icon, removed in Tark)
+    # were 120 MB of the asset catalog.
+    for preview in ICONS.glob('appIconAlternate_*.imageset'):
+        shutil.rmtree(preview)
 
 
 # Toolbar glyphs drawn for Tark (I5d): the tabs button as a box taller than
@@ -231,6 +235,25 @@ def glyphs():
         run('rsvg-convert', '-f', 'pdf', source, '-o', images / path)
 
 
+def archive():
+    # The App Store build (scheme and configuration "Firefox"). Firefox's
+    # configuration names Mozilla's Bitrise profiles and "iPhone Distribution";
+    # Tark signs automatically with its own team. Export re-signs for the store.
+    run('sh', './bootstrap.sh', cwd=TREE)
+    out_path = DERIVED.parent / 'Tark.xcarchive'
+    shutil.rmtree(out_path, ignore_errors=True)
+    run('xcodebuild', '-project', 'firefox-ios/Client.xcodeproj',
+        '-scheme', 'Firefox', '-configuration', 'Firefox',
+        '-destination', 'generic/platform=iOS',
+        '-archivePath', out_path,
+        '-derivedDataPath', DERIVED.parent / 'dd-release',
+        '-skipMacroValidation', '-skipPackagePluginValidation',
+        '-allowProvisioningUpdates',
+        'DEVELOPMENT_TEAM=UMTJNNPK6C', 'CODE_SIGN_STYLE=Automatic',
+        'PROVISIONING_PROFILE_SPECIFIER=', 'CODE_SIGN_IDENTITY=Apple Development',
+        'archive', cwd=TREE)
+
+
 def sim():
     # No -sdk: it would build the package macros (host tools) for the
     # simulator too, and the compiler then cannot run them.
@@ -245,7 +268,7 @@ def sim():
 
 
 if __name__ == '__main__':
-    steps = {'fetch': fetch, 'patch': patch, 'lists': lists, 'engine': engine, 'xlit': xlit, 'brand': brand, 'sim': sim}
+    steps = {'fetch': fetch, 'patch': patch, 'lists': lists, 'engine': engine, 'xlit': xlit, 'brand': brand, 'sim': sim, 'archive': archive}
     if len(sys.argv) != 2 or sys.argv[1] not in steps:
         sys.exit(__doc__)
     steps[sys.argv[1]]()
