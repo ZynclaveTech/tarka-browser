@@ -15,6 +15,8 @@ src=$1; report=$2
 out=$src/out/Default
 mkdir -p "$report"
 programs="tark_captions_unittests tark_speech_unittests tark_xlit_unittests"
+# The test programs need Chromium's test fonts, which the lite tarball leaves out.
+python3 "$(dirname "$0")/fetch_test_fonts.py" "$src" || exit 1
 ninja -C "$out" $programs || exit 1
 
 fails=0
