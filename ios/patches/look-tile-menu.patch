@@ -1,0 +1,251 @@
+diff --git a/BrowserKit/Sources/MenuKit/MenuTableViewHelper.swift b/BrowserKit/Sources/MenuKit/MenuTableViewHelper.swift
+index a1b6ce9..c207ba1 100644
+--- a/BrowserKit/Sources/MenuKit/MenuTableViewHelper.swift
++++ b/BrowserKit/Sources/MenuKit/MenuTableViewHelper.swift
+@@ -60,7 +60,8 @@ final class MenuTableViewHelper: NSObject {
+                 return UITableViewCell()
+             }
+             if let theme { cell.applyTheme(theme: theme) }
+-            cell.reloadData(with: menuData, and: menuData[indexPath.section].groupA11yLabel)
++            // Tark: the menu has more than one row of squares; each cell draws its own section.
++            cell.reloadData(with: [menuData[indexPath.section]], and: menuData[indexPath.section].groupA11yLabel)
+             return cell
+         }
+ 
+diff --git a/BrowserKit/Sources/ToolbarKit/AddressToolbar/BrowserAddressToolbar.swift b/BrowserKit/Sources/ToolbarKit/AddressToolbar/BrowserAddressToolbar.swift
+index dd4af12..e001704 100644
+--- a/BrowserKit/Sources/ToolbarKit/AddressToolbar/BrowserAddressToolbar.swift
++++ b/BrowserKit/Sources/ToolbarKit/AddressToolbar/BrowserAddressToolbar.swift
+@@ -427,10 +427,20 @@ public class BrowserAddressToolbar: UIView,
+     }
+ 
+     private func updateSpacing(leading: CGFloat, trailing: CGFloat) {
+-        leadingNavigationActionStackConstraint?.constant = leading
++        tarkLeadingSpace = leading
++        applyTarkLeadingSpace()
+         trailingBrowserActionStackConstraint?.constant = -trailing
+     }
+ 
++    /// Tark: without a back button (while typing) the pill keeps a margin from the
++    /// screen edge instead of touching it.
++    private var tarkLeadingSpace: CGFloat = 0
++    private func applyTarkLeadingSpace() {
++        let hasNavigationActions = !navigationActionStack.arrangedSubviews.isEmpty
++        leadingNavigationActionStackConstraint?.constant =
++            hasNavigationActions ? tarkLeadingSpace : max(tarkLeadingSpace, UX.horizontalSpace * 2)
++    }
++
+     private func setZeroWidthConstraint(_ stackView: UIStackView) {
+         let widthAnchor = stackView.widthAnchor.constraint(equalToConstant: 0)
+         widthAnchor.isActive = true
+@@ -491,6 +501,7 @@ public class BrowserAddressToolbar: UIView,
+ 
+         // Navigation action spacing
+         let hasNavigationActions = !navigationActionStack.arrangedSubviews.isEmpty
++        applyTarkLeadingSpace()
+         let isRegular = traitCollection.horizontalSizeClass == .regular
+         leadingLocationContainerConstraint?.constant = hasNavigationActions && isRegular ? -UX.horizontalSpace : 0
+ 
+diff --git a/firefox-ios/Client/Frontend/Browser/MainMenu/MainMenuConfigurationUtility.swift b/firefox-ios/Client/Frontend/Browser/MainMenu/MainMenuConfigurationUtility.swift
+index 3d9aa66..336a564 100644
+--- a/firefox-ios/Client/Frontend/Browser/MainMenu/MainMenuConfigurationUtility.swift
++++ b/firefox-ios/Client/Frontend/Browser/MainMenu/MainMenuConfigurationUtility.swift
+@@ -77,23 +77,144 @@ struct MainMenuConfigurationUtility: Equatable, FeatureFlaggable {
+         profileImage: UIImage?,
+         localeProvider: LocaleProvider
+     ) -> [MenuSection] {
+-        // Always include these sections
++        // Tark: Android's tile menu. On a page, a row for the page (forward,
++        // bookmark, reload, share); then New tab, Private tab, History,
++        // Downloads; then Bookmarks and the page's tools; then Settings.
+         var menuSections: [MenuSection] = []
+-
+-        if tabInfo.isHomepage {
+-            menuSections.append(getHorizontalTabsSection(with: uuid, tabInfo: tabInfo))
+-            menuSections.append(getAccountSection(with: uuid, tabInfo: tabInfo, profileImage: profileImage))
+-        } else {
+-            menuSections.append(
+-                getSiteSection(with: uuid, tabInfo: tabInfo, isExpanded: isExpanded, localeProvider: localeProvider)
+-            )
+-            menuSections.append(getHorizontalTabsSection(with: uuid, tabInfo: tabInfo))
+-            menuSections.append(getAccountSection(with: uuid, tabInfo: tabInfo, profileImage: profileImage))
++        if !tabInfo.isHomepage || tabInfo.canGoForward {
++            menuSections.append(getTarkPageRow(with: uuid, tabInfo: tabInfo))
+         }
+-
++        menuSections.append(getTarkTiles(with: uuid, tabInfo: tabInfo))
++        menuSections.append(getTarkRows(with: uuid, tabInfo: tabInfo))
++        menuSections.append(getAccountSection(with: uuid, tabInfo: tabInfo, profileImage: profileImage))
+         return menuSections
+     }
+ 
++    // MARK: - Tark sections
++
++    /// A menu item that closes the menu, then does `perform`.
++    private func tarkItem(
++        _ title: String,
++        icon: String,
++        a11yId: String,
++        uuid: WindowUUID,
++        tabInfo: MainMenuTabInfo,
++        isEnabled: Bool = true,
++        perform: @escaping @MainActor () -> Void
++    ) -> MenuElement {
++        return MenuElement(
++            title: title,
++            iconName: icon,
++            isEnabled: isEnabled,
++            isActive: false,
++            a11yLabel: title,
++            a11yHint: "",
++            a11yId: a11yId,
++            action: {
++                store.dispatch(
++                    MainMenuAction(
++                        windowUUID: uuid,
++                        actionType: MainMenuActionType.tapCloseMenu,
++                        telemetryInfo: TelemetryInfo(isHomepage: tabInfo.isHomepage)
++                    )
++                )
++                perform()
++            }
++        )
++    }
++
++    /// A menu item that opens one of the menu's destinations.
++    private func tarkDestination(
++        _ title: String,
++        icon: String,
++        a11yId: String,
++        destination: MainMenuNavigationDestination,
++        uuid: WindowUUID,
++        tabInfo: MainMenuTabInfo
++    ) -> MenuElement {
++        return MenuElement(
++            title: title,
++            iconName: icon,
++            isEnabled: true,
++            isActive: false,
++            a11yLabel: title,
++            a11yHint: "",
++            a11yId: a11yId,
++            action: {
++                store.dispatch(
++                    MainMenuAction(
++                        windowUUID: uuid,
++                        actionType: MainMenuActionType.tapNavigateToDestination,
++                        navigationDestination: MenuNavigationDestination(destination),
++                        telemetryInfo: TelemetryInfo(isHomepage: tabInfo.isHomepage)
++                    )
++                )
++            }
++        )
++    }
++
++    private func browserAction(_ type: GeneralBrowserActionType, uuid: WindowUUID) -> @MainActor () -> Void {
++        return { store.dispatch(GeneralBrowserAction(windowUUID: uuid, actionType: type)) }
++    }
++
++    private func getTarkPageRow(with uuid: WindowUUID, tabInfo: MainMenuTabInfo) -> MenuSection {
++        return MenuSection(
++            isHorizontalTabsSection: true,
++            groupA11yLabel: .MainMenu.ToolsSection.AccessibilityLabels.LibraryOptions,
++            isHomepage: tabInfo.isHomepage,
++            options: [
++                tarkItem(.KeyboardShortcuts.Forward, icon: StandardImageIdentifiers.Large.chevronRight,
++                         a11yId: "tark.menu.forward", uuid: uuid, tabInfo: tabInfo,
++                         isEnabled: tabInfo.canGoForward,
++                         perform: browserAction(.navigateForward, uuid: uuid)),
++                configureBookmarkPageItem(with: uuid, and: tabInfo),
++                tarkItem(.KeyboardShortcuts.ReloadPage, icon: StandardImageIdentifiers.Large.arrowClockwise,
++                         a11yId: "tark.menu.reload", uuid: uuid, tabInfo: tabInfo,
++                         perform: browserAction(.reloadWebsite, uuid: uuid)),
++                tarkDestination(.ShareContextMenuTitle, icon: Icons.share, a11yId: "tark.menu.share",
++                                destination: .shareSheet, uuid: uuid, tabInfo: tabInfo),
++            ]
++        )
++    }
++
++    private func getTarkTiles(with uuid: WindowUUID, tabInfo: MainMenuTabInfo) -> MenuSection {
++        return MenuSection(
++            isHorizontalTabsSection: true,
++            groupA11yLabel: .MainMenu.ToolsSection.AccessibilityLabels.LibraryOptions,
++            isHomepage: tabInfo.isHomepage,
++            options: [
++                tarkItem(.KeyboardShortcuts.NewTab, icon: StandardImageIdentifiers.Large.plus,
++                         a11yId: "tark.menu.newTab", uuid: uuid, tabInfo: tabInfo,
++                         perform: { store.dispatch(TabPanelViewModernAction.addNewTab(ofType: .normal), forWindowUUID: uuid) }),
++                tarkItem(.KeyboardShortcuts.NewPrivateTab, icon: StandardImageIdentifiers.Large.privateMode,
++                         a11yId: "tark.menu.privateTab", uuid: uuid, tabInfo: tabInfo,
++                         perform: { store.dispatch(TabPanelViewModernAction.addNewTab(ofType: .private), forWindowUUID: uuid) }),
++                tarkDestination(.MainMenu.PanelLinkSection.History, icon: Icons.history,
++                                a11yId: AccessibilityIdentifiers.MainMenu.history,
++                                destination: .history, uuid: uuid, tabInfo: tabInfo),
++                tarkDestination(.MainMenu.PanelLinkSection.Downloads, icon: Icons.downloads,
++                                a11yId: AccessibilityIdentifiers.MainMenu.downloads,
++                                destination: .downloads, uuid: uuid, tabInfo: tabInfo),
++            ]
++        )
++    }
++
++    private func getTarkRows(with uuid: WindowUUID, tabInfo: MainMenuTabInfo) -> MenuSection {
++        var options = [
++            tarkDestination(.MainMenu.PanelLinkSection.Bookmarks, icon: Icons.bookmarksTray,
++                            a11yId: AccessibilityIdentifiers.MainMenu.bookmarks,
++                            destination: .bookmarks, uuid: uuid, tabInfo: tabInfo)
++        ]
++        if !tabInfo.isHomepage {
++            options.append(tarkDestination(.MainMenu.ToolsSection.FindInPageV2, icon: Icons.findInPage,
++                                           a11yId: AccessibilityIdentifiers.MainMenu.findInPage,
++                                           destination: .findInPage, uuid: uuid, tabInfo: tabInfo))
++            options.append(configureUserAgentItem(with: uuid, tabInfo: tabInfo))
++            options.append(configureReaderViewItem(with: uuid, tabInfo: tabInfo))
++        }
++        return MenuSection(isHomepage: tabInfo.isHomepage, options: options)
++    }
++
+     // MARK: - Menu Sections
+     // Horizontal Tabs Section
+     private func getHorizontalTabsSection(with uuid: WindowUUID, tabInfo: MainMenuTabInfo) -> MenuSection {
+diff --git a/firefox-ios/Client/Frontend/Browser/MainMenu/Redux/MainMenuMiddleware.swift b/firefox-ios/Client/Frontend/Browser/MainMenu/Redux/MainMenuMiddleware.swift
+index 3595c14..a370a5e 100644
+--- a/firefox-ios/Client/Frontend/Browser/MainMenu/Redux/MainMenuMiddleware.swift
++++ b/firefox-ios/Client/Frontend/Browser/MainMenu/Redux/MainMenuMiddleware.swift
+@@ -136,7 +136,9 @@ final class MainMenuMiddleware {
+             MainMenuAction(
+                 windowUUID: action.windowUUID,
+                 actionType: MainMenuMiddlewareActionType.updateBannerVisibility,
+-                isBrowserDefault: DefaultBrowserUtility().isDefaultBrowser
++                // Tark: no default-browser banner in the menu; Settings has the
++                // Default Browser row (the I5d mockup).
++                isBrowserDefault: true
+             )
+         )
+     }
+diff --git a/firefox-ios/Client/Frontend/Browser/MainMenu/Redux/MainMenuState.swift b/firefox-ios/Client/Frontend/Browser/MainMenu/Redux/MainMenuState.swift
+index 0f2ff3f..2c4c7e0 100644
+--- a/firefox-ios/Client/Frontend/Browser/MainMenu/Redux/MainMenuState.swift
++++ b/firefox-ios/Client/Frontend/Browser/MainMenu/Redux/MainMenuState.swift
+@@ -77,6 +77,8 @@ struct MainMenuTabInfo: Equatable {
+     let isPinned: Bool
+     let accountData: AccountData
+     let translationConfiguration: TranslationConfiguration?
++    /// Tark: the menu's page row shows on the new tab too when forward is possible.
++    var canGoForward = false
+ }
+ 
+ @Copyable
+diff --git a/firefox-ios/Client/Frontend/Browser/Tabs/Middleware/TabManagerMiddleware.swift b/firefox-ios/Client/Frontend/Browser/Tabs/Middleware/TabManagerMiddleware.swift
+index 974c988..6ff0676 100644
+--- a/firefox-ios/Client/Frontend/Browser/Tabs/Middleware/TabManagerMiddleware.swift
++++ b/firefox-ios/Client/Frontend/Browser/Tabs/Middleware/TabManagerMiddleware.swift
+@@ -836,7 +836,8 @@ final class TabManagerMiddleware: FeatureFlaggable, CanRemoveQuickActionBookmark
+                     isInReadingList: info.isInReadingList,
+                     isPinned: info.isPinned,
+                     accountData: accountData,
+-                    translationConfiguration: translationConfig
++                    translationConfiguration: translationConfig,
++                    canGoForward: selectedTab.canGoForward
+                 )
+             )
+         )
