@@ -24,7 +24,8 @@ Design and plan: tarka-notes `specs/2026-10-28-tark-linux-design.md`,
 - `tark_post_patch.py` — the steps every non-Mac desktop build shares
   (`utils/tark_post_patch_common.py`: name substitution, the mark, trust
   data, Inter, the ad blocker's crates and lists, IndicXlit, the captions'
-  credits), and ONNX Runtime. Test: `python3 -m unittest utils.tests.test_post_patch_common`.
+  credits), and ONNX Runtime. Test:
+  `python3 -m unittest utils.tests.test_post_patch_common`.
 - `mac-only-patches.txt` — patches the Linux build leaves out.
 
 ## What Linux has (L1, L2)
