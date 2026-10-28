@@ -15,7 +15,8 @@ FILES = ['chrome', 'chrome_100_percent.pak', 'chrome_200_percent.pak', 'chrome_c
          'chrome-wrapper', 'icudtl.dat', 'libEGL.so', 'libGLESv2.so', 'libqt5_shim.so',
          'libqt6_shim.so', 'libvk_swiftshader.so', 'libvulkan.so.1', 'product_logo_48.png',
          'resources.pak', 'v8_context_snapshot.bin', 'vk_swiftshader_icd.json', 'xdg-mime',
-         'xdg-settings', 'locales/en-US.pak', 'indicxlit/xlit-model.bin', 'indicxlit/xlit-words.bin']
+         'xdg-settings', 'locales/en-US.pak', 'indicxlit/xlit-model.bin', 'indicxlit/xlit-words.bin',
+         'libonnxruntime.so.1']
 
 
 class TestLinuxPackage(unittest.TestCase):

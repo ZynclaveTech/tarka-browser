@@ -23,21 +23,33 @@ Design and plan: tarka-notes `specs/2026-10-28-tark-linux-design.md`,
   `python3 -m unittest utils.tests.test_linux_workdir`.
 - `tark_post_patch.py` — the steps every non-Mac desktop build shares
   (`utils/tark_post_patch_common.py`: name substitution, the mark, trust
-  data, Inter, the ad blocker's crates and lists, IndicXlit). The captions'
-  credits come with live captions (L2). Test: `python3 -m unittest utils.tests.test_post_patch_common`.
+  data, Inter, the ad blocker's crates and lists, IndicXlit, the captions'
+  credits), and ONNX Runtime. Test:
+  `python3 -m unittest utils.tests.test_post_patch_common`.
 - `mac-only-patches.txt` — patches the Linux build leaves out.
 
-## What Linux has (L1)
+## What Linux has (L1, L2)
 
 Open on Linux: the ad blocker (`adblock-desktop.patch`, which also builds
 the Zynclave sign-in service), typing in your language
 (`windows/xlit-provider.patch`), Sign in with Zynclave (the web offer and the
-Settings card no longer sit inside the captions-only blocks).
+Settings card no longer sit inside the captions-only blocks), and live
+captions (`tarka/linux/captions.patch`, L2): the model languages, as on
+Windows.
+
+How captions run on Linux: ONNX Runtime is Microsoft's linux-x64 release
+(`downloads-onnxruntime.ini`), copied next to the chrome binary as
+`libonnxruntime.so.1`. The browser names it and the captions models folder
+in two switches to the speech process, whose pre-sandbox hook
+(`content/utility/speech/speech_recognition_sandbox_hook_linux.cc`) loads it
+before the sandbox and lets the sandbox read the models folder and the CPU
+details ONNX Runtime sizes its threads from. `run_tests.sh` builds and runs
+the captions, speech and transliteration unit tests on the build machine,
+and ONNX Runtime running Silero VAD.
 
 Still Mac and Windows only, on purpose:
 
-- **Live captions** (`windows/captions.patch`, the speech sandbox and ONNX
-  Runtime patches): Linux needs ONNX Runtime and its sandbox rule first (L2).
+- **Apple's caption languages** (English, Spanish, …): macOS's own speech.
 - **Widevine opt-in** (`core/widevine-opt-in.patch`): context from
   Chromium's own Mac/Windows block, where the component installer lives.
 
