@@ -17,7 +17,7 @@ stem="Tark-$chromium-$revision-x64-linux"
 
 files="chrome chrome_100_percent.pak chrome_200_percent.pak chrome_crashpad_handler
 chrome-wrapper icudtl.dat libEGL.so libGLESv2.so libqt5_shim.so libqt6_shim.so
-libvk_swiftshader.so libvulkan.so.1 libonnxruntime.so.1 locales indicxlit product_logo_48.png
+libvk_swiftshader.so libvulkan.so.1 libonnxruntime.so.1 locales indicxlit tark_adblock product_logo_48.png
 resources.pak v8_context_snapshot.bin vk_swiftshader_icd.json"
 # The default-browser helpers: packed when the build made them.
 optional="xdg-mime xdg-settings"
