@@ -74,13 +74,17 @@ class TestPostPatchSteps(unittest.TestCase):
         def monkey(m, run, seen):
             m.common.run = run
             m.run = run
+            m.install_onnxruntime = lambda *a: seen.append('onnxruntime')
 
-        self.assertEqual(steps(module, self.src, monkey), COMMON)
+        # ONNX Runtime's headers: components/tark_captions builds on every
+        # desktop, captions on or not.
+        self.assertEqual(steps(module, self.src, monkey), COMMON + ['onnxruntime'])
 
     def test_inter_is_copied(self):
         module = load('linux', self.work('l'))
         module.common.run = lambda *a, **k: None
         module.run = lambda *a, **k: None
+        module.install_onnxruntime = lambda *a: None
         module.main_for(self.src)
         fonts = list((self.src / 'ui' / 'webui' / 'resources' / 'fonts').glob('inter-latin*.woff2'))
         self.assertTrue(fonts)
