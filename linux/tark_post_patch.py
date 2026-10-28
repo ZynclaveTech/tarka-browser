@@ -9,8 +9,8 @@
 Run by the hook in upstream's scripts/build.sh (after patches and domain
 substitution, before gn gen), from the workdir linux/prepare_workdir.py
 made; the repo is named in tark_repo.txt next to this file. The steps every
-non-Mac desktop build shares (utils/tark_post_patch_common.py); ONNX Runtime
-for live captions joins them in L2.
+non-Mac desktop build shares before its own (utils/tark_post_patch_common.py);
+ONNX Runtime and the captions' credits join them in L2.
 """
 
 import os
@@ -30,7 +30,8 @@ BASH = os.environ.get('TARK_BASH', 'bash')
 
 def main_for(src):
     common.before_platform(REPO, CORE, CACHE, WORK, src, BASH)
-    common.after_platform(REPO, CORE, CACHE, src, BASH)
+    # No common.after_platform yet: the captions' credits describe ONNX
+    # Runtime and the models, which Linux gets with live captions (L2).
     print('tark: post-patch steps done', flush=True)
 
 

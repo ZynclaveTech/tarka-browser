@@ -22,8 +22,8 @@ Design and plan: tarka-notes `specs/2026-10-28-tark-linux-design.md`,
   `python3 -m unittest utils.tests.test_linux_workdir`.
 - `tark_post_patch.py` — the steps every non-Mac desktop build shares
   (`utils/tark_post_patch_common.py`: name substitution, the mark, trust
-  data, Inter, the ad blocker's crates and lists, IndicXlit, the captions'
-  credits). Test: `python3 -m unittest utils.tests.test_post_patch_common`.
+  data, Inter, the ad blocker's crates and lists, IndicXlit). The captions'
+  credits come with live captions (L2). Test: `python3 -m unittest utils.tests.test_post_patch_common`.
 - `mac-only-patches.txt` — patches the Linux build leaves out.
 
 ## What Linux has (L1)

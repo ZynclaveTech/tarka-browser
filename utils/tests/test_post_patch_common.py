@@ -66,15 +66,16 @@ class TestPostPatchSteps(unittest.TestCase):
         self.assertEqual(steps(module, self.src, monkey),
                          COMMON + ['onnxruntime', 'winsparkle', 'install_captions_credits.sh'])
 
-    def test_linux_runs_the_common_steps_then_the_credits(self):
+    def test_linux_runs_the_common_steps_without_the_captions_credits(self):
+        # Live captions are not on Linux yet (no ONNX Runtime until L2), so
+        # about:credits must not list what they run on.
         module = load('linux', self.work('l'))
 
         def monkey(m, run, seen):
             m.common.run = run
             m.run = run
 
-        self.assertEqual(steps(module, self.src, monkey),
-                         COMMON + ['install_captions_credits.sh'])
+        self.assertEqual(steps(module, self.src, monkey), COMMON)
 
     def test_inter_is_copied(self):
         module = load('linux', self.work('l'))
