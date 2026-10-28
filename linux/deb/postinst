@@ -1,0 +1,25 @@
+#!/bin/sh
+# Tark's package (L3): Tark's apt repository, once the package carries its
+# key, so `apt upgrade` brings new versions; the AppArmor profile; the app
+# menu and icon caches. Safe to run again (upgrades, reinstalls).
+set -e
+root=${DPKG_ROOT:-}
+key=$root/opt/tark/tark-archive-keyring.gpg
+
+if [ "$1" = configure ]; then
+  if [ -f "$key" ]; then
+    mkdir -p "$root/usr/share/keyrings" "$root/etc/apt/sources.list.d"
+    cp "$key" "$root/usr/share/keyrings/tark-archive-keyring.gpg"
+    chmod 644 "$root/usr/share/keyrings/tark-archive-keyring.gpg"
+    echo "deb [arch=amd64 signed-by=/usr/share/keyrings/tark-archive-keyring.gpg] https://gettarka.com/apt stable main" \
+      > "$root/etc/apt/sources.list.d/tark.list"
+  fi
+  if [ -z "$root" ]; then
+    if command -v apparmor_parser >/dev/null 2>&1 && [ -d /sys/kernel/security/apparmor ]; then
+      apparmor_parser -r -T -W /etc/apparmor.d/tark || true
+    fi
+    command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database -q /usr/share/applications || true
+    command -v gtk-update-icon-cache >/dev/null 2>&1 && gtk-update-icon-cache -q -t -f /usr/share/icons/hicolor || true
+  fi
+fi
+exit 0
