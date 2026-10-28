@@ -1,0 +1,159 @@
+diff --git a/BrowserKit/Sources/Shared/SupportUtils.swift b/BrowserKit/Sources/Shared/SupportUtils.swift
+index 671462b..0d07f9e 100644
+--- a/BrowserKit/Sources/Shared/SupportUtils.swift
++++ b/BrowserKit/Sources/Shared/SupportUtils.swift
+@@ -7,79 +7,67 @@ import Foundation
+ import UIKit
+ 
+ /// Utility functions related to SUMO and Webcompat
++/// Tark: every help link opens Tark's iOS help page on gettarka.com (a section
++/// per topic, as on Android); privacy and terms links open Tark's privacy page.
++/// None of them open Mozilla's sites.
+ public struct SupportUtils {
++    private static let tarkHelp = "https://gettarka.com/help/ios/"
++    private static let tarkPrivacy = "https://gettarka.com/privacy/"
++
+     public static var URLForPrivateBrowsingLearnMore: URL? {
+         // Returns the predefined URL associated to private homepage message card learn more action.
+-        return URL(string: "https://support.mozilla.org/en-US/kb/common-myths-about-private-browsing?as=u&utm_source=inproduct")
++        return URL(string: tarkHelp + "#private-browsing")
+     }
+ 
+     public static var URLForGetHelp: URL? {
+         // Returns the predefined URL associated to the menu's Get Help button action.
+-        return URL(string: "https://support.mozilla.org/products/ios")
++        return URL(string: tarkHelp)
+     }
+ 
+     public static var URLForPocketLearnMore: URL? {
+         // Returns the predefined URL associated to homepage Pocket's Learn more action.
+-        return URL(string: "https://www.mozilla.org/firefox/pocket/?utm_source=ff_ios")
++        return URL(string: tarkHelp)
+     }
+ 
+     public static var URLForTermsOfUse: URL? {
+-        return URL(string: "https://www.mozilla.org/about/legal/terms/firefox/")
++        return URL(string: tarkPrivacy)
+     }
+ 
+     public static var URLForPrivacyNotice: URL? {
+-        return URL(string: "https://www.mozilla.org/privacy/firefox/")
++        return URL(string: tarkPrivacy)
+     }
+ 
+     public static var URLForUpdatedPrivacyNotice: URL? {
+-        return URL(string: "https://www.mozilla.org/privacy/firefox/next/")
++        return URL(string: tarkPrivacy)
+     }
+ 
+     public static var URLForUpdatedPrivacyNoticeDiff: URL? {
+-        return URL(string: "https://www.mozilla.org/privacy/firefox/update/")
++        return URL(string: tarkPrivacy)
+     }
+ 
+     public static var URLForRelayAccountManagement: URL? {
+-        return URL(string: "https://relay.firefox.com/accounts/profile")
++        return URL(string: tarkHelp)
+     }
+ 
+     public static var URLForRelayMaskLearnMoreArticle: URL? {
+-        return URL(string: "https://support.mozilla.org/en-US/kb/relay-masks-ios")
++        return URL(string: tarkHelp)
+     }
+ 
+     public static var URLForConnectionNotSecureLearnMore: URL? {
+-        return URL(string: "https://support.mozilla.org/en-US/kb/what-does-your-connection-is-not-secure-mean")
++        return URL(string: tarkHelp + "#connection-not-secure")
+     }
+ 
+     public static func URLForTopic(_ topic: String, useMobilePath: Bool = true) -> URL? {
+-        // Construct a NSURL pointing to a specific topic on SUMO. The topic should be a non-escaped string. It will
+-        // be properly escaped by this function.
+-        //
+-        // The resulting NSURL will include the app version, operating system and locale code. For example, a topic
+-        // "cheese" will be turned into a link that looks like https://support.mozilla.org/1/mobile/2.0/iOS/en-US/cheese
+-        guard let escapedTopic = topic.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed),
+-              let languageIdentifier = Locale.preferredLanguages.first
+-        else {
++        // The topic's section of Tark's iOS help page: "cheese" becomes
++        // https://gettarka.com/help/ios/#cheese. The topic is escaped here.
++        guard let escapedTopic = topic.addingPercentEncoding(withAllowedCharacters: .urlFragmentAllowed) else {
+             return nil
+         }
+-        let productPath = useMobilePath ? "mobile" : "firefox"
+-        return URL(string: "https://support.mozilla.org/1/\(productPath)/\(AppInfo.appVersion)/iOS/\(languageIdentifier)/\(escapedTopic)")
++        return URL(string: tarkHelp + "#" + escapedTopic)
+     }
+ 
+     public static func URLForPrivacyNotice(source: String, campaign: String, content: String?) -> URL? {
+-        let defaultURL = URL(string: "https://www.mozilla.org/privacy/firefox")
+-
+-        guard let languageIdentifier = Locale.preferredLanguages.first else {
+-            return defaultURL
+-        }
+-
+-        var privacyNoticeString =
+-                    "https://www.mozilla.org/\(languageIdentifier)/privacy/firefox/?utm_medium=firefox-mobile&utm_source=\(source)&utm_campaign=\(campaign)"
+-
+-        if let content {
+-            privacyNoticeString.append("&utm_content=\(content)")
+-        }
+-
+-        return URL(string: privacyNoticeString) ?? defaultURL
++        // Tark: no tracking parameters.
++        return URL(string: tarkPrivacy)
+     }
+ }
+diff --git a/firefox-ios/Client/Application/RemoteSettings/Application Services/ASAIRemoteConfig.swift b/firefox-ios/Client/Application/RemoteSettings/Application Services/ASAIRemoteConfig.swift
+index ca2aed7..834680e 100644
+--- a/firefox-ios/Client/Application/RemoteSettings/Application Services/ASAIRemoteConfig.swift	
++++ b/firefox-ios/Client/Application/RemoteSettings/Application Services/ASAIRemoteConfig.swift	
+@@ -65,7 +65,8 @@ final class ASAIRemoteConfig: Sendable {
+     }
+ 
+     private func getRecords() -> [SummarizerModelConfig] {
+-        guard let records = rsClient?.getRecords(syncIfEmpty: true) else { return [] }
++        // Tark: only what ships in the app; never fetched from Mozilla's Remote Settings.
++        guard let records = rsClient?.getRecords(syncIfEmpty: false) else { return [] }
+         let decoder = JSONDecoder()
+         return records.compactMap { record in
+             guard let data = record.fields.data(using: .utf8) else { return nil }
+diff --git a/firefox-ios/Client/Application/RemoteSettings/Application Services/ASAdBlockerListFetcher.swift b/firefox-ios/Client/Application/RemoteSettings/Application Services/ASAdBlockerListFetcher.swift
+index fbf940e..48a02b6 100644
+--- a/firefox-ios/Client/Application/RemoteSettings/Application Services/ASAdBlockerListFetcher.swift	
++++ b/firefox-ios/Client/Application/RemoteSettings/Application Services/ASAdBlockerListFetcher.swift	
+@@ -56,7 +56,9 @@ final class ASAdBlockerListFetcher: AdBlockerListFetcherProtocol {
+     }
+ 
+     private func loadAdBlockerListJSON() -> String? {
+-        guard let client = clientProvider(), let records = client.getRecords(syncIfEmpty: true) else {
++        // Tark: only the list that ships in the app; never fetched from Mozilla's Remote Settings
++        // (the shield's per-site switch reloads this list).
++        guard let client = clientProvider(), let records = client.getRecords(syncIfEmpty: false) else {
+             logger.log("Ad-blocker list fetch failed: nil client or no records.",
+                        level: .warning,
+                        category: .remoteSettings)
+diff --git a/firefox-ios/Client/Frontend/PasswordManagement/BreachAlertsClient.swift b/firefox-ios/Client/Frontend/PasswordManagement/BreachAlertsClient.swift
+index 387b0fd..7231f50 100644
+--- a/firefox-ios/Client/Frontend/PasswordManagement/BreachAlertsClient.swift
++++ b/firefox-ios/Client/Frontend/PasswordManagement/BreachAlertsClient.swift
+@@ -34,6 +34,9 @@ class BreachAlertsClient: BreachAlertsClientProtocol {
+ 
+     /// Makes a header-only request to an endpoint and hands off the endpoint's etag to a completion handler.
+     func fetchEtag(endpoint: Endpoint, profile: Profile, completion: @escaping @Sendable (_ etag: String?) -> Void) {
++        // Tark: no breach list from Mozilla's Monitor; nothing is fetched.
++        completion(nil)
++        return
+         guard let url = URL(string: endpoint.rawValue) else { return }
+         var request = URLRequest(url: url)
+         request.httpMethod = "HEAD"
+@@ -59,6 +62,9 @@ class BreachAlertsClient: BreachAlertsClientProtocol {
+ 
+     /// Makes a network request to an endpoint and hands off the result to a completion handler.
+     func fetchData(endpoint: Endpoint, profile: Profile, completion: @escaping @Sendable (_ result: Maybe<Data>) -> Void) {
++        // Tark: no breach list from Mozilla's Monitor; nothing is fetched.
++        completion(Maybe(failure: BreachAlertsError(description: "breach alerts are off in Tark")))
++        return
+         guard let url = URL(string: endpoint.rawValue) else { return }
+ 
+         dataTask?.cancel()
