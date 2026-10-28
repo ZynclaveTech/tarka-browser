@@ -1,0 +1,166 @@
+diff --git a/BrowserKit/Sources/ToolbarKit/AddressToolbar/BrowserAddressToolbar.swift b/BrowserKit/Sources/ToolbarKit/AddressToolbar/BrowserAddressToolbar.swift
+index 603dd41..dd4af12 100644
+--- a/BrowserKit/Sources/ToolbarKit/AddressToolbar/BrowserAddressToolbar.swift
++++ b/BrowserKit/Sources/ToolbarKit/AddressToolbar/BrowserAddressToolbar.swift
+@@ -569,6 +569,9 @@ public class BrowserAddressToolbar: UIView,
+         previousConfiguration?.uxConfiguration.addressToolbarBackgroundColor(theme: theme)
+         locationContainer.backgroundColor = previousConfiguration?.uxConfiguration
+             .locationContainerBackgroundColor(theme: theme)
++        // Tark: the address pill is raised with a hairline, as on Android.
++        locationContainer.layer.borderWidth = 0.5
++        locationContainer.layer.borderColor = colors.borderPrimary.cgColor
+         locationDividerView.backgroundColor = colors.layer1
+         toolbarTopBorderView.backgroundColor = colors.borderPrimary
+         toolbarBottomBorderView.backgroundColor = colors.borderPrimary
+diff --git a/firefox-ios/Client/Frontend/Browser/BrowserViewController/Views/BrowserViewController.swift b/firefox-ios/Client/Frontend/Browser/BrowserViewController/Views/BrowserViewController.swift
+index 5617d71..262146e 100644
+--- a/firefox-ios/Client/Frontend/Browser/BrowserViewController/Views/BrowserViewController.swift
++++ b/firefox-ios/Client/Frontend/Browser/BrowserViewController/Views/BrowserViewController.swift
+@@ -348,6 +348,9 @@ class BrowserViewController: UIViewController,
+ 
+     // MARK: Computed vars
+ 
++    private let tarkBottomInset: UIView = .build()
++    private var tarkBottomInsetHeight: NSLayoutConstraint?
++
+     lazy var isBottomSearchBar: Bool = {
+         return searchBarPosition == .bottom
+     }()
+@@ -764,13 +767,9 @@ class BrowserViewController: UIViewController,
+         let showNavToolbar = toolbarHelper.shouldShowNavigationToolbar(for: newCollection)
+         let showTopTabs = toolbarHelper.shouldShowTopTabs(for: newCollection)
+ 
+-        if showNavToolbar {
+-            navigationToolbarContainer.isHidden = false
+-            navigationToolbarContainer.applyTheme(theme: currentTheme())
+-            updateTabCountUsingTabManager(self.tabManager)
+-        } else {
+-            navigationToolbarContainer.isHidden = true
+-        }
++        // Tark: one row; the second row of buttons stays hidden.
++        _ = showNavToolbar
++        navigationToolbarContainer.isHidden = true
+ 
+         updateToolbarStateTraitCollectionIfNecessary(newCollection)
+         appMenuBadgeUpdate()
+@@ -1425,6 +1424,11 @@ class BrowserViewController: UIViewController,
+         view.addSubview(bottomContentStackView)
+ 
+         bottomContainer.addArrangedSubview(navigationToolbarContainer)
++        // Tark: with the second row hidden, this keeps the one-row bar above the
++        // home indicator (the second row used to supply that space).
++        bottomContainer.addArrangedSubview(tarkBottomInset)
++        tarkBottomInsetHeight = tarkBottomInset.heightAnchor.constraint(equalToConstant: 0)
++        tarkBottomInsetHeight?.isActive = true
+         view.addSubview(bottomContainer)
+ 
+         // add overKeyboardContainer after bottomContainer so the address toolbar shadow
+@@ -1519,6 +1523,10 @@ class BrowserViewController: UIViewController,
+ 
+     override func viewDidLayoutSubviews() {
+         super.viewDidLayoutSubviews()
++        let bottomInset = isBottomSearchBar ? view.safeAreaInsets.bottom : 0
++        if tarkBottomInsetHeight?.constant != bottomInset {
++            tarkBottomInsetHeight?.constant = bottomInset
++        }
+ 
+         // Documentation found in https://mozilla-hub.atlassian.net/browse/FXIOS-10952
+         checkForJSAlerts()
+diff --git a/firefox-ios/Client/Frontend/Browser/Toolbars/Redux/BrowserActionsBuilder.swift b/firefox-ios/Client/Frontend/Browser/Toolbars/Redux/BrowserActionsBuilder.swift
+index 4946ab6..d530ad4 100644
+--- a/firefox-ios/Client/Frontend/Browser/Toolbars/Redux/BrowserActionsBuilder.swift
++++ b/firefox-ios/Client/Frontend/Browser/Toolbars/Redux/BrowserActionsBuilder.swift
+@@ -42,13 +42,12 @@ enum BrowserActionsBuilder {
+         }
+ 
+         // In compact only cancel action should be shown
+-        guard !isShowingNavigationToolbar else {
++        // Tark: while typing, the row is the pill and Cancel only, as on Android.
++        guard !isShowingNavigationToolbar, !isEditing else {
+             return actions
+         }
+ 
+-        if !isShowingTopTabs, !isHomepage {
+-            actions.append(newTabAction)
+-        }
++        // Tark: no new-tab button in the bar (New tab is in the menu).
+ 
+         let menuIcon = ImageIdentifiers.tarkMenuMark
+         let iconName: String? = switch tabTrayButtonStyle {
+@@ -56,22 +55,9 @@ enum BrowserActionsBuilder {
+         case .screenshot: nil
+         }
+ 
++        // Tark: tabs, then the mark, whatever the layout setting.
+         switch toolbarLayout {
+-        case .version1, .none:
+-            actions.append(
+-                contentsOf: [
+-                    menuAction(iconName: menuIcon, showWarningBadge: showWarningBadge),
+-                    tabsAction(
+-                        iconName: iconName,
+-                        numberOfTabs: numberOfTabs,
+-                        isPrivateMode: isPrivateMode,
+-                        isNovaDesignEnabled: isNovaDesignEnabled,
+-                        previousTabScreenshot: previousTabScreenshot,
+-                        nextTabScreenshot: nextTabScreenshot
+-                    )
+-                ]
+-            )
+-        case .version2:
++        case .version1, .version2, .none:
+             actions.append(
+                 contentsOf: [
+                     tabsAction(
+@@ -116,16 +102,12 @@ enum BrowserActionsBuilder {
+             .Toolbars.TabsButtonOverflowLargeContentTitle :
+             String(format: .Toolbars.TabsButtonLargeContentTitle, NSNumber(value: numberOfTabs))
+ 
+-        let isNovaPrivate = isPrivateMode && isNovaDesignEnabled
+-        let badgeImageName = isNovaPrivate
+-            ? StandardImageIdentifiers.Medium.privateModeCircleFillStrokeMulticolor
+-            : StandardImageIdentifiers.Medium.privateModeCircleFillPurple
+-
+         return ToolbarActionConfiguration(
+             actionType: .tabs,
+             iconName: iconName,
+-            badgeImageName: isPrivateMode ? badgeImageName : nil,
+-            maskImageName: (isPrivateMode && iconName != nil) ? ImageIdentifiers.badgeMask : nil,
++            // Tark: no mask badge in private; the dark paper says it.
++            badgeImageName: nil,
++            maskImageName: nil,
+             numberOfTabs: numberOfTabs,
+             isEnabled: true,
+             largeContentTitle: largeContentTitle,
+diff --git a/firefox-ios/Client/Frontend/Browser/Toolbars/Redux/NavigationActionsBuilder.swift b/firefox-ios/Client/Frontend/Browser/Toolbars/Redux/NavigationActionsBuilder.swift
+index 82ca5c4..a56b8cf 100644
+--- a/firefox-ios/Client/Frontend/Browser/Toolbars/Redux/NavigationActionsBuilder.swift
++++ b/firefox-ios/Client/Frontend/Browser/Toolbars/Redux/NavigationActionsBuilder.swift
+@@ -13,10 +13,8 @@ enum NavigationActionsBuilder {
+                            canGoBack: Bool,
+                            canGoForward: Bool) -> [ToolbarActionConfiguration] {
+         guard !isShowingNavigationToolbar else { return [] }
+-        return [
+-            backAction(enabled: canGoBack),
+-            forwardAction(enabled: canGoForward)
+-        ]
++        // Tark: back only in the bar; forward is in the menu's top row.
++        return [backAction(enabled: canGoBack)]
+     }
+ 
+     // MARK: - Helper
+diff --git a/firefox-ios/Client/Frontend/Browser/Toolbars/Redux/ToolbarState.swift b/firefox-ios/Client/Frontend/Browser/Toolbars/Redux/ToolbarState.swift
+index 074faf1..19a85de 100644
+--- a/firefox-ios/Client/Frontend/Browser/Toolbars/Redux/ToolbarState.swift
++++ b/firefox-ios/Client/Frontend/Browser/Toolbars/Redux/ToolbarState.swift
+@@ -123,7 +123,9 @@ struct ToolbarState: ScreenState, Sendable {
+         self.isPrivateMode = isPrivateMode
+         self.addressToolbar = addressToolbar
+         self.navigationToolbar = navigationToolbar
+-        self.isShowingNavigationToolbar = isShowingNavigationToolbar
++        // Tark: the address row always carries back, tabs and the mark (one row,
++        // as on Android); the second row of buttons is never used.
++        self.isShowingNavigationToolbar = false
+         self.isShowingTopTabs = isShowingTopTabs
+         self.canGoBack = canGoBack
+         self.canGoForward = canGoForward
