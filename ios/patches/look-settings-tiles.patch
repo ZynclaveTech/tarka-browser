@@ -1,0 +1,142 @@
+diff --git a/firefox-ios/Client/Frontend/Settings/Main/AppSettingsTableViewController.swift b/firefox-ios/Client/Frontend/Settings/Main/AppSettingsTableViewController.swift
+index 67cda4e..5ad76a6 100644
+--- a/firefox-ios/Client/Frontend/Settings/Main/AppSettingsTableViewController.swift
++++ b/firefox-ios/Client/Frontend/Settings/Main/AppSettingsTableViewController.swift
+@@ -337,9 +337,129 @@ class AppSettingsTableViewController: SettingsTableViewController,
+             settings += getDebugSettings()
+         }
+ 
++        // Tark: the main settings are tiles at the top (as on Android); the rest
++        // stays in the list below. Empty sections go.
++        let tileTypes: [Setting.Type] = [
++            SearchSetting.self, ContentBlockerSetting.self, ThemeSetting.self,
++            AutofillPasswordSetting.self, TarkLanguagesSetting.self, NewTabPageSetting.self,
++            HomeSetting.self, ClearPrivateDataSetting.self,
++        ]
++        let all = settings.flatMap { $0.children }
++        tarkTiles = tileTypes.compactMap { type in all.first { Swift.type(of: $0) == type } }
++        settings = settings.compactMap { section in
++            let rest = section.children.filter { child in !tarkTiles.contains { $0 === child } }
++            guard !rest.isEmpty else { return nil }
++            guard rest.count != section.children.count else { return section }
++            return SettingSection(title: section.title, footerTitle: section.footerTitle, children: rest)
++        }
++        updateTarkHeader()
+         return settings
+     }
+ 
++    // MARK: - Tark header
++
++    private var tarkTiles: [Setting] = []
++
++    private func updateTarkHeader() {
++        let theme = currentTheme()
++        let header = UIStackView()
++        header.axis = .vertical
++        header.spacing = 12
++        header.isLayoutMarginsRelativeArrangement = true
++        header.directionalLayoutMargins = NSDirectionalEdgeInsets(top: 12, leading: 16, bottom: 8, trailing: 16)
++
++        let mark = UIImageView(image: UIImage(named: "tarkMenuMark"))
++        mark.contentMode = .scaleAspectFit
++        mark.widthAnchor.constraint(equalToConstant: 28).isActive = true
++        mark.heightAnchor.constraint(equalToConstant: 28).isActive = true
++        let summary = UILabel()
++        summary.text = "Private by default. No Mozilla · no sync"
++        summary.font = FXFontStyles.Regular.subheadline.scaledFont()
++        summary.adjustsFontForContentSizeCategory = true
++        summary.numberOfLines = 0
++        summary.textColor = theme.colors.textAccent
++        let top = UIStackView(arrangedSubviews: [mark, summary])
++        top.spacing = 10
++        top.alignment = .center
++        header.addArrangedSubview(top)
++
++        var row: UIStackView?
++        for (index, setting) in tarkTiles.enumerated() {
++            if index % 2 == 0 {
++                let newRow = UIStackView()
++                newRow.spacing = 8
++                newRow.distribution = .fillEqually
++                header.addArrangedSubview(newRow)
++                row = newRow
++            }
++            row?.addArrangedSubview(tarkTile(for: setting, theme: theme))
++        }
++        if tarkTiles.count % 2 == 1 { row?.addArrangedSubview(UIView()) }
++
++        let width = tableView.bounds.width > 0 ? tableView.bounds.width : view.bounds.width
++        let size = header.systemLayoutSizeFitting(
++            CGSize(width: width, height: UIView.layoutFittingCompressedSize.height),
++            withHorizontalFittingPriority: .required,
++            verticalFittingPriority: .fittingSizeLevel)
++        header.frame = CGRect(x: 0, y: 0, width: width, height: size.height)
++        tableView.tableHeaderView = header
++    }
++
++    /// Android's plain names for the tiles (English for now; the rows keep
++    /// Firefox's translated names).
++    private func tarkTileName(for setting: Setting) -> String? {
++        switch setting {
++        case is ContentBlockerSetting: return "Ad blocking"
++        case is ThemeSetting: return "Look"
++        case is AutofillPasswordSetting: return "Passwords"
++        case is ClearPrivateDataSetting: return "Clear data"
++        default: return nil
++        }
++    }
++
++    private func tarkTile(for setting: Setting, theme: Theme) -> UIView {
++        let title = UILabel()
++        title.text = tarkTileName(for: setting) ?? setting.title?.string
++        title.font = FXFontStyles.Bold.subheadline.scaledFont()
++        title.adjustsFontForContentSizeCategory = true
++        title.textColor = theme.colors.textPrimary
++        title.numberOfLines = 2
++        let status = UILabel()
++        status.text = setting.status?.string
++        status.font = FXFontStyles.Regular.caption1.scaledFont()
++        status.adjustsFontForContentSizeCategory = true
++        status.textColor = theme.colors.textSecondary
++        status.numberOfLines = 1
++        status.isHidden = (status.text ?? "").isEmpty
++
++        let stack = UIStackView(arrangedSubviews: [title, status])
++        stack.axis = .vertical
++        stack.spacing = 2
++        stack.isUserInteractionEnabled = false
++        stack.translatesAutoresizingMaskIntoConstraints = false
++
++        let tile = UIControl()
++        tile.backgroundColor = theme.colors.layer2
++        tile.layer.cornerRadius = 12
++        tile.layer.borderWidth = 0.5
++        tile.layer.borderColor = theme.colors.borderPrimary.cgColor
++        tile.accessibilityLabel = title.text
++        tile.accessibilityTraits = .button
++        tile.isAccessibilityElement = true
++        tile.addSubview(stack)
++        NSLayoutConstraint.activate([
++            stack.leadingAnchor.constraint(equalTo: tile.leadingAnchor, constant: 12),
++            stack.trailingAnchor.constraint(equalTo: tile.trailingAnchor, constant: -12),
++            stack.topAnchor.constraint(equalTo: tile.topAnchor, constant: 10),
++            stack.bottomAnchor.constraint(equalTo: tile.bottomAnchor, constant: -10),
++            tile.heightAnchor.constraint(greaterThanOrEqualToConstant: 60),
++        ])
++        tile.addAction(UIAction { [weak self, weak setting] _ in
++            setting?.onClick(self?.navigationController)
++        }, for: .touchUpInside)
++        return tile
++    }
++
+     private func getDefaultBrowserSetting() -> [SettingSection] {
+         let footerTitle = NSAttributedString(
+             string: String.FirefoxHomepage.HomeTabBanner.EvergreenMessage.HomeTabBannerDescription)
+@@ -650,6 +770,7 @@ class AppSettingsTableViewController: SettingsTableViewController,
+ 
+     func askedToReload() {
+         tableView.reloadData()
++        updateTarkHeader()
+     }
+ 
+     override func applyTheme() {
