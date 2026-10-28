@@ -56,5 +56,28 @@ class TestLinuxPackage(unittest.TestCase):
         self.assertEqual(line, [hashlib.sha256(data).hexdigest(), f'{self.stem}.tar.xz'])
 
 
+class TestLinuxPackageOptional(unittest.TestCase):
+    """xdg-mime and xdg-settings (the default-browser helpers) are packed when
+    the build has them; anything else missing stops the package."""
+    def make(self, skip):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        out = pathlib.Path(tmp.name) / 'Default'
+        for f in FILES:
+            if f in skip:
+                continue
+            (out / f).parent.mkdir(parents=True, exist_ok=True)
+            (out / f).write_text(f)
+        return subprocess.run(['bash', str(SCRIPT), str(REPO), str(out), str(pathlib.Path(tmp.name) / 'o')],
+                              capture_output=True, text=True)
+
+    def test_without_the_xdg_helpers(self):
+        r = self.make({'xdg-mime', 'xdg-settings'})
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def test_without_chrome_fails(self):
+        self.assertNotEqual(self.make({'chrome'}).returncode, 0)
+
+
 if __name__ == '__main__':
     unittest.main()
