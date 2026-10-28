@@ -197,21 +197,15 @@
    AddSettingsPageUIHandler(std::make_unique<TarkZynclaveHandler>(profile));
 --- a/components/tark_captions/BUILD.gn
 +++ b/components/tark_captions/BUILD.gn
-@@ -65,6 +65,13 @@
+@@ -65,6 +65,7 @@
      "vad.h",
    ]
    include_dirs = [ "//third_party/tark_onnxruntime/include" ]
 +
-+  # Linux (L2): the engine calls ONNX Runtime through the function table of a
-+  # library dlopen()ed at run time, which is not built with CFI; Chromium's
-+  # official Linux build checks every indirect call (is_cfi) and stops the
-+  # process at the first one. No effect where CFI is off (Mac, Windows).
-+  configs += [ "//build/config/sanitizers:cfi_icall_disable" ]
-+
    deps = [
      "//base",
      "//components/prefs",
-@@ -81,6 +88,18 @@
+@@ -81,6 +82,18 @@
    if (is_win) {
      data_deps = [ ":onnxruntime_dll" ]
    }
@@ -230,6 +224,31 @@
  }
  
  if (is_win) {
+--- a/components/tark_captions/ort_runtime.cc
++++ b/components/tark_captions/ort_runtime.cc
+@@ -11,6 +11,14 @@
+ #include "base/memory/ptr_util.h"
+ #include "onnxruntime_c_api.h"
+ 
++// Every call into ONNX Runtime goes through the function table of a library
++// loaded at run time, built without control-flow integrity; Chromium's
++// official Linux build checks each indirect call (CFI) and would stop the
++// process at the first. This file's functions alone skip that check (L2).
++#if defined(__clang__)
++#pragma clang attribute push(__attribute__((no_sanitize("cfi-icall"))), apply_to = function)
++#endif
++
+ namespace tark_captions {
+ namespace {
+ 
+@@ -195,3 +203,7 @@
+ }
+ 
+ }  // namespace tark_captions
++
++#if defined(__clang__)
++#pragma clang attribute pop
++#endif
 --- a/content/utility/speech/speech_recognition_sandbox_hook_linux.cc
 +++ b/content/utility/speech/speech_recognition_sandbox_hook_linux.cc
 @@ -6,7 +6,13 @@
