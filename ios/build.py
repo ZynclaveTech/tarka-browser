@@ -420,9 +420,13 @@ def debrand():
                 path.write_text(new)
     # Mozilla's experiment data and Firefox's test pages ship in the app.
     (TREE / 'firefox-ios' / 'Client' / 'Experiments' / 'initial_experiments.json').write_text('{"data": []}\n')
-    for fixture in (TREE / 'firefox-ios').glob('**/test-fixtures/*'):
-        if fixture.is_file() and FIREFOX_WORDS.search(fixture.name + fixture.read_text(errors='ignore')):
-            fixture.write_text('')
+    # Firefox's UI-test pages (test-fixtures, "The Book of Mozilla", ...) were
+    # copied into every build; not into the App Store build.
+    project = TREE / 'firefox-ios' / 'Client.xcodeproj' / 'project.pbxproj'
+    text = project.read_text()
+    copy = 'shellScript = "fixtures=\\"${SRCROOT}/../test-fixtures\\"\\n'
+    if copy in text:
+        project.write_text(text.replace(copy, copy[:15] + '[ \\"$CONFIGURATION\\" = Firefox ] && exit 0\\n' + copy[15:]))
     # The search widget's name in the widget gallery.
     for config in [TREE / 'firefox-ios' / 'Client.xcodeproj' / 'project.pbxproj',
                    *(TREE / 'firefox-ios' / 'Client' / 'Configuration').glob('*.xcconfig')]:
