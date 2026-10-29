@@ -1,0 +1,134 @@
+diff --git a/firefox-ios/Client/Frontend/Settings/BrowsingSettingsViewController.swift b/firefox-ios/Client/Frontend/Settings/BrowsingSettingsViewController.swift
+index 7c8f3f8..cbf0a40 100644
+--- a/firefox-ios/Client/Frontend/Settings/BrowsingSettingsViewController.swift
++++ b/firefox-ios/Client/Frontend/Settings/BrowsingSettingsViewController.swift
+@@ -107,6 +107,7 @@ final class BrowsingSettingsViewController: SettingsTableViewController, Feature
+             }
+             if featureFlagsProvider.isEnabled(.backgroundAudio) {
+                 contentSection.append(BackgroundAudioSetting(prefs: profile.prefs))
++                contentSection.append(PictureInPictureSetting(prefs: profile.prefs))
+             }
+             contentSection += [
+                 BlockPopupSetting(prefs: profile.prefs),
+diff --git a/firefox-ios/Client/Frontend/Settings/Main/General/BackgroundAudioSetting.swift b/firefox-ios/Client/Frontend/Settings/Main/General/BackgroundAudioSetting.swift
+index 38ebac8..6dcf38b 100644
+--- a/firefox-ios/Client/Frontend/Settings/Main/General/BackgroundAudioSetting.swift
++++ b/firefox-ios/Client/Frontend/Settings/Main/General/BackgroundAudioSetting.swift
+@@ -25,3 +25,23 @@ class BackgroundAudioSetting: BoolSetting {
+         return AccessibilityIdentifiers.Settings.Browsing.backgroundAudio
+     }
+ }
++
++/// Tark: a video playing when Tark leaves the screen goes into Picture in
++/// Picture.
++class PictureInPictureSetting: BoolSetting {
++    init(prefs: Prefs) {
++        super.init(
++            prefs: prefs,
++            prefKey: BackgroundAudioHelper.pictureInPictureKey,
++            defaultValue: true,
++            attributedTitleText: NSAttributedString(string: "Picture in Picture"),
++            attributedStatusText: NSAttributedString(
++                string: "A playing video keeps going in a small window when you leave Tark."),
++            settingDidChange: { isEnabled in
++                Task { @MainActor in
++                    BackgroundAudioHelper.shared.togglePictureInPicture(isEnabled: isEnabled, prefs: prefs)
++                }
++            }
++        )
++    }
++}
+diff --git a/firefox-ios/Client/Frontend/TabContentsScripts/BackgroundAudioHelper.swift b/firefox-ios/Client/Frontend/TabContentsScripts/BackgroundAudioHelper.swift
+index f712513..66fef22 100644
+--- a/firefox-ios/Client/Frontend/TabContentsScripts/BackgroundAudioHelper.swift
++++ b/firefox-ios/Client/Frontend/TabContentsScripts/BackgroundAudioHelper.swift
+@@ -18,6 +18,7 @@ class BackgroundAudioHelper: Notifiable {
+     static let shared = BackgroundAudioHelper()
+ 
+     private var isObserving = false
++    private var prefs: Prefs?
+     private let notificationCenter: NotificationProtocol
+ 
+     private static let observedNotifications: [Notification.Name] = [
+@@ -32,6 +33,21 @@ class BackgroundAudioHelper: Notifiable {
+         });
+         """
+ 
++    /// Tark: a video playing when Tark leaves the screen goes into Picture in
++    /// Picture (sites like YouTube play inline and offer no PiP of their own).
++    /// If WebKit declines, the sound carries on as background audio.
++    private static let pictureInPictureJS = """
++        (() => {
++          const video = [...document.querySelectorAll('video')].find(v =>
++            !v.paused && !v.ended && v.readyState > 2 && v.videoWidth > 0);
++          if (video && video.webkitSupportsPresentationMode
++              && video.webkitSupportsPresentationMode('picture-in-picture')
++              && video.webkitPresentationMode === 'inline') {
++            video.webkitSetPresentationMode('picture-in-picture');
++          }
++        })();
++        """
++
+     private static let resumeTaggedMediaJS = """
+         document.querySelectorAll('[data-was-playing="true"]').forEach(el => {
+             el.play();
+@@ -62,14 +78,32 @@ class BackgroundAudioHelper: Notifiable {
+         return prefs.boolForKey(PrefsKeys.BackgroundAudio) ?? defaultOn
+     }
+ 
++    /// Tark: Settings → Browsing → Picture in Picture, on until turned off.
++    static let pictureInPictureKey = "tark.pictureInPicture"
++
++    static func isPictureInPictureEnabled(_ prefs: Prefs) -> Bool {
++        return prefs.boolForKey(pictureInPictureKey) ?? true
++    }
++
+     func configure(prefs: Prefs) {
+-        guard Self.isEnabled(prefs) else { return }
+-        startObserving()
++        self.prefs = prefs
++        updateObserving()
+     }
+ 
+     func toggle(isEnabled: Bool, prefs: Prefs) {
+         prefs.setBool(isEnabled, forKey: PrefsKeys.BackgroundAudio)
+-        if isEnabled {
++        configure(prefs: prefs)
++    }
++
++    func togglePictureInPicture(isEnabled: Bool, prefs: Prefs) {
++        prefs.setBool(isEnabled, forKey: Self.pictureInPictureKey)
++        configure(prefs: prefs)
++    }
++
++    /// Listens while background audio or Picture in Picture is on.
++    private func updateObserving() {
++        guard let prefs else { return }
++        if Self.isEnabled(prefs) || Self.isPictureInPictureEnabled(prefs) {
+             startObserving()
+         } else {
+             stopObserving()
+@@ -113,8 +147,14 @@ class BackgroundAudioHelper: Notifiable {
+     }
+ 
+     private func handleWillResignActive() {
++        guard let prefs else { return }
+         for webView in Self.selectedTabWebViews() {
+-            webView.evaluateJavaScript(Self.tagPlayingMediaJS)
++            if Self.isEnabled(prefs) {
++                webView.evaluateJavaScript(Self.tagPlayingMediaJS)
++            }
++            if Self.isPictureInPictureEnabled(prefs) {
++                webView.evaluateJavaScript(Self.pictureInPictureJS)
++            }
+         }
+     }
+ 
+@@ -125,6 +165,7 @@ class BackgroundAudioHelper: Notifiable {
+     }
+ 
+     private func resumeTaggedMedia() {
++        guard let prefs, Self.isEnabled(prefs) else { return }
+         for webView in Self.selectedTabWebViews() {
+             webView.evaluateJavaScript(Self.applyVisibilityOverridesJS, in: nil, in: .page)
+             webView.setAllMediaPlaybackSuspended(false) {
