@@ -56,6 +56,11 @@ class TestAndroidSeries(unittest.TestCase):
         self.assertTrue([e for e in self.tark if e.startswith('tarka/zynclave/')])
         self.assertFalse([e for e in self.series if e.startswith('tarka/zynclave/')])
 
+    def test_desktop_page_translation_stays_off_android(self):
+        self.assertIn('tarka/translate/', self.skip)
+        self.assertTrue([e for e in self.tark if e.startswith('tarka/translate/')])
+        self.assertFalse([e for e in self.series if e.startswith('tarka/translate/')])
+
     def test_locales_fix_is_android_only(self):
         self.assertIn('android/locales-android-branch.patch', self.series)
         self.assertNotIn('android/locales-android-branch.patch',
