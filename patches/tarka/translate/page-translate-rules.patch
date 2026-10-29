@@ -1,6 +1,6 @@
 --- a/components/tark_captions/page_translate_rules.h
 +++ b/components/tark_captions/page_translate_rules.h
-@@ -0,0 +1,44 @@
+@@ -0,0 +1,57 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -42,12 +42,25 @@
 +               bool never_language,
 +               bool never_site);
 +
++// What the translate bar shows. `step` is where Chromium's translation is;
++// a failed translation whose models aren't downloaded offers the download.
++enum class PageStep { kBefore, kTranslating, kAfter, kError };
++enum class BarMode {
++  kOffer,          // Original selected; Translated starts it.
++  kTranslating,    // Translated selected while the first text arrives.
++  kTranslated,     // Translated selected.
++  kNeedsDownload,  // "Download (N MB)".
++  kDownloading,    // "Getting translation ready… N%".
++  kError,          // "Couldn't translate this page".
++};
++BarMode BarModeFor(PageStep step, bool models_missing, bool downloading);
++
 +}  // namespace tark_captions
 +
 +#endif  // COMPONENTS_TARK_CAPTIONS_PAGE_TRANSLATE_RULES_H_
 --- a/components/tark_captions/page_translate_rules.cc
 +++ b/components/tark_captions/page_translate_rules.cc
-@@ -0,0 +1,58 @@
+@@ -0,0 +1,77 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -105,10 +118,29 @@
 +  return never_language ? Offer::kNone : Offer::kOffer;
 +}
 +
++BarMode BarModeFor(PageStep step, bool models_missing, bool downloading) {
++  if (downloading) {
++    return BarMode::kDownloading;
++  }
++  if (models_missing) {
++    return BarMode::kNeedsDownload;
++  }
++  switch (step) {
++    case PageStep::kBefore:
++      return BarMode::kOffer;
++    case PageStep::kTranslating:
++      return BarMode::kTranslating;
++    case PageStep::kAfter:
++      return BarMode::kTranslated;
++    case PageStep::kError:
++      return BarMode::kError;
++  }
++}
++
 +}  // namespace tark_captions
 --- a/components/tark_captions/page_translate_rules_unittest.cc
 +++ b/components/tark_captions/page_translate_rules_unittest.cc
-@@ -0,0 +1,56 @@
+@@ -0,0 +1,69 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -161,6 +193,19 @@
 +TEST(PageTranslateRulesTest, NoPreferenceOffersSupportedPairsOnly) {
 +  EXPECT_EQ(OfferFor("hi", "en", false, false, false), Offer::kOffer);
 +  EXPECT_EQ(OfferFor("fr", "en", false, false, false), Offer::kNone);
++}
++
++TEST(PageTranslateRulesTest, BarFollowsTheTranslation) {
++  EXPECT_EQ(BarModeFor(PageStep::kBefore, false, false), BarMode::kOffer);
++  EXPECT_EQ(BarModeFor(PageStep::kTranslating, false, false), BarMode::kTranslating);
++  EXPECT_EQ(BarModeFor(PageStep::kAfter, false, false), BarMode::kTranslated);
++  EXPECT_EQ(BarModeFor(PageStep::kError, false, false), BarMode::kError);
++}
++
++TEST(PageTranslateRulesTest, MissingModelsOfferTheDownload) {
++  EXPECT_EQ(BarModeFor(PageStep::kError, true, false), BarMode::kNeedsDownload);
++  EXPECT_EQ(BarModeFor(PageStep::kBefore, true, false), BarMode::kNeedsDownload);
++  EXPECT_EQ(BarModeFor(PageStep::kError, true, true), BarMode::kDownloading);
 +}
 +
 +}  // namespace
