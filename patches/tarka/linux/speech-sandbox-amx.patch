@@ -1,0 +1,43 @@
+Tark (Linux): the speech process (live captions, page translation) runs
+ONNX Runtime, which asks for the CPU's AMX tiles on CPUs that have them;
+the seccomp policy now refuses that one arch_prctl (EPERM, ONNX Runtime
+then runs without AMX) instead of killing the process.
+
+
+--- a/sandbox/policy/linux/bpf_speech_recognition_policy_linux.cc
++++ b/sandbox/policy/linux/bpf_speech_recognition_policy_linux.cc
+@@ -4,6 +4,7 @@
+ 
+ #include "sandbox/policy/linux/bpf_speech_recognition_policy_linux.h"
+ 
++#include <errno.h>
+ #include <sys/mman.h>
+ 
+ #include "sandbox/linux/bpf_dsl/bpf_dsl.h"
+@@ -16,6 +17,7 @@
+ 
+ using sandbox::bpf_dsl::Allow;
+ using sandbox::bpf_dsl::Arg;
++using sandbox::bpf_dsl::Error;
+ using sandbox::bpf_dsl::If;
+ using sandbox::bpf_dsl::ResultExpr;
+ using sandbox::bpf_dsl::Trap;
+@@ -51,6 +53,18 @@
+           .Else(BPFBasePolicy::EvaluateSyscall(system_call_number));
+     }
+ #endif
++#if defined(__NR_arch_prctl)
++    // Tark: ONNX Runtime (captions, page translation) asks the kernel for
++    // the CPU's AMX tiles when it loads a model on a CPU that has them
++    // (arch_prctl(ARCH_REQ_XCOMP_PERM, XFEATURE_XTILEDATA)). Refused, it
++    // runs without AMX; the baseline policy would kill the process instead.
++    case __NR_arch_prctl: {
++      constexpr int kArchReqXcompPerm = 0x1023;
++      const Arg<int> option(0);
++      return If(option == kArchReqXcompPerm, Error(EPERM))
++          .Else(BPFBasePolicy::EvaluateSyscall(system_call_number));
++    }
++#endif
+     default:
+       if (SyscallSets::IsMmap(system_call_number)) {
+         // The speech recognition sandbox requires the MAP_POPULATE flag in
