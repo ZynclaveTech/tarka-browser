@@ -1,0 +1,130 @@
+diff --git a/chrome/browser/ui/browser_ui_prefs.cc b/chrome/browser/ui/browser_ui_prefs.cc
+index 42a5109..7a1a918 100644
+--- a/chrome/browser/ui/browser_ui_prefs.cc
++++ b/chrome/browser/ui/browser_ui_prefs.cc
+@@ -145,7 +145,7 @@ void RegisterBrowserUserPrefs(user_prefs::PrefRegistrySyncable* registry) {
+   registry->RegisterBooleanPref(prefs::kWebAppCreateInAppsMenu, true);
+   registry->RegisterBooleanPref(prefs::kWebAppCreateInQuickLaunchBar, true);
+   registry->RegisterBooleanPref(
+-      translate::prefs::kOfferTranslateEnabled, false,
++      translate::prefs::kOfferTranslateEnabled, true,
+       user_prefs::PrefRegistrySyncable::SYNCABLE_PREF);
+   registry->RegisterDictionaryPref(prefs::kBrowserWindowPlacement);
+   registry->RegisterDictionaryPref(prefs::kBrowserWindowPlacementPopup);
+diff --git a/components/resources/translate_resources.grdp b/components/resources/translate_resources.grdp
+index 5226e14..4aa65ea 100644
+--- a/components/resources/translate_resources.grdp
++++ b/components/resources/translate_resources.grdp
+@@ -1,4 +1,5 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <grit-part>
+   <include name="IDR_TRANSLATE_JS" file="../translate/core/browser/resources/translate.js" type="BINDATA" />
++  <include name="IDR_TARK_STUB_ELEMENT_JS" file="../translate/core/browser/resources/tark_stub_element.js" type="BINDATA" />
+ </grit-part>
+diff --git a/components/translate/core/browser/resources/tark_stub_element.js b/components/translate/core/browser/resources/tark_stub_element.js
+new file mode 100644
+index 0000000..87a449b
+--- /dev/null
++++ b/components/translate/core/browser/resources/tark_stub_element.js
+@@ -0,0 +1,29 @@
++// Tark spike (throwaway): a stand-in for element.js served from the APK.
++// It "translates" by upper-casing every text node, and restores them.
++var google = google || {};
++google.translate = google.translate || {};
++google.translate.TranslateService = function(opts) {
++  const originals = new Map();
++  return {
++    isAvailable: function() { return true; },
++    getDetectedLanguage: function() { return 'hi'; },
++    translatePage: function(src, tgt, onProgress) {
++      const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
++      let node;
++      while ((node = walker.nextNode())) {
++        if (!originals.has(node)) {
++          originals.set(node, node.nodeValue);
++        }
++        node.nodeValue = node.nodeValue.toUpperCase();
++      }
++      onProgress(100, true, 0);
++    },
++    restore: function() {
++      for (const [node, value] of originals) {
++        node.nodeValue = value;
++      }
++      originals.clear();
++    },
++  };
++};
++cr.googleTranslate.onTranslateElementLoad();
+diff --git a/components/translate/core/browser/translate_manager.cc b/components/translate/core/browser/translate_manager.cc
+index 3febab3..4583bb8 100644
+--- a/components/translate/core/browser/translate_manager.cc
++++ b/components/translate/core/browser/translate_manager.cc
+@@ -189,7 +189,7 @@ void TranslateManager::InitiateTranslation(std::string_view page_lang) {
+ bool TranslateManager::CanManuallyTranslate(bool menu_logging) {
+   bool can_translate = true;
+ 
+-  if (net::NetworkChangeNotifier::IsOffline()) {
++  if ((false) && net::NetworkChangeNotifier::IsOffline()) {
+     if (!menu_logging) {
+       return false;
+     }
+@@ -199,7 +199,7 @@ bool TranslateManager::CanManuallyTranslate(bool menu_logging) {
+     can_translate = false;
+   }
+ 
+-  if (!ignore_missing_key_for_testing_ &&
++  if ((false) && !ignore_missing_key_for_testing_ &&
+       !::google_apis::HasAPIKeyConfigured()) {
+     if (!menu_logging) {
+       return false;
+@@ -760,7 +760,7 @@ void TranslateManager::SetIgnoreMissingKeyForTesting(bool ignore) {
+ // static
+ bool TranslateManager::IsAvailable(const TranslatePrefs* prefs) {
+   // These conditions mirror the conditions in InitiateTranslation.
+-  return (ignore_missing_key_for_testing_ ||
++  return ((true) || ignore_missing_key_for_testing_ ||
+           ::google_apis::HasAPIKeyConfigured()) &&
+          prefs->IsOfferTranslateEnabled();
+ }
+@@ -936,15 +936,15 @@ void TranslateManager::FilterIsTranslatePossible(
+ 
+   // Also, skip if the connection is currently offline - initiation doesn't make
+   // sense there, either.
+-  if (net::NetworkChangeNotifier::IsOffline()) {
++  if ((false) && net::NetworkChangeNotifier::IsOffline()) {
+     decision->PreventAllTriggering();
+     GetActiveTranslateMetricsLogger()->LogTriggerDecision(
+         TriggerDecision::kDisabledOffline);
+   }
+ 
+   const base::CommandLine& command_line = *base::CommandLine::ForCurrentProcess();
+-  if (!command_line.HasSwitch(translate::switches::kTranslateScriptURL) ||
+-      (!ignore_missing_key_for_testing_ && !::google_apis::HasAPIKeyConfigured())) {
++  if ((false) && (!command_line.HasSwitch(translate::switches::kTranslateScriptURL) ||
++      (!ignore_missing_key_for_testing_ && !::google_apis::HasAPIKeyConfigured()))) {
+     // Without an API key, translate won't work, so don't offer to translate in
+     // the first place. Leave kOfferTranslateEnabled on, though, because that
+     // settings syncs and we don't want to turn off translate everywhere else.
+diff --git a/components/translate/core/browser/translate_script.cc b/components/translate/core/browser/translate_script.cc
+index 981b97f..4c78858 100644
+--- a/components/translate/core/browser/translate_script.cc
++++ b/components/translate/core/browser/translate_script.cc
+@@ -99,6 +99,17 @@ void TranslateScript::Request(RequestCallback callback,
+     return;
+   }
+ 
++  // Tark spike: no network; serve the bundled stub as the fetched script.
++  if ((true)) {
++    base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
++        FROM_HERE,
++        base::BindOnce(&TranslateScript::OnScriptFetchComplete,
++                       weak_method_factory_.GetWeakPtr(), true,
++                       ui::ResourceBundle::GetSharedInstance()
++                           .LoadDataResourceString(IDR_TARK_STUB_ELEMENT_JS)));
++    return;
++  }
++
+   GURL translate_script_url = GetTranslateScriptURL();
+ 
+   if (base::FeatureList::IsEnabled(kTranslateElementRegionalization)) {
