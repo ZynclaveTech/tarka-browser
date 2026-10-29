@@ -1,0 +1,221 @@
+diff --git a/firefox-ios/Client/Frontend/Settings/AIControls/AIControlsModel.swift b/firefox-ios/Client/Frontend/Settings/AIControls/AIControlsModel.swift
+index fecec89..90e13c2 100644
+--- a/firefox-ios/Client/Frontend/Settings/AIControls/AIControlsModel.swift
++++ b/firefox-ios/Client/Frontend/Settings/AIControls/AIControlsModel.swift
+@@ -4,6 +4,7 @@
+ 
+ import Shared
+ import Common
++import TarkTranslate
+ 
+ class AIControlsModel: ObservableObject,
+                        FeatureFlaggable,
+@@ -16,6 +17,17 @@ class AIControlsModel: ObservableObject,
+     @Published var translationsVisible = false
+     @Published var pageSummariesVisible = false
+     @Published var quickAnswersVisible = false
++    // Tark: page translation with Tark's own IndicTrans2 model, and the
++    // models it has downloaded (direction, bytes), for "On this phone".
++    @Published var pageTranslationEnabled = true
++    @Published var modelsOnPhone: [(direction: TarkTranslateModels.Direction, bytes: Int64)] = []
++
++    /// Whether page translation is on (the Translate button shows itself);
++    /// on unless turned off here or by "Turn off AI features".
++    static let pageTranslationKey = "tark.pageTranslation"
++    static var isPageTranslationOn: Bool {
++        return UserDefaults.standard.object(forKey: pageTranslationKey) as? Bool ?? true
++    }
+ 
+     let headerLinkInfo = LinkInfo(
+         label: .Settings.AIControls.HeaderCard.Link,
+@@ -50,7 +62,8 @@ class AIControlsModel: ObservableObject,
+ 
+ 
+     var hasVisibleAIFeatures: Bool {
+-        return translationsVisible || pageSummariesVisible || quickAnswersVisible
++        // Tark: page translation is always offered.
++        return true
+     }
+ 
+     private static let topicString = "ios-ai-controls"
+@@ -92,6 +105,31 @@ class AIControlsModel: ObservableObject,
+         quickAnswersVisible = featureFlagsProvider.isEnabled(.quickAnswers)
+ 
+         killSwitchIsOn = featureFlagsProvider.isEnabled(.aiKillSwitch) && userPreferences.getPreferenceFor(.aiKillSwitch)
++        pageTranslationEnabled = Self.isPageTranslationOn
++        refreshModelsOnPhone()
++    }
++
++    /// Tark: reads what each direction takes on the phone now.
++    func refreshModelsOnPhone() {
++        modelsOnPhone = TarkTranslateModels.Direction.allCases.compactMap { direction in
++            let bytes = TarkTranslateModels.shared.bytesOnPhone(direction)
++            return bytes > 0 ? (direction, bytes) : nil
++        }
++    }
++
++    /// Tark: frees the model in memory and deletes `direction`'s files.
++    @MainActor
++    func deleteModel(_ direction: TarkTranslateModels.Direction) {
++        TarkPageTranslator.shared.unload()
++        TarkTranslateModels.shared.delete(direction)
++        refreshModelsOnPhone()
++    }
++
++    @MainActor
++    func togglePageTranslation(to newValue: Bool) {
++        pageTranslationEnabled = newValue
++        UserDefaults.standard.set(newValue, forKey: Self.pageTranslationKey)
++        if !newValue { TarkPageTranslator.shared.unload() }
+     }
+ 
+     @MainActor
+@@ -110,6 +148,11 @@ class AIControlsModel: ObservableObject,
+         updatePageSummariesFeature(to: !newValue)
+         updateTranslationsFeature(to: !newValue)
+         updateQuickAnswersFeature(to: !newValue)
++        // Tark: the models are Tark's own download, so turning AI off removes them.
++        togglePageTranslation(to: !newValue)
++        if newValue {
++            TarkTranslateModels.Direction.allCases.forEach(deleteModel)
++        }
+         settingsTelemetry.changedSetting(
+             PrefsKeys.Settings.aiKillSwitchFeature,
+             to: String(newValue),
+diff --git a/firefox-ios/Client/Frontend/Settings/AIControls/AIControlsSettingsView.swift b/firefox-ios/Client/Frontend/Settings/AIControls/AIControlsSettingsView.swift
+index dbe94fd..9983f4c 100644
+--- a/firefox-ios/Client/Frontend/Settings/AIControls/AIControlsSettingsView.swift
++++ b/firefox-ios/Client/Frontend/Settings/AIControls/AIControlsSettingsView.swift
+@@ -4,6 +4,7 @@
+ import SwiftUI
+ import Common
+ import Shared
++import TarkTranslate
+ 
+ struct AIControlsSettingsView: ThemeableView {
+     @ObservedObject var aiControlsModel: AIControlsModel
+@@ -55,9 +56,14 @@ struct AIControlsSettingsView: ThemeableView {
+                 if aiControlsModel.hasVisibleAIFeatures {
+                     aiFeaturesControlsStatusDescription
+                 }
++                if !aiControlsModel.modelsOnPhone.isEmpty {
++                    Spacer(minLength: UX.cardSpacing)
++                    onThisPhone
++                }
+             }.padding(.horizontal, UX.padding)
+         }
+         .background(themeColors.layer1.color)
++        .onAppear { aiControlsModel.refreshModelsOnPhone() }
+         .listenToThemeChanges(in: self, theme: $theme)
+     }
+ 
+@@ -73,8 +79,8 @@ struct AIControlsSettingsView: ThemeableView {
+                     Text(verbatim: "AI in Tark")
+                         .font(FXFontStyles.Bold.headline.scaledSwiftUIFont())
+                         .foregroundStyle(themeColors.textPrimary.color)
+-                    Text(verbatim: "Tark's AI features use Apple Intelligence on your iPhone. "
+-                         + "What they read never leaves your phone.")
++                    Text(verbatim: "Tark's AI features run on your iPhone: Tark's own model translates "
++                         + "pages, Apple Intelligence summarises them. What they read never leaves your phone.")
+                         .font(FXFontStyles.Regular.body.scaledSwiftUIFont())
+                         .foregroundStyle(themeColors.textSecondary.color)
+                 }
+@@ -135,17 +141,18 @@ struct AIControlsSettingsView: ThemeableView {
+             padding: UX.padding
+         ) {
+             VStack(alignment: .leading) {
++                pageTranslationToggle
+                 if aiControlsModel.translationsVisible {
++                    Divider().foregroundStyle(themeColors.textSecondary.color)
+                     translationsToggle
+                 }
+-                if aiControlsModel.translationsVisible && aiControlsModel.pageSummariesVisible {
++                if aiControlsModel.pageSummariesVisible {
+                     Divider().foregroundStyle(themeColors.textSecondary.color)
+                 }
+                 if aiControlsModel.pageSummariesVisible {
+                     pageSummariesToggle
+                 }
+-                if aiControlsModel.quickAnswersVisible
+-                    && (aiControlsModel.translationsVisible || aiControlsModel.pageSummariesVisible) {
++                if aiControlsModel.quickAnswersVisible {
+                     Divider().foregroundStyle(themeColors.textSecondary.color)
+                 }
+                 if aiControlsModel.quickAnswersVisible {
+@@ -155,6 +162,62 @@ struct AIControlsSettingsView: ThemeableView {
+         }
+     }
+ 
++    // Tark: translating pages with Tark's own IndicTrans2 model.
++    @ViewBuilder
++    var pageTranslationToggle: some View {
++        Toggle(isOn: Binding(
++            get: { aiControlsModel.pageTranslationEnabled },
++            set: { aiControlsModel.togglePageTranslation(to: $0) }
++        )) {
++            VStack(alignment: .leading, spacing: UX.infoCardTextSpacing) {
++                Text(verbatim: "Page translation")
++                    .font(FXFontStyles.Regular.body.scaledSwiftUIFont())
++                    .foregroundStyle(themeColors.textPrimary.color)
++                Text(verbatim: "Translates pages on your iPhone with Tark's own model. Pages never leave your phone.")
++                    .font(FXFontStyles.Regular.footnote.scaledSwiftUIFont())
++                    .foregroundStyle(themeColors.textSecondary.color)
++                aiFeatureToggleStatus(isEnabled: aiControlsModel.pageTranslationEnabled)
++            }
++        }.tint(themeColors.actionPrimary.color)
++    }
++
++    // Tark: the translation models Tark has downloaded, each with Delete.
++    @ViewBuilder
++    var onThisPhone: some View {
++        Text(verbatim: "On this phone")
++            .textCase(.uppercase)
++            .font(.caption)
++            .foregroundStyle(themeColors.textSecondary.color)
++            .padding(.leading, UX.padding)
++        RoundedCard(
++            background: themeColors.layer5.color,
++            cornerRadius: UX.cornerRadius,
++            padding: UX.padding
++        ) {
++            VStack(alignment: .leading) {
++                ForEach(Array(aiControlsModel.modelsOnPhone.enumerated()), id: \.offset) { index, model in
++                    if index > 0 {
++                        Divider().foregroundStyle(themeColors.textSecondary.color)
++                    }
++                    HStack {
++                        VStack(alignment: .leading, spacing: UX.infoCardTextSpacing) {
++                            Text(verbatim: model.direction == .indicToEnglish
++                                 ? "Indian languages → English" : "English → Indian languages")
++                                .font(FXFontStyles.Regular.body.scaledSwiftUIFont())
++                                .foregroundStyle(themeColors.textPrimary.color)
++                            Text(verbatim: ByteCountFormatter.string(fromByteCount: model.bytes, countStyle: .file))
++                                .font(FXFontStyles.Regular.footnote.scaledSwiftUIFont())
++                                .foregroundStyle(themeColors.textSecondary.color)
++                        }
++                        Spacer()
++                        Button("Delete") { aiControlsModel.deleteModel(model.direction) }
++                            .foregroundStyle(themeColors.textCritical.color)
++                    }
++                }
++            }
++        }
++    }
++
+     @ViewBuilder
+     var translationsToggle: some View {
+         Toggle(isOn: Binding(
+diff --git a/firefox-ios/firefox-ios-tests/Tests/ClientTests/Settings/AI Controls/AIControlsModelTests.swift b/firefox-ios/firefox-ios-tests/Tests/ClientTests/Settings/AI Controls/AIControlsModelTests.swift
+index ea1d8db..6364739 100644
+--- a/firefox-ios/firefox-ios-tests/Tests/ClientTests/Settings/AI Controls/AIControlsModelTests.swift	
++++ b/firefox-ios/firefox-ios-tests/Tests/ClientTests/Settings/AI Controls/AIControlsModelTests.swift	
+@@ -87,7 +87,8 @@ class AIControlsModelTests: XCTestCase, StoreTestUtility {
+             prefs: mockPrefs,
+             summarizeFeatureEnabled: false
+         )
+-        XCTAssertFalse(aiControlsModel4.hasVisibleAIFeatures)
++        // Tark: page translation is always offered, so the section always shows.
++        XCTAssertTrue(aiControlsModel4.hasVisibleAIFeatures)
+     }
+ 
+     @MainActor
