@@ -320,10 +320,17 @@ diff --color -ruN a/chrome/android/java/src/org/chromium/chrome/browser/media/Fu
  import org.chromium.content_public.browser.WebContents;
  import org.chromium.content_public.browser.WebContentsObserver;
  import org.chromium.media_session.mojom.MediaSession.SuspendType;
-@@ -176,6 +179,18 @@
+@@ -176,6 +179,25 @@
      /** Should media be suspended if the activity stops, i.e. was the pip window closed? */
      private boolean mShouldSuspendMediaOnStop;
  
++    /**
++     * Tark: the activity stopped in the window because the screen turned off (Background play
++     * on). Unlocking restarts and resumes it while still in the window; that resume isn't the
++     * window being restored, so it doesn't dismiss.
++     */
++    private boolean mTarkStoppedByScreenOff;
++
 +    /**
 +     * Tark: whether leaving floats the current tab's video changed without a player starting or
 +     * stopping (the page muted or unmuted, its sound started, a setting changed): the auto-enter
@@ -339,7 +346,7 @@ diff --color -ruN a/chrome/android/java/src/org/chromium/chrome/browser/media/Fu
      public FullscreenVideoPictureInPictureController(
              Activity activity,
              ActivityTabProvider activityTabProvider,
-@@ -189,6 +204,7 @@
+@@ -189,6 +211,7 @@
  
          if (ENABLE_AUTO_ENTER) {
              addObserversIfNeeded();
@@ -347,7 +354,7 @@ diff --color -ruN a/chrome/android/java/src/org/chromium/chrome/browser/media/Fu
          }
      }
  
-@@ -214,8 +230,10 @@
+@@ -214,8 +237,10 @@
          assertLibraryLoaderIsInitialized();
  
          // Only auto-PiP if there is a playing fullscreen video that allows PiP.
@@ -360,7 +367,7 @@ diff --color -ruN a/chrome/android/java/src/org/chromium/chrome/browser/media/Fu
              return false;
          }
  
-@@ -331,6 +349,7 @@
+@@ -331,6 +356,7 @@
                  builder.setSourceRectHint(bounds);
              }
          }
@@ -368,7 +375,7 @@ diff --color -ruN a/chrome/android/java/src/org/chromium/chrome/browser/media/Fu
  
          try {
              if (!mActivity.enterPictureInPictureMode(builder.build())) return;
-@@ -420,12 +439,25 @@
+@@ -420,12 +446,25 @@
  
          webContents.setHasPersistentVideo(true);
  
@@ -394,15 +401,16 @@ diff --color -ruN a/chrome/android/java/src/org/chromium/chrome/browser/media/Fu
                  });
  
          // Setup observers to dismiss the Activity on events that should end PiP.  In auto-enter
-@@ -445,6 +477,7 @@
+@@ -445,6 +484,8 @@
      public void onDestroy() {
          sControllers.remove(mActivity);
          removeObserversIfNeeded();
 +        TarkPictureInPicture.removeOfferObserver(mTarkOfferObserver);
++        mTarkStoppedByScreenOff = false;
      }
  
      public void onStart() {
-@@ -459,6 +492,14 @@
+@@ -459,6 +500,15 @@
      // on large form factors (see IsBackgroundMediaSuspendEnabled), so suspend it here.
      public void onStop() {
          if (mShouldSuspendMediaOnStop) {
@@ -412,12 +420,29 @@ diff --color -ruN a/chrome/android/java/src/org/chromium/chrome/browser/media/Fu
 +            // upstream.
 +            if (!mPowerManager.isInteractive() && TarkMediaPrefs.backgroundPlay()) {
 +                Log.i(TAG, "Tark: stopped in Picture in Picture by the screen turning off");
++                mTarkStoppedByScreenOff = true;
 +                return;
 +            }
              mShouldSuspendMediaOnStop = false;
  
              final MediaSession mediaSession = getMediaSession();
-@@ -477,6 +518,24 @@
+@@ -469,6 +519,15 @@
+     }
+ 
+     public void onResume() {
++        // Tark: unlocking after the screen turned off in the window (Background play on) resumes
++        // the activity while it's still in the window. Keep the window, its fullscreen and its
++        // media; mShouldSuspendMediaOnStop stays, so closing the window later still suspends.
++        boolean stoppedByScreenOff = mTarkStoppedByScreenOff;
++        mTarkStoppedByScreenOff = false;
++        if (stoppedByScreenOff && mActivity.isInPictureInPictureMode()) {
++            Log.i(TAG, "Tark: resumed in Picture in Picture after the screen turned on, keeping it");
++            return;
++        }
+         // Pip was restored rather than closed, so media should keep playing.
+         mShouldSuspendMediaOnStop = false;
+         // Unconditionally dismiss pip, because the activity has been resumed.  This can happen if
+@@ -477,6 +536,24 @@
          dismissActivityIfNeeded(mActivity, MetricsEndReason.RESUME);
      }
  
@@ -442,7 +467,15 @@ diff --color -ruN a/chrome/android/java/src/org/chromium/chrome/browser/media/Fu
      private static @Nullable Rect getVideoBounds(WebContents webContents, Activity activity) {
          Rect rect = webContents.getFullscreenVideoSize();
          if (rect == null || rect.width() == 0 || rect.height() == 0) return null;
-@@ -579,6 +638,14 @@
+@@ -531,6 +608,7 @@
+      */
+     private void onExitedPictureInPicture(@MetricsEndReason int reason) {
+         Log.i(TAG, "Exited picture in picture with reason: " + reason);
++        mTarkStoppedByScreenOff = false;
+ 
+         // Any pending dismiss is no longer pending.
+         mDismissPending = true;
+@@ -579,6 +657,14 @@
                      new FullscreenManager.Observer() {
                          @Override
                          public void onExitFullscreen(Tab tab) {
@@ -457,7 +490,7 @@ diff --color -ruN a/chrome/android/java/src/org/chromium/chrome/browser/media/Fu
                              Log.i(TAG, "Exiting fullscreen");
                              dismissActivityIfNeeded(mActivity, MetricsEndReason.LEFT_FULLSCREEN);
                          }
-@@ -638,6 +705,7 @@
+@@ -638,6 +724,7 @@
                      builder.setSourceRectHint(bounds);
                  }
              }
@@ -465,7 +498,7 @@ diff --color -ruN a/chrome/android/java/src/org/chromium/chrome/browser/media/Fu
          }
          builder.setAutoEnterEnabled(allowed);
  
-@@ -670,6 +738,10 @@
+@@ -670,8 +757,14 @@
          // Something interesting happened -- make sure we've updated our preference for auto-PiP
          // with the framework, if applicable.
          Log.i(TAG, "Dismiss activity with reason " + reason);
@@ -475,8 +508,12 @@ diff --color -ruN a/chrome/android/java/src/org/chromium/chrome/browser/media/Fu
 +        }
          updateAutoPictureInPictureStatusIfNeeded();
          mDismissPending = false;
++        // Tark: the window is being dismissed; a later resume is upstream's.
++        mTarkStoppedByScreenOff = false;
  
-@@ -855,6 +927,14 @@
+         if (!isPipSessionActive()) {
+             return;
+@@ -855,6 +948,14 @@
          public DismissActivityOnWebContentsObserver(Activity activity, WebContents webContents) {
              super(webContents);
              mActivity = activity;
@@ -1320,7 +1357,7 @@ diff --color -ruN a/chrome/android/junit/src/org/chromium/chrome/browser/media/F
      }
  
      /** Run any runnables, including any delayed ones. */
-@@ -343,6 +351,94 @@
+@@ -343,6 +351,178 @@
          verify(mMediaSession, times(0)).suspend(SuspendType.SYSTEM);
      }
  
@@ -1410,6 +1447,90 @@ diff --color -ruN a/chrome/android/junit/src/org/chromium/chrome/browser/media/F
 +        when(mPowerManager.isInteractive()).thenReturn(false);
 +        mController.onStop();
 +        verify(mMediaSession, times(1)).suspend(SuspendType.SYSTEM);
++    }
++
++    /**
++     * Tark: unlocking after the screen turned off in the window (Background play on) restarts and
++     * resumes the activity while it's still in the window. That resume keeps the window and its
++     * media; closing the window afterwards still suspends.
++     */
++    @Test
++    public void tarkResumeInTheWindowAfterTheScreenTurnedOffKeepsTheWindow() {
++        enterPip();
++        verify(mWebContents).addObserver(mWebContentsObserverCaptor.capture());
++        mWebContentsObserverCaptor.getValue().mediaStartedPlaying(0, true, true);
++        when(mActivity.isInPictureInPictureMode()).thenReturn(true);
++
++        when(mPowerManager.isInteractive()).thenReturn(false);
++        mController.onStop();
++        when(mPowerManager.isInteractive()).thenReturn(true);
++        mController.onStart();
++        mController.onResume();
++
++        verify(mActivity, times(0)).moveTaskToBack(anyBoolean());
++        verify(mMediaSession, times(0)).suspend(SuspendType.SYSTEM);
++
++        // ✕ closes the window: the activity stops with the screen on.
++        mController.onStop();
++        verify(mMediaSession, times(1)).suspend(SuspendType.SYSTEM);
++    }
++
++    /** Tark: only the one resume after the screen-off stop is kept; the next one is upstream's. */
++    @Test
++    public void tarkOnlyTheFirstResumeAfterTheScreenTurnedOffIsKept() {
++        enterPip();
++        when(mActivity.isInPictureInPictureMode()).thenReturn(true);
++
++        when(mPowerManager.isInteractive()).thenReturn(false);
++        mController.onStop();
++        when(mPowerManager.isInteractive()).thenReturn(true);
++        mController.onResume();
++        verify(mActivity, times(0)).moveTaskToBack(anyBoolean());
++
++        mController.onResume();
++        verify(mActivity, times(1)).moveTaskToBack(true);
++    }
++
++    /** Tark: a resume in the window without a screen-off stop dismisses, as upstream. */
++    @Test
++    public void tarkResumeInTheWindowWithoutTheScreenTurningOffDismisses() {
++        enterPip();
++        when(mActivity.isInPictureInPictureMode()).thenReturn(true);
++
++        mController.onResume();
++        verify(mActivity, times(1)).moveTaskToBack(true);
++    }
++
++    /** Tark: the window ending forgets the screen-off stop; a later window's resume dismisses. */
++    @Test
++    public void tarkLeavingTheWindowForgetsTheScreenOffStop() {
++        enterPip();
++        when(mPowerManager.isInteractive()).thenReturn(false);
++        mController.onStop();
++        when(mPowerManager.isInteractive()).thenReturn(true);
++
++        // Expanded: the framework left the window.
++        mController.onFrameworkExitedPictureInPicture();
++
++        // A later window, resumed while in it without the screen turning off.
++        enterPip();
++        when(mActivity.isInPictureInPictureMode()).thenReturn(true);
++        mController.onResume();
++        verify(mActivity, times(1)).moveTaskToBack(true);
++    }
++
++    /** Tark: with Background play off, the screen-off stop isn't remembered (upstream). */
++    @Test
++    public void tarkWithoutBackgroundPlayResumeAfterTheScreenTurnedOffDismisses() {
++        TarkMediaPrefs.setBackgroundPlay(false);
++        enterPip();
++        when(mActivity.isInPictureInPictureMode()).thenReturn(true);
++
++        when(mPowerManager.isInteractive()).thenReturn(false);
++        mController.onStop();
++        when(mPowerManager.isInteractive()).thenReturn(true);
++        mController.onResume();
++        verify(mActivity, times(1)).moveTaskToBack(true);
 +    }
 +
      @Test
