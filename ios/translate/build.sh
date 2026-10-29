@@ -60,6 +60,6 @@ done
 tark "$HERE/tark_translate_c.cc"
 tark "$HERE/translate_check.cc"
 xcrun clang++ "${COMMON[@]}" "${OBJS[@]}" "$ORT/onnxruntime.xcframework/$SLICE/onnxruntime.framework/onnxruntime" \
-  -licucore -framework Foundation -framework CoreML -framework Network "${UIKIT[@]}" -Wl,-dead_strip \
+  -licucore -framework Foundation -framework CoreML -framework Network ${UIKIT[@]+"${UIKIT[@]}"} -Wl,-dead_strip \
   -o "$OUT/translate_check"
 ls -la "$OUT/translate_check"

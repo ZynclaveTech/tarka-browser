@@ -250,6 +250,8 @@ def translate():
     for line in (ROOT / 'patches' / 'series').read_text().splitlines():
         if line.startswith('tarka/captions/'):
             run('git', 'apply', '--include=components/tark_captions/*', ROOT / 'patches' / line, cwd=src)
+    # iOS only: ORT-format models used from their mapped files (memory).
+    run('git', 'apply', TRANSLATE / 'engine-ort-format.patch', cwd=src)
     # The target: engine, SentencePiece's runtime, pffft, the shim, the C interface.
     shutil.rmtree(TRANSLATE_CORE, ignore_errors=True)
     engine = TRANSLATE_CORE / 'engine' / 'components' / 'tark_captions'
