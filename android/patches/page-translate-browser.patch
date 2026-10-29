@@ -1,0 +1,925 @@
+--- a/chrome/browser/BUILD.gn
++++ b/chrome/browser/BUILD.gn
+@@ -1689,6 +1689,8 @@
+       # caption bar's bridge.
+       "tark_captions_android/android/tark_captions_bridge.cc",
+       "tark_captions_android/android/tark_captions_bridge.h",
++      "tark_captions_android/tark_page_translation.cc",
++      "tark_captions_android/tark_page_translation.h",
+       "tark_captions_android/caption_downloads.cc",
+       "tark_captions_android/caption_downloads.h",
+       "tark_captions_android/tark_captions_tab.cc",
+--- a/chrome/browser/tark_captions_android/BUILD.gn
++++ b/chrome/browser/tark_captions_android/BUILD.gn
+@@ -14,6 +14,8 @@ static_library("rules") {
+     "model_files.cc",
+     "model_files.h",
+     "model_files.inc",
++    "page_translation.cc",
++    "page_translation.h",
+     "tab_captions.cc",
+     "tab_captions.h",
+   ]
+@@ -37,6 +39,9 @@ if (!is_android) {
+       "//base/test:test_support",
+       "//testing/gtest",
+     ]
++
++    # Page translation: one tab's batches, idle unload, the owner.
++    sources += [ "tark_page_translation_unittest.cc" ]
+   }
+ }
+ 
+--- a/chrome/browser/tark_captions_android/model_files.cc
++++ b/chrome/browser/tark_captions_android/model_files.cc
+@@ -224,6 +224,7 @@ namespace {
+ constexpr std::pair<Owner, std::string_view> kOwnerNames[] = {
+     {Owner::kCaptions, "captions"},
+     {Owner::kVoice, "voice"},
++    {Owner::kPageTranslation, "page_translation"},
+ };
+ 
+ }  // namespace
+--- a/chrome/browser/tark_captions_android/model_files.h
++++ b/chrome/browser/tark_captions_android/model_files.h
+@@ -103,8 +103,9 @@ std::vector<std::string> UnitsToQueue(std::string_view unit,
+                                       const std::deque<std::string>& queue);
+ 
+ // The features that download units. A unit may be wanted by both (the
+-// detector: voice search and captions), and stays while either wants it.
+-enum class Owner { kCaptions, kVoice };
++// detector: voice search and captions; a translation model: captions'
++// Translate and page translation), and stays while either wants it.
++enum class Owner { kCaptions, kVoice, kPageTranslation };
+ 
+ // Which features want each unit, kept in local state (kOwnersPref) as
+ // {"<unit>": ["captions", "voice"]}. A unit no feature wants may be deleted.
+--- /dev/null
++++ b/chrome/browser/tark_captions_android/page_translation.cc
+@@ -0,0 +1,156 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/tark_captions_android/page_translation.h"
++
++#include <algorithm>
++#include <utility>
++
++#include "base/containers/contains.h"
++#include "base/functional/bind.h"
++
++namespace tark_captions {
++namespace {
++
++// The 22 languages of India's Eighth Schedule (IndicTrans2's).
++constexpr std::string_view kIndian[] = {
++    "as", "bn",  "brx", "doi", "gu", "hi", "kn", "ks", "kok", "mai", "ml",
++    "mni", "mr", "ne",  "or",  "pa", "sa", "sat", "sd", "ta",  "te",  "ur",
++};
++
++bool IsIndian(std::string_view code) {
++  return base::Contains(kIndian, code);
++}
++
++}  // namespace
++
++std::vector<std::string> PageUnitsFor(std::string_view source, std::string_view target) {
++  if (source == target || (target != "en" && !IsIndian(target))) {
++    return {};
++  }
++  std::vector<std::string> units;
++  if (IsIndian(source)) {
++    units.emplace_back("tr_indic_en");
++  } else if (source == "es") {
++    units.emplace_back("tr_es_en");
++  } else if (source != "en") {
++    return {};
++  }
++  if (IsIndian(target)) {
++    units.emplace_back("tr_en_indic");
++  }
++  return units;
++}
++
++PageTranslation::PageTranslation(Backend* backend, bool off_the_record)
++    : backend_(backend), off_the_record_(off_the_record) {}
++
++PageTranslation::~PageTranslation() {
++  Cancel();
++  Unload();
++}
++
++void PageTranslation::Translate(std::vector<std::string> texts,
++                                std::string source,
++                                std::string target,
++                                ResultsCallback callback) {
++  const std::vector<std::string> units = PageUnitsFor(source, target);
++  if (texts.empty() || !ModelsReady(source, target)) {
++    std::move(callback).Run(Results(texts.size()));
++    return;
++  }
++  idle_.Stop();
++  if (!connected_) {
++    connected_ = true;
++    backend_->Connect();
++  }
++  for (const std::string& unit : units) {
++    if (!base::Contains(in_use_, unit)) {
++      backend_->SetInUse(unit, true);
++      in_use_.push_back(unit);
++    }
++  }
++  const uint64_t id = next_id_++;
++  pending_[id] = Pending{texts.size(), std::move(callback)};
++  backend_->SendBatch(source, target, units, texts,
++                      base::BindOnce(&PageTranslation::OnResults, weak_factory_.GetWeakPtr(), id));
++}
++
++bool PageTranslation::ModelsReady(std::string source, std::string target) const {
++  const std::vector<std::string> units = PageUnitsFor(source, target);
++  return !units.empty() && std::ranges::all_of(units, [&](const std::string& unit) {
++    return backend_->UnitReady(unit);
++  });
++}
++
++bool PageTranslation::RequestModels(std::string source, std::string target, bool now) {
++  if (off_the_record_) {
++    return false;
++  }
++  for (const std::string& unit : PageUnitsFor(source, target)) {
++    if (!backend_->UnitReady(unit)) {
++      backend_->RequestUnit(unit, now);
++    }
++  }
++  return true;
++}
++
++void PageTranslation::Cancel() {
++  std::map<uint64_t, Pending> pending = std::move(pending_);
++  pending_.clear();
++  for (auto& [id, batch] : pending) {
++    std::move(batch.callback).Run(Results(batch.size));
++  }
++  MaybeStartIdleTimer();
++}
++
++void PageTranslation::OnAppBackgrounded() {
++  Cancel();
++  Unload();
++}
++
++void PageTranslation::OnBackendGone() {
++  connected_ = false;  // nothing to let go
++  Cancel();
++  Unload();
++}
++
++void PageTranslation::OnResults(uint64_t id, Results results) {
++  auto it = pending_.find(id);
++  if (it == pending_.end()) {
++    return;  // cancelled: the page it was for is gone
++  }
++  Pending batch = std::move(it->second);
++  pending_.erase(it);
++  if (results.size() != batch.size) {
++    results = Results(batch.size);
++  }
++  std::move(batch.callback).Run(std::move(results));
++  MaybeStartIdleTimer();
++}
++
++void PageTranslation::MaybeStartIdleTimer() {
++  if (connected_ && pending_.empty()) {
++    idle_.Start(FROM_HERE, kIdleUnload,
++                base::BindOnce(&PageTranslation::Unload, base::Unretained(this)));
++  }
++}
++
++void PageTranslation::Unload() {
++  idle_.Stop();
++  if (connected_) {
++    connected_ = false;
++    backend_->Disconnect();
++  }
++  ReleaseUnits();
++}
++
++void PageTranslation::ReleaseUnits() {
++  for (const std::string& unit : in_use_) {
++    backend_->SetInUse(unit, false);
++  }
++  in_use_.clear();
++}
++
++}  // namespace tark_captions
+--- /dev/null
++++ b/chrome/browser/tark_captions_android/page_translation.h
+@@ -0,0 +1,116 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_TARK_CAPTIONS_ANDROID_PAGE_TRANSLATION_H_
++#define CHROME_BROWSER_TARK_CAPTIONS_ANDROID_PAGE_TRANSLATION_H_
++
++#include <cstdint>
++#include <map>
++#include <optional>
++#include <string>
++#include <string_view>
++#include <vector>
++
++#include "base/functional/callback.h"
++#include "base/memory/raw_ptr.h"
++#include "base/memory/weak_ptr.h"
++#include "base/time/time.h"
++#include "base/timer/timer.h"
++
++namespace tark_captions {
++
++// The translation units ("tr_indic_en", "tr_en_indic", "tr_es_en") a page in
++// `source` needs to reach `target`, in order: any of the 22 Indian languages
++// and Spanish go through English, so Indian ↔ Indian is both IndicTrans2
++// models (the captions process loads them a leg at a time). Empty when there
++// is no model for the pair, or the two are the same.
++std::vector<std::string> PageUnitsFor(std::string_view source, std::string_view target);
++
++// One tab's page translation, without content or mojo (TarkPageTranslation
++// is the tab's side; this is what it decides, tested on the build machine).
++// Batches go to the tab's captions process through the Backend; the process
++// is connected on the first batch and let go after three idle minutes, when
++// the app goes to the background, or when the backend goes away. A batch
++// whose page is gone (Cancel) answers all-null at once and its late results
++// are dropped, so nothing is applied to the next page. Off the record,
++// nothing is written to prefs.
++class PageTranslation {
++ public:
++  using Results = std::vector<std::optional<std::string>>;
++  using ResultsCallback = base::OnceCallback<void(Results)>;
++
++  static constexpr base::TimeDelta kIdleUnload = base::Seconds(180);
++
++  class Backend {
++   public:
++    virtual ~Backend() = default;
++    // Binds a page translator on the tab's captions process: captions' own
++    // when captions are on, otherwise one started for the page, without
++    // speech. Never a second process for the tab.
++    virtual void Connect() = 0;
++    // Lets the translator go; a process started only for the page exits.
++    virtual void Disconnect() = 0;
++    // One batch on the connected translator with `units`' files.
++    virtual void SendBatch(const std::string& source,
++                           const std::string& target,
++                           const std::vector<std::string>& units,
++                           const std::vector<std::string>& texts,
++                           ResultsCallback done) = 0;
++    virtual bool UnitReady(const std::string& unit) const = 0;
++    // Held from deletion while a batch may use it.
++    virtual void SetInUse(const std::string& unit, bool in_use) = 0;
++    // Downloads `unit` for page translation (owner "page_translation" in
++    // tark.captions.owners: a pref write).
++    virtual void RequestUnit(const std::string& unit, bool now) = 0;
++  };
++
++  PageTranslation(Backend* backend, bool off_the_record);
++  PageTranslation(const PageTranslation&) = delete;
++  PageTranslation& operator=(const PageTranslation&) = delete;
++  ~PageTranslation();
++
++  // Results in `texts`' order; a sentence that failed is null (the page keeps
++  // its original). All null at once when the models are not on the phone.
++  void Translate(std::vector<std::string> texts,
++                 std::string source,
++                 std::string target,
++                 ResultsCallback callback);
++  bool ModelsReady(std::string source, std::string target) const;
++  // Asks for the pair's missing models; false (nothing asked, nothing
++  // written) off the record.
++  bool RequestModels(std::string source, std::string target, bool now);
++  // The page went (a navigation): outstanding batches answer all-null now.
++  void Cancel();
++  // The app went to the background: no translating there, the model goes.
++  void OnAppBackgrounded();
++  // The captions process went away (crash, or another tab took the slot).
++  void OnBackendGone();
++
++  bool connected() const { return connected_; }
++  size_t outstanding() const { return pending_.size(); }
++
++ private:
++  struct Pending {
++    size_t size = 0;
++    ResultsCallback callback;
++  };
++
++  void OnResults(uint64_t id, Results results);
++  void Unload();
++  void ReleaseUnits();
++  void MaybeStartIdleTimer();
++
++  const raw_ptr<Backend> backend_;
++  const bool off_the_record_;
++  bool connected_ = false;
++  uint64_t next_id_ = 1;
++  std::map<uint64_t, Pending> pending_;
++  std::vector<std::string> in_use_;
++  base::OneShotTimer idle_;
++  base::WeakPtrFactory<PageTranslation> weak_factory_{this};
++};
++
++}  // namespace tark_captions
++
++#endif  // CHROME_BROWSER_TARK_CAPTIONS_ANDROID_PAGE_TRANSLATION_H_
+--- a/chrome/browser/tark_captions_android/tark_captions_tab.cc
++++ b/chrome/browser/tark_captions_android/tark_captions_tab.cc
+@@ -17,6 +17,7 @@
+ #include "chrome/browser/tark_captions_android/android/tark_captions_bridge.h"
+ #include "chrome/browser/tark_captions_android/model_files.h"
+ #include "chrome/browser/tark_captions_android/tab_captions.h"
++#include "chrome/browser/tark_captions_android/tark_page_translation.h"
+ #include "components/prefs/pref_service.h"
+ #include "content/public/browser/render_frame_host.h"
+ #include "content/public/browser/service_process_host.h"
+@@ -463,9 +464,16 @@ void TarkCaptionsTab::StartEngine() {
+   style_ = StyleForDevice(FastestCoreKhz(),
+                           static_cast<int>(base::SysInfo::AmountOfTotalPhysicalMemory().InMiB()),
+                           g_browser_process->local_state()->GetInteger(kStylePref));
+-  content::ServiceProcessHost::Launch(
+-      service_.BindNewPipeAndPassReceiver(),
+-      content::ServiceProcessHost::Options().WithDisplayName("Tark captions").Pass());
++  // A process the page's translation started takes captions too: never two
++  // captions processes in a tab.
++  if (TarkPageTranslation* page = TarkPageTranslation::FromWebContents(web_contents())) {
++    service_ = page->HandOverProcess();
++  }
++  if (!service_.is_bound()) {
++    content::ServiceProcessHost::Launch(
++        service_.BindNewPipeAndPassReceiver(),
++        content::ServiceProcessHost::Options().WithDisplayName("Tark captions").Pass());
++  }
+   service_.set_disconnect_handler(
+       base::BindOnce(&TarkCaptionsTab::OnServiceGone, weak_factory_.GetWeakPtr()));
+   engine_unit_ = unit;
+@@ -575,6 +583,15 @@ void TarkCaptionsTab::StopEngine() {
+   if (!service_.is_bound()) {
+     return;
+   }
++  TarkPageTranslation* page = TarkPageTranslation::FromWebContents(web_contents());
++  if (page) {
++    // The page still translating keeps the process, without speech or
++    // captions' translation.
++    service_->SetTarget(std::string(), {}, base::DoNothing());
++    service_->Stop();
++    service_.set_disconnect_handler(base::OnceClosure());
++    page->TakeProcess(service_);  // moves it out when the page takes it
++  }
+   service_.reset();  // the process exits with its last remote
+   client_.reset();
+   draft_text_.clear();
+--- a/chrome/browser/tark_captions_android/tark_captions_tab.h
++++ b/chrome/browser/tark_captions_android/tark_captions_tab.h
+@@ -73,6 +73,11 @@ class TarkCaptionsTab : public content::WebContentsObserver,
+   // ✕: the bar goes for this page.
+   void HideBarForPage();
+   View GetView() const;
++  // The running captions process, for page translation to share; null when
++  // captions are not running in this tab.
++  mojom::CaptionService* RunningService() {
++    return service_.is_bound() ? service_.get() : nullptr;
++  }
+ 
+  private:
+   explicit TarkCaptionsTab(content::WebContents* web_contents);
+--- /dev/null
++++ b/chrome/browser/tark_captions_android/tark_page_translation.cc
+@@ -0,0 +1,215 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/tark_captions_android/tark_page_translation.h"
++
++#include <utility>
++
++#include "base/android/application_status_listener.h"
++#include "base/containers/flat_map.h"
++#include "base/files/file_path.h"
++#include "base/functional/bind.h"
++#include "base/no_destructor.h"
++#include "base/task/thread_pool.h"
++#include "chrome/browser/tark_captions_android/caption_downloads.h"
++#include "chrome/browser/tark_captions_android/model_files.h"
++#include "chrome/browser/tark_captions_android/tark_captions_tab.h"
++#include "content/public/browser/browser_context.h"
++#include "content/public/browser/service_process_host.h"
++#include "content/public/browser/web_contents.h"
++
++namespace tark_captions {
++namespace {
++
++// The tab whose page holds the browser's one page-only captions process.
++TarkPageTranslation* g_page_only_holder = nullptr;
++
++// The units' files, keyed "<unit>/<name>" (PageTranslator), read-only.
++// Blocking.
++std::map<std::string, base::File> OpenUnits(
++    std::vector<std::pair<std::string, base::FilePath>> units) {
++  std::map<std::string, base::File> files;
++  for (const auto& [unit, dir] : units) {
++    for (const CaptionFile* file : FilesOf(unit)) {
++      base::File opened(dir.AppendASCII(file->name),
++                        base::File::FLAG_OPEN | base::File::FLAG_READ);
++      if (opened.IsValid()) {
++        files.emplace(unit + "/" + std::string(file->name), std::move(opened));
++      }
++    }
++  }
++  return files;
++}
++
++}  // namespace
++
++TarkPageTranslation::TarkPageTranslation(content::WebContents* web_contents)
++    : content::WebContentsObserver(web_contents),
++      content::WebContentsUserData<TarkPageTranslation>(*web_contents),
++      logic_(this, web_contents->GetBrowserContext()->IsOffTheRecord()) {
++  // No translating in the background: the app leaving the screen cancels
++  // the page's batches and lets the model go.
++  app_status_ = base::android::ApplicationStatusListener::New(base::BindRepeating(
++      [](TarkPageTranslation* self, base::android::ApplicationState state) {
++        if (state == base::android::APPLICATION_STATE_HAS_STOPPED_ACTIVITIES ||
++            state == base::android::APPLICATION_STATE_HAS_DESTROYED_ACTIVITIES) {
++          self->logic_.OnAppBackgrounded();
++        }
++      },
++      base::Unretained(this)));
++}
++
++TarkPageTranslation::~TarkPageTranslation() {
++  if (g_page_only_holder == this) {
++    g_page_only_holder = nullptr;
++  }
++}
++
++void TarkPageTranslation::Translate(
++    std::vector<std::string> texts,
++    std::string source,
++    std::string target,
++    base::OnceCallback<void(std::vector<std::optional<std::string>>)> callback) {
++  logic_.Translate(std::move(texts), std::move(source), std::move(target), std::move(callback));
++}
++
++bool TarkPageTranslation::ModelsReady(std::string source, std::string target) {
++  return logic_.ModelsReady(std::move(source), std::move(target));
++}
++
++bool TarkPageTranslation::RequestModels(std::string source, std::string target, bool now) {
++  return logic_.RequestModels(std::move(source), std::move(target), now);
++}
++
++void TarkPageTranslation::Cancel() {
++  logic_.Cancel();
++}
++
++mojo::Remote<mojom::CaptionService> TarkPageTranslation::HandOverProcess() {
++  if (g_page_only_holder == this) {
++    g_page_only_holder = nullptr;
++  }
++  // Captions set their own disconnect handler; translator_ notices the
++  // process going either way.
++  return std::move(own_service_);
++}
++
++bool TarkPageTranslation::TakeProcess(mojo::Remote<mojom::CaptionService>& service) {
++  if (!logic_.connected() || !translator_.is_bound() || !service.is_bound()) {
++    return false;
++  }
++  if (g_page_only_holder && g_page_only_holder != this) {
++    g_page_only_holder->ReleaseForOtherTab();
++  }
++  g_page_only_holder = this;
++  own_service_ = std::move(service);
++  own_service_.set_disconnect_handler(
++      base::BindOnce(&TarkPageTranslation::OnGone, weak_factory_.GetWeakPtr()));
++  return true;
++}
++
++void TarkPageTranslation::PrimaryPageChanged(content::Page& page) {
++  // A new main document: the old page's batches answer null and are dropped.
++  logic_.Cancel();
++}
++
++void TarkPageTranslation::Connect() {
++  TarkCaptionsTab* captions = TarkCaptionsTab::FromWebContents(web_contents());
++  mojom::CaptionService* service = captions ? captions->RunningService() : nullptr;
++  if (!service) {
++    // Captions are off: a process for the page, without speech (no Start).
++    if (g_page_only_holder && g_page_only_holder != this) {
++      g_page_only_holder->ReleaseForOtherTab();
++    }
++    g_page_only_holder = this;
++    content::ServiceProcessHost::Launch(
++        own_service_.BindNewPipeAndPassReceiver(),
++        content::ServiceProcessHost::Options().WithDisplayName("Tark captions").Pass());
++    own_service_.set_disconnect_handler(
++        base::BindOnce(&TarkPageTranslation::OnGone, weak_factory_.GetWeakPtr()));
++    service = own_service_.get();
++  }
++  service->BindPageTranslator(translator_.BindNewPipeAndPassReceiver());
++  translator_.set_disconnect_handler(
++      base::BindOnce(&TarkPageTranslation::OnGone, weak_factory_.GetWeakPtr()));
++}
++
++void TarkPageTranslation::Disconnect() {
++  translator_.reset();
++  own_service_.reset();  // a page-only process exits with its last remote
++  if (g_page_only_holder == this) {
++    g_page_only_holder = nullptr;
++  }
++}
++
++void TarkPageTranslation::SendBatch(const std::string& source,
++                                    const std::string& target,
++                                    const std::vector<std::string>& units,
++                                    const std::vector<std::string>& texts,
++                                    PageTranslation::ResultsCallback done) {
++  std::vector<std::pair<std::string, base::FilePath>> dirs;
++  for (const std::string& unit : units) {
++    dirs.emplace_back(unit, CaptionDownloads::Get().UnitDir(unit));
++  }
++  base::ThreadPool::PostTaskAndReplyWithResult(
++      FROM_HERE, {base::MayBlock(), base::TaskPriority::USER_VISIBLE},
++      base::BindOnce(&OpenUnits, std::move(dirs)),
++      base::BindOnce(&TarkPageTranslation::OnFilesOpened, weak_factory_.GetWeakPtr(), source,
++                     target, texts, std::move(done)));
++}
++
++void TarkPageTranslation::OnFilesOpened(std::string source,
++                                        std::string target,
++                                        std::vector<std::string> texts,
++                                        PageTranslation::ResultsCallback done,
++                                        std::map<std::string, base::File> files) {
++  if (!translator_.is_bound()) {
++    std::move(done).Run(PageTranslation::Results(texts.size()));
++    return;
++  }
++  base::flat_map<std::string, base::File> handles;
++  for (auto& [name, file] : files) {
++    handles.emplace(name, std::move(file));
++  }
++  // A batch lost with the process never answers; PageTranslation's
++  // OnBackendGone answers it null.
++  translator_->TranslateBatch(
++      source, target, std::move(handles), texts,
++      base::BindOnce(
++          [](PageTranslation::ResultsCallback done,
++             const std::vector<std::optional<std::string>>& results) {
++            std::move(done).Run(results);
++          },
++          std::move(done)));
++}
++
++bool TarkPageTranslation::UnitReady(const std::string& unit) const {
++  return CaptionDownloads::Get().State(unit).state == CaptionDownloads::State::kReady;
++}
++
++void TarkPageTranslation::SetInUse(const std::string& unit, bool in_use) {
++  CaptionDownloads::Get().SetInUse(unit, in_use);
++}
++
++void TarkPageTranslation::RequestUnit(const std::string& unit, bool now) {
++  CaptionDownloads::Get().Request(unit, now, Owner::kPageTranslation);
++}
++
++void TarkPageTranslation::OnGone() {
++  translator_.reset();
++  own_service_.reset();
++  if (g_page_only_holder == this) {
++    g_page_only_holder = nullptr;
++  }
++  logic_.OnBackendGone();
++}
++
++void TarkPageTranslation::ReleaseForOtherTab() {
++  // Like the app going to the background: answers null, model let go.
++  logic_.OnAppBackgrounded();
++}
++
++WEB_CONTENTS_USER_DATA_KEY_IMPL(TarkPageTranslation);
++
++}  // namespace tark_captions
+--- /dev/null
++++ b/chrome/browser/tark_captions_android/tark_page_translation.h
+@@ -0,0 +1,105 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_TARK_CAPTIONS_ANDROID_TARK_PAGE_TRANSLATION_H_
++#define CHROME_BROWSER_TARK_CAPTIONS_ANDROID_TARK_PAGE_TRANSLATION_H_
++
++#include <map>
++#include <memory>
++#include <optional>
++#include <string>
++#include <vector>
++
++#include "base/files/file.h"
++#include "base/functional/callback.h"
++#include "base/memory/weak_ptr.h"
++#include "chrome/browser/tark_captions_android/page_translation.h"
++#include "chrome/services/tark_captions/public/mojom/tark_captions.mojom.h"
++#include "content/public/browser/web_contents_observer.h"
++#include "content/public/browser/web_contents_user_data.h"
++#include "mojo/public/cpp/bindings/remote.h"
++
++namespace base::android {
++class ApplicationStatusListener;
++}  // namespace base::android
++
++namespace tark_captions {
++
++// Tark for Android's page translation in one tab, tied to its main document:
++// sends the page's text in batches to the tab's captions process
++// (PageTranslator). When captions are on, that is captions' process; when
++// not, one is started for the page, without speech. Never two for a tab:
++// when captions start they take over the page's process, and when they stop
++// while the page still translates it is handed back. At most one process
++// started only for a page runs in the whole browser (the current tab's: a
++// tab starting one makes another tab's page-only process go). The process is
++// let go after three idle minutes or when the app goes to the background
++// (ApplicationStatus); a new main document cancels what is outstanding. The
++// decisions are PageTranslation's.
++class TarkPageTranslation : public content::WebContentsObserver,
++                            public content::WebContentsUserData<TarkPageTranslation>,
++                            public PageTranslation::Backend {
++ public:
++  ~TarkPageTranslation() override;
++
++  // Null results are sentences that failed: the page keeps the original.
++  void Translate(std::vector<std::string> texts,
++                 std::string source,
++                 std::string target,
++                 base::OnceCallback<void(std::vector<std::optional<std::string>>)> callback);
++  bool ModelsReady(std::string source, std::string target);
++  // Asks captions' downloads for the pair's missing models (Wi-Fi unless
++  // `now`); false in a Private tab, which writes nothing.
++  bool RequestModels(std::string source, std::string target, bool now);
++  void Cancel();
++
++  // TarkCaptionsTab: captions are starting in this tab. The process the page
++  // started, if any (unbound otherwise); the page keeps translating on it.
++  mojo::Remote<mojom::CaptionService> HandOverProcess();
++  // TarkCaptionsTab: captions stopped; whether the page takes `service`
++  // (still translating) instead of it exiting.
++  bool TakeProcess(mojo::Remote<mojom::CaptionService>& service);
++
++ private:
++  explicit TarkPageTranslation(content::WebContents* web_contents);
++  friend class content::WebContentsUserData<TarkPageTranslation>;
++
++  // content::WebContentsObserver:
++  void PrimaryPageChanged(content::Page& page) override;
++
++  // PageTranslation::Backend:
++  void Connect() override;
++  void Disconnect() override;
++  void SendBatch(const std::string& source,
++                 const std::string& target,
++                 const std::vector<std::string>& units,
++                 const std::vector<std::string>& texts,
++                 PageTranslation::ResultsCallback done) override;
++  bool UnitReady(const std::string& unit) const override;
++  void SetInUse(const std::string& unit, bool in_use) override;
++  void RequestUnit(const std::string& unit, bool now) override;
++
++  void OnFilesOpened(std::string source,
++                     std::string target,
++                     std::vector<std::string> texts,
++                     PageTranslation::ResultsCallback done,
++                     std::map<std::string, base::File> files);
++  void OnGone();
++  // Another tab started a page-only process.
++  void ReleaseForOtherTab();
++
++  // Set only while the page holds a process captions do not.
++  mojo::Remote<mojom::CaptionService> own_service_;
++  mojo::Remote<mojom::PageTranslator> translator_;
++  std::unique_ptr<base::android::ApplicationStatusListener> app_status_;
++  // After the remotes: its destructor lets them go.
++  PageTranslation logic_;
++  base::WeakPtrFactory<TarkPageTranslation> weak_factory_{this};
++
++  WEB_CONTENTS_USER_DATA_KEY_DECL();
++};
++
++}  // namespace tark_captions
++
++#endif  // CHROME_BROWSER_TARK_CAPTIONS_ANDROID_TARK_PAGE_TRANSLATION_H_
+--- /dev/null
++++ b/chrome/browser/tark_captions_android/tark_page_translation_unittest.cc
+@@ -0,0 +1,202 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// TarkPageTranslation's decisions (PageTranslation), on the build machine.
++
++#include <set>
++
++#include "base/functional/bind.h"
++#include "base/test/task_environment.h"
++#include "base/values.h"
++#include "chrome/browser/tark_captions_android/model_files.h"
++#include "chrome/browser/tark_captions_android/page_translation.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace tark_captions {
++namespace {
++
++using Results = PageTranslation::Results;
++
++class FakeBackend : public PageTranslation::Backend {
++ public:
++  void Connect() override {
++    ++connects;
++    connected = true;
++  }
++  void Disconnect() override {
++    ++disconnects;
++    connected = false;
++  }
++  void SendBatch(const std::string& source,
++                 const std::string& target,
++                 const std::vector<std::string>& units,
++                 const std::vector<std::string>& texts,
++                 PageTranslation::ResultsCallback done) override {
++    ASSERT_TRUE(connected);
++    sent_units = units;
++    sent.push_back(std::move(done));
++  }
++  bool UnitReady(const std::string& unit) const override { return ready.contains(unit); }
++  void SetInUse(const std::string& unit, bool in_use) override {
++    if (in_use) {
++      in_use_units.insert(unit);
++    } else {
++      in_use_units.erase(unit);
++    }
++  }
++  void RequestUnit(const std::string& unit, bool now) override {
++    owners.SetWanted(unit, Owner::kPageTranslation, true);
++    ++pref_writes;
++  }
++
++  // The captions process answers the oldest batch.
++  void Answer(Results results) {
++    PageTranslation::ResultsCallback done = std::move(sent.front());
++    sent.erase(sent.begin());
++    std::move(done).Run(std::move(results));
++  }
++
++  int connects = 0;
++  int disconnects = 0;
++  bool connected = false;
++  std::set<std::string> ready = {"tr_indic_en", "tr_en_indic"};
++  std::set<std::string> in_use_units;
++  std::vector<std::string> sent_units;
++  std::vector<PageTranslation::ResultsCallback> sent;
++  UnitOwners owners;
++  int pref_writes = 0;
++};
++
++class TarkPageTranslationTest : public testing::Test {
++ protected:
++  // Translates `texts` from Hindi into English; the results land in `out`.
++  void Translate(PageTranslation& page, std::vector<std::string> texts) {
++    page.Translate(std::move(texts), "hi", "en", base::BindOnce(
++                                                    [](TarkPageTranslationTest* self, Results r) {
++                                                      ++self->answers_;
++                                                      self->out_ = std::move(r);
++                                                    },
++                                                    base::Unretained(this)));
++  }
++
++  base::test::TaskEnvironment task_environment_{
++      base::test::TaskEnvironment::TimeSource::MOCK_TIME};
++  FakeBackend backend_;
++  int answers_ = 0;
++  Results out_;
++};
++
++TEST_F(TarkPageTranslationTest, StartsProcessOnFirstBatchWithoutSpeech) {
++  PageTranslation page(&backend_, /*off_the_record=*/false);
++  EXPECT_EQ(backend_.connects, 0);  // nothing runs before the first batch
++  Translate(page, {"नमस्ते", "दुनिया"});
++  EXPECT_EQ(backend_.connects, 1);
++  EXPECT_EQ(backend_.sent_units, (std::vector<std::string>{"tr_indic_en"}));
++  EXPECT_TRUE(backend_.in_use_units.contains("tr_indic_en"));
++  Translate(page, {"फिर"});
++  EXPECT_EQ(backend_.connects, 1);  // the same process
++  backend_.Answer({"Hello", std::nullopt});
++  EXPECT_EQ(out_, (Results{"Hello", std::nullopt}));
++}
++
++TEST_F(TarkPageTranslationTest, UnloadsAfterThreeMinutesIdle) {
++  PageTranslation page(&backend_, false);
++  Translate(page, {"एक"});
++  task_environment_.FastForwardBy(base::Seconds(300));
++  EXPECT_TRUE(backend_.connected);  // a batch in flight is never idle
++  backend_.Answer({"one"});
++  task_environment_.FastForwardBy(base::Seconds(179));
++  EXPECT_TRUE(backend_.connected);
++  task_environment_.FastForwardBy(base::Seconds(1));
++  EXPECT_FALSE(backend_.connected);
++  EXPECT_EQ(backend_.disconnects, 1);
++  EXPECT_TRUE(backend_.in_use_units.empty());
++  Translate(page, {"दो"});  // the next batch starts it again
++  EXPECT_EQ(backend_.connects, 2);
++}
++
++TEST_F(TarkPageTranslationTest, UnloadsWhenAppBackgrounded) {
++  PageTranslation page(&backend_, false);
++  Translate(page, {"एक", "दो"});
++  page.OnAppBackgrounded();
++  EXPECT_FALSE(backend_.connected);
++  EXPECT_EQ(answers_, 1);
++  EXPECT_EQ(out_, Results(2));  // the page keeps its text
++  EXPECT_TRUE(backend_.in_use_units.empty());
++}
++
++TEST_F(TarkPageTranslationTest, NavigationCancelsOutstanding) {
++  PageTranslation page(&backend_, false);
++  Translate(page, {"एक", "दो"});
++  page.Cancel();
++  EXPECT_EQ(answers_, 1);
++  EXPECT_EQ(out_, Results(2));
++  EXPECT_EQ(page.outstanding(), 0u);
++  backend_.Answer({"one", "two"});  // late: for the old page
++  EXPECT_EQ(answers_, 1);
++  EXPECT_EQ(out_, Results(2));  // nothing applied
++}
++
++TEST_F(TarkPageTranslationTest, IncognitoStoresNothing) {
++  PageTranslation page(&backend_, /*off_the_record=*/true);
++  backend_.ready.clear();
++  EXPECT_FALSE(page.RequestModels("hi", "ta", /*now=*/true));
++  backend_.ready = {"tr_indic_en"};
++  Translate(page, {"एक"});
++  backend_.Answer({"one"});
++  EXPECT_EQ(out_, (Results{"one"}));
++  EXPECT_EQ(backend_.pref_writes, 0);
++  EXPECT_TRUE(backend_.owners.Units().empty());
++}
++
++TEST_F(TarkPageTranslationTest, OwnerKeepsModelsWhileCaptionsRemoved) {
++  PageTranslation page(&backend_, false);
++  backend_.ready.clear();
++  EXPECT_TRUE(page.RequestModels("hi", "en", /*now=*/false));
++  EXPECT_TRUE(backend_.owners.WantedBy("tr_indic_en", Owner::kPageTranslation));
++
++  // Captions' Translate wanted it too; the person removes it from captions.
++  UnitOwners owners(backend_.owners.ToDict());  // as saved in local state
++  owners.SetWanted("tr_indic_en", Owner::kCaptions, true);
++  EXPECT_EQ(*owners.ToDict().FindList("tr_indic_en"),
++            base::ListValue().Append("captions").Append("page_translation"));
++  owners.SetWanted("tr_indic_en", Owner::kCaptions, false);
++  UnitUse use;
++  EXPECT_EQ(DecideRemoval("tr_indic_en", owners, use), Removal::kKeep);
++  owners.SetWanted("tr_indic_en", Owner::kPageTranslation, false);
++  EXPECT_EQ(DecideRemoval("tr_indic_en", owners, use), Removal::kNow);
++}
++
++TEST_F(TarkPageTranslationTest, MissingModelsAnswerNullWithoutAProcess) {
++  PageTranslation page(&backend_, false);
++  backend_.ready.clear();
++  Translate(page, {"एक"});
++  EXPECT_EQ(out_, Results(1));
++  EXPECT_EQ(backend_.connects, 0);
++}
++
++TEST_F(TarkPageTranslationTest, BackendGoneAnswersNull) {
++  PageTranslation page(&backend_, false);
++  Translate(page, {"एक"});
++  backend_.connected = false;
++  page.OnBackendGone();
++  EXPECT_EQ(out_, Results(1));
++  EXPECT_EQ(backend_.disconnects, 0);
++  EXPECT_FALSE(page.connected());
++}
++
++TEST(PageUnitsForTest, EveryIndianLanguageThroughEnglish) {
++  using V = std::vector<std::string>;
++  EXPECT_EQ(PageUnitsFor("hi", "en"), (V{"tr_indic_en"}));
++  EXPECT_EQ(PageUnitsFor("en", "sat"), (V{"tr_en_indic"}));
++  EXPECT_EQ(PageUnitsFor("ta", "mni"), (V{"tr_indic_en", "tr_en_indic"}));
++  EXPECT_EQ(PageUnitsFor("es", "en"), (V{"tr_es_en"}));
++  EXPECT_EQ(PageUnitsFor("es", "kok"), (V{"tr_es_en", "tr_en_indic"}));
++  EXPECT_TRUE(PageUnitsFor("hi", "hi").empty());
++  EXPECT_TRUE(PageUnitsFor("fr", "en").empty());
++  EXPECT_TRUE(PageUnitsFor("hi", "es").empty());
++}
++
++}  // namespace
++}  // namespace tark_captions
