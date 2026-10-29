@@ -307,7 +307,10 @@ def brand():
     square.write_text(BRAND_ICON.read_text().replace(' rx="226"', ''))
     # The "Open in Tark" share action has its own icon set.
     action_icons = TREE / 'firefox-ios' / 'Extensions' / 'ActionExtension' / 'Media.xcassets' / 'AppIconExtension-iOS.appiconset'
-    for folder in [ICONS / f'{name}.appiconset' for name in ICON_SETS] + [action_icons]:
+    # Firefox's alternate app icons (Settings → App Icon is gone in Tark, but
+    # the icons still ship): each becomes Tark's icon.
+    alternates = sorted(ICONS.glob('AppIcon_Alt_*.appiconset'))
+    for folder in [ICONS / f'{name}.appiconset' for name in ICON_SETS] + alternates + [action_icons]:
         for png in sorted(folder.glob('*.png')):
             size = re.search(r'pixelWidth: (\d+)', out('sips', '-g', 'pixelWidth', png)).group(1)
             run('rsvg-convert', '-w', size, '-h', size, square, '-o', png)
@@ -320,6 +323,93 @@ def brand():
     # were 120 MB of the asset catalog.
     for preview in ICONS.glob('appIconAlternate_*.imageset'):
         shutil.rmtree(preview)
+    debrand()
+
+
+# Firefox's artwork that ships in the app (logos, the fox illustrations, the
+# Firefox favicon): each becomes Tark's mark. App Review rejected a build
+# under 4.1(a) "copycat" for Firefox's branding (stickers, widget name).
+FIREFOX_IMAGESETS = ('faviconFox', 'foxConfirmation', 'foxDefaultBrowser', 'foxWithStars',
+                     'fxHomeHeaderLogoBall', 'fxHomeHeaderLogoText', 'logoFirefoxLarge',
+                     'onboardingFoxyWindow', 'firefoxLoader', 'firefox-jp', 'Icon-Small', 'splash',
+                     # The fox in Firefox's illustrations (onboarding, empty and
+                     # error states, the protections panel) and Pocket's logo;
+                     # found by rendering every image in the app.
+                     'onboardingSyncWithIconsBrandRefresh', 'onboardingSyncWithIconsJapan',
+                     'onboardingToolbarIconBottomJapanSelected', 'onboardingToolbarIconTopJapanSelected',
+                     'onboardingWelcomeBrandRefresh', 'onboardingWelcomeJapan', 'onboardingWelcome',
+                     'onboardingDock', 'onboardingNotification', 'onboardingSearchWidget',
+                     'onboardingSetDefaultSteps', 'noInternetConnection', 'securityError', 'kitCircle',
+                     'kitOnboardingNotifications', 'kitOnboardingSync', 'homepage-pocket',
+                     'noBookmarksInFolder', 'noBookmarksInRoot', 'picShieldCheckmark',
+                     'protectionPanelAlert', 'protectionPanelOff', 'protectionPanelOn')
+# Names of Mozilla's products and of Mozilla in the app's text. No word
+# boundaries: some languages join the name to the next letter.
+FIREFOX_WORDS = re.compile(r'Firefox|Mozilla|Fennec')
+# Only the text, never the keys (code looks strings up by key): the value of
+# a "key" = "value"; line, and <string> elements in a .stringsdict.
+STRINGS_VALUE = re.compile(r'^(\s*"(?:[^"\\]|\\.)*"\s*=\s*")((?:[^"\\]|\\.)*)(")', re.M)
+STRINGSDICT_VALUE = re.compile(r'(<string>)([^<]*)(</string>)')
+
+
+def debrand():
+    mark_svg = DERIVED.parent / 'tark-mark.svg'
+    mark_svg.write_text(TOOLBAR_GLYPHS['tarkMenuMark.imageset/tarkMenuMark.pdf'].replace(
+        'width="24" height="24"', 'width="88" height="88"'))
+    mark_pdf = DERIVED.parent / 'tark-mark.pdf'
+    run('rsvg-convert', '-f', 'pdf', mark_svg, '-o', mark_pdf)
+    contents = json.dumps({'images': [{'filename': 'tarkMark.pdf', 'idiom': 'universal'}],
+                           'info': {'author': 'xcode', 'version': 1},
+                           'properties': {'preserves-vector-representation': True}}, indent=2)
+    shipped = [TREE / 'firefox-ios', TREE / 'BrowserKit' / 'Sources']
+    for root in shipped:
+        for name in FIREFOX_IMAGESETS:
+            for imageset in root.rglob(f'{name}.imageset'):
+                if 'Tests' in imageset.parts:
+                    continue
+                for f in imageset.iterdir():
+                    f.unlink()
+                shutil.copy(mark_pdf, imageset / 'tarkMark.pdf')
+                (imageset / 'Contents.json').write_text(contents)
+    # Firefox's fox GIFs (pull-to-refresh easter egg, a hero image) and the
+    # intro video (a phone showing Firefox's icon): Tark's mark instead.
+    mark_png = DERIVED.parent / 'tark-mark.png'
+    run('rsvg-convert', '-w', '240', '-h', '240', mark_svg, '-o', mark_png)
+    for gif in ('easterEggGif.gif', 'kitHeroGif.gif'):
+        run('magick', mark_png, TREE / 'firefox-ios' / 'Client' / 'Assets' / gif)
+    run('ffmpeg', '-loglevel', 'error', '-y', '-loop', '1', '-i', mark_png, '-t', '1',
+        '-vf', 'pad=720:1280:(ow-iw)/2:(oh-ih)/2:color=0x13141f,format=yuv420p', '-c:v', 'libx264',
+        TREE / 'BrowserKit' / 'Sources' / 'OnboardingKit' / 'IntroVideo.mp4')
+    # The app's text, every language: Firefox / Mozilla → Tark.
+    for root in shipped:
+        for path in list(root.rglob('*.strings')) + list(root.rglob('*.stringsdict')):
+            if any(part.endswith('Tests') for part in path.parts):
+                continue
+            raw = path.read_bytes()
+            encoding = 'utf-16' if raw[:2] in (b'\xff\xfe', b'\xfe\xff') else 'utf-8'
+            text = raw.decode(encoding)
+            pattern = STRINGSDICT_VALUE if path.suffix == '.stringsdict' else STRINGS_VALUE
+            new = pattern.sub(lambda m: m.group(1) + FIREFOX_WORDS.sub('Tark', m.group(2)) + m.group(3), text)
+            if new != text:
+                path.write_bytes(new.encode(encoding))
+    # The English fallbacks compiled into the app (`value: "..."` in
+    # Strings.swift and the other string tables in code).
+    swift_value = re.compile(r'(value:\s*")((?:[^"\\]|\\.)*)(")')
+    for root in shipped:
+        for path in root.rglob('*.swift'):
+            if any(part.endswith('Tests') for part in path.parts):
+                continue
+            text = path.read_text()
+            if 'value:' not in text or not FIREFOX_WORDS.search(text):
+                continue
+            new = swift_value.sub(lambda m: m.group(1) + FIREFOX_WORDS.sub('Tark', m.group(2)) + m.group(3), text)
+            if new != text:
+                path.write_text(new)
+    # The search widget's name in the widget gallery.
+    for config in [TREE / 'firefox-ios' / 'Client.xcodeproj' / 'project.pbxproj',
+                   *(TREE / 'firefox-ios' / 'Client' / 'Configuration').glob('*.xcconfig')]:
+        text = config.read_text()
+        config.write_text(text.replace('Firefox - Search', 'Tark - Search'))
 
 
 # Toolbar glyphs drawn for Tark (I5d): the tabs button as a box taller than
