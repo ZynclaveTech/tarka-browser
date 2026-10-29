@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """End-to-end check of desktop page translation (Linux, Mac).
 
-    translate_e2e.py APP MODELS_DIR [--screenshot PNG]
+    translate_e2e.py APP MODELS_DIR [--screenshot PNG] [--diag DIR]
 
 Launches APP (on Linux the tarball's folder) on a fresh profile that always
 translates Hindi into English, with the translation models from MODELS_DIR
@@ -13,6 +13,9 @@ local Hindi page and checks, through DevTools:
   link_kept        The link inside a translated sentence is still a link.
 With --screenshot, the whole screen (the translate bar under the toolbar
 is browser UI, not page) is saved after the checks (ImageMagick's import).
+With --diag, a failed run leaves Tark's log (translate VLOGs on), the text
+of chrome://translate-internals (Chromium's translate events and errors)
+and the models folder's listing in DIR.
 Prints "ok …" / "FAIL …"; exits 1 if any check fails.
 """
 
@@ -102,6 +105,18 @@ def report(ok, name, detail=''):
     return 0 if ok else 1
 
 
+def diagnose(browser, models, out):
+    out.mkdir(parents=True, exist_ok=True)
+    internals = page_ws('chrome://translate-internals', timeout=5)
+    text = e2e.evaluate(internals, 'document.body.innerText') if internals else None
+    (out / 'translate-internals.txt').write_text(text or 'no translate-internals tab')
+    (out / 'tark.log').write_text(browser.log.read_text(errors='replace'))
+    listing = sorted(str(p.relative_to(models)) for p in pathlib.Path(models).rglob('*'))
+    home = pathlib.Path(os.environ.get('XDG_CONFIG_HOME', ''))
+    seen = sorted(str(p.relative_to(home)) for p in home.rglob('*') if p.is_dir()) if home.name else []
+    (out / 'models.txt').write_text('\n'.join(listing + ['--- config home'] + seen))
+
+
 def models_home(models):
     """An XDG config home whose Tark (and Chromium-named) user data folders
     hold the models where Tark looks for them: <user data>/Captions/models."""
@@ -119,14 +134,19 @@ def main(argv=None):
     ap.add_argument('app')
     ap.add_argument('models')
     ap.add_argument('--screenshot')
+    ap.add_argument('--diag')
     args = ap.parse_args(argv)
     os.environ['XDG_CONFIG_HOME'] = str(models_home(args.models))
     server = serve()
-    browser = e2e.Browser(args.app, prefs=PREFS)
+    browser = e2e.Browser(args.app, prefs=PREFS,
+                          extra_flags=['--host-resolver-rules=MAP tark.test 127.0.0.1',
+                                       '--vmodule=*translate*=2,*tark*=1'])
     failed = 0
     try:
         if not browser.wait_ready():
             return report(False, 'started', 'Tark never started')
+        # Opened first, so it records the page's translate events.
+        browser.open('chrome://translate-internals/')
         url = f'http://127.0.0.1:{PORT}/'
         browser.open(url)
         ws = page_ws(url)
@@ -143,6 +163,8 @@ def main(argv=None):
         failed += report(ok3 and has_link, 'link_kept', f'{t3!r}, link={has_link}')
         if args.screenshot:
             subprocess.run(['import', '-window', 'root', args.screenshot], check=False)
+        if failed and args.diag:
+            diagnose(browser, args.models, pathlib.Path(args.diag))
     finally:
         browser.close()
         server.shutdown()
