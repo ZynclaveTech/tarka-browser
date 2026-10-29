@@ -92,6 +92,17 @@ class TestLinuxJob(unittest.TestCase):
         self.assertTrue(0 < tarball < zynclave, (tarball, zynclave))
         self.assertIn('--production', text[zynclave:zynclave + 200])
 
+    def test_checks_page_translation_on_the_tarball_with_real_models(self):
+        # Desktop page translation: the tarball's Tark translates a Hindi
+        # page (and text its JS adds) on the computer, with the models
+        # fetched and checked as Tark fetches them.
+        text = JOB.read_text()
+        tarball = text.find('package_tarball.sh" "$repo"')
+        fetch = text.find('linux/fetch_translate_models.sh" "$work/build/src"')
+        e2e = text.find('python3 "$repo/utils/translate_e2e.py"')
+        self.assertTrue(0 < tarball < fetch < e2e, (tarball, fetch, e2e))
+        self.assertIn('checks/translate.txt', text[e2e:e2e + 600])
+
     def test_installs_websocket_client_before_the_zynclave_checks(self):
         # zynclave_e2e.py talks to DevTools through websocket-client.
         text = JOB.read_text()

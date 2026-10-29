@@ -134,6 +134,26 @@ if (( code == 0 )); then
   upload "$L/checks/zynclave.txt" checks/zynclave.txt
   rm -rf "$unpacked"
 fi
+# Desktop page translation on the tarball's Tark: a Hindi page, and text its
+# JS adds later, turned into English on the computer by the real models
+# (utils/translate_e2e.py).
+if (( code == 0 )); then
+  unpacked=$(mktemp -d)
+  models=$(mktemp -d)
+  tar -xJf "$L"/out/Tark-*-x64-linux.tar.xz -C "$unpacked"
+  if bash "$repo/linux/fetch_translate_models.sh" "$work/build/src" "$models" >> "$log" 2>&1; then
+    timeout 15m xvfb-run -a -s "-screen 0 1280x800x24" \
+      python3 "$repo/utils/translate_e2e.py" "$(ls -d "$unpacked"/Tark-*/)" "$models" \
+      --screenshot "$L/checks/translate-bar.png" \
+      > "$L/checks/translate.txt" 2>&1 || code=1
+  else
+    echo "FAIL translate: could not fetch the translation models" > "$L/checks/translate.txt"; code=1
+  fi
+  cat "$L/checks/translate.txt" >> "$log"
+  upload "$L/checks/translate.txt" checks/translate.txt
+  [[ -f $L/checks/translate-bar.png ]] && upload "$L/checks/translate-bar.png" checks/translate-bar.png
+  rm -rf "$unpacked" "$models"
+fi
 # L3: the .deb, from the tarball as people get it, then installed and started
 # in a clean Ubuntu.
 if (( code == 0 )); then
