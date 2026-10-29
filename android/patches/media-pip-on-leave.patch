@@ -1,0 +1,779 @@
+diff --color -ruN a/chrome/android/BUILD.gn b/chrome/android/BUILD.gn
+--- a/chrome/android/BUILD.gn	2026-10-29 17:26:39.839097620 +0530
++++ b/chrome/android/BUILD.gn	2026-10-29 17:26:56.745838285 +0530
+@@ -3248,6 +3248,7 @@
+       "java/src/org/chromium/chrome/browser/tabmodel/TabCollectionTabModelImpl.java",
+       "java/src/org/chromium/chrome/browser/tabmodel/TabModelJniBridge.java",
+       "java/src/org/chromium/chrome/browser/tabmodel/TabModelObserverJniBridge.java",
++      "java/src/org/chromium/chrome/browser/tark/media/TarkPictureInPicture.java",
+       "java/src/org/chromium/chrome/browser/touch_to_fill/autofill/TouchToFillAutofillViewBridge.java",
+       "java/src/org/chromium/chrome/browser/touch_to_fill/payments/TouchToFillPaymentMethodControllerBridge.java",
+       "java/src/org/chromium/chrome/browser/touch_to_fill/payments/TouchToFillPaymentMethodViewBridge.java",
+diff --color -ruN a/chrome/android/chrome_java_sources.gni b/chrome/android/chrome_java_sources.gni
+--- a/chrome/android/chrome_java_sources.gni	2026-10-29 17:26:39.839732756 +0530
++++ b/chrome/android/chrome_java_sources.gni	2026-10-29 17:26:56.746691966 +0530
+@@ -974,8 +974,10 @@
+   "java/src/org/chromium/chrome/browser/page_info/SiteSettingsHelper.java",
+   "java/src/org/chromium/chrome/browser/page_info/TarkAdblockSiteSwitch.java",
+   "java/src/org/chromium/chrome/browser/tark_captions/TarkCaptionBarCoordinator.java",
++  "java/src/org/chromium/chrome/browser/tark/media/TarkLeaveDecision.java",
+   "java/src/org/chromium/chrome/browser/tark/media/TarkMediaPrefs.java",
+   "java/src/org/chromium/chrome/browser/tark/media/TarkMediaSwitchPreference.java",
++  "java/src/org/chromium/chrome/browser/tark/media/TarkPictureInPicture.java",
+   "java/src/org/chromium/chrome/browser/tark/zynclave/AuthStateStore.java",
+   "java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAccount.java",
+   "java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAccountPreference.java",
+diff --color -ruN a/chrome/android/java/src/org/chromium/chrome/browser/app/ChromeActivity.java b/chrome/android/java/src/org/chromium/chrome/browser/app/ChromeActivity.java
+--- a/chrome/android/java/src/org/chromium/chrome/browser/app/ChromeActivity.java	2026-10-29 17:26:39.841591287 +0530
++++ b/chrome/android/java/src/org/chromium/chrome/browser/app/ChromeActivity.java	2026-10-29 17:32:06.185882101 +0530
+@@ -217,6 +217,8 @@
+ import org.chromium.chrome.browser.tabmodel.TabModelSelectorSupplier;
+ import org.chromium.chrome.browser.tabmodel.TabModelSelectorTabObserver;
+ import org.chromium.chrome.browser.tabmodel.TabModelUtils;
++import org.chromium.chrome.browser.tark.media.TarkMediaPrefs;
++import org.chromium.chrome.browser.tark.media.TarkPictureInPicture;
+ import org.chromium.chrome.browser.task_manager.TaskManager;
+ import org.chromium.chrome.browser.task_manager.TaskManagerFactory;
+ import org.chromium.chrome.browser.tasks.tab_management.TabGroupUiUtils;
+@@ -1567,6 +1569,18 @@
+             return;
+         }
+ 
++        // Tark: Picture in Picture on leave. The current tab's video, playing with sound, floats
++        // in video Picture in Picture (inline or fullscreen; the window requestPictureInPicture()
++        // opens), here before the tab is hidden, on every Android version: setAutoEnterEnabled()
++        // only covers this activity's own Picture in Picture, which the fullscreen controller
++        // below now leaves to Tark for such a tab.
++        if (TarkPictureInPicture.enter(getActivityTab())) {
++            FullscreenVideoPictureInPictureController.disableAutoPictureInPicture(this);
++            return;
++        }
++        // Settings → Picture in Picture off: no fullscreen-video Picture in Picture either.
++        if (!TarkMediaPrefs.pictureInPicture()) return;
++
+         FullscreenVideoPictureInPictureController controller =
+                 ensureFullscreenVideoPictureInPictureController();
+         if (controller != null) {
+@@ -1607,6 +1621,11 @@
+             maybeCreateActorPipController();
+             if (mActorPipController != null && mActorPipController.shouldEnterPip()) return;
+ 
++            // Tark: no snackbar in the Picture in Picture window, such as the fullscreen notice
++            // "To exit full screen, press |Esc|" (ExclusiveAccessBubble doesn't show one there).
++            SnackbarManager snackbarManager = mSnackbarManagerSupplier.get();
++            if (snackbarManager != null) snackbarManager.dismissAllSnackbars();
++
+             FullscreenVideoPictureInPictureController controller =
+                     ensureFullscreenVideoPictureInPictureController();
+             if (controller != null) {
+diff --color -ruN a/chrome/android/java/src/org/chromium/chrome/browser/media/FullscreenVideoPictureInPictureController.java b/chrome/android/java/src/org/chromium/chrome/browser/media/FullscreenVideoPictureInPictureController.java
+--- a/chrome/android/java/src/org/chromium/chrome/browser/media/FullscreenVideoPictureInPictureController.java	2026-10-29 17:26:39.842265673 +0530
++++ b/chrome/android/java/src/org/chromium/chrome/browser/media/FullscreenVideoPictureInPictureController.java	2026-10-29 17:30:53.218013147 +0530
+@@ -31,6 +31,8 @@
+ import org.chromium.chrome.browser.notifications.NotificationIntentInterceptor;
+ import org.chromium.chrome.browser.tab.Tab;
+ import org.chromium.chrome.browser.tab.TabObserver;
++import org.chromium.chrome.browser.tark.media.TarkMediaPrefs;
++import org.chromium.chrome.browser.tark.media.TarkPictureInPicture;
+ import org.chromium.chrome.browser.util.AndroidTaskUtils;
+ import org.chromium.content_public.browser.MediaSession;
+ import org.chromium.content_public.browser.WebContents;
+@@ -213,6 +215,13 @@
+ 
+         assertLibraryLoaderIsInitialized();
+ 
++        // Tark: a tab playing with sound floats its video instead (TarkPictureInPicture, from
++        // ChromeActivity.onUserLeaveHint), not this whole activity, so this activity doesn't
++        // auto-enter either. Settings → Picture in Picture off: no Picture in Picture at all.
++        if (!TarkMediaPrefs.pictureInPicture() || TarkPictureInPicture.canOffer(webContents)) {
++            return false;
++        }
++
+         // Only auto-PiP if there is a playing fullscreen video that allows PiP.
+         if (!webContents.hasActiveEffectivelyFullscreenVideo()
+                 || !webContents.isPictureInPictureAllowedForFullscreenVideo()) {
+diff --color -ruN a/chrome/android/java/src/org/chromium/chrome/browser/tark/media/TarkLeaveDecision.java b/chrome/android/java/src/org/chromium/chrome/browser/tark/media/TarkLeaveDecision.java
+--- a/chrome/android/java/src/org/chromium/chrome/browser/tark/media/TarkLeaveDecision.java	1970-01-01 05:30:00.000000000 +0530
++++ b/chrome/android/java/src/org/chromium/chrome/browser/tark/media/TarkLeaveDecision.java	2026-10-29 17:30:14.929703827 +0530
+@@ -0,0 +1,39 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++package org.chromium.chrome.browser.tark.media;
++
++import org.chromium.build.annotations.NullMarked;
++
++/**
++ * What leaving Tark does to the current tab's media: float its video in Picture in Picture, keep
++ * only its sound going (Background play, the visibility hold), or nothing (upstream: the page is
++ * hidden and its video pauses). Only the current tab counts, and only while it plays with sound: a
++ * muted video, or another tab's, never floats. Incognito tabs are treated the same; nothing is
++ * stored.
++ */
++@NullMarked
++public final class TarkLeaveDecision {
++    /** The outcome of leaving Tark. */
++    public enum LeaveAction {
++        PIP,
++        SOUND_ONLY,
++        NONE
++    }
++
++    private TarkLeaveDecision() {}
++
++    /**
++     * @param currentTabPlayingWithSound The current tab plays a video with sound now.
++     * @param backgroundPlay Settings → Background play.
++     * @param pip Settings → Picture in Picture.
++     */
++    public static LeaveAction decide(
++            boolean currentTabPlayingWithSound, boolean backgroundPlay, boolean pip) {
++        if (!currentTabPlayingWithSound) return LeaveAction.NONE;
++        if (pip) return LeaveAction.PIP;
++        if (backgroundPlay) return LeaveAction.SOUND_ONLY;
++        return LeaveAction.NONE;
++    }
++}
+diff --color -ruN a/chrome/android/java/src/org/chromium/chrome/browser/tark/media/TarkPictureInPicture.java b/chrome/android/java/src/org/chromium/chrome/browser/tark/media/TarkPictureInPicture.java
+--- a/chrome/android/java/src/org/chromium/chrome/browser/tark/media/TarkPictureInPicture.java	1970-01-01 05:30:00.000000000 +0530
++++ b/chrome/android/java/src/org/chromium/chrome/browser/tark/media/TarkPictureInPicture.java	2026-10-29 17:30:53.218424820 +0530
+@@ -0,0 +1,67 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++package org.chromium.chrome.browser.tark.media;
++
++import org.jni_zero.NativeMethods;
++
++import org.chromium.base.library_loader.LibraryLoader;
++import org.chromium.build.annotations.NullMarked;
++import org.chromium.build.annotations.Nullable;
++import org.chromium.chrome.browser.tab.Tab;
++import org.chromium.chrome.browser.tark.media.TarkLeaveDecision.LeaveAction;
++import org.chromium.content_public.browser.WebContents;
++
++/**
++ * Picture in Picture on leave. When the user leaves Tark (ChromeActivity.onUserLeaveHint, before
++ * the tab is hidden) while the current tab plays a video with sound and Settings → Picture in
++ * Picture is on, its video floats in video Picture in Picture: the window requestPictureInPicture()
++ * opens, inline or fullscreen. It's a browser-initiated request, so a page's
++ * disablePictureInPicture (YouTube's) doesn't stop it. The tab's page keeps seeing "visible" while
++ * the window is open (content's VisibilityHold), so YouTube keeps its player.
++ */
++@NullMarked
++public final class TarkPictureInPicture {
++    private TarkPictureInPicture() {}
++
++    /** Whether leaving Tark now floats this tab's video. */
++    public static boolean canOffer(@Nullable Tab tab) {
++        return canOffer(tab != null ? tab.getWebContents() : null);
++    }
++
++    /** {@link #canOffer(Tab)} for a tab's WebContents. */
++    public static boolean canOffer(@Nullable WebContents webContents) {
++        return decide(webContents) == LeaveAction.PIP;
++    }
++
++    /**
++     * Floats the tab's playing video if {@link #canOffer(Tab)}. Returns whether it was requested
++     * (the window opens asynchronously), or a video of the tab already floats.
++     */
++    public static boolean enter(@Nullable Tab tab) {
++        WebContents webContents = tab != null ? tab.getWebContents() : null;
++        if (webContents == null || !canOffer(webContents)) return false;
++        return TarkPictureInPictureJni.get().enter(webContents);
++    }
++
++    /** What leaving Tark does to this tab's media, by the settings. */
++    public static LeaveAction decide(@Nullable WebContents webContents) {
++        boolean playingWithSound =
++                webContents != null
++                        && LibraryLoader.getInstance().isInitialized()
++                        && !webContents.isDestroyed()
++                        && TarkPictureInPictureJni.get().isPlayingVideoWithSound(webContents);
++        return TarkLeaveDecision.decide(
++                playingWithSound,
++                TarkMediaPrefs.backgroundPlay(),
++                TarkMediaPrefs.pictureInPicture());
++    }
++
++    @NativeMethods
++    interface Natives {
++        boolean isPlayingVideoWithSound(WebContents webContents);
++
++        boolean enter(WebContents webContents);
++    }
++}
+diff --color -ruN a/chrome/android/java/src/org/chromium/chrome/browser/ui/ExclusiveAccessBubble.java b/chrome/android/java/src/org/chromium/chrome/browser/ui/ExclusiveAccessBubble.java
+--- a/chrome/android/java/src/org/chromium/chrome/browser/ui/ExclusiveAccessBubble.java	2026-10-29 17:26:39.841170196 +0530
++++ b/chrome/android/java/src/org/chromium/chrome/browser/ui/ExclusiveAccessBubble.java	2026-10-29 17:31:55.868299861 +0530
+@@ -45,6 +45,8 @@
+     @CalledByNative
+     public void show() {
+         if (mText == null || mSnackbar != null) return;
++        // Tark: not in Picture in Picture (ChromeActivity dismisses one shown before).
++        if (mParentContext.isInPictureInPictureMode()) return;
+         SnackbarManager snackbarManager = mParentContext.getSnackbarManager();
+         if (snackbarManager == null) return;
+ 
+diff --color -ruN a/chrome/android/java/src/org/chromium/chrome/browser/ui/ExclusiveAccessContext.java b/chrome/android/java/src/org/chromium/chrome/browser/ui/ExclusiveAccessContext.java
+--- a/chrome/android/java/src/org/chromium/chrome/browser/ui/ExclusiveAccessContext.java	2026-10-29 17:26:39.840944526 +0530
++++ b/chrome/android/java/src/org/chromium/chrome/browser/ui/ExclusiveAccessContext.java	2026-10-29 17:31:55.868034024 +0530
+@@ -4,6 +4,8 @@
+ 
+ package org.chromium.chrome.browser.ui;
+ 
++import android.app.Activity;
++
+ import org.jni_zero.CalledByNative;
+ import org.jni_zero.NativeMethods;
+ 
+@@ -107,6 +109,15 @@
+         return SnackbarManagerProvider.from(mWindowAndroid);
+     }
+ 
++    /**
++     * Tark: whether this activity is in Picture in Picture mode, where the fullscreen notice ("To
++     * exit full screen, press Esc") has nothing to say: nothing in the window takes keys or swipes.
++     */
++    public boolean isInPictureInPictureMode() {
++        Activity activity = mWindowAndroid.getActivity().get();
++        return activity != null && activity.isInPictureInPictureMode();
++    }
++
+     @Override
+     @CalledByNative
+     public void destroy() {
+diff --color -ruN a/chrome/android/junit/BUILD.gn b/chrome/android/junit/BUILD.gn
+--- a/chrome/android/junit/BUILD.gn	2026-10-29 17:26:39.839475210 +0530
++++ b/chrome/android/junit/BUILD.gn	2026-10-29 17:26:56.747736317 +0530
+@@ -1428,8 +1428,10 @@
+       "chrome_junit_tests_org.chromium.chrome.browser.tark.media") {
+     resources_package = "org.chromium.chrome"
+ 
+-    sources =
+-        [ "src/org/chromium/chrome/browser/tark/media/TarkMediaPrefsTest.java" ]
++    sources = [
++      "src/org/chromium/chrome/browser/tark/media/TarkLeaveDecisionTest.java",
++      "src/org/chromium/chrome/browser/tark/media/TarkMediaPrefsTest.java",
++    ]
+ 
+     deps = [ ":chrome_junit_tests_helper" ]
+   }
+diff --color -ruN a/chrome/android/junit/src/org/chromium/chrome/browser/tark/media/TarkLeaveDecisionTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/tark/media/TarkLeaveDecisionTest.java
+--- a/chrome/android/junit/src/org/chromium/chrome/browser/tark/media/TarkLeaveDecisionTest.java	1970-01-01 05:30:00.000000000 +0530
++++ b/chrome/android/junit/src/org/chromium/chrome/browser/tark/media/TarkLeaveDecisionTest.java	2026-10-29 17:30:29.873474925 +0530
+@@ -0,0 +1,81 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++package org.chromium.chrome.browser.tark.media;
++
++import static org.junit.Assert.assertEquals;
++
++import android.content.SharedPreferences;
++
++import org.junit.Before;
++import org.junit.Test;
++import org.junit.runner.RunWith;
++
++import org.chromium.base.ContextUtils;
++import org.chromium.base.test.BaseRobolectricTestRunner;
++import org.chromium.chrome.browser.tark.media.TarkLeaveDecision.LeaveAction;
++
++import java.util.HashMap;
++import java.util.Map;
++
++/** What leaving Tark does to the current tab's media. */
++@RunWith(BaseRobolectricTestRunner.class)
++public class TarkLeaveDecisionTest {
++    private SharedPreferences mPrefs;
++
++    @Before
++    public void setUp() {
++        mPrefs = ContextUtils.getAppSharedPreferences();
++        mPrefs.edit().clear().commit();
++    }
++
++    @Test
++    public void testPlayingWithSoundPipOn() {
++        assertEquals(LeaveAction.PIP, TarkLeaveDecision.decide(true, true, true));
++        // Picture in Picture alone is enough: the window keeps the page playing.
++        assertEquals(LeaveAction.PIP, TarkLeaveDecision.decide(true, false, true));
++    }
++
++    @Test
++    public void testPipOffBackgroundOn() {
++        assertEquals(LeaveAction.SOUND_ONLY, TarkLeaveDecision.decide(true, true, false));
++    }
++
++    @Test
++    public void testBothOff() {
++        assertEquals(LeaveAction.NONE, TarkLeaveDecision.decide(true, false, false));
++    }
++
++    @Test
++    public void testMutedAutoplayNeverFloats() {
++        // A muted video that plays isn't "playing with sound" (the native side asks
++        // WebContents::IsCurrentlyAudible()): nothing floats, nothing plays on.
++        assertEquals(LeaveAction.NONE, TarkLeaveDecision.decide(false, true, true));
++    }
++
++    @Test
++    public void testOnlyCurrentTabCounts() {
++        // The current tab is paused while a background tab plays: the caller passes the
++        // current tab's state only, so nothing floats.
++        boolean currentTabPlayingWithSound = false;
++        assertEquals(
++                LeaveAction.NONE, TarkLeaveDecision.decide(currentTabPlayingWithSound, true, true));
++    }
++
++    @Test
++    public void testIncognitoFloatsNothingStored() {
++        // An incognito tab playing with sound floats like any other, and deciding writes
++        // nothing: the prefs file is the same before and after.
++        TarkMediaPrefs.setBackgroundPlay(true);
++        TarkMediaPrefs.setPictureInPicture(true);
++        Map<String, ?> before = new HashMap<>(mPrefs.getAll());
++        LeaveAction action =
++                TarkLeaveDecision.decide(
++                        /* currentTabPlayingWithSound= */ true,
++                        TarkMediaPrefs.backgroundPlay(),
++                        TarkMediaPrefs.pictureInPicture());
++        assertEquals(LeaveAction.PIP, action);
++        assertEquals(before, new HashMap<>(mPrefs.getAll()));
++    }
++}
+diff --color -ruN a/chrome/browser/android/BUILD.gn b/chrome/browser/android/BUILD.gn
+--- a/chrome/browser/android/BUILD.gn	2026-10-29 17:27:22.136572462 +0530
++++ b/chrome/browser/android/BUILD.gn	2026-10-29 17:27:22.158363201 +0530
+@@ -509,6 +509,7 @@
+       "tab_web_contents_destroyer.h",
+       "tabbed_startup_window_policy_delegate_bridge.cc",
+       "tark/safe_browsing_stubs_android.cc",
++      "tark/tark_picture_in_picture_android.cc",
+       "trusted_cdn.cc",
+       "trusted_cdn.h",
+       "usage_stats/usage_stats_bridge.cc",
+diff --color -ruN a/chrome/browser/android/tark/tark_picture_in_picture_android.cc b/chrome/browser/android/tark/tark_picture_in_picture_android.cc
+--- a/chrome/browser/android/tark/tark_picture_in_picture_android.cc	1970-01-01 05:30:00.000000000 +0530
++++ b/chrome/browser/android/tark/tark_picture_in_picture_android.cc	2026-10-29 17:30:14.927788587 +0530
+@@ -0,0 +1,32 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// Tark for Android: Picture in Picture on leave. TarkPictureInPicture.java's
++// natives: whether the current tab plays a video with sound, and floating it.
++
++#include "base/android/jni_android.h"
++#include "base/android/jni_string.h"
++#include "content/public/browser/tark_picture_in_picture.h"
++#include "content/public/browser/web_contents.h"
++
++// Must come after all headers that specialize FromJniType() / ToJniType().
++#include "chrome/android/chrome_jni_headers/TarkPictureInPicture_jni.h"
++
++using base::android::JavaRef;
++
++static bool JNI_TarkPictureInPicture_IsPlayingVideoWithSound(
++    JNIEnv* env,
++    const JavaRef<jobject>& jweb_contents) {
++  return content::tark_media::CanEnterPictureInPictureOnLeave(
++      content::WebContents::FromJavaWebContents(jweb_contents));
++}
++
++static bool JNI_TarkPictureInPicture_Enter(
++    JNIEnv* env,
++    const JavaRef<jobject>& jweb_contents) {
++  return content::tark_media::EnterPictureInPictureOnLeave(
++      content::WebContents::FromJavaWebContents(jweb_contents));
++}
++
++DEFINE_JNI(TarkPictureInPicture)
+diff --color -ruN a/content/browser/media/session/media_session_impl.cc b/content/browser/media/session/media_session_impl.cc
+--- a/content/browser/media/session/media_session_impl.cc	2026-10-29 17:26:39.835679188 +0530
++++ b/content/browser/media/session/media_session_impl.cc	2026-10-29 17:28:01.710864743 +0530
+@@ -29,6 +29,7 @@
+ #include "content/public/browser/media_session_player_observer.h"
+ #include "content/public/browser/navigation_handle.h"
+ #include "content/public/browser/render_frame_host.h"
++#include "content/public/browser/tark_picture_in_picture.h"
+ #include "content/public/browser/web_contents.h"
+ #include "content/public/browser/web_contents_delegate.h"
+ #include "content/public/common/content_client.h"
+@@ -1348,6 +1349,50 @@
+       MediaSessionUmaHelper::EnterPictureInPictureType::kDefaultManual);
+ }
+ 
++bool MediaSessionImpl::TarkPlayingVideo(bool float_it) {
++  for (const auto& player : normal_players_) {
++    const PlayerIdentifier& id = player.first;
++    if (!id.observer->HasVideo(id.player_id) ||
++        id.observer->IsPaused(id.player_id)) {
++      continue;
++    }
++    if (float_it) {
++      // No details: a browser-initiated request, which Blink lets through a
++      // page's disablePictureInPicture (Tark,
++      // picture_in_picture_controller_impl.cc).
++      id.observer->OnEnterPictureInPicture(id.player_id, std::nullopt);
++    }
++    return true;
++  }
++  return false;
++}
++
++namespace tark_media {
++
++bool CanEnterPictureInPictureOnLeave(WebContents* web_contents) {
++  if (!web_contents || !web_contents->IsCurrentlyAudible()) {
++    return false;
++  }
++  if (web_contents->HasPictureInPictureVideo()) {
++    return true;
++  }
++  MediaSessionImpl* session = MediaSessionImpl::FromWebContents(web_contents);
++  return session && session->TarkPlayingVideo(/*float_it=*/false);
++}
++
++bool EnterPictureInPictureOnLeave(WebContents* web_contents) {
++  if (!CanEnterPictureInPictureOnLeave(web_contents)) {
++    return false;
++  }
++  if (web_contents->HasPictureInPictureVideo()) {
++    return true;
++  }
++  return MediaSessionImpl::FromWebContents(web_contents)
++      ->TarkPlayingVideo(/*float_it=*/true);
++}
++
++}  // namespace tark_media
++
+ void MediaSessionImpl::ExitPictureInPicture() {
+   static_cast<WebContentsImpl*>(web_contents())->ExitPictureInPicture();
+ }
+diff --color -ruN a/content/browser/media/session/media_session_impl.h b/content/browser/media/session/media_session_impl.h
+--- a/content/browser/media/session/media_session_impl.h	2026-10-29 17:26:39.835915275 +0530
++++ b/content/browser/media/session/media_session_impl.h	2026-10-29 17:27:45.523512425 +0530
+@@ -290,6 +290,13 @@
+   // Exit picture-in-picture.
+   void ExitPictureInPicture() override;
+ 
++  // Tark: Picture in Picture on leave (tark_picture_in_picture.h). Whether a
++  // player plays a video now; with `float_it`, the first one is floated in
++  // video Picture in Picture, as requestPictureInPicture() would, without the
++  // page's enterpictureinpicture handler or the one-player rule of
++  // EnterPictureInPicture().
++  bool TarkPlayingVideo(bool float_it);
++
+   // Automatically enter picture-in-picture from a non-user source (e.g. in
+   // reaction to content being hidden).
+   void EnterAutoPictureInPicture() override;
+diff --color -ruN a/content/browser/web_contents/tark_media/visibility_hold.cc b/content/browser/web_contents/tark_media/visibility_hold.cc
+--- a/content/browser/web_contents/tark_media/visibility_hold.cc	2026-10-29 17:26:39.834662838 +0530
++++ b/content/browser/web_contents/tark_media/visibility_hold.cc	2026-10-29 17:28:46.445641917 +0530
+@@ -17,6 +17,7 @@
+ bool VisibilityHold::ShouldHoldVisibility(bool page_hidden,
+                                           bool audible,
+                                           bool playing,
++                                          bool in_picture_in_picture,
+                                           base::FunctionRef<bool()> allowed) {
+   if (!page_hidden) {
+     held_ = false;
+@@ -25,8 +26,9 @@
+   }
+   if (held_) {
+     // A later update while hidden (occlusion, Picture in Picture starting or
+-    // ending) keeps the hold while a player plays.
+-    if (playing) {
++    // ending) keeps the hold while a player plays or a video is in Picture in
++    // Picture.
++    if (playing || in_picture_in_picture) {
+       return true;
+     }
+     held_ = false;
+@@ -40,8 +42,9 @@
+   return false;
+ }
+ 
+-bool VisibilityHold::OnPlayingChanged(bool playing) {
+-  if (!held_ || playing) {
++bool VisibilityHold::OnPlayingChanged(bool playing,
++                                      bool in_picture_in_picture) {
++  if (!held_ || playing || in_picture_in_picture) {
+     return false;
+   }
+   held_ = false;
+diff --color -ruN a/content/browser/web_contents/tark_media/visibility_hold.h b/content/browser/web_contents/tark_media/visibility_hold.h
+--- a/content/browser/web_contents/tark_media/visibility_hold.h	2026-10-29 17:26:39.835128971 +0530
++++ b/content/browser/web_contents/tark_media/visibility_hold.h	2026-10-29 17:28:46.445965796 +0530
+@@ -17,8 +17,10 @@
+ // WebContentsImpl::GetPageVisibilityState() still reports hidden.
+ //
+ // The hold ends as soon as no media player in the tab is playing (all paused
+-// or ended): the page then gets "hidden" and one visibilitychange, as it
+-// would have on leaving. A silent stretch while a player still plays (a quiet
++// or ended) and none of its videos is in Picture in Picture: the page then
++// gets "hidden" and one visibilitychange, as it would have on leaving. A
++// video paused from the Picture in Picture window keeps the hold (YouTube
++// tears its player down on "hidden"), until the window closes. A silent stretch while a player still plays (a quiet
+ // gap, an ad's silent start) keeps it. Showing the tab ends it too, with no
+ // event (the page already sees "visible").
+ //
+@@ -39,18 +41,21 @@
+ 
+   // On every visibility update. `page_hidden`: upstream would tell the page
+   // hidden (kHidden or kHiddenButPainting). `audible`: the tab plays sound
+-  // now (needed to start a hold). `playing`: a media player of the tab plays
+-  // (needed to keep one). `allowed`: asked only when a hold would start.
++  // now (needed to start a hold). `playing`: a media player of the tab plays;
++  // `in_picture_in_picture`: one of its videos is in Picture in Picture
++  // (either keeps a hold). `allowed`: asked only when a hold would start.
+   // Returns true when the page must be told "visible" instead.
+   bool ShouldHoldVisibility(bool page_hidden,
+                             bool audible,
+                             bool playing,
++                            bool in_picture_in_picture,
+                             base::FunctionRef<bool()> allowed);
+ 
+   // When the tab's playing state changes (a player started or stopped).
+   // Returns true when this releases the hold: the caller then sends the page
+-  // its real visibility again.
+-  bool OnPlayingChanged(bool playing);
++  // its real visibility again. The Picture in Picture window closing is a
++  // visibility update (ShouldHoldVisibility()), not this.
++  bool OnPlayingChanged(bool playing, bool in_picture_in_picture);
+ 
+   bool held() const { return held_; }
+ 
+diff --color -ruN a/content/browser/web_contents/tark_media/visibility_hold_unittest.cc b/content/browser/web_contents/tark_media/visibility_hold_unittest.cc
+--- a/content/browser/web_contents/tark_media/visibility_hold_unittest.cc	2026-10-29 17:26:39.834915217 +0530
++++ b/content/browser/web_contents/tark_media/visibility_hold_unittest.cc	2026-10-29 17:29:11.150671659 +0530
+@@ -31,6 +31,15 @@
+   // Tark entered Picture in Picture (onUserLeaveHint, before WasHidden).
+   void EnterPictureInPicture() { has_pip_video_ = true; }
+ 
++  // The Picture in Picture window closed (SetHasPictureInPictureVideo(false)
++  // re-runs the update of a hidden tab: SetHasPictureInPictureCommon).
++  void LeavePictureInPicture() {
++    has_pip_video_ = false;
++    if (hidden_) {
++      Update(/*hidden=*/true);
++    }
++  }
++
+   // The page's own play()/pause(), a silent stretch, the end of the stream.
+   void Play() {
+     audible_ = !muted_;
+@@ -58,18 +67,20 @@
+   // MediaStartedPlaying / MediaStoppedPlaying.
+   void SetPlaying(bool playing) {
+     playing_ = playing;
+-    if (hold_.OnPlayingChanged(playing)) {
++    if (hold_.OnPlayingChanged(playing, has_pip_video_)) {
+       Update(/*hidden=*/true);
+     }
+   }
+ 
+   void Update(bool hidden) {
+-    bool held = hold_.ShouldHoldVisibility(hidden, audible_, playing_, [this] {
+-      ++asked_;
+-      return VisibilityHold::Allowed(settings_.background_play,
+-                                     settings_.picture_in_picture,
+-                                     has_pip_video_);
+-    });
++    hidden_ = hidden;
++    bool held = hold_.ShouldHoldVisibility(
++        hidden, audible_, playing_, has_pip_video_, [this] {
++          ++asked_;
++          return VisibilityHold::Allowed(settings_.background_play,
++                                         settings_.picture_in_picture,
++                                         has_pip_video_);
++        });
+     bool visible = !hidden || held;
+     if (visible != page_visible_) {
+       page_visible_ = visible;
+@@ -90,6 +101,7 @@
+   bool playing_ = false;
+   bool muted_ = false;
+   bool has_pip_video_ = false;
++  bool hidden_ = false;
+   std::vector<std::string> events_;
+   int asked_ = 0;
+ };
+@@ -193,6 +205,57 @@
+   EXPECT_FALSE(tab.video_paused());
+ }
+ 
++TEST(TarkVisibilityHoldTest, PausedInPictureInPictureStaysHeld) {
++  // Paused from the Picture in Picture window: YouTube keeps its player (it
++  // tears it down on "hidden"), and play resumes from the window.
++  FakeTab tab({.background_play = false, .picture_in_picture = true});
++  tab.Show();
++  tab.Play();
++  tab.EnterPictureInPicture();
++  tab.Hide();
++  tab.Pause();
++  EXPECT_EQ("visible", tab.visibility_state());
++  tab.Hide();  // A later update (the window moved, occlusion) while paused.
++  EXPECT_EQ("visible", tab.visibility_state());
++  tab.Play();
++  EXPECT_EQ("visible", tab.visibility_state());
++  EXPECT_FALSE(tab.video_paused());
++  EXPECT_EQ(std::vector<std::string>{"visible"}, tab.events());
++}
++
++TEST(TarkVisibilityHoldTest, PictureInPictureClosedWhilePausedReleases) {
++  FakeTab tab;
++  tab.Show();
++  tab.Play();
++  tab.EnterPictureInPicture();
++  tab.Hide();
++  tab.Pause();
++  ASSERT_EQ("visible", tab.visibility_state());
++  tab.LeavePictureInPicture();
++  EXPECT_EQ("hidden", tab.visibility_state());
++  // Exactly one visibilitychange, to hidden.
++  EXPECT_EQ((std::vector<std::string>{"visible", "hidden"}), tab.events());
++  // Nothing re-holds it.
++  tab.Hide();
++  EXPECT_EQ("hidden", tab.visibility_state());
++  EXPECT_EQ(1, tab.asked());
++}
++
++TEST(TarkVisibilityHoldTest, PictureInPictureCloseButtonReleases) {
++  // The window's close button: the window closes first, then the video is
++  // paused (the pause reaches the renderer asynchronously).
++  FakeTab tab({.background_play = false, .picture_in_picture = true});
++  tab.Show();
++  tab.Play();
++  tab.EnterPictureInPicture();
++  tab.Hide();
++  tab.LeavePictureInPicture();
++  EXPECT_EQ("visible", tab.visibility_state());  // Still playing.
++  tab.Pause();
++  EXPECT_EQ("hidden", tab.visibility_state());
++  EXPECT_EQ((std::vector<std::string>{"visible", "hidden"}), tab.events());
++}
++
+ TEST(TarkVisibilityHoldTest, BackgroundPlayOnlyIsHeld) {
+   FakeTab tab({.background_play = true, .picture_in_picture = false});
+   tab.Show();
+diff --color -ruN a/content/browser/web_contents/web_contents_impl.cc b/content/browser/web_contents/web_contents_impl.cc
+--- a/content/browser/web_contents/web_contents_impl.cc	2026-10-29 17:26:39.834032911 +0530
++++ b/content/browser/web_contents/web_contents_impl.cc	2026-10-29 17:28:56.254429923 +0530
+@@ -5305,15 +5305,16 @@
+ 
+   // Tark: Background play and Picture in Picture. A tab playing media with
+   // sound when it's hidden keeps telling its page "visible" while a player
+-  // plays: no visibilitychange, and Blink doesn't pause the hidden video
+-  // (tark_media::VisibilityHold). Only the frame trees are held: the views
+-  // below are hidden as upstream, and GetPageVisibilityState() (and a
+-  // RenderViewHost created while held) still says hidden.
++  // plays or a video is in Picture in Picture: no visibilitychange, and Blink
++  // doesn't pause the hidden video (tark_media::VisibilityHold). Only the
++  // frame trees are held: the views below are hidden as upstream, and
++  // GetPageVisibilityState() (and a RenderViewHost created while held) still
++  // says hidden.
+   const PageVisibilityState frame_tree_visibility =
+       tark_visibility_hold_.ShouldHoldVisibility(
+           page_visibility != PageVisibilityState::kVisible,
+           is_currently_audible_, !tark_playing_players_.empty(),
+-          [this] {
++          has_picture_in_picture_video_, [this] {
+             if (!delegate_) {
+               return false;
+             }
+@@ -12499,10 +12500,13 @@
+     WebContentsObserver::MediaStoppedReason reason) {
+   OPTIONAL_TRACE_EVENT0("content", "WebContentsImpl::MediaStoppedPlaying");
+   // Tark: Background play. A page held "visible" is told "hidden" as soon as
+-  // none of its players plays (paused or ended), before the observers run
+-  // (one of them may delete this WebContents).
++  // none of its players plays (paused or ended) and none of its videos is in
++  // Picture in Picture, before the observers run (one of them may delete this
++  // WebContents). Closing the Picture in Picture window re-runs the update
++  // (SetHasPictureInPictureCommon), which releases it then.
+   tark_playing_players_.erase(id);
+-  if (tark_visibility_hold_.OnPlayingChanged(!tark_playing_players_.empty()) &&
++  if (tark_visibility_hold_.OnPlayingChanged(!tark_playing_players_.empty(),
++                                             has_picture_in_picture_video_) &&
+       !IsBeingDestroyed()) {
+     UpdateVisibilityAndNotifyPageAndView(visibility_, /*is_activity=*/false);
+   }
+diff --color -ruN a/content/public/browser/BUILD.gn b/content/public/browser/BUILD.gn
+--- a/content/public/browser/BUILD.gn	2026-10-29 17:26:39.836656788 +0530
++++ b/content/public/browser/BUILD.gn	2026-10-29 17:27:45.523119627 +0530
+@@ -461,6 +461,7 @@
+     "surface_embed_connector.h",
+     "swap_metrics_driver.h",
+     "synthetic_trial_syncer.h",
++    "tark_picture_in_picture.h",
+     "touch_selection_controller_client_manager.h",
+     "tracing_controller.h",
+     "tracing_delegate.cc",
+diff --color -ruN a/content/public/browser/tark_picture_in_picture.h b/content/public/browser/tark_picture_in_picture.h
+--- a/content/public/browser/tark_picture_in_picture.h	1970-01-01 05:30:00.000000000 +0530
++++ b/content/public/browser/tark_picture_in_picture.h	2026-10-29 17:28:01.715888638 +0530
+@@ -0,0 +1,35 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CONTENT_PUBLIC_BROWSER_TARK_PICTURE_IN_PICTURE_H_
++#define CONTENT_PUBLIC_BROWSER_TARK_PICTURE_IN_PICTURE_H_
++
++#include "content/common/content_export.h"
++
++namespace content {
++
++class WebContents;
++
++namespace tark_media {
++
++// Tark for Android: Picture in Picture on leave. When the user leaves Tark
++// while the current tab plays a video with sound, Tark floats that video in
++// video Picture in Picture (the window requestPictureInPicture() opens),
++// inline or fullscreen, before the tab is hidden.
++
++// Whether `web_contents` plays sound and a video now (or one of its videos is
++// already in Picture in Picture). A muted video doesn't count.
++CONTENT_EXPORT bool CanEnterPictureInPictureOnLeave(WebContents* web_contents);
++
++// Floats the first playing video of `web_contents`. It's a browser-initiated
++// request: no page enterpictureinpicture handler, any number of players, and
++// a page's disablePictureInPicture doesn't stop it. Returns whether it was
++// requested (Blink opens the window asynchronously), or true if a video is
++// already in Picture in Picture.
++CONTENT_EXPORT bool EnterPictureInPictureOnLeave(WebContents* web_contents);
++
++}  // namespace tark_media
++}  // namespace content
++
++#endif  // CONTENT_PUBLIC_BROWSER_TARK_PICTURE_IN_PICTURE_H_
+diff --color -ruN a/third_party/blink/renderer/modules/document_picture_in_picture/picture_in_picture_controller_impl.cc b/third_party/blink/renderer/modules/document_picture_in_picture/picture_in_picture_controller_impl.cc
+--- a/third_party/blink/renderer/modules/document_picture_in_picture/picture_in_picture_controller_impl.cc	2026-10-29 17:26:39.837875350 +0530
++++ b/third_party/blink/renderer/modules/document_picture_in_picture/picture_in_picture_controller_impl.cc	2026-10-29 17:28:19.031094178 +0530
+@@ -244,8 +244,16 @@
+   picture_in_picture_session_.Bind(
+       std::move(session_remote),
+       element->GetDocument().GetTaskRunner(TaskType::kMediaElementEvent));
+-  if (IsElementAllowedInternal(*element, is_immersive,
+-                               /*report_failure=*/true) != Status::kEnabled) {
++  Status status = IsElementAllowedInternal(*element, is_immersive,
++                                          /*report_failure=*/true);
++  // Tark: Picture in Picture on leave. A browser-initiated request (no
++  // promise, not immersive: Tark floating the tab's playing video when the
++  // user leaves, or the media notification's button) isn't stopped by the
++  // page's disablePictureInPicture. The page's own requests still are.
++  if (status == Status::kDisabledByAttribute && !resolver && !is_immersive) {
++    status = Status::kEnabled;
++  }
++  if (status != Status::kEnabled) {
+     if (resolver &&
+         IsInParallelAlgorithmRunnable(resolver->GetExecutionContext(),
+                                       resolver->GetScriptState())) {
