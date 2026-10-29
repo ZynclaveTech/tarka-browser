@@ -1,0 +1,111 @@
+diff --color -ruN a/chrome/android/java/src/org/chromium/chrome/browser/app/ChromeActivity.java b/chrome/android/java/src/org/chromium/chrome/browser/app/ChromeActivity.java
+--- a/chrome/android/java/src/org/chromium/chrome/browser/app/ChromeActivity.java	2026-10-29 14:52:08.572843333 +0530
++++ b/chrome/android/java/src/org/chromium/chrome/browser/app/ChromeActivity.java	2026-10-29 14:53:07.067093733 +0530
+@@ -273,6 +273,7 @@
+ import org.chromium.content_public.browser.ChildProcessLauncherHelper;
+ import org.chromium.content_public.browser.ContentFeatureList;
+ import org.chromium.content_public.browser.DeviceUtils;
++import org.chromium.content_public.browser.MediaSession;
+ import org.chromium.content_public.browser.HostZoomMap;
+ import org.chromium.content_public.browser.LoadUrlParams;
+ import org.chromium.content_public.browser.SelectionPopupController;
+@@ -1567,6 +1568,21 @@
+             return;
+         }
+ 
++        // TARK PIP SPIKE (throwaway): a tab playing controllable media floats
++        // its playing video through Chromium's video Picture in Picture (the one
++        // requestPictureInPicture() uses), inline or fullscreen, instead of the
++        // fullscreen-only activity PiP below. 10 = MediaSessionAction
++        // kEnterPictureInPicture.
++        Tab tarkTab = getActivityTab();
++        WebContents tarkContents = tarkTab != null ? tarkTab.getWebContents() : null;
++        MediaSession tarkSession =
++                tarkContents != null ? MediaSession.fromWebContents(tarkContents) : null;
++        if (tarkSession != null && tarkSession.isControllable()) {
++            Log.i(TAG, "Tark PiP spike: entering video PiP");
++            tarkSession.didReceiveAction(10);
++            return;
++        }
++
+         FullscreenVideoPictureInPictureController controller =
+                 ensureFullscreenVideoPictureInPictureController();
+         if (controller != null) {
+diff --color -ruN a/content/browser/media/session/media_session_impl.cc b/content/browser/media/session/media_session_impl.cc
+--- a/content/browser/media/session/media_session_impl.cc	2026-10-29 14:51:43.613779885 +0530
++++ b/content/browser/media/session/media_session_impl.cc	2026-10-29 14:52:33.877925603 +0530
+@@ -1705,6 +1705,24 @@
+ void MediaSessionImpl::DidReceiveAction(
+     media_session::mojom::MediaSessionAction action,
+     blink::mojom::MediaSessionActionDetailsPtr details) {
++  // TARK PIP SPIKE (throwaway): Java's MediaSession.didReceiveAction(
++  // ENTER_PICTURE_IN_PICTURE) comes with no details. Float the first playing
++  // video player directly (not the page's handler, and whether or not there
++  // is exactly one player).
++  if (action ==
++          media_session::mojom::MediaSessionAction::kEnterPictureInPicture &&
++      !details) {
++    for (const auto& player : normal_players_) {
++      if (player.first.observer->HasVideo(player.first.player_id) &&
++          !player.first.observer->IsPaused(player.first.player_id)) {
++        player.first.observer->OnEnterPictureInPicture(player.first.player_id,
++                                                       std::nullopt);
++        return;
++      }
++    }
++    return;
++  }
++
+   // Pause all players in non-routed frames if the action is PAUSE.
+   //
+   // This is the default PAUSE action handler per Media Session API spec. The
+diff --color -ruN a/content/browser/web_contents/web_contents_impl.cc b/content/browser/web_contents/web_contents_impl.cc
+--- a/content/browser/web_contents/web_contents_impl.cc	2026-10-29 14:51:42.705244156 +0530
++++ b/content/browser/web_contents/web_contents_impl.cc	2026-10-29 14:52:22.119469811 +0530
+@@ -5302,6 +5302,16 @@
+   PageVisibilityState page_visibility =
+       CalculatePageVisibilityState(new_visibility);
+ 
++  // TARK PIP SPIKE (throwaway): while this tab's media is audible, the page's
++  // script keeps seeing "visible" (no visibilitychange, and
++  // WebMediaPlayerImpl's IsPageHidden() stays false, so it doesn't pause).
++  // The widget itself is still hidden below.
++  PageVisibilityState frame_tree_visibility = page_visibility;
++  if (page_visibility != PageVisibilityState::kVisible &&
++      IsCurrentlyAudible()) {
++    frame_tree_visibility = PageVisibilityState::kVisible;
++  }
++
+   TRACE_EVENT1("content",
+                "WebContentsImpl::UpdateVisibilityAndNotifyPageAndView",
+                "page_visibility", page_visibility);
+@@ -5351,7 +5361,7 @@
+ 
+             render_view_host->SetFrameTreeVisibility(page_visibility);
+           },
+-          page_visibility);
++          frame_tree_visibility);
+ 
+   if (page_visibility != PageVisibilityState::kHidden) {
+     // This shows the Page before showing the individual RenderWidgets, as
+diff --color -ruN a/third_party/blink/renderer/modules/document_picture_in_picture/picture_in_picture_controller_impl.cc b/third_party/blink/renderer/modules/document_picture_in_picture/picture_in_picture_controller_impl.cc
+--- a/third_party/blink/renderer/modules/document_picture_in_picture/picture_in_picture_controller_impl.cc	2026-10-29 14:51:45.626152915 +0530
++++ b/third_party/blink/renderer/modules/document_picture_in_picture/picture_in_picture_controller_impl.cc	2026-10-29 14:52:46.513361907 +0530
+@@ -244,8 +244,15 @@
+   picture_in_picture_session_.Bind(
+       std::move(session_remote),
+       element->GetDocument().GetTaskRunner(TaskType::kMediaElementEvent));
+-  if (IsElementAllowedInternal(*element, is_immersive,
+-                               /*report_failure=*/true) != Status::kEnabled) {
++  Status status = IsElementAllowedInternal(*element, is_immersive,
++                                          /*report_failure=*/true);
++  // TARK PIP SPIKE (throwaway): a browser-initiated request (no promise, not
++  // immersive: MediaSession's RequestEnterPictureInPicture) ignores the
++  // page's disablePictureInPicture. The page's own request still honours it.
++  if (status == Status::kDisabledByAttribute && !resolver && !is_immersive) {
++    status = Status::kEnabled;
++  }
++  if (status != Status::kEnabled) {
+     if (resolver &&
+         IsInParallelAlgorithmRunnable(resolver->GetExecutionContext(),
+                                       resolver->GetScriptState())) {
