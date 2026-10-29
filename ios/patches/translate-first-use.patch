@@ -1,0 +1,366 @@
+diff --git a/BrowserKit/Sources/TarkTranslate/TarkModelsCard.swift b/BrowserKit/Sources/TarkTranslate/TarkModelsCard.swift
+new file mode 100644
+index 0000000..5112369
+--- /dev/null
++++ b/BrowserKit/Sources/TarkTranslate/TarkModelsCard.swift
+@@ -0,0 +1,199 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++import SwiftUI
++import TarkXlit
++import UIKit
++
++/// Tark: the first-use card for page translation. When a page needs a model
++/// that is not on the phone yet, it says what and how big, downloads on
++/// Wi-Fi (or now, on mobile data, if the person says so), shows progress,
++/// and answers whether translation can go ahead. Nothing downloads without a
++/// tap.
++@MainActor
++public enum TarkModelsCard {
++    /// True when every model `source` → `target` needs is on the phone,
++    /// asking and downloading first if not; false when the person said not
++    /// now (or closed the card).
++    public static func ensureModels(from source: String,
++                                    to target: String,
++                                    presentingFrom presenter: UIViewController?,
++                                    models: TarkTranslateModels = .shared) async -> Bool {
++        let missing = TarkTranslateModels.directions(from: source, to: target).filter { !models.isReady($0) }
++        guard !missing.isEmpty else { return true }
++        guard let presenter = presenter.map(topmost) else { return false }
++
++        return await withCheckedContinuation { continuation in
++            let state = CardState(source: source, target: target, missing: missing, models: models)
++            let host = UIHostingController(rootView: CardView(state: state))
++            host.view.backgroundColor = .systemBackground
++            if let sheet = host.sheetPresentationController {
++                sheet.detents = [.medium()]
++                sheet.prefersGrabberVisible = true
++            }
++            state.finish = { [weak host] ready in
++                state.finish = nil
++                state.cancel()
++                host?.dismiss(animated: true)
++                continuation.resume(returning: ready)
++            }
++            host.presentationController?.delegate = state
++            presenter.present(host, animated: true)
++        }
++    }
++
++    private static func topmost(_ controller: UIViewController) -> UIViewController {
++        var top = controller
++        while let presented = top.presentedViewController, !presented.isBeingDismissed {
++            top = presented
++        }
++        return top
++    }
++}
++
++@MainActor
++private final class CardState: NSObject, ObservableObject, UIAdaptivePresentationControllerDelegate {
++    enum Phase: Equatable {
++        case asking
++        case waitingForWiFi
++        case downloading
++        case failed
++    }
++
++    @Published var phase: Phase = .asking
++    @Published var done: Int64 = 0
++
++    let title: String
++    let total: Int64
++    var finish: ((Bool) -> Void)?
++
++    private let missing: [TarkTranslateModels.Direction]
++    private let models: TarkTranslateModels
++    private var task: Task<Void, Never>?
++
++    init(source: String, target: String, missing: [TarkTranslateModels.Direction], models: TarkTranslateModels) {
++        self.missing = missing
++        self.models = models
++        self.total = missing.reduce(0) { $0 + TarkTranslateModels.size($1) }
++        self.title = "\(Self.name(source)) → \(Self.name(target))"
++    }
++
++    var size: String { Self.megabytes(total) }
++    var progressText: String { "\(Self.megabytes(done)) of \(size)" }
++
++    func start(now: Bool) {
++        task?.cancel()
++        task = Task { [weak self] in
++            guard let self else { return }
++            while !Task.isCancelled {
++                if !now, await !TarkXlitDownloader.isUnmeteredNetwork() {
++                    self.phase = .waitingForWiFi
++                    // Tries again when the phone may have joined Wi-Fi.
++                    try? await Task.sleep(nanoseconds: 5_000_000_000)
++                    continue
++                }
++                self.phase = .downloading
++                if await self.downloadMissing() {
++                    self.finish?(true)
++                } else if !Task.isCancelled {
++                    self.phase = .failed
++                }
++                return
++            }
++        }
++    }
++
++    private func downloadMissing() async -> Bool {
++        var before: Int64 = 0
++        for direction in missing {
++            let base = before
++            let outcome = await models.download(direction, now: true) { [weak self] bytes, _ in
++                Task { @MainActor in self?.done = base + bytes }
++            }
++            guard case .ready = outcome else { return false }
++            before += TarkTranslateModels.size(direction)
++        }
++        return true
++    }
++
++    func cancel() {
++        task?.cancel()
++        task = nil
++    }
++
++    func presentationControllerDidDismiss(_ presentationController: UIPresentationController) {
++        finish?(false)
++    }
++
++    private static func name(_ code: String) -> String {
++        return Locale.current.localizedString(forLanguageCode: code) ?? code
++    }
++
++    private static func megabytes(_ bytes: Int64) -> String {
++        return ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
++    }
++}
++
++private struct CardView: View {
++    @ObservedObject var state: CardState
++
++    var body: some View {
++        VStack(alignment: .leading, spacing: 16) {
++            Text(verbatim: "Getting translation ready")
++                .font(.title3.bold())
++            Text(verbatim: state.title)
++                .font(.headline)
++                .foregroundStyle(.secondary)
++            Text(verbatim: description)
++                .font(.body)
++                .fixedSize(horizontal: false, vertical: true)
++
++            switch state.phase {
++            case .asking:
++                primary("Download · \(state.size)") { state.start(now: false) }
++                secondary("Not now") { state.finish?(false) }
++            case .waitingForWiFi:
++                Label { Text(verbatim: "Waiting for Wi-Fi") } icon: { ProgressView() }
++                primary("Download now on mobile data") { state.start(now: true) }
++                secondary("Not now") { state.finish?(false) }
++            case .downloading:
++                ProgressView(value: Double(state.done), total: Double(max(state.total, 1)))
++                    .tint(.indigo)
++                Text(verbatim: state.progressText)
++                    .font(.footnote.monospacedDigit())
++                    .foregroundStyle(.secondary)
++                secondary("Cancel") { state.finish?(false) }
++            case .failed:
++                Text(verbatim: "The download didn't finish. Check the connection and try again.")
++                    .font(.footnote)
++                    .foregroundStyle(.red)
++                primary("Try again") { state.start(now: false) }
++                secondary("Not now") { state.finish?(false) }
++            }
++            Spacer(minLength: 0)
++        }
++        .padding(24)
++    }
++
++    private var description: String {
++        return "Tark translates pages on your iPhone with its own model, so pages never leave your phone. "
++            + "The model downloads once (\(state.size)). Tark uses Wi-Fi for it unless you choose mobile data."
++    }
++
++    private func primary(_ title: String, action: @escaping () -> Void) -> some View {
++        Button(action: action) {
++            Text(verbatim: title).font(.body.bold()).frame(maxWidth: .infinity)
++        }
++        .buttonStyle(.borderedProminent)
++        .tint(.indigo)
++        .controlSize(.large)
++    }
++
++    private func secondary(_ title: String, action: @escaping () -> Void) -> some View {
++        Button(action: action) {
++            Text(verbatim: title).frame(maxWidth: .infinity)
++        }
++        .controlSize(.large)
++    }
++}
+diff --git a/BrowserKit/Sources/TarkTranslate/TarkTranslateModels.swift b/BrowserKit/Sources/TarkTranslate/TarkTranslateModels.swift
+index 7eb2e01..0583d05 100644
+--- a/BrowserKit/Sources/TarkTranslate/TarkTranslateModels.swift
++++ b/BrowserKit/Sources/TarkTranslate/TarkTranslateModels.swift
+@@ -52,6 +52,15 @@ public final class TarkTranslateModels: NSObject, @unchecked Sendable, URLSessio
+         return TarkTranslateFiles.table.keys.filter { $0.hasPrefix(direction.rawValue + "/") }.sorted()
+     }
+ 
++    /// The models a translation from `source` into `target` goes through
++    /// (Indian ↔ Indian needs both).
++    public static func directions(from source: String, to target: String) -> [Direction] {
++        var directions: [Direction] = []
++        if source != "en" { directions.append(.indicToEnglish) }
++        if target != "en" { directions.append(.englishToIndic) }
++        return directions
++    }
++
+     /// The download size of `direction`.
+     public static func size(_ direction: Direction) -> Int64 {
+         return names(direction).reduce(0) { $0 + (TarkTranslateFiles.table[$1]?.size ?? 0) }
+@@ -95,7 +104,8 @@ public final class TarkTranslateModels: NSObject, @unchecked Sendable, URLSessio
+ 
+     /// Downloads what `direction` still needs. Cellular or a constrained
+     /// network waits unless `now` (the person chose "Download now").
+-    /// `progress` gets the bytes of `direction` checked so far after each file.
++    /// `progress` gets the bytes of `direction` so far and its total, as they
++    /// arrive.
+     public func download(_ direction: Direction,
+                          now: Bool,
+                          progress: (@Sendable (Int64, Int64) -> Void)? = nil) async -> Outcome {
+@@ -109,7 +119,8 @@ public final class TarkTranslateModels: NSObject, @unchecked Sendable, URLSessio
+                 var fetched = false
+                 for _ in 0..<Self.triesPerRun where !fetched {
+                     if Task.isCancelled { return .failed }
+-                    fetched = await fetch(name)
++                    let before = done
++                    fetched = await fetch(name) { bytes in progress?(before + bytes, total) }
+                 }
+                 if !fetched { return .failed }
+             }
+@@ -124,7 +135,7 @@ public final class TarkTranslateModels: NSObject, @unchecked Sendable, URLSessio
+         try? FileManager.default.removeItem(at: directory.appendingPathComponent(direction.rawValue))
+     }
+ 
+-    private func fetch(_ name: String) async -> Bool {
++    private func fetch(_ name: String, progress: @escaping @Sendable (Int64) -> Void) async -> Bool {
+         guard let pinned = TarkTranslateFiles.table[name] else { return false }
+         let url = Self.baseURL.appendingPathComponent("\(pinned.sha256).bin")
+         // What an earlier, cut-off try left: URLSession's resume data, so the
+@@ -135,9 +146,10 @@ public final class TarkTranslateModels: NSObject, @unchecked Sendable, URLSessio
+         do {
+             if let resumeData = try? Data(contentsOf: resumeFile) {
+                 try? FileManager.default.removeItem(at: resumeFile)
+-                (temporary, response) = try await session.download(resumeFrom: resumeData)
++                (temporary, response) = try await session.download(resumeFrom: resumeData,
++                                                                   delegate: ProgressDelegate(progress))
+             } else {
+-                (temporary, response) = try await session.download(from: url)
++                (temporary, response) = try await session.download(from: url, delegate: ProgressDelegate(progress))
+             }
+         } catch {
+             if let resumeData = (error as? URLError)?.downloadTaskResumeData {
+@@ -164,3 +176,22 @@ public final class TarkTranslateModels: NSObject, @unchecked Sendable, URLSessio
+         return nil
+     }
+ }
++
++/// Reports one file's bytes written so far.
++private final class ProgressDelegate: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
++    private let progress: @Sendable (Int64) -> Void
++
++    init(_ progress: @escaping @Sendable (Int64) -> Void) {
++        self.progress = progress
++    }
++
++    func urlSession(_ session: URLSession,
++                    downloadTask: URLSessionDownloadTask,
++                    didWriteData bytesWritten: Int64,
++                    totalBytesWritten: Int64,
++                    totalBytesExpectedToWrite: Int64) {
++        progress(totalBytesWritten)
++    }
++
++    func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {}
++}
+diff --git a/firefox-ios/Client/Frontend/Translations/Service/TranslationsService.swift b/firefox-ios/Client/Frontend/Translations/Service/TranslationsService.swift
+index 4d1e763..ae29c8b 100644
+--- a/firefox-ios/Client/Frontend/Translations/Service/TranslationsService.swift
++++ b/firefox-ios/Client/Frontend/Translations/Service/TranslationsService.swift
+@@ -4,6 +4,7 @@
+ 
+ import Foundation
+ import Common
++import TarkTranslate
+ import WebKit
+ 
+ /// Default implementation of `TranslationsServiceProtocol`
+@@ -70,8 +71,15 @@ final class TranslationsService: TranslationsServiceProtocol {
+         let webView = try currentWebView(for: windowUUID)
+         // The tab's WKWebView outlives its documents, and prewarming can take seconds.
+         let expectedDocumentId = try await currentDocumentIdJS(on: webView)
+-        // Prewarm resources prior to calling the JS translation API.
+-        await modelsFetcher.prewarmResources(for: pageLanguage, to: targetLanguage)
++        // Tark: the first time a language needs a model, the card asks and
++        // downloads it (Wi-Fi unless the person chooses mobile data).
++        guard await TarkModelsCard.ensureModels(
++            from: pageLanguage,
++            to: targetLanguage,
++            presentingFrom: webView.window?.rootViewController
++        ) else {
++            throw TranslationsServiceError.declinedDownload
++        }
+         try Task.checkCancellation()
+         // Create a bridge to the translations engine.
+         _ = translationsEngine.bridge(to: webView)
+diff --git a/firefox-ios/Client/Frontend/Translations/Service/TranslationsServiceError.swift b/firefox-ios/Client/Frontend/Translations/Service/TranslationsServiceError.swift
+index 0048e28..7b4a19d 100644
+--- a/firefox-ios/Client/Frontend/Translations/Service/TranslationsServiceError.swift
++++ b/firefox-ios/Client/Frontend/Translations/Service/TranslationsServiceError.swift
+@@ -7,6 +7,9 @@ enum TranslationsServiceError: Error, Equatable {
+     case missingWebView
+     /// The page navigated before the translation started, so the request is dropped.
+     case documentChanged
++    /// Tark: the page needs a model that is not on the phone, and the person
++    /// said not now on the download card.
++    case declinedDownload
+     case jsEvaluationFailed(reason: String)
+     case pageLanguageDetectionFailed(description: String)
+     case unknown(domain: String, code: Int)
+@@ -29,6 +32,8 @@ enum TranslationsServiceError: Error, Equatable {
+             return "missing_webview"
+         case .documentChanged:
+             return "document_changed"
++        case .declinedDownload:
++            return "declined_download"
+         case .jsEvaluationFailed(let reason):
+             /// reason is already a stable token like "JS evaluation failed: startTranslationsJS"
+             return "js_evaluation_failed(\(reason))"
+diff --git a/firefox-ios/Client/Frontend/Translations/TranslationsMiddleware.swift b/firefox-ios/Client/Frontend/Translations/TranslationsMiddleware.swift
+index 9ce7fc4..c0557dc 100644
+--- a/firefox-ios/Client/Frontend/Translations/TranslationsMiddleware.swift
++++ b/firefox-ios/Client/Frontend/Translations/TranslationsMiddleware.swift
+@@ -655,6 +655,18 @@ final class TranslationsMiddleware: FeatureFlaggable, Notifiable {
+             guard !Task.isCancelled else { return }
+             let serviceError = TranslationsServiceError.fromUnknown(error)
+             // Not a failure, but the icon and the telemetry flow still have to be closed out.
++            // Tark: nor is "Not now" on the model download card; the button
++            // stays, untranslated, so the person can tap it again.
++            if serviceError == .declinedDownload {
++                dispatchAction(
++                    for: TranslationsActionType.didReceiveErrorTranslating,
++                    with: .inactive,
++                    and: windowUUID,
++                    on: tab
++                )
++                translationFlowIds[windowUUID] = nil
++                return
++            }
+             if serviceError == .documentChanged {
+                 logger.log(
+                     "Translation dropped because the page changed before it started.",
