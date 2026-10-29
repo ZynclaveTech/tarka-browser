@@ -1,0 +1,715 @@
+--- a/components/translate/core/browser/resources/tark_page_translate.js
++++ b/components/translate/core/browser/resources/tark_page_translate.js
+@@ -0,0 +1,328 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// Tark's page translation library. It stands in for the translate
++// element's google.translate.TranslateService, so Chromium's translate.js
++// (cr.googleTranslate) drives it unchanged. Runs in the translate isolated
++// world. The text goes to the computer's own translator: TranslateAgent
++// pulls sentences with __tarkTranslatePull() and returns translations with
++// __tarkTranslatePush(); nothing is sent over the network.
++//
++// Only text nodes change: a block's sentences are translated together and
++// written into its first text node, the block's other text nodes are
++// emptied, and every node's original is kept so restore() is exact. Text
++// the page adds or changes later (JS pages) is translated as it appears.
++(function() {
++  'use strict';
++
++  const SKIP = new Set([
++    'SCRIPT', 'STYLE', 'NOSCRIPT', 'TEMPLATE', 'TEXTAREA', 'INPUT', 'SELECT',
++    'OPTION', 'CODE', 'PRE', 'KBD', 'SAMP', 'SVG', 'MATH', 'CANVAS', 'IFRAME',
++  ]);
++  const INLINE = new Set([
++    'A', 'ABBR', 'B', 'BDI', 'BDO', 'CITE', 'DATA', 'DFN', 'EM', 'FONT', 'I',
++    'LABEL', 'MARK', 'Q', 'S', 'SMALL', 'SPAN', 'STRONG', 'SUB', 'SUP', 'TIME',
++    'U', 'WBR', 'BR',
++  ]);
++  const BATCH = 24;          // Sentences per pull.
++  const SLICE_MS = 8;        // Main-thread work per slice.
++  const DEBOUNCE_MS = 150;   // After the page's mutations.
++
++  // A block: the nearest non-inline ancestor of its text nodes.
++  // unit = {block, nodes: [Text], text, sentences: [string], done}
++  const units = new Map();           // block -> unit
++  const originals = new WeakMap();   // Text -> the page's own text
++  const written = new WeakMap();     // Text -> what Tark wrote
++  const cache = new Map();           // sentence -> translation
++  let queue = [];                    // sentences waiting to be pulled
++  const queued = new Set();
++  const waiting = new Map();         // id -> sentence, pulled, not back
++  let nextId = 1;
++  let active = false;                // Showing translations.
++  let writing = false;
++  let source = '';
++  let target = '';
++  let onProgress = null;
++  let failed = false;
++  const observers = [];
++  let dirty = new Set();
++  let dirtyTimer = 0;
++
++  function skipped(element) {
++    for (let e = element; e; e = e.parentElement) {
++      if (SKIP.has(e.tagName) || e.isContentEditable) return true;
++      if (e.getAttribute('translate') === 'no') return true;
++      if (e.classList && e.classList.contains('notranslate')) return true;
++    }
++    return false;
++  }
++
++  function blockOf(node) {
++    let e = node.parentElement;
++    while (e && INLINE.has(e.tagName) && e.parentElement) e = e.parentElement;
++    return e;
++  }
++
++  function splitSentences(text) {
++    const parts = text.split(/(?<=[.!?।॥])\s+/u);
++    return parts.map(s => s.trim()).filter(s => s.length > 0);
++  }
++
++  function hasLetters(text) {
++    return /\p{L}/u.test(text);
++  }
++
++  // Text nodes of `root` (and same-origin iframes), grouped into units.
++  function collect(root, out) {
++    const doc = root.ownerDocument || root;
++    const walker = doc.createTreeWalker(root, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT, {
++      acceptNode(n) {
++        if (n.nodeType === Node.ELEMENT_NODE) {
++          if (n.tagName === 'IFRAME') {
++            try {
++              if (n.contentDocument && n.contentDocument.body) {
++                watch(n.contentDocument);
++                collect(n.contentDocument.body, out);
++              }
++            } catch (e) { /* Cross-origin: not reachable. */ }
++            return NodeFilter.FILTER_REJECT;
++          }
++          if (n.shadowRoot) collect(n.shadowRoot, out);
++          return SKIP.has(n.tagName) || n.isContentEditable ||
++                  n.getAttribute('translate') === 'no' ||
++                  n.classList.contains('notranslate')
++              ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_SKIP;
++        }
++        return NodeFilter.FILTER_ACCEPT;
++      },
++    });
++    for (let n = walker.nextNode(); n; n = walker.nextNode()) {
++      const block = blockOf(n);
++      if (!block) continue;
++      out.add(block);
++    }
++  }
++
++  // Rebuilds `block`'s unit from its current text nodes.
++  function refresh(block) {
++    if (!block.isConnected || skipped(block)) {
++      units.delete(block);
++      return;
++    }
++    const nodes = [];
++    const walker = block.ownerDocument.createTreeWalker(block, NodeFilter.SHOW_TEXT);
++    for (let n = walker.nextNode(); n; n = walker.nextNode()) {
++      if (blockOf(n) !== block || skipped(n.parentElement)) continue;
++      // The page's own text: a node Tark hasn't written, or one the page
++      // has rewritten since.
++      if (!originals.has(n) || n.data !== written.get(n)) {
++        originals.set(n, n.data);
++        written.delete(n);
++      }
++      nodes.push(n);
++    }
++    const text = nodes.map(n => originals.get(n)).join('').replace(/\s+/g, ' ').trim();
++    if (!hasLetters(text)) {
++      units.delete(block);
++      return;
++    }
++    const old = units.get(block);
++    if (old && old.text === text && old.nodes.length === nodes.length &&
++        old.nodes.every((n, i) => n === nodes[i])) {
++      return;
++    }
++    const unit = {block, nodes, text, sentences: splitSentences(text), done: false};
++    units.set(block, unit);
++    for (const s of unit.sentences) {
++      if (!cache.has(s) && !queued.has(s)) {
++        queued.add(s);
++        queue.push({s, block});
++      }
++    }
++  }
++
++  function visible(block) {
++    if (!block.getBoundingClientRect) return false;
++    const r = block.getBoundingClientRect();
++    const view = block.ownerDocument.defaultView;
++    return r.bottom > 0 && r.top < (view ? view.innerHeight : 0) && r.width > 0;
++  }
++
++  // What's on screen goes first.
++  function prioritize() {
++    const seen = [];
++    const rest = [];
++    for (const item of queue) (visible(item.block) ? seen : rest).push(item);
++    queue = seen.concat(rest);
++  }
++
++  function write(unit) {
++    if (!unit.sentences.every(s => cache.has(s))) return;
++    const translation = unit.sentences.map(s => cache.get(s)).join(' ');
++    writing = true;
++    unit.nodes.forEach((n, i) => {
++      const value = i === 0 ? (/^\s/.test(originals.get(n)) ? ' ' : '') + translation +
++                                  (/\s$/.test(originals.get(n)) ? ' ' : '')
++                            : '';
++      if (n.data !== value) n.data = value;
++      written.set(n, value);
++    });
++    writing = false;
++    unit.done = true;
++  }
++
++  function writeAll() {
++    for (const unit of units.values()) {
++      if (!unit.done) write(unit);
++    }
++    report();
++  }
++
++  function restoreAll() {
++    writing = true;
++    for (const unit of units.values()) {
++      for (const n of unit.nodes) {
++        const original = originals.get(n);
++        // A node the page rewrote while translated keeps the page's text.
++        if (written.has(n) && n.data !== written.get(n)) continue;
++        if (original !== undefined && n.data !== original) n.data = original;
++        written.delete(n);
++      }
++      unit.done = false;
++    }
++    writing = false;
++  }
++
++  function report() {
++    if (!onProgress) return;
++    const total = units.size || 1;
++    let done = 0;
++    for (const unit of units.values()) if (unit.done) done++;
++    // Incremental, like the translate element with IntersectionObserver:
++    // always finished, so Chromium reports the page translated while text
++    // keeps arriving.
++    onProgress(Math.round(100 * done / total), true, 0);
++  }
++
++  // Collects in slices so the page stays responsive.
++  function scan(blocks) {
++    const list = Array.from(blocks);
++    let i = 0;
++    (function slice() {
++      const start = performance.now();
++      while (i < list.length && performance.now() - start < SLICE_MS) refresh(list[i++]);
++      if (i < list.length) {
++        setTimeout(slice, 0);
++      } else {
++        prioritize();
++        if (active) writeAll();
++      }
++    })();
++  }
++
++  function onMutations(records) {
++    if (writing || !active) return;
++    for (const r of records) {
++      if (r.type === 'characterData') {
++        const block = blockOf(r.target);
++        if (block) dirty.add(block);
++      } else {
++        const block = r.target.nodeType === Node.TEXT_NODE ? blockOf(r.target) : r.target;
++        if (block) dirty.add(block);
++        for (const n of r.addedNodes) {
++          if (n.nodeType === Node.TEXT_NODE) {
++            const b = blockOf(n);
++            if (b) dirty.add(b);
++          } else if (n.nodeType === Node.ELEMENT_NODE) {
++            const found = new Set();
++            collect(n, found);
++            for (const b of found) dirty.add(b);
++          }
++        }
++      }
++    }
++    clearTimeout(dirtyTimer);
++    dirtyTimer = setTimeout(() => {
++      const blocks = dirty;
++      dirty = new Set();
++      scan(blocks);
++    }, DEBOUNCE_MS);
++  }
++
++  function watch(doc) {
++    if (observers.some(o => o.doc === doc)) return;
++    const observer = new MutationObserver(onMutations);
++    observer.observe(doc, {childList: true, characterData: true, subtree: true});
++    observers.push({doc, observer});
++  }
++
++  // Called by TranslateAgent: up to BATCH sentences as [[id, text], ...].
++  window.__tarkTranslatePull = function() {
++    if (!active || failed) return [];
++    const out = [];
++    while (queue.length && out.length < BATCH) {
++      const {s} = queue.shift();
++      queued.delete(s);
++      if (cache.has(s)) continue;
++      const id = nextId++;
++      waiting.set(id, s);
++      out.push([id, s]);
++    }
++    return out;
++  };
++
++  // Called by TranslateAgent with the translations of `ids`, or ok=false.
++  window.__tarkTranslatePush = function(ids, translations, ok) {
++    if (!ok) {
++      ids.forEach(id => waiting.delete(id));
++      failed = true;
++      if (onProgress) onProgress(0, true, 1);
++      return;
++    }
++    ids.forEach((id, i) => {
++      const s = waiting.get(id);
++      waiting.delete(id);
++      if (s !== undefined && translations[i]) cache.set(s, translations[i]);
++    });
++    if (active) writeAll();
++  };
++
++  const service = {
++    isAvailable() {
++      return true;
++    },
++    getDetectedLanguage() {
++      return source;
++    },
++    translatePage(sourceLang, targetLang, progress) {
++      if (sourceLang !== source || targetLang !== target) {
++        cache.clear();
++        units.clear();
++        queue = [];
++        queued.clear();
++      }
++      source = sourceLang;
++      target = targetLang;
++      onProgress = progress;
++      failed = false;
++      active = true;
++      watch(document);
++      const blocks = new Set();
++      if (document.body) collect(document.body, blocks);
++      for (const unit of units.values()) blocks.add(unit.block);
++      scan(blocks);
++    },
++    restore() {
++      active = false;
++      restoreAll();
++    },
++  };
++
++  window.google = window.google || {};
++  google.translate = google.translate || {};
++  google.translate.TranslateService = function() {
++    return service;
++  };
++  cr.googleTranslate.onTranslateElementLoad();
++})();
+--- a/components/resources/translate_resources.grdp
++++ b/components/resources/translate_resources.grdp
+@@ -1,4 +1,5 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <grit-part>
++  <include name="IDR_TARK_PAGE_TRANSLATE_JS" file="../translate/core/browser/resources/tark_page_translate.js" type="BINDATA" />
+   <include name="IDR_TRANSLATE_JS" file="../translate/core/browser/resources/translate.js" type="BINDATA" />
+ </grit-part>
+--- a/components/translate/core/browser/translate_script.cc
++++ b/components/translate/core/browser/translate_script.cc
+@@ -99,6 +99,21 @@
+     return;
+   }
+ 
++  // Tark: pages are translated on the computer by Tark's own library
++  // (tark_page_translate.js), which needs nothing from the network. Only an
++  // explicit --translate-script-url (the user's own server) fetches.
++  if (!base::CommandLine::ForCurrentProcess()->HasSwitch(
++          translate::switches::kTranslateScriptURL)) {
++    base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
++        FROM_HERE,
++        base::BindOnce(
++            &TranslateScript::OnScriptFetchComplete,
++            weak_method_factory_.GetWeakPtr(), true,
++            ui::ResourceBundle::GetSharedInstance().LoadDataResourceString(
++                IDR_TARK_PAGE_TRANSLATE_JS)));
++    return;
++  }
++
+   GURL translate_script_url = GetTranslateScriptURL();
+ 
+   if (base::FeatureList::IsEnabled(kTranslateElementRegionalization)) {
+--- a/components/translate/content/common/translate.mojom
++++ b/components/translate/content/common/translate.mojom
+@@ -113,6 +113,14 @@
+       mojo_base.mojom.String16 contents, string pdf_lang, url.mojom.Url url);
+ };
+ 
++// Tark: translates a page's sentences on the computer. Bound per main
++// frame through the frame's BrowserInterfaceBroker; the browser knows the
++// tab's source and target languages. `ok` is false when the pair has no
++// model or one is not downloaded yet.
++interface TarkPageTranslateHost {
++  Translate(array<string> sentences) => (bool ok, array<string> translations);
++};
++
+ // Reports when page is ready for translation. This is used by the
+ // renderer of a main frame to report its detected language to the
+ // browser process and provides the translation interface back to itself.
+--- a/components/translate/content/renderer/translate_agent.h
++++ b/components/translate/content/renderer/translate_agent.h
+@@ -14,6 +14,7 @@
+ #include "base/memory/weak_ptr.h"
+ #include "base/task/single_thread_task_runner.h"
+ #include "base/time/time.h"
++#include "base/timer/timer.h"
+ #include "components/language_detection/content/renderer/language_detection_agent.h"
+ #include "components/translate/content/common/translate.mojom.h"
+ #include "components/translate/core/common/translate_errors.h"
+@@ -208,6 +209,19 @@
+ 
+   mojo::Receiver<mojom::TranslateAgent> receiver_{this};
+ 
++  // Tark: while a page is translated with Tark's library (no
++  // --translate-script-url), its sentences are pulled from the isolated
++  // world and translated by the browser's TarkPageTranslateHost.
++  void StartTarkPump();
++  void StopTarkPump();
++  void PumpTark();
++  void OnTarkTranslated(std::vector<int> ids,
++                        bool ok,
++                        const std::vector<std::string>& translations);
++  base::RepeatingTimer tark_pump_;
++  bool tark_in_flight_ = false;
++  mojo::Remote<mojom::TarkPageTranslateHost> tark_host_;
++
+   // Method factory used to make calls to TranslatePageImpl.
+   base::WeakPtrFactory<TranslateAgent> weak_method_factory_{this};
+ 
+--- a/components/translate/content/renderer/translate_agent.cc
++++ b/components/translate/content/renderer/translate_agent.cc
+@@ -14,6 +14,8 @@
+ #include "base/compiler_specific.h"
+ #include "base/feature_list.h"
+ #include "base/functional/bind.h"
++#include "base/json/json_reader.h"
++#include "base/json/json_writer.h"
+ #include "base/json/string_escape.h"
+ #include "base/location.h"
+ #include "base/metrics/histogram_functions.h"
+@@ -32,6 +34,7 @@
+ #include "components/translate/core/common/translate_constants.h"
+ #include "components/translate/core/common/translate_features.h"
+ #include "components/translate/core/common/translate_metrics.h"
++#include "components/translate/core/common/translate_switches.h"
+ #include "components/translate/core/common/translate_util.h"
+ #include "components/translate/core/language_detection/language_detection_model.h"
+ #include "components/translate/core/language_detection/language_detection_util.h"
+@@ -532,6 +535,9 @@
+   }
+ 
+   TranslatePageImpl(0);
++  if (weak_this) {
++    StartTarkPump();
++  }
+ }
+ 
+ void TranslateAgent::RevertTranslation() {
+@@ -547,6 +553,7 @@
+   }
+ 
+   CancelPendingTranslation();
++  StopTarkPump();
+ 
+   ExecuteScript("cr.googleTranslate.revert()");
+ }
+@@ -719,6 +726,7 @@
+ }
+ 
+ void TranslateAgent::ResetPage() {
++  StopTarkPump();
+   last_details_ = {};
+   receiver_.reset();
+   translate_callback_pending_.Reset();
+@@ -729,6 +737,94 @@
+   delete this;
+ }
+ 
++void TranslateAgent::StartTarkPump() {
++  if (base::CommandLine::ForCurrentProcess()->HasSwitch(
++          translate::switches::kTranslateScriptURL)) {
++    return;  // The user's own translate server: Chromium's path.
++  }
++  // Every 100 ms; text a page adds is translated well within a second.
++  tark_pump_.Start(FROM_HERE, base::Milliseconds(100),
++                   base::BindRepeating(&TranslateAgent::PumpTark,
++                                       base::Unretained(this)));
++}
++
++void TranslateAgent::StopTarkPump() {
++  tark_pump_.Stop();
++}
++
++void TranslateAgent::PumpTark() {
++  if (tark_in_flight_) {
++    return;
++  }
++  auto weak_this = weak_pointer_factory_.GetWeakPtr();
++  const std::string pulled = ExecuteScriptAndGetStringResult(
++      "window.__tarkTranslatePull ? JSON.stringify(__tarkTranslatePull()) : '[]'");
++  if (!weak_this) {
++    return;
++  }
++  std::optional<base::Value> batch =
++      base::JSONReader::Read(pulled, base::JSON_PARSE_RFC);
++  if (!batch || !batch->is_list() || batch->GetList().empty()) {
++    return;
++  }
++  std::vector<int> ids;
++  std::vector<std::string> sentences;
++  for (const base::Value& item : batch->GetList()) {
++    if (!item.is_list() || item.GetList().size() != 2 ||
++        !item.GetList()[0].is_int() || !item.GetList()[1].is_string()) {
++      continue;
++    }
++    ids.push_back(item.GetList()[0].GetInt());
++    sentences.push_back(item.GetList()[1].GetString());
++  }
++  if (ids.empty()) {
++    return;
++  }
++  if (!tark_host_.is_bound()) {
++    render_frame()->GetBrowserInterfaceBroker().GetInterface(
++        tark_host_.BindNewPipeAndPassReceiver());
++    tark_host_.reset_on_disconnect();
++  }
++  tark_in_flight_ = true;
++  tark_host_->Translate(
++      sentences, base::BindOnce(&TranslateAgent::OnTarkTranslated,
++                                weak_pointer_factory_.GetWeakPtr(), ids));
++}
++
++void TranslateAgent::OnTarkTranslated(
++    std::vector<int> ids,
++    bool ok,
++    const std::vector<std::string>& translations) {
++  tark_in_flight_ = false;
++  WebLocalFrame* main_frame = render_frame()->GetWebFrame();
++  if (!main_frame) {
++    return;
++  }
++  base::Value::List id_list;
++  for (int id : ids) {
++    id_list.Append(id);
++  }
++  base::Value::List text_list;
++  if (ok && translations.size() == ids.size()) {
++    for (const std::string& text : translations) {
++      text_list.Append(text);
++    }
++  } else {
++    ok = false;
++  }
++  const std::string script =
++      "window.__tarkTranslatePush && __tarkTranslatePush(" +
++      base::WriteJson(id_list).value_or("[]") + "," +
++      base::WriteJson(text_list).value_or("[]") + "," + (ok ? "true" : "false") +
++      ")";
++  main_frame->ExecuteScriptInIsolatedWorld(
++      world_id_, WebScriptSource(WebString::FromUTF8(script)),
++      blink::BackForwardCacheAware::kAllow);
++  if (!ok) {
++    StopTarkPump();
++  }
++}
++
+ /* static */
+ std::string TranslateAgent::BuildTranslationScript(
+     const std::string& source_lang,
+--- a/chrome/test/data/tark_translate/adds_by_timer.html
++++ b/chrome/test/data/tark_translate/adds_by_timer.html
+@@ -0,0 +1,11 @@
++<!doctype html><meta charset="utf-8"><script src="harness.js"></script>
++<body><div id=feed><p>पहली खबर</p></div>
++<script>tarkTest(async t => {
++  t.translate(); await t.sleep(600);
++  const p = document.createElement('p'); p.id = 'new'; p.textContent = 'नई खबर आई';
++  document.querySelector('#feed').appendChild(p);
++  await t.sleep(1000);
++  t.check(t.text('#new') === t.tr('नई खबर आई'), 'added text after 1s: ' + t.text('#new'));
++  t.service.restore();
++  t.check(t.text('#new') === 'नई खबर आई', 'restore added');
++});</script>
+--- a/chrome/test/data/tark_translate/harness.js
++++ b/chrome/test/data/tark_translate/harness.js
+@@ -0,0 +1,33 @@
++// Tark page translation test harness: Chromium's translate.js stand-in,
++// a fake translator (upper case, 100 ms polling like TranslateAgent) and
++// assertions. Each page calls tarkTest(async (t) => {...}).
++window.cr = {googleTranslate: {onTranslateElementLoad() {}}};
++window.tarkPushes = 0;
++function tarkPump() {
++  const batch = window.__tarkTranslatePull ? __tarkTranslatePull() : [];
++  if (batch.length) {
++    tarkPushes++;
++    __tarkTranslatePush(batch.map(b => b[0]), batch.map(b => '⟦' + b[1] + '⟧'), true);
++  }
++}
++setInterval(tarkPump, 100);
++const sleep = ms => new Promise(r => setTimeout(r, ms));
++function tarkTest(body) {
++  const lib = document.createElement('script');
++  lib.src = '/components/translate/core/browser/resources/tark_page_translate.js';
++  lib.onload = async () => {
++    const service = google.translate.TranslateService();
++    const t = {
++      service, fails: [],
++      translate() { service.translatePage('hi', 'en', () => {}); },
++      check(cond, msg) { if (!cond) t.fails.push(msg); },
++      tree() { return Array.from(document.body.querySelectorAll('*')).map(e => e.tagName).join(','); },
++      text(sel) { return document.querySelector(sel).textContent; },
++      sleep,
++      tr(text) { return text.split(/(?<=[.!?।॥])\s+/u).map(s => '⟦' + s.trim() + '⟧').join(' '); },
++    };
++    try { await body(t); } catch (e) { t.fails.push('threw: ' + e); }
++    document.title = t.fails.length ? 'FAIL: ' + t.fails.join(' | ') : 'PASS';
++  };
++  document.head.appendChild(lib);
++}
+--- a/chrome/test/data/tark_translate/iframe_same.html
++++ b/chrome/test/data/tark_translate/iframe_same.html
+@@ -0,0 +1,7 @@
++<!doctype html><meta charset="utf-8"><script src="harness.js"></script>
++<body><p>बाहर</p><iframe id=f srcdoc="<p id=in>अंदर</p>"></iframe>
++<script>tarkTest(async t => {
++  await t.sleep(300); t.translate(); await t.sleep(800);
++  const inner = document.querySelector('#f').contentDocument.querySelector('#in');
++  t.check(inner.textContent === t.tr('अंदर'), 'iframe: ' + inner.textContent);
++});</script>
+--- a/chrome/test/data/tark_translate/index.html
++++ b/chrome/test/data/tark_translate/index.html
+@@ -0,0 +1,16 @@
++<!doctype html><meta charset="utf-8"><title>runner</title><body><pre id=out></pre>
++<script>
++const cases = ['static','skips','split_link','adds_by_timer','rewrites','pushstate','iframe_same','long'];
++(async () => {
++  const out = document.querySelector('#out'); let all = true;
++  for (const c of cases) {
++    const f = document.createElement('iframe'); f.style.width = '800px'; f.style.height = '400px';
++    f.src = c + '.html'; document.body.appendChild(f);
++    let title = '';
++    for (let i = 0; i < 100 && !/^(PASS|FAIL)/.test(title); i++) { await new Promise(r => setTimeout(r, 100)); title = f.contentDocument.title; }
++    out.textContent += c + ': ' + (title || 'TIMEOUT') + '\n'; all = all && title === 'PASS';
++    f.remove();
++  }
++  document.title = all ? 'ALL PASS' : 'SOME FAIL';
++})();
++</script>
+--- a/chrome/test/data/tark_translate/long.html
++++ b/chrome/test/data/tark_translate/long.html
+@@ -0,0 +1,11 @@
++<!doctype html><meta charset="utf-8"><script src="harness.js"></script>
++<body><div id=all></div>
++<script>const all = document.querySelector('#all');
++for (let i = 0; i < 5000; i++) { const p = document.createElement('p'); p.textContent = 'पंक्ति ' + i + ' यहाँ है।'; all.appendChild(p); }
++tarkTest(async t => {
++  let worst = 0;
++  new PerformanceObserver(l => { for (const e of l.getEntries()) worst = Math.max(worst, e.duration); }).observe({type: 'longtask'});
++  t.translate(); await t.sleep(2000);
++  t.check(worst <= 50, 'long task ' + worst + ' ms');
++  t.check(all.firstChild.textContent === t.tr('पंक्ति 0 यहाँ है।'), 'first visible: ' + all.firstChild.textContent);
++});</script>
+--- a/chrome/test/data/tark_translate/pushstate.html
++++ b/chrome/test/data/tark_translate/pushstate.html
+@@ -0,0 +1,9 @@
++<!doctype html><meta charset="utf-8"><script src="harness.js"></script>
++<body><main id=m><p>मुख्य पन्ना</p></main>
++<script>tarkTest(async t => {
++  t.translate(); await t.sleep(600);
++  history.pushState({}, '', '#route2');
++  document.querySelector('#m').innerHTML = '<p id=r>दूसरा पन्ना</p>';
++  await t.sleep(1000);
++  t.check(t.text('#r') === t.tr('दूसरा पन्ना'), 'route text: ' + t.text('#r'));
++});</script>
+--- a/chrome/test/data/tark_translate/rewrites.html
++++ b/chrome/test/data/tark_translate/rewrites.html
+@@ -0,0 +1,12 @@
++<!doctype html><meta charset="utf-8"><script src="harness.js"></script>
++<body><p id=c>गिनती 0</p>
++<script>let n = 0; setInterval(() => { document.querySelector('#c').textContent = 'गिनती ' + (++n); }, 1000);
++tarkTest(async t => {
++  t.translate(); await t.sleep(300);
++  const start = tarkPushes; let seen = 0;
++  for (let i = 0; i < 60; i++) { await t.sleep(50); if (t.text('#c') === t.tr('गिनती ' + n)) seen++; }
++  t.check(tarkPushes - start <= 16, 'pushes in 3s: ' + (tarkPushes - start));
++  t.check(seen > 20, 'translated latest text only ' + seen + '/60 samples');
++  t.service.restore();
++  t.check(t.text('#c') === 'गिनती ' + n, 'restore shows latest: ' + t.text('#c') + ' vs ' + n);
++});</script>
+--- a/chrome/test/data/tark_translate/skips.html
++++ b/chrome/test/data/tark_translate/skips.html
+@@ -0,0 +1,15 @@
++<!doctype html><meta charset="utf-8"><script src="harness.js"></script>
++<body><p id=ok>अनुवाद करो</p><input id=i value="इनपुट"><textarea id=ta>लिखो</textarea>
++<div id=ce contenteditable>संपादन</div><code id=c>कोड</code><pre id=pre>पूर्व</pre>
++<p id=no translate="no">नहीं</p><p id=nt class="notranslate">नहीं भी</p>
++<script>tarkTest(async t => {
++  t.translate(); await t.sleep(800);
++  t.check(t.text('#ok') === t.tr('अनुवाद करो'), 'ok not translated');
++  t.check(document.querySelector('#i').value === 'इनपुट', 'input');
++  t.check(t.text('#ta') === 'लिखो', 'textarea');
++  t.check(t.text('#ce') === 'संपादन', 'contenteditable');
++  t.check(t.text('#c') === 'कोड', 'code');
++  t.check(t.text('#pre') === 'पूर्व', 'pre');
++  t.check(t.text('#no') === 'नहीं', 'translate=no');
++  t.check(t.text('#nt') === 'नहीं भी', 'notranslate');
++});</script>
+--- a/chrome/test/data/tark_translate/split_link.html
++++ b/chrome/test/data/tark_translate/split_link.html
+@@ -0,0 +1,10 @@
++<!doctype html><meta charset="utf-8"><script src="harness.js"></script>
++<body><p id=p>पढ़ो <a href="#x">रिपोर्ट</a> आज</p>
++<script>tarkTest(async t => {
++  t.translate(); await t.sleep(800);
++  const p = document.querySelector('#p');
++  t.check(p.querySelector('a') !== null, 'link element gone');
++  t.check(p.textContent.trim() === t.tr('पढ़ो रिपोर्ट आज'), 'p ' + p.textContent);
++  t.service.restore();
++  t.check(p.innerHTML === 'पढ़ो <a href="#x">रिपोर्ट</a> आज', 'restore ' + p.innerHTML);
++});</script>
+--- a/chrome/test/data/tark_translate/static.html
++++ b/chrome/test/data/tark_translate/static.html
+@@ -0,0 +1,11 @@
++<!doctype html><meta charset="utf-8"><script src="harness.js"></script>
++<body><h1>नमस्ते दुनिया</h1><p>पहला वाक्य। दूसरा वाक्य।</p><ul><li>एक</li><li>दो</li></ul>
++<script>tarkTest(async t => {
++  const before = t.tree();
++  t.translate(); await t.sleep(800);
++  t.check(t.text('h1') === t.tr('नमस्ते दुनिया'), 'h1 ' + t.text('h1'));
++  t.check(t.text('p') === t.tr('पहला वाक्य। दूसरा वाक्य।'), 'p ' + t.text('p'));
++  t.check(t.tree() === before, 'tree changed');
++  t.service.restore();
++  t.check(t.text('p') === 'पहला वाक्य। दूसरा वाक्य।', 'restore ' + t.text('p'));
++});</script>
