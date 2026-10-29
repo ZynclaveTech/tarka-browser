@@ -10,7 +10,8 @@ local Hindi page and checks, through DevTools:
   page_translated  The page's Hindi paragraphs turn into English, on the
                    computer (no translate server is reachable: none is set).
   js_text          A paragraph the page adds 3 s later is translated too.
-  link_kept        The link inside a translated sentence is still a link.
+  link_kept        The link inside a translated sentence is still a link,
+                   with translated words of its own to click.
 With --screenshot, the whole screen (the translate bar under the toolbar
 is browser UI, not page) is saved after the checks (ImageMagick's import).
 With --diag, a failed run leaves Tark's log (translate VLOGs on), the text
@@ -159,8 +160,9 @@ def main(argv=None):
         ok, late = wait_text(ws, 'late', 20)
         failed += report(ok, 'js_text', repr(late))
         ok3, t3 = wait_text(ws, 'p3', 20)
-        has_link = e2e.evaluate(ws, "!!document.querySelector('#p3 a#a')")
-        failed += report(ok3 and has_link, 'link_kept', f'{t3!r}, link={has_link}')
+        # The link keeps English words of its own, so it can be clicked.
+        link = e2e.evaluate(ws, "(a => a ? a.textContent : null)(document.querySelector('#p3 a#a'))")
+        failed += report(ok3 and english(link), 'link_kept', f'{t3!r}, link={link!r}')
         if args.screenshot:
             subprocess.run(['import', '-window', 'root', args.screenshot], check=False)
         if failed and args.diag:
