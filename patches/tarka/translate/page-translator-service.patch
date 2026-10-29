@@ -1,0 +1,474 @@
+--- a/media/mojo/mojom/tark_page_translator.mojom
++++ b/media/mojo/mojom/tark_page_translator.mojom
+@@ -0,0 +1,19 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++module media.mojom;
++
++// Tark: translates a web page's sentences on the computer, in the speech
++// recognition utility process (the captions' engine). Bound by the browser
++// through SpeechRecognitionService.BindTarkPageTranslator.
++interface TarkPageTranslator {
++  // `sentences` in `source` ("hi", "ta", "bn", "en", "es") into `target`
++  // ("en", "hi", "ta", "bn"); Indian and Spanish pairs go through English.
++  // `translations` has one entry per sentence, in order. `ok` is false when
++  // the pair has no model or a model fails; `missing` then names the model
++  // folders not on the computer ("it2_indic_en", "it2_en_indic",
++  // "opus_es_en").
++  Translate(array<string> sentences, string source, string target)
++      => (bool ok, array<string> translations, array<string> missing);
++};
+--- a/media/mojo/mojom/BUILD.gn
++++ b/media/mojo/mojom/BUILD.gn
+@@ -61,6 +61,7 @@
+       "speech_recognition_service.mojom",
+       "tark_audio_tap.mojom",
+       "tark_caption_translator.mojom",
++      "tark_page_translator.mojom",
+     ]
+   }
+ 
+--- a/media/mojo/mojom/speech_recognition_service.mojom
++++ b/media/mojo/mojom/speech_recognition_service.mojom
+@@ -11,6 +11,7 @@
+ import "media/mojo/mojom/speech_recognition.mojom";
+ import "media/mojo/mojom/tark_audio_tap.mojom";
+ import "media/mojo/mojom/tark_caption_translator.mojom";
++import "media/mojo/mojom/tark_page_translator.mojom";
+ import "mojo/public/mojom/base/file_path.mojom";
+ import "sandbox/policy/mojom/context.mojom";
+ import "sandbox/policy/mojom/sandbox.mojom";
+@@ -66,6 +67,10 @@
+   // Runtime and models folder given to SetSodaPaths.
+   BindTarkCaptionTranslator(pending_receiver<TarkCaptionTranslator> receiver);
+ 
++  // Tark: a translator for web pages, with the same ONNX Runtime and
++  // models folder. Works with no captions or audio running.
++  BindTarkPageTranslator(pending_receiver<TarkPageTranslator> receiver);
++
+   // Tark (D4 Phase 3): where recognizers open their taps while the call's
+   // language is one macOS captions (the browser's Apple captioners). A new
+   // source replaces the last; one call captions at a time.
+--- a/chrome/services/speech/tark_page_translator.h
++++ b/chrome/services/speech/tark_page_translator.h
+@@ -0,0 +1,60 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_SERVICES_SPEECH_TARK_PAGE_TRANSLATOR_H_
++#define CHROME_SERVICES_SPEECH_TARK_PAGE_TRANSLATOR_H_
++
++#include <string>
++#include <string_view>
++#include <vector>
++
++#include "base/files/file_path.h"
++#include "base/threading/sequence_bound.h"
++#include "base/time/time.h"
++#include "media/mojo/mojom/tark_page_translator.mojom.h"
++#include "mojo/public/cpp/bindings/pending_receiver.h"
++
++namespace speech {
++
++// Tark: web page translation with the captions' TranslationEngine. The
++// models stay loaded while pages are being translated (both of them for a
++// pair that goes through English) and are freed after kIdleUnload.
++class TarkPageTranslator : public media::mojom::TarkPageTranslator {
++ public:
++  static constexpr base::TimeDelta kIdleUnload = base::Minutes(3);
++
++  // Binds a self-owned translator to `receiver`.
++  static void Create(mojo::PendingReceiver<media::mojom::TarkPageTranslator> receiver,
++                     const base::FilePath& ort_dylib,
++                     const base::FilePath& models_dir);
++
++  // The model folders `source` → `target` needs that are not in
++  // `models_dir`, in the order they are used. Empty when nothing is missing
++  // or the pair has no model.
++  static std::vector<std::string> MissingModels(const base::FilePath& models_dir,
++                                                std::string_view source,
++                                                std::string_view target);
++
++  TarkPageTranslator(const base::FilePath& ort_dylib, const base::FilePath& models_dir);
++  TarkPageTranslator(const TarkPageTranslator&) = delete;
++  TarkPageTranslator& operator=(const TarkPageTranslator&) = delete;
++  ~TarkPageTranslator() override;
++
++  // media::mojom::TarkPageTranslator:
++  void Translate(const std::vector<std::string>& sentences,
++                 const std::string& source,
++                 const std::string& target,
++                 TranslateCallback callback) override;
++
++  // Whether a model is in memory now (tests).
++  void IsLoadedForTesting(base::OnceCallback<void(bool)> callback);
++
++ private:
++  class Worker;
++  base::SequenceBound<Worker> worker_;
++};
++
++}  // namespace speech
++
++#endif  // CHROME_SERVICES_SPEECH_TARK_PAGE_TRANSLATOR_H_
+--- a/chrome/services/speech/tark_page_translator.cc
++++ b/chrome/services/speech/tark_page_translator.cc
+@@ -0,0 +1,155 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/services/speech/tark_page_translator.h"
++
++#include <memory>
++#include <optional>
++#include <utility>
++
++#include "base/files/file_util.h"
++#include "base/functional/bind.h"
++#include "base/logging.h"
++#include "base/task/thread_pool.h"
++#include "base/timer/timer.h"
++#include "components/tark_captions/translation_engine.h"
++#include "mojo/public/cpp/bindings/self_owned_receiver.h"
++
++namespace speech {
++
++namespace {
++
++const char* FolderOf(tark_captions::TranslationDirection direction) {
++  switch (direction) {
++    case tark_captions::TranslationDirection::kIndicToEnglish:
++      return "it2_indic_en";
++    case tark_captions::TranslationDirection::kEnglishToIndic:
++      return "it2_en_indic";
++    case tark_captions::TranslationDirection::kSpanishToEnglish:
++      return "opus_es_en";
++  }
++}
++
++// The pair's directions, or empty when it has no model. `target` "" and
++// unknown codes have none.
++std::vector<tark_captions::TranslationDirection> Directions(std::string_view source,
++                                                            std::string_view target) {
++  const std::optional<tark_captions::Target> t = tark_captions::TargetFromCode(target);
++  if (!t || *t == tark_captions::Target::kNone) {
++    return {};
++  }
++  return tark_captions::DirectionsFor(source, *t);
++}
++
++struct Result {
++  bool ok = false;
++  std::vector<std::string> translations;
++  std::vector<std::string> missing;
++};
++
++}  // namespace
++
++// Lives on a thread-pool sequence that may block (model loads, decoding).
++class TarkPageTranslator::Worker {
++ public:
++  Worker(const base::FilePath& ort_dylib, const base::FilePath& models_dir)
++      : ort_dylib_(ort_dylib), models_dir_(models_dir) {}
++
++  Result Translate(const std::vector<std::string>& sentences,
++                   const std::string& source,
++                   const std::string& target) {
++    Result result;
++    if (Directions(source, target).empty()) {
++      return result;
++    }
++    result.missing = MissingModels(models_dir_, source, target);
++    if (!result.missing.empty()) {
++      return result;
++    }
++    if (!engine_) {
++      engine_ = tark_captions::TranslationEngine::Create(models_dir_, ort_dylib_);
++      if (!engine_) {
++        return result;
++      }
++    }
++    const tark_captions::Target t = *tark_captions::TargetFromCode(target);
++    result.translations.reserve(sentences.size());
++    for (const std::string& sentence : sentences) {
++      std::optional<std::string> translation = engine_->TranslateFrom(sentence, source, t);
++      if (!translation) {
++        result.translations.clear();
++        return result;
++      }
++      result.translations.push_back(std::move(*translation));
++    }
++    // Codes and counts only: page content stays out of logs.
++    VLOG(1) << "Tark page translation: " << source << " -> " << target << ", "
++            << sentences.size() << " sentences";
++    result.ok = true;
++    idle_.Start(FROM_HERE, kIdleUnload,
++                base::BindOnce(&Worker::Unload, base::Unretained(this)));
++    return result;
++  }
++
++  bool IsLoaded() const { return !!engine_; }
++
++ private:
++  void Unload() { engine_.reset(); }
++
++  const base::FilePath ort_dylib_;
++  const base::FilePath models_dir_;
++  std::unique_ptr<tark_captions::TranslationEngine> engine_;
++  base::OneShotTimer idle_;
++};
++
++// static
++void TarkPageTranslator::Create(mojo::PendingReceiver<media::mojom::TarkPageTranslator> receiver,
++                                const base::FilePath& ort_dylib,
++                                const base::FilePath& models_dir) {
++  mojo::MakeSelfOwnedReceiver(std::make_unique<TarkPageTranslator>(ort_dylib, models_dir),
++                              std::move(receiver));
++}
++
++// static
++std::vector<std::string> TarkPageTranslator::MissingModels(const base::FilePath& models_dir,
++                                                           std::string_view source,
++                                                           std::string_view target) {
++  std::vector<std::string> missing;
++  for (tark_captions::TranslationDirection direction : Directions(source, target)) {
++    const char* folder = FolderOf(direction);
++    if (models_dir.empty() || !base::DirectoryExists(models_dir.AppendASCII(folder))) {
++      missing.push_back(folder);
++    }
++  }
++  return missing;
++}
++
++TarkPageTranslator::TarkPageTranslator(const base::FilePath& ort_dylib,
++                                       const base::FilePath& models_dir)
++    : worker_(base::ThreadPool::CreateSequencedTaskRunner(
++                  {base::MayBlock(), base::TaskPriority::USER_VISIBLE}),
++              ort_dylib,
++              models_dir) {}
++
++TarkPageTranslator::~TarkPageTranslator() = default;
++
++void TarkPageTranslator::Translate(const std::vector<std::string>& sentences,
++                                   const std::string& source,
++                                   const std::string& target,
++                                   TranslateCallback callback) {
++  worker_.AsyncCall(&Worker::Translate)
++      .WithArgs(sentences, source, target)
++      .Then(base::BindOnce(
++          [](TranslateCallback callback, Result result) {
++            std::move(callback).Run(result.ok, std::move(result.translations),
++                                    std::move(result.missing));
++          },
++          std::move(callback)));
++}
++
++void TarkPageTranslator::IsLoadedForTesting(base::OnceCallback<void(bool)> callback) {
++  worker_.AsyncCall(&Worker::IsLoaded).Then(std::move(callback));
++}
++
++}  // namespace speech
+--- a/chrome/services/speech/tark_page_translator_unittest.cc
++++ b/chrome/services/speech/tark_page_translator_unittest.cc
+@@ -0,0 +1,134 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/services/speech/tark_page_translator.h"
++
++#include <string>
++#include <vector>
++
++#include "base/files/file_util.h"
++#include "base/files/scoped_temp_dir.h"
++#include "base/test/task_environment.h"
++#include "base/test/test_future.h"
++#include "components/tark_captions/test_util.h"
++#include "mojo/public/cpp/bindings/remote.h"
++#include "testing/gmock/include/gmock/gmock.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace speech {
++namespace {
++
++using ::testing::ElementsAre;
++using ::testing::IsEmpty;
++
++struct Translated {
++  bool ok;
++  std::vector<std::string> translations;
++  std::vector<std::string> missing;
++};
++
++class TarkPageTranslatorTest : public testing::Test {
++ protected:
++  void Bind(const base::FilePath& ort, const base::FilePath& models) {
++    TarkPageTranslator::Create(translator_.BindNewPipeAndPassReceiver(), ort, models);
++  }
++  Translated Translate(const std::vector<std::string>& sentences,
++                       const std::string& source,
++                       const std::string& target) {
++    base::test::TestFuture<bool, const std::vector<std::string>&,
++                           const std::vector<std::string>&>
++        done;
++    translator_->Translate(sentences, source, target, done.GetCallback());
++    return {done.Get<0>(), done.Get<1>(), done.Get<2>()};
++  }
++
++  base::test::TaskEnvironment env_{base::test::TaskEnvironment::TimeSource::MOCK_TIME};
++  mojo::Remote<media::mojom::TarkPageTranslator> translator_;
++};
++
++base::FilePath Nowhere() {
++  return base::FilePath(FILE_PATH_LITERAL("/nonexistent"));
++}
++
++TEST(TarkPageTranslatorMissingTest, OneModelForIndianToEnglish) {
++  EXPECT_THAT(TarkPageTranslator::MissingModels(Nowhere(), "hi", "en"),
++              ElementsAre("it2_indic_en"));
++}
++
++TEST(TarkPageTranslatorMissingTest, IndianToIndianGoesThroughEnglish) {
++  EXPECT_THAT(TarkPageTranslator::MissingModels(Nowhere(), "hi", "ta"),
++              ElementsAre("it2_indic_en", "it2_en_indic"));
++}
++
++TEST(TarkPageTranslatorMissingTest, SpanishToIndianGoesThroughEnglish) {
++  EXPECT_THAT(TarkPageTranslator::MissingModels(Nowhere(), "es", "hi"),
++              ElementsAre("opus_es_en", "it2_en_indic"));
++}
++
++TEST(TarkPageTranslatorMissingTest, UnsupportedPairNeedsNothing) {
++  EXPECT_THAT(TarkPageTranslator::MissingModels(Nowhere(), "en", "es"), IsEmpty());
++  EXPECT_THAT(TarkPageTranslator::MissingModels(Nowhere(), "hi", "hi"), IsEmpty());
++}
++
++TEST(TarkPageTranslatorMissingTest, PresentFoldersAreNotMissing) {
++  base::ScopedTempDir dir;
++  ASSERT_TRUE(dir.CreateUniqueTempDir());
++  ASSERT_TRUE(base::CreateDirectory(dir.GetPath().AppendASCII("it2_indic_en")));
++  EXPECT_THAT(TarkPageTranslator::MissingModels(dir.GetPath(), "hi", "ta"),
++              ElementsAre("it2_en_indic"));
++}
++
++TEST_F(TarkPageTranslatorTest, UnsupportedPairIsNotOk) {
++  Bind(Nowhere(), Nowhere());
++  Translated t = Translate({"Hello"}, "en", "es");
++  EXPECT_FALSE(t.ok);
++  EXPECT_THAT(t.translations, IsEmpty());
++  EXPECT_THAT(t.missing, IsEmpty());
++}
++
++TEST_F(TarkPageTranslatorTest, MissingModelsAreNamed) {
++  Bind(Nowhere(), Nowhere());
++  Translated t = Translate({"नमस्ते"}, "hi", "ta");
++  EXPECT_FALSE(t.ok);
++  EXPECT_THAT(t.missing, ElementsAre("it2_indic_en", "it2_en_indic"));
++}
++
++// With TARK_CAPTIONS_* set (as tark_captions_unittests): the real models.
++TEST_F(TarkPageTranslatorTest, TranslatesInOrderAndUnloadsWhenIdle) {
++  std::optional<base::FilePath> ort = tark_captions::test::OrtPath();
++  std::optional<base::FilePath> models = tark_captions::test::ModelsDir();
++  if (!ort || !models) {
++    GTEST_SKIP() << "no ONNX Runtime or models";
++  }
++  Bind(*ort, *models);
++  Translated t = Translate({"नमस्ते", "", "भारत एक देश है।"}, "hi", "en");
++  ASSERT_TRUE(t.ok);
++  ASSERT_EQ(t.translations.size(), 3u);
++  EXPECT_FALSE(t.translations[0].empty());
++  EXPECT_EQ(t.translations[1], "");
++  EXPECT_NE(t.translations[2].find("India"), std::string::npos) << t.translations[2];
++
++  // Hindi → Tamil holds both models while translating.
++  Translated pivot = Translate({"भारत एक देश है।"}, "hi", "ta");
++  ASSERT_TRUE(pivot.ok);
++  EXPECT_FALSE(pivot.translations[0].empty());
++
++  // The receiver is self-owned; reach the implementation through a second
++  // instance for the idle check.
++  TarkPageTranslator direct(*ort, *models);
++  base::test::TestFuture<bool, const std::vector<std::string>&, const std::vector<std::string>&>
++      done;
++  direct.Translate({"नमस्ते"}, "hi", "en", done.GetCallback());
++  ASSERT_TRUE(done.Get<0>());
++  base::test::TestFuture<bool> loaded;
++  direct.IsLoadedForTesting(loaded.GetCallback());
++  EXPECT_TRUE(loaded.Get());
++  env_.FastForwardBy(TarkPageTranslator::kIdleUnload + base::Seconds(1));
++  base::test::TestFuture<bool> unloaded;
++  direct.IsLoadedForTesting(unloaded.GetCallback());
++  EXPECT_FALSE(unloaded.Get());
++}
++
++}  // namespace
++}  // namespace speech
+--- a/chrome/services/speech/speech_recognition_service_impl.h
++++ b/chrome/services/speech/speech_recognition_service_impl.h
+@@ -64,6 +64,8 @@
+       const base::flat_map<std::string, base::FilePath>& config_paths) override;
+   void BindTarkCaptionTranslator(
+       mojo::PendingReceiver<media::mojom::TarkCaptionTranslator> receiver) override;
++  void BindTarkPageTranslator(
++      mojo::PendingReceiver<media::mojom::TarkPageTranslator> receiver) override;
+   void BindTarkAudioTapSource(
+       mojo::PendingRemote<media::mojom::TarkAudioTapSource> source) override;
+ 
+--- a/chrome/services/speech/speech_recognition_service_impl.cc
++++ b/chrome/services/speech/speech_recognition_service_impl.cc
+@@ -15,6 +15,7 @@
+ #include "chrome/services/speech/speech_recognition_recognizer_impl.h"
+ #include "chrome/services/speech/tark_caption_recognizer.h"
+ #include "chrome/services/speech/tark_caption_translator.h"
++#include "chrome/services/speech/tark_page_translator.h"
+ #include "media/mojo/mojom/speech_recognition.mojom.h"
+ #include "media/mojo/mojom/speech_recognition_service.mojom.h"
+ #include "mojo/public/cpp/bindings/pending_receiver.h"
+@@ -81,6 +82,14 @@
+   TarkCaptionTranslator::Create(std::move(receiver), binary_path_, models_dir);
+ }
+ 
++void SpeechRecognitionServiceImpl::BindTarkPageTranslator(
++    mojo::PendingReceiver<media::mojom::TarkPageTranslator> receiver) {
++  // Tark: page translation, with the captions' ONNX Runtime and models.
++  const base::FilePath models_dir =
++      config_paths_.empty() ? base::FilePath() : config_paths_.begin()->second;
++  TarkPageTranslator::Create(std::move(receiver), binary_path_, models_dir);
++}
++
+ void SpeechRecognitionServiceImpl::BindTarkAudioTapSource(
+     mojo::PendingRemote<media::mojom::TarkAudioTapSource> source) {
+   tark_tap_source_.reset();
+--- a/chrome/services/speech/BUILD.gn
++++ b/chrome/services/speech/BUILD.gn
+@@ -24,6 +24,8 @@
+     "tark_caption_recognizer.h",
+     "tark_caption_translator.cc",
+     "tark_caption_translator.h",
++    "tark_page_translator.cc",
++    "tark_page_translator.h",
+   ]
+ 
+   configs += [ "//build/config/compiler:wexit_time_destructors" ]
+@@ -118,6 +120,7 @@
+   sources = [
+     "tark_caption_recognizer_unittest.cc",
+     "tark_caption_translator_unittest.cc",
++    "tark_page_translator_unittest.cc",
+     "tark_speech_service_unittest.cc",
+   ]
+   deps = [
+@@ -129,6 +132,7 @@
+     "//media/mojo/mojom",
+     "//mojo/core/test:run_all_unittests",
+     "//mojo/public/cpp/bindings",
++    "//testing/gmock",
+     "//testing/gtest",
+   ]
+ }

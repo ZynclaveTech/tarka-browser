@@ -1,0 +1,209 @@
+--- a/components/tark_captions/page_translate_rules.h
++++ b/components/tark_captions/page_translate_rules.h
+@@ -0,0 +1,43 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef COMPONENTS_TARK_CAPTIONS_PAGE_TRANSLATE_RULES_H_
++#define COMPONENTS_TARK_CAPTIONS_PAGE_TRANSLATE_RULES_H_
++
++#include <string>
++#include <string_view>
++#include <vector>
++
++namespace tark_captions {
++
++// Tark's page translation: which language a page is translated into, and
++// whether the translate bar offers it.
++
++// The first of `accept_languages` ("ta-IN", "en", …) that pages can be
++// translated into ("en", "hi", "ta", "bn"), as its base code; "en" when
++// none is.
++std::string TargetFor(const std::vector<std::string>& accept_languages);
++
++// Whether a page in `source` can be translated into `target` (base codes):
++// "hi", "ta", "bn" ↔ "en", "es" → "en", and the pairs through English.
++bool Supported(std::string_view source, std::string_view target);
++
++enum class Offer {
++  kNone,   // No bar.
++  kOffer,  // The bar offers translation and waits.
++  kAuto,   // The page opens translated.
++};
++
++// "Never translate this site" wins over "Always translate [language]",
++// which wins over "Never translate [language]" for the same language (the
++// prefs keep them exclusive).
++Offer OfferFor(std::string_view source,
++               std::string_view target,
++               bool always_language,
++               bool never_language,
++               bool never_site);
++
++}  // namespace tark_captions
++
++#endif  // COMPONENTS_TARK_CAPTIONS_PAGE_TRANSLATE_RULES_H_
+--- a/components/tark_captions/page_translate_rules.cc
++++ b/components/tark_captions/page_translate_rules.cc
+@@ -0,0 +1,55 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/tark_captions/page_translate_rules.h"
++
++#include "base/containers/contains.h"
++#include "base/strings/string_util.h"
++#include "components/tark_captions/translation_engine.h"
++
++namespace tark_captions {
++
++namespace {
++
++constexpr std::string_view kTargets[] = {"en", "hi", "ta", "bn"};
++
++std::string Base(std::string_view code) {
++  return base::ToLowerASCII(code.substr(0, code.find_first_of("-_")));
++}
++
++}  // namespace
++
++std::string TargetFor(const std::vector<std::string>& accept_languages) {
++  for (const std::string& language : accept_languages) {
++    const std::string base = Base(language);
++    if (base::Contains(kTargets, base)) {
++      return base;
++    }
++  }
++  return "en";
++}
++
++bool Supported(std::string_view source, std::string_view target) {
++  const std::optional<Target> t = TargetFromCode(target);
++  if (!t || *t == Target::kNone) {
++    return false;
++  }
++  return !DirectionsFor(source, *t).empty();
++}
++
++Offer OfferFor(std::string_view source,
++               std::string_view target,
++               bool always_language,
++               bool never_language,
++               bool never_site) {
++  if (source == target || !Supported(source, target) || never_site) {
++    return Offer::kNone;
++  }
++  if (always_language) {
++    return Offer::kAuto;
++  }
++  return never_language ? Offer::kNone : Offer::kOffer;
++}
++
++}  // namespace tark_captions
+--- a/components/tark_captions/page_translate_rules_unittest.cc
++++ b/components/tark_captions/page_translate_rules_unittest.cc
+@@ -0,0 +1,57 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/tark_captions/page_translate_rules.h"
++
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace tark_captions {
++namespace {
++
++TEST(PageTranslateRulesTest, TargetIsTheFirstSupportedLanguage) {
++  EXPECT_EQ(TargetFor({"fr", "ta", "en"}), "ta");
++  EXPECT_EQ(TargetFor({"hi-IN", "en-US"}), "hi");
++  EXPECT_EQ(TargetFor({"en-GB"}), "en");
++}
++
++TEST(PageTranslateRulesTest, TargetFallsBackToEnglish) {
++  EXPECT_EQ(TargetFor({"fr"}), "en");
++  EXPECT_EQ(TargetFor({}), "en");
++}
++
++TEST(PageTranslateRulesTest, SupportedPairs) {
++  EXPECT_TRUE(Supported("hi", "en"));
++  EXPECT_TRUE(Supported("en", "ta"));
++  EXPECT_TRUE(Supported("es", "en"));
++  EXPECT_TRUE(Supported("hi", "ta"));  // Through English.
++  EXPECT_TRUE(Supported("es", "hi"));  // Through English.
++  EXPECT_FALSE(Supported("en", "es"));
++  EXPECT_FALSE(Supported("fr", "en"));
++  EXPECT_FALSE(Supported("hi", ""));
++}
++
++TEST(PageTranslateRulesTest, SameLanguageHasNoBar) {
++  EXPECT_EQ(OfferFor("en", "en", false, false, false), Offer::kNone);
++  EXPECT_EQ(OfferFor("hi", "hi", true, false, false), Offer::kNone);
++}
++
++TEST(PageTranslateRulesTest, NeverSiteWinsOverAlwaysLanguage) {
++  EXPECT_EQ(OfferFor("hi", "en", true, false, true), Offer::kNone);
++}
++
++TEST(PageTranslateRulesTest, AlwaysLanguageOpensTranslated) {
++  EXPECT_EQ(OfferFor("hi", "en", true, false, false), Offer::kAuto);
++}
++
++TEST(PageTranslateRulesTest, NeverLanguageHidesTheBar) {
++  EXPECT_EQ(OfferFor("hi", "en", false, true, false), Offer::kNone);
++}
++
++TEST(PageTranslateRulesTest, NoPreferenceOffersSupportedPairsOnly) {
++  EXPECT_EQ(OfferFor("hi", "en", false, false, false), Offer::kOffer);
++  EXPECT_EQ(OfferFor("fr", "en", false, false, false), Offer::kNone);
++}
++
++}  // namespace
++}  // namespace tark_captions
+--- a/components/tark_captions/BUILD.gn
++++ b/components/tark_captions/BUILD.gn
+@@ -59,12 +59,15 @@
+     "romanize.h",
+     "segmenter.cc",
+     "segmenter.h",
++    "page_translate_rules.cc",
++    "page_translate_rules.h",
+     "translation_engine.cc",
+     "translation_engine.h",
+     "vad.cc",
+     "vad.h",
+   ]
+   include_dirs = [ "//third_party/tark_onnxruntime/include" ]
++
+   deps = [
+     "//base",
+     "//components/prefs",
+@@ -81,6 +84,18 @@
+   if (is_win) {
+     data_deps = [ ":onnxruntime_dll" ]
+   }
++  if (is_linux) {
++    data_deps = [ ":onnxruntime_so" ]
++  }
++}
++
++if (is_linux) {
++  # Microsoft's release (linux/downloads-onnxruntime.ini), next to the chrome
++  # binary by its soname; linux/package_tarball.sh packs it (L2).
++  copy("onnxruntime_so") {
++    sources = [ "//third_party/tark_onnxruntime/lib/libonnxruntime.so.1.31.0" ]
++    outputs = [ "$root_out_dir/libonnxruntime.so.1" ]
++  }
+ }
+ 
+ if (is_win) {
+@@ -126,6 +141,7 @@
+       "language_hint_unittest.cc",
+       "media_players_unittest.cc",
+       "mel_frontend_unittest.cc",
++      "page_translate_rules_unittest.cc",
+       "model_manifest_unittest.cc",
+       "model_source_unittest.cc",
+       "mono_resampler_unittest.cc",
