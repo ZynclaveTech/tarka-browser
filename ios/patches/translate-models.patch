@@ -1,0 +1,449 @@
+diff --git a/BrowserKit/Package.swift b/BrowserKit/Package.swift
+index ad8e7d6..eb9f599 100644
+--- a/BrowserKit/Package.swift
++++ b/BrowserKit/Package.swift
+@@ -164,6 +164,11 @@ let package = Package(
+                 .linkedFramework("CoreFoundation"),
+                 .linkedFramework("UIKit"),
+             ]),
++        // Tark: page translation's models (downloaded, checked, deleted) and
++        // the translator that holds one of them at a time.
++        .target(
++            name: "TarkTranslate",
++            dependencies: ["TarkTranslateCore", "TarkXlit"]),
+         // Tark: the address bar's `@` sources (@wiki, @maps, ...), the Mac's
+         // starter pack entries.
+         .target(
+@@ -182,6 +187,11 @@ let package = Package(
+             swiftSettings: [
+                 .unsafeFlags(["-enable-testing"]),
+             ]),
++        // Tark: page translation's models and translator. The download and
++        // translate test runs only with TARK_TRANSLATE_NETWORK=1 (~490 MB).
++        .testTarget(
++            name: "TarkTranslateTests",
++            dependencies: ["TarkTranslate"]),
+         .testTarget(
+             name: "ComponentLibraryTests",
+             dependencies: ["ComponentLibrary"],
+@@ -219,7 +229,7 @@ let package = Package(
+                            "SwiftyBeaver",
+                            "TarkAdblock",
+                            "TarkSources",
+-                           "TarkTranslateCore",
++                           "TarkTranslate",
+                            "TarkXlit",
+                            .product(name: "Sentry-Dynamic", package: "sentry-cocoa")],
+             swiftSettings: [
+diff --git a/BrowserKit/Sources/TarkTranslate/TarkPageTranslator.swift b/BrowserKit/Sources/TarkTranslate/TarkPageTranslator.swift
+new file mode 100644
+index 0000000..07a0b70
+--- /dev/null
++++ b/BrowserKit/Sources/TarkTranslate/TarkPageTranslator.swift
+@@ -0,0 +1,113 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++import Foundation
++import TarkTranslateCore
++import UIKit
++
++/// Tark: translates text on the phone with IndicTrans2 (tark_captions'
++/// translator). Holds **one model at a time** (the user's decision, to stay
++/// under 450 MB): Indian ↔ Indian translates the whole batch into English,
++/// frees that model, then loads the other. The model is freed after 3
++/// minutes unused and when Tark goes to the background. Nothing leaves the
++/// phone.
++public final class TarkPageTranslator: @unchecked Sendable {
++    public static let shared = TarkPageTranslator()
++
++    static let idleTimeout: TimeInterval = 180
++
++    private let models: TarkTranslateModels
++    /// Everything that touches `translator` runs here, one sentence at a time.
++    private let queue = DispatchQueue(label: "com.gettarka.translate", qos: .userInitiated)
++    private var translator: OpaquePointer?
++    private var loaded: TarkTranslateModels.Direction?
++    private var idleUnload: DispatchWorkItem?
++
++    public init(models: TarkTranslateModels = .shared) {
++        self.models = models
++        NotificationCenter.default.addObserver(forName: UIApplication.didEnterBackgroundNotification,
++                                               object: nil, queue: nil) { [weak self] _ in
++            self?.unload()
++        }
++    }
++
++    deinit {
++        if let translator { tark_translator_destroy(translator) }
++    }
++
++    /// The direction loaded now, if any (for tests and memory checks).
++    public var loadedDirection: TarkTranslateModels.Direction? {
++        return queue.sync { loaded }
++    }
++
++    /// `texts` from `source` into `target` ("en", "hi", "ta", ...), in order;
++    /// nil for a sentence that failed (the page keeps its original). Needs the
++    /// models of the directions it goes through (TarkTranslateModels).
++    public func translate(_ texts: [String], from source: String, to target: String) async -> [String?] {
++        guard source != target else { return texts }
++        var current: [String?] = texts
++        if source != "en" {
++            current = await run(.indicToEnglish, current, language: source)
++        }
++        if target != "en" {
++            current = await run(.englishToIndic, current, language: target)
++        }
++        return current
++    }
++
++    /// Frees the model now.
++    public func unload() {
++        queue.async { self.free() }
++    }
++
++    private func run(_ direction: TarkTranslateModels.Direction,
++                     _ texts: [String?],
++                     language: String) async -> [String?] {
++        await withCheckedContinuation { continuation in
++            queue.async {
++                guard let translator = self.load(direction) else {
++                    continuation.resume(returning: texts.map { _ in nil })
++                    return
++                }
++                let out: [String?] = texts.map { text in
++                    guard let text else { return nil }
++                    guard let result = tark_translator_translate(translator, text, language) else { return nil }
++                    defer { tark_translate_free(result) }
++                    return String(cString: result)
++                }
++                self.scheduleIdleUnload()
++                continuation.resume(returning: out)
++            }
++        }
++    }
++
++    /// On `queue`. Frees the other direction's model before loading this one.
++    private func load(_ direction: TarkTranslateModels.Direction) -> OpaquePointer? {
++        if loaded == direction, let translator { return translator }
++        free()
++        guard models.isReady(direction) else { return nil }
++        let raw: TarkTranslateDirection = direction == .indicToEnglish
++            ? TARK_TRANSLATE_INDIC_TO_ENGLISH : TARK_TRANSLATE_ENGLISH_TO_INDIC
++        translator = models.directory.path.withCString { tark_translator_create($0, raw) }
++        loaded = translator == nil ? nil : direction
++        return translator
++    }
++
++    /// On `queue`.
++    private func free() {
++        idleUnload?.cancel()
++        idleUnload = nil
++        if let translator { tark_translator_destroy(translator) }
++        translator = nil
++        loaded = nil
++    }
++
++    /// On `queue`.
++    private func scheduleIdleUnload() {
++        idleUnload?.cancel()
++        let work = DispatchWorkItem { [weak self] in self?.free() }
++        idleUnload = work
++        queue.asyncAfter(deadline: .now() + Self.idleTimeout, execute: work)
++    }
++}
+diff --git a/BrowserKit/Sources/TarkTranslate/TarkTranslateModels.swift b/BrowserKit/Sources/TarkTranslate/TarkTranslateModels.swift
+new file mode 100644
+index 0000000..7eb2e01
+--- /dev/null
++++ b/BrowserKit/Sources/TarkTranslate/TarkTranslateModels.swift
+@@ -0,0 +1,166 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++import Foundation
++import TarkXlit
++
++/// Tark: page translation's IndicTrans2 models, the files Tark for Android
++/// downloads, content-addressed on gettarka.com and checked against the size
++/// and sha256 compiled into the app (TarkTranslateFiles). One folder per
++/// direction under Application Support/tark-translate; a file that does not
++/// match is deleted. A download cut off part way resumes where it stopped.
++public final class TarkTranslateModels: NSObject, @unchecked Sendable, URLSessionTaskDelegate {
++    public enum Direction: String, CaseIterable, Sendable {
++        /// Indian languages → English (~221 MB).
++        case indicToEnglish = "it2_indic_en"
++        /// English → Indian languages (~265 MB).
++        case englishToIndic = "it2_en_indic"
++    }
++
++    public enum Outcome: Sendable {
++        case ready
++        /// Not tried: cellular or a constrained network, without "Download now".
++        case waitingForWiFi
++        /// Tried and did not get verified files.
++        case failed
++    }
++
++    public static let baseURL = URL(string: "https://gettarka.com/models/android/v1/")!
++    private static let triesPerRun = 3
++
++    public static let shared = TarkTranslateModels()
++
++    /// Application Support/tark-translate, kept out of backups; the engine
++    /// reads <directory>/<direction>/.
++    public let directory: URL
++    private lazy var session = URLSession(configuration: .ephemeral, delegate: self, delegateQueue: nil)
++
++    public init(directory: URL? = nil) {
++        let base = directory ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
++            .appendingPathComponent("tark-translate", isDirectory: true)
++        try? FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
++        var values = URLResourceValues()
++        values.isExcludedFromBackup = true
++        var excluded = base
++        try? excluded.setResourceValues(values)
++        self.directory = base
++    }
++
++    /// The pinned files of `direction`, as "<direction>/<file>".
++    static func names(_ direction: Direction) -> [String] {
++        return TarkTranslateFiles.table.keys.filter { $0.hasPrefix(direction.rawValue + "/") }.sorted()
++    }
++
++    /// The download size of `direction`.
++    public static func size(_ direction: Direction) -> Int64 {
++        return names(direction).reduce(0) { $0 + (TarkTranslateFiles.table[$1]?.size ?? 0) }
++    }
++
++    func path(_ name: String) -> URL {
++        return directory.appendingPathComponent(name)
++    }
++
++    /// Every file of `direction` present and checked.
++    public func isReady(_ direction: Direction) -> Bool {
++        return Self.names(direction).allSatisfy(isVerified)
++    }
++
++    /// Bytes of `direction` on the phone (checked or not), for "On this phone".
++    public func bytesOnPhone(_ direction: Direction) -> Int64 {
++        let folder = directory.appendingPathComponent(direction.rawValue)
++        guard let files = try? FileManager.default.contentsOfDirectory(
++            at: folder, includingPropertiesForKeys: [.fileSizeKey]) else { return 0 }
++        return files.reduce(0) { total, file in
++            total + Int64((try? file.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
++        }
++    }
++
++    /// Whether the file is there with the size and hash the app pins. A
++    /// "<name>.sha256" record beside it saves hashing it on every start.
++    func isVerified(_ name: String) -> Bool {
++        guard let pinned = TarkTranslateFiles.table[name] else { return false }
++        let file = path(name)
++        let record = path(name + ".sha256")
++        guard let attributes = try? FileManager.default.attributesOfItem(atPath: file.path),
++              (attributes[.size] as? NSNumber)?.int64Value == pinned.size else { return false }
++        if (try? String(contentsOf: record, encoding: .utf8)) == pinned.sha256 { return true }
++        guard TarkXlitDownloader.sha256(of: file) == pinned.sha256 else {
++            try? FileManager.default.removeItem(at: file)
++            return false
++        }
++        try? pinned.sha256.write(to: record, atomically: true, encoding: .utf8)
++        return true
++    }
++
++    /// Downloads what `direction` still needs. Cellular or a constrained
++    /// network waits unless `now` (the person chose "Download now").
++    /// `progress` gets the bytes of `direction` checked so far after each file.
++    public func download(_ direction: Direction,
++                         now: Bool,
++                         progress: (@Sendable (Int64, Int64) -> Void)? = nil) async -> Outcome {
++        if !now, await !TarkXlitDownloader.isUnmeteredNetwork() { return .waitingForWiFi }
++        let total = Self.size(direction)
++        try? FileManager.default.createDirectory(at: directory.appendingPathComponent(direction.rawValue),
++                                                 withIntermediateDirectories: true)
++        var done: Int64 = 0
++        for name in Self.names(direction) {
++            if !isVerified(name) {
++                var fetched = false
++                for _ in 0..<Self.triesPerRun where !fetched {
++                    if Task.isCancelled { return .failed }
++                    fetched = await fetch(name)
++                }
++                if !fetched { return .failed }
++            }
++            done += TarkTranslateFiles.table[name]?.size ?? 0
++            progress?(done, total)
++        }
++        return isReady(direction) ? .ready : .failed
++    }
++
++    /// Deletes `direction`'s files, finished or part-downloaded.
++    public func delete(_ direction: Direction) {
++        try? FileManager.default.removeItem(at: directory.appendingPathComponent(direction.rawValue))
++    }
++
++    private func fetch(_ name: String) async -> Bool {
++        guard let pinned = TarkTranslateFiles.table[name] else { return false }
++        let url = Self.baseURL.appendingPathComponent("\(pinned.sha256).bin")
++        // What an earlier, cut-off try left: URLSession's resume data, so the
++        // file continues from where it stopped (gettarka.com serves ranges).
++        let resumeFile = path(name + ".resume")
++        let temporary: URL
++        let response: URLResponse
++        do {
++            if let resumeData = try? Data(contentsOf: resumeFile) {
++                try? FileManager.default.removeItem(at: resumeFile)
++                (temporary, response) = try await session.download(resumeFrom: resumeData)
++            } else {
++                (temporary, response) = try await session.download(from: url)
++            }
++        } catch {
++            if let resumeData = (error as? URLError)?.downloadTaskResumeData {
++                try? resumeData.write(to: resumeFile)
++            }
++            return false
++        }
++        defer { try? FileManager.default.removeItem(at: temporary) }
++        // 206 when resumed.
++        guard let status = (response as? HTTPURLResponse)?.statusCode, status == 200 || status == 206,
++              TarkXlitDownloader.sha256(of: temporary) == pinned.sha256 else { return false }
++        let file = path(name)
++        try? FileManager.default.removeItem(at: file)
++        guard (try? FileManager.default.moveItem(at: temporary, to: file)) != nil else { return false }
++        try? pinned.sha256.write(to: path(name + ".sha256"), atomically: true, encoding: .utf8)
++        return true
++    }
++
++    /// Never follows a redirect: the files come from gettarka.com only.
++    public func urlSession(_ session: URLSession,
++                           task: URLSessionTask,
++                           willPerformHTTPRedirection response: HTTPURLResponse,
++                           newRequest request: URLRequest) async -> URLRequest? {
++        return nil
++    }
++}
+diff --git a/BrowserKit/Sources/TarkXlit/TarkXlitDownloader.swift b/BrowserKit/Sources/TarkXlit/TarkXlitDownloader.swift
+index ea68f83..3790694 100644
+--- a/BrowserKit/Sources/TarkXlit/TarkXlitDownloader.swift
++++ b/BrowserKit/Sources/TarkXlit/TarkXlitDownloader.swift
+@@ -104,7 +104,7 @@ public final class TarkXlitDownloader: NSObject, @unchecked Sendable, URLSession
+         return nil
+     }
+ 
+-    static func sha256(of file: URL) -> String? {
++    public static func sha256(of file: URL) -> String? {
+         guard let handle = try? FileHandle(forReadingFrom: file) else { return nil }
+         defer { try? handle.close() }
+         var hasher = SHA256()
+@@ -114,7 +114,7 @@ public final class TarkXlitDownloader: NSObject, @unchecked Sendable, URLSession
+         return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+     }
+ 
+-    static func isUnmeteredNetwork() async -> Bool {
++    public static func isUnmeteredNetwork() async -> Bool {
+         await withCheckedContinuation { continuation in
+             let monitor = NWPathMonitor()
+             // The handler can run more than once; only the first answers. It
+diff --git a/BrowserKit/Tests/TarkTranslateTests/TarkTranslateTests.swift b/BrowserKit/Tests/TarkTranslateTests/TarkTranslateTests.swift
+new file mode 100644
+index 0000000..11dd5d3
+--- /dev/null
++++ b/BrowserKit/Tests/TarkTranslateTests/TarkTranslateTests.swift
+@@ -0,0 +1,93 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++import Foundation
++import XCTest
++@testable import TarkTranslate
++
++final class TarkTranslateModelsTests: XCTestCase {
++    private var folder: URL!
++
++    override func setUp() {
++        super.setUp()
++        folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
++    }
++
++    override func tearDown() {
++        try? FileManager.default.removeItem(at: folder)
++        super.tearDown()
++    }
++
++    func testEachDirectionPinsTheSixFilesAndroidPublishes() {
++        for direction in TarkTranslateModels.Direction.allCases {
++            XCTAssertEqual(TarkTranslateModels.names(direction).map { $0.components(separatedBy: "/")[1] },
++                           ["config.json", "decoder_step.int8.onnx", "dict.SRC.json", "dict.TGT.json",
++                            "encoder.int8.onnx", "model.SRC"])
++        }
++        XCTAssertEqual(TarkTranslateModels.size(.indicToEnglish), 238_880_795)
++        XCTAssertEqual(TarkTranslateModels.size(.englishToIndic), 282_651_524)
++    }
++
++    func testAFileThatIsNotThePinnedOneIsDeleted() throws {
++        let models = TarkTranslateModels(directory: folder)
++        let name = "it2_indic_en/config.json"
++        try FileManager.default.createDirectory(at: models.path("it2_indic_en"), withIntermediateDirectories: true)
++        // The pinned size, other bytes.
++        try Data(count: 1370).write(to: models.path(name))
++        XCTAssertFalse(models.isVerified(name))
++        XCTAssertFalse(FileManager.default.fileExists(atPath: models.path(name).path))
++        XCTAssertFalse(models.isReady(.indicToEnglish))
++    }
++
++    func testDeleteRemovesTheDirectionOnly() throws {
++        let models = TarkTranslateModels(directory: folder)
++        for direction in TarkTranslateModels.Direction.allCases {
++            try FileManager.default.createDirectory(at: models.path(direction.rawValue),
++                                                    withIntermediateDirectories: true)
++            try Data(count: 10).write(to: models.path(direction.rawValue + "/model.SRC.resume"))
++        }
++        models.delete(.indicToEnglish)
++        XCTAssertEqual(models.bytesOnPhone(.indicToEnglish), 0)
++        XCTAssertEqual(models.bytesOnPhone(.englishToIndic), 10)
++    }
++
++    func testWithoutModelsEverySentenceKeepsItsOriginal() async {
++        let translator = TarkPageTranslator(models: TarkTranslateModels(directory: folder))
++        let out = await translator.translate(["नमस्ते"], from: "hi", to: "en")
++        XCTAssertEqual(out, [nil])
++        XCTAssertNil(translator.loadedDirection)
++    }
++}
++
++/// Downloads both models from gettarka.com (~490 MB, kept between runs) and
++/// translates with them. Only with TARK_TRANSLATE_NETWORK=1 (xcodebuild:
++/// TEST_RUNNER_TARK_TRANSLATE_NETWORK=1).
++final class TarkTranslateDownloadTests: XCTestCase {
++    func testDownloadsCheckedModelsAndHoldsOneAtATime() async throws {
++        try XCTSkipUnless(ProcessInfo.processInfo.environment["TARK_TRANSLATE_NETWORK"] == "1")
++        let folder = FileManager.default.temporaryDirectory.appendingPathComponent("tark-translate-download")
++        let models = TarkTranslateModels(directory: folder)
++        let translator = TarkPageTranslator(models: models)
++
++        let indicToEnglish = await models.download(.indicToEnglish, now: true)
++        XCTAssertEqual("\(indicToEnglish)", "ready")
++        let english = await translator.translate(["मुझे आज बाज़ार जाना है।"], from: "hi", to: "en")
++        let sentence = try XCTUnwrap(english.first ?? nil)
++        print("hi→en:", sentence)
++        XCTAssertTrue(sentence.lowercased().contains("market"))
++        XCTAssertEqual(translator.loadedDirection, .indicToEnglish)
++
++        let englishToIndic = await models.download(.englishToIndic, now: true)
++        XCTAssertEqual("\(englishToIndic)", "ready")
++        let tamil = await translator.translate(["मुझे आज बाज़ार जाना है।"], from: "hi", to: "ta")
++        let tamilSentence = try XCTUnwrap(tamil.first ?? nil)
++        print("hi→ta:", tamilSentence)
++        XCTAssertTrue(tamilSentence.unicodeScalars.contains { (0x0B80...0x0BFF).contains($0.value) })
++        // Indian ↔ Indian went through English and kept only the second model.
++        XCTAssertEqual(translator.loadedDirection, .englishToIndic)
++
++        translator.unload()
++        XCTAssertNil(translator.loadedDirection)
++    }
++}
