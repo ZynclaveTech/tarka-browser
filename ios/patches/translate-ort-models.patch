@@ -1,0 +1,71 @@
+diff --git a/BrowserKit/Sources/TarkTranslate/TarkTranslateModels.swift b/BrowserKit/Sources/TarkTranslate/TarkTranslateModels.swift
+index 4cbc900..1531fb2 100644
+--- a/BrowserKit/Sources/TarkTranslate/TarkTranslateModels.swift
++++ b/BrowserKit/Sources/TarkTranslate/TarkTranslateModels.swift
+@@ -113,6 +113,7 @@ public final class TarkTranslateModels: NSObject, @unchecked Sendable, URLSessio
+         let total = Self.size(direction)
+         try? FileManager.default.createDirectory(at: directory.appendingPathComponent(direction.rawValue),
+                                                  withIntermediateDirectories: true)
++        removeUnpinned(direction)
+         var done: Int64 = 0
+         for name in Self.names(direction) {
+             if !isVerified(name) {
+@@ -130,6 +131,22 @@ public final class TarkTranslateModels: NSObject, @unchecked Sendable, URLSessio
+         return isReady(direction) ? .ready : .failed
+     }
+ 
++    /// Deletes files in `direction`'s folder that the app no longer pins
++    /// (e.g. .onnx models replaced by .ort), keeping pinned files and their
++    /// .sha256 and .resume companions.
++    func removeUnpinned(_ direction: Direction) {
++        let folder = directory.appendingPathComponent(direction.rawValue)
++        let pinned = Set(Self.names(direction).map { $0.components(separatedBy: "/")[1] })
++        let files = (try? FileManager.default.contentsOfDirectory(atPath: folder.path)) ?? []
++        for file in files {
++            let base = file.hasSuffix(".sha256") || file.hasSuffix(".resume")
++                ? String(file[..<file.lastIndex(of: ".")!]) : file
++            if !pinned.contains(base) {
++                try? FileManager.default.removeItem(at: folder.appendingPathComponent(file))
++            }
++        }
++    }
++
+     /// Deletes `direction`'s files, finished or part-downloaded.
+     public func delete(_ direction: Direction) {
+         try? FileManager.default.removeItem(at: directory.appendingPathComponent(direction.rawValue))
+diff --git a/BrowserKit/Tests/TarkTranslateTests/TarkTranslateTests.swift b/BrowserKit/Tests/TarkTranslateTests/TarkTranslateTests.swift
+index 11dd5d3..c4eb4f9 100644
+--- a/BrowserKit/Tests/TarkTranslateTests/TarkTranslateTests.swift
++++ b/BrowserKit/Tests/TarkTranslateTests/TarkTranslateTests.swift
+@@ -19,14 +19,26 @@ final class TarkTranslateModelsTests: XCTestCase {
+         super.tearDown()
+     }
+ 
+-    func testEachDirectionPinsTheSixFilesAndroidPublishes() {
++    /// Android's files, with the two models in ORT format (used mapped, for memory).
++    func testEachDirectionPinsSixFilesWithORTModels() {
+         for direction in TarkTranslateModels.Direction.allCases {
+             XCTAssertEqual(TarkTranslateModels.names(direction).map { $0.components(separatedBy: "/")[1] },
+-                           ["config.json", "decoder_step.int8.onnx", "dict.SRC.json", "dict.TGT.json",
+-                            "encoder.int8.onnx", "model.SRC"])
++                           ["config.json", "decoder_step.int8.ort", "dict.SRC.json", "dict.TGT.json",
++                            "encoder.int8.ort", "model.SRC"])
+         }
+-        XCTAssertEqual(TarkTranslateModels.size(.indicToEnglish), 238_880_795)
+-        XCTAssertEqual(TarkTranslateModels.size(.englishToIndic), 282_651_524)
++        XCTAssertEqual(TarkTranslateModels.size(.indicToEnglish), 239_275_332)
++        XCTAssertEqual(TarkTranslateModels.size(.englishToIndic), 283_045_478)
++    }
++
++    func testFilesNoLongerPinnedAreRemoved() throws {
++        let models = TarkTranslateModels(directory: folder)
++        try FileManager.default.createDirectory(at: models.path("it2_indic_en"), withIntermediateDirectories: true)
++        for name in ["encoder.int8.onnx", "encoder.int8.onnx.sha256", "encoder.int8.ort.resume", "config.json"] {
++            try Data(count: 4).write(to: models.path("it2_indic_en/" + name))
++        }
++        models.removeUnpinned(.indicToEnglish)
++        let left = try FileManager.default.contentsOfDirectory(atPath: models.path("it2_indic_en").path).sorted()
++        XCTAssertEqual(left, ["config.json", "encoder.int8.ort.resume"])
+     }
+ 
+     func testAFileThatIsNotThePinnedOneIsDeleted() throws {

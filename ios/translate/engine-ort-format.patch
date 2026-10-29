@@ -1,5 +1,5 @@
 diff --git a/components/tark_captions/ort_runtime.cc b/components/tark_captions/ort_runtime.cc
-index a5fa932..75d4866 100644
+index a5fa932..8496640 100644
 --- a/components/tark_captions/ort_runtime.cc
 +++ b/components/tark_captions/ort_runtime.cc
 @@ -2,6 +2,11 @@
@@ -14,21 +14,24 @@ index a5fa932..75d4866 100644
  #include "components/tark_captions/ort_runtime.h"
  
  #include <utility>
-@@ -83,12 +88,56 @@ std::unique_ptr<OrtModel> OrtRuntime::LoadModel(const ModelSource& source,
+@@ -82,6 +87,16 @@ std::unique_ptr<OrtModel> OrtRuntime::LoadModelFromMemory(base::span<const uint8
+ std::unique_ptr<OrtModel> OrtRuntime::LoadModel(const ModelSource& source,
                                                  std::string_view name,
                                                  int threads) {
-   if (std::optional<base::FilePath> path = source.PathOf(name)) {
-+    // Tark for iOS: "<name>.ort" beside "<name>.onnx" is used instead.
-+    const std::string& onnx = path->value();
-+    if (onnx.ends_with(".onnx")) {
-+      std::string ort = onnx.substr(0, onnx.size() - 5) + ".ort";
-+      if (std::unique_ptr<OrtModel> model = LoadMappedOrtModel(base::FilePath(ort), threads)) {
++  // Tark for iOS: "<name>.ort" (ORT format, mapped) is used when the source
++  // has it, with or without "<name>.onnx".
++  if (name.ends_with(".onnx")) {
++    const std::string ort = std::string(name.substr(0, name.size() - 5)) + ".ort";
++    if (std::optional<base::FilePath> path = source.PathOf(ort)) {
++      if (std::unique_ptr<OrtModel> model = LoadMappedOrtModel(*path, threads)) {
 +        return model;
 +      }
 +    }
++  }
+   if (std::optional<base::FilePath> path = source.PathOf(name)) {
      return LoadModel(*path, threads);
    }
-   std::optional<base::span<const uint8_t>> bytes = source.Read(name);
+@@ -89,6 +104,42 @@ std::unique_ptr<OrtModel> OrtRuntime::LoadModel(const ModelSource& source,
    return bytes ? LoadModelFromMemory(*bytes, threads) : nullptr;
  }
  
@@ -71,7 +74,7 @@ index a5fa932..75d4866 100644
  std::unique_ptr<OrtModel> OrtRuntime::Load(
      int threads,
      base::FunctionRef<OrtStatus*(OrtSessionOptions*, OrtSession**)> create) {
-@@ -112,6 +161,9 @@ OrtModel::OrtModel(const OrtApi* api, OrtSession* session) : api_(api), session_
+@@ -112,6 +163,9 @@ OrtModel::OrtModel(const OrtApi* api, OrtSession* session) : api_(api), session_
  
  OrtModel::~OrtModel() {
    api_->ReleaseSession(session_.ExtractAsDangling());
