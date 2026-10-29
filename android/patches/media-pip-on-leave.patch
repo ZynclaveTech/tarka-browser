@@ -140,7 +140,7 @@ diff --color -ruN a/chrome/android/java/src/org/chromium/chrome/browser/app/tab_
          if (!mActivity.isInMultiWindowMode() && mTab.isUserInteractable()) {
 diff --color -ruN a/chrome/android/java/src/org/chromium/chrome/browser/fullscreen/FullscreenHtmlApiHandlerBase.java b/chrome/android/java/src/org/chromium/chrome/browser/fullscreen/FullscreenHtmlApiHandlerBase.java
 --- a/chrome/android/java/src/org/chromium/chrome/browser/fullscreen/FullscreenHtmlApiHandlerBase.java	2026-10-30 00:38:40.115826810 +0530
-+++ b/chrome/android/java/src/org/chromium/chrome/browser/fullscreen/FullscreenHtmlApiHandlerBase.java	2026-10-30 00:51:54.332029346 +0530
++++ b/chrome/android/java/src/org/chromium/chrome/browser/fullscreen/FullscreenHtmlApiHandlerBase.java	2026-10-30 01:36:11.715983573 +0530
 @@ -33,6 +33,7 @@
  import org.chromium.base.ApplicationStatus.ActivityStateListener;
  import org.chromium.base.ApplicationStatus.WindowFocusChangedListener;
@@ -149,7 +149,15 @@ diff --color -ruN a/chrome/android/java/src/org/chromium/chrome/browser/fullscre
  import org.chromium.base.ObserverList;
  import org.chromium.base.supplier.NonNullObservableSupplier;
  import org.chromium.base.supplier.ObservableSuppliers;
-@@ -69,6 +70,9 @@
+@@ -53,6 +54,7 @@
+ import org.chromium.chrome.browser.tab.TabHidingType;
+ import org.chromium.chrome.browser.tabmodel.TabModelSelector;
+ import org.chromium.chrome.browser.tabmodel.TabModelSelectorTabObserver;
++import org.chromium.chrome.browser.tark.media.TarkMediaPrefs;
+ import org.chromium.chrome.browser.util.AndroidTaskUtils;
+ import org.chromium.components.embedder_support.view.ContentView;
+ import org.chromium.content_public.browser.GestureListenerManager;
+@@ -69,6 +71,9 @@
          implements ActivityStateListener, WindowFocusChangedListener, FullscreenManager {
      private static final boolean DEBUG_LOGS = false;
  
@@ -159,9 +167,26 @@ diff --color -ruN a/chrome/android/java/src/org/chromium/chrome/browser/fullscre
      protected static final int MSG_ID_SET_VISIBILITY_FOR_SYSTEM_BARS = 1;
      protected static final int MSG_ID_UNSET_FULLSCREEN_LAYOUT = 2;
  
-@@ -398,7 +402,10 @@
+@@ -87,6 +92,11 @@
  
-         if (isSameDisplay(options)) {
+     private final NonNullObservableSupplier<Boolean> mAreControlsHidden;
+     private boolean mExitFullscreenOnStop;
++
++    // Tark: the activity fullscreen mode (Activity.requestFullscreenMode) asked for while in
++    // Picture in Picture, where it would take the task out of the pinned window. It is applied
++    // when the window is expanded and the activity resumes, if fullscreen is still on.
++    private @Nullable OutcomeReceiver<@Nullable Void, Throwable> mTarkActivityFullscreenOnResume;
+     private final ObserverList<FullscreenManager.Observer> mObservers = new ObserverList<>();
+ 
+     // We need to cache WebContents/ContentView since we are setting fullscreen UI state on
+@@ -396,9 +406,14 @@
+                     }
+                 };
+ 
+-        if (isSameDisplay(options)) {
++        // Tark: in Picture in Picture fullscreen stays on this display: moving the task to
++        // another display would take it out of the pinned window.
++        if (isSameDisplay(options) || mActivity.isInPictureInPictureMode()) {
              ensureTaskMovedToFront();
 -            if (tab.isUserInteractable()) {
 +            // Tark: in Picture in Picture the paused activity's tab is not
@@ -171,7 +196,32 @@ diff --color -ruN a/chrome/android/java/src/org/chromium/chrome/browser/fullscre
                  r.run();
              } else {
                  setEnterFullscreenRunnable(tab, r);
-@@ -628,6 +635,11 @@
+@@ -481,6 +496,8 @@
+ 
+     private void ensureTaskMovedToFront() {
+         if (!isWindowMoveAvailable()) return;
++        // Tark: moving the task to the front expands the Picture in Picture window.
++        if (mActivity.isInPictureInPictureMode()) return;
+         // When using Task.moveTaskTo to another display the Task may not keep the focus and as so
+         // would not be able to request display edge to edge fullscreen mode on the new display. To
+         // work around this issue we are moving the task to the front on the new display.
+@@ -592,7 +609,14 @@
+                                     mDisplayEdgeToEdgeFullscreenToBeExited = false;
+                                 }
+                             };
+-                    maybeEnterActivityFullscreenMode(resultCb);
++                    if (mActivity.isInPictureInPictureMode()) {
++                        // Tark: requestFullscreenMode takes the task out of the pinned window
++                        // (an inline video Tark makes fullscreen in it closed the window at
++                        // once). Ask for it when the window is expanded instead.
++                        mTarkActivityFullscreenOnResume = resultCb;
++                    } else {
++                        maybeEnterActivityFullscreenMode(resultCb);
++                    }
+                 }
+             }
+             mPersistentModeSupplier.set(true);
+@@ -628,6 +652,12 @@
  
      @Override
      public void exitPersistentFullscreenMode() {
@@ -180,9 +230,48 @@ diff --color -ruN a/chrome/android/java/src/org/chromium/chrome/browser/fullscre
 +        if (getPersistentFullscreenMode() && mActivity.isInPictureInPictureMode()) {
 +            Log.w(TARK_TAG, "Tark: leaving fullscreen in Picture in Picture", new Throwable());
 +        }
++        mTarkActivityFullscreenOnResume = null;
          // Return to the original starting position and bounds if the fullscreen was opening on
          // another display.
          returnFromTargetScreenIfNeeded();
+@@ -881,7 +911,11 @@
+ 
+     @Override
+     public void onActivityStateChange(Activity activity, int newState) {
+-        if (newState == ActivityState.STOPPED && mExitFullscreenOnStop) {
++        if (newState == ActivityState.RESUMED) {
++            tarkApplyActivityFullscreenOnResume();
++        } else if (newState == ActivityState.STOPPED
++                && mExitFullscreenOnStop
++                && !tarkKeepsFullscreenOnStop()) {
+             // Exit fullscreen in onStop to ensure the system UI flags are set
+             // correctly when
+             // showing again (on JB MR2+ builds, the omnibox would be covered by the
+@@ -893,6 +927,24 @@
+         }
+     }
+ 
++    /**
++     * Tark: the screen turning off stops the activity in its Picture in Picture window. With
++     * Background play on, fullscreen stays, and so do the window (which
++     * FullscreenVideoPictureInPictureController closes when fullscreen ends) and its video. With it
++     * off the window closes and the video pauses, as upstream.
++     */
++    private boolean tarkKeepsFullscreenOnStop() {
++        return mActivity.isInPictureInPictureMode() && TarkMediaPrefs.backgroundPlay();
++    }
++
++    /** Tark: the activity fullscreen mode deferred while in Picture in Picture, now expanded. */
++    private void tarkApplyActivityFullscreenOnResume() {
++        OutcomeReceiver<@Nullable Void, Throwable> resultCb = mTarkActivityFullscreenOnResume;
++        if (resultCb == null || mActivity.isInPictureInPictureMode()) return;
++        mTarkActivityFullscreenOnResume = null;
++        if (getPersistentFullscreenMode()) maybeEnterActivityFullscreenMode(resultCb);
++    }
++
+     // WindowFocusChangedListener
+ 
+     @Override
 diff --color -ruN a/chrome/android/java/src/org/chromium/chrome/browser/media/FullscreenVideoPictureInPictureController.java b/chrome/android/java/src/org/chromium/chrome/browser/media/FullscreenVideoPictureInPictureController.java
 --- a/chrome/android/java/src/org/chromium/chrome/browser/media/FullscreenVideoPictureInPictureController.java	2026-10-30 00:38:28.571086272 +0530
 +++ b/chrome/android/java/src/org/chromium/chrome/browser/media/FullscreenVideoPictureInPictureController.java	2026-10-30 00:40:06.005453556 +0530
@@ -797,8 +886,16 @@ diff --color -ruN a/chrome/android/java/src/org/chromium/chrome/browser/ui/Exclu
      public void destroy() {
 diff --color -ruN a/chrome/android/junit/BUILD.gn b/chrome/android/junit/BUILD.gn
 --- a/chrome/android/junit/BUILD.gn	2026-10-30 00:38:40.151093986 +0530
-+++ b/chrome/android/junit/BUILD.gn	2026-10-30 00:38:40.247315761 +0530
-@@ -1428,8 +1428,11 @@
++++ b/chrome/android/junit/BUILD.gn	2026-10-30 01:36:03.118971161 +0530
+@@ -907,6 +907,7 @@
+       "src/org/chromium/chrome/browser/fullscreen/BrowserControlsManagerUnitTest.java",
+       "src/org/chromium/chrome/browser/fullscreen/FullscreenHtmlApiHandlerCompatUnitTest.java",
+       "src/org/chromium/chrome/browser/fullscreen/FullscreenHtmlApiHandlerLegacyUnitTest.java",
++      "src/org/chromium/chrome/browser/fullscreen/TarkFullscreenPipTest.java",
+     ]
+ 
+     deps = [
+@@ -1428,8 +1429,11 @@
        "chrome_junit_tests_org.chromium.chrome.browser.tark.media") {
      resources_package = "org.chromium.chrome"
  
@@ -812,7 +909,7 @@ diff --color -ruN a/chrome/android/junit/BUILD.gn b/chrome/android/junit/BUILD.g
  
      deps = [ ":chrome_junit_tests_helper" ]
    }
-@@ -1658,6 +1661,7 @@
+@@ -1658,6 +1662,7 @@
        "src/org/chromium/chrome/browser/ui/ExclusiveAccessContextTest.java",
        "src/org/chromium/chrome/browser/ui/ExpandedSheetHelperImplUnitTest.java",
        "src/org/chromium/chrome/browser/ui/IncognitoRestoreAppLaunchDrawBlockerUnitTest.java",
@@ -820,6 +917,207 @@ diff --color -ruN a/chrome/android/junit/BUILD.gn b/chrome/android/junit/BUILD.g
        "src/org/chromium/chrome/browser/ui/TextAppearanceOverlayFontFeaturesTest.java",
        "src/org/chromium/chrome/browser/ui/activity_recreation/ActivityRecreationControllerUnitTest.java",
        "src/org/chromium/chrome/browser/ui/color/ColorProviderBridgeImplTest.java",
+diff --color -ruN a/chrome/android/junit/src/org/chromium/chrome/browser/fullscreen/TarkFullscreenPipTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/fullscreen/TarkFullscreenPipTest.java
+--- a/chrome/android/junit/src/org/chromium/chrome/browser/fullscreen/TarkFullscreenPipTest.java	1970-01-01 05:30:00.000000000 +0530
++++ b/chrome/android/junit/src/org/chromium/chrome/browser/fullscreen/TarkFullscreenPipTest.java	1970-01-01 05:30:00.000000000 +0530
+@@ -0,0 +1,197 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++package org.chromium.chrome.browser.fullscreen;
++
++import static android.view.Display.INVALID_DISPLAY;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.assertTrue;
++import static org.mockito.Mockito.doReturn;
++
++import android.app.Activity;
++import android.os.Build;
++import android.os.OutcomeReceiver;
++
++import org.junit.Before;
++import org.junit.Rule;
++import org.junit.Test;
++import org.junit.runner.RunWith;
++import org.mockito.Mock;
++import org.mockito.junit.MockitoJUnit;
++import org.mockito.junit.MockitoRule;
++import org.robolectric.Robolectric;
++import org.robolectric.annotation.Config;
++import org.robolectric.annotation.Implementation;
++import org.robolectric.annotation.Implements;
++import org.robolectric.shadows.ShadowActivity;
++
++import org.chromium.base.ActivityState;
++import org.chromium.base.ContextUtils;
++import org.chromium.base.UserDataHost;
++import org.chromium.base.supplier.ObservableSuppliers;
++import org.chromium.base.supplier.SettableNonNullObservableSupplier;
++import org.chromium.base.test.BaseRobolectricTestRunner;
++import org.chromium.base.test.util.Features;
++import org.chromium.chrome.browser.flags.ChromeFeatureList;
++import org.chromium.chrome.browser.multiwindow.MultiWindowModeStateDispatcherImpl;
++import org.chromium.chrome.browser.tab.Tab;
++import org.chromium.chrome.browser.tark.media.TarkMediaPrefs;
++
++/**
++ * Tark: HTML fullscreen in the activity's Picture in Picture window. Entering it must not take
++ * the task out of the window (Activity.requestFullscreenMode waits for the window to expand), and
++ * the screen turning off keeps it while Background play is on.
++ */
++@Features.EnableFeatures({ChromeFeatureList.DISPLAY_EDGE_TO_EDGE_FULLSCREEN})
++@Features.DisableFeatures({ChromeFeatureList.ENABLE_EXCLUSIVE_ACCESS_MANAGER})
++@RunWith(BaseRobolectricTestRunner.class)
++@Config(
++        shadows = {TarkFullscreenPipTest.PipShadowActivity.class},
++        sdk = Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
++public class TarkFullscreenPipTest {
++    /** An activity whose Picture in Picture mode the test sets, counting fullscreen requests. */
++    @Implements(Activity.class)
++    public static class PipShadowActivity extends ShadowActivity {
++        static boolean sInPip;
++        static int sEnterRequests;
++        static int sExitRequests;
++
++        public PipShadowActivity() {}
++
++        @Implementation
++        protected boolean isInPictureInPictureMode() {
++            return sInPip;
++        }
++
++        @Implementation(minSdk = 34)
++        protected void requestFullscreenMode(
++                int request, OutcomeReceiver<Void, Throwable> approvalCallback) {
++            if (request == Activity.FULLSCREEN_MODE_REQUEST_ENTER) sEnterRequests++;
++            if (request == Activity.FULLSCREEN_MODE_REQUEST_EXIT) sExitRequests++;
++            if (approvalCallback != null) approvalCallback.onResult(null);
++        }
++    }
++
++    @Rule public final MockitoRule mMockitoRule = MockitoJUnit.rule();
++    @Mock private Tab mTab;
++
++    private Activity mActivity;
++    private FullscreenHtmlApiHandlerCompat mHandler;
++
++    @Before
++    public void setUp() {
++        ContextUtils.getAppSharedPreferences().edit().clear().commit();
++        PipShadowActivity.sInPip = false;
++        PipShadowActivity.sEnterRequests = 0;
++        PipShadowActivity.sExitRequests = 0;
++
++        mActivity = Robolectric.buildActivity(Activity.class).setup().get();
++        doReturn(new UserDataHost()).when(mTab).getUserDataHost();
++        // Avoids GestureListenerManager and SelectionPopupController.
++        doReturn(null).when(mTab).getWebContents();
++        doReturn(true).when(mTab).isUserInteractable();
++
++        // Controls stay shown: fullscreen stops at its pending state, which is all these tests
++        // need (persistent mode and the activity fullscreen request come before it).
++        SettableNonNullObservableSupplier<Boolean> areControlsHidden =
++                ObservableSuppliers.createNonNull(false);
++        mHandler =
++                new FullscreenHtmlApiHandlerCompat(
++                        mActivity,
++                        areControlsHidden,
++                        /* exitFullscreenOnStop= */ true,
++                        new MultiWindowModeStateDispatcherImpl(mActivity)) {
++                    @Override
++                    public void destroySelectActionMode(Tab tab) {}
++
++                    @Override
++                    protected void updateMultiTouchZoomSupport(boolean enable) {}
++                };
++        mHandler.setTabForTesting(mTab);
++    }
++
++    private void enterFullscreen() {
++        mHandler.onEnterFullscreen(mTab, new FullscreenOptions(false, false, INVALID_DISPLAY));
++    }
++
++    @Test
++    public void testOutsideTheWindowTheActivityFullscreenModeIsRequestedAtOnce() {
++        enterFullscreen();
++
++        assertTrue(mHandler.getPersistentFullscreenMode());
++        assertEquals(1, PipShadowActivity.sEnterRequests);
++    }
++
++    @Test
++    public void testInTheWindowTheActivityFullscreenModeWaitsForTheWindowToExpand() {
++        PipShadowActivity.sInPip = true;
++        enterFullscreen();
++
++        assertTrue(mHandler.getPersistentFullscreenMode());
++        assertEquals(0, PipShadowActivity.sEnterRequests);
++
++        // Resumed while still in the window: still nothing.
++        mHandler.onActivityStateChange(mActivity, ActivityState.RESUMED);
++        assertEquals(0, PipShadowActivity.sEnterRequests);
++
++        // Expanded, still fullscreen: requested once.
++        PipShadowActivity.sInPip = false;
++        mHandler.onActivityStateChange(mActivity, ActivityState.RESUMED);
++        assertEquals(1, PipShadowActivity.sEnterRequests);
++        mHandler.onActivityStateChange(mActivity, ActivityState.RESUMED);
++        assertEquals(1, PipShadowActivity.sEnterRequests);
++
++        // And left again on exit, as upstream.
++        mHandler.exitPersistentFullscreenMode();
++        assertEquals(1, PipShadowActivity.sExitRequests);
++    }
++
++    @Test
++    public void testFullscreenEndedInTheWindowRequestsNothingOnExpand() {
++        PipShadowActivity.sInPip = true;
++        enterFullscreen();
++        mHandler.exitPersistentFullscreenMode();
++
++        PipShadowActivity.sInPip = false;
++        mHandler.onActivityStateChange(mActivity, ActivityState.RESUMED);
++
++        assertFalse(mHandler.getPersistentFullscreenMode());
++        assertEquals(0, PipShadowActivity.sEnterRequests);
++        assertEquals(0, PipShadowActivity.sExitRequests);
++    }
++
++    @Test
++    public void testScreenOffInTheWindowKeepsFullscreenWithBackgroundPlay() {
++        TarkMediaPrefs.setBackgroundPlay(true);
++        PipShadowActivity.sInPip = true;
++        enterFullscreen();
++
++        mHandler.onActivityStateChange(mActivity, ActivityState.STOPPED);
++
++        assertTrue(mHandler.getPersistentFullscreenMode());
++    }
++
++    @Test
++    public void testScreenOffInTheWindowExitsFullscreenWithoutBackgroundPlay() {
++        TarkMediaPrefs.setBackgroundPlay(false);
++        PipShadowActivity.sInPip = true;
++        enterFullscreen();
++
++        mHandler.onActivityStateChange(mActivity, ActivityState.STOPPED);
++
++        assertFalse(mHandler.getPersistentFullscreenMode());
++    }
++
++    @Test
++    public void testStopOutsideTheWindowExitsFullscreenWithBackgroundPlay() {
++        TarkMediaPrefs.setBackgroundPlay(true);
++        enterFullscreen();
++
++        mHandler.onActivityStateChange(mActivity, ActivityState.STOPPED);
++
++        assertFalse(mHandler.getPersistentFullscreenMode());
++    }
++}
 diff --color -ruN a/chrome/android/junit/src/org/chromium/chrome/browser/media/FullscreenVideoPictureInPictureControllerUnitTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/media/FullscreenVideoPictureInPictureControllerUnitTest.java
 --- a/chrome/android/junit/src/org/chromium/chrome/browser/media/FullscreenVideoPictureInPictureControllerUnitTest.java	2026-10-30 00:38:28.562349947 +0530
 +++ b/chrome/android/junit/src/org/chromium/chrome/browser/media/FullscreenVideoPictureInPictureControllerUnitTest.java	2026-10-30 00:38:40.248626612 +0530
