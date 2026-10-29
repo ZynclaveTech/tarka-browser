@@ -345,7 +345,12 @@ FIREFOX_IMAGESETS = ('faviconFox', 'foxConfirmation', 'foxDefaultBrowser', 'foxW
                      'protectionPanelAlert', 'protectionPanelOff', 'protectionPanelOn')
 # Names of Mozilla's products and of Mozilla in the app's text. No word
 # boundaries: some languages join the name to the next letter.
-FIREFOX_WORDS = re.compile(r'Firefox|Mozilla|Fennec')
+FIREFOX_WORDS = re.compile(r'Firefox|Mozilla|Fennec', re.I)
+FIREFOX_SITE = re.compile(r'firefox\.com', re.I)
+
+
+def tarkify(text):
+    return FIREFOX_WORDS.sub('Tark', FIREFOX_SITE.sub('gettarka.com', text))
 # Only the text, never the keys (code looks strings up by key): the value of
 # a "key" = "value"; line, and <string> elements in a .stringsdict.
 STRINGS_VALUE = re.compile(r'^(\s*"(?:[^"\\]|\\.)*"\s*=\s*")((?:[^"\\]|\\.)*)(")', re.M)
@@ -389,22 +394,35 @@ def debrand():
             encoding = 'utf-16' if raw[:2] in (b'\xff\xfe', b'\xfe\xff') else 'utf-8'
             text = raw.decode(encoding)
             pattern = STRINGSDICT_VALUE if path.suffix == '.stringsdict' else STRINGS_VALUE
-            new = pattern.sub(lambda m: m.group(1) + FIREFOX_WORDS.sub('Tark', m.group(2)) + m.group(3), text)
+            new = pattern.sub(lambda m: m.group(1) + tarkify(m.group(2)) + m.group(3), text)
             if new != text:
                 path.write_bytes(new.encode(encoding))
-    # The English fallbacks compiled into the app (`value: "..."` in
-    # Strings.swift and the other string tables in code).
-    swift_value = re.compile(r'(value:\s*")((?:[^"\\]|\\.)*)(")')
+    # Sentences in code (English fallbacks, translator comments, debug-menu
+    # text): any Swift string literal with a space that names Firefox/Mozilla.
+    # Script identifiers (window.__firefox__) are code, not text, and stay.
+    swift_value = re.compile(r'(")((?:[^"\\\n]|\\.)* (?:[^"\\\n]|\\.)*)(")')
     for root in shipped:
         for path in root.rglob('*.swift'):
             if any(part.endswith('Tests') for part in path.parts):
                 continue
             text = path.read_text()
-            if 'value:' not in text or not FIREFOX_WORDS.search(text):
+            if not FIREFOX_WORDS.search(text):
                 continue
-            new = swift_value.sub(lambda m: m.group(1) + FIREFOX_WORDS.sub('Tark', m.group(2)) + m.group(3), text)
+            # Never a lookup key: key: "...", or the first argument of
+            # NSLocalizedString( / MZLocalizedString(.
+            def rewrite(m, text=text):
+                before = text[max(0, m.start() - 40):m.start()]
+                if '__firefox' in m.group(2) or re.search(r'(key:\s*|LocalizedString\(\s*)$', before):
+                    return m.group(0)
+                return m.group(1) + tarkify(m.group(2)) + m.group(3)
+            new = swift_value.sub(rewrite, text)
             if new != text:
                 path.write_text(new)
+    # Mozilla's experiment data and Firefox's test pages ship in the app.
+    (TREE / 'firefox-ios' / 'Client' / 'Experiments' / 'initial_experiments.json').write_text('{"data": []}\n')
+    for fixture in (TREE / 'firefox-ios').glob('**/test-fixtures/*'):
+        if fixture.is_file() and FIREFOX_WORDS.search(fixture.name + fixture.read_text(errors='ignore')):
+            fixture.write_text('')
     # The search widget's name in the widget gallery.
     for config in [TREE / 'firefox-ios' / 'Client.xcodeproj' / 'project.pbxproj',
                    *(TREE / 'firefox-ios' / 'Client' / 'Configuration').glob('*.xcconfig')]:
