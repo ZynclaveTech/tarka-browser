@@ -48,17 +48,24 @@
    }
  
   private:
-@@ -115,7 +113,8 @@
+@@ -115,7 +113,15 @@
  
  CaptionServiceImpl::CaptionServiceImpl(mojo::PendingReceiver<mojom::CaptionService> receiver)
      : receiver_(this, std::move(receiver)),
 -      session_(base::BindRepeating(&MakeEngine), base::BindRepeating(&MakeTranslator)) {}
 +      session_(base::BindRepeating(&MakeEngine), base::BindRepeating(&MakeTranslator)),
-+      page_(&session_, base::BindRepeating(&MakeTranslator)) {}
++      page_(&session_, base::BindRepeating(&MakeTranslator)) {
++  // A page's pipe closes on navigation: its queued batches go with it.
++  page_receivers_.set_disconnect_handler(base::BindRepeating(
++      [](CaptionServiceImpl* self) {
++        self->page_.DropBatches(self->page_receivers_.current_receiver());
++      },
++      base::Unretained(this)));
++}
  
  CaptionServiceImpl::~CaptionServiceImpl() = default;
  
-@@ -171,6 +170,28 @@
+@@ -171,6 +177,29 @@
  
  void CaptionServiceImpl::Stop() {
    session_.Stop();
@@ -83,7 +90,8 @@
 +                           [](TranslateBatchCallback callback, PageResults results) {
 +                             std::move(callback).Run(results);
 +                           },
-+                           std::move(callback)));
++                           std::move(callback)),
++                       page_receivers_.current_receiver());
  }
  
  }  // namespace tark_captions
@@ -216,13 +224,14 @@
  };
 --- /dev/null
 +++ b/chrome/services/tark_captions/page_translator.cc
-@@ -0,0 +1,228 @@
+@@ -0,0 +1,243 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
 +
 +#include "chrome/services/tark_captions/page_translator.h"
 +
++#include <algorithm>
 +#include <set>
 +#include <utility>
 +
@@ -305,6 +314,7 @@
 +  std::map<std::string, base::File> files;
 +  std::vector<std::string> texts;
 +  PageBatchCallback callback;
++  uint64_t owner = 0;
 +};
 +
 +namespace {
@@ -373,8 +383,10 @@
 +                                    const std::string& target,
 +                                    std::map<std::string, base::File> files,
 +                                    std::vector<std::string> texts,
-+                                    PageBatchCallback callback) {
++                                    PageBatchCallback callback,
++                                    uint64_t owner) {
 +  auto batch = std::make_unique<Batch>();
++  batch->owner = owner;
 +  batch->source = source;
 +  batch->target = target;
 +  batch->legs = PageLegsFor(source, target);
@@ -382,6 +394,17 @@
 +  batch->texts = std::move(texts);
 +  batch->callback = std::move(callback);
 +  queue_.push_back(std::move(batch));
++  Pump();
++}
++
++void PageTranslator::DropBatches(uint64_t owner) {
++  // The front batch is running when `running_`: it stays until it is done.
++  auto first = queue_.begin() + (running_ ? 1 : 0);
++  queue_.erase(std::remove_if(first, queue_.end(),
++                              [owner](const std::unique_ptr<Batch>& batch) {
++                                return batch->owner == owner;
++                              }),
++               queue_.end());
 +  Pump();
 +}
 +
@@ -447,13 +470,15 @@
 +}  // namespace tark_captions
 --- /dev/null
 +++ b/chrome/services/tark_captions/page_translator.h
-@@ -0,0 +1,93 @@
+@@ -0,0 +1,100 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
 +
 +#ifndef CHROME_SERVICES_TARK_CAPTIONS_PAGE_TRANSLATOR_H_
 +#define CHROME_SERVICES_TARK_CAPTIONS_PAGE_TRANSLATOR_H_
++
++#include <stdint.h>
 +
 +#include <map>
 +#include <memory>
@@ -515,7 +540,12 @@
 +                      const std::string& target,
 +                      std::map<std::string, base::File> files,
 +                      std::vector<std::string> texts,
-+                      PageBatchCallback callback);
++                      PageBatchCallback callback,
++                      uint64_t owner = 0);
++  // `owner`'s pipe is gone (the page navigated): its batches still queued
++  // are dropped, not run, so a new page's batches never wait behind them.
++  // One already running finishes; its result goes nowhere.
++  void DropBatches(uint64_t owner);
 +
 +  // The page's own model, on the translation sequence.
 +  struct Slot;
@@ -543,7 +573,7 @@
 +#endif  // CHROME_SERVICES_TARK_CAPTIONS_PAGE_TRANSLATOR_H_
 --- /dev/null
 +++ b/chrome/services/tark_captions/page_translator_unittest.cc
-@@ -0,0 +1,246 @@
+@@ -0,0 +1,265 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -770,6 +800,25 @@
 +                          base::Unretained(&order), both.GetCallback()));
 +  ASSERT_TRUE(both.Wait());
 +  EXPECT_EQ(order, (std::vector<int>{1, 2}));
++}
++
++// The page navigated: its pipe closed, so its batches still queued are
++// dropped rather than run, and the next page's batch does not wait for them.
++TEST_F(PageTranslatorTest, DisconnectedPipeBatchesAreDropped) {
++  ASSERT_TRUE(session_.SetTarget("en", Units({"tr_indic_en"})));
++  PageTranslator page(&session_, Factory());
++  base::test::TestFuture<PageResults> old_page, new_page;
++  // Captions hold another model, so the old page's batch waits in the queue.
++  page.TranslateBatch("en", "hi", Units({"tr_en_indic"}), {"old"}, old_page.GetCallback(),
++                      /*owner=*/1);
++  page.DropBatches(1);
++  ASSERT_TRUE(session_.SetTarget("", {}));
++  page.TranslateBatch("en", "hi", Units({"tr_en_indic"}), {"new"}, new_page.GetCallback(),
++                      /*owner=*/2);
++  EXPECT_EQ(new_page.Take(), (PageResults{"hi:new"}));
++  EXPECT_FALSE(old_page.IsReady());
++  base::AutoLock hold(models_.lock);
++  EXPECT_EQ(models_.received, (std::vector<std::string>{"new"}));
 +}
 +
 +TEST_F(PageTranslatorTest, Legs) {
