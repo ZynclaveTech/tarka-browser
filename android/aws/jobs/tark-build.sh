@@ -50,7 +50,8 @@ echo "submodule $SUB" >> $log
 
 (( fresh )) && rm -rf /tark/work/src /tark/work/src-base /tark/work/prepared.stamp /tark/work/base.stamp /tark/work/layers.json
 # An earlier build's APK must never be uploaded as this job's.
-rm -f /tark/work/src/out/Default/apks/ChromePublic.apk /tark/work/src/out/Default/apks/ChromePublic.aab
+rm -f /tark/work/src/out/Default/apks/ChromePublic.apk /tark/work/src/out/Default/apks/ChromePublic.aab \
+  /tark/work/src/out/Default/apks/ChromePublic.apk.mapping /tark/work/src/out/Default/apks/ChromePublic.aab.mapping
 # A2: a list bundle staged in s3://BUCKET/lists/ (latest.json and its zip)
 # stands in for gettarka.com's; build.sh checks its signature either way.
 rm -rf /tark/lists && mkdir -p /tark/lists
@@ -71,6 +72,15 @@ if (( code == 0 )); then
     grep -qE "^\[[0-9]+/[0-9]+\] CaptionDownloadsTest\.$t \([0-9]+ ms\)$" $log || { echo "no CaptionDownloadsTest.$t test ran" >> $log; code=1; }
     grep -qE "CaptionDownloadsTest\.$t.*(SKIPPED|FAILED)|(SKIPPED|FAILED).*CaptionDownloadsTest\.$t" $log && { echo "CaptionDownloadsTest.$t did not pass" >> $log; code=1; }
   done
+  # Background play's visibility hold (media-background-play.patch).
+  for t in PlayingWithSoundThenHideStaysVisible NothingPlayingThenHideIsHidden MutedThenHideIsHidden \
+      HoldReleasedWhenMediaPauses HoldReleasedWhenEnded SilentStretchWhilePlayingKeepsTheHold SettingsOffIsUpstream \
+      OnlyPictureInPictureWithoutWindowIsUpstream OnlyPictureInPictureWithWindowIsHeld BackgroundPlayOnlyIsHeld \
+      TabSwitchInsideTarkIsUpstream Allowed LaterHiddenUpdatesKeepTheHold ShowAfterHoldSendsNoEvent NoHoldAgainAfterRelease NeverShownTabIsNotHeld \
+      HoldAgainAfterShowingAgain; do
+    grep -qE "^\[[0-9]+/[0-9]+\] TarkVisibilityHoldTest\.$t \([0-9]+ ms\)$" $log || { echo "no TarkVisibilityHoldTest.$t test ran" >> $log; code=1; }
+    grep -qE "TarkVisibilityHoldTest\.$t.*(SKIPPED|FAILED)|(SKIPPED|FAILED).*TarkVisibilityHoldTest\.$t" $log && { echo "TarkVisibilityHoldTest.$t did not pass" >> $log; code=1; }
+  done
   # Voice search's detector: its 15 s ring of audio (voice-language-detect.patch).
   for t in RingBufferKeeps15s RingBufferHoldsLessWhenShorter RingBufferDropsAtSessionEnd NoModelsDecidesNothing \
       SharedModelsWaitForAttachedSessions UnattachedDetectorLeavesSharedUseAlone; do
@@ -80,6 +90,10 @@ if (( code == 0 )); then
 fi
 (( code == 0 )) && upload /tark/work/src/out/Default/apks/ChromePublic.apk ChromePublic.apk
 (( code == 0 )) && upload /tark/work/src/out/Default/apks/ChromePublic.aab ChromePublic.aab
+# R8's mapping files (proguard writes <apk>.mapping next to each output), to
+# retrace the build's obfuscated stacks: retrace from third_party/r8.
+(( code == 0 )) && upload /tark/work/src/out/Default/apks/ChromePublic.apk.mapping ChromePublic.apk.mapping
+(( code == 0 )) && upload /tark/work/src/out/Default/apks/ChromePublic.aab.mapping ChromePublic.aab.mapping
 # A3: the IndicXlit files this APK pins (android/xlit/files.py), for the
 # emulator checks and for publishing on gettarka.com.
 if (( code == 0 )); then
@@ -87,8 +101,9 @@ if (( code == 0 )); then
   upload /tark/xlit-files.tgz xlit-files.tgz
 fi
 # The junit tests of the speech and voice patches (voice input) and of the
-# Private button (private-tab-button.patch) and of Sign in with Zynclave
-# (zynclave-*.patch), built and
+# Private button (private-tab-button.patch), of Sign in with Zynclave
+# (zynclave-*.patch), of Background play (media-background-play.patch) and of
+# Picture in Picture on leave (media-pip-on-leave.patch), built and
 # run here on the same tree (the runners with a venv's Python: there is no
 # vpython3); a failure, or a filter that runs no test, fails the job.
 if (( code == 0 )); then
@@ -118,12 +133,15 @@ if (( code == 0 )); then
       /tark/junit-venv/bin/python $o/bin/run_content_junit_tests --gtest_filter='*SpeechRecognitionImplTest*' &&
       /tark/junit-venv/bin/python $o/bin/run_chrome_junit_tests --gtest_filter='*SpeechLanguageSnackbarTest*:*VoiceDetectionTest*:*VoiceLanguagesTest*:*VoiceLanguageSignalsTest*:*VoiceLanguagesSettingsTest*:*AndroidVoicePlatformTest*:*VoiceSiteLanguagesTest*:*VoiceLanguageOfferTest*' &&
       /tark/junit-venv/bin/python $o/bin/run_chrome_junit_tests --gtest_filter='*IncognitoTabSwitcherPaneUnitTest*' &&
-      /tark/junit-venv/bin/python $o/bin/run_chrome_junit_tests --gtest_filter='*ZynclaveAuthFlowTest*:*AuthStateStoreTest*:*ZynclaveAccountTest*:*ZynclaveAccountRowTest*:*ZynclaveNoTokenLogsTest*:*ZynclaveRedirectTest*:*ZynclaveWebOfferTest*'
+      /tark/junit-venv/bin/python $o/bin/run_chrome_junit_tests --gtest_filter='*ZynclaveAuthFlowTest*:*AuthStateStoreTest*:*ZynclaveAccountTest*:*ZynclaveAccountRowTest*:*ZynclaveNoTokenLogsTest*:*ZynclaveRedirectTest*:*ZynclaveWebOfferTest*' &&
+      /tark/junit-venv/bin/python $o/bin/run_chrome_junit_tests --gtest_filter='*TarkMediaPrefsTest*:*TarkLeaveDecisionTest*:*TarkExclusiveAccessPipTest*:*TarkPipEntryPointsTest*:*TarkAutoPictureInPictureTest*:*FullscreenVideoPictureInPictureControllerUnitTest*:*TarkFullscreenPipTest*'
     } > /tark/junit.log 2>&1
     code=$?
     # A filter that matches nothing "passes" with no test run.
     for t in SpeechRecognitionImplTest SpeechLanguageSnackbarTest VoiceDetectionTest VoiceLanguagesTest VoiceLanguageSignalsTest VoiceLanguagesSettingsTest AndroidVoicePlatformTest VoiceSiteLanguagesTest VoiceLanguageOfferTest IncognitoTabSwitcherPaneUnitTest \
-        ZynclaveAuthFlowTest AuthStateStoreTest ZynclaveAccountTest ZynclaveAccountRowTest ZynclaveNoTokenLogsTest ZynclaveRedirectTest ZynclaveWebOfferTest; do
+        ZynclaveAuthFlowTest AuthStateStoreTest ZynclaveAccountTest ZynclaveAccountRowTest ZynclaveNoTokenLogsTest ZynclaveRedirectTest ZynclaveWebOfferTest \
+        TarkMediaPrefsTest TarkLeaveDecisionTest TarkExclusiveAccessPipTest TarkPipEntryPointsTest \
+        TarkAutoPictureInPictureTest FullscreenVideoPictureInPictureControllerUnitTest TarkFullscreenPipTest; do
       grep -q "OK \] .*$t\." /tark/junit.log || { echo "junit: no $t test ran" >> $log; code=1; }
     done
     upload /tark/junit.log junit.log

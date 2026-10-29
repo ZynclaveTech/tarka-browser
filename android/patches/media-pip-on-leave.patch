@@ -1,0 +1,2629 @@
+diff --color -ruN a/chrome/android/BUILD.gn b/chrome/android/BUILD.gn
+--- a/chrome/android/BUILD.gn	2026-10-30 00:38:40.143605054 +0530
++++ b/chrome/android/BUILD.gn	2026-10-30 00:38:40.234784554 +0530
+@@ -3248,6 +3248,7 @@
+       "java/src/org/chromium/chrome/browser/tabmodel/TabCollectionTabModelImpl.java",
+       "java/src/org/chromium/chrome/browser/tabmodel/TabModelJniBridge.java",
+       "java/src/org/chromium/chrome/browser/tabmodel/TabModelObserverJniBridge.java",
++      "java/src/org/chromium/chrome/browser/tark/media/TarkPictureInPicture.java",
+       "java/src/org/chromium/chrome/browser/touch_to_fill/autofill/TouchToFillAutofillViewBridge.java",
+       "java/src/org/chromium/chrome/browser/touch_to_fill/payments/TouchToFillPaymentMethodControllerBridge.java",
+       "java/src/org/chromium/chrome/browser/touch_to_fill/payments/TouchToFillPaymentMethodViewBridge.java",
+diff --color -ruN a/chrome/android/chrome_java_sources.gni b/chrome/android/chrome_java_sources.gni
+--- a/chrome/android/chrome_java_sources.gni	2026-10-30 00:38:40.146780846 +0530
++++ b/chrome/android/chrome_java_sources.gni	2026-10-30 00:38:40.237153377 +0530
+@@ -974,8 +974,10 @@
+   "java/src/org/chromium/chrome/browser/page_info/SiteSettingsHelper.java",
+   "java/src/org/chromium/chrome/browser/page_info/TarkAdblockSiteSwitch.java",
+   "java/src/org/chromium/chrome/browser/tark_captions/TarkCaptionBarCoordinator.java",
++  "java/src/org/chromium/chrome/browser/tark/media/TarkLeaveDecision.java",
+   "java/src/org/chromium/chrome/browser/tark/media/TarkMediaPrefs.java",
+   "java/src/org/chromium/chrome/browser/tark/media/TarkMediaSwitchPreference.java",
++  "java/src/org/chromium/chrome/browser/tark/media/TarkPictureInPicture.java",
+   "java/src/org/chromium/chrome/browser/tark/zynclave/AuthStateStore.java",
+   "java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAccount.java",
+   "java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAccountPreference.java",
+diff --color -ruN a/chrome/android/java/src/org/chromium/chrome/browser/app/ChromeActivity.java b/chrome/android/java/src/org/chromium/chrome/browser/app/ChromeActivity.java
+--- a/chrome/android/java/src/org/chromium/chrome/browser/app/ChromeActivity.java	2026-10-30 00:38:28.568046231 +0530
++++ b/chrome/android/java/src/org/chromium/chrome/browser/app/ChromeActivity.java	2026-10-30 00:40:06.006065188 +0530
+@@ -217,6 +217,8 @@
+ import org.chromium.chrome.browser.tabmodel.TabModelSelectorSupplier;
+ import org.chromium.chrome.browser.tabmodel.TabModelSelectorTabObserver;
+ import org.chromium.chrome.browser.tabmodel.TabModelUtils;
++import org.chromium.chrome.browser.tark.media.TarkMediaPrefs;
++import org.chromium.chrome.browser.tark.media.TarkPictureInPicture;
+ import org.chromium.chrome.browser.task_manager.TaskManager;
+ import org.chromium.chrome.browser.task_manager.TaskManagerFactory;
+ import org.chromium.chrome.browser.tasks.tab_management.TabGroupUiUtils;
+@@ -226,6 +228,7 @@
+ import org.chromium.chrome.browser.tark_captions.TarkCaptionBarCoordinator;
+ import org.chromium.chrome.browser.ui.BottomContainer;
+ import org.chromium.chrome.browser.ui.ChromeActivitySnackbarHelper;
++import org.chromium.chrome.browser.ui.ExclusiveAccessBubble;
+ import org.chromium.chrome.browser.ui.RootUiCoordinator;
+ import org.chromium.chrome.browser.ui.appmenu.AppMenuBlocker;
+ import org.chromium.chrome.browser.ui.appmenu.AppMenuDelegate;
+@@ -467,6 +470,14 @@
+     private @Nullable DisplayAndroidObserver mDisplayAndroidObserver;
+ 
+     private @Nullable BottomContainer mBottomContainer;
++
++    // Tark: the bottom container's visibility before Picture in Picture hid it (its snackbars
++    // wait, paused, until the window ends); null when not hidden.
++    private @Nullable Integer mTarkBottomContainerVisibilityBeforePip;
++
++    // Tark: how long the fullscreen notice owed since Picture in Picture waits on leaving it,
++    // while the fullscreen Tark made for the window ends (and with it the notice).
++    private static final long TARK_OWED_NOTICE_DELAY_MS = 500;
+     // Tark: live captions' bar, in the bottom container.
+     private @Nullable TarkCaptionBarCoordinator mTarkCaptionBar;
+ 
+@@ -1567,6 +1578,15 @@
+             return;
+         }
+ 
++        // Tark: Settings → Picture in Picture off: no Picture in Picture (the auto-enter params
++        // follow the setting already; this is belt and braces). Otherwise the controller below
++        // also floats the current tab's video playing with sound, inline or fullscreen
++        // (TarkPictureInPicture); on 33+ it has usually auto-entered already.
++        if (!TarkMediaPrefs.pictureInPicture()) {
++            FullscreenVideoPictureInPictureController.disableAutoPictureInPicture(this);
++            return;
++        }
++
+         FullscreenVideoPictureInPictureController controller =
+                 ensureFullscreenVideoPictureInPictureController();
+         if (controller != null) {
+@@ -1607,18 +1627,43 @@
+             maybeCreateActorPipController();
+             if (mActorPipController != null && mActorPipController.shouldEnterPip()) return;
+ 
++            // Tark: no snackbar in the Picture in Picture window. The fullscreen notice ("To exit
++            // full screen, press |Esc|") is owed and shows again on leaving it while still
++            // fullscreen; the others (undo close tab, downloads, ...) stay, hidden with the bottom
++            // container, their timers paused with the activity, and come back with it.
++            ExclusiveAccessBubble.onPictureInPictureModeChanged(this, true, 0);
++            if (mBottomContainer != null && mTarkBottomContainerVisibilityBeforePip == null) {
++                mTarkBottomContainerVisibilityBeforePip = mBottomContainer.getVisibility();
++                mBottomContainer.setVisibility(View.INVISIBLE);
++            }
++
+             FullscreenVideoPictureInPictureController controller =
+                     ensureFullscreenVideoPictureInPictureController();
+             if (controller != null) {
+                 controller.onEnteredPictureInPictureMode();
+             }
+         } else {
++            // Tark: the fullscreen notice owed since entering Picture in Picture. When Tark made
++            // the fullscreen, it ends just below: the notice waits, and native's hide() cancels
++            // it instead of it flashing up.
++            ExclusiveAccessBubble.onPictureInPictureModeChanged(
++                    this,
++                    false,
++                    TarkPictureInPicture.hasFullscreenItMade() ? TARK_OWED_NOTICE_DELAY_MS : 0);
++            if (mBottomContainer != null && mTarkBottomContainerVisibilityBeforePip != null) {
++                mBottomContainer.setVisibility(mTarkBottomContainerVisibilityBeforePip);
++            }
++            mTarkBottomContainerVisibilityBeforePip = null;
+             if (mActorPipController != null) {
+                 mActorPipController.onFrameworkExitedPictureInPicture();
+             }
+             if (mFullscreenVideoPictureInPictureController != null) {
+                 mFullscreenVideoPictureInPictureController.onFrameworkExitedPictureInPicture();
+             }
++            // Tark: the controller's exit callbacks end the fullscreen Tark made and release the
++            // window size the page sees; if this activity was recreated in the window, the new
++            // controller has none, so do it here.
++            TarkPictureInPicture.leaveWindow();
+             mLastPictureInPictureModeForTesting = false;
+         }
+     }
+diff --color -ruN a/chrome/android/java/src/org/chromium/chrome/browser/app/tab_activity_glue/ActivityTabWebContentsDelegateAndroid.java b/chrome/android/java/src/org/chromium/chrome/browser/app/tab_activity_glue/ActivityTabWebContentsDelegateAndroid.java
+--- a/chrome/android/java/src/org/chromium/chrome/browser/app/tab_activity_glue/ActivityTabWebContentsDelegateAndroid.java	2026-10-30 00:38:39.257762522 +0530
++++ b/chrome/android/java/src/org/chromium/chrome/browser/app/tab_activity_glue/ActivityTabWebContentsDelegateAndroid.java	2026-10-30 00:40:53.530773432 +0530
+@@ -414,6 +414,16 @@
+             return;
+         }
+ 
++        // Tark: in Picture in Picture, a page doesn't bring the activity to the front: that
++        // expands the window (moveTaskToFront). A fullscreen request activates its contents
++        // (WebContentsImpl::EnterFullscreenMode), and Tark makes the playing video fullscreen
++        // just after entering the window; window.focus() would do the same. The user expands
++        // the window from its own controls.
++        if (mActivity.isInPictureInPictureMode()) {
++            Log.w(TAG, "Tark: not activating contents in Picture in Picture", new Throwable());
++            return;
++        }
++
+         // If the tab can currently be interacted with by the user and it's not in multi-window
+         // mode, then it is already focused so we can drop the call.
+         if (!mActivity.isInMultiWindowMode() && mTab.isUserInteractable()) {
+diff --color -ruN a/chrome/android/java/src/org/chromium/chrome/browser/fullscreen/FullscreenHtmlApiHandlerBase.java b/chrome/android/java/src/org/chromium/chrome/browser/fullscreen/FullscreenHtmlApiHandlerBase.java
+--- a/chrome/android/java/src/org/chromium/chrome/browser/fullscreen/FullscreenHtmlApiHandlerBase.java	2026-10-30 02:23:11.294175192 +0530
++++ b/chrome/android/java/src/org/chromium/chrome/browser/fullscreen/FullscreenHtmlApiHandlerBase.java	2026-10-30 02:30:37.541580844 +0530
+@@ -17,6 +17,7 @@
+ import android.os.Handler;
+ import android.os.Message;
+ import android.os.OutcomeReceiver;
++import android.os.PowerManager;
+ import android.util.Pair;
+ import android.view.Display;
+ import android.view.View;
+@@ -33,6 +34,7 @@
+ import org.chromium.base.ApplicationStatus.ActivityStateListener;
+ import org.chromium.base.ApplicationStatus.WindowFocusChangedListener;
+ import org.chromium.base.DeviceInfo;
++import org.chromium.base.Log;
+ import org.chromium.base.ObserverList;
+ import org.chromium.base.supplier.NonNullObservableSupplier;
+ import org.chromium.base.supplier.ObservableSuppliers;
+@@ -53,6 +55,7 @@
+ import org.chromium.chrome.browser.tab.TabHidingType;
+ import org.chromium.chrome.browser.tabmodel.TabModelSelector;
+ import org.chromium.chrome.browser.tabmodel.TabModelSelectorTabObserver;
++import org.chromium.chrome.browser.tark.media.TarkMediaPrefs;
+ import org.chromium.chrome.browser.util.AndroidTaskUtils;
+ import org.chromium.components.embedder_support.view.ContentView;
+ import org.chromium.content_public.browser.GestureListenerManager;
+@@ -69,6 +72,9 @@
+         implements ActivityStateListener, WindowFocusChangedListener, FullscreenManager {
+     private static final boolean DEBUG_LOGS = false;
+ 
++    // Tark: diagnostics for fullscreen ending in Picture in Picture.
++    private static final String TARK_TAG = "TarkFullscreen";
++
+     protected static final int MSG_ID_SET_VISIBILITY_FOR_SYSTEM_BARS = 1;
+     protected static final int MSG_ID_UNSET_FULLSCREEN_LAYOUT = 2;
+ 
+@@ -87,6 +93,11 @@
+ 
+     private final NonNullObservableSupplier<Boolean> mAreControlsHidden;
+     private boolean mExitFullscreenOnStop;
++
++    // Tark: the activity fullscreen mode (Activity.requestFullscreenMode) asked for while in
++    // Picture in Picture, where it would take the task out of the pinned window. It is applied
++    // when the window is expanded and the activity resumes, if fullscreen is still on.
++    private @Nullable OutcomeReceiver<@Nullable Void, Throwable> mTarkActivityFullscreenOnResume;
+     private final ObserverList<FullscreenManager.Observer> mObservers = new ObserverList<>();
+ 
+     // We need to cache WebContents/ContentView since we are setting fullscreen UI state on
+@@ -320,8 +331,7 @@
+ 
+                     @Override
+                     public void onHidden(Tab tab, @TabHidingType int reason) {
+-                        // Clean up any fullscreen state that might impact other tabs.
+-                        mFullscreenManagerDelegate.onExitFullscreen(null);
++                        onTabHidden(reason);
+                     }
+ 
+                     @Override
+@@ -396,9 +406,14 @@
+                     }
+                 };
+ 
+-        if (isSameDisplay(options)) {
++        // Tark: in Picture in Picture fullscreen stays on this display: moving the task to
++        // another display would take it out of the pinned window.
++        if (isSameDisplay(options) || mActivity.isInPictureInPictureMode()) {
+             ensureTaskMovedToFront();
+-            if (tab.isUserInteractable()) {
++            // Tark: in Picture in Picture the paused activity's tab is not
++            // interactable; apply the fullscreen now so the window shows only
++            // the video (as upstream's fullscreen-video Picture in Picture).
++            if (tab.isUserInteractable() || mActivity.isInPictureInPictureMode()) {
+                 r.run();
+             } else {
+                 setEnterFullscreenRunnable(tab, r);
+@@ -481,6 +496,8 @@
+ 
+     private void ensureTaskMovedToFront() {
+         if (!isWindowMoveAvailable()) return;
++        // Tark: moving the task to the front expands the Picture in Picture window.
++        if (mActivity.isInPictureInPictureMode()) return;
+         // When using Task.moveTaskTo to another display the Task may not keep the focus and as so
+         // would not be able to request display edge to edge fullscreen mode on the new display. To
+         // work around this issue we are moving the task to the front on the new display.
+@@ -592,7 +609,14 @@
+                                     mDisplayEdgeToEdgeFullscreenToBeExited = false;
+                                 }
+                             };
+-                    maybeEnterActivityFullscreenMode(resultCb);
++                    if (mActivity.isInPictureInPictureMode()) {
++                        // Tark: requestFullscreenMode takes the task out of the pinned window
++                        // (an inline video Tark makes fullscreen in it closed the window at
++                        // once). Ask for it when the window is expanded instead.
++                        mTarkActivityFullscreenOnResume = resultCb;
++                    } else {
++                        maybeEnterActivityFullscreenMode(resultCb);
++                    }
+                 }
+             }
+             mPersistentModeSupplier.set(true);
+@@ -628,6 +652,12 @@
+ 
+     @Override
+     public void exitPersistentFullscreenMode() {
++        // Tark: diagnostics. Fullscreen ending in Picture in Picture closes the window
++        // (FullscreenVideoPictureInPictureController, LEFT_FULLSCREEN): log who ended it.
++        if (getPersistentFullscreenMode() && mActivity.isInPictureInPictureMode()) {
++            Log.w(TARK_TAG, "Tark: leaving fullscreen in Picture in Picture", new Throwable());
++        }
++        mTarkActivityFullscreenOnResume = null;
+         // Return to the original starting position and bounds if the fullscreen was opening on
+         // another display.
+         returnFromTargetScreenIfNeeded();
+@@ -881,7 +911,11 @@
+ 
+     @Override
+     public void onActivityStateChange(Activity activity, int newState) {
+-        if (newState == ActivityState.STOPPED && mExitFullscreenOnStop) {
++        if (newState == ActivityState.RESUMED) {
++            tarkApplyActivityFullscreenOnResume();
++        } else if (newState == ActivityState.STOPPED
++                && mExitFullscreenOnStop
++                && !tarkKeepsFullscreenOnStop()) {
+             // Exit fullscreen in onStop to ensure the system UI flags are set
+             // correctly when
+             // showing again (on JB MR2+ builds, the omnibox would be covered by the
+@@ -893,6 +927,39 @@
+         }
+     }
+ 
++    /** A tab was hidden (the tab model observer's onHidden). Package-private for tests. */
++    void onTabHidden(@TabHidingType int reason) {
++        // Tark: the activity stopping hides its tab too (ChromeActivity.onStop), after the
++        // STOPPED state change: the same screen turning off, the same exception.
++        if (reason == TabHidingType.ACTIVITY_HIDDEN && tarkKeepsFullscreenOnStop()) return;
++        // Clean up any fullscreen state that might impact other tabs.
++        mFullscreenManagerDelegate.onExitFullscreen(null);
++    }
++
++    /**
++     * Tark: the screen turning off stops the activity in its Picture in Picture window. With
++     * Background play on, fullscreen stays, and so do the window (which
++     * FullscreenVideoPictureInPictureController closes when fullscreen ends) and its video. With it
++     * off the window closes and the video pauses, as upstream. Closing the window also stops the
++     * activity while it's still in Picture in Picture, with the screen on: upstream.
++     */
++    private boolean tarkKeepsFullscreenOnStop() {
++        if (!mActivity.isInPictureInPictureMode() || !TarkMediaPrefs.backgroundPlay()) {
++            return false;
++        }
++        PowerManager powerManager =
++                (PowerManager) mActivity.getSystemService(Context.POWER_SERVICE);
++        return powerManager != null && !powerManager.isInteractive();
++    }
++
++    /** Tark: the activity fullscreen mode deferred while in Picture in Picture, now expanded. */
++    private void tarkApplyActivityFullscreenOnResume() {
++        OutcomeReceiver<@Nullable Void, Throwable> resultCb = mTarkActivityFullscreenOnResume;
++        if (resultCb == null || mActivity.isInPictureInPictureMode()) return;
++        mTarkActivityFullscreenOnResume = null;
++        if (getPersistentFullscreenMode()) maybeEnterActivityFullscreenMode(resultCb);
++    }
++
+     // WindowFocusChangedListener
+ 
+     @Override
+diff --color -ruN a/chrome/android/java/src/org/chromium/chrome/browser/media/FullscreenVideoPictureInPictureController.java b/chrome/android/java/src/org/chromium/chrome/browser/media/FullscreenVideoPictureInPictureController.java
+--- a/chrome/android/java/src/org/chromium/chrome/browser/media/FullscreenVideoPictureInPictureController.java	2026-10-30 02:23:11.294753408 +0530
++++ b/chrome/android/java/src/org/chromium/chrome/browser/media/FullscreenVideoPictureInPictureController.java	2026-10-30 02:30:26.925479639 +0530
+@@ -31,8 +31,11 @@
+ import org.chromium.chrome.browser.notifications.NotificationIntentInterceptor;
+ import org.chromium.chrome.browser.tab.Tab;
+ import org.chromium.chrome.browser.tab.TabObserver;
++import org.chromium.chrome.browser.tark.media.TarkMediaPrefs;
++import org.chromium.chrome.browser.tark.media.TarkPictureInPicture;
+ import org.chromium.chrome.browser.util.AndroidTaskUtils;
+ import org.chromium.content_public.browser.MediaSession;
++import org.chromium.content_public.browser.NavigationHandle;
+ import org.chromium.content_public.browser.WebContents;
+ import org.chromium.content_public.browser.WebContentsObserver;
+ import org.chromium.media_session.mojom.MediaSession.SuspendType;
+@@ -176,6 +179,25 @@
+     /** Should media be suspended if the activity stops, i.e. was the pip window closed? */
+     private boolean mShouldSuspendMediaOnStop;
+ 
++    /**
++     * Tark: the activity stopped in the window because the screen turned off (Background play
++     * on). Unlocking restarts and resumes it while still in the window; that resume isn't the
++     * window being restored, so it doesn't dismiss.
++     */
++    private boolean mTarkStoppedByScreenOff;
++
++    /**
++     * Tark: whether leaving floats the current tab's video changed without a player starting or
++     * stopping (the page muted or unmuted, its sound started, a setting changed): the auto-enter
++     * params follow it.
++     */
++    private final Callback<@Nullable WebContents> mTarkOfferObserver =
++            webContents -> {
++                if (webContents == null || webContents == getWebContents()) {
++                    updateAutoPictureInPictureStatusIfNeeded();
++                }
++            };
++
+     public FullscreenVideoPictureInPictureController(
+             Activity activity,
+             ActivityTabProvider activityTabProvider,
+@@ -189,6 +211,7 @@
+ 
+         if (ENABLE_AUTO_ENTER) {
+             addObserversIfNeeded();
++            TarkPictureInPicture.addOfferObserver(mTarkOfferObserver);
+         }
+     }
+ 
+@@ -214,8 +237,10 @@
+         assertLibraryLoaderIsInitialized();
+ 
+         // Only auto-PiP if there is a playing fullscreen video that allows PiP.
+-        if (!webContents.hasActiveEffectivelyFullscreenVideo()
+-                || !webContents.isPictureInPictureAllowedForFullscreenVideo()) {
++        // Tark: instead, with Settings → Picture in Picture on (off: none at all), when the tab
++        // plays a video with sound, inline or fullscreen (TarkPictureInPicture makes an inline one
++        // fullscreen as the window opens); a muted or silent fullscreen video doesn't float.
++        if (!TarkPictureInPicture.allowsPictureInPicture(webContents)) {
+             return false;
+         }
+ 
+@@ -331,6 +356,7 @@
+                 builder.setSourceRectHint(bounds);
+             }
+         }
++        tarkSetAspectRatio(builder, webContents);
+ 
+         try {
+             if (!mActivity.enterPictureInPictureMode(builder.build())) return;
+@@ -420,12 +446,25 @@
+ 
+         webContents.setHasPersistentVideo(true);
+ 
++        // Tark: the page keeps seeing a screen-sized window while it's in this one (players such
++        // as m.youtube.com's leave fullscreen and pause in a small window, which closes it).
++        TarkPictureInPicture.enterWindow(webContents);
++
++        // Tark: an inline video playing with sound becomes the fullscreen element, so the window
++        // shows only the video. Fullscreen ends with the window (TarkPictureInPicture remembers
++        // it, should this activity be recreated meanwhile).
++        if (!webContents.hasActiveEffectivelyFullscreenVideo()
++                && TarkPictureInPicture.enter(activityTab)) {
++            Log.i(TAG, "Tark: video made fullscreen for Picture-in-picture");
++        }
++
+         mOnLeavePipCallbacks.add(
+                 () -> {
+                     Log.i(TAG, "Running Picture-in-picture exit callbacks");
+                     if (!webContents.isDestroyed()) {
+                         webContents.setHasPersistentVideo(false);
+                     }
++                    TarkPictureInPicture.leaveWindow();
+                 });
+ 
+         // Setup observers to dismiss the Activity on events that should end PiP.  In auto-enter
+@@ -445,6 +484,8 @@
+     public void onDestroy() {
+         sControllers.remove(mActivity);
+         removeObserversIfNeeded();
++        TarkPictureInPicture.removeOfferObserver(mTarkOfferObserver);
++        mTarkStoppedByScreenOff = false;
+     }
+ 
+     public void onStart() {
+@@ -459,6 +500,15 @@
+     // on large form factors (see IsBackgroundMediaSuspendEnabled), so suspend it here.
+     public void onStop() {
+         if (mShouldSuspendMediaOnStop) {
++            // Tark: with Background play on, the screen turning off (the lock screen) stops the
++            // activity in the window too; that isn't the window closing, so media plays on. The
++            // flag stays: closing the window after unlocking still suspends. Background play off:
++            // upstream.
++            if (!mPowerManager.isInteractive() && TarkMediaPrefs.backgroundPlay()) {
++                Log.i(TAG, "Tark: stopped in Picture in Picture by the screen turning off");
++                mTarkStoppedByScreenOff = true;
++                return;
++            }
+             mShouldSuspendMediaOnStop = false;
+ 
+             final MediaSession mediaSession = getMediaSession();
+@@ -469,6 +519,15 @@
+     }
+ 
+     public void onResume() {
++        // Tark: unlocking after the screen turned off in the window (Background play on) resumes
++        // the activity while it's still in the window. Keep the window, its fullscreen and its
++        // media; mShouldSuspendMediaOnStop stays, so closing the window later still suspends.
++        boolean stoppedByScreenOff = mTarkStoppedByScreenOff;
++        mTarkStoppedByScreenOff = false;
++        if (stoppedByScreenOff && mActivity.isInPictureInPictureMode()) {
++            Log.i(TAG, "Tark: resumed in Picture in Picture after the screen turned on, keeping it");
++            return;
++        }
+         // Pip was restored rather than closed, so media should keep playing.
+         mShouldSuspendMediaOnStop = false;
+         // Unconditionally dismiss pip, because the activity has been resumed.  This can happen if
+@@ -477,6 +536,24 @@
+         dismissActivityIfNeeded(mActivity, MetricsEndReason.RESUME);
+     }
+ 
++    /**
++     * Tark: the window takes the shape of a video Tark floats. Not a source rect hint: the video
++     * is inline until the window opens, so the fullscreen bounds above don't match the screen.
++     */
++    private static void tarkSetAspectRatio(
++            PictureInPictureParams.Builder builder, WebContents webContents) {
++        if (webContents.hasActiveEffectivelyFullscreenVideo()) return;
++        Rect size = TarkPictureInPicture.playingVideoSize(webContents);
++        if (size == null) return;
++        // In thousandths, inside Android's limits (MIN_ASPECT_RATIO..MAX_ASPECT_RATIO).
++        int thousandths =
++                MathUtils.clamp(
++                        Math.round(1000f * size.width() / size.height()),
++                        (int) Math.ceil(1000 * MIN_ASPECT_RATIO),
++                        (int) Math.floor(1000 * MAX_ASPECT_RATIO));
++        builder.setAspectRatio(new Rational(thousandths, 1000));
++    }
++
+     private static @Nullable Rect getVideoBounds(WebContents webContents, Activity activity) {
+         Rect rect = webContents.getFullscreenVideoSize();
+         if (rect == null || rect.width() == 0 || rect.height() == 0) return null;
+@@ -531,6 +608,7 @@
+      */
+     private void onExitedPictureInPicture(@MetricsEndReason int reason) {
+         Log.i(TAG, "Exited picture in picture with reason: " + reason);
++        mTarkStoppedByScreenOff = false;
+ 
+         // Any pending dismiss is no longer pending.
+         mDismissPending = true;
+@@ -579,6 +657,14 @@
+                     new FullscreenManager.Observer() {
+                         @Override
+                         public void onExitFullscreen(Tab tab) {
++                            // Tark: the window ended and Tark is ending the fullscreen it made
++                            // for it (TarkPictureInPicture.leaveWindow, from the exit callbacks).
++                            // That isn't the page leaving fullscreen: dismissing here would move
++                            // the task to the back of a window that just expanded.
++                            if (TarkPictureInPicture.isEndingFullscreenItMade()) {
++                                Log.i(TAG, "Tark: Tark ended its fullscreen, not dismissing");
++                                return;
++                            }
+                             Log.i(TAG, "Exiting fullscreen");
+                             dismissActivityIfNeeded(mActivity, MetricsEndReason.LEFT_FULLSCREEN);
+                         }
+@@ -638,6 +724,7 @@
+                     builder.setSourceRectHint(bounds);
+                 }
+             }
++            tarkSetAspectRatio(builder, webContents);
+         }
+         builder.setAutoEnterEnabled(allowed);
+ 
+@@ -670,8 +757,14 @@
+         // Something interesting happened -- make sure we've updated our preference for auto-PiP
+         // with the framework, if applicable.
+         Log.i(TAG, "Dismiss activity with reason " + reason);
++        // Tark: diagnostics. What closes a Picture in Picture window, with the caller.
++        if (isPipSessionActive()) {
++            Log.w(TAG, "Tark: dismissing Picture in Picture, reason " + reason, new Throwable());
++        }
+         updateAutoPictureInPictureStatusIfNeeded();
+         mDismissPending = false;
++        // Tark: the window is being dismissed; a later resume is upstream's.
++        mTarkStoppedByScreenOff = false;
+ 
+         if (!isPipSessionActive()) {
+             return;
+@@ -855,6 +948,14 @@
+         public DismissActivityOnWebContentsObserver(Activity activity, WebContents webContents) {
+             super(webContents);
+             mActivity = activity;
++            // Tark: hear when the tab turns audible or silent (mTarkOfferObserver).
++            TarkPictureInPicture.watch(webContents);
++        }
++
++        @Override
++        public void didFinishNavigationInPrimaryMainFrame(NavigationHandle navigationHandle) {
++            // Tark: a new page: whether it floats on leave is decided afresh.
++            if (navigationHandle.hasCommitted()) updateAutoPictureInPictureStatusIfNeeded();
+         }
+ 
+         @Override
+diff --color -ruN a/chrome/android/java/src/org/chromium/chrome/browser/tark/media/TarkLeaveDecision.java b/chrome/android/java/src/org/chromium/chrome/browser/tark/media/TarkLeaveDecision.java
+--- a/chrome/android/java/src/org/chromium/chrome/browser/tark/media/TarkLeaveDecision.java	1970-01-01 05:30:00.000000000 +0530
++++ b/chrome/android/java/src/org/chromium/chrome/browser/tark/media/TarkLeaveDecision.java	1970-01-01 05:30:00.000000000 +0530
+@@ -0,0 +1,39 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++package org.chromium.chrome.browser.tark.media;
++
++import org.chromium.build.annotations.NullMarked;
++
++/**
++ * What leaving Tark does to the current tab's media: float its video in Picture in Picture, keep
++ * only its sound going (Background play, the visibility hold), or nothing (upstream: the page is
++ * hidden and its video pauses). Only the current tab counts, and only while it plays with sound: a
++ * muted video, or another tab's, never floats. Incognito tabs are treated the same; nothing is
++ * stored.
++ */
++@NullMarked
++public final class TarkLeaveDecision {
++    /** The outcome of leaving Tark. */
++    public enum LeaveAction {
++        PIP,
++        SOUND_ONLY,
++        NONE
++    }
++
++    private TarkLeaveDecision() {}
++
++    /**
++     * @param currentTabPlayingWithSound The current tab plays a video with sound now.
++     * @param backgroundPlay Settings → Background play.
++     * @param pip Settings → Picture in Picture.
++     */
++    public static LeaveAction decide(
++            boolean currentTabPlayingWithSound, boolean backgroundPlay, boolean pip) {
++        if (!currentTabPlayingWithSound) return LeaveAction.NONE;
++        if (pip) return LeaveAction.PIP;
++        if (backgroundPlay) return LeaveAction.SOUND_ONLY;
++        return LeaveAction.NONE;
++    }
++}
+diff --color -ruN a/chrome/android/java/src/org/chromium/chrome/browser/tark/media/TarkPictureInPicture.java b/chrome/android/java/src/org/chromium/chrome/browser/tark/media/TarkPictureInPicture.java
+--- a/chrome/android/java/src/org/chromium/chrome/browser/tark/media/TarkPictureInPicture.java	1970-01-01 05:30:00.000000000 +0530
++++ b/chrome/android/java/src/org/chromium/chrome/browser/tark/media/TarkPictureInPicture.java	2026-10-30 02:30:19.449469387 +0530
+@@ -0,0 +1,263 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++package org.chromium.chrome.browser.tark.media;
++
++import android.content.SharedPreferences;
++import android.graphics.Rect;
++
++import org.jni_zero.CalledByNative;
++import org.jni_zero.JniType;
++import org.jni_zero.NativeMethods;
++
++import org.chromium.base.Callback;
++import org.chromium.base.ContextUtils;
++import org.chromium.base.ObserverList;
++import org.chromium.base.ResettersForTesting;
++import org.chromium.base.library_loader.LibraryLoader;
++import org.chromium.build.annotations.NullMarked;
++import org.chromium.build.annotations.Nullable;
++import org.chromium.chrome.browser.preferences.ChromePreferenceKeys;
++import org.chromium.chrome.browser.tab.Tab;
++import org.chromium.chrome.browser.tark.media.TarkLeaveDecision.LeaveAction;
++import org.chromium.content_public.browser.WebContents;
++
++import java.util.ArrayList;
++import java.util.Collections;
++import java.util.List;
++import java.util.Set;
++import java.util.WeakHashMap;
++
++/**
++ * Picture in Picture on leave. When the user leaves Tark while the current tab plays a video with
++ * sound and Settings → Picture in Picture is on, the browser activity enters Android's Picture in
++ * Picture (FullscreenVideoPictureInPictureController: auto-enter on 33+, onUserLeaveHint on every
++ * level), inline video included, whatever the page's disablePictureInPicture says (the attribute
++ * is about video Picture in Picture; this is the activity's). As it enters, Tark makes the video
++ * the fullscreen element (browser-initiated), so the window shows only the video, and leaves
++ * fullscreen again when the window ends.
++ *
++ * <p>Whether leaving floats a tab's video changes without a player starting or stopping: the page
++ * mutes or unmutes, its sound starts a little after the player, the video gets its size, or a
++ * setting changes. {@link #addOfferObserver} hears about all of them, for the tabs passed to
++ * {@link #watch}; the auto-enter params and the Picture in Picture button both follow it.
++ */
++@NullMarked
++public final class TarkPictureInPicture {
++    private static final ObserverList<Callback<@Nullable WebContents>> sOfferObservers =
++            new ObserverList<>();
++
++    // SharedPreferences holds its listeners weakly: this one lives while there are observers.
++    private static final SharedPreferences.OnSharedPreferenceChangeListener sPrefListener =
++            (prefs, key) -> {
++                if (ChromePreferenceKeys.TARK_MEDIA_PICTURE_IN_PICTURE.equals(key)
++                        || ChromePreferenceKeys.TARK_MEDIA_BACKGROUND_PLAY.equals(key)) {
++                    notifyOfferObservers(null);
++                }
++            };
++
++    // The tabs whose video Tark made fullscreen for a Picture in Picture window that hasn't ended.
++    // Static, so a ChromeActivity recreated while in the window (a theme or locale change) still
++    // ends that fullscreen when the window ends.
++    private static final Set<WebContents> sMadeFullscreen =
++            Collections.newSetFromMap(new WeakHashMap<>());
++
++    // The tabs shown in a Picture in Picture window that hasn't ended: their pages keep seeing a
++    // screen-sized window. Static for the same reason as sMadeFullscreen.
++    private static final Set<WebContents> sInWindow =
++            Collections.newSetFromMap(new WeakHashMap<>());
++
++    // Whether Tark is ending a fullscreen it made (the window ended). The fullscreen exit it
++    // causes is Tark's own, not the page's or the user's: it must not close (move to the back)
++    // the activity whose window just expanded.
++    private static boolean sEndingFullscreenItMade;
++
++    private static @Nullable Boolean sPlayingVideoWithSoundForTesting;
++
++    private TarkPictureInPicture() {}
++
++    /** Whether leaving Tark now floats this tab's video. */
++    public static boolean canOffer(@Nullable Tab tab) {
++        return canOffer(tab != null ? tab.getWebContents() : null);
++    }
++
++    /** {@link #canOffer(Tab)} for a tab's WebContents. */
++    public static boolean canOffer(@Nullable WebContents webContents) {
++        return decide(webContents) == LeaveAction.PIP;
++    }
++
++    /**
++     * Tark's part of entering Picture in Picture: makes the tab's playing video the fullscreen
++     * element, if {@link #canOffer(Tab)}. Returns whether it was requested (the page enters
++     * fullscreen asynchronously); if so, {@link #leaveWindow} ends it.
++     */
++    public static boolean enter(@Nullable Tab tab) {
++        WebContents webContents = tab != null ? tab.getWebContents() : null;
++        if (webContents == null || !canOffer(webContents)) return false;
++        if (!TarkPictureInPictureJni.get().requestFullscreen(webContents)) return false;
++        sMadeFullscreen.add(webContents);
++        return true;
++    }
++
++    /** Whether a fullscreen Tark made for a Picture in Picture window is still to be ended. */
++    public static boolean hasFullscreenItMade() {
++        return !sMadeFullscreen.isEmpty();
++    }
++
++    /**
++     * Whether the fullscreen exit happening now is Tark ending a fullscreen it made, because the
++     * window ended (expanded or closed). WebContents.exitFullscreen tells the fullscreen observers
++     * synchronously, so this holds while they run.
++     */
++    public static boolean isEndingFullscreenItMade() {
++        return sEndingFullscreenItMade;
++    }
++
++    /** Ends every fullscreen Tark made for Picture in Picture (the window ended). */
++    private static void exitFullscreenItMade() {
++        List<WebContents> made = new ArrayList<>(sMadeFullscreen);
++        sMadeFullscreen.clear();
++        boolean wasEnding = sEndingFullscreenItMade;
++        sEndingFullscreenItMade = true;
++        try {
++            for (WebContents webContents : made) {
++                if (!webContents.isDestroyed()) webContents.exitFullscreen();
++            }
++        } finally {
++            sEndingFullscreenItMade = wasEnding;
++        }
++    }
++
++    /**
++     * The activity entered Picture in Picture showing `webContents`: its page keeps seeing a
++     * screen-sized window (window.outerWidth/outerHeight) while the window is open. A player that
++     * reads a small window as its mini player (m.youtube.com) would otherwise leave fullscreen
++     * and pause, and the window closes with the fullscreen.
++     */
++    public static void enterWindow(@Nullable WebContents webContents) {
++        if (webContents == null || !isUsable(webContents)) return;
++        sInWindow.add(webContents);
++        TarkPictureInPictureJni.get().setInWindow(webContents, true);
++    }
++
++    /**
++     * The window ended: the pages see their real window size again, and every fullscreen Tark
++     * made for it ends.
++     */
++    public static void leaveWindow() {
++        List<WebContents> shown = new ArrayList<>(sInWindow);
++        sInWindow.clear();
++        for (WebContents webContents : shown) {
++            if (isUsable(webContents)) {
++                TarkPictureInPictureJni.get().setInWindow(webContents, false);
++            }
++        }
++        exitFullscreenItMade();
++    }
++
++    /** The playing video's natural size as a Rect at 0,0, for the window's aspect ratio. */
++    public static @Nullable Rect playingVideoSize(@Nullable WebContents webContents) {
++        if (webContents == null || !isUsable(webContents)) return null;
++        int[] size = TarkPictureInPictureJni.get().getPlayingVideoSize(webContents);
++        if (size.length != 2 || size[0] <= 0 || size[1] <= 0) return null;
++        return new Rect(0, 0, size[0], size[1]);
++    }
++
++    /** What leaving Tark does to this tab's media, by the settings. */
++    public static LeaveAction decide(@Nullable WebContents webContents) {
++        Boolean playingForTesting = sPlayingVideoWithSoundForTesting;
++        boolean playingWithSound =
++                webContents != null
++                        && (playingForTesting != null
++                                ? playingForTesting.booleanValue()
++                                : isUsable(webContents)
++                                        && TarkPictureInPictureJni.get()
++                                                .isPlayingVideoWithSound(webContents));
++        return TarkLeaveDecision.decide(
++                playingWithSound,
++                TarkMediaPrefs.backgroundPlay(),
++                TarkMediaPrefs.pictureInPicture());
++    }
++
++    /**
++     * Whether the activity may enter Picture in Picture for the current tab (auto-enter, leaving):
++     * only when leaving floats the tab's video ({@link #canOffer}: Settings → Picture in Picture on
++     * and a video playing with sound), inline or fullscreen. Replaces upstream's rule (any
++     * fullscreen video that allows it): a muted or silent video never floats, fullscreen or not.
++     *
++     * @param webContents The current tab's.
++     */
++    public static boolean allowsPictureInPicture(@Nullable WebContents webContents) {
++        return canOffer(webContents);
++    }
++
++    /**
++     * Hear about {@code webContents}'s audibility and video size changing (see {@link
++     * #addOfferObserver}). Idempotent; lasts as long as the WebContents.
++     */
++    public static void watch(@Nullable WebContents webContents) {
++        if (webContents == null || !isUsable(webContents)) return;
++        TarkPictureInPictureJni.get().watch(webContents);
++    }
++
++    /**
++     * Adds an observer told when {@link #canOffer} may have changed without a player starting or
++     * stopping: with the WebContents (one passed to {@link #watch}), or null when a setting
++     * changed (every tab).
++     */
++    public static void addOfferObserver(Callback<@Nullable WebContents> observer) {
++        // Registering again is a no-op (and covers a new preferences instance in tests).
++        ContextUtils.getAppSharedPreferences()
++                .registerOnSharedPreferenceChangeListener(sPrefListener);
++        sOfferObservers.addObserver(observer);
++    }
++
++    public static void removeOfferObserver(Callback<@Nullable WebContents> observer) {
++        if (!sOfferObservers.removeObserver(observer) || !sOfferObservers.isEmpty()) return;
++        ContextUtils.getAppSharedPreferences()
++                .unregisterOnSharedPreferenceChangeListener(sPrefListener);
++    }
++
++    /** From native (TarkOfferWatcher): the tab turned audible or silent, or a video resized. */
++    @CalledByNative
++    public static void onOfferMayHaveChanged(WebContents webContents) {
++        notifyOfferObservers(webContents);
++    }
++
++    private static void notifyOfferObservers(@Nullable WebContents webContents) {
++        for (Callback<@Nullable WebContents> observer : sOfferObservers) {
++            observer.onResult(webContents);
++        }
++    }
++
++    private static boolean isUsable(WebContents webContents) {
++        return LibraryLoader.getInstance().isInitialized() && !webContents.isDestroyed();
++    }
++
++    /** Tests outside this package: whether every tab plays a video with sound (null: ask). */
++    public static void setPlayingVideoWithSoundForTesting(@Nullable Boolean playing) {
++        sPlayingVideoWithSoundForTesting = playing;
++        ResettersForTesting.register(() -> sPlayingVideoWithSoundForTesting = null);
++    }
++
++    /** Tests outside this package: as if Tark had made `webContents`'s fullscreen. */
++    public static void setMadeFullscreenForTesting(WebContents webContents) {
++        sMadeFullscreen.add(webContents);
++        ResettersForTesting.register(sMadeFullscreen::clear);
++    }
++
++    @NativeMethods
++    interface Natives {
++        boolean isPlayingVideoWithSound(WebContents webContents);
++
++        @JniType("std::vector<int32_t>")
++        int[] getPlayingVideoSize(WebContents webContents);
++
++        boolean requestFullscreen(WebContents webContents);
++
++        void setInWindow(WebContents webContents, boolean inWindow);
++
++        void watch(WebContents webContents);
++    }
++}
+diff --color -ruN a/chrome/android/java/src/org/chromium/chrome/browser/ui/ExclusiveAccessBubble.java b/chrome/android/java/src/org/chromium/chrome/browser/ui/ExclusiveAccessBubble.java
+--- a/chrome/android/java/src/org/chromium/chrome/browser/ui/ExclusiveAccessBubble.java	2026-10-30 00:38:28.566508502 +0530
++++ b/chrome/android/java/src/org/chromium/chrome/browser/ui/ExclusiveAccessBubble.java	2026-10-30 00:38:40.244061760 +0530
+@@ -4,6 +4,10 @@
+ 
+ package org.chromium.chrome.browser.ui;
+ 
++import android.app.Activity;
++import android.os.Handler;
++import android.os.Looper;
++
+ import org.jni_zero.CalledByNative;
+ import org.jni_zero.JniType;
+ 
+@@ -13,6 +17,11 @@
+ import org.chromium.chrome.browser.ui.messages.snackbar.SnackbarManager;
+ import org.chromium.ui.base.DeviceInput;
+ 
++import java.util.ArrayList;
++import java.util.Collections;
++import java.util.Set;
++import java.util.WeakHashMap;
++
+ /**
+  * This class is the Java counterpart of ExclusiveAccessBubbleAndroid. It owns the notification
+  * snackbar for the exclusive access APIs (fullscreen, keyboard lock & pointer lock)
+@@ -33,18 +42,83 @@
+ 
+     private @Nullable String mText;
+ 
++    // Tark: the notice is anti-spoofing UI. In Picture in Picture it isn't shown (nothing in the
++    // window takes keys or swipes), but it's owed: it shows again when the activity leaves
++    // Picture in Picture while the page is still fullscreen (native hasn't hidden the notice).
++    private boolean mOwedAfterPictureInPicture;
++
++    // Tark: live notices, to tell them their activity's Picture in Picture changes.
++    private static final Set<ExclusiveAccessBubble> sBubbles =
++            Collections.newSetFromMap(new WeakHashMap<>());
++
+     private ExclusiveAccessBubble(ExclusiveAccessContext parentContext) {
+         mParentContext = parentContext;
+     }
+ 
+     @CalledByNative
+     public static ExclusiveAccessBubble create(ExclusiveAccessContext context) {
+-        return new ExclusiveAccessBubble(context);
++        ExclusiveAccessBubble bubble = new ExclusiveAccessBubble(context);
++        sBubbles.add(bubble);
++        return bubble;
++    }
++
++    /**
++     * Tark: `activity` entered or left Picture in Picture mode (ChromeActivity).
++     *
++     * @param owedDelayMs On leaving, how long an owed notice waits: Tark is about to end the
++     *     fullscreen it made for the window, and native's hide() then cancels the notice instead
++     *     of it flashing up. 0 shows it at once.
++     */
++    public static void onPictureInPictureModeChanged(
++            Activity activity, boolean inPicture, long owedDelayMs) {
++        for (ExclusiveAccessBubble bubble : new ArrayList<>(sBubbles)) {
++            if (bubble.mParentContext.getActivity() == activity) {
++                bubble.onPictureInPictureModeChanged(inPicture, owedDelayMs);
++            }
++        }
++    }
++
++    /** Tark: {@link #onPictureInPictureModeChanged(boolean, long)} with no delay. */
++    public void onPictureInPictureModeChanged(boolean inPicture) {
++        onPictureInPictureModeChanged(inPicture, 0);
++    }
++
++    /**
++     * Tark: entering Picture in Picture takes a shown notice down and owes it; leaving shows an
++     * owed notice again, if native still wants it (the page is still fullscreen), after
++     * `owedDelayMs`.
++     */
++    public void onPictureInPictureModeChanged(boolean inPicture, long owedDelayMs) {
++        if (inPicture) {
++            if (mSnackbar != null) {
++                dismissSnackbar();
++                mOwedAfterPictureInPicture = true;
++            }
++            return;
++        }
++        if (!mOwedAfterPictureInPicture) return;
++        if (owedDelayMs > 0) {
++            new Handler(Looper.getMainLooper()).postDelayed(this::showIfOwed, owedDelayMs);
++            return;
++        }
++        showIfOwed();
++    }
++
++    private void showIfOwed() {
++        // hide() (fullscreen ended) in the meantime pays the debt.
++        if (!mOwedAfterPictureInPicture) return;
++        mOwedAfterPictureInPicture = false;
++        show();
+     }
+ 
+     @CalledByNative
+     public void show() {
+         if (mText == null || mSnackbar != null) return;
++        // Tark: owed until the activity leaves Picture in Picture.
++        if (mParentContext.isInPictureInPictureMode()) {
++            mOwedAfterPictureInPicture = true;
++            return;
++        }
+         SnackbarManager snackbarManager = mParentContext.getSnackbarManager();
+         if (snackbarManager == null) return;
+ 
+@@ -84,6 +158,12 @@
+ 
+     @CalledByNative
+     public void hide() {
++        // Native is done with the notice (fullscreen ended): nothing is owed.
++        mOwedAfterPictureInPicture = false;
++        dismissSnackbar();
++    }
++
++    private void dismissSnackbar() {
+         SnackbarManager snackbarManager = mParentContext.getSnackbarManager();
+         if (snackbarManager != null && mSnackbar != null) {
+             snackbarManager.dismissSnackbars(mSnackbarController);
+diff --color -ruN a/chrome/android/java/src/org/chromium/chrome/browser/ui/ExclusiveAccessContext.java b/chrome/android/java/src/org/chromium/chrome/browser/ui/ExclusiveAccessContext.java
+--- a/chrome/android/java/src/org/chromium/chrome/browser/ui/ExclusiveAccessContext.java	2026-10-30 00:38:28.566165456 +0530
++++ b/chrome/android/java/src/org/chromium/chrome/browser/ui/ExclusiveAccessContext.java	2026-10-30 00:38:40.244494349 +0530
+@@ -4,6 +4,8 @@
+ 
+ package org.chromium.chrome.browser.ui;
+ 
++import android.app.Activity;
++
+ import org.jni_zero.CalledByNative;
+ import org.jni_zero.NativeMethods;
+ 
+@@ -107,6 +109,20 @@
+         return SnackbarManagerProvider.from(mWindowAndroid);
+     }
+ 
++    /**
++     * Tark: whether this activity is in Picture in Picture mode, where the fullscreen notice ("To
++     * exit full screen, press Esc") has nothing to say: nothing in the window takes keys or swipes.
++     */
++    public boolean isInPictureInPictureMode() {
++        Activity activity = getActivity();
++        return activity != null && activity.isInPictureInPictureMode();
++    }
++
++    /** Tark: this context's activity, if it's still alive. */
++    public @Nullable Activity getActivity() {
++        return mWindowAndroid.getActivity().get();
++    }
++
+     @Override
+     @CalledByNative
+     public void destroy() {
+diff --color -ruN a/chrome/android/junit/BUILD.gn b/chrome/android/junit/BUILD.gn
+--- a/chrome/android/junit/BUILD.gn	2026-10-30 00:38:40.151093986 +0530
++++ b/chrome/android/junit/BUILD.gn	2026-10-30 01:36:03.118971161 +0530
+@@ -907,6 +907,7 @@
+       "src/org/chromium/chrome/browser/fullscreen/BrowserControlsManagerUnitTest.java",
+       "src/org/chromium/chrome/browser/fullscreen/FullscreenHtmlApiHandlerCompatUnitTest.java",
+       "src/org/chromium/chrome/browser/fullscreen/FullscreenHtmlApiHandlerLegacyUnitTest.java",
++      "src/org/chromium/chrome/browser/fullscreen/TarkFullscreenPipTest.java",
+     ]
+ 
+     deps = [
+@@ -1428,8 +1429,11 @@
+       "chrome_junit_tests_org.chromium.chrome.browser.tark.media") {
+     resources_package = "org.chromium.chrome"
+ 
+-    sources =
+-        [ "src/org/chromium/chrome/browser/tark/media/TarkMediaPrefsTest.java" ]
++    sources = [
++      "src/org/chromium/chrome/browser/tark/media/TarkAutoPictureInPictureTest.java",
++      "src/org/chromium/chrome/browser/tark/media/TarkLeaveDecisionTest.java",
++      "src/org/chromium/chrome/browser/tark/media/TarkMediaPrefsTest.java",
++    ]
+ 
+     deps = [ ":chrome_junit_tests_helper" ]
+   }
+@@ -1658,6 +1662,7 @@
+       "src/org/chromium/chrome/browser/ui/ExclusiveAccessContextTest.java",
+       "src/org/chromium/chrome/browser/ui/ExpandedSheetHelperImplUnitTest.java",
+       "src/org/chromium/chrome/browser/ui/IncognitoRestoreAppLaunchDrawBlockerUnitTest.java",
++      "src/org/chromium/chrome/browser/ui/TarkExclusiveAccessPipTest.java",
+       "src/org/chromium/chrome/browser/ui/TextAppearanceOverlayFontFeaturesTest.java",
+       "src/org/chromium/chrome/browser/ui/activity_recreation/ActivityRecreationControllerUnitTest.java",
+       "src/org/chromium/chrome/browser/ui/color/ColorProviderBridgeImplTest.java",
+diff --color -ruN a/chrome/android/junit/src/org/chromium/chrome/browser/fullscreen/TarkFullscreenPipTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/fullscreen/TarkFullscreenPipTest.java
+--- a/chrome/android/junit/src/org/chromium/chrome/browser/fullscreen/TarkFullscreenPipTest.java	1970-01-01 05:30:00.000000000 +0530
++++ b/chrome/android/junit/src/org/chromium/chrome/browser/fullscreen/TarkFullscreenPipTest.java	2026-10-30 02:31:21.353693482 +0530
+@@ -0,0 +1,286 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++package org.chromium.chrome.browser.fullscreen;
++
++import static android.view.Display.INVALID_DISPLAY;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.assertTrue;
++import static org.mockito.Mockito.doReturn;
++import static org.robolectric.Shadows.shadowOf;
++
++import android.app.Activity;
++import android.content.Context;
++import android.os.Build;
++import android.os.OutcomeReceiver;
++import android.os.PowerManager;
++
++import org.junit.Before;
++import org.junit.Rule;
++import org.junit.Test;
++import org.junit.runner.RunWith;
++import org.mockito.Mock;
++import org.mockito.junit.MockitoJUnit;
++import org.mockito.junit.MockitoRule;
++import org.robolectric.Robolectric;
++import org.robolectric.annotation.Config;
++import org.robolectric.annotation.Implementation;
++import org.robolectric.annotation.Implements;
++import org.robolectric.shadows.ShadowActivity;
++
++import org.chromium.base.ActivityState;
++import org.chromium.base.ContextUtils;
++import org.chromium.base.UserDataHost;
++import org.chromium.base.supplier.ObservableSuppliers;
++import org.chromium.base.supplier.SettableNonNullObservableSupplier;
++import org.chromium.base.test.BaseRobolectricTestRunner;
++import org.chromium.base.test.util.Features;
++import org.chromium.chrome.browser.flags.ChromeFeatureList;
++import org.chromium.chrome.browser.multiwindow.MultiWindowModeStateDispatcherImpl;
++import org.chromium.chrome.browser.tab.Tab;
++import org.chromium.chrome.browser.tab.TabHidingType;
++import org.chromium.chrome.browser.tark.media.TarkMediaPrefs;
++
++/**
++ * Tark: HTML fullscreen in the activity's Picture in Picture window. Entering it must not take
++ * the task out of the window (Activity.requestFullscreenMode waits for the window to expand), and
++ * the screen turning off keeps it while Background play is on: both the activity stopping and the
++ * tab it hides as it stops (ChromeActivity.onStop) would end it otherwise. Closing the window (the
++ * screen on) and switching tabs end it, as upstream.
++ */
++@Features.EnableFeatures({ChromeFeatureList.DISPLAY_EDGE_TO_EDGE_FULLSCREEN})
++@Features.DisableFeatures({
++    ChromeFeatureList.ENABLE_EXCLUSIVE_ACCESS_MANAGER,
++    ChromeFeatureList.ENABLE_FULLSCREEN_TO_ANY_SCREEN_ANDROID
++})
++@RunWith(BaseRobolectricTestRunner.class)
++@Config(
++        shadows = {TarkFullscreenPipTest.PipShadowActivity.class},
++        sdk = Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
++public class TarkFullscreenPipTest {
++    /** An activity whose Picture in Picture mode the test sets, counting fullscreen requests. */
++    @Implements(Activity.class)
++    public static class PipShadowActivity extends ShadowActivity {
++        static boolean sInPip;
++        static int sEnterRequests;
++        static int sExitRequests;
++
++        public PipShadowActivity() {}
++
++        @Implementation
++        protected boolean isInPictureInPictureMode() {
++            return sInPip;
++        }
++
++        @Implementation(minSdk = 34)
++        protected void requestFullscreenMode(
++                int request, OutcomeReceiver<Void, Throwable> approvalCallback) {
++            if (request == Activity.FULLSCREEN_MODE_REQUEST_ENTER) sEnterRequests++;
++            if (request == Activity.FULLSCREEN_MODE_REQUEST_EXIT) sExitRequests++;
++            if (approvalCallback != null) approvalCallback.onResult(null);
++        }
++    }
++
++    @Rule public final MockitoRule mMockitoRule = MockitoJUnit.rule();
++    @Mock private Tab mTab;
++
++    private Activity mActivity;
++    private FullscreenHtmlApiHandlerCompat mHandler;
++
++    @Before
++    public void setUp() {
++        ContextUtils.getAppSharedPreferences().edit().clear().commit();
++        PipShadowActivity.sInPip = false;
++        PipShadowActivity.sEnterRequests = 0;
++        PipShadowActivity.sExitRequests = 0;
++
++        mActivity = Robolectric.buildActivity(Activity.class).setup().get();
++        doReturn(new UserDataHost()).when(mTab).getUserDataHost();
++        // Avoids GestureListenerManager and SelectionPopupController.
++        doReturn(null).when(mTab).getWebContents();
++        doReturn(true).when(mTab).isUserInteractable();
++
++        // Controls stay shown: fullscreen stops at its pending state, which is all these tests
++        // need (persistent mode and the activity fullscreen request come before it).
++        SettableNonNullObservableSupplier<Boolean> areControlsHidden =
++                ObservableSuppliers.createNonNull(false);
++        mHandler =
++                new FullscreenHtmlApiHandlerCompat(
++                        mActivity,
++                        areControlsHidden,
++                        /* exitFullscreenOnStop= */ true,
++                        new MultiWindowModeStateDispatcherImpl(mActivity)) {
++                    @Override
++                    public void destroySelectActionMode(Tab tab) {}
++
++                    @Override
++                    protected void updateMultiTouchZoomSupport(boolean enable) {}
++                };
++        mHandler.setTabForTesting(mTab);
++        setScreenOn(true);
++    }
++
++    private void setScreenOn(boolean on) {
++        shadowOf((PowerManager) mActivity.getSystemService(Context.POWER_SERVICE))
++                .setIsInteractive(on);
++    }
++
++    private void enterFullscreen() {
++        mHandler.onEnterFullscreen(mTab, new FullscreenOptions(false, false, INVALID_DISPLAY));
++    }
++
++    @Test
++    public void testOutsideTheWindowTheActivityFullscreenModeIsRequestedAtOnce() {
++        enterFullscreen();
++
++        assertTrue(mHandler.getPersistentFullscreenMode());
++        assertEquals(1, PipShadowActivity.sEnterRequests);
++    }
++
++    @Test
++    public void testInTheWindowTheActivityFullscreenModeWaitsForTheWindowToExpand() {
++        PipShadowActivity.sInPip = true;
++        enterFullscreen();
++
++        assertTrue(mHandler.getPersistentFullscreenMode());
++        assertEquals(0, PipShadowActivity.sEnterRequests);
++
++        // Resumed while still in the window: still nothing.
++        mHandler.onActivityStateChange(mActivity, ActivityState.RESUMED);
++        assertEquals(0, PipShadowActivity.sEnterRequests);
++
++        // Expanded, still fullscreen: requested once.
++        PipShadowActivity.sInPip = false;
++        mHandler.onActivityStateChange(mActivity, ActivityState.RESUMED);
++        assertEquals(1, PipShadowActivity.sEnterRequests);
++        mHandler.onActivityStateChange(mActivity, ActivityState.RESUMED);
++        assertEquals(1, PipShadowActivity.sEnterRequests);
++
++        // And left again on exit, as upstream.
++        mHandler.exitPersistentFullscreenMode();
++        assertEquals(1, PipShadowActivity.sExitRequests);
++    }
++
++    @Test
++    public void testFullscreenEndedInTheWindowRequestsNothingOnExpand() {
++        PipShadowActivity.sInPip = true;
++        enterFullscreen();
++        mHandler.exitPersistentFullscreenMode();
++
++        PipShadowActivity.sInPip = false;
++        mHandler.onActivityStateChange(mActivity, ActivityState.RESUMED);
++
++        assertFalse(mHandler.getPersistentFullscreenMode());
++        assertEquals(0, PipShadowActivity.sEnterRequests);
++        assertEquals(0, PipShadowActivity.sExitRequests);
++    }
++
++    @Test
++    public void testScreenOffInTheWindowKeepsFullscreenWithBackgroundPlay() {
++        TarkMediaPrefs.setBackgroundPlay(true);
++        PipShadowActivity.sInPip = true;
++        enterFullscreen();
++        setScreenOn(false);
++
++        mHandler.onActivityStateChange(mActivity, ActivityState.STOPPED);
++
++        assertTrue(mHandler.getPersistentFullscreenMode());
++    }
++
++    @Test
++    public void testScreenOffInTheWindowExitsFullscreenWithoutBackgroundPlay() {
++        TarkMediaPrefs.setBackgroundPlay(false);
++        PipShadowActivity.sInPip = true;
++        enterFullscreen();
++        setScreenOn(false);
++
++        mHandler.onActivityStateChange(mActivity, ActivityState.STOPPED);
++
++        assertFalse(mHandler.getPersistentFullscreenMode());
++    }
++
++    @Test
++    public void testClosingTheWindowExitsFullscreenWithBackgroundPlay() {
++        // The window closing stops the activity while it's still in Picture in Picture.
++        TarkMediaPrefs.setBackgroundPlay(true);
++        PipShadowActivity.sInPip = true;
++        enterFullscreen();
++
++        mHandler.onActivityStateChange(mActivity, ActivityState.STOPPED);
++
++        assertFalse(mHandler.getPersistentFullscreenMode());
++    }
++
++    @Test
++    public void testScreenOffInTheWindowHidingTheTabKeepsFullscreenWithBackgroundPlay() {
++        TarkMediaPrefs.setBackgroundPlay(true);
++        PipShadowActivity.sInPip = true;
++        enterFullscreen();
++        setScreenOn(false);
++
++        // ChromeActivity.onStop: STOPPED, then the tab hidden.
++        mHandler.onActivityStateChange(mActivity, ActivityState.STOPPED);
++        mHandler.onTabHidden(TabHidingType.ACTIVITY_HIDDEN);
++
++        assertTrue(mHandler.getPersistentFullscreenMode());
++    }
++
++    @Test
++    public void testScreenOffInTheWindowHidingTheTabExitsFullscreenWithoutBackgroundPlay() {
++        TarkMediaPrefs.setBackgroundPlay(false);
++        PipShadowActivity.sInPip = true;
++        enterFullscreen();
++        setScreenOn(false);
++
++        mHandler.onTabHidden(TabHidingType.ACTIVITY_HIDDEN);
++
++        assertFalse(mHandler.getPersistentFullscreenMode());
++    }
++
++    @Test
++    public void testClosingTheWindowHidingTheTabExitsFullscreenWithBackgroundPlay() {
++        TarkMediaPrefs.setBackgroundPlay(true);
++        PipShadowActivity.sInPip = true;
++        enterFullscreen();
++
++        mHandler.onTabHidden(TabHidingType.ACTIVITY_HIDDEN);
++
++        assertFalse(mHandler.getPersistentFullscreenMode());
++    }
++
++    @Test
++    public void testSwitchingTabsInTheWindowExitsFullscreenWithBackgroundPlay() {
++        TarkMediaPrefs.setBackgroundPlay(true);
++        PipShadowActivity.sInPip = true;
++        enterFullscreen();
++        setScreenOn(false);
++
++        mHandler.onTabHidden(TabHidingType.CHANGED_TABS);
++
++        assertFalse(mHandler.getPersistentFullscreenMode());
++    }
++
++    @Test
++    public void testHidingTheTabOutsideTheWindowExitsFullscreenWithBackgroundPlay() {
++        TarkMediaPrefs.setBackgroundPlay(true);
++        enterFullscreen();
++        setScreenOn(false);
++
++        mHandler.onTabHidden(TabHidingType.ACTIVITY_HIDDEN);
++
++        assertFalse(mHandler.getPersistentFullscreenMode());
++    }
++
++    @Test
++    public void testStopOutsideTheWindowExitsFullscreenWithBackgroundPlay() {
++        TarkMediaPrefs.setBackgroundPlay(true);
++        enterFullscreen();
++
++        mHandler.onActivityStateChange(mActivity, ActivityState.STOPPED);
++
++        assertFalse(mHandler.getPersistentFullscreenMode());
++    }
++}
+diff --color -ruN a/chrome/android/junit/src/org/chromium/chrome/browser/media/FullscreenVideoPictureInPictureControllerUnitTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/media/FullscreenVideoPictureInPictureControllerUnitTest.java
+--- a/chrome/android/junit/src/org/chromium/chrome/browser/media/FullscreenVideoPictureInPictureControllerUnitTest.java	2026-10-30 02:23:11.286528760 +0530
++++ b/chrome/android/junit/src/org/chromium/chrome/browser/media/FullscreenVideoPictureInPictureControllerUnitTest.java	2026-10-30 02:31:21.354056412 +0530
+@@ -6,6 +6,8 @@
+ 
+ import static org.junit.Assert.assertFalse;
+ import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.ArgumentMatchers.anyBoolean;
++import static org.mockito.Mockito.doAnswer;
+ import static org.mockito.Mockito.mock;
+ import static org.mockito.Mockito.times;
+ import static org.mockito.Mockito.verify;
+@@ -43,6 +45,8 @@
+ import org.chromium.chrome.browser.fullscreen.FullscreenManager;
+ import org.chromium.chrome.browser.media.FullscreenVideoPictureInPictureController.PipEntered;
+ import org.chromium.chrome.browser.tab.Tab;
++import org.chromium.chrome.browser.tark.media.TarkMediaPrefs;
++import org.chromium.chrome.browser.tark.media.TarkPictureInPicture;
+ import org.chromium.content_public.browser.MediaSession;
+ import org.chromium.content_public.browser.WebContentsObserver;
+ import org.chromium.content_public.browser.test.mock.MockWebContents;
+@@ -94,6 +98,8 @@
+     @Before
+     public void setUp() {
+         Context context = ContextUtils.getApplicationContext();
++        // Tark: Settings → Background play and Picture in Picture at their defaults (on).
++        ContextUtils.getAppSharedPreferences().edit().clear().commit();
+         ShadowPackageManager shadowPackageManager = Shadows.shadowOf(context.getPackageManager());
+         shadowPackageManager.setSystemFeature(PackageManager.FEATURE_PICTURE_IN_PICTURE, true);
+         mActivityTabProvider.setForTesting(mTab);
+@@ -123,6 +129,8 @@
+     private void setHasFullscreenVideo(boolean hasVideo) {
+         when(mWebContents.hasActiveEffectivelyFullscreenVideo()).thenReturn(hasVideo);
+         when(mWebContents.isPictureInPictureAllowedForFullscreenVideo()).thenReturn(hasVideo);
++        // Tark: only a video playing with sound floats; these fullscreen videos have sound.
++        TarkPictureInPicture.setPlayingVideoWithSoundForTesting(hasVideo);
+     }
+ 
+     /** Run any runnables, including any delayed ones. */
+@@ -343,6 +351,178 @@
+         verify(mMediaSession, times(0)).suspend(SuspendType.SYSTEM);
+     }
+ 
++    /**
++     * Tark: the window expanding ends the fullscreen Tark made for an inline video (the exit
++     * callbacks). That exit tells the fullscreen observer synchronously; it must not dismiss, which
++     * would move the just-expanded task to the back.
++     */
++    @Test
++    public void tarkEndingItsFullscreenOnExpandDoesNotMoveTheTaskToBack() {
++        setHasFullscreenVideo(true);
++        enterPip();
++        verify(mFullscreenManager).addObserver(mFullscreenObserverCaptor.capture());
++        FullscreenManager.Observer observer = mFullscreenObserverCaptor.getValue();
++        TarkPictureInPicture.setMadeFullscreenForTesting(mWebContents);
++        doAnswer(
++                        invocation -> {
++                            observer.onExitFullscreen(mTab);
++                            return null;
++                        })
++                .when(mWebContents)
++                .exitFullscreen();
++
++        mController.onFrameworkExitedPictureInPicture();
++
++        verify(mWebContents, times(1)).exitFullscreen();
++        verify(mActivity, times(0)).moveTaskToBack(anyBoolean());
++        assertFalse(TarkPictureInPicture.isEndingFullscreenItMade());
++
++        // The page leaving fullscreen later, the session over: still nothing.
++        observer.onExitFullscreen(mTab);
++        verify(mActivity, times(0)).moveTaskToBack(anyBoolean());
++    }
++
++    /** Tark: the page leaving fullscreen in the window still closes it, as upstream. */
++    @Test
++    public void tarkThePageLeavingFullscreenInTheWindowStillDismisses() {
++        setHasFullscreenVideo(true);
++        enterPip();
++        verify(mFullscreenManager).addObserver(mFullscreenObserverCaptor.capture());
++        TarkPictureInPicture.setMadeFullscreenForTesting(mWebContents);
++
++        mFullscreenObserverCaptor.getValue().onExitFullscreen(mTab);
++
++        verify(mActivity, times(1)).moveTaskToBack(true);
++        // Then the exit callbacks end Tark's fullscreen.
++        verify(mWebContents, times(1)).exitFullscreen();
++    }
++
++    /** Tark: a muted or silent fullscreen video doesn't float. */
++    @Test
++    public void tarkPictureInPictureFailsForSilentFullscreenVideo() {
++        setHasFullscreenVideo(true);
++        TarkPictureInPicture.setPlayingVideoWithSoundForTesting(false);
++        mController.attemptPictureInPicture();
++        verify(mActivity, times(0)).enterPictureInPictureMode(any());
++    }
++
++    /**
++     * Tark: with Background play on, the screen turning off stops the activity in the window; the
++     * media plays on. Closing the window after unlocking still suspends it.
++     */
++    @Test
++    public void tarkBackgroundPlayKeepsMediaWhenTheScreenTurnsOffInPictureInPicture() {
++        enterPip();
++        verify(mWebContents).addObserver(mWebContentsObserverCaptor.capture());
++        mWebContentsObserverCaptor.getValue().mediaStartedPlaying(0, true, true);
++
++        when(mPowerManager.isInteractive()).thenReturn(false);
++        mController.onStop();
++        verify(mMediaSession, times(0)).suspend(SuspendType.SYSTEM);
++
++        when(mPowerManager.isInteractive()).thenReturn(true);
++        mController.onStart();
++        mController.onStop();
++        verify(mMediaSession, times(1)).suspend(SuspendType.SYSTEM);
++    }
++
++    /** Tark: with Background play off, the screen turning off in the window suspends (upstream). */
++    @Test
++    public void tarkWithoutBackgroundPlayTheScreenTurningOffInPictureInPictureSuspends() {
++        TarkMediaPrefs.setBackgroundPlay(false);
++        enterPip();
++        verify(mWebContents).addObserver(mWebContentsObserverCaptor.capture());
++        mWebContentsObserverCaptor.getValue().mediaStartedPlaying(0, true, true);
++
++        when(mPowerManager.isInteractive()).thenReturn(false);
++        mController.onStop();
++        verify(mMediaSession, times(1)).suspend(SuspendType.SYSTEM);
++    }
++
++    /**
++     * Tark: unlocking after the screen turned off in the window (Background play on) restarts and
++     * resumes the activity while it's still in the window. That resume keeps the window and its
++     * media; closing the window afterwards still suspends.
++     */
++    @Test
++    public void tarkResumeInTheWindowAfterTheScreenTurnedOffKeepsTheWindow() {
++        enterPip();
++        verify(mWebContents).addObserver(mWebContentsObserverCaptor.capture());
++        mWebContentsObserverCaptor.getValue().mediaStartedPlaying(0, true, true);
++        when(mActivity.isInPictureInPictureMode()).thenReturn(true);
++
++        when(mPowerManager.isInteractive()).thenReturn(false);
++        mController.onStop();
++        when(mPowerManager.isInteractive()).thenReturn(true);
++        mController.onStart();
++        mController.onResume();
++
++        verify(mActivity, times(0)).moveTaskToBack(anyBoolean());
++        verify(mMediaSession, times(0)).suspend(SuspendType.SYSTEM);
++
++        // ✕ closes the window: the activity stops with the screen on.
++        mController.onStop();
++        verify(mMediaSession, times(1)).suspend(SuspendType.SYSTEM);
++    }
++
++    /** Tark: only the one resume after the screen-off stop is kept; the next one is upstream's. */
++    @Test
++    public void tarkOnlyTheFirstResumeAfterTheScreenTurnedOffIsKept() {
++        enterPip();
++        when(mActivity.isInPictureInPictureMode()).thenReturn(true);
++
++        when(mPowerManager.isInteractive()).thenReturn(false);
++        mController.onStop();
++        when(mPowerManager.isInteractive()).thenReturn(true);
++        mController.onResume();
++        verify(mActivity, times(0)).moveTaskToBack(anyBoolean());
++
++        mController.onResume();
++        verify(mActivity, times(1)).moveTaskToBack(true);
++    }
++
++    /** Tark: a resume in the window without a screen-off stop dismisses, as upstream. */
++    @Test
++    public void tarkResumeInTheWindowWithoutTheScreenTurningOffDismisses() {
++        enterPip();
++        when(mActivity.isInPictureInPictureMode()).thenReturn(true);
++
++        mController.onResume();
++        verify(mActivity, times(1)).moveTaskToBack(true);
++    }
++
++    /** Tark: the window ending forgets the screen-off stop; a later window's resume dismisses. */
++    @Test
++    public void tarkLeavingTheWindowForgetsTheScreenOffStop() {
++        enterPip();
++        when(mPowerManager.isInteractive()).thenReturn(false);
++        mController.onStop();
++        when(mPowerManager.isInteractive()).thenReturn(true);
++
++        // Expanded: the framework left the window.
++        mController.onFrameworkExitedPictureInPicture();
++
++        // A later window, resumed while in it without the screen turning off.
++        enterPip();
++        when(mActivity.isInPictureInPictureMode()).thenReturn(true);
++        mController.onResume();
++        verify(mActivity, times(1)).moveTaskToBack(true);
++    }
++
++    /** Tark: with Background play off, the screen-off stop isn't remembered (upstream). */
++    @Test
++    public void tarkWithoutBackgroundPlayResumeAfterTheScreenTurnedOffDismisses() {
++        TarkMediaPrefs.setBackgroundPlay(false);
++        enterPip();
++        when(mActivity.isInPictureInPictureMode()).thenReturn(true);
++
++        when(mPowerManager.isInteractive()).thenReturn(false);
++        mController.onStop();
++        when(mPowerManager.isInteractive()).thenReturn(true);
++        mController.onResume();
++        verify(mActivity, times(1)).moveTaskToBack(true);
++    }
++
+     @Test
+     public void testOnStopDoesNotSuspendMediaWithoutPictureInPicture() {
+         mController.onStop();
+diff --color -ruN a/chrome/android/junit/src/org/chromium/chrome/browser/tark/media/TarkAutoPictureInPictureTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/tark/media/TarkAutoPictureInPictureTest.java
+--- a/chrome/android/junit/src/org/chromium/chrome/browser/tark/media/TarkAutoPictureInPictureTest.java	1970-01-01 05:30:00.000000000 +0530
++++ b/chrome/android/junit/src/org/chromium/chrome/browser/tark/media/TarkAutoPictureInPictureTest.java	1970-01-01 05:30:00.000000000 +0530
+@@ -0,0 +1,258 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++package org.chromium.chrome.browser.tark.media;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.assertTrue;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.Mockito.atLeastOnce;
++import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.never;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.when;
++import static org.mockito.Mockito.withSettings;
++import static org.robolectric.Shadows.shadowOf;
++
++import android.app.Activity;
++import android.app.ActivityManager;
++import android.app.PictureInPictureParams;
++import android.content.Context;
++import android.content.pm.PackageManager;
++import android.os.Build;
++import android.os.Looper;
++import android.os.PowerManager;
++import android.util.Rational;
++
++import org.junit.After;
++import org.junit.Before;
++import org.junit.Rule;
++import org.junit.Test;
++import org.junit.runner.RunWith;
++import org.mockito.ArgumentCaptor;
++import org.mockito.Mock;
++import org.mockito.junit.MockitoJUnit;
++import org.mockito.junit.MockitoRule;
++import org.robolectric.annotation.Config;
++
++import org.chromium.base.ContextUtils;
++import org.chromium.base.UserDataHost;
++import org.chromium.base.library_loader.LibraryLoader;
++import org.chromium.base.test.BaseRobolectricTestRunner;
++import org.chromium.chrome.browser.ActivityTabProvider;
++import org.chromium.chrome.browser.fullscreen.FullscreenManager;
++import org.chromium.chrome.browser.media.FullscreenVideoPictureInPictureController;
++import org.chromium.chrome.browser.tab.Tab;
++import org.chromium.content_public.browser.WebContents;
++import org.chromium.content_public.browser.WebContentsObserver;
++
++/**
++ * The activity's auto-enter Picture in Picture (33+) follows whether leaving floats the current
++ * tab's video, whatever changed it: the page muting or unmuting (no player stops), Settings →
++ * Picture in Picture, or switching to another tab.
++ */
++@RunWith(BaseRobolectricTestRunner.class)
++@Config(sdk = Build.VERSION_CODES.TIRAMISU)
++public class TarkAutoPictureInPictureTest {
++    @Rule public MockitoRule mMockitoRule = MockitoJUnit.rule();
++
++    @Mock private TarkPictureInPicture.Natives mNatives;
++    @Mock private LibraryLoader mLibraryLoader;
++    @Mock private Activity mActivity;
++    @Mock private FullscreenManager mFullscreenManager;
++    @Mock private PowerManager mPowerManager;
++    @Mock private Tab mTab;
++
++    private final UserDataHost mUserDataHost = new UserDataHost();
++    private final ActivityTabProvider mTabProvider = new ActivityTabProvider();
++    private WebContents mWebContents;
++    private FullscreenVideoPictureInPictureController mController;
++
++    @Before
++    public void setUp() {
++        Context context = ContextUtils.getApplicationContext();
++        ContextUtils.getAppSharedPreferences().edit().clear().commit();
++        shadowOf(context.getPackageManager())
++                .setSystemFeature(PackageManager.FEATURE_PICTURE_IN_PICTURE, true);
++
++        TarkPictureInPictureJni.setInstanceForTesting(mNatives);
++        LibraryLoader.setLibraryLoaderForTesting(mLibraryLoader);
++        when(mLibraryLoader.isInitialized()).thenReturn(true);
++        when(mNatives.getPlayingVideoSize(any())).thenReturn(new int[] {1920, 1080});
++
++        when(mActivity.getSystemService(Context.ACTIVITY_SERVICE))
++                .thenReturn((ActivityManager) context.getSystemService(Context.ACTIVITY_SERVICE));
++        when(mActivity.getSystemService(Context.POWER_SERVICE)).thenReturn(mPowerManager);
++        when(mActivity.getPackageManager()).thenReturn(context.getPackageManager());
++        when(mPowerManager.isInteractive()).thenReturn(true);
++
++        mWebContents = newWebContents();
++        when(mTab.getWebContents()).thenReturn(mWebContents);
++        when(mTab.getUserDataHost()).thenReturn(mUserDataHost);
++        mTabProvider.setForTesting(mTab);
++
++        mController =
++                new FullscreenVideoPictureInPictureController(
++                        mActivity, mTabProvider, mFullscreenManager);
++        idle();
++    }
++
++    @After
++    public void tearDown() {
++        mController.onDestroy();
++    }
++
++    private static WebContents newWebContents() {
++        return mock(
++                WebContents.class,
++                withSettings().extraInterfaces(WebContentsObserver.Observable.class));
++    }
++
++    private void setPlayingWithSound(WebContents webContents, boolean playing) {
++        when(mNatives.isPlayingVideoWithSound(webContents)).thenReturn(playing);
++    }
++
++    private static void idle() {
++        shadowOf(Looper.getMainLooper()).idle();
++    }
++
++    /** The params last given to the framework. */
++    private PictureInPictureParams lastParams() {
++        ArgumentCaptor<PictureInPictureParams> captor =
++                ArgumentCaptor.forClass(PictureInPictureParams.class);
++        verify(mActivity, atLeastOnce()).setPictureInPictureParams(captor.capture());
++        return captor.getValue();
++    }
++
++    /** The page's sound started, or it muted or unmuted itself (TarkOfferWatcher). */
++    private void audibleChanged(WebContents webContents) {
++        TarkPictureInPicture.onOfferMayHaveChanged(webContents);
++    }
++
++    @Test
++    public void testWatchesTheCurrentTab() {
++        verify(mNatives).watch(mWebContents);
++    }
++
++    @Test
++    public void testPlayingWithSoundAutoEntersInTheVideosShape() {
++        setPlayingWithSound(mWebContents, true);
++        audibleChanged(mWebContents);
++        PictureInPictureParams params = lastParams();
++        assertTrue(params.isAutoEnterEnabled());
++        assertEquals(new Rational(1778, 1000), params.getAspectRatio());
++    }
++
++    @Test
++    public void testExtremeVideoShapeIsClamped() {
++        when(mNatives.getPlayingVideoSize(any())).thenReturn(new int[] {4000, 1000});
++        setPlayingWithSound(mWebContents, true);
++        audibleChanged(mWebContents);
++        assertEquals(new Rational(2390, 1000), lastParams().getAspectRatio());
++    }
++
++    @Test
++    public void testMutedTurnsAutoEnterOffAndUnmutedOn() {
++        setPlayingWithSound(mWebContents, true);
++        audibleChanged(mWebContents);
++        assertTrue(lastParams().isAutoEnterEnabled());
++
++        // The page mutes its video: it keeps playing (no player stops), only the sound ends.
++        setPlayingWithSound(mWebContents, false);
++        audibleChanged(mWebContents);
++        assertFalse(lastParams().isAutoEnterEnabled());
++
++        // Unmuted again.
++        setPlayingWithSound(mWebContents, true);
++        audibleChanged(mWebContents);
++        assertTrue(lastParams().isAutoEnterEnabled());
++    }
++
++    @Test
++    public void testSettingOffTurnsAutoEnterOff() {
++        setPlayingWithSound(mWebContents, true);
++        audibleChanged(mWebContents);
++        assertTrue(lastParams().isAutoEnterEnabled());
++
++        TarkMediaPrefs.setPictureInPicture(false);
++        idle();
++        assertFalse(lastParams().isAutoEnterEnabled());
++
++        // Off means none at all: not even upstream's fullscreen video that allows it.
++        when(mWebContents.hasActiveEffectivelyFullscreenVideo()).thenReturn(true);
++        when(mWebContents.isPictureInPictureAllowedForFullscreenVideo()).thenReturn(true);
++        audibleChanged(mWebContents);
++        assertFalse(lastParams().isAutoEnterEnabled());
++
++        TarkMediaPrefs.setPictureInPicture(true);
++        idle();
++        assertTrue(lastParams().isAutoEnterEnabled());
++    }
++
++    @Test
++    public void testAnotherTabTurnsAutoEnterOff() {
++        setPlayingWithSound(mWebContents, true);
++        audibleChanged(mWebContents);
++        assertTrue(lastParams().isAutoEnterEnabled());
++
++        // Switched to a tab that plays nothing; the first tab still plays with sound.
++        Tab other = mock(Tab.class);
++        WebContents otherContents = newWebContents();
++        when(other.getWebContents()).thenReturn(otherContents);
++        when(other.getUserDataHost()).thenReturn(new UserDataHost());
++        setPlayingWithSound(otherContents, false);
++        mTabProvider.setForTesting(other);
++        idle();
++        assertFalse(lastParams().isAutoEnterEnabled());
++        verify(mNatives).watch(otherContents);
++
++        // The first tab's sound changing doesn't count any more.
++        audibleChanged(mWebContents);
++        assertFalse(lastParams().isAutoEnterEnabled());
++    }
++
++    @Test
++    public void testThePageSeesAScreenSizedWindowWhileInTheWindow() {
++        // m.youtube.com reads a small window as its mini player: it leaves fullscreen and pauses,
++        // and the window closes with the fullscreen. Held from entering until the window ends.
++        setPlayingWithSound(mWebContents, true);
++        mController.onEnteredPictureInPictureMode();
++        verify(mNatives).setInWindow(mWebContents, true);
++        verify(mNatives, never()).setInWindow(mWebContents, false);
++
++        mController.onFrameworkExitedPictureInPicture();
++        verify(mNatives).setInWindow(mWebContents, false);
++    }
++
++    @Test
++    public void testTheWindowSizeIsReleasedWhenTheActivityWasRecreated() {
++        // A recreated activity's controller has no exit callbacks; ChromeActivity leaves for it.
++        setPlayingWithSound(mWebContents, true);
++        mController.onEnteredPictureInPictureMode();
++        verify(mNatives).setInWindow(mWebContents, true);
++
++        TarkPictureInPicture.leaveWindow();
++        verify(mNatives).setInWindow(mWebContents, false);
++
++        // Nothing is held any more: the controller's own exit doesn't release twice.
++        mController.onFrameworkExitedPictureInPicture();
++        verify(mNatives).setInWindow(mWebContents, false);
++    }
++
++    @Test
++    public void testMutedFullscreenVideoDoesNotAutoEnter() {
++        // Upstream would float any fullscreen video that allows it; Tark only one with sound.
++        when(mWebContents.hasActiveEffectivelyFullscreenVideo()).thenReturn(true);
++        when(mWebContents.isPictureInPictureAllowedForFullscreenVideo()).thenReturn(true);
++        setPlayingWithSound(mWebContents, false);
++        audibleChanged(mWebContents);
++        // Auto-enter stays off: upstream only tells the framework when it changes.
++        verify(mActivity, never()).setPictureInPictureParams(any());
++
++        setPlayingWithSound(mWebContents, true);
++        audibleChanged(mWebContents);
++        assertTrue(lastParams().isAutoEnterEnabled());
++    }
++}
+diff --color -ruN a/chrome/android/junit/src/org/chromium/chrome/browser/tark/media/TarkLeaveDecisionTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/tark/media/TarkLeaveDecisionTest.java
+--- a/chrome/android/junit/src/org/chromium/chrome/browser/tark/media/TarkLeaveDecisionTest.java	1970-01-01 05:30:00.000000000 +0530
++++ b/chrome/android/junit/src/org/chromium/chrome/browser/tark/media/TarkLeaveDecisionTest.java	1970-01-01 05:30:00.000000000 +0530
+@@ -0,0 +1,81 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++package org.chromium.chrome.browser.tark.media;
++
++import static org.junit.Assert.assertEquals;
++
++import android.content.SharedPreferences;
++
++import org.junit.Before;
++import org.junit.Test;
++import org.junit.runner.RunWith;
++
++import org.chromium.base.ContextUtils;
++import org.chromium.base.test.BaseRobolectricTestRunner;
++import org.chromium.chrome.browser.tark.media.TarkLeaveDecision.LeaveAction;
++
++import java.util.HashMap;
++import java.util.Map;
++
++/** What leaving Tark does to the current tab's media. */
++@RunWith(BaseRobolectricTestRunner.class)
++public class TarkLeaveDecisionTest {
++    private SharedPreferences mPrefs;
++
++    @Before
++    public void setUp() {
++        mPrefs = ContextUtils.getAppSharedPreferences();
++        mPrefs.edit().clear().commit();
++    }
++
++    @Test
++    public void testPlayingWithSoundPipOn() {
++        assertEquals(LeaveAction.PIP, TarkLeaveDecision.decide(true, true, true));
++        // Picture in Picture alone is enough: the window keeps the page playing.
++        assertEquals(LeaveAction.PIP, TarkLeaveDecision.decide(true, false, true));
++    }
++
++    @Test
++    public void testPipOffBackgroundOn() {
++        assertEquals(LeaveAction.SOUND_ONLY, TarkLeaveDecision.decide(true, true, false));
++    }
++
++    @Test
++    public void testBothOff() {
++        assertEquals(LeaveAction.NONE, TarkLeaveDecision.decide(true, false, false));
++    }
++
++    @Test
++    public void testMutedAutoplayNeverFloats() {
++        // A muted video that plays isn't "playing with sound" (the native side asks
++        // WebContents::IsCurrentlyAudible()): nothing floats, nothing plays on.
++        assertEquals(LeaveAction.NONE, TarkLeaveDecision.decide(false, true, true));
++    }
++
++    @Test
++    public void testOnlyCurrentTabCounts() {
++        // The current tab is paused while a background tab plays: the caller passes the
++        // current tab's state only, so nothing floats.
++        boolean currentTabPlayingWithSound = false;
++        assertEquals(
++                LeaveAction.NONE, TarkLeaveDecision.decide(currentTabPlayingWithSound, true, true));
++    }
++
++    @Test
++    public void testIncognitoFloatsNothingStored() {
++        // An incognito tab playing with sound floats like any other, and deciding writes
++        // nothing: the prefs file is the same before and after.
++        TarkMediaPrefs.setBackgroundPlay(true);
++        TarkMediaPrefs.setPictureInPicture(true);
++        Map<String, ?> before = new HashMap<>(mPrefs.getAll());
++        LeaveAction action =
++                TarkLeaveDecision.decide(
++                        /* currentTabPlayingWithSound= */ true,
++                        TarkMediaPrefs.backgroundPlay(),
++                        TarkMediaPrefs.pictureInPicture());
++        assertEquals(LeaveAction.PIP, action);
++        assertEquals(before, new HashMap<>(mPrefs.getAll()));
++    }
++}
+diff --color -ruN a/chrome/android/junit/src/org/chromium/chrome/browser/ui/TarkExclusiveAccessPipTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/ui/TarkExclusiveAccessPipTest.java
+--- a/chrome/android/junit/src/org/chromium/chrome/browser/ui/TarkExclusiveAccessPipTest.java	1970-01-01 05:30:00.000000000 +0530
++++ b/chrome/android/junit/src/org/chromium/chrome/browser/ui/TarkExclusiveAccessPipTest.java	1970-01-01 05:30:00.000000000 +0530
+@@ -0,0 +1,127 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++package org.chromium.chrome.browser.ui;
++
++import static org.robolectric.Shadows.shadowOf;
++
++import android.os.Looper;
++
++import org.junit.Assert;
++import org.junit.Before;
++import org.junit.Rule;
++import org.junit.Test;
++import org.junit.runner.RunWith;
++import org.mockito.Mock;
++import org.mockito.Mockito;
++import org.mockito.junit.MockitoJUnit;
++import org.mockito.junit.MockitoRule;
++
++import org.chromium.base.test.BaseRobolectricTestRunner;
++import org.chromium.chrome.browser.ui.messages.snackbar.Snackbar;
++import org.chromium.chrome.browser.ui.messages.snackbar.SnackbarManager;
++
++import java.util.concurrent.TimeUnit;
++
++/**
++ * Tark: the fullscreen notice ("To exit full screen, press |Esc|") isn't shown in Picture in
++ * Picture, and shows again on leaving it while the page is still fullscreen.
++ */
++@RunWith(BaseRobolectricTestRunner.class)
++public class TarkExclusiveAccessPipTest {
++    @Rule public MockitoRule mMockitoRule = MockitoJUnit.rule();
++
++    @Mock private ExclusiveAccessContext mContext;
++    @Mock private SnackbarManager mSnackbarManager;
++
++    @Before
++    public void setUp() {
++        Mockito.when(mContext.getSnackbarManager()).thenReturn(mSnackbarManager);
++    }
++
++    private void setInPictureInPicture(boolean inPicture) {
++        Mockito.when(mContext.isInPictureInPictureMode()).thenReturn(inPicture);
++    }
++
++    @Test
++    public void testEnterPipWhileFullscreenThenLeaveShowsNoticeAgain() {
++        ExclusiveAccessBubble bubble = ExclusiveAccessBubble.create(mContext);
++        bubble.update("To exit full screen, press |Esc|");
++        Assert.assertTrue(bubble.isVisible());
++        Mockito.verify(mSnackbarManager, Mockito.times(1)).showSnackbar(Mockito.any(Snackbar.class));
++
++        // Enter Picture in Picture, still fullscreen: no notice in the window.
++        setInPictureInPicture(true);
++        bubble.onPictureInPictureModeChanged(true);
++        Assert.assertFalse(bubble.isVisible());
++        Mockito.verify(mSnackbarManager, Mockito.times(1)).dismissSnackbars(Mockito.any());
++        // Native asking again (a forced update) shows nothing in Picture in Picture.
++        bubble.show();
++        Assert.assertFalse(bubble.isVisible());
++        Mockito.verify(mSnackbarManager, Mockito.times(1)).showSnackbar(Mockito.any(Snackbar.class));
++
++        // Leave Picture in Picture, still fullscreen: the notice shows again.
++        setInPictureInPicture(false);
++        bubble.onPictureInPictureModeChanged(false);
++        Assert.assertTrue(bubble.isVisible());
++        Mockito.verify(mSnackbarManager, Mockito.times(2)).showSnackbar(Mockito.any(Snackbar.class));
++    }
++
++    @Test
++    public void testNoticeFirstAskedInPipShowsOnLeaving() {
++        setInPictureInPicture(true);
++        ExclusiveAccessBubble bubble = ExclusiveAccessBubble.create(mContext);
++        bubble.update("To exit full screen, press |Esc|");
++        Assert.assertFalse(bubble.isVisible());
++        setInPictureInPicture(false);
++        bubble.onPictureInPictureModeChanged(false);
++        Assert.assertTrue(bubble.isVisible());
++    }
++
++    @Test
++    public void testFullscreenEndedInPipShowsNothingOnLeaving() {
++        ExclusiveAccessBubble bubble = ExclusiveAccessBubble.create(mContext);
++        bubble.update("To exit full screen, press |Esc|");
++        setInPictureInPicture(true);
++        bubble.onPictureInPictureModeChanged(true);
++        // Fullscreen ends (video Picture in Picture exits it): native hides the notice.
++        bubble.hide();
++        setInPictureInPicture(false);
++        bubble.onPictureInPictureModeChanged(false);
++        Assert.assertFalse(bubble.isVisible());
++        Mockito.verify(mSnackbarManager, Mockito.times(1)).showSnackbar(Mockito.any(Snackbar.class));
++    }
++
++    @Test
++    public void testOwedNoticeWaitsAndTarksFullscreenEndingCancelsIt() {
++        ExclusiveAccessBubble bubble = ExclusiveAccessBubble.create(mContext);
++        bubble.update("To exit full screen, press |Esc|");
++        setInPictureInPicture(true);
++        bubble.onPictureInPictureModeChanged(true);
++
++        // Leaving the window ends the fullscreen Tark made for it: the notice waits...
++        setInPictureInPicture(false);
++        bubble.onPictureInPictureModeChanged(false, 500);
++        Assert.assertFalse(bubble.isVisible());
++        // ... and native hides it as fullscreen ends: no flash.
++        bubble.hide();
++        shadowOf(Looper.getMainLooper()).idleFor(500, TimeUnit.MILLISECONDS);
++        Assert.assertFalse(bubble.isVisible());
++        Mockito.verify(mSnackbarManager, Mockito.times(1)).showSnackbar(Mockito.any(Snackbar.class));
++    }
++
++    @Test
++    public void testOwedNoticeShowsAfterTheWaitWhenStillFullscreen() {
++        ExclusiveAccessBubble bubble = ExclusiveAccessBubble.create(mContext);
++        bubble.update("To exit full screen, press |Esc|");
++        setInPictureInPicture(true);
++        bubble.onPictureInPictureModeChanged(true);
++        setInPictureInPicture(false);
++        bubble.onPictureInPictureModeChanged(false, 500);
++        Assert.assertFalse(bubble.isVisible());
++        // Fullscreen didn't end (the page kept it): the notice shows after the wait.
++        shadowOf(Looper.getMainLooper()).idleFor(500, TimeUnit.MILLISECONDS);
++        Assert.assertTrue(bubble.isVisible());
++    }
++}
+diff --color -ruN a/chrome/browser/android/BUILD.gn b/chrome/browser/android/BUILD.gn
+--- a/chrome/browser/android/BUILD.gn	2026-10-30 00:38:28.557178212 +0530
++++ b/chrome/browser/android/BUILD.gn	2026-10-30 00:38:40.251524692 +0530
+@@ -509,6 +509,7 @@
+       "tab_web_contents_destroyer.h",
+       "tabbed_startup_window_policy_delegate_bridge.cc",
+       "tark/safe_browsing_stubs_android.cc",
++      "tark/tark_picture_in_picture_android.cc",
+       "trusted_cdn.cc",
+       "trusted_cdn.h",
+       "usage_stats/usage_stats_bridge.cc",
+diff --color -ruN a/chrome/browser/android/tark/tark_picture_in_picture_android.cc b/chrome/browser/android/tark/tark_picture_in_picture_android.cc
+--- a/chrome/browser/android/tark/tark_picture_in_picture_android.cc	1970-01-01 05:30:00.000000000 +0530
++++ b/chrome/browser/android/tark/tark_picture_in_picture_android.cc	1970-01-01 05:30:00.000000000 +0530
+@@ -0,0 +1,113 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// Tark for Android: Picture in Picture on leave. TarkPictureInPicture.java's
++// natives: whether the current tab plays a video with sound, its size, making
++// it the fullscreen element for the Picture in Picture window, and telling
++// Java when the first of these may have changed.
++
++#include <optional>
++#include <vector>
++
++#include "base/android/jni_android.h"
++#include "base/android/jni_array.h"
++#include "base/android/jni_string.h"
++#include "content/public/browser/media_player_id.h"
++#include "content/public/browser/tark_picture_in_picture.h"
++#include "content/public/browser/web_contents.h"
++#include "content/public/browser/web_contents_observer.h"
++#include "content/public/browser/web_contents_user_data.h"
++#include "ui/gfx/geometry/size.h"
++
++// Must come after all headers that specialize FromJniType() / ToJniType().
++#include "chrome/android/chrome_jni_headers/TarkPictureInPicture_jni.h"
++
++using base::android::JavaRef;
++
++namespace {
++
++// Tells TarkPictureInPicture.java when whether its WebContents plays a video
++// with sound may have changed: it turned audible or silent (the page muted or
++// unmuted, or its sound started a little after the player), or a video got
++// its size. Players starting and stopping have their own Java signal.
++class TarkOfferWatcher : public content::WebContentsObserver,
++                         public content::WebContentsUserData<TarkOfferWatcher> {
++ public:
++  TarkOfferWatcher(const TarkOfferWatcher&) = delete;
++  TarkOfferWatcher& operator=(const TarkOfferWatcher&) = delete;
++  ~TarkOfferWatcher() override = default;
++
++  // content::WebContentsObserver:
++  void OnAudioStateChanged(bool audible) override { Notify(); }
++  void MediaResized(const gfx::Size& size,
++                    const content::MediaPlayerId& id) override {
++    Notify();
++  }
++
++ private:
++  friend class content::WebContentsUserData<TarkOfferWatcher>;
++
++  explicit TarkOfferWatcher(content::WebContents* web_contents)
++      : content::WebContentsObserver(web_contents),
++        content::WebContentsUserData<TarkOfferWatcher>(*web_contents) {}
++
++  void Notify() {
++    JNIEnv* env = base::android::AttachCurrentThread();
++    Java_TarkPictureInPicture_onOfferMayHaveChanged(
++        env, web_contents()->GetJavaWebContents());
++  }
++
++  WEB_CONTENTS_USER_DATA_KEY_DECL();
++};
++
++WEB_CONTENTS_USER_DATA_KEY_IMPL(TarkOfferWatcher);
++
++}  // namespace
++
++static bool JNI_TarkPictureInPicture_IsPlayingVideoWithSound(
++    JNIEnv* env,
++    const JavaRef<jobject>& jweb_contents) {
++  return content::tark_media::CanEnterPictureInPictureOnLeave(
++      content::WebContents::FromJavaWebContents(jweb_contents));
++}
++
++// {width, height}, or empty when no video plays.
++static std::vector<int32_t> JNI_TarkPictureInPicture_GetPlayingVideoSize(
++    JNIEnv* env,
++    const JavaRef<jobject>& jweb_contents) {
++  std::optional<gfx::Size> size = content::tark_media::GetPlayingVideoSize(
++      content::WebContents::FromJavaWebContents(jweb_contents));
++  if (!size) {
++    return {};
++  }
++  return {size->width(), size->height()};
++}
++
++static bool JNI_TarkPictureInPicture_RequestFullscreen(
++    JNIEnv* env,
++    const JavaRef<jobject>& jweb_contents) {
++  return content::tark_media::RequestFullscreenForPictureInPicture(
++      content::WebContents::FromJavaWebContents(jweb_contents));
++}
++
++static void JNI_TarkPictureInPicture_SetInWindow(
++    JNIEnv* env,
++    const JavaRef<jobject>& jweb_contents,
++    bool in_window) {
++  content::tark_media::SetInPictureInPictureWindow(
++      content::WebContents::FromJavaWebContents(jweb_contents), in_window);
++}
++
++// Idempotent: one watcher per WebContents, for its lifetime.
++static void JNI_TarkPictureInPicture_Watch(
++    JNIEnv* env,
++    const JavaRef<jobject>& jweb_contents) {
++  content::WebContents* web_contents =
++      content::WebContents::FromJavaWebContents(jweb_contents);
++  if (web_contents) {
++    TarkOfferWatcher::CreateForWebContents(web_contents);
++  }
++}
++
++DEFINE_JNI(TarkPictureInPicture)
+diff --color -ruN a/content/browser/media/media_web_contents_observer_unittest.cc b/content/browser/media/media_web_contents_observer_unittest.cc
+--- a/content/browser/media/media_web_contents_observer_unittest.cc	2026-10-30 00:38:28.545692935 +0530
++++ b/content/browser/media/media_web_contents_observer_unittest.cc	2026-10-30 00:38:40.252754542 +0530
+@@ -42,6 +42,10 @@
+   void SetAudioSinkId(const std::string& sink_id) override {}
+   void SuspendForFrameClosed() override {}
+   void RequestMediaRemoting() override {}
++  void RequestTarkFullscreenForPictureInPicture(
++      RequestTarkFullscreenForPictureInPictureCallback callback) override {
++    std::move(callback).Run();
++  }
+   void RequestVisibility(
+       RequestVisibilityCallback request_visibility_callback) override {}
+   void RecordAutoPictureInPictureInfo(
+diff --color -ruN a/content/browser/media/session/media_session_controller_unittest.cc b/content/browser/media/session/media_session_controller_unittest.cc
+--- a/content/browser/media/session/media_session_controller_unittest.cc	2026-10-30 00:38:28.546532738 +0530
++++ b/content/browser/media/session/media_session_controller_unittest.cc	2026-10-30 00:38:40.254151894 +0530
+@@ -165,6 +165,10 @@
+   void SuspendForFrameClosed() override {}
+ 
+   void RequestMediaRemoting() override {}
++  void RequestTarkFullscreenForPictureInPicture(
++      RequestTarkFullscreenForPictureInPictureCallback callback) override {
++    std::move(callback).Run();
++  }
+   void RequestSaveVideoFrame() override {}
+ 
+   void RequestVisibility(
+diff --color -ruN a/content/browser/picture_in_picture/picture_in_picture_service_impl_unittest.cc b/content/browser/picture_in_picture/picture_in_picture_service_impl_unittest.cc
+--- a/content/browser/picture_in_picture/picture_in_picture_service_impl_unittest.cc	2026-10-30 00:38:28.538525548 +0530
++++ b/content/browser/picture_in_picture/picture_in_picture_service_impl_unittest.cc	2026-10-30 00:38:40.256160754 +0530
+@@ -190,6 +190,10 @@
+   void SetAudioSinkId(const std::string& sink_id) override {}
+   void SuspendForFrameClosed() override {}
+   void RequestMediaRemoting() override {}
++  void RequestTarkFullscreenForPictureInPicture(
++      RequestTarkFullscreenForPictureInPictureCallback callback) override {
++    std::move(callback).Run();
++  }
+   void RequestSaveVideoFrame() override {}
+   void RequestVisibility(
+       RequestVisibilityCallback request_visibility_callback) override {}
+diff --color -ruN a/content/browser/renderer_host/render_widget_host_delegate.cc b/content/browser/renderer_host/render_widget_host_delegate.cc
+--- a/content/browser/renderer_host/render_widget_host_delegate.cc	2026-10-30 00:38:38.909033400 +0530
++++ b/content/browser/renderer_host/render_widget_host_delegate.cc	2026-10-30 00:38:58.209708434 +0530
+@@ -90,6 +90,10 @@
+   return false;
+ }
+ 
++bool RenderWidgetHostDelegate::TarkHoldsWindowScreenRect() {
++  return false;
++}
++
+ bool RenderWidgetHostDelegate::ShouldShowStaleContentOnEviction() {
+   return false;
+ }
+diff --color -ruN a/content/browser/renderer_host/render_widget_host_delegate.h b/content/browser/renderer_host/render_widget_host_delegate.h
+--- a/content/browser/renderer_host/render_widget_host_delegate.h	2026-10-30 00:38:38.547534152 +0530
++++ b/content/browser/renderer_host/render_widget_host_delegate.h	2026-10-30 00:38:58.209496265 +0530
+@@ -233,6 +233,11 @@
+   // Returns whether the associated tab is in fullscreen mode.
+   virtual bool IsFullscreen();
+ 
++  // Tark: whether the page should keep seeing its window at the screen's size
++  // (window.outerWidth/outerHeight, screenX/screenY) although the window
++  // shrank: Android's Picture in Picture window of the whole browser.
++  virtual bool TarkHoldsWindowScreenRect();
++
+   // Returns true if the widget's frame content needs to be stored before
+   // eviction and displayed until a new frame is generated. If false, a white
+   // solid color is displayed instead.
+diff --color -ruN a/content/browser/renderer_host/render_widget_host_impl.cc b/content/browser/renderer_host/render_widget_host_impl.cc
+--- a/content/browser/renderer_host/render_widget_host_impl.cc	2026-10-30 00:38:37.354183837 +0530
++++ b/content/browser/renderer_host/render_widget_host_impl.cc	2026-10-30 00:38:58.210239525 +0530
+@@ -727,12 +727,12 @@
+   }
+ 
+   if (last_view_screen_rect_ == view_->GetViewBoundsWithoutTransform() &&
+-      last_window_screen_rect_ == view_->GetBoundsInScreenWithoutTransform()) {
++      last_window_screen_rect_ == TarkWindowScreenRect()) {
+     return;
+   }
+ 
+   last_view_screen_rect_ = view_->GetViewBoundsWithoutTransform();
+-  last_window_screen_rect_ = view_->GetBoundsInScreenWithoutTransform();
++  last_window_screen_rect_ = TarkWindowScreenRect();
+   blink_widget_->UpdateScreenRects(
+       last_view_screen_rect_, last_window_screen_rect_,
+       base::BindOnce(&RenderWidgetHostImpl::OnUpdateScreenRectsAck,
+@@ -3075,13 +3075,25 @@
+   view_->SendInitialPropertiesIfNeeded();
+ 
+   if (view_->GetViewBoundsWithoutTransform() == last_view_screen_rect_ &&
+-      view_->GetBoundsInScreenWithoutTransform() == last_window_screen_rect_) {
++      TarkWindowScreenRect() == last_window_screen_rect_) {
+     return;
+   }
+ 
+   SendScreenRects();
+ }
+ 
++gfx::Rect RenderWidgetHostImpl::TarkWindowScreenRect() {
++  // Tark: in Android's Picture in Picture window of the whole browser, the
++  // page keeps seeing a screen-sized window. Some players read a small window
++  // (outerWidth * outerHeight against the screen's area) as a mini player and
++  // leave fullscreen or pause (m.youtube.com does both), which closes the
++  // window. The page's viewport (innerWidth/innerHeight) is the real one.
++  if (delegate_ && delegate_->TarkHoldsWindowScreenRect()) {
++    return GetScreenInfo().rect;
++  }
++  return view_->GetBoundsInScreenWithoutTransform();
++}
++
+ void RenderWidgetHostImpl::OnRenderFrameSubmission() {}
+ 
+ void RenderWidgetHostImpl::OnLocalSurfaceIdChanged(
+diff --color -ruN a/content/browser/renderer_host/render_widget_host_impl.h b/content/browser/renderer_host/render_widget_host_impl.h
+--- a/content/browser/renderer_host/render_widget_host_impl.h	2026-10-30 00:38:38.098933998 +0530
++++ b/content/browser/renderer_host/render_widget_host_impl.h	2026-10-30 00:38:58.209870770 +0530
+@@ -1237,6 +1237,10 @@
+   // IPC message handlers
+   void OnClose();
+   void OnUpdateScreenRectsAck();
++
++  // Tark: the window rect the renderer is told: the view's, or the screen's
++  // while the delegate holds it (TarkHoldsWindowScreenRect).
++  gfx::Rect TarkWindowScreenRect();
+   void OnUpdateDragOperation(DragOperationCallback callback,
+                              ui::mojom::DragOperation current_op,
+                              bool document_is_handling_drag);
+diff --color -ruN a/content/browser/web_contents/web_contents_impl.cc b/content/browser/web_contents/web_contents_impl.cc
+--- a/content/browser/web_contents/web_contents_impl.cc	2026-10-30 00:38:40.191120267 +0530
++++ b/content/browser/web_contents/web_contents_impl.cc	2026-10-30 00:39:32.211020896 +0530
+@@ -175,6 +175,7 @@
+ #include "content/public/browser/site_isolation_policy.h"
+ #include "content/public/browser/ssl_status.h"
+ #include "content/public/browser/storage_partition.h"
++#include "content/public/browser/tark_picture_in_picture.h"
+ #include "content/public/browser/web_contents_delegate.h"
+ #include "content/public/browser/web_contents_view_delegate.h"
+ #include "content/public/browser/web_ui_controller.h"
+@@ -5494,6 +5495,10 @@
+   return delegate_ && delegate_->IsFullscreenForTabOrPending(this);
+ }
+ 
++bool WebContentsImpl::TarkHoldsWindowScreenRect() {
++  return tark_in_pip_window_;
++}
++
+ bool WebContentsImpl::ShouldShowStaleContentOnEviction() {
+   return GetDelegate() && GetDelegate()->ShouldShowStaleContentOnEviction(this);
+ }
+@@ -12526,6 +12531,110 @@
+   observers_.NotifyObservers(&WebContentsObserver::MediaResized, size, id);
+ }
+ 
++std::optional<gfx::Size> WebContentsImpl::TarkPlayingVideoSize() const {
++  // Only video players are ever resized (MediaResized).
++  for (const MediaPlayerId& id : tark_playing_players_) {
++    if (auto it = cached_video_sizes_.find(id);
++        it != cached_video_sizes_.end() && !it->second.IsEmpty()) {
++      return it->second;
++    }
++  }
++  return std::nullopt;
++}
++
++bool WebContentsImpl::TarkRequestFullscreenForPictureInPicture() {
++  if (!media_web_contents_observer_) {
++    return false;
++  }
++  for (const MediaPlayerId& id : tark_playing_players_) {
++    auto it = cached_video_sizes_.find(id);
++    if (it == cached_video_sizes_.end() || it->second.IsEmpty() ||
++        !media_web_contents_observer_->IsMediaPlayerRemoteAvailable(id)) {
++      continue;
++    }
++    // The waiver is armed for this player's frame only, until the renderer
++    // replies (TarkFullscreenForPictureInPictureReplied).
++    tark_pip_fullscreen_waiver_ = {.frame = id.frame_routing_id,
++                                   .armed_at = base::TimeTicks::Now(),
++                                   .request = ++tark_pip_fullscreen_requests_};
++    media_web_contents_observer_->GetMediaPlayerRemote(id)
++        ->RequestTarkFullscreenForPictureInPicture(base::BindOnce(
++            &WebContentsImpl::TarkFullscreenForPictureInPictureReplied,
++            weak_factory_.GetWeakPtr(), tark_pip_fullscreen_requests_));
++    return true;
++  }
++  return false;
++}
++
++void WebContentsImpl::TarkFullscreenForPictureInPictureReplied(
++    uint64_t request) {
++  // The player's interface and LocalFrameHost share the frame's channel, so
++  // the frame's EnterFullscreen() for Tark's request arrived before this
++  // reply. Whatever came of it (entered, or Blink refused: an iframe without
++  // allowfullscreen), nothing else gets the waiver.
++  if (tark_pip_fullscreen_waiver_ &&
++      tark_pip_fullscreen_waiver_->request == request) {
++    tark_pip_fullscreen_waiver_.reset();
++  }
++}
++
++bool WebContentsImpl::TarkConsumePictureInPictureFullscreenWaiver(
++    RenderFrameHostImpl* requesting_frame) {
++  if (!tark_pip_fullscreen_waiver_ || !requesting_frame ||
++      requesting_frame->GetGlobalId() != tark_pip_fullscreen_waiver_->frame) {
++    return false;
++  }
++  static constexpr base::TimeDelta kMaxWait = base::Seconds(1);
++  const bool fresh =
++      base::TimeTicks::Now() - tark_pip_fullscreen_waiver_->armed_at <=
++      kMaxWait;
++  // Single use, fresh or not.
++  tark_pip_fullscreen_waiver_.reset();
++  return fresh;
++}
++
++void WebContentsImpl::TarkSetInPictureInPictureWindow(bool in_window) {
++  if (tark_in_pip_window_ == in_window || IsBeingDestroyed()) {
++    return;
++  }
++  tark_in_pip_window_ = in_window;
++  // Each widget compares against what it last sent, so only the window rect
++  // changes; a widget waiting for an ack sends it on the ack.
++  SendScreenRects();
++}
++
++namespace tark_media {
++
++bool CanEnterPictureInPictureOnLeave(WebContents* web_contents) {
++  // A video already in video Picture in Picture (the page's own request)
++  // floats on its own.
++  return web_contents && web_contents->IsCurrentlyAudible() &&
++         !web_contents->HasPictureInPictureVideo() &&
++         static_cast<WebContentsImpl*>(web_contents)
++             ->TarkPlayingVideoSize()
++             .has_value();
++}
++
++std::optional<gfx::Size> GetPlayingVideoSize(WebContents* web_contents) {
++  return web_contents ? static_cast<WebContentsImpl*>(web_contents)
++                            ->TarkPlayingVideoSize()
++                      : std::nullopt;
++}
++
++bool RequestFullscreenForPictureInPicture(WebContents* web_contents) {
++  return web_contents && static_cast<WebContentsImpl*>(web_contents)
++                             ->TarkRequestFullscreenForPictureInPicture();
++}
++
++void SetInPictureInPictureWindow(WebContents* web_contents, bool in_window) {
++  if (web_contents) {
++    static_cast<WebContentsImpl*>(web_contents)
++        ->TarkSetInPictureInPictureWindow(in_window);
++  }
++}
++
++}  // namespace tark_media
++
+ void WebContentsImpl::MediaEffectivelyFullscreenChanged(bool is_fullscreen) {
+   OPTIONAL_TRACE_EVENT1("content",
+                         "WebContentsImpl::MediaEffectivelyFullscreenChanged",
+@@ -12712,6 +12821,14 @@
+     return false;
+   }
+ 
++  // Tark: the request Tark itself caused for Picture in Picture
++  // (RequestTarkFullscreenForPictureInPicture): browser-initiated, as a
++  // rotation to landscape is. Only from the player's frame, only once, and
++  // only before the renderer has answered Tark's request.
++  if (TarkConsumePictureInPictureFullscreenWaiver(requesting_frame)) {
++    return false;
++  }
++
+   // Require transient activation shortly after a same-origin WebContents exit.
+   RenderFrameHostImpl* primary_main_frame = GetPrimaryMainFrame();
+   RenderFrameHostImpl* host =
+diff --color -ruN a/content/browser/web_contents/web_contents_impl.h b/content/browser/web_contents/web_contents_impl.h
+--- a/content/browser/web_contents/web_contents_impl.h	2026-10-30 00:38:40.194249016 +0530
++++ b/content/browser/web_contents/web_contents_impl.h	2026-10-30 00:39:32.209079356 +0530
+@@ -637,6 +637,7 @@
+   void StopFinding(StopFindAction action) override;
+   bool WasEverAudible() override;
+   bool IsFullscreen() override;
++  bool TarkHoldsWindowScreenRect() override;
+   bool ShouldShowStaleContentOnEviction() override;
+   void ExitFullscreen(bool will_cause_resize) override;
+   [[nodiscard]] std::optional<base::ScopedClosureRunner>
+@@ -1419,6 +1420,22 @@
+   void MediaResized(const gfx::Size& size, const MediaPlayerId& id);
+   void MediaEffectivelyFullscreenChanged(bool is_fullscreen);
+ 
++  // Tark: Picture in Picture on leave (tark_picture_in_picture.h). The
++  // natural size of the first playing video, if any; and making it the
++  // fullscreen element, browser-initiated.
++  std::optional<gfx::Size> TarkPlayingVideoSize() const;
++  bool TarkRequestFullscreenForPictureInPicture();
++  // The renderer answered RequestTarkFullscreenForPictureInPicture number
++  // `request`: its waiver ends.
++  void TarkFullscreenForPictureInPictureReplied(uint64_t request);
++  // Whether `requesting_frame`'s fullscreen request is the one Tark asked for
++  // (needs no user activation). Uses the waiver up.
++  bool TarkConsumePictureInPictureFullscreenWaiver(
++      RenderFrameHostImpl* requesting_frame);
++  // The browser's Picture in Picture window opened or closed: while it's open
++  // the page keeps seeing a screen-sized window (TarkHoldsWindowScreenRect).
++  void TarkSetInPictureInPictureWindow(bool in_window);
++
+   // Called by MediaWebContentsObserver when a buffer underflow occurs. See the
+   // WebContentsObserver function stubs for more details.
+   void MediaBufferUnderflow(const MediaPlayerId& id);
+@@ -2725,6 +2742,18 @@
+   // players stopped when it's destroyed.
+   base::flat_set<MediaPlayerId> tark_playing_players_;
+   tark_media::VisibilityHold tark_visibility_hold_;
++  // Tark: Tark asked a video to go fullscreen for Picture in Picture. The
++  // fullscreen request its frame sends for it needs no user activation; any
++  // other request does.
++  struct TarkPipFullscreenWaiver {
++    GlobalRenderFrameHostId frame;
++    base::TimeTicks armed_at;
++    uint64_t request = 0;
++  };
++  std::optional<TarkPipFullscreenWaiver> tark_pip_fullscreen_waiver_;
++  uint64_t tark_pip_fullscreen_requests_ = 0;
++  // Tark: this tab is shown in the browser's Picture in Picture window.
++  bool tark_in_pip_window_ = false;
+ 
+   // Manages media players, CDMs, and power save blockers for media.
+   std::unique_ptr<MediaWebContentsObserver> media_web_contents_observer_;
+diff --color -ruN a/content/public/browser/BUILD.gn b/content/public/browser/BUILD.gn
+--- a/content/public/browser/BUILD.gn	2026-10-30 00:38:28.547638586 +0530
++++ b/content/public/browser/BUILD.gn	2026-10-30 00:38:40.270162147 +0530
+@@ -461,6 +461,7 @@
+     "surface_embed_connector.h",
+     "swap_metrics_driver.h",
+     "synthetic_trial_syncer.h",
++    "tark_picture_in_picture.h",
+     "touch_selection_controller_client_manager.h",
+     "tracing_controller.h",
+     "tracing_delegate.cc",
+diff --color -ruN a/content/public/browser/tark_picture_in_picture.h b/content/public/browser/tark_picture_in_picture.h
+--- a/content/public/browser/tark_picture_in_picture.h	1970-01-01 05:30:00.000000000 +0530
++++ b/content/public/browser/tark_picture_in_picture.h	1970-01-01 05:30:00.000000000 +0530
+@@ -0,0 +1,50 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CONTENT_PUBLIC_BROWSER_TARK_PICTURE_IN_PICTURE_H_
++#define CONTENT_PUBLIC_BROWSER_TARK_PICTURE_IN_PICTURE_H_
++
++#include <optional>
++
++#include "content/common/content_export.h"
++#include "ui/gfx/geometry/size.h"
++
++namespace content {
++
++class WebContents;
++
++namespace tark_media {
++
++// Tark for Android: Picture in Picture on leave. When the user leaves Tark
++// while the current tab plays a video with sound, the browser activity enters
++// Android's Picture in Picture, and that video becomes the fullscreen element
++// so the window shows only the video, inline or already fullscreen.
++
++// Whether `web_contents` plays sound and a video now. A muted video doesn't
++// count, nor a tab whose video is already in video Picture in Picture.
++CONTENT_EXPORT bool CanEnterPictureInPictureOnLeave(WebContents* web_contents);
++
++// The natural size of the first playing video, for the window's aspect ratio.
++CONTENT_EXPORT std::optional<gfx::Size> GetPlayingVideoSize(
++    WebContents* web_contents);
++
++// Makes the first playing video the fullscreen element. Browser-initiated:
++// the fullscreen request this causes in the player's frame needs no user
++// activation (one request, before the renderer answers; nothing else is
++// waived). Returns whether it was requested (the renderer enters fullscreen
++// asynchronously).
++CONTENT_EXPORT bool RequestFullscreenForPictureInPicture(
++    WebContents* web_contents);
++
++// The browser's Picture in Picture window opened (`in_window`) or closed with
++// `web_contents` in it. While it's open the page keeps seeing a screen-sized
++// window (window.outerWidth/outerHeight): m.youtube.com reads a small window
++// as its mini player and leaves fullscreen and pauses, closing the window.
++CONTENT_EXPORT void SetInPictureInPictureWindow(WebContents* web_contents,
++                                                bool in_window);
++
++}  // namespace tark_media
++}  // namespace content
++
++#endif  // CONTENT_PUBLIC_BROWSER_TARK_PICTURE_IN_PICTURE_H_
+diff --color -ruN a/media/mojo/mojom/media_player.mojom b/media/mojo/mojom/media_player.mojom
+--- a/media/mojo/mojom/media_player.mojom	2026-10-30 00:38:28.572451831 +0530
++++ b/media/mojo/mojom/media_player.mojom	2026-10-30 00:38:40.270882949 +0530
+@@ -32,6 +32,14 @@
+   // accounting for transforms and zoom).
+   RequestEnterPictureInPicture(gfx.mojom.Size? min_size);
+ 
++  // Tark: Picture in Picture on leave. Requests the video player to become
++  // the fullscreen element, so the browser's Picture in Picture window shows
++  // only the video. Browser-initiated: the browser waives transient
++  // activation for the fullscreen request the player's frame sends while
++  // handling this, and for no other (WebContentsImpl); the reply ends the
++  // waiver. Players without video ignore it and reply.
++  RequestTarkFullscreenForPictureInPicture() => ();
++
+   // Requests the media player to mute or unmute.
+   RequestMute(bool mute);
+ 
+diff --color -ruN a/third_party/blink/renderer/core/html/media/html_media_element.h b/third_party/blink/renderer/core/html/media/html_media_element.h
+--- a/third_party/blink/renderer/core/html/media/html_media_element.h	2026-10-30 00:38:28.550319413 +0530
++++ b/third_party/blink/renderer/core/html/media/html_media_element.h	2026-10-30 00:38:40.272277092 +0530
+@@ -679,6 +679,10 @@
+   void SetAudioSinkId(const String&) override;
+   void SuspendForFrameClosed() override;
+   void RequestMediaRemoting() override {}
++  void RequestTarkFullscreenForPictureInPicture(
++      RequestTarkFullscreenForPictureInPictureCallback callback) override {
++    std::move(callback).Run();
++  }
+   void RequestVisibility(
+       RequestVisibilityCallback request_visibility_cb) override {}
+   void RecordAutoPictureInPictureInfo(
+diff --color -ruN a/third_party/blink/renderer/core/html/media/html_video_element.cc b/third_party/blink/renderer/core/html/media/html_video_element.cc
+--- a/third_party/blink/renderer/core/html/media/html_video_element.cc	2026-10-30 00:38:28.549699030 +0530
++++ b/third_party/blink/renderer/core/html/media/html_video_element.cc	2026-10-30 00:38:40.273373440 +0530
+@@ -59,6 +59,7 @@
+ #include "third_party/blink/renderer/core/frame/picture_in_picture_controller.h"
+ #include "third_party/blink/renderer/core/frame/settings.h"
+ #include "third_party/blink/renderer/core/fullscreen/fullscreen.h"
++#include "third_party/blink/renderer/core/fullscreen/scoped_allow_fullscreen.h"
+ #include "third_party/blink/renderer/core/html/media/media_custom_controls_fullscreen_detector.h"
+ #include "third_party/blink/renderer/core/html/media/media_remoting_interstitial.h"
+ #include "third_party/blink/renderer/core/html/media/media_video_visibility_tracker.h"
+@@ -836,6 +837,19 @@
+   }
+ }
+ 
++void HTMLVideoElement::RequestTarkFullscreenForPictureInPicture(
++    RequestTarkFullscreenForPictureInPictureCallback callback) {
++  // Tark: Picture in Picture on leave. The browser asked (not the page), as
++  // it does on a rotation to landscape. The allowance covers this element's
++  // request only, made here; the browser waives transient activation for the
++  // frame's request sent before the reply below, and for nothing after it.
++  {
++    ScopedAllowFullscreen allow(ScopedAllowFullscreen::kOrientationChange);
++    EnterFullscreen();
++  }
++  std::move(callback).Run();
++}
++
+ void HTMLVideoElement::DidEnterFullscreen() {
+   UpdateControlsVisibility();
+ 
+diff --color -ruN a/third_party/blink/renderer/core/html/media/html_video_element.h b/third_party/blink/renderer/core/html/media/html_video_element.h
+--- a/third_party/blink/renderer/core/html/media/html_video_element.h	2026-10-30 00:38:28.550044243 +0530
++++ b/third_party/blink/renderer/core/html/media/html_video_element.h	2026-10-30 00:38:40.274185201 +0530
+@@ -249,6 +249,8 @@
+   void RequestEnterPictureInPicture(
+       const std::optional<gfx::Size>& min_size) final;
+   void RequestMediaRemoting() final;
++  void RequestTarkFullscreenForPictureInPicture(
++      RequestTarkFullscreenForPictureInPictureCallback callback) final;
+   void RequestVisibility(RequestVisibilityCallback request_visibility_cb) final;
+ 
+   void DidMoveToNewDocument(Document& old_document) override;
+diff --color -ruN a/third_party/blink/renderer/modules/webaudio/audio_context.h b/third_party/blink/renderer/modules/webaudio/audio_context.h
+--- a/third_party/blink/renderer/modules/webaudio/audio_context.h	2026-10-30 00:38:36.663486267 +0530
++++ b/third_party/blink/renderer/modules/webaudio/audio_context.h	2026-10-30 00:38:40.274993545 +0530
+@@ -198,6 +198,10 @@
+   void SetAudioSinkId(const String&) override {}
+   void SuspendForFrameClosed() override {}
+   void RequestMediaRemoting() override {}
++  void RequestTarkFullscreenForPictureInPicture(
++      RequestTarkFullscreenForPictureInPictureCallback callback) override {
++    std::move(callback).Run();
++  }
+   void RequestVisibility(
+       RequestVisibilityCallback request_visibility_cb) override {}
+   void RecordAutoPictureInPictureInfo(

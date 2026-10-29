@@ -1,0 +1,1034 @@
+diff --color -ruN a/chrome/android/BUILD.gn b/chrome/android/BUILD.gn
+--- a/chrome/android/BUILD.gn	2026-10-29 22:46:27.274412295 +0530
++++ b/chrome/android/BUILD.gn	2026-10-29 22:46:27.308801984 +0530
+@@ -1186,6 +1186,7 @@
+       "junit:chrome_junit_tests_org.chromium.chrome.browser.tab",
+       "junit:chrome_junit_tests_org.chromium.chrome.browser.tabbed_mode",
+       "junit:chrome_junit_tests_org.chromium.chrome.browser.tabmodel",
++      "junit:chrome_junit_tests_org.chromium.chrome.browser.tark.media",
+       "junit:chrome_junit_tests_org.chromium.chrome.browser.tark.zynclave",
+       "junit:chrome_junit_tests_org.chromium.chrome.browser.tasks",
+       "junit:chrome_junit_tests_org.chromium.chrome.browser.toolbar",
+diff --color -ruN a/chrome/android/chrome_java_sources.gni b/chrome/android/chrome_java_sources.gni
+--- a/chrome/android/chrome_java_sources.gni	2026-10-29 22:46:27.277631965 +0530
++++ b/chrome/android/chrome_java_sources.gni	2026-10-29 22:46:27.312462661 +0530
+@@ -974,6 +974,8 @@
+   "java/src/org/chromium/chrome/browser/page_info/SiteSettingsHelper.java",
+   "java/src/org/chromium/chrome/browser/page_info/TarkAdblockSiteSwitch.java",
+   "java/src/org/chromium/chrome/browser/tark_captions/TarkCaptionBarCoordinator.java",
++  "java/src/org/chromium/chrome/browser/tark/media/TarkMediaPrefs.java",
++  "java/src/org/chromium/chrome/browser/tark/media/TarkMediaSwitchPreference.java",
+   "java/src/org/chromium/chrome/browser/tark/zynclave/AuthStateStore.java",
+   "java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAccount.java",
+   "java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAccountPreference.java",
+diff --color -ruN a/chrome/android/java/res/xml/main_preferences.xml b/chrome/android/java/res/xml/main_preferences.xml
+--- a/chrome/android/java/res/xml/main_preferences.xml	2026-10-29 22:46:27.279283697 +0530
++++ b/chrome/android/java/res/xml/main_preferences.xml	2026-10-29 22:46:27.314247602 +0530
+@@ -124,30 +124,41 @@
+         android:key="accessibility"
+         android:order="26"
+         android:title="@string/prefs_accessibility"/>
++    <!-- Tark: Background play and Picture in Picture (TarkMediaPrefs). -->
++    <org.chromium.chrome.browser.tark.media.TarkMediaSwitchPreference
++        android:key="tark_background_play"
++        android:order="27"
++        android:title="@string/tark_background_play"
++        android:summary="@string/tark_background_play_summary"/>
++    <org.chromium.chrome.browser.tark.media.TarkMediaSwitchPreference
++        android:key="tark_picture_in_picture"
++        android:order="28"
++        android:title="@string/tark_picture_in_picture"
++        android:summary="@string/tark_picture_in_picture_summary"/>
+     <org.chromium.components.browser_ui.settings.ChromeBasePreference
+         android:fragment="org.chromium.components.browser_ui.site_settings.SiteSettings"
+         android:key="content_settings"
+-        android:order="27"
++        android:order="29"
+         android:title="@string/prefs_site_settings"/>
+     <org.chromium.components.browser_ui.settings.ChromeBasePreference
+         android:fragment="org.chromium.chrome.browser.language.settings.LanguageSettings"
+         android:key="languages"
+-        android:order="28"
++        android:order="30"
+         android:title="@string/language_settings"/>
+     <org.chromium.components.browser_ui.settings.ChromeBasePreference
+         android:fragment="org.chromium.chrome.browser.download.settings.DownloadSettings"
+         android:key="downloads"
+-        android:order="29"
++        android:order="31"
+         android:title="@string/menu_downloads"/>
+     <org.chromium.components.browser_ui.settings.ChromeBasePreference
+         android:fragment="org.chromium.chrome.browser.tracing.settings.DeveloperSettings"
+         android:key="developer"
+-        android:order="30"
++        android:order="32"
+         android:title="Developer options"/>
+     <org.chromium.components.browser_ui.settings.ChromeBasePreference
+         android:fragment="org.chromium.chrome.browser.about_settings.AboutChromeSettings"
+         android:key="about_chrome"
+-        android:order="31"
++        android:order="33"
+         android:title="@string/prefs_about_chrome"/>
+ 
+ </PreferenceScreen>
+diff --color -ruN a/chrome/android/java/src/org/chromium/chrome/browser/tark/media/TarkMediaPrefs.java b/chrome/android/java/src/org/chromium/chrome/browser/tark/media/TarkMediaPrefs.java
+--- a/chrome/android/java/src/org/chromium/chrome/browser/tark/media/TarkMediaPrefs.java	1970-01-01 05:30:00.000000000 +0530
++++ b/chrome/android/java/src/org/chromium/chrome/browser/tark/media/TarkMediaPrefs.java	2026-10-29 22:46:27.318534412 +0530
+@@ -0,0 +1,43 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++package org.chromium.chrome.browser.tark.media;
++
++import org.chromium.build.annotations.NullMarked;
++import org.chromium.chrome.browser.preferences.ChromePreferenceKeys;
++import org.chromium.chrome.browser.preferences.ChromeSharedPreferences;
++
++/**
++ * Settings → Background play and → Picture in Picture, both on by default. Chrome's shared
++ * preferences hold them, so the browser's C++ reads the same values
++ * (TabWebContentsDelegateAndroid::GetBackgroundMediaSettings). A tab playing with sound when Tark
++ * is left keeps telling its page "visible" while a player plays, if Background play is on, or
++ * Picture in Picture is on and its video floats.
++ */
++@NullMarked
++public final class TarkMediaPrefs {
++    private TarkMediaPrefs() {}
++
++    /** Media keeps playing when you leave Tark. */
++    public static boolean backgroundPlay() {
++        return ChromeSharedPreferences.getInstance()
++                .readBoolean(ChromePreferenceKeys.TARK_MEDIA_BACKGROUND_PLAY, true);
++    }
++
++    /** A playing video floats in a small window when you leave Tark. */
++    public static boolean pictureInPicture() {
++        return ChromeSharedPreferences.getInstance()
++                .readBoolean(ChromePreferenceKeys.TARK_MEDIA_PICTURE_IN_PICTURE, true);
++    }
++
++    public static void setBackgroundPlay(boolean on) {
++        ChromeSharedPreferences.getInstance()
++                .writeBoolean(ChromePreferenceKeys.TARK_MEDIA_BACKGROUND_PLAY, on);
++    }
++
++    public static void setPictureInPicture(boolean on) {
++        ChromeSharedPreferences.getInstance()
++                .writeBoolean(ChromePreferenceKeys.TARK_MEDIA_PICTURE_IN_PICTURE, on);
++    }
++}
+diff --color -ruN a/chrome/android/java/src/org/chromium/chrome/browser/tark/media/TarkMediaSwitchPreference.java b/chrome/android/java/src/org/chromium/chrome/browser/tark/media/TarkMediaSwitchPreference.java
+--- a/chrome/android/java/src/org/chromium/chrome/browser/tark/media/TarkMediaSwitchPreference.java	1970-01-01 05:30:00.000000000 +0530
++++ b/chrome/android/java/src/org/chromium/chrome/browser/tark/media/TarkMediaSwitchPreference.java	2026-10-29 22:46:27.318838750 +0530
+@@ -0,0 +1,57 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++package org.chromium.chrome.browser.tark.media;
++
++import android.content.Context;
++import android.util.AttributeSet;
++
++import org.chromium.build.annotations.NullMarked;
++import org.chromium.build.annotations.Nullable;
++import org.chromium.components.browser_ui.settings.ChromeSwitchPreference;
++
++/**
++ * A Settings switch for one of {@link TarkMediaPrefs}: Background play (key {@link
++ * #KEY_BACKGROUND_PLAY}) or Picture in Picture (key {@link #KEY_PICTURE_IN_PICTURE}).
++ */
++@NullMarked
++public class TarkMediaSwitchPreference extends ChromeSwitchPreference {
++    public static final String KEY_BACKGROUND_PLAY = "tark_background_play";
++    public static final String KEY_PICTURE_IN_PICTURE = "tark_picture_in_picture";
++
++    public TarkMediaSwitchPreference(Context context, @Nullable AttributeSet attrs) {
++        super(context, attrs);
++        // TarkMediaPrefs holds the value, not the preference screen's own storage.
++        setPersistent(false);
++        setOnPreferenceChangeListener(
++                (preference, newValue) -> {
++                    write((Boolean) newValue);
++                    return true;
++                });
++    }
++
++    @Override
++    public void onAttached() {
++        super.onAttached();
++        setChecked(read());
++    }
++
++    private boolean isPictureInPicture() {
++        return KEY_PICTURE_IN_PICTURE.equals(getKey());
++    }
++
++    private boolean read() {
++        return isPictureInPicture()
++                ? TarkMediaPrefs.pictureInPicture()
++                : TarkMediaPrefs.backgroundPlay();
++    }
++
++    private void write(boolean on) {
++        if (isPictureInPicture()) {
++            TarkMediaPrefs.setPictureInPicture(on);
++        } else {
++            TarkMediaPrefs.setBackgroundPlay(on);
++        }
++    }
++}
+diff --color -ruN a/chrome/android/junit/BUILD.gn b/chrome/android/junit/BUILD.gn
+--- a/chrome/android/junit/BUILD.gn	2026-10-29 22:46:27.275023054 +0530
++++ b/chrome/android/junit/BUILD.gn	2026-10-29 22:46:27.309354242 +0530
+@@ -1423,6 +1423,17 @@
+     ]
+   }
+ 
++  # Tark: Background play and Picture in Picture.
++  robolectric_library(
++      "chrome_junit_tests_org.chromium.chrome.browser.tark.media") {
++    resources_package = "org.chromium.chrome"
++
++    sources =
++        [ "src/org/chromium/chrome/browser/tark/media/TarkMediaPrefsTest.java" ]
++
++    deps = [ ":chrome_junit_tests_helper" ]
++  }
++
+   # Tark: Sign in with Zynclave.
+   robolectric_library(
+       "chrome_junit_tests_org.chromium.chrome.browser.tark.zynclave") {
+diff --color -ruN a/chrome/android/junit/src/org/chromium/chrome/browser/tark/media/TarkMediaPrefsTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/tark/media/TarkMediaPrefsTest.java
+--- a/chrome/android/junit/src/org/chromium/chrome/browser/tark/media/TarkMediaPrefsTest.java	1970-01-01 05:30:00.000000000 +0530
++++ b/chrome/android/junit/src/org/chromium/chrome/browser/tark/media/TarkMediaPrefsTest.java	2026-10-29 22:46:27.311079850 +0530
+@@ -0,0 +1,65 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++package org.chromium.chrome.browser.tark.media;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.assertTrue;
++
++import android.content.SharedPreferences;
++
++import org.junit.Before;
++import org.junit.Test;
++import org.junit.runner.RunWith;
++
++import org.chromium.base.ContextUtils;
++import org.chromium.base.test.BaseRobolectricTestRunner;
++
++/** Settings → Background play and → Picture in Picture: on by default, and kept. */
++@RunWith(BaseRobolectricTestRunner.class)
++public class TarkMediaPrefsTest {
++    private SharedPreferences mPrefs;
++
++    @Before
++    public void setUp() {
++        mPrefs = ContextUtils.getAppSharedPreferences();
++        mPrefs.edit().clear().commit();
++    }
++
++    @Test
++    public void testBothDefaultOn() {
++        assertTrue(TarkMediaPrefs.backgroundPlay());
++        assertTrue(TarkMediaPrefs.pictureInPicture());
++    }
++
++    @Test
++    public void testBackgroundPlayPersists() {
++        TarkMediaPrefs.setBackgroundPlay(false);
++        assertFalse(TarkMediaPrefs.backgroundPlay());
++        // The other setting is separate.
++        assertTrue(TarkMediaPrefs.pictureInPicture());
++        TarkMediaPrefs.setBackgroundPlay(true);
++        assertTrue(TarkMediaPrefs.backgroundPlay());
++    }
++
++    @Test
++    public void testPictureInPicturePersists() {
++        TarkMediaPrefs.setPictureInPicture(false);
++        assertFalse(TarkMediaPrefs.pictureInPicture());
++        assertTrue(TarkMediaPrefs.backgroundPlay());
++        TarkMediaPrefs.setPictureInPicture(true);
++        assertTrue(TarkMediaPrefs.pictureInPicture());
++    }
++
++    @Test
++    public void testStoredUnderTheKeysNativeReads() {
++        // TabWebContentsDelegateAndroid::GetBackgroundMediaSettings reads these keys
++        // from Chrome's shared preferences.
++        TarkMediaPrefs.setBackgroundPlay(false);
++        TarkMediaPrefs.setPictureInPicture(false);
++        assertEquals(false, mPrefs.getBoolean("tark.media.background_play", true));
++        assertEquals(false, mPrefs.getBoolean("tark.media.pip", true));
++    }
++}
+diff --color -ruN a/chrome/browser/android/tab_web_contents_delegate_android.cc b/chrome/browser/android/tab_web_contents_delegate_android.cc
+--- a/chrome/browser/android/tab_web_contents_delegate_android.cc	2026-10-29 22:46:27.273157778 +0530
++++ b/chrome/browser/android/tab_web_contents_delegate_android.cc	2026-10-29 22:46:27.307492633 +0530
+@@ -13,6 +13,7 @@
+ #include <utility>
+ #include <vector>
+ 
++#include "base/android/application_status_listener.h"
+ #include "base/android/jni_android.h"
+ #include "base/android/jni_string.h"
+ #include "base/android/scoped_java_ref.h"
+@@ -37,6 +38,7 @@
+ #include "chrome/browser/media/webrtc/media_capture_devices_dispatcher.h"
+ #include "chrome/browser/password_manager/chrome_password_manager_client.h"
+ #include "chrome/browser/picture_in_picture/picture_in_picture_window_manager.h"
++#include "chrome/browser/preferences/android/chrome_shared_preferences.h"
+ #include "chrome/browser/preloading/preloading_prefs.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/safe_browsing/chrome_password_reuse_detection_manager_client.h"
+@@ -701,6 +703,31 @@
+   return true;
+ }
+ 
++content::WebContentsDelegate::BackgroundMediaSettings
++TabWebContentsDelegateAndroid::GetBackgroundMediaSettings(
++    content::WebContents* source) {
++  // Tark: Settings → Background play and → Picture in Picture (both on by
++  // default). The keys and defaults are TarkMediaPrefs.java's. Tark itself
++  // went to the background when none of its activities is running or paused
++  // (Home, another app, the lock screen; Picture in Picture pauses the
++  // activity and doesn't hide the tab): ChromeActivity.onStop hides the tab
++  // after its activity is stopped (ApplicationStatus updates in
++  // Activity.onStop). A tab switch inside Tark leaves the state running.
++  const base::android::ApplicationState app_state =
++      base::android::ApplicationStatusListener::GetState();
++  base::android::SharedPreferencesManager prefs =
++      android::shared_preferences::GetChromeSharedPreferences();
++  return {
++      .app_hidden =
++          app_state ==
++              base::android::APPLICATION_STATE_HAS_STOPPED_ACTIVITIES ||
++          app_state ==
++              base::android::APPLICATION_STATE_HAS_DESTROYED_ACTIVITIES,
++      .background_play = prefs.ReadBoolean("tark.media.background_play", true),
++      .picture_in_picture = prefs.ReadBoolean("tark.media.pip", true),
++  };
++}
++
+ content::PreloadingEligibility
+ TabWebContentsDelegateAndroid::IsPrerender2Supported(
+     content::WebContents& web_contents,
+diff --color -ruN a/chrome/browser/android/tab_web_contents_delegate_android.h b/chrome/browser/android/tab_web_contents_delegate_android.h
+--- a/chrome/browser/android/tab_web_contents_delegate_android.h	2026-10-29 22:46:27.273577450 +0530
++++ b/chrome/browser/android/tab_web_contents_delegate_android.h	2026-10-29 22:46:27.307969765 +0530
+@@ -143,6 +143,8 @@
+       content::WebContents* web_contents) override;
+   void ExitPictureInPicture() override;
+   bool IsBackForwardCacheSupported(content::WebContents& web_contents) override;
++  BackgroundMediaSettings GetBackgroundMediaSettings(
++      content::WebContents* source) override;
+   content::PreloadingEligibility IsPrerender2Supported(
+       content::WebContents& web_contents,
+       content::PreloadingTriggerType trigger_type) override;
+diff --color -ruN a/chrome/browser/preferences/android/java/src/org/chromium/chrome/browser/preferences/ChromePreferenceKeys.java b/chrome/browser/preferences/android/java/src/org/chromium/chrome/browser/preferences/ChromePreferenceKeys.java
+--- a/chrome/browser/preferences/android/java/src/org/chromium/chrome/browser/preferences/ChromePreferenceKeys.java	2026-10-29 22:46:27.271130416 +0530
++++ b/chrome/browser/preferences/android/java/src/org/chromium/chrome/browser/preferences/ChromePreferenceKeys.java	2026-10-29 22:46:27.305522605 +0530
+@@ -1059,6 +1059,12 @@
+     public static final String TARK_ZYNCLAVE_DECLINED = "tark.zynclave.declined";
+     public static final String TARK_ZYNCLAVE_SALT = "tark.zynclave.salt";
+ 
++    // Tark: Settings → Background play and → Picture in Picture (TarkMediaPrefs; both on by
++    // default). The browser's C++ reads them too
++    // (TabWebContentsDelegateAndroid::GetBackgroundMediaSettings).
++    public static final String TARK_MEDIA_BACKGROUND_PLAY = "tark.media.background_play";
++    public static final String TARK_MEDIA_PICTURE_IN_PICTURE = "tark.media.pip";
++
+     // Whether the Tips Notifications Opt In promo has been accepted.
+     public static final String TIPS_NOTIFICATIONS_OPT_IN_PROMO_ACCEPTED =
+             "Chrome.TipsNotifications.OptInAccepted";
+diff --color -ruN a/chrome/browser/preferences/android/java/src/org/chromium/chrome/browser/preferences/LegacyChromePreferenceKeys.java b/chrome/browser/preferences/android/java/src/org/chromium/chrome/browser/preferences/LegacyChromePreferenceKeys.java
+--- a/chrome/browser/preferences/android/java/src/org/chromium/chrome/browser/preferences/LegacyChromePreferenceKeys.java	2026-10-29 22:46:27.271451962 +0530
++++ b/chrome/browser/preferences/android/java/src/org/chromium/chrome/browser/preferences/LegacyChromePreferenceKeys.java	2026-10-29 22:46:27.305886152 +0530
+@@ -114,6 +114,9 @@
+                 // Tark's keys keep Tark's "tark." naming (Sign in with Zynclave).
+                 ChromePreferenceKeys.TARK_ZYNCLAVE_DECLINED,
+                 ChromePreferenceKeys.TARK_ZYNCLAVE_SALT,
++                // And Background play and Picture in Picture.
++                ChromePreferenceKeys.TARK_MEDIA_BACKGROUND_PLAY,
++                ChromePreferenceKeys.TARK_MEDIA_PICTURE_IN_PICTURE,
+                 ChromePreferenceKeys.TOS_ACKED_ACCOUNTS,
+                 ChromePreferenceKeys.TWA_DISCLOSURE_ACCEPTED_PACKAGES,
+                 ChromePreferenceKeys.UI_THEME_SETTING,
+diff --color -ruN a/chrome/browser/ui/android/strings/android_chrome_strings.grd b/chrome/browser/ui/android/strings/android_chrome_strings.grd
+--- a/chrome/browser/ui/android/strings/android_chrome_strings.grd	2026-10-29 22:46:27.266893440 +0530
++++ b/chrome/browser/ui/android/strings/android_chrome_strings.grd	2026-10-29 22:46:27.302322227 +0530
+@@ -847,6 +847,19 @@
+       <message name="IDS_TARK_SETTINGS_SUMMARY_DETAIL" desc="Tark: the rest of the summary line at the top of Settings.">
+         No Google · no sync
+       </message>
++      <!-- Tark: Settings → Background play and → Picture in Picture. -->
++      <message name="IDS_TARK_BACKGROUND_PLAY" desc="Tark: title of the Settings switch that keeps a playing video or audio playing when the user leaves the browser (home screen, another app, lock screen).">
++        Background play
++      </message>
++      <message name="IDS_TARK_BACKGROUND_PLAY_SUMMARY" desc="Tark: description under the Background play switch in Settings.">
++        Videos keep playing when you leave Tark.
++      </message>
++      <message name="IDS_TARK_PICTURE_IN_PICTURE" desc="Tark: title of the Settings switch that floats a playing video in a small window when the user leaves the browser.">
++        Picture in Picture
++      </message>
++      <message name="IDS_TARK_PICTURE_IN_PICTURE_SUMMARY" desc="Tark: description under the Picture in Picture switch in Settings.">
++        A playing video floats in a small window when you leave Tark.
++      </message>
+       <!-- Tark: the ad blocker's switch in page info (A2). -->
+       <message name="IDS_TARK_PAGE_INFO_BLOCK_ADS" desc="Tark: switch in the page info sheet that turns ad blocking on or off for the current site.">
+         Block ads on this site
+diff --color -ruN a/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb b/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb
+--- a/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb	2026-10-29 22:46:27.268968344 +0530
++++ b/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb	2026-10-29 22:46:27.303528536 +0530
+@@ -2223,4 +2223,7 @@
+ <translation id="5161658736143099157">क्या Tark में अपने Zynclave खाते से साइन इन करें?</translation>
+ <translation id="664694320964506959">बुकमार्क और सेटिंग सिंक करने के लिए Tark में अपना Zynclave खाता इस्तेमाल करें।</translation>
+ <translation id="8998913419965535255">साइन इन का सुझाव बंद हुआ</translation>
++<translation id="1690924763769415936">बैकग्राउंड में चलाएं</translation>
++<translation id="3941434853185571817">Tark से बाहर जाने पर भी वीडियो चलते रहते हैं।</translation>
++<translation id="588100706970716640">Tark से बाहर जाने पर, चल रहा वीडियो एक छोटी विंडो में दिखता रहता है।</translation>
+ </translationbundle>
+\ No newline at end of file
+diff --color -ruN a/content/browser/BUILD.gn b/content/browser/BUILD.gn
+--- a/content/browser/BUILD.gn	2026-10-29 22:46:27.251836355 +0530
++++ b/content/browser/BUILD.gn	2026-10-29 22:46:27.291056528 +0530
+@@ -220,6 +220,7 @@
+     "//content/browser/resources",
+     "//content/browser/resources/media:resources",
+     "//content/browser/tracing/traces_internals:mojo_bindings",
++    "//content/browser/web_contents/tark_media:visibility_hold",
+     "//content/browser/webrtc/resources",
+     "//content/common",
+     "//content/common:buildflags",
+diff --color -ruN a/content/browser/web_contents/tark_media/BUILD.gn b/content/browser/web_contents/tark_media/BUILD.gn
+--- a/content/browser/web_contents/tark_media/BUILD.gn	1970-01-01 05:30:00.000000000 +0530
++++ b/content/browser/web_contents/tark_media/BUILD.gn	2026-10-29 22:46:27.294568660 +0530
+@@ -0,0 +1,38 @@
++# Copyright 2026 The Tark Authors
++# Use of this source code is governed by a BSD-style license that can be
++# found in the LICENSE file.
++#
++# Tark for Android: Background play. WebContentsImpl asks VisibilityHold
++# whether a tab being hidden keeps showing "visible" to its page while its
++# media plays with sound. It has no browser dependencies, so its unit tests
++# also build for the build machine (android/build.sh runs them).
++
++import("//testing/test.gni")
++
++source_set("visibility_hold") {
++  sources = [
++    "visibility_hold.cc",
++    "visibility_hold.h",
++  ]
++  deps = [ "//base" ]
++}
++
++if (!is_android) {
++  # For the build machine only, as tark_update_unittests.
++  test("tark_visibility_hold_unittests") {
++    sources = [ "visibility_hold_unittest.cc" ]
++    deps = [
++      ":visibility_hold",
++      "//base",
++      "//base/test:run_all_unittests",
++      "//testing/gtest",
++    ]
++  }
++}
++
++if (current_toolchain == default_toolchain) {
++  group("host_unittests") {
++    testonly = true
++    deps = [ ":tark_visibility_hold_unittests($host_toolchain)" ]
++  }
++}
+diff --color -ruN a/content/browser/web_contents/tark_media/visibility_hold.cc b/content/browser/web_contents/tark_media/visibility_hold.cc
+--- a/content/browser/web_contents/tark_media/visibility_hold.cc	1970-01-01 05:30:00.000000000 +0530
++++ b/content/browser/web_contents/tark_media/visibility_hold.cc	2026-10-29 22:46:27.294933207 +0530
+@@ -0,0 +1,54 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "content/browser/web_contents/tark_media/visibility_hold.h"
++
++namespace content::tark_media {
++
++// static
++bool VisibilityHold::Allowed(bool app_hidden,
++                             bool background_play,
++                             bool picture_in_picture,
++                             bool has_picture_in_picture_video) {
++  return app_hidden &&
++         (background_play ||
++          (picture_in_picture && has_picture_in_picture_video));
++}
++
++bool VisibilityHold::ShouldHoldVisibility(bool page_hidden,
++                                          bool audible,
++                                          bool playing,
++                                          base::FunctionRef<bool()> allowed) {
++  if (!page_hidden) {
++    held_ = false;
++    page_sees_visible_ = true;
++    return false;
++  }
++  if (held_) {
++    // A later update while hidden (occlusion, Picture in Picture starting or
++    // ending) keeps the hold while a player plays.
++    if (playing) {
++      return true;
++    }
++    held_ = false;
++  } else if (page_sees_visible_ && audible && allowed()) {
++    // Only at the moment of leaving: a page that was already told hidden
++    // isn't told visible again.
++    held_ = true;
++    return true;
++  }
++  page_sees_visible_ = false;
++  return false;
++}
++
++bool VisibilityHold::OnPlayingChanged(bool playing) {
++  if (!held_ || playing) {
++    return false;
++  }
++  held_ = false;
++  page_sees_visible_ = false;
++  return true;
++}
++
++}  // namespace content::tark_media
+diff --color -ruN a/content/browser/web_contents/tark_media/visibility_hold.h b/content/browser/web_contents/tark_media/visibility_hold.h
+--- a/content/browser/web_contents/tark_media/visibility_hold.h	1970-01-01 05:30:00.000000000 +0530
++++ b/content/browser/web_contents/tark_media/visibility_hold.h	2026-10-29 22:46:27.295737760 +0530
+@@ -0,0 +1,69 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CONTENT_BROWSER_WEB_CONTENTS_TARK_MEDIA_VISIBILITY_HOLD_H_
++#define CONTENT_BROWSER_WEB_CONTENTS_TARK_MEDIA_VISIBILITY_HOLD_H_
++
++#include "base/functional/function_ref.h"
++
++namespace content::tark_media {
++
++// Tark for Android: Background play and Picture in Picture. A tab that is
++// playing media with sound at the moment it is hidden keeps telling its page
++// "visible": no visibilitychange, and Blink's media player doesn't pause hidden
++// video (WebMediaPlayerImpl::IsPageHidden() stays false). Only the page's
++// frame trees are held; the tab's views are hidden as upstream, and
++// WebContentsImpl::GetPageVisibilityState() still reports hidden.
++//
++// The hold ends as soon as no media player in the tab is playing (all paused
++// or ended): the page then gets "hidden" and one visibilitychange, as it
++// would have on leaving. A silent stretch while a player still plays (a quiet
++// gap, an ad's silent start) keeps it. Showing the tab ends it too, with no
++// event (the page already sees "visible").
++//
++// One per WebContentsImpl; it only decides; WebContentsImpl sends.
++class VisibilityHold {
++ public:
++  VisibilityHold() = default;
++  VisibilityHold(const VisibilityHold&) = delete;
++  VisibilityHold& operator=(const VisibilityHold&) = delete;
++
++  // Whether a hold may start, from the embedder: only when the tab is hidden
++  // because Tark itself went to the background (`app_hidden`: Home, another
++  // app, the lock screen), never for a tab hidden inside Tark (a tab switch,
++  // the tab switcher, a new tab), which pauses as upstream. Then Background
++  // play on, or Picture in Picture on and a video of the tab is in Picture in
++  // Picture (Tark enters it before the tab is hidden). With only Picture in
++  // Picture on and no window, the page is hidden and pauses, as upstream.
++  static bool Allowed(bool app_hidden,
++                      bool background_play,
++                      bool picture_in_picture,
++                      bool has_picture_in_picture_video);
++
++  // On every visibility update. `page_hidden`: upstream would tell the page
++  // hidden (kHidden or kHiddenButPainting). `audible`: the tab plays sound
++  // now (needed to start a hold). `playing`: a media player of the tab plays
++  // (needed to keep one). `allowed`: asked only when a hold would start.
++  // Returns true when the page must be told "visible" instead.
++  bool ShouldHoldVisibility(bool page_hidden,
++                            bool audible,
++                            bool playing,
++                            base::FunctionRef<bool()> allowed);
++
++  // When the tab's playing state changes (a player started or stopped).
++  // Returns true when this releases the hold: the caller then sends the page
++  // its real visibility again.
++  bool OnPlayingChanged(bool playing);
++
++  bool held() const { return held_; }
++
++ private:
++  // The page sees "visible" (shown, or held).
++  bool page_sees_visible_ = false;
++  bool held_ = false;
++};
++
++}  // namespace content::tark_media
++
++#endif  // CONTENT_BROWSER_WEB_CONTENTS_TARK_MEDIA_VISIBILITY_HOLD_H_
+diff --color -ruN a/content/browser/web_contents/tark_media/visibility_hold_unittest.cc b/content/browser/web_contents/tark_media/visibility_hold_unittest.cc
+--- a/content/browser/web_contents/tark_media/visibility_hold_unittest.cc	1970-01-01 05:30:00.000000000 +0530
++++ b/content/browser/web_contents/tark_media/visibility_hold_unittest.cc	2026-10-29 22:46:27.295343630 +0530
+@@ -0,0 +1,297 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "content/browser/web_contents/tark_media/visibility_hold.h"
++
++#include <string>
++#include <vector>
++
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace content::tark_media {
++namespace {
++
++struct Settings {
++  bool background_play = true;
++  bool picture_in_picture = true;
++};
++
++// A page as WebContentsImpl drives it: what the page's script sees
++// (document.visibilityState), the visibilitychange events it got, and whether
++// Blink's media player would pause its video (it pauses hidden video).
++class FakeTab {
++ public:
++  explicit FakeTab(Settings settings = {}) : settings_(settings) {}
++
++  // WasShown / WasHidden: UpdateVisibilityAndNotifyPageAndView. Hide():
++  // Tark went to the background; HideInsideTark(): another tab was selected.
++  void Show() { Update(/*hidden=*/false); }
++  void Hide() {
++    app_hidden_ = true;
++    Update(/*hidden=*/true);
++  }
++  void HideInsideTark() {
++    app_hidden_ = false;
++    Update(/*hidden=*/true);
++  }
++
++  // Tark entered Picture in Picture (onUserLeaveHint, before WasHidden).
++  void EnterPictureInPicture() { has_pip_video_ = true; }
++
++  // The page's own play()/pause(), a silent stretch, the end of the stream.
++  void Play() {
++    audible_ = !muted_;
++    SetPlaying(true);
++  }
++  void Pause() {
++    audible_ = false;
++    SetPlaying(false);
++  }
++  void Ended() { Pause(); }
++  void Mute() {
++    muted_ = true;
++    audible_ = false;  // OnAudioStateChanged: nothing to do.
++  }
++  void SilentStretch() { audible_ = false; }
++
++  std::string visibility_state() const {
++    return page_visible_ ? "visible" : "hidden";
++  }
++  const std::vector<std::string>& events() const { return events_; }
++  bool video_paused() const { return !playing_; }
++  int asked() const { return asked_; }
++
++ private:
++  // MediaStartedPlaying / MediaStoppedPlaying.
++  void SetPlaying(bool playing) {
++    playing_ = playing;
++    if (hold_.OnPlayingChanged(playing)) {
++      Update(/*hidden=*/true);
++    }
++  }
++
++  void Update(bool hidden) {
++    bool held = hold_.ShouldHoldVisibility(hidden, audible_, playing_, [this] {
++      ++asked_;
++      return VisibilityHold::Allowed(app_hidden_, settings_.background_play,
++                                     settings_.picture_in_picture,
++                                     has_pip_video_);
++    });
++    bool visible = !hidden || held;
++    if (visible != page_visible_) {
++      page_visible_ = visible;
++      events_.push_back(visibility_state());
++    }
++    // WebMediaPlayerImpl::OnPageHidden → PauseVideoIfNeeded(kPageHidden),
++    // except a video in Picture in Picture.
++    if (!page_visible_ && !has_pip_video_) {
++      playing_ = false;
++      audible_ = false;
++    }
++  }
++
++  const Settings settings_;
++  VisibilityHold hold_;
++  bool page_visible_ = false;
++  bool audible_ = false;
++  bool playing_ = false;
++  bool muted_ = false;
++  bool has_pip_video_ = false;
++  bool app_hidden_ = false;
++  std::vector<std::string> events_;
++  int asked_ = 0;
++};
++
++TEST(TarkVisibilityHoldTest, PlayingWithSoundThenHideStaysVisible) {
++  FakeTab tab;
++  tab.Show();
++  tab.Play();
++  tab.Hide();
++  EXPECT_EQ("visible", tab.visibility_state());
++  EXPECT_FALSE(tab.video_paused());
++  EXPECT_EQ(std::vector<std::string>{"visible"}, tab.events());
++}
++
++TEST(TarkVisibilityHoldTest, NothingPlayingThenHideIsHidden) {
++  FakeTab tab;
++  tab.Show();
++  tab.Hide();
++  EXPECT_EQ("hidden", tab.visibility_state());
++  EXPECT_EQ((std::vector<std::string>{"visible", "hidden"}), tab.events());
++  // Nothing to hold: the settings aren't even asked.
++  EXPECT_EQ(0, tab.asked());
++}
++
++TEST(TarkVisibilityHoldTest, MutedThenHideIsHidden) {
++  FakeTab tab;
++  tab.Show();
++  tab.Play();
++  tab.Mute();
++  tab.Hide();
++  EXPECT_EQ("hidden", tab.visibility_state());
++  EXPECT_TRUE(tab.video_paused());
++}
++
++TEST(TarkVisibilityHoldTest, HoldReleasedWhenMediaPauses) {
++  FakeTab tab;
++  tab.Show();
++  tab.Play();
++  tab.Hide();
++  ASSERT_EQ("visible", tab.visibility_state());
++  // Released at once: no wait for the audible state.
++  tab.Pause();
++  EXPECT_EQ("hidden", tab.visibility_state());
++  // Exactly one visibilitychange, to hidden, after the first show.
++  EXPECT_EQ((std::vector<std::string>{"visible", "hidden"}), tab.events());
++}
++
++TEST(TarkVisibilityHoldTest, HoldReleasedWhenEnded) {
++  // The stream ends with no next item.
++  FakeTab tab;
++  tab.Show();
++  tab.Play();
++  tab.Hide();
++  tab.Ended();
++  EXPECT_EQ("hidden", tab.visibility_state());
++}
++
++TEST(TarkVisibilityHoldTest, SilentStretchWhilePlayingKeepsTheHold) {
++  // A quiet gap, an ad's silent start, or a mute while the player plays.
++  FakeTab tab;
++  tab.Show();
++  tab.Play();
++  tab.Hide();
++  tab.SilentStretch();
++  EXPECT_EQ("visible", tab.visibility_state());
++  tab.Mute();
++  tab.Hide();  // A later update (occlusion) while silent.
++  EXPECT_EQ("visible", tab.visibility_state());
++  EXPECT_FALSE(tab.video_paused());
++  EXPECT_EQ(std::vector<std::string>{"visible"}, tab.events());
++}
++
++TEST(TarkVisibilityHoldTest, SettingsOffIsUpstream) {
++  FakeTab tab({.background_play = false, .picture_in_picture = false});
++  tab.Show();
++  tab.Play();
++  tab.Hide();
++  EXPECT_EQ("hidden", tab.visibility_state());
++  EXPECT_TRUE(tab.video_paused());
++  EXPECT_EQ(1, tab.asked());
++}
++
++TEST(TarkVisibilityHoldTest, OnlyPictureInPictureWithoutWindowIsUpstream) {
++  // Background play off, Picture in Picture on, no window opened: the sound
++  // doesn't go on in the background.
++  FakeTab tab({.background_play = false, .picture_in_picture = true});
++  tab.Show();
++  tab.Play();
++  tab.Hide();
++  EXPECT_EQ("hidden", tab.visibility_state());
++  EXPECT_TRUE(tab.video_paused());
++}
++
++TEST(TarkVisibilityHoldTest, OnlyPictureInPictureWithWindowIsHeld) {
++  FakeTab tab({.background_play = false, .picture_in_picture = true});
++  tab.Show();
++  tab.Play();
++  tab.EnterPictureInPicture();
++  tab.Hide();
++  EXPECT_EQ("visible", tab.visibility_state());
++  EXPECT_FALSE(tab.video_paused());
++}
++
++TEST(TarkVisibilityHoldTest, BackgroundPlayOnlyIsHeld) {
++  FakeTab tab({.background_play = true, .picture_in_picture = false});
++  tab.Show();
++  tab.Play();
++  tab.Hide();
++  EXPECT_EQ("visible", tab.visibility_state());
++}
++
++TEST(TarkVisibilityHoldTest, TabSwitchInsideTarkIsUpstream) {
++  // Another tab selected while this one plays with sound: it pauses as
++  // upstream, whatever the settings.
++  FakeTab tab;
++  tab.Show();
++  tab.Play();
++  tab.HideInsideTark();
++  EXPECT_EQ("hidden", tab.visibility_state());
++  EXPECT_TRUE(tab.video_paused());
++  EXPECT_EQ((std::vector<std::string>{"visible", "hidden"}), tab.events());
++}
++
++TEST(TarkVisibilityHoldTest, Allowed) {
++  EXPECT_TRUE(VisibilityHold::Allowed(true, true, false, false));
++  EXPECT_TRUE(VisibilityHold::Allowed(true, true, true, false));
++  EXPECT_FALSE(VisibilityHold::Allowed(true, false, true, false));
++  EXPECT_TRUE(VisibilityHold::Allowed(true, false, true, true));
++  EXPECT_FALSE(VisibilityHold::Allowed(true, false, false, true));
++  // A tab hidden inside Tark: never.
++  EXPECT_FALSE(VisibilityHold::Allowed(false, true, true, true));
++}
++
++TEST(TarkVisibilityHoldTest, LaterHiddenUpdatesKeepTheHold) {
++  // Occlusion, or Picture in Picture starting (kHiddenButPainting), re-run
++  // the update while hidden.
++  FakeTab tab;
++  tab.Show();
++  tab.Play();
++  tab.Hide();
++  tab.Hide();
++  EXPECT_EQ("visible", tab.visibility_state());
++  EXPECT_FALSE(tab.video_paused());
++  EXPECT_EQ(1, tab.asked());
++}
++
++TEST(TarkVisibilityHoldTest, ShowAfterHoldSendsNoEvent) {
++  FakeTab tab;
++  tab.Show();
++  tab.Play();
++  tab.Hide();
++  tab.Show();
++  EXPECT_EQ("visible", tab.visibility_state());
++  EXPECT_EQ(std::vector<std::string>{"visible"}, tab.events());
++  // Paused once shown: nothing to release.
++  tab.Pause();
++  EXPECT_EQ("visible", tab.visibility_state());
++}
++
++TEST(TarkVisibilityHoldTest, NoHoldAgainAfterRelease) {
++  // Released, hidden: playing again in the background doesn't make the page
++  // visible again.
++  FakeTab tab;
++  tab.Show();
++  tab.Play();
++  tab.Hide();
++  tab.Pause();
++  tab.Play();
++  tab.Hide();
++  EXPECT_EQ("hidden", tab.visibility_state());
++}
++
++TEST(TarkVisibilityHoldTest, NeverShownTabIsNotHeld) {
++  // A tab opened in the background that plays sound isn't made visible.
++  FakeTab tab;
++  tab.Play();
++  tab.Hide();
++  EXPECT_EQ("hidden", tab.visibility_state());
++  EXPECT_EQ(0, tab.asked());
++}
++
++TEST(TarkVisibilityHoldTest, HoldAgainAfterShowingAgain) {
++  FakeTab tab;
++  tab.Show();
++  tab.Play();
++  tab.Hide();
++  tab.Pause();
++  tab.Show();
++  tab.Play();
++  tab.Hide();
++  EXPECT_EQ("visible", tab.visibility_state());
++  EXPECT_FALSE(tab.video_paused());
++}
++
++}  // namespace
++}  // namespace content::tark_media
+diff --color -ruN a/content/browser/web_contents/web_contents_impl.cc b/content/browser/web_contents/web_contents_impl.cc
+--- a/content/browser/web_contents/web_contents_impl.cc	2026-10-29 22:46:27.257732479 +0530
++++ b/content/browser/web_contents/web_contents_impl.cc	2026-10-29 22:46:27.293100557 +0530
+@@ -136,6 +136,7 @@
+ #include "content/browser/web_contents/file_chooser_impl.h"
+ #include "content/browser/web_contents/java_script_dialog_commit_deferring_condition.h"
+ #include "content/browser/web_contents/slow_web_preference_cache.h"
++#include "content/browser/web_contents/tark_media/visibility_hold.h"
+ #include "content/browser/web_contents/web_contents_view.h"
+ #include "content/browser/web_contents/web_contents_view_child_frame.h"
+ #include "content/browser/webui/web_ui_controller_factory_registry.h"
+@@ -5302,6 +5303,30 @@
+   PageVisibilityState page_visibility =
+       CalculatePageVisibilityState(new_visibility);
+ 
++  // Tark: Background play and Picture in Picture. A tab playing media with
++  // sound when it's hidden keeps telling its page "visible" while a player
++  // plays: no visibilitychange, and Blink doesn't pause the hidden video
++  // (tark_media::VisibilityHold), if the tab is hidden because Tark went to
++  // the background, not by a tab switch. Only the frame trees are held: the views
++  // below are hidden as upstream, and GetPageVisibilityState() (and a
++  // RenderViewHost created while held) still says hidden.
++  const PageVisibilityState frame_tree_visibility =
++      tark_visibility_hold_.ShouldHoldVisibility(
++          page_visibility != PageVisibilityState::kVisible,
++          is_currently_audible_, !tark_playing_players_.empty(),
++          [this] {
++            if (!delegate_) {
++              return false;
++            }
++            WebContentsDelegate::BackgroundMediaSettings settings =
++                delegate_->GetBackgroundMediaSettings(this);
++            return tark_media::VisibilityHold::Allowed(
++                settings.app_hidden, settings.background_play, settings.picture_in_picture,
++                has_picture_in_picture_video_);
++          })
++          ? PageVisibilityState::kVisible
++          : page_visibility;
++
+   TRACE_EVENT1("content",
+                "WebContentsImpl::UpdateVisibilityAndNotifyPageAndView",
+                "page_visibility", page_visibility);
+@@ -5351,7 +5376,7 @@
+ 
+             render_view_host->SetFrameTreeVisibility(page_visibility);
+           },
+-          page_visibility);
++          frame_tree_visibility);
+ 
+   if (page_visibility != PageVisibilityState::kHidden) {
+     // This shows the Page before showing the individual RenderWidgets, as
+@@ -12464,6 +12489,7 @@
+     const WebContentsObserver::MediaPlayerInfo& media_info,
+     const MediaPlayerId& id) {
+   OPTIONAL_TRACE_EVENT0("content", "WebContentsImpl::MediaStartedPlaying");
++  tark_playing_players_.insert(id);
+   observers_.NotifyObservers(&WebContentsObserver::MediaStartedPlaying,
+                              media_info, id);
+ }
+@@ -12473,6 +12499,14 @@
+     const MediaPlayerId& id,
+     WebContentsObserver::MediaStoppedReason reason) {
+   OPTIONAL_TRACE_EVENT0("content", "WebContentsImpl::MediaStoppedPlaying");
++  // Tark: Background play. A page held "visible" is told "hidden" as soon as
++  // none of its players plays (paused or ended), before the observers run
++  // (one of them may delete this WebContents).
++  tark_playing_players_.erase(id);
++  if (tark_visibility_hold_.OnPlayingChanged(!tark_playing_players_.empty()) &&
++      !IsBeingDestroyed()) {
++    UpdateVisibilityAndNotifyPageAndView(visibility_, /*is_activity=*/false);
++  }
+   observers_.NotifyObservers(&WebContentsObserver::MediaStoppedPlaying,
+                              media_info, id, reason);
+ }
+diff --color -ruN a/content/browser/web_contents/web_contents_impl.h b/content/browser/web_contents/web_contents_impl.h
+--- a/content/browser/web_contents/web_contents_impl.h	2026-10-29 22:46:27.258789702 +0530
++++ b/content/browser/web_contents/web_contents_impl.h	2026-10-29 22:46:27.294164696 +0530
+@@ -19,6 +19,7 @@
+ #include "base/auto_reset.h"
+ #include "base/callback_list.h"
+ #include "base/containers/flat_map.h"
++#include "base/containers/flat_set.h"
+ #include "base/functional/callback_helpers.h"
+ #include "base/functional/function_ref.h"
+ #include "base/gtest_prod_util.h"
+@@ -53,9 +54,11 @@
+ #include "content/browser/renderer_host/visible_time_request_trigger.h"
+ #include "content/browser/web_contents/file_chooser_impl.h"
+ #include "content/browser/web_contents/slow_web_preference_cache.h"
++#include "content/browser/web_contents/tark_media/visibility_hold.h"
+ #include "content/common/content_export.h"
+ #include "content/public/browser/fullscreen_types.h"
+ #include "content/public/browser/global_routing_id.h"
++#include "content/public/browser/media_player_id.h"
+ #include "content/public/browser/media_stream_request.h"
+ #include "content/public/browser/preloading.h"
+ #include "content/public/browser/tracing_support.h"
+@@ -2716,6 +2719,13 @@
+   bool has_picture_in_picture_video_ = false;
+   bool has_picture_in_picture_document_ = false;
+ 
++  // Tark: Background play. The media players playing now (MediaStartedPlaying
++  // / MediaStoppedPlaying), and whether the page is told "visible" while
++  // hidden. Declared before media_web_contents_observer_, which reports its
++  // players stopped when it's destroyed.
++  base::flat_set<MediaPlayerId> tark_playing_players_;
++  tark_media::VisibilityHold tark_visibility_hold_;
++
+   // Manages media players, CDMs, and power save blockers for media.
+   std::unique_ptr<MediaWebContentsObserver> media_web_contents_observer_;
+ 
+diff --color -ruN a/content/public/browser/web_contents_delegate.cc b/content/public/browser/web_contents_delegate.cc
+--- a/content/public/browser/web_contents_delegate.cc	2026-10-29 22:46:27.261715659 +0530
++++ b/content/public/browser/web_contents_delegate.cc	2026-10-29 22:46:27.297684704 +0530
+@@ -433,6 +433,11 @@
+   return false;
+ }
+ 
++WebContentsDelegate::BackgroundMediaSettings
++WebContentsDelegate::GetBackgroundMediaSettings(WebContents* source) {
++  return {};
++}
++
+ PreloadingEligibility WebContentsDelegate::IsPrerender2Supported(
+     WebContents& web_contents,
+     PreloadingTriggerType trigger_type) {
+diff --color -ruN a/content/public/browser/web_contents_delegate.h b/content/public/browser/web_contents_delegate.h
+--- a/content/public/browser/web_contents_delegate.h	2026-10-29 22:46:27.262729007 +0530
++++ b/content/public/browser/web_contents_delegate.h	2026-10-29 22:46:27.298366463 +0530
+@@ -826,6 +826,21 @@
+   // indication that the cache will be used.
+   virtual bool IsBackForwardCacheSupported(WebContents& web_contents);
+ 
++  // Tark: Background play and Picture in Picture, the embedder's settings.
++  // A tab playing media with sound when it's hidden keeps telling its page
++  // "visible" while a player plays, if Background play is on, or Picture in
++  // Picture is on and one of its videos is in Picture in Picture, when it's
++  // hidden because the embedder's UI went to the background (`app_hidden`),
++  // not inside it (a tab switch). Asked only when such a tab is hidden; all
++  // off by default.
++  struct BackgroundMediaSettings {
++    bool app_hidden = false;
++    bool background_play = false;
++    bool picture_in_picture = false;
++  };
++  virtual BackgroundMediaSettings GetBackgroundMediaSettings(
++      WebContents* source);
++
+   // Returns PreloadingEligibility::kEligible if Prerender2 (see
+   // content/browser/preloading/prerender/README.md for details) is supported.
+   // If it is not supported, returns the reason.
