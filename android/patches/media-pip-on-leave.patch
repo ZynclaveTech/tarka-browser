@@ -25,7 +25,7 @@ diff --color -ruN a/chrome/android/chrome_java_sources.gni b/chrome/android/chro
    "java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAccountPreference.java",
 diff --color -ruN a/chrome/android/java/src/org/chromium/chrome/browser/app/ChromeActivity.java b/chrome/android/java/src/org/chromium/chrome/browser/app/ChromeActivity.java
 --- a/chrome/android/java/src/org/chromium/chrome/browser/app/ChromeActivity.java	2026-10-29 17:26:39.841591287 +0530
-+++ b/chrome/android/java/src/org/chromium/chrome/browser/app/ChromeActivity.java	2026-10-29 17:32:06.185882101 +0530
++++ b/chrome/android/java/src/org/chromium/chrome/browser/app/ChromeActivity.java	2026-10-29 17:35:59.096559864 +0530
 @@ -217,6 +217,8 @@
  import org.chromium.chrome.browser.tabmodel.TabModelSelectorSupplier;
  import org.chromium.chrome.browser.tabmodel.TabModelSelectorTabObserver;
@@ -35,7 +35,15 @@ diff --color -ruN a/chrome/android/java/src/org/chromium/chrome/browser/app/Chro
  import org.chromium.chrome.browser.task_manager.TaskManager;
  import org.chromium.chrome.browser.task_manager.TaskManagerFactory;
  import org.chromium.chrome.browser.tasks.tab_management.TabGroupUiUtils;
-@@ -1567,6 +1569,18 @@
+@@ -226,6 +228,7 @@
+ import org.chromium.chrome.browser.tark_captions.TarkCaptionBarCoordinator;
+ import org.chromium.chrome.browser.ui.BottomContainer;
+ import org.chromium.chrome.browser.ui.ChromeActivitySnackbarHelper;
++import org.chromium.chrome.browser.ui.ExclusiveAccessBubble;
+ import org.chromium.chrome.browser.ui.RootUiCoordinator;
+ import org.chromium.chrome.browser.ui.appmenu.AppMenuBlocker;
+ import org.chromium.chrome.browser.ui.appmenu.AppMenuDelegate;
+@@ -1567,6 +1570,18 @@
              return;
          }
  
@@ -54,18 +62,28 @@ diff --color -ruN a/chrome/android/java/src/org/chromium/chrome/browser/app/Chro
          FullscreenVideoPictureInPictureController controller =
                  ensureFullscreenVideoPictureInPictureController();
          if (controller != null) {
-@@ -1607,6 +1621,11 @@
+@@ -1607,12 +1622,21 @@
              maybeCreateActorPipController();
              if (mActorPipController != null && mActorPipController.shouldEnterPip()) return;
  
-+            // Tark: no snackbar in the Picture in Picture window, such as the fullscreen notice
-+            // "To exit full screen, press |Esc|" (ExclusiveAccessBubble doesn't show one there).
++            // Tark: no snackbar in the Picture in Picture window. The fullscreen notice ("To exit
++            // full screen, press |Esc|") is owed and shows again on leaving it while still
++            // fullscreen; the others (undo, downloads, ...) aren't security UI and expire.
++            ExclusiveAccessBubble.onPictureInPictureModeChanged(this, true);
 +            SnackbarManager snackbarManager = mSnackbarManagerSupplier.get();
 +            if (snackbarManager != null) snackbarManager.dismissAllSnackbars();
 +
              FullscreenVideoPictureInPictureController controller =
                      ensureFullscreenVideoPictureInPictureController();
              if (controller != null) {
+                 controller.onEnteredPictureInPictureMode();
+             }
+         } else {
++            // Tark: the fullscreen notice owed since entering Picture in Picture.
++            ExclusiveAccessBubble.onPictureInPictureModeChanged(this, false);
+             if (mActorPipController != null) {
+                 mActorPipController.onFrameworkExitedPictureInPicture();
+             }
 diff --color -ruN a/chrome/android/java/src/org/chromium/chrome/browser/media/FullscreenVideoPictureInPictureController.java b/chrome/android/java/src/org/chromium/chrome/browser/media/FullscreenVideoPictureInPictureController.java
 --- a/chrome/android/java/src/org/chromium/chrome/browser/media/FullscreenVideoPictureInPictureController.java	2026-10-29 17:26:39.842265673 +0530
 +++ b/chrome/android/java/src/org/chromium/chrome/browser/media/FullscreenVideoPictureInPictureController.java	2026-10-29 17:30:53.218013147 +0530
@@ -208,19 +226,106 @@ diff --color -ruN a/chrome/android/java/src/org/chromium/chrome/browser/tark/med
 +}
 diff --color -ruN a/chrome/android/java/src/org/chromium/chrome/browser/ui/ExclusiveAccessBubble.java b/chrome/android/java/src/org/chromium/chrome/browser/ui/ExclusiveAccessBubble.java
 --- a/chrome/android/java/src/org/chromium/chrome/browser/ui/ExclusiveAccessBubble.java	2026-10-29 17:26:39.841170196 +0530
-+++ b/chrome/android/java/src/org/chromium/chrome/browser/ui/ExclusiveAccessBubble.java	2026-10-29 17:31:55.868299861 +0530
-@@ -45,6 +45,8 @@
++++ b/chrome/android/java/src/org/chromium/chrome/browser/ui/ExclusiveAccessBubble.java	2026-10-29 17:35:40.332459447 +0530
+@@ -4,6 +4,8 @@
+ 
+ package org.chromium.chrome.browser.ui;
+ 
++import android.app.Activity;
++
+ import org.jni_zero.CalledByNative;
+ import org.jni_zero.JniType;
+ 
+@@ -13,6 +15,11 @@
+ import org.chromium.chrome.browser.ui.messages.snackbar.SnackbarManager;
+ import org.chromium.ui.base.DeviceInput;
+ 
++import java.util.ArrayList;
++import java.util.Collections;
++import java.util.Set;
++import java.util.WeakHashMap;
++
+ /**
+  * This class is the Java counterpart of ExclusiveAccessBubbleAndroid. It owns the notification
+  * snackbar for the exclusive access APIs (fullscreen, keyboard lock & pointer lock)
+@@ -33,18 +40,60 @@
+ 
+     private @Nullable String mText;
+ 
++    // Tark: the notice is anti-spoofing UI. In Picture in Picture it isn't shown (nothing in the
++    // window takes keys or swipes), but it's owed: it shows again when the activity leaves
++    // Picture in Picture while the page is still fullscreen (native hasn't hidden the notice).
++    private boolean mOwedAfterPictureInPicture;
++
++    // Tark: live notices, to tell them their activity's Picture in Picture changes.
++    private static final Set<ExclusiveAccessBubble> sBubbles =
++            Collections.newSetFromMap(new WeakHashMap<>());
++
+     private ExclusiveAccessBubble(ExclusiveAccessContext parentContext) {
+         mParentContext = parentContext;
+     }
+ 
+     @CalledByNative
+     public static ExclusiveAccessBubble create(ExclusiveAccessContext context) {
+-        return new ExclusiveAccessBubble(context);
++        ExclusiveAccessBubble bubble = new ExclusiveAccessBubble(context);
++        sBubbles.add(bubble);
++        return bubble;
++    }
++
++    /** Tark: `activity` entered or left Picture in Picture mode (ChromeActivity). */
++    public static void onPictureInPictureModeChanged(Activity activity, boolean inPicture) {
++        for (ExclusiveAccessBubble bubble : new ArrayList<>(sBubbles)) {
++            if (bubble.mParentContext.getActivity() == activity) {
++                bubble.onPictureInPictureModeChanged(inPicture);
++            }
++        }
++    }
++
++    /**
++     * Tark: entering Picture in Picture takes a shown notice down and owes it; leaving shows an
++     * owed notice again, if native still wants it (the page is still fullscreen).
++     */
++    public void onPictureInPictureModeChanged(boolean inPicture) {
++        if (inPicture) {
++            if (mSnackbar != null) {
++                dismissSnackbar();
++                mOwedAfterPictureInPicture = true;
++            }
++            return;
++        }
++        if (!mOwedAfterPictureInPicture) return;
++        mOwedAfterPictureInPicture = false;
++        show();
+     }
+ 
      @CalledByNative
      public void show() {
          if (mText == null || mSnackbar != null) return;
-+        // Tark: not in Picture in Picture (ChromeActivity dismisses one shown before).
-+        if (mParentContext.isInPictureInPictureMode()) return;
++        // Tark: owed until the activity leaves Picture in Picture.
++        if (mParentContext.isInPictureInPictureMode()) {
++            mOwedAfterPictureInPicture = true;
++            return;
++        }
          SnackbarManager snackbarManager = mParentContext.getSnackbarManager();
          if (snackbarManager == null) return;
  
+@@ -84,6 +133,12 @@
+ 
+     @CalledByNative
+     public void hide() {
++        // Native is done with the notice (fullscreen ended): nothing is owed.
++        mOwedAfterPictureInPicture = false;
++        dismissSnackbar();
++    }
++
++    private void dismissSnackbar() {
+         SnackbarManager snackbarManager = mParentContext.getSnackbarManager();
+         if (snackbarManager != null && mSnackbar != null) {
+             snackbarManager.dismissSnackbars(mSnackbarController);
 diff --color -ruN a/chrome/android/java/src/org/chromium/chrome/browser/ui/ExclusiveAccessContext.java b/chrome/android/java/src/org/chromium/chrome/browser/ui/ExclusiveAccessContext.java
 --- a/chrome/android/java/src/org/chromium/chrome/browser/ui/ExclusiveAccessContext.java	2026-10-29 17:26:39.840944526 +0530
-+++ b/chrome/android/java/src/org/chromium/chrome/browser/ui/ExclusiveAccessContext.java	2026-10-29 17:31:55.868034024 +0530
++++ b/chrome/android/java/src/org/chromium/chrome/browser/ui/ExclusiveAccessContext.java	2026-10-29 17:35:40.332718077 +0530
 @@ -4,6 +4,8 @@
  
  package org.chromium.chrome.browser.ui;
@@ -230,7 +335,7 @@ diff --color -ruN a/chrome/android/java/src/org/chromium/chrome/browser/ui/Exclu
  import org.jni_zero.CalledByNative;
  import org.jni_zero.NativeMethods;
  
-@@ -107,6 +109,15 @@
+@@ -107,6 +109,20 @@
          return SnackbarManagerProvider.from(mWindowAndroid);
      }
  
@@ -239,8 +344,13 @@ diff --color -ruN a/chrome/android/java/src/org/chromium/chrome/browser/ui/Exclu
 +     * exit full screen, press Esc") has nothing to say: nothing in the window takes keys or swipes.
 +     */
 +    public boolean isInPictureInPictureMode() {
-+        Activity activity = mWindowAndroid.getActivity().get();
++        Activity activity = getActivity();
 +        return activity != null && activity.isInPictureInPictureMode();
++    }
++
++    /** Tark: this context's activity, if it's still alive. */
++    public @Nullable Activity getActivity() {
++        return mWindowAndroid.getActivity().get();
 +    }
 +
      @Override
@@ -248,7 +358,7 @@ diff --color -ruN a/chrome/android/java/src/org/chromium/chrome/browser/ui/Exclu
      public void destroy() {
 diff --color -ruN a/chrome/android/junit/BUILD.gn b/chrome/android/junit/BUILD.gn
 --- a/chrome/android/junit/BUILD.gn	2026-10-29 17:26:39.839475210 +0530
-+++ b/chrome/android/junit/BUILD.gn	2026-10-29 17:26:56.747736317 +0530
++++ b/chrome/android/junit/BUILD.gn	2026-10-29 17:35:59.120586804 +0530
 @@ -1428,8 +1428,10 @@
        "chrome_junit_tests_org.chromium.chrome.browser.tark.media") {
      resources_package = "org.chromium.chrome"
@@ -262,6 +372,14 @@ diff --color -ruN a/chrome/android/junit/BUILD.gn b/chrome/android/junit/BUILD.g
  
      deps = [ ":chrome_junit_tests_helper" ]
    }
+@@ -1658,6 +1660,7 @@
+       "src/org/chromium/chrome/browser/ui/ExclusiveAccessContextTest.java",
+       "src/org/chromium/chrome/browser/ui/ExpandedSheetHelperImplUnitTest.java",
+       "src/org/chromium/chrome/browser/ui/IncognitoRestoreAppLaunchDrawBlockerUnitTest.java",
++      "src/org/chromium/chrome/browser/ui/TarkExclusiveAccessPipTest.java",
+       "src/org/chromium/chrome/browser/ui/TextAppearanceOverlayFontFeaturesTest.java",
+       "src/org/chromium/chrome/browser/ui/activity_recreation/ActivityRecreationControllerUnitTest.java",
+       "src/org/chromium/chrome/browser/ui/color/ColorProviderBridgeImplTest.java",
 diff --color -ruN a/chrome/android/junit/src/org/chromium/chrome/browser/tark/media/TarkLeaveDecisionTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/tark/media/TarkLeaveDecisionTest.java
 --- a/chrome/android/junit/src/org/chromium/chrome/browser/tark/media/TarkLeaveDecisionTest.java	1970-01-01 05:30:00.000000000 +0530
 +++ b/chrome/android/junit/src/org/chromium/chrome/browser/tark/media/TarkLeaveDecisionTest.java	2026-10-29 17:30:29.873474925 +0530
@@ -345,6 +463,99 @@ diff --color -ruN a/chrome/android/junit/src/org/chromium/chrome/browser/tark/me
 +                        TarkMediaPrefs.pictureInPicture());
 +        assertEquals(LeaveAction.PIP, action);
 +        assertEquals(before, new HashMap<>(mPrefs.getAll()));
++    }
++}
+diff --color -ruN a/chrome/android/junit/src/org/chromium/chrome/browser/ui/TarkExclusiveAccessPipTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/ui/TarkExclusiveAccessPipTest.java
+--- a/chrome/android/junit/src/org/chromium/chrome/browser/ui/TarkExclusiveAccessPipTest.java	1970-01-01 05:30:00.000000000 +0530
++++ b/chrome/android/junit/src/org/chromium/chrome/browser/ui/TarkExclusiveAccessPipTest.java	2026-10-29 17:36:16.893056884 +0530
+@@ -0,0 +1,89 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++package org.chromium.chrome.browser.ui;
++
++import org.junit.Assert;
++import org.junit.Before;
++import org.junit.Rule;
++import org.junit.Test;
++import org.junit.runner.RunWith;
++import org.mockito.Mock;
++import org.mockito.Mockito;
++import org.mockito.junit.MockitoJUnit;
++import org.mockito.junit.MockitoRule;
++
++import org.chromium.base.test.BaseRobolectricTestRunner;
++import org.chromium.chrome.browser.ui.messages.snackbar.Snackbar;
++import org.chromium.chrome.browser.ui.messages.snackbar.SnackbarManager;
++
++/**
++ * Tark: the fullscreen notice ("To exit full screen, press |Esc|") isn't shown in Picture in
++ * Picture, and shows again on leaving it while the page is still fullscreen.
++ */
++@RunWith(BaseRobolectricTestRunner.class)
++public class TarkExclusiveAccessPipTest {
++    @Rule public MockitoRule mMockitoRule = MockitoJUnit.rule();
++
++    @Mock private ExclusiveAccessContext mContext;
++    @Mock private SnackbarManager mSnackbarManager;
++
++    @Before
++    public void setUp() {
++        Mockito.when(mContext.getSnackbarManager()).thenReturn(mSnackbarManager);
++    }
++
++    private void setInPictureInPicture(boolean inPicture) {
++        Mockito.when(mContext.isInPictureInPictureMode()).thenReturn(inPicture);
++    }
++
++    @Test
++    public void testEnterPipWhileFullscreenThenLeaveShowsNoticeAgain() {
++        ExclusiveAccessBubble bubble = ExclusiveAccessBubble.create(mContext);
++        bubble.update("To exit full screen, press |Esc|");
++        Assert.assertTrue(bubble.isVisible());
++        Mockito.verify(mSnackbarManager, Mockito.times(1)).showSnackbar(Mockito.any(Snackbar.class));
++
++        // Enter Picture in Picture, still fullscreen: no notice in the window.
++        setInPictureInPicture(true);
++        bubble.onPictureInPictureModeChanged(true);
++        Assert.assertFalse(bubble.isVisible());
++        Mockito.verify(mSnackbarManager, Mockito.times(1)).dismissSnackbars(Mockito.any());
++        // Native asking again (a forced update) shows nothing in Picture in Picture.
++        bubble.show();
++        Assert.assertFalse(bubble.isVisible());
++        Mockito.verify(mSnackbarManager, Mockito.times(1)).showSnackbar(Mockito.any(Snackbar.class));
++
++        // Leave Picture in Picture, still fullscreen: the notice shows again.
++        setInPictureInPicture(false);
++        bubble.onPictureInPictureModeChanged(false);
++        Assert.assertTrue(bubble.isVisible());
++        Mockito.verify(mSnackbarManager, Mockito.times(2)).showSnackbar(Mockito.any(Snackbar.class));
++    }
++
++    @Test
++    public void testNoticeFirstAskedInPipShowsOnLeaving() {
++        setInPictureInPicture(true);
++        ExclusiveAccessBubble bubble = ExclusiveAccessBubble.create(mContext);
++        bubble.update("To exit full screen, press |Esc|");
++        Assert.assertFalse(bubble.isVisible());
++        setInPictureInPicture(false);
++        bubble.onPictureInPictureModeChanged(false);
++        Assert.assertTrue(bubble.isVisible());
++    }
++
++    @Test
++    public void testFullscreenEndedInPipShowsNothingOnLeaving() {
++        ExclusiveAccessBubble bubble = ExclusiveAccessBubble.create(mContext);
++        bubble.update("To exit full screen, press |Esc|");
++        setInPictureInPicture(true);
++        bubble.onPictureInPictureModeChanged(true);
++        // Fullscreen ends (video Picture in Picture exits it): native hides the notice.
++        bubble.hide();
++        setInPictureInPicture(false);
++        bubble.onPictureInPictureModeChanged(false);
++        Assert.assertFalse(bubble.isVisible());
++        Mockito.verify(mSnackbarManager, Mockito.times(1)).showSnackbar(Mockito.any(Snackbar.class));
 +    }
 +}
 diff --color -ruN a/chrome/browser/android/BUILD.gn b/chrome/browser/android/BUILD.gn
