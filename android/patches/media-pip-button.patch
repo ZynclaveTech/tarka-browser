@@ -1,0 +1,726 @@
+diff --color -ruN a/chrome/android/chrome_java_resources.gni b/chrome/android/chrome_java_resources.gni
+--- a/chrome/android/chrome_java_resources.gni	2026-10-29 21:41:04.506283754 +0530
++++ b/chrome/android/chrome_java_resources.gni	2026-10-29 21:43:55.133206570 +0530
+@@ -406,6 +406,7 @@
+   "java/res/drawable/tark_caption_mark.xml",
+   "java/res/drawable/tark_caption_surface.xml",
+   "java/res/drawable/tark_ntp_mark.xml",
++  "java/res/drawable/tark_pip_24dp.xml",
+   "java/res/drawable/task_spark_24dp.xml",
+   "java/res/drawable/text_cursor_lowend.xml",
+   "java/res/drawable/tips_opt_in_logo.xml",
+diff --color -ruN a/chrome/android/chrome_java_sources.gni b/chrome/android/chrome_java_sources.gni
+--- a/chrome/android/chrome_java_sources.gni	2026-10-29 21:41:04.498560891 +0530
++++ b/chrome/android/chrome_java_sources.gni	2026-10-29 21:43:55.133917985 +0530
+@@ -978,6 +978,8 @@
+   "java/src/org/chromium/chrome/browser/tark/media/TarkMediaPrefs.java",
+   "java/src/org/chromium/chrome/browser/tark/media/TarkMediaSwitchPreference.java",
+   "java/src/org/chromium/chrome/browser/tark/media/TarkPictureInPicture.java",
++  "java/src/org/chromium/chrome/browser/tark/media/TarkPipButtonController.java",
++  "java/src/org/chromium/chrome/browser/tark/media/TarkPipEntryPoints.java",
+   "java/src/org/chromium/chrome/browser/tark/zynclave/AuthStateStore.java",
+   "java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAccount.java",
+   "java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAccountPreference.java",
+diff --color -ruN a/chrome/android/java/res/drawable/tark_pip_24dp.xml b/chrome/android/java/res/drawable/tark_pip_24dp.xml
+--- a/chrome/android/java/res/drawable/tark_pip_24dp.xml	1970-01-01 05:30:00.000000000 +0530
++++ b/chrome/android/java/res/drawable/tark_pip_24dp.xml	2026-10-29 21:44:00.729546581 +0530
+@@ -0,0 +1,18 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!--
++Copyright 2026 The Tark Authors
++Use of this source code is governed by a BSD-style license that can be
++found in the LICENSE file.
++-->
++<!-- Tark: Android's Picture in Picture glyph (Material "picture_in_picture_alt"),
++     for the app menu's item and the address bar's button. -->
++<vector xmlns:android="http://schemas.android.com/apk/res/android"
++    android:width="24dp"
++    android:height="24dp"
++    android:viewportWidth="24"
++    android:viewportHeight="24"
++    android:tint="@macro/default_icon_color">
++  <path
++      android:fillColor="@android:color/white"
++      android:pathData="M19,11h-8v6h8v-6zM23,19L23,4.98C23,3.88 22.1,3 21,3L3,3c-1.1,0 -2,0.88 -2,1.98L1,19c0,1.1 0.9,2 2,2h18c1.1,0 2,-0.9 2,-2zM21,19.02L3,19.02L3,4.97h18v14.05z" />
++</vector>
+diff --color -ruN a/chrome/android/java/res/values/ids.xml b/chrome/android/java/res/values/ids.xml
+--- a/chrome/android/java/res/values/ids.xml	2026-10-29 21:41:04.499694776 +0530
++++ b/chrome/android/java/res/values/ids.xml	2026-10-29 21:43:09.375922029 +0530
+@@ -171,6 +171,8 @@
+     <item type="id" name="about_chrome_menu_id" />
+     <!-- Tark: the app menu's tiles. -->
+     <item type="id" name="tark_tiles_menu_id" />
++    <!-- Tark: the app menu's Picture in Picture item. -->
++    <item type="id" name="tark_pip_menu_id" />
+     <item type="id" name="add_tab_to_reading_list_menu_id" />
+     <item type="id" name="add_to_existing_group_menu_item_id" />
+     <item type="id" name="add_to_group_incognito_sub_menu_id" />
+diff --color -ruN a/chrome/android/java/src/org/chromium/chrome/browser/app/ChromeActivity.java b/chrome/android/java/src/org/chromium/chrome/browser/app/ChromeActivity.java
+--- a/chrome/android/java/src/org/chromium/chrome/browser/app/ChromeActivity.java	2026-10-29 21:41:04.504349945 +0530
++++ b/chrome/android/java/src/org/chromium/chrome/browser/app/ChromeActivity.java	2026-10-29 21:42:59.560267379 +0530
+@@ -218,6 +218,7 @@
+ import org.chromium.chrome.browser.tabmodel.TabModelSelectorTabObserver;
+ import org.chromium.chrome.browser.tabmodel.TabModelUtils;
+ import org.chromium.chrome.browser.tark.media.TarkMediaPrefs;
++import org.chromium.chrome.browser.tark.media.TarkPipEntryPoints;
+ import org.chromium.chrome.browser.task_manager.TaskManager;
+ import org.chromium.chrome.browser.task_manager.TaskManagerFactory;
+ import org.chromium.chrome.browser.tasks.tab_management.TabGroupUiUtils;
+@@ -1585,6 +1586,19 @@
+         // notification from mOnPictureInPictureModeChanged.
+     }
+ 
++    /**
++     * Tark: Picture in Picture from a tap (the app menu's item, the address bar's button). The
++     * same Picture in Picture as leaving Tark (onUserLeaveHint): the controller floats the current
++     * tab's video playing with sound, inline or fullscreen, if Settings → Picture in Picture is on.
++     */
++    public void tarkEnterPictureInPicture() {
++        if (isActivityFinishingOrDestroyed() || isInPictureInPictureMode()) return;
++        if (!TarkPipEntryPoints.canShow(this, getActivityTab())) return;
++        FullscreenVideoPictureInPictureController controller =
++                ensureFullscreenVideoPictureInPictureController();
++        if (controller != null) controller.attemptPictureInPicture();
++    }
++
+     @Override
+     public void onPictureInPictureUiStateChanged(PictureInPictureUiState pipState) {
+         super.onPictureInPictureUiStateChanged(pipState);
+@@ -3305,6 +3319,11 @@
+             return true;
+         }
+ 
++        if (id == R.id.tark_pip_menu_id) {
++            tarkEnterPictureInPicture();
++            return true;
++        }
++
+         if (id == R.id.info_menu_id) {
+             ChromePageInfo pageInfo =
+                     new ChromePageInfo(
+diff --color -ruN a/chrome/android/java/src/org/chromium/chrome/browser/tabbed_mode/TabbedAppMenuPropertiesDelegate.java b/chrome/android/java/src/org/chromium/chrome/browser/tabbed_mode/TabbedAppMenuPropertiesDelegate.java
+--- a/chrome/android/java/src/org/chromium/chrome/browser/tabbed_mode/TabbedAppMenuPropertiesDelegate.java	2026-10-29 21:41:04.505762041 +0530
++++ b/chrome/android/java/src/org/chromium/chrome/browser/tabbed_mode/TabbedAppMenuPropertiesDelegate.java	2026-10-29 21:43:23.369172306 +0530
+@@ -73,6 +73,7 @@
+ import org.chromium.chrome.browser.tab.Tab;
+ import org.chromium.chrome.browser.tab_group_sync.TabGroupSyncServiceFactory;
+ import org.chromium.chrome.browser.tabmodel.TabModelSelector;
++import org.chromium.chrome.browser.tark.media.TarkPipEntryPoints;
+ import org.chromium.chrome.browser.task_manager.TaskManager;
+ import org.chromium.chrome.browser.toolbar.ToolbarManager;
+ import org.chromium.chrome.browser.toolbar.menu_button.MenuItemState;
+@@ -496,6 +497,8 @@
+                         AppMenuItemUtils.buildModelForIconRow(
+                                 R.id.tark_tiles_menu_id, tiles, isMenuIconAtStart())));
+ 
++        maybeAddTarkPipItem(modelList, currentTab);
++
+         // Add to Group
+         if (mTabGroupItemBuilder.shouldShowAddToGroup(currentTab)) {
+             modelList.add(
+@@ -690,6 +693,8 @@
+             modelList.add(buildNewIncognitoTabItem());
+         }
+ 
++        maybeAddTarkPipItem(modelList, currentTab);
++
+         // Tab groups
+         if (mTabGroupItemBuilder.shouldShowTabGroupsParentItem(currentTab)) {
+             modelList.add(mTabGroupItemBuilder.buildTabGroupsParentItem(currentTab));
+@@ -1138,6 +1143,25 @@
+                         isMenuIconAtStart()));
+     }
+ 
++    // Tark: "Picture in Picture" while the current tab plays a video with sound and Settings →
++    // Picture in Picture is on (private tabs too). A tap enters the same Picture in Picture as
++    // leaving Tark (ChromeActivity#tarkEnterPictureInPicture). The menu is built as it opens.
++    private void maybeAddTarkPipItem(MVCListAdapter.ModelList modelList, @Nullable Tab currentTab) {
++        if (!TarkPipEntryPoints.canShow(mContext, currentTab)) return;
++        modelList.add(
++                new ListItem(
++                        AppMenuHandler.AppMenuItemType.STANDARD,
++                        AppMenuItemUtils.buildModelForStandardMenuItem(
++                                mContext,
++                                getAppMenuItemTheme(),
++                                R.id.tark_pip_menu_id,
++                                R.string.contextmenu_picture_in_picture,
++                                shouldShowIconBeforeItem()
++                                        ? R.drawable.tark_pip_24dp
++                                        : Resources.ID_NULL,
++                                isMenuIconAtStart())));
++    }
++
+     private ListItem buildDownloadsItem() {
+         return new ListItem(
+                 AppMenuHandler.AppMenuItemType.STANDARD,
+diff --color -ruN a/chrome/android/java/src/org/chromium/chrome/browser/tark/media/TarkPipButtonController.java b/chrome/android/java/src/org/chromium/chrome/browser/tark/media/TarkPipButtonController.java
+--- a/chrome/android/java/src/org/chromium/chrome/browser/tark/media/TarkPipButtonController.java	1970-01-01 05:30:00.000000000 +0530
++++ b/chrome/android/java/src/org/chromium/chrome/browser/tark/media/TarkPipButtonController.java	2026-10-29 21:44:26.435167556 +0530
+@@ -0,0 +1,203 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++package org.chromium.chrome.browser.tark.media;
++
++import android.content.Context;
++import android.graphics.drawable.Drawable;
++import android.os.Handler;
++import android.os.Looper;
++import android.view.View;
++
++import androidx.annotation.VisibleForTesting;
++
++import org.chromium.base.Callback;
++import org.chromium.build.annotations.NullMarked;
++import org.chromium.build.annotations.Nullable;
++import org.chromium.chrome.R;
++import org.chromium.chrome.browser.ActivityTabProvider;
++import org.chromium.chrome.browser.tab.Tab;
++import org.chromium.chrome.browser.tab.TabHidingType;
++import org.chromium.chrome.browser.tab.TabSelectionType;
++import org.chromium.chrome.browser.toolbar.optional_button.BaseButtonDataProvider;
++import org.chromium.chrome.browser.toolbar.optional_button.ButtonData.ButtonSpec;
++import org.chromium.content_public.browser.NavigationHandle;
++import org.chromium.content_public.browser.WebContents;
++import org.chromium.content_public.browser.WebContentsObserver;
++import org.chromium.ui.modaldialog.ModalDialogManager;
++
++import java.util.HashSet;
++import java.util.Set;
++
++/**
++ * Tark: the address bar's Picture in Picture button (the toolbar's optional button slot, trailing
++ * the address pill). It shows while {@link TarkPipEntryPoints#canShow}, private tabs included, and
++ * a tap runs the given entry (ChromeActivity#tarkEnterPictureInPicture, the same Picture in Picture
++ * as leaving Tark).
++ *
++ * <p>It follows the current tab only: tab switches, navigations, and its players starting and
++ * stopping. Whether the tab is audible has no Java signal, and it turns true a little after a
++ * player starts (or when the page unmutes), so while a player of the current tab plays the button
++ * checks again every {@link #RECHECK_MS}.
++ */
++@NullMarked
++public class TarkPipButtonController extends BaseButtonDataProvider {
++    @VisibleForTesting static final long RECHECK_MS = 1000;
++
++    private final Context mContext;
++    private final Callback<Tab> mEnter;
++    private final ActivityTabProvider.ActivityTabTabObserver mTabObserver;
++    private final Handler mHandler = new Handler(Looper.getMainLooper());
++    private final Runnable mRecheck = this::recheckAndRepeat;
++    private final Set<Integer> mPlayingPlayers = new HashSet<>();
++
++    private @Nullable WebContents mObservedWebContents;
++    private @Nullable WebContentsObserver mWebContentsObserver;
++    private boolean mShowing;
++    private boolean mDestroyed;
++
++    /**
++     * @param context The context for the description.
++     * @param buttonDrawable The Picture in Picture icon (R.drawable.tark_pip_24dp).
++     * @param tabProvider The activity's current tab.
++     * @param modalDialogManager Disables the button while a dialog shows; null for none.
++     * @param enter Enters Picture in Picture for the tab (called at most once per tap).
++     */
++    public TarkPipButtonController(
++            Context context,
++            @Nullable Drawable buttonDrawable,
++            ActivityTabProvider tabProvider,
++            @Nullable ModalDialogManager modalDialogManager,
++            Callback<Tab> enter) {
++        super(
++                tabProvider,
++                modalDialogManager,
++                new ButtonSpec.Builder(
++                                buttonDrawable,
++                                context.getString(R.string.contextmenu_picture_in_picture),
++                                /* supportsTinting= */ true)
++                        .setHoverTooltipTextId(R.string.contextmenu_picture_in_picture)
++                        .build());
++        mContext = context;
++        mEnter = enter;
++        // Private tabs behave the same (spec).
++        setShouldShowOnIncognitoTabs(true);
++        mTabObserver =
++                new ActivityTabProvider.ActivityTabTabObserver(
++                        tabProvider, /* shouldTrigger= */ true) {
++                    @Override
++                    protected void onObservingDifferentTab(@Nullable Tab tab) {
++                        observeWebContents(tab);
++                        recheck();
++                    }
++
++                    @Override
++                    public void onContentChanged(Tab tab) {
++                        observeWebContents(tab);
++                        recheck();
++                    }
++
++                    @Override
++                    public void onUrlUpdated(Tab tab) {
++                        recheck();
++                    }
++
++                    @Override
++                    public void onShown(Tab tab, @TabSelectionType int type) {
++                        // Back from Settings (the Picture in Picture switch) or the window.
++                        recheck();
++                    }
++
++                    @Override
++                    public void onHidden(Tab tab, @TabHidingType int type) {
++                        mHandler.removeCallbacks(mRecheck);
++                    }
++                };
++    }
++
++    @Override
++    protected boolean shouldShowButton(@Nullable Tab tab) {
++        if (!super.shouldShowButton(tab)) return false;
++        return TarkPipEntryPoints.canShow(mContext, tab);
++    }
++
++    @Override
++    public void onClick(View view) {
++        Tab tab = mActiveTabSupplier.get();
++        // The state may have changed since the button was drawn: check again.
++        if (!shouldShowButton(tab)) {
++            recheck();
++            return;
++        }
++        mEnter.onResult(tab);
++    }
++
++    @Override
++    public void destroy() {
++        mDestroyed = true;
++        mHandler.removeCallbacks(mRecheck);
++        observeWebContents(null);
++        mTabObserver.destroy();
++        super.destroy();
++    }
++
++    private void observeWebContents(@Nullable Tab tab) {
++        WebContents webContents = tab != null ? tab.getWebContents() : null;
++        if (webContents == mObservedWebContents && !mDestroyed) return;
++        if (mWebContentsObserver != null) {
++            mWebContentsObserver.observe(null);
++            mWebContentsObserver = null;
++        }
++        mObservedWebContents = null;
++        mPlayingPlayers.clear();
++        mHandler.removeCallbacks(mRecheck);
++        if (webContents == null || mDestroyed) return;
++        mObservedWebContents = webContents;
++        mWebContentsObserver =
++                new WebContentsObserver(webContents) {
++                    @Override
++                    public void mediaStartedPlaying(int id, boolean hasAudio, boolean hasVideo) {
++                        mPlayingPlayers.add(id);
++                        recheckAndRepeat();
++                    }
++
++                    @Override
++                    public void mediaStoppedPlaying(int id) {
++                        mPlayingPlayers.remove(id);
++                        recheckAndRepeat();
++                    }
++
++                    @Override
++                    public void didFinishNavigationInPrimaryMainFrame(
++                            NavigationHandle navigationHandle) {
++                        if (navigationHandle.hasCommitted()) recheck();
++                    }
++
++                    @Override
++                    public void webContentsDestroyed() {
++                        mPlayingPlayers.clear();
++                        mHandler.removeCallbacks(mRecheck);
++                        recheck();
++                    }
++                };
++    }
++
++    /** Checks again now, and again every {@link #RECHECK_MS} while a player plays. */
++    private void recheckAndRepeat() {
++        mHandler.removeCallbacks(mRecheck);
++        recheck();
++        if (!mDestroyed && !mPlayingPlayers.isEmpty()) {
++            mHandler.postDelayed(mRecheck, RECHECK_MS);
++        }
++    }
++
++    /** Tells the toolbar when the button's visibility changes. */
++    private void recheck() {
++        if (mDestroyed) return;
++        boolean showing = shouldShowButton(mActiveTabSupplier.get());
++        if (showing == mShowing) return;
++        mShowing = showing;
++        notifyObservers(showing);
++    }
++}
+diff --color -ruN a/chrome/android/java/src/org/chromium/chrome/browser/tark/media/TarkPipEntryPoints.java b/chrome/android/java/src/org/chromium/chrome/browser/tark/media/TarkPipEntryPoints.java
+--- a/chrome/android/java/src/org/chromium/chrome/browser/tark/media/TarkPipEntryPoints.java	1970-01-01 05:30:00.000000000 +0530
++++ b/chrome/android/java/src/org/chromium/chrome/browser/tark/media/TarkPipEntryPoints.java	2026-10-29 21:41:23.746315063 +0530
+@@ -0,0 +1,34 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++package org.chromium.chrome.browser.tark.media;
++
++import android.content.Context;
++import android.content.pm.PackageManager;
++
++import org.chromium.build.annotations.NullMarked;
++import org.chromium.build.annotations.Nullable;
++import org.chromium.chrome.browser.tab.Tab;
++
++/**
++ * Picture in Picture from a tap: the app menu's "Picture in Picture" item and the address bar's
++ * button. Both show exactly when leaving Tark now would float the current tab's video ({@link
++ * TarkPictureInPicture#canOffer(Tab)}: a video playing with sound, Settings → Picture in Picture
++ * on), private tabs included, on a device that has Picture in Picture. A tap enters the same
++ * Picture in Picture as leaving Tark (ChromeActivity#tarkEnterPictureInPicture).
++ */
++@NullMarked
++public final class TarkPipEntryPoints {
++    private TarkPipEntryPoints() {}
++
++    /** Whether the menu item and the address-bar button show for {@code tab}. */
++    public static boolean canShow(Context context, @Nullable Tab tab) {
++        if (tab == null) return false;
++        if (!context.getPackageManager()
++                .hasSystemFeature(PackageManager.FEATURE_PICTURE_IN_PICTURE)) {
++            return false;
++        }
++        return TarkPictureInPicture.canOffer(tab);
++    }
++}
+diff --color -ruN a/chrome/android/java/src/org/chromium/chrome/browser/ui/AdaptiveToolbarUiCoordinator.java b/chrome/android/java/src/org/chromium/chrome/browser/ui/AdaptiveToolbarUiCoordinator.java
+--- a/chrome/android/java/src/org/chromium/chrome/browser/ui/AdaptiveToolbarUiCoordinator.java	2026-10-29 21:41:04.501862796 +0530
++++ b/chrome/android/java/src/org/chromium/chrome/browser/ui/AdaptiveToolbarUiCoordinator.java	2026-10-29 21:44:26.435723315 +0530
+@@ -21,6 +21,7 @@
+ import org.chromium.build.annotations.Nullable;
+ import org.chromium.chrome.R;
+ import org.chromium.chrome.browser.ActivityTabProvider;
++import org.chromium.chrome.browser.app.ChromeActivity;
+ import org.chromium.chrome.browser.bookmarks.BookmarkModel;
+ import org.chromium.chrome.browser.bookmarks.TabBookmarker;
+ import org.chromium.chrome.browser.commerce.CommerceBottomSheetContentController;
+@@ -47,6 +48,7 @@
+ import org.chromium.chrome.browser.share.ShareButtonController;
+ import org.chromium.chrome.browser.share.ShareDelegate;
+ import org.chromium.chrome.browser.tabmodel.TabModelSelector;
++import org.chromium.chrome.browser.tark.media.TarkPipButtonController;
+ import org.chromium.chrome.browser.toolbar.VoiceToolbarButtonController;
+ import org.chromium.chrome.browser.toolbar.adaptive.AdaptiveButtonActionMenuCoordinator;
+ import org.chromium.chrome.browser.toolbar.adaptive.AdaptiveToolbarBehavior;
+@@ -244,8 +246,21 @@
+         mAdaptiveToolbarButtonController = adaptiveToolbarButtonController;
+         toolbarBehavior.registerPerSurfaceButtons(adaptiveToolbarButtonController, trackerSupplier);
+ 
+-        // Tark: no profile (identity disc) button: Tark has no Google sign-in.
+-        mButtonDataProviders = List.of(adaptiveToolbarButtonController);
++        // Tark: no profile (identity disc) button: Tark has no Google sign-in. The Picture in
++        // Picture button comes first: while the current tab plays a video with sound it takes the
++        // slot, and a tap enters the same Picture in Picture as leaving Tark.
++        TarkPipButtonController pipButtonController =
++                new TarkPipButtonController(
++                        mContext,
++                        AppCompatResources.getDrawable(mContext, R.drawable.tark_pip_24dp),
++                        mActivityTabProvider,
++                        mModalDialogManagerSupplier.get(),
++                        tab -> {
++                            if (mActivity instanceof ChromeActivity) {
++                                ((ChromeActivity) mActivity).tarkEnterPictureInPicture();
++                            }
++                        });
++        mButtonDataProviders = List.of(pipButtonController, adaptiveToolbarButtonController);
+     }
+ 
+     /**
+diff --color -ruN a/chrome/android/junit/BUILD.gn b/chrome/android/junit/BUILD.gn
+--- a/chrome/android/junit/BUILD.gn	2026-10-29 21:41:04.496759040 +0530
++++ b/chrome/android/junit/BUILD.gn	2026-10-29 21:43:55.134455141 +0530
+@@ -1431,6 +1431,7 @@
+     sources = [
+       "src/org/chromium/chrome/browser/tark/media/TarkLeaveDecisionTest.java",
+       "src/org/chromium/chrome/browser/tark/media/TarkMediaPrefsTest.java",
++      "src/org/chromium/chrome/browser/tark/media/TarkPipEntryPointsTest.java",
+     ]
+ 
+     deps = [ ":chrome_junit_tests_helper" ]
+diff --color -ruN a/chrome/android/junit/src/org/chromium/chrome/browser/tark/media/TarkPipEntryPointsTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/tark/media/TarkPipEntryPointsTest.java
+--- a/chrome/android/junit/src/org/chromium/chrome/browser/tark/media/TarkPipEntryPointsTest.java	1970-01-01 05:30:00.000000000 +0530
++++ b/chrome/android/junit/src/org/chromium/chrome/browser/tark/media/TarkPipEntryPointsTest.java	2026-10-29 21:45:18.270552057 +0530
+@@ -0,0 +1,268 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++package org.chromium.chrome.browser.tark.media;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.assertTrue;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.ArgumentMatchers.anyBoolean;
++import static org.mockito.Mockito.atLeastOnce;
++import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.never;
++import static org.mockito.Mockito.times;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.when;
++import static org.mockito.Mockito.withSettings;
++import static org.robolectric.Shadows.shadowOf;
++
++import android.content.Context;
++import android.content.pm.PackageManager;
++import android.graphics.drawable.Drawable;
++import android.os.Looper;
++import android.view.View;
++
++import org.junit.After;
++import org.junit.Before;
++import org.junit.Rule;
++import org.junit.Test;
++import org.junit.runner.RunWith;
++import org.mockito.ArgumentCaptor;
++import org.mockito.Mock;
++import org.mockito.junit.MockitoJUnit;
++import org.mockito.junit.MockitoRule;
++
++import org.chromium.base.Callback;
++import org.chromium.base.ContextUtils;
++import org.chromium.base.library_loader.LibraryLoader;
++import org.chromium.base.test.BaseRobolectricTestRunner;
++import org.chromium.chrome.browser.ActivityTabProvider;
++import org.chromium.chrome.browser.tab.Tab;
++import org.chromium.chrome.browser.tab.TabObserver;
++import org.chromium.chrome.browser.toolbar.optional_button.ButtonDataProvider.ButtonDataObserver;
++import org.chromium.content_public.browser.WebContents;
++import org.chromium.content_public.browser.WebContentsObserver;
++
++import java.util.HashMap;
++import java.util.Map;
++import java.util.concurrent.TimeUnit;
++
++/**
++ * Picture in Picture from a tap: when the app menu's item and the address bar's button show
++ * (playing video with sound × Settings → Picture in Picture × private tab × device), and that a
++ * tap enters once.
++ */
++@RunWith(BaseRobolectricTestRunner.class)
++public class TarkPipEntryPointsTest {
++    @Rule public MockitoRule mMockitoRule = MockitoJUnit.rule();
++
++    @Mock private TarkPictureInPicture.Natives mNatives;
++    @Mock private LibraryLoader mLibraryLoader;
++    @Mock private Tab mTab;
++    @Mock private Callback<Tab> mEnter;
++    @Mock private ButtonDataObserver mToolbar;
++
++    private Context mContext;
++    private WebContents mWebContents;
++    private ActivityTabProvider mTabProvider;
++    private TarkPipButtonController mButton;
++
++    @Before
++    public void setUp() {
++        mContext = ContextUtils.getApplicationContext();
++        ContextUtils.getAppSharedPreferences().edit().clear().commit();
++        setDeviceHasPictureInPicture(true);
++
++        TarkPictureInPictureJni.setInstanceForTesting(mNatives);
++        LibraryLoader.setLibraryLoaderForTesting(mLibraryLoader);
++        when(mLibraryLoader.isInitialized()).thenReturn(true);
++
++        mWebContents =
++                mock(
++                        WebContents.class,
++                        withSettings().extraInterfaces(WebContentsObserver.Observable.class));
++        when(mTab.getWebContents()).thenReturn(mWebContents);
++        setPlayingWithSound(false);
++
++        mTabProvider = new ActivityTabProvider();
++    }
++
++    @After
++    public void tearDown() {
++        if (mButton != null) mButton.destroy();
++    }
++
++    private void setPlayingWithSound(boolean playing) {
++        when(mNatives.isPlayingVideoWithSound(any())).thenReturn(playing);
++    }
++
++    private void setDeviceHasPictureInPicture(boolean has) {
++        shadowOf(mContext.getPackageManager())
++                .setSystemFeature(PackageManager.FEATURE_PICTURE_IN_PICTURE, has);
++    }
++
++    private TarkPipButtonController createButtonForCurrentTab() {
++        mTabProvider.setForTesting(mTab);
++        mButton =
++                new TarkPipButtonController(
++                        mContext, mock(Drawable.class), mTabProvider, null, mEnter);
++        mButton.addObserver(mToolbar);
++        shadowOf(Looper.getMainLooper()).idle();
++        return mButton;
++    }
++
++    private boolean buttonShows() {
++        return mButton.get(mTabProvider.get()).canShow();
++    }
++
++    /** The WebContentsObserver the button put on the current tab's WebContents. */
++    private WebContentsObserver webContentsObserver() {
++        ArgumentCaptor<WebContentsObserver> captor =
++                ArgumentCaptor.forClass(WebContentsObserver.class);
++        verify((WebContentsObserver.Observable) mWebContents, atLeastOnce())
++                .addObserver(captor.capture());
++        return captor.getValue();
++    }
++
++    // The menu item and the button share TarkPipEntryPoints.canShow.
++
++    @Test
++    public void testShowsOnlyWhilePlayingWithSoundAndSettingOn() {
++        // Playing with sound × setting.
++        for (boolean playing : new boolean[] {false, true}) {
++            for (boolean setting : new boolean[] {false, true}) {
++                setPlayingWithSound(playing);
++                TarkMediaPrefs.setPictureInPicture(setting);
++                assertEquals(
++                        "playing=" + playing + " setting=" + setting,
++                        playing && setting,
++                        TarkPipEntryPoints.canShow(mContext, mTab));
++            }
++        }
++    }
++
++    @Test
++    public void testBackgroundPlayAloneDoesNotShow() {
++        // Background play on, Picture in Picture off: leaving plays sound only, so no item.
++        setPlayingWithSound(true);
++        TarkMediaPrefs.setBackgroundPlay(true);
++        TarkMediaPrefs.setPictureInPicture(false);
++        assertFalse(TarkPipEntryPoints.canShow(mContext, mTab));
++    }
++
++    @Test
++    public void testIncognitoShowsTheSameAndStoresNothing() {
++        setPlayingWithSound(true);
++        when(mTab.isIncognito()).thenReturn(true);
++        when(mTab.isIncognitoBranded()).thenReturn(true);
++        Map<String, ?> before = new HashMap<>(ContextUtils.getAppSharedPreferences().getAll());
++        assertTrue(TarkPipEntryPoints.canShow(mContext, mTab));
++
++        createButtonForCurrentTab();
++        assertTrue(buttonShows());
++        assertEquals(before, new HashMap<>(ContextUtils.getAppSharedPreferences().getAll()));
++    }
++
++    @Test
++    public void testNoTabNoDeviceSupportNoNativeDoesNotShow() {
++        setPlayingWithSound(true);
++        assertFalse(TarkPipEntryPoints.canShow(mContext, null));
++
++        setDeviceHasPictureInPicture(false);
++        assertFalse(TarkPipEntryPoints.canShow(mContext, mTab));
++        setDeviceHasPictureInPicture(true);
++
++        when(mLibraryLoader.isInitialized()).thenReturn(false);
++        assertFalse(TarkPipEntryPoints.canShow(mContext, mTab));
++        when(mLibraryLoader.isInitialized()).thenReturn(true);
++
++        when(mWebContents.isDestroyed()).thenReturn(true);
++        assertFalse(TarkPipEntryPoints.canShow(mContext, mTab));
++    }
++
++    @Test
++    public void testButtonFollowsPlayback() {
++        createButtonForCurrentTab();
++        assertFalse(buttonShows());
++
++        // A player starts; the tab turns audible a little later: the recheck finds it.
++        WebContentsObserver observer = webContentsObserver();
++        observer.mediaStartedPlaying(1, /* hasAudio= */ true, /* hasVideo= */ true);
++        assertFalse(buttonShows());
++        setPlayingWithSound(true);
++        shadowOf(Looper.getMainLooper())
++                .idleFor(TarkPipButtonController.RECHECK_MS, TimeUnit.MILLISECONDS);
++        assertTrue(buttonShows());
++        verify(mToolbar).buttonDataChanged(true);
++
++        // Paused: it hides at once.
++        setPlayingWithSound(false);
++        observer.mediaStoppedPlaying(1);
++        assertFalse(buttonShows());
++        verify(mToolbar).buttonDataChanged(false);
++    }
++
++    @Test
++    public void testButtonHidesWhenTheUrlChanges() {
++        setPlayingWithSound(true);
++        createButtonForCurrentTab();
++        assertTrue(buttonShows());
++
++        // Navigated away: the page's players are gone.
++        setPlayingWithSound(false);
++        ArgumentCaptor<TabObserver> tabObserver = ArgumentCaptor.forClass(TabObserver.class);
++        verify(mTab, atLeastOnce()).addObserver(tabObserver.capture());
++        tabObserver.getValue().onUrlUpdated(mTab);
++        assertFalse(buttonShows());
++        verify(mToolbar).buttonDataChanged(false);
++    }
++
++    @Test
++    public void testButtonHidesWhenTheSettingTurnsOff() {
++        setPlayingWithSound(true);
++        createButtonForCurrentTab();
++        assertTrue(buttonShows());
++        TarkMediaPrefs.setPictureInPicture(false);
++        assertFalse(buttonShows());
++    }
++
++    @Test
++    public void testOnlyTheCurrentTabCounts() {
++        setPlayingWithSound(true);
++        createButtonForCurrentTab();
++        assertTrue(buttonShows());
++
++        // Switched to a tab that plays nothing (another tab still plays).
++        Tab other = mock(Tab.class);
++        WebContents otherContents =
++                mock(
++                        WebContents.class,
++                        withSettings().extraInterfaces(WebContentsObserver.Observable.class));
++        when(other.getWebContents()).thenReturn(otherContents);
++        when(mNatives.isPlayingVideoWithSound(otherContents)).thenReturn(false);
++        mTabProvider.setForTesting(other);
++        shadowOf(Looper.getMainLooper()).idle();
++        assertFalse(buttonShows());
++        verify(mToolbar).buttonDataChanged(false);
++    }
++
++    @Test
++    public void testTapEntersOnce() {
++        setPlayingWithSound(true);
++        createButtonForCurrentTab();
++        mButton.onClick(new View(mContext));
++        verify(mEnter, times(1)).onResult(mTab);
++    }
++
++    @Test
++    public void testTapAfterPlaybackStoppedDoesNothing() {
++        setPlayingWithSound(true);
++        createButtonForCurrentTab();
++        setPlayingWithSound(false);
++        mButton.onClick(new View(mContext));
++        verify(mEnter, never()).onResult(any());
++        verify(mToolbar).buttonDataChanged(anyBoolean());
++    }
++}
