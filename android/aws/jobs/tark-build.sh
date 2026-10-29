@@ -71,12 +71,10 @@ if (( code == 0 )); then
     grep -qE "^\[[0-9]+/[0-9]+\] CaptionDownloadsTest\.$t \([0-9]+ ms\)$" $log || { echo "no CaptionDownloadsTest.$t test ran" >> $log; code=1; }
     grep -qE "CaptionDownloadsTest\.$t.*(SKIPPED|FAILED)|(SKIPPED|FAILED).*CaptionDownloadsTest\.$t" $log && { echo "CaptionDownloadsTest.$t did not pass" >> $log; code=1; }
   done
-  # Background play's visibility hold (media-background-play.patch), kept
-  # while in Picture in Picture (media-pip-on-leave.patch).
+  # Background play's visibility hold (media-background-play.patch).
   for t in PlayingWithSoundThenHideStaysVisible NothingPlayingThenHideIsHidden MutedThenHideIsHidden \
       HoldReleasedWhenMediaPauses HoldReleasedWhenEnded SilentStretchWhilePlayingKeepsTheHold SettingsOffIsUpstream \
       OnlyPictureInPictureWithoutWindowIsUpstream OnlyPictureInPictureWithWindowIsHeld BackgroundPlayOnlyIsHeld \
-      PausedInPictureInPictureStaysHeld PictureInPictureClosedWhilePausedReleases PictureInPictureCloseButtonReleases \
       Allowed LaterHiddenUpdatesKeepTheHold ShowAfterHoldSendsNoEvent NoHoldAgainAfterRelease NeverShownTabIsNotHeld \
       HoldAgainAfterShowingAgain; do
     grep -qE "^\[[0-9]+/[0-9]+\] TarkVisibilityHoldTest\.$t \([0-9]+ ms\)$" $log || { echo "no TarkVisibilityHoldTest.$t test ran" >> $log; code=1; }
@@ -131,13 +129,14 @@ if (( code == 0 )); then
       /tark/junit-venv/bin/python $o/bin/run_chrome_junit_tests --gtest_filter='*SpeechLanguageSnackbarTest*:*VoiceDetectionTest*:*VoiceLanguagesTest*:*VoiceLanguageSignalsTest*:*VoiceLanguagesSettingsTest*:*AndroidVoicePlatformTest*:*VoiceSiteLanguagesTest*:*VoiceLanguageOfferTest*' &&
       /tark/junit-venv/bin/python $o/bin/run_chrome_junit_tests --gtest_filter='*IncognitoTabSwitcherPaneUnitTest*' &&
       /tark/junit-venv/bin/python $o/bin/run_chrome_junit_tests --gtest_filter='*ZynclaveAuthFlowTest*:*AuthStateStoreTest*:*ZynclaveAccountTest*:*ZynclaveAccountRowTest*:*ZynclaveNoTokenLogsTest*:*ZynclaveRedirectTest*:*ZynclaveWebOfferTest*' &&
-      /tark/junit-venv/bin/python $o/bin/run_chrome_junit_tests --gtest_filter='*TarkMediaPrefsTest*:*TarkLeaveDecisionTest*:*TarkExclusiveAccessPipTest*:*TarkPipEntryPointsTest*'
+      /tark/junit-venv/bin/python $o/bin/run_chrome_junit_tests --gtest_filter='*TarkMediaPrefsTest*:*TarkLeaveDecisionTest*:*TarkExclusiveAccessPipTest*:*TarkPipEntryPointsTest*:*TarkAutoPictureInPictureTest*:*FullscreenVideoPictureInPictureControllerUnitTest*'
     } > /tark/junit.log 2>&1
     code=$?
     # A filter that matches nothing "passes" with no test run.
     for t in SpeechRecognitionImplTest SpeechLanguageSnackbarTest VoiceDetectionTest VoiceLanguagesTest VoiceLanguageSignalsTest VoiceLanguagesSettingsTest AndroidVoicePlatformTest VoiceSiteLanguagesTest VoiceLanguageOfferTest IncognitoTabSwitcherPaneUnitTest \
         ZynclaveAuthFlowTest AuthStateStoreTest ZynclaveAccountTest ZynclaveAccountRowTest ZynclaveNoTokenLogsTest ZynclaveRedirectTest ZynclaveWebOfferTest \
-        TarkMediaPrefsTest TarkLeaveDecisionTest TarkExclusiveAccessPipTest TarkPipEntryPointsTest; do
+        TarkMediaPrefsTest TarkLeaveDecisionTest TarkExclusiveAccessPipTest TarkPipEntryPointsTest \
+        TarkAutoPictureInPictureTest FullscreenVideoPictureInPictureControllerUnitTest; do
       grep -q "OK \] .*$t\." /tark/junit.log || { echo "junit: no $t test ran" >> $log; code=1; }
     done
     upload /tark/junit.log junit.log
