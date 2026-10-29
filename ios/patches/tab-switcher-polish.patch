@@ -1,0 +1,80 @@
+diff --git a/firefox-ios/Client/Frontend/Browser/Tabs/Views/CustomSelectorView/TabTraySelectorButtonModel.swift b/firefox-ios/Client/Frontend/Browser/Tabs/Views/CustomSelectorView/TabTraySelectorButtonModel.swift
+index fe1fb70..f6592bf 100644
+--- a/firefox-ios/Client/Frontend/Browser/Tabs/Views/CustomSelectorView/TabTraySelectorButtonModel.swift
++++ b/firefox-ios/Client/Frontend/Browser/Tabs/Views/CustomSelectorView/TabTraySelectorButtonModel.swift
+@@ -17,6 +17,12 @@ struct TabTraySelectorButtonModel {
+ final class TabTraySelectorButton: UIButton, ThemeApplicable {
+     private var foregroundColorNormal: UIColor = .clear
+     private var foregroundColorHighlighted: UIColor = .clear
++    /// Tark: the chosen side sits on the indigo highlight, so its text is light.
++    private var foregroundColorSelected: UIColor = .clear
++
++    override var isSelected: Bool {
++        didSet { setNeedsUpdateConfiguration() }
++    }
+     private var backgroundColorNormal: UIColor = .clear
+ 
+     override init(frame: CGRect) {
+@@ -75,6 +81,8 @@ final class TabTraySelectorButton: UIButton, ThemeApplicable {
+         switch state {
+         case [.highlighted]:
+             updatedConfiguration.baseForegroundColor = foregroundColorHighlighted
++        case _ where state.contains(.selected):
++            updatedConfiguration.baseForegroundColor = foregroundColorSelected
+         default:
+             updatedConfiguration.baseForegroundColor = foregroundColorNormal
+         }
+@@ -88,6 +96,7 @@ final class TabTraySelectorButton: UIButton, ThemeApplicable {
+     func applyTheme(theme: Theme) {
+         foregroundColorNormal = theme.colors.textPrimary
+         foregroundColorHighlighted = theme.colors.actionSecondaryHover
++        foregroundColorSelected = theme.colors.textOnDark
+         backgroundColorNormal = .clear
+         setNeedsUpdateConfiguration()
+     }
+diff --git a/firefox-ios/Client/Frontend/Browser/Tabs/Views/ExperimentEmptyPrivateTabsView.swift b/firefox-ios/Client/Frontend/Browser/Tabs/Views/ExperimentEmptyPrivateTabsView.swift
+index dd04d39..b3a23e9 100644
+--- a/firefox-ios/Client/Frontend/Browser/Tabs/Views/ExperimentEmptyPrivateTabsView.swift
++++ b/firefox-ios/Client/Frontend/Browser/Tabs/Views/ExperimentEmptyPrivateTabsView.swift
+@@ -101,8 +101,16 @@ class ExperimentEmptyPrivateTabsView: UIView,
+             containerView.bottomAnchor.constraint(equalTo: scrollView.contentLayoutGuide.bottomAnchor),
+             containerView.trailingAnchor.constraint(equalTo: scrollView.contentLayoutGuide.trailingAnchor),
+ 
+-            iconImageView.topAnchor.constraint(equalTo: containerView.topAnchor,
++            // Tark: the icon and text sit in the middle of the screen (they
++            // still scroll when larger than it).
++            containerView.heightAnchor.constraint(greaterThanOrEqualTo: scrollView.frameLayoutGuide.heightAnchor),
++            iconImageView.topAnchor.constraint(greaterThanOrEqualTo: containerView.topAnchor,
+                                                constant: UX.topPadding),
++            {
++                let centre = titleLabel.centerYAnchor.constraint(equalTo: containerView.centerYAnchor)
++                centre.priority = .defaultHigh
++                return centre
++            }(),
+             iconImageView.centerXAnchor.constraint(equalTo: containerView.centerXAnchor),
+             iconImageView.widthAnchor.constraint(equalToConstant: UX.imageSize.width),
+             iconImageView.heightAnchor.constraint(equalToConstant: UX.imageSize.height),
+@@ -127,7 +135,7 @@ class ExperimentEmptyPrivateTabsView: UIView,
+                                                      constant: UX.horizontalPadding),
+             learnMoreButton.trailingAnchor.constraint(equalTo: containerView.trailingAnchor,
+                                                       constant: -UX.horizontalPadding),
+-            learnMoreButton.bottomAnchor.constraint(equalTo: containerView.bottomAnchor,
++            learnMoreButton.bottomAnchor.constraint(lessThanOrEqualTo: containerView.bottomAnchor,
+                                                     constant: -UX.bottomPadding)
+         ])
+     }
+diff --git a/firefox-ios/Client/Frontend/Browser/Tabs/Views/TabDisplayPanelViewController.swift b/firefox-ios/Client/Frontend/Browser/Tabs/Views/TabDisplayPanelViewController.swift
+index 90a9dfa..188899e 100644
+--- a/firefox-ios/Client/Frontend/Browser/Tabs/Views/TabDisplayPanelViewController.swift
++++ b/firefox-ios/Client/Frontend/Browser/Tabs/Views/TabDisplayPanelViewController.swift
+@@ -297,7 +297,9 @@ final class TabDisplayPanelViewController: UIViewController,
+             }
+ 
+             emptyPrivateTabsView.updateInsets(top: 0, bottom: bottomInset)
+-            tabDisplayView.updateInsets(top: 0, bottom: DefaultTabTrayUtils().segmentedControlHeight)
++            // Tark: the Tabs | Private switcher is at the top, so the grid
++            // starts below it rather than leaving room at the bottom.
++            tabDisplayView.updateInsets(top: DefaultTabTrayUtils().segmentedControlHeight, bottom: 0)
+         } else {
+             emptyPrivateTabsView.updateInsets(top: view.safeAreaInsets.top, bottom: 0)
+             tabDisplayView.updateInsets(top: 0, bottom: 0)
