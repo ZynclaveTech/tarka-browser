@@ -1,6 +1,6 @@
 diff --color -ruN a/chrome/android/BUILD.gn b/chrome/android/BUILD.gn
---- a/chrome/android/BUILD.gn	2026-10-29 22:47:18.364664552 +0530
-+++ b/chrome/android/BUILD.gn	2026-10-29 22:47:18.400482986 +0530
+--- a/chrome/android/BUILD.gn	2026-10-30 00:41:26.904877330 +0530
++++ b/chrome/android/BUILD.gn	2026-10-30 00:41:26.945480571 +0530
 @@ -3248,6 +3248,7 @@
        "java/src/org/chromium/chrome/browser/tabmodel/TabCollectionTabModelImpl.java",
        "java/src/org/chromium/chrome/browser/tabmodel/TabModelJniBridge.java",
@@ -10,8 +10,8 @@ diff --color -ruN a/chrome/android/BUILD.gn b/chrome/android/BUILD.gn
        "java/src/org/chromium/chrome/browser/touch_to_fill/payments/TouchToFillPaymentMethodControllerBridge.java",
        "java/src/org/chromium/chrome/browser/touch_to_fill/payments/TouchToFillPaymentMethodViewBridge.java",
 diff --color -ruN a/chrome/android/chrome_java_sources.gni b/chrome/android/chrome_java_sources.gni
---- a/chrome/android/chrome_java_sources.gni	2026-10-29 22:47:18.367899785 +0530
-+++ b/chrome/android/chrome_java_sources.gni	2026-10-29 22:47:18.406450092 +0530
+--- a/chrome/android/chrome_java_sources.gni	2026-10-30 00:41:26.908362251 +0530
++++ b/chrome/android/chrome_java_sources.gni	2026-10-30 00:41:26.950339176 +0530
 @@ -974,8 +974,10 @@
    "java/src/org/chromium/chrome/browser/page_info/SiteSettingsHelper.java",
    "java/src/org/chromium/chrome/browser/page_info/TarkAdblockSiteSwitch.java",
@@ -24,8 +24,8 @@ diff --color -ruN a/chrome/android/chrome_java_sources.gni b/chrome/android/chro
    "java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAccount.java",
    "java/src/org/chromium/chrome/browser/tark/zynclave/ZynclaveAccountPreference.java",
 diff --color -ruN a/chrome/android/java/src/org/chromium/chrome/browser/app/ChromeActivity.java b/chrome/android/java/src/org/chromium/chrome/browser/app/ChromeActivity.java
---- a/chrome/android/java/src/org/chromium/chrome/browser/app/ChromeActivity.java	2026-10-29 22:47:18.373142543 +0530
-+++ b/chrome/android/java/src/org/chromium/chrome/browser/app/ChromeActivity.java	2026-10-29 22:47:18.411595170 +0530
+--- a/chrome/android/java/src/org/chromium/chrome/browser/app/ChromeActivity.java	2026-10-30 00:41:26.914293828 +0530
++++ b/chrome/android/java/src/org/chromium/chrome/browser/app/ChromeActivity.java	2026-10-30 00:41:26.955182490 +0530
 @@ -217,6 +217,8 @@
  import org.chromium.chrome.browser.tabmodel.TabModelSelectorSupplier;
  import org.chromium.chrome.browser.tabmodel.TabModelSelectorTabObserver;
@@ -74,7 +74,7 @@ diff --color -ruN a/chrome/android/java/src/org/chromium/chrome/browser/app/Chro
          FullscreenVideoPictureInPictureController controller =
                  ensureFullscreenVideoPictureInPictureController();
          if (controller != null) {
-@@ -1607,18 +1627,42 @@
+@@ -1607,18 +1627,43 @@
              maybeCreateActorPipController();
              if (mActorPipController != null && mActorPipController.shouldEnterPip()) return;
  
@@ -111,15 +111,69 @@ diff --color -ruN a/chrome/android/java/src/org/chromium/chrome/browser/app/Chro
              if (mFullscreenVideoPictureInPictureController != null) {
                  mFullscreenVideoPictureInPictureController.onFrameworkExitedPictureInPicture();
              }
-+            // Tark: the controller's exit callbacks end the fullscreen Tark made; if this activity
-+            // was recreated in the window, the new controller has none, so end it here.
-+            TarkPictureInPicture.exitFullscreenItMade();
++            // Tark: the controller's exit callbacks end the fullscreen Tark made and release the
++            // window size the page sees; if this activity was recreated in the window, the new
++            // controller has none, so do it here.
++            TarkPictureInPicture.leaveWindow();
              mLastPictureInPictureModeForTesting = false;
          }
      }
+diff --color -ruN a/chrome/android/java/src/org/chromium/chrome/browser/app/tab_activity_glue/ActivityTabWebContentsDelegateAndroid.java b/chrome/android/java/src/org/chromium/chrome/browser/app/tab_activity_glue/ActivityTabWebContentsDelegateAndroid.java
+--- a/chrome/android/java/src/org/chromium/chrome/browser/app/tab_activity_glue/ActivityTabWebContentsDelegateAndroid.java	2026-10-30 00:41:26.912758308 +0530
++++ b/chrome/android/java/src/org/chromium/chrome/browser/app/tab_activity_glue/ActivityTabWebContentsDelegateAndroid.java	2026-10-30 00:41:26.954700567 +0530
+@@ -414,6 +414,16 @@
+             return;
+         }
+ 
++        // Tark: in Picture in Picture, a page doesn't bring the activity to the front: that
++        // expands the window (moveTaskToFront). A fullscreen request activates its contents
++        // (WebContentsImpl::EnterFullscreenMode), and Tark makes the playing video fullscreen
++        // just after entering the window; window.focus() would do the same. The user expands
++        // the window from its own controls.
++        if (mActivity.isInPictureInPictureMode()) {
++            Log.w(TAG, "Tark: not activating contents in Picture in Picture", new Throwable());
++            return;
++        }
++
+         // If the tab can currently be interacted with by the user and it's not in multi-window
+         // mode, then it is already focused so we can drop the call.
+         if (!mActivity.isInMultiWindowMode() && mTab.isUserInteractable()) {
+diff --color -ruN a/chrome/android/java/src/org/chromium/chrome/browser/fullscreen/FullscreenHtmlApiHandlerBase.java b/chrome/android/java/src/org/chromium/chrome/browser/fullscreen/FullscreenHtmlApiHandlerBase.java
+--- a/chrome/android/java/src/org/chromium/chrome/browser/fullscreen/FullscreenHtmlApiHandlerBase.java	2026-10-30 00:41:26.916512316 +0530
++++ b/chrome/android/java/src/org/chromium/chrome/browser/fullscreen/FullscreenHtmlApiHandlerBase.java	2026-10-30 00:41:26.959313461 +0530
+@@ -33,6 +33,7 @@
+ import org.chromium.base.ApplicationStatus.ActivityStateListener;
+ import org.chromium.base.ApplicationStatus.WindowFocusChangedListener;
+ import org.chromium.base.DeviceInfo;
++import org.chromium.base.Log;
+ import org.chromium.base.ObserverList;
+ import org.chromium.base.supplier.NonNullObservableSupplier;
+ import org.chromium.base.supplier.ObservableSuppliers;
+@@ -69,6 +70,9 @@
+         implements ActivityStateListener, WindowFocusChangedListener, FullscreenManager {
+     private static final boolean DEBUG_LOGS = false;
+ 
++    // Tark: diagnostics for fullscreen ending in Picture in Picture.
++    private static final String TARK_TAG = "TarkFullscreen";
++
+     protected static final int MSG_ID_SET_VISIBILITY_FOR_SYSTEM_BARS = 1;
+     protected static final int MSG_ID_UNSET_FULLSCREEN_LAYOUT = 2;
+ 
+@@ -628,6 +632,11 @@
+ 
+     @Override
+     public void exitPersistentFullscreenMode() {
++        // Tark: diagnostics. Fullscreen ending in Picture in Picture closes the window
++        // (FullscreenVideoPictureInPictureController, LEFT_FULLSCREEN): log who ended it.
++        if (getPersistentFullscreenMode() && mActivity.isInPictureInPictureMode()) {
++            Log.w(TARK_TAG, "Tark: leaving fullscreen in Picture in Picture", new Throwable());
++        }
+         // Return to the original starting position and bounds if the fullscreen was opening on
+         // another display.
+         returnFromTargetScreenIfNeeded();
 diff --color -ruN a/chrome/android/java/src/org/chromium/chrome/browser/media/FullscreenVideoPictureInPictureController.java b/chrome/android/java/src/org/chromium/chrome/browser/media/FullscreenVideoPictureInPictureController.java
---- a/chrome/android/java/src/org/chromium/chrome/browser/media/FullscreenVideoPictureInPictureController.java	2026-10-29 22:47:18.375533869 +0530
-+++ b/chrome/android/java/src/org/chromium/chrome/browser/media/FullscreenVideoPictureInPictureController.java	2026-10-29 22:47:18.414793982 +0530
+--- a/chrome/android/java/src/org/chromium/chrome/browser/media/FullscreenVideoPictureInPictureController.java	2026-10-30 00:41:26.917069990 +0530
++++ b/chrome/android/java/src/org/chromium/chrome/browser/media/FullscreenVideoPictureInPictureController.java	2026-10-30 00:41:26.960882398 +0530
 @@ -31,8 +31,11 @@
  import org.chromium.chrome.browser.notifications.NotificationIntentInterceptor;
  import org.chromium.chrome.browser.tab.Tab;
@@ -180,10 +234,14 @@ diff --color -ruN a/chrome/android/java/src/org/chromium/chrome/browser/media/Fu
  
          try {
              if (!mActivity.enterPictureInPictureMode(builder.build())) return;
-@@ -420,12 +439,21 @@
+@@ -420,12 +439,25 @@
  
          webContents.setHasPersistentVideo(true);
  
++        // Tark: the page keeps seeing a screen-sized window while it's in this one (players such
++        // as m.youtube.com's leave fullscreen and pause in a small window, which closes it).
++        TarkPictureInPicture.enterWindow(webContents);
++
 +        // Tark: an inline video playing with sound becomes the fullscreen element, so the window
 +        // shows only the video. Fullscreen ends with the window (TarkPictureInPicture remembers
 +        // it, should this activity be recreated meanwhile).
@@ -198,11 +256,11 @@ diff --color -ruN a/chrome/android/java/src/org/chromium/chrome/browser/media/Fu
                      if (!webContents.isDestroyed()) {
                          webContents.setHasPersistentVideo(false);
                      }
-+                    TarkPictureInPicture.exitFullscreenItMade();
++                    TarkPictureInPicture.leaveWindow();
                  });
  
          // Setup observers to dismiss the Activity on events that should end PiP.  In auto-enter
-@@ -445,6 +473,7 @@
+@@ -445,6 +477,7 @@
      public void onDestroy() {
          sControllers.remove(mActivity);
          removeObserversIfNeeded();
@@ -210,7 +268,7 @@ diff --color -ruN a/chrome/android/java/src/org/chromium/chrome/browser/media/Fu
      }
  
      public void onStart() {
-@@ -459,6 +488,14 @@
+@@ -459,6 +492,14 @@
      // on large form factors (see IsBackgroundMediaSuspendEnabled), so suspend it here.
      public void onStop() {
          if (mShouldSuspendMediaOnStop) {
@@ -225,7 +283,7 @@ diff --color -ruN a/chrome/android/java/src/org/chromium/chrome/browser/media/Fu
              mShouldSuspendMediaOnStop = false;
  
              final MediaSession mediaSession = getMediaSession();
-@@ -477,6 +514,24 @@
+@@ -477,6 +518,24 @@
          dismissActivityIfNeeded(mActivity, MetricsEndReason.RESUME);
      }
  
@@ -250,7 +308,7 @@ diff --color -ruN a/chrome/android/java/src/org/chromium/chrome/browser/media/Fu
      private static @Nullable Rect getVideoBounds(WebContents webContents, Activity activity) {
          Rect rect = webContents.getFullscreenVideoSize();
          if (rect == null || rect.width() == 0 || rect.height() == 0) return null;
-@@ -638,6 +693,7 @@
+@@ -638,6 +697,7 @@
                      builder.setSourceRectHint(bounds);
                  }
              }
@@ -258,7 +316,18 @@ diff --color -ruN a/chrome/android/java/src/org/chromium/chrome/browser/media/Fu
          }
          builder.setAutoEnterEnabled(allowed);
  
-@@ -855,6 +911,14 @@
+@@ -670,6 +730,10 @@
+         // Something interesting happened -- make sure we've updated our preference for auto-PiP
+         // with the framework, if applicable.
+         Log.i(TAG, "Dismiss activity with reason " + reason);
++        // Tark: diagnostics. What closes a Picture in Picture window, with the caller.
++        if (isPipSessionActive()) {
++            Log.w(TAG, "Tark: dismissing Picture in Picture, reason " + reason, new Throwable());
++        }
+         updateAutoPictureInPictureStatusIfNeeded();
+         mDismissPending = false;
+ 
+@@ -855,6 +919,14 @@
          public DismissActivityOnWebContentsObserver(Activity activity, WebContents webContents) {
              super(webContents);
              mActivity = activity;
@@ -275,7 +344,7 @@ diff --color -ruN a/chrome/android/java/src/org/chromium/chrome/browser/media/Fu
          @Override
 diff --color -ruN a/chrome/android/java/src/org/chromium/chrome/browser/tark/media/TarkLeaveDecision.java b/chrome/android/java/src/org/chromium/chrome/browser/tark/media/TarkLeaveDecision.java
 --- a/chrome/android/java/src/org/chromium/chrome/browser/tark/media/TarkLeaveDecision.java	1970-01-01 05:30:00.000000000 +0530
-+++ b/chrome/android/java/src/org/chromium/chrome/browser/tark/media/TarkLeaveDecision.java	2026-10-29 22:47:18.413155175 +0530
++++ b/chrome/android/java/src/org/chromium/chrome/browser/tark/media/TarkLeaveDecision.java	2026-10-30 00:41:26.957861108 +0530
 @@ -0,0 +1,39 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
@@ -318,8 +387,8 @@ diff --color -ruN a/chrome/android/java/src/org/chromium/chrome/browser/tark/med
 +}
 diff --color -ruN a/chrome/android/java/src/org/chromium/chrome/browser/tark/media/TarkPictureInPicture.java b/chrome/android/java/src/org/chromium/chrome/browser/tark/media/TarkPictureInPicture.java
 --- a/chrome/android/java/src/org/chromium/chrome/browser/tark/media/TarkPictureInPicture.java	1970-01-01 05:30:00.000000000 +0530
-+++ b/chrome/android/java/src/org/chromium/chrome/browser/tark/media/TarkPictureInPicture.java	2026-10-29 22:47:18.412895473 +0530
-@@ -0,0 +1,203 @@
++++ b/chrome/android/java/src/org/chromium/chrome/browser/tark/media/TarkPictureInPicture.java	2026-10-30 00:41:26.957487312 +0530
+@@ -0,0 +1,237 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -385,6 +454,11 @@ diff --color -ruN a/chrome/android/java/src/org/chromium/chrome/browser/tark/med
 +    private static final Set<WebContents> sMadeFullscreen =
 +            Collections.newSetFromMap(new WeakHashMap<>());
 +
++    // The tabs shown in a Picture in Picture window that hasn't ended: their pages keep seeing a
++    // screen-sized window. Static for the same reason as sMadeFullscreen.
++    private static final Set<WebContents> sInWindow =
++            Collections.newSetFromMap(new WeakHashMap<>());
++
 +    private static @Nullable Boolean sPlayingVideoWithSoundForTesting;
 +
 +    private TarkPictureInPicture() {}
@@ -402,7 +476,7 @@ diff --color -ruN a/chrome/android/java/src/org/chromium/chrome/browser/tark/med
 +    /**
 +     * Tark's part of entering Picture in Picture: makes the tab's playing video the fullscreen
 +     * element, if {@link #canOffer(Tab)}. Returns whether it was requested (the page enters
-+     * fullscreen asynchronously); if so, {@link #exitFullscreenItMade} ends it.
++     * fullscreen asynchronously); if so, {@link #leaveWindow} ends it.
 +     */
 +    public static boolean enter(@Nullable Tab tab) {
 +        WebContents webContents = tab != null ? tab.getWebContents() : null;
@@ -418,12 +492,39 @@ diff --color -ruN a/chrome/android/java/src/org/chromium/chrome/browser/tark/med
 +    }
 +
 +    /** Ends every fullscreen Tark made for Picture in Picture (the window ended). */
-+    public static void exitFullscreenItMade() {
++    private static void exitFullscreenItMade() {
 +        List<WebContents> made = new ArrayList<>(sMadeFullscreen);
 +        sMadeFullscreen.clear();
 +        for (WebContents webContents : made) {
 +            if (!webContents.isDestroyed()) webContents.exitFullscreen();
 +        }
++    }
++
++    /**
++     * The activity entered Picture in Picture showing `webContents`: its page keeps seeing a
++     * screen-sized window (window.outerWidth/outerHeight) while the window is open. A player that
++     * reads a small window as its mini player (m.youtube.com) would otherwise leave fullscreen
++     * and pause, and the window closes with the fullscreen.
++     */
++    public static void enterWindow(@Nullable WebContents webContents) {
++        if (webContents == null || !isUsable(webContents)) return;
++        sInWindow.add(webContents);
++        TarkPictureInPictureJni.get().setInWindow(webContents, true);
++    }
++
++    /**
++     * The window ended: the pages see their real window size again, and every fullscreen Tark
++     * made for it ends.
++     */
++    public static void leaveWindow() {
++        List<WebContents> shown = new ArrayList<>(sInWindow);
++        sInWindow.clear();
++        for (WebContents webContents : shown) {
++            if (isUsable(webContents)) {
++                TarkPictureInPictureJni.get().setInWindow(webContents, false);
++            }
++        }
++        exitFullscreenItMade();
 +    }
 +
 +    /** The playing video's natural size as a Rect at 0,0, for the window's aspect ratio. */
@@ -520,12 +621,14 @@ diff --color -ruN a/chrome/android/java/src/org/chromium/chrome/browser/tark/med
 +
 +        boolean requestFullscreen(WebContents webContents);
 +
++        void setInWindow(WebContents webContents, boolean inWindow);
++
 +        void watch(WebContents webContents);
 +    }
 +}
 diff --color -ruN a/chrome/android/java/src/org/chromium/chrome/browser/ui/ExclusiveAccessBubble.java b/chrome/android/java/src/org/chromium/chrome/browser/ui/ExclusiveAccessBubble.java
---- a/chrome/android/java/src/org/chromium/chrome/browser/ui/ExclusiveAccessBubble.java	2026-10-29 22:47:18.372346976 +0530
-+++ b/chrome/android/java/src/org/chromium/chrome/browser/ui/ExclusiveAccessBubble.java	2026-10-29 22:47:18.410167725 +0530
+--- a/chrome/android/java/src/org/chromium/chrome/browser/ui/ExclusiveAccessBubble.java	2026-10-30 00:41:26.912011673 +0530
++++ b/chrome/android/java/src/org/chromium/chrome/browser/ui/ExclusiveAccessBubble.java	2026-10-30 00:41:26.953762846 +0530
 @@ -4,6 +4,10 @@
  
  package org.chromium.chrome.browser.ui;
@@ -648,8 +751,8 @@ diff --color -ruN a/chrome/android/java/src/org/chromium/chrome/browser/ui/Exclu
          if (snackbarManager != null && mSnackbar != null) {
              snackbarManager.dismissSnackbars(mSnackbarController);
 diff --color -ruN a/chrome/android/java/src/org/chromium/chrome/browser/ui/ExclusiveAccessContext.java b/chrome/android/java/src/org/chromium/chrome/browser/ui/ExclusiveAccessContext.java
---- a/chrome/android/java/src/org/chromium/chrome/browser/ui/ExclusiveAccessContext.java	2026-10-29 22:47:18.371746811 +0530
-+++ b/chrome/android/java/src/org/chromium/chrome/browser/ui/ExclusiveAccessContext.java	2026-10-29 22:47:18.409835971 +0530
+--- a/chrome/android/java/src/org/chromium/chrome/browser/ui/ExclusiveAccessContext.java	2026-10-30 00:41:26.911658877 +0530
++++ b/chrome/android/java/src/org/chromium/chrome/browser/ui/ExclusiveAccessContext.java	2026-10-30 00:41:26.953454884 +0530
 @@ -4,6 +4,8 @@
  
  package org.chromium.chrome.browser.ui;
@@ -681,8 +784,8 @@ diff --color -ruN a/chrome/android/java/src/org/chromium/chrome/browser/ui/Exclu
      @CalledByNative
      public void destroy() {
 diff --color -ruN a/chrome/android/junit/BUILD.gn b/chrome/android/junit/BUILD.gn
---- a/chrome/android/junit/BUILD.gn	2026-10-29 22:47:18.365244006 +0530
-+++ b/chrome/android/junit/BUILD.gn	2026-10-29 22:47:18.401877093 +0530
+--- a/chrome/android/junit/BUILD.gn	2026-10-30 00:41:26.905409920 +0530
++++ b/chrome/android/junit/BUILD.gn	2026-10-30 00:41:26.946094287 +0530
 @@ -1428,8 +1428,11 @@
        "chrome_junit_tests_org.chromium.chrome.browser.tark.media") {
      resources_package = "org.chromium.chrome"
@@ -706,8 +809,8 @@ diff --color -ruN a/chrome/android/junit/BUILD.gn b/chrome/android/junit/BUILD.g
        "src/org/chromium/chrome/browser/ui/activity_recreation/ActivityRecreationControllerUnitTest.java",
        "src/org/chromium/chrome/browser/ui/color/ColorProviderBridgeImplTest.java",
 diff --color -ruN a/chrome/android/junit/src/org/chromium/chrome/browser/media/FullscreenVideoPictureInPictureControllerUnitTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/media/FullscreenVideoPictureInPictureControllerUnitTest.java
---- a/chrome/android/junit/src/org/chromium/chrome/browser/media/FullscreenVideoPictureInPictureControllerUnitTest.java	2026-10-29 22:47:18.367356294 +0530
-+++ b/chrome/android/junit/src/org/chromium/chrome/browser/media/FullscreenVideoPictureInPictureControllerUnitTest.java	2026-10-29 22:47:18.405474751 +0530
+--- a/chrome/android/junit/src/org/chromium/chrome/browser/media/FullscreenVideoPictureInPictureControllerUnitTest.java	2026-10-30 00:41:26.907793993 +0530
++++ b/chrome/android/junit/src/org/chromium/chrome/browser/media/FullscreenVideoPictureInPictureControllerUnitTest.java	2026-10-30 00:41:26.949758711 +0530
 @@ -43,6 +43,8 @@
  import org.chromium.chrome.browser.fullscreen.FullscreenManager;
  import org.chromium.chrome.browser.media.FullscreenVideoPictureInPictureController.PipEntered;
@@ -786,8 +889,8 @@ diff --color -ruN a/chrome/android/junit/src/org/chromium/chrome/browser/media/F
          mController.onStop();
 diff --color -ruN a/chrome/android/junit/src/org/chromium/chrome/browser/tark/media/TarkAutoPictureInPictureTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/tark/media/TarkAutoPictureInPictureTest.java
 --- a/chrome/android/junit/src/org/chromium/chrome/browser/tark/media/TarkAutoPictureInPictureTest.java	1970-01-01 05:30:00.000000000 +0530
-+++ b/chrome/android/junit/src/org/chromium/chrome/browser/tark/media/TarkAutoPictureInPictureTest.java	2026-10-29 22:47:18.404031054 +0530
-@@ -0,0 +1,230 @@
++++ b/chrome/android/junit/src/org/chromium/chrome/browser/tark/media/TarkAutoPictureInPictureTest.java	2026-10-30 00:41:26.948156815 +0530
+@@ -0,0 +1,258 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -1004,6 +1107,34 @@ diff --color -ruN a/chrome/android/junit/src/org/chromium/chrome/browser/tark/me
 +    }
 +
 +    @Test
++    public void testThePageSeesAScreenSizedWindowWhileInTheWindow() {
++        // m.youtube.com reads a small window as its mini player: it leaves fullscreen and pauses,
++        // and the window closes with the fullscreen. Held from entering until the window ends.
++        setPlayingWithSound(mWebContents, true);
++        mController.onEnteredPictureInPictureMode();
++        verify(mNatives).setInWindow(mWebContents, true);
++        verify(mNatives, never()).setInWindow(mWebContents, false);
++
++        mController.onFrameworkExitedPictureInPicture();
++        verify(mNatives).setInWindow(mWebContents, false);
++    }
++
++    @Test
++    public void testTheWindowSizeIsReleasedWhenTheActivityWasRecreated() {
++        // A recreated activity's controller has no exit callbacks; ChromeActivity leaves for it.
++        setPlayingWithSound(mWebContents, true);
++        mController.onEnteredPictureInPictureMode();
++        verify(mNatives).setInWindow(mWebContents, true);
++
++        TarkPictureInPicture.leaveWindow();
++        verify(mNatives).setInWindow(mWebContents, false);
++
++        // Nothing is held any more: the controller's own exit doesn't release twice.
++        mController.onFrameworkExitedPictureInPicture();
++        verify(mNatives).setInWindow(mWebContents, false);
++    }
++
++    @Test
 +    public void testMutedFullscreenVideoDoesNotAutoEnter() {
 +        // Upstream would float any fullscreen video that allows it; Tark only one with sound.
 +        when(mWebContents.hasActiveEffectivelyFullscreenVideo()).thenReturn(true);
@@ -1020,7 +1151,7 @@ diff --color -ruN a/chrome/android/junit/src/org/chromium/chrome/browser/tark/me
 +}
 diff --color -ruN a/chrome/android/junit/src/org/chromium/chrome/browser/tark/media/TarkLeaveDecisionTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/tark/media/TarkLeaveDecisionTest.java
 --- a/chrome/android/junit/src/org/chromium/chrome/browser/tark/media/TarkLeaveDecisionTest.java	1970-01-01 05:30:00.000000000 +0530
-+++ b/chrome/android/junit/src/org/chromium/chrome/browser/tark/media/TarkLeaveDecisionTest.java	2026-10-29 22:47:18.404349514 +0530
++++ b/chrome/android/junit/src/org/chromium/chrome/browser/tark/media/TarkLeaveDecisionTest.java	2026-10-30 00:41:26.948504111 +0530
 @@ -0,0 +1,81 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
@@ -1105,7 +1236,7 @@ diff --color -ruN a/chrome/android/junit/src/org/chromium/chrome/browser/tark/me
 +}
 diff --color -ruN a/chrome/android/junit/src/org/chromium/chrome/browser/ui/TarkExclusiveAccessPipTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/ui/TarkExclusiveAccessPipTest.java
 --- a/chrome/android/junit/src/org/chromium/chrome/browser/ui/TarkExclusiveAccessPipTest.java	1970-01-01 05:30:00.000000000 +0530
-+++ b/chrome/android/junit/src/org/chromium/chrome/browser/ui/TarkExclusiveAccessPipTest.java	2026-10-29 22:47:18.403117179 +0530
++++ b/chrome/android/junit/src/org/chromium/chrome/browser/ui/TarkExclusiveAccessPipTest.java	2026-10-30 00:41:26.947368262 +0530
 @@ -0,0 +1,127 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
@@ -1235,8 +1366,8 @@ diff --color -ruN a/chrome/android/junit/src/org/chromium/chrome/browser/ui/Tark
 +    }
 +}
 diff --color -ruN a/chrome/browser/android/BUILD.gn b/chrome/browser/android/BUILD.gn
---- a/chrome/browser/android/BUILD.gn	2026-10-29 22:47:18.361725858 +0530
-+++ b/chrome/browser/android/BUILD.gn	2026-10-29 22:47:18.398076699 +0530
+--- a/chrome/browser/android/BUILD.gn	2026-10-30 00:41:26.903022264 +0530
++++ b/chrome/browser/android/BUILD.gn	2026-10-30 00:41:26.943573338 +0530
 @@ -509,6 +509,7 @@
        "tab_web_contents_destroyer.h",
        "tabbed_startup_window_policy_delegate_bridge.cc",
@@ -1247,8 +1378,8 @@ diff --color -ruN a/chrome/browser/android/BUILD.gn b/chrome/browser/android/BUI
        "usage_stats/usage_stats_bridge.cc",
 diff --color -ruN a/chrome/browser/android/tark/tark_picture_in_picture_android.cc b/chrome/browser/android/tark/tark_picture_in_picture_android.cc
 --- a/chrome/browser/android/tark/tark_picture_in_picture_android.cc	1970-01-01 05:30:00.000000000 +0530
-+++ b/chrome/browser/android/tark/tark_picture_in_picture_android.cc	2026-10-29 22:47:18.398979405 +0530
-@@ -0,0 +1,105 @@
++++ b/chrome/browser/android/tark/tark_picture_in_picture_android.cc	2026-10-30 00:41:26.944427516 +0530
+@@ -0,0 +1,113 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -1342,6 +1473,14 @@ diff --color -ruN a/chrome/browser/android/tark/tark_picture_in_picture_android.
 +      content::WebContents::FromJavaWebContents(jweb_contents));
 +}
 +
++static void JNI_TarkPictureInPicture_SetInWindow(
++    JNIEnv* env,
++    const JavaRef<jobject>& jweb_contents,
++    bool in_window) {
++  content::tark_media::SetInPictureInPictureWindow(
++      content::WebContents::FromJavaWebContents(jweb_contents), in_window);
++}
++
 +// Idempotent: one watcher per WebContents, for its lifetime.
 +static void JNI_TarkPictureInPicture_Watch(
 +    JNIEnv* env,
@@ -1355,8 +1494,8 @@ diff --color -ruN a/chrome/browser/android/tark/tark_picture_in_picture_android.
 +
 +DEFINE_JNI(TarkPictureInPicture)
 diff --color -ruN a/content/browser/media/media_web_contents_observer_unittest.cc b/content/browser/media/media_web_contents_observer_unittest.cc
---- a/content/browser/media/media_web_contents_observer_unittest.cc	2026-10-29 22:47:18.350709104 +0530
-+++ b/content/browser/media/media_web_contents_observer_unittest.cc	2026-10-29 22:47:18.386508660 +0530
+--- a/content/browser/media/media_web_contents_observer_unittest.cc	2026-10-30 00:41:26.889226833 +0530
++++ b/content/browser/media/media_web_contents_observer_unittest.cc	2026-10-30 00:41:26.930272830 +0530
 @@ -42,6 +42,10 @@
    void SetAudioSinkId(const std::string& sink_id) override {}
    void SuspendForFrameClosed() override {}
@@ -1369,8 +1508,8 @@ diff --color -ruN a/content/browser/media/media_web_contents_observer_unittest.c
        RequestVisibilityCallback request_visibility_callback) override {}
    void RecordAutoPictureInPictureInfo(
 diff --color -ruN a/content/browser/media/session/media_session_controller_unittest.cc b/content/browser/media/session/media_session_controller_unittest.cc
---- a/content/browser/media/session/media_session_controller_unittest.cc	2026-10-29 22:47:18.351323396 +0530
-+++ b/content/browser/media/session/media_session_controller_unittest.cc	2026-10-29 22:47:18.387060652 +0530
+--- a/content/browser/media/session/media_session_controller_unittest.cc	2026-10-30 00:41:26.890173387 +0530
++++ b/content/browser/media/session/media_session_controller_unittest.cc	2026-10-30 00:41:26.930996006 +0530
 @@ -165,6 +165,10 @@
    void SuspendForFrameClosed() override {}
  
@@ -1383,8 +1522,8 @@ diff --color -ruN a/content/browser/media/session/media_session_controller_unitt
  
    void RequestVisibility(
 diff --color -ruN a/content/browser/picture_in_picture/picture_in_picture_service_impl_unittest.cc b/content/browser/picture_in_picture/picture_in_picture_service_impl_unittest.cc
---- a/content/browser/picture_in_picture/picture_in_picture_service_impl_unittest.cc	2026-10-29 22:47:18.347402652 +0530
-+++ b/content/browser/picture_in_picture/picture_in_picture_service_impl_unittest.cc	2026-10-29 22:47:18.381487391 +0530
+--- a/content/browser/picture_in_picture/picture_in_picture_service_impl_unittest.cc	2026-10-30 00:41:26.880595178 +0530
++++ b/content/browser/picture_in_picture/picture_in_picture_service_impl_unittest.cc	2026-10-30 00:41:26.922450810 +0530
 @@ -190,6 +190,10 @@
    void SetAudioSinkId(const std::string& sink_id) override {}
    void SuspendForFrameClosed() override {}
@@ -1396,9 +1535,97 @@ diff --color -ruN a/content/browser/picture_in_picture/picture_in_picture_servic
    void RequestSaveVideoFrame() override {}
    void RequestVisibility(
        RequestVisibilityCallback request_visibility_callback) override {}
+diff --color -ruN a/content/browser/renderer_host/render_widget_host_delegate.cc b/content/browser/renderer_host/render_widget_host_delegate.cc
+--- a/content/browser/renderer_host/render_widget_host_delegate.cc	2026-10-30 00:41:26.886105709 +0530
++++ b/content/browser/renderer_host/render_widget_host_delegate.cc	2026-10-30 00:41:26.928800644 +0530
+@@ -90,6 +90,10 @@
+   return false;
+ }
+ 
++bool RenderWidgetHostDelegate::TarkHoldsWindowScreenRect() {
++  return false;
++}
++
+ bool RenderWidgetHostDelegate::ShouldShowStaleContentOnEviction() {
+   return false;
+ }
+diff --color -ruN a/content/browser/renderer_host/render_widget_host_delegate.h b/content/browser/renderer_host/render_widget_host_delegate.h
+--- a/content/browser/renderer_host/render_widget_host_delegate.h	2026-10-30 00:41:26.888378197 +0530
++++ b/content/browser/renderer_host/render_widget_host_delegate.h	2026-10-30 00:41:26.929568862 +0530
+@@ -233,6 +233,11 @@
+   // Returns whether the associated tab is in fullscreen mode.
+   virtual bool IsFullscreen();
+ 
++  // Tark: whether the page should keep seeing its window at the screen's size
++  // (window.outerWidth/outerHeight, screenX/screenY) although the window
++  // shrank: Android's Picture in Picture window of the whole browser.
++  virtual bool TarkHoldsWindowScreenRect();
++
+   // Returns true if the widget's frame content needs to be stored before
+   // eviction and displayed until a new frame is generated. If false, a white
+   // solid color is displayed instead.
+diff --color -ruN a/content/browser/renderer_host/render_widget_host_impl.cc b/content/browser/renderer_host/render_widget_host_impl.cc
+--- a/content/browser/renderer_host/render_widget_host_impl.cc	2026-10-30 00:41:26.885777913 +0530
++++ b/content/browser/renderer_host/render_widget_host_impl.cc	2026-10-30 00:41:26.928474431 +0530
+@@ -727,12 +727,12 @@
+   }
+ 
+   if (last_view_screen_rect_ == view_->GetViewBoundsWithoutTransform() &&
+-      last_window_screen_rect_ == view_->GetBoundsInScreenWithoutTransform()) {
++      last_window_screen_rect_ == TarkWindowScreenRect()) {
+     return;
+   }
+ 
+   last_view_screen_rect_ = view_->GetViewBoundsWithoutTransform();
+-  last_window_screen_rect_ = view_->GetBoundsInScreenWithoutTransform();
++  last_window_screen_rect_ = TarkWindowScreenRect();
+   blink_widget_->UpdateScreenRects(
+       last_view_screen_rect_, last_window_screen_rect_,
+       base::BindOnce(&RenderWidgetHostImpl::OnUpdateScreenRectsAck,
+@@ -3075,13 +3075,25 @@
+   view_->SendInitialPropertiesIfNeeded();
+ 
+   if (view_->GetViewBoundsWithoutTransform() == last_view_screen_rect_ &&
+-      view_->GetBoundsInScreenWithoutTransform() == last_window_screen_rect_) {
++      TarkWindowScreenRect() == last_window_screen_rect_) {
+     return;
+   }
+ 
+   SendScreenRects();
+ }
+ 
++gfx::Rect RenderWidgetHostImpl::TarkWindowScreenRect() {
++  // Tark: in Android's Picture in Picture window of the whole browser, the
++  // page keeps seeing a screen-sized window. Some players read a small window
++  // (outerWidth * outerHeight against the screen's area) as a mini player and
++  // leave fullscreen or pause (m.youtube.com does both), which closes the
++  // window. The page's viewport (innerWidth/innerHeight) is the real one.
++  if (delegate_ && delegate_->TarkHoldsWindowScreenRect()) {
++    return GetScreenInfo().rect;
++  }
++  return view_->GetBoundsInScreenWithoutTransform();
++}
++
+ void RenderWidgetHostImpl::OnRenderFrameSubmission() {}
+ 
+ void RenderWidgetHostImpl::OnLocalSurfaceIdChanged(
+diff --color -ruN a/content/browser/renderer_host/render_widget_host_impl.h b/content/browser/renderer_host/render_widget_host_impl.h
+--- a/content/browser/renderer_host/render_widget_host_impl.h	2026-10-30 00:41:26.887662479 +0530
++++ b/content/browser/renderer_host/render_widget_host_impl.h	2026-10-30 00:41:26.929212066 +0530
+@@ -1237,6 +1237,10 @@
+   // IPC message handlers
+   void OnClose();
+   void OnUpdateScreenRectsAck();
++
++  // Tark: the window rect the renderer is told: the view's, or the screen's
++  // while the delegate holds it (TarkHoldsWindowScreenRect).
++  gfx::Rect TarkWindowScreenRect();
+   void OnUpdateDragOperation(DragOperationCallback callback,
+                              ui::mojom::DragOperation current_op,
+                              bool document_is_handling_drag);
 diff --color -ruN a/content/browser/web_contents/web_contents_impl.cc b/content/browser/web_contents/web_contents_impl.cc
---- a/content/browser/web_contents/web_contents_impl.cc	2026-10-29 22:47:18.348456338 +0530
-+++ b/content/browser/web_contents/web_contents_impl.cc	2026-10-29 22:47:18.382452356 +0530
+--- a/content/browser/web_contents/web_contents_impl.cc	2026-10-30 00:41:26.882760956 +0530
++++ b/content/browser/web_contents/web_contents_impl.cc	2026-10-30 00:41:26.923524866 +0530
 @@ -175,6 +175,7 @@
  #include "content/public/browser/site_isolation_policy.h"
  #include "content/public/browser/ssl_status.h"
@@ -1407,7 +1634,18 @@ diff --color -ruN a/content/browser/web_contents/web_contents_impl.cc b/content/
  #include "content/public/browser/web_contents_delegate.h"
  #include "content/public/browser/web_contents_view_delegate.h"
  #include "content/public/browser/web_ui_controller.h"
-@@ -12526,6 +12527,93 @@
+@@ -5494,6 +5495,10 @@
+   return delegate_ && delegate_->IsFullscreenForTabOrPending(this);
+ }
+ 
++bool WebContentsImpl::TarkHoldsWindowScreenRect() {
++  return tark_in_pip_window_;
++}
++
+ bool WebContentsImpl::ShouldShowStaleContentOnEviction() {
+   return GetDelegate() && GetDelegate()->ShouldShowStaleContentOnEviction(this);
+ }
+@@ -12526,6 +12531,110 @@
    observers_.NotifyObservers(&WebContentsObserver::MediaResized, size, id);
  }
  
@@ -1473,6 +1711,16 @@ diff --color -ruN a/content/browser/web_contents/web_contents_impl.cc b/content/
 +  return fresh;
 +}
 +
++void WebContentsImpl::TarkSetInPictureInPictureWindow(bool in_window) {
++  if (tark_in_pip_window_ == in_window || IsBeingDestroyed()) {
++    return;
++  }
++  tark_in_pip_window_ = in_window;
++  // Each widget compares against what it last sent, so only the window rect
++  // changes; a widget waiting for an ack sends it on the ack.
++  SendScreenRects();
++}
++
 +namespace tark_media {
 +
 +bool CanEnterPictureInPictureOnLeave(WebContents* web_contents) {
@@ -1496,12 +1744,19 @@ diff --color -ruN a/content/browser/web_contents/web_contents_impl.cc b/content/
 +                             ->TarkRequestFullscreenForPictureInPicture();
 +}
 +
++void SetInPictureInPictureWindow(WebContents* web_contents, bool in_window) {
++  if (web_contents) {
++    static_cast<WebContentsImpl*>(web_contents)
++        ->TarkSetInPictureInPictureWindow(in_window);
++  }
++}
++
 +}  // namespace tark_media
 +
  void WebContentsImpl::MediaEffectivelyFullscreenChanged(bool is_fullscreen) {
    OPTIONAL_TRACE_EVENT1("content",
                          "WebContentsImpl::MediaEffectivelyFullscreenChanged",
-@@ -12712,6 +12800,14 @@
+@@ -12712,6 +12821,14 @@
      return false;
    }
  
@@ -1517,9 +1772,17 @@ diff --color -ruN a/content/browser/web_contents/web_contents_impl.cc b/content/
    RenderFrameHostImpl* primary_main_frame = GetPrimaryMainFrame();
    RenderFrameHostImpl* host =
 diff --color -ruN a/content/browser/web_contents/web_contents_impl.h b/content/browser/web_contents/web_contents_impl.h
---- a/content/browser/web_contents/web_contents_impl.h	2026-10-29 22:47:18.348888813 +0530
-+++ b/content/browser/web_contents/web_contents_impl.h	2026-10-29 22:47:18.383564716 +0530
-@@ -1419,6 +1419,19 @@
+--- a/content/browser/web_contents/web_contents_impl.h	2026-10-30 00:41:26.883475007 +0530
++++ b/content/browser/web_contents/web_contents_impl.h	2026-10-30 00:41:26.925150929 +0530
+@@ -637,6 +637,7 @@
+   void StopFinding(StopFindAction action) override;
+   bool WasEverAudible() override;
+   bool IsFullscreen() override;
++  bool TarkHoldsWindowScreenRect() override;
+   bool ShouldShowStaleContentOnEviction() override;
+   void ExitFullscreen(bool will_cause_resize) override;
+   [[nodiscard]] std::optional<base::ScopedClosureRunner>
+@@ -1419,6 +1420,22 @@
    void MediaResized(const gfx::Size& size, const MediaPlayerId& id);
    void MediaEffectivelyFullscreenChanged(bool is_fullscreen);
  
@@ -1535,11 +1798,14 @@ diff --color -ruN a/content/browser/web_contents/web_contents_impl.h b/content/b
 +  // (needs no user activation). Uses the waiver up.
 +  bool TarkConsumePictureInPictureFullscreenWaiver(
 +      RenderFrameHostImpl* requesting_frame);
++  // The browser's Picture in Picture window opened or closed: while it's open
++  // the page keeps seeing a screen-sized window (TarkHoldsWindowScreenRect).
++  void TarkSetInPictureInPictureWindow(bool in_window);
 +
    // Called by MediaWebContentsObserver when a buffer underflow occurs. See the
    // WebContentsObserver function stubs for more details.
    void MediaBufferUnderflow(const MediaPlayerId& id);
-@@ -2725,6 +2738,16 @@
+@@ -2725,6 +2742,18 @@
    // players stopped when it's destroyed.
    base::flat_set<MediaPlayerId> tark_playing_players_;
    tark_media::VisibilityHold tark_visibility_hold_;
@@ -1553,12 +1819,14 @@ diff --color -ruN a/content/browser/web_contents/web_contents_impl.h b/content/b
 +  };
 +  std::optional<TarkPipFullscreenWaiver> tark_pip_fullscreen_waiver_;
 +  uint64_t tark_pip_fullscreen_requests_ = 0;
++  // Tark: this tab is shown in the browser's Picture in Picture window.
++  bool tark_in_pip_window_ = false;
  
    // Manages media players, CDMs, and power save blockers for media.
    std::unique_ptr<MediaWebContentsObserver> media_web_contents_observer_;
 diff --color -ruN a/content/public/browser/BUILD.gn b/content/public/browser/BUILD.gn
---- a/content/public/browser/BUILD.gn	2026-10-29 22:47:18.352165761 +0530
-+++ b/content/public/browser/BUILD.gn	2026-10-29 22:47:18.388090626 +0530
+--- a/content/public/browser/BUILD.gn	2026-10-30 00:41:26.891418028 +0530
++++ b/content/public/browser/BUILD.gn	2026-10-30 00:41:26.932795280 +0530
 @@ -461,6 +461,7 @@
      "surface_embed_connector.h",
      "swap_metrics_driver.h",
@@ -1569,8 +1837,8 @@ diff --color -ruN a/content/public/browser/BUILD.gn b/content/public/browser/BUI
      "tracing_delegate.cc",
 diff --color -ruN a/content/public/browser/tark_picture_in_picture.h b/content/public/browser/tark_picture_in_picture.h
 --- a/content/public/browser/tark_picture_in_picture.h	1970-01-01 05:30:00.000000000 +0530
-+++ b/content/public/browser/tark_picture_in_picture.h	2026-10-29 22:47:18.388354412 +0530
-@@ -0,0 +1,43 @@
++++ b/content/public/browser/tark_picture_in_picture.h	2026-10-30 00:41:26.933094825 +0530
+@@ -0,0 +1,50 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -1610,13 +1878,20 @@ diff --color -ruN a/content/public/browser/tark_picture_in_picture.h b/content/p
 +CONTENT_EXPORT bool RequestFullscreenForPictureInPicture(
 +    WebContents* web_contents);
 +
++// The browser's Picture in Picture window opened (`in_window`) or closed with
++// `web_contents` in it. While it's open the page keeps seeing a screen-sized
++// window (window.outerWidth/outerHeight): m.youtube.com reads a small window
++// as its mini player and leaves fullscreen and pauses, closing the window.
++CONTENT_EXPORT void SetInPictureInPictureWindow(WebContents* web_contents,
++                                                bool in_window);
++
 +}  // namespace tark_media
 +}  // namespace content
 +
 +#endif  // CONTENT_PUBLIC_BROWSER_TARK_PICTURE_IN_PICTURE_H_
 diff --color -ruN a/media/mojo/mojom/media_player.mojom b/media/mojo/mojom/media_player.mojom
---- a/media/mojo/mojom/media_player.mojom	2026-10-29 22:47:18.376935603 +0530
-+++ b/media/mojo/mojom/media_player.mojom	2026-10-29 22:47:18.416178379 +0530
+--- a/media/mojo/mojom/media_player.mojom	2026-10-30 00:41:26.918500759 +0530
++++ b/media/mojo/mojom/media_player.mojom	2026-10-30 00:41:26.962343417 +0530
 @@ -32,6 +32,14 @@
    // accounting for transforms and zoom).
    RequestEnterPictureInPicture(gfx.mojom.Size? min_size);
@@ -1633,8 +1908,8 @@ diff --color -ruN a/media/mojo/mojom/media_player.mojom b/media/mojo/mojom/media
    RequestMute(bool mute);
  
 diff --color -ruN a/third_party/blink/renderer/core/html/media/html_media_element.h b/third_party/blink/renderer/core/html/media/html_media_element.h
---- a/third_party/blink/renderer/core/html/media/html_media_element.h	2026-10-29 22:47:18.355512426 +0530
-+++ b/third_party/blink/renderer/core/html/media/html_media_element.h	2026-10-29 22:47:18.391649112 +0530
+--- a/third_party/blink/renderer/core/html/media/html_media_element.h	2026-10-30 00:41:26.894664196 +0530
++++ b/third_party/blink/renderer/core/html/media/html_media_element.h	2026-10-30 00:41:26.936123406 +0530
 @@ -679,6 +679,10 @@
    void SetAudioSinkId(const String&) override;
    void SuspendForFrameClosed() override;
@@ -1647,8 +1922,8 @@ diff --color -ruN a/third_party/blink/renderer/core/html/media/html_media_elemen
        RequestVisibilityCallback request_visibility_cb) override {}
    void RecordAutoPictureInPictureInfo(
 diff --color -ruN a/third_party/blink/renderer/core/html/media/html_video_element.cc b/third_party/blink/renderer/core/html/media/html_video_element.cc
---- a/third_party/blink/renderer/core/html/media/html_video_element.cc	2026-10-29 22:47:18.354495621 +0530
-+++ b/third_party/blink/renderer/core/html/media/html_video_element.cc	2026-10-29 22:47:18.390949308 +0530
+--- a/third_party/blink/renderer/core/html/media/html_video_element.cc	2026-10-30 00:41:26.893677766 +0530
++++ b/third_party/blink/renderer/core/html/media/html_video_element.cc	2026-10-30 00:41:26.935176352 +0530
 @@ -59,6 +59,7 @@
  #include "third_party/blink/renderer/core/frame/picture_in_picture_controller.h"
  #include "third_party/blink/renderer/core/frame/settings.h"
@@ -1678,8 +1953,8 @@ diff --color -ruN a/third_party/blink/renderer/core/html/media/html_video_elemen
    UpdateControlsVisibility();
  
 diff --color -ruN a/third_party/blink/renderer/core/html/media/html_video_element.h b/third_party/blink/renderer/core/html/media/html_video_element.h
---- a/third_party/blink/renderer/core/html/media/html_video_element.h	2026-10-29 22:47:18.354898718 +0530
-+++ b/third_party/blink/renderer/core/html/media/html_video_element.h	2026-10-29 22:47:18.391308191 +0530
+--- a/third_party/blink/renderer/core/html/media/html_video_element.h	2026-10-30 00:41:26.894034646 +0530
++++ b/third_party/blink/renderer/core/html/media/html_video_element.h	2026-10-30 00:41:26.935558357 +0530
 @@ -249,6 +249,8 @@
    void RequestEnterPictureInPicture(
        const std::optional<gfx::Size>& min_size) final;
@@ -1690,8 +1965,8 @@ diff --color -ruN a/third_party/blink/renderer/core/html/media/html_video_elemen
  
    void DidMoveToNewDocument(Document& old_document) override;
 diff --color -ruN a/third_party/blink/renderer/modules/webaudio/audio_context.h b/third_party/blink/renderer/modules/webaudio/audio_context.h
---- a/third_party/blink/renderer/modules/webaudio/audio_context.h	2026-10-29 22:59:49.719874532 +0530
-+++ b/third_party/blink/renderer/modules/webaudio/audio_context.h	2026-10-29 22:59:49.738697386 +0530
+--- a/third_party/blink/renderer/modules/webaudio/audio_context.h	2026-10-30 00:41:26.895620708 +0530
++++ b/third_party/blink/renderer/modules/webaudio/audio_context.h	2026-10-30 00:41:26.936843583 +0530
 @@ -198,6 +198,10 @@
    void SetAudioSinkId(const String&) override {}
    void SuspendForFrameClosed() override {}
