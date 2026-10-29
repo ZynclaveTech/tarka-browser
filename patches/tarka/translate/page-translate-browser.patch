@@ -44,7 +44,7 @@
  }
 --- a/chrome/browser/tark_captions/page_translator.h
 +++ b/chrome/browser/tark_captions/page_translator.h
-@@ -0,0 +1,73 @@
+@@ -0,0 +1,76 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -66,8 +66,10 @@
 +namespace tark_captions {
 +
 +// Tark: one tab's page translation in the browser. Sentences already
-+// translated are kept in memory (never on disk) and go when the tab does;
-+// the rest go to the speech process's TarkPageTranslator.
++// translated are kept in memory (never on disk) per `scope` (the page's
++// origin), so one site can't learn by timing what another site in the tab
++// had translated; they go when the tab does. The rest go to the speech
++// process's TarkPageTranslator.
 +class PageTranslator {
 + public:
 +  using Binder = base::RepeatingCallback<void(
@@ -82,7 +84,8 @@
 +  PageTranslator& operator=(const PageTranslator&) = delete;
 +  ~PageTranslator();
 +
-+  void Translate(const std::vector<std::string>& sentences,
++  void Translate(const std::string& scope,
++                 const std::vector<std::string>& sentences,
 +                 const std::string& source,
 +                 const std::string& target,
 +                 Callback callback);
@@ -120,7 +123,7 @@
 +#endif  // CHROME_BROWSER_TARK_CAPTIONS_PAGE_TRANSLATOR_H_
 --- a/chrome/browser/tark_captions/page_translator.cc
 +++ b/chrome/browser/tark_captions/page_translator.cc
-@@ -0,0 +1,117 @@
+@@ -0,0 +1,118 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -164,11 +167,12 @@
 +  return translator_.get();
 +}
 +
-+void PageTranslator::Translate(const std::vector<std::string>& sentences,
++void PageTranslator::Translate(const std::string& scope,
++                               const std::vector<std::string>& sentences,
 +                               const std::string& source,
 +                               const std::string& target,
 +                               Callback callback) {
-+  const std::string prefix = source + '\n' + target + '\n';
++  const std::string prefix = scope + '\n' + source + '\n' + target + '\n';
 +  std::vector<std::string> result(sentences.size());
 +  std::vector<std::string> todo;
 +  std::vector<size_t> positions;
@@ -240,7 +244,7 @@
 +}  // namespace tark_captions
 --- a/chrome/browser/tark_captions/page_translator_unittest.cc
 +++ b/chrome/browser/tark_captions/page_translator_unittest.cc
-@@ -0,0 +1,117 @@
+@@ -0,0 +1,126 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -295,9 +299,11 @@
 +            },
 +            &fake_)) {}
 +
-+  std::pair<bool, std::vector<std::string>> Translate(std::vector<std::string> sentences) {
++  std::pair<bool, std::vector<std::string>> Translate(
++      std::vector<std::string> sentences,
++      const std::string& scope = "https://a.example") {
 +    base::test::TestFuture<bool, std::vector<std::string>> done;
-+    translator_.Translate(sentences, "hi", "en", done.GetCallback());
++    translator_.Translate(scope, sentences, "hi", "en", done.GetCallback());
 +    return {done.Get<0>(), done.Get<1>()};
 +  }
 +
@@ -319,6 +325,13 @@
 +  EXPECT_TRUE(ok);
 +  EXPECT_THAT(out, ElementsAre("[b]", "[a]"));
 +  EXPECT_EQ(fake_.calls, 1);
++}
++
++TEST_F(PageTranslatorTest, OriginsDoNotShareTheCache) {
++  Translate({"a"}, "https://a.example");
++  ASSERT_EQ(fake_.calls, 1);
++  Translate({"a"}, "https://b.example");
++  EXPECT_EQ(fake_.calls, 2);
 +}
 +
 +TEST_F(PageTranslatorTest, OnlyNewSentencesAreAsked) {
@@ -360,7 +373,7 @@
 +}  // namespace tark_captions
 --- a/chrome/browser/tark_captions/page_translate_tab_helper.h
 +++ b/chrome/browser/tark_captions/page_translate_tab_helper.h
-@@ -0,0 +1,58 @@
+@@ -0,0 +1,60 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -373,6 +386,7 @@
 +#include "components/translate/content/common/translate.mojom.h"
 +#include "content/public/browser/web_contents_user_data.h"
 +#include "mojo/public/cpp/bindings/receiver_set.h"
++#include "url/origin.h"
 +
 +namespace content {
 +class RenderFrameHost;
@@ -410,7 +424,8 @@
 +  explicit PageTranslateTabHelper(content::WebContents* web_contents);
 +
 +  PageTranslator translator_;
-+  mojo::ReceiverSet<translate::mojom::TarkPageTranslateHost> receivers_;
++  // Each receiver's context is its frame's origin when bound.
++  mojo::ReceiverSet<translate::mojom::TarkPageTranslateHost, url::Origin> receivers_;
 +  base::RepeatingClosureList missing_changed_;
 +
 +  WEB_CONTENTS_USER_DATA_KEY_DECL();
@@ -421,7 +436,7 @@
 +#endif  // CHROME_BROWSER_TARK_CAPTIONS_PAGE_TRANSLATE_TAB_HELPER_H_
 --- a/chrome/browser/tark_captions/page_translate_tab_helper.cc
 +++ b/chrome/browser/tark_captions/page_translate_tab_helper.cc
-@@ -0,0 +1,79 @@
+@@ -0,0 +1,80 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -468,7 +483,8 @@
 +  }
 +  PageTranslateTabHelper::CreateForWebContents(web_contents);
 +  PageTranslateTabHelper* helper = PageTranslateTabHelper::FromWebContents(web_contents);
-+  helper->receivers_.Add(helper, std::move(receiver));
++  helper->receivers_.Add(helper, std::move(receiver),
++                         render_frame_host->GetLastCommittedOrigin());
 +}
 +
 +PageTranslateTabHelper::PageTranslateTabHelper(content::WebContents* web_contents)
@@ -490,7 +506,7 @@
 +                                       const std::string& target,
 +                                       TranslateCallback callback) {
 +  translator_.Translate(
-+      sentences, source, target,
++      receivers_.current_context().Serialize(), sentences, source, target,
 +      base::BindOnce(
 +          [](TranslateCallback callback, bool ok, std::vector<std::string> translations) {
 +            std::move(callback).Run(ok, std::move(translations));
