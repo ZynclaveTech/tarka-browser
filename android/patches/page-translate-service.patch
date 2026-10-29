@@ -1,0 +1,795 @@
+--- a/chrome/services/tark_captions/BUILD.gn
++++ b/chrome/services/tark_captions/BUILD.gn
+@@ -4,7 +4,8 @@
+ #
+ # Tark for Android's live captions process: the caption engine on the model
+ # files the browser hands over. CaptionSession has no mojo or engine
+-# dependencies, so its tests build for the build machine.
++# dependencies, so its tests build for the build machine; so has
++# PageTranslator (page translation on the same model slot).
+ 
+ import("//testing/test.gni")
+ 
+@@ -12,6 +13,8 @@
+   sources = [
+     "caption_session.cc",
+     "caption_session.h",
++    "page_translator.cc",
++    "page_translator.h",
+   ]
+   deps = [ "//base" ]
+ }
+@@ -32,7 +35,10 @@
+ 
+ if (!is_android) {
+   test("tark_captions_session_unittests") {
+-    sources = [ "caption_session_unittest.cc" ]
++    sources = [
++      "caption_session_unittest.cc",
++      "page_translator_unittest.cc",
++    ]
+     deps = [
+       ":session",
+       "//base",
+--- a/chrome/services/tark_captions/caption_service_impl.cc
++++ b/chrome/services/tark_captions/caption_service_impl.cc
+@@ -115,7 +115,8 @@
+ 
+ CaptionServiceImpl::CaptionServiceImpl(mojo::PendingReceiver<mojom::CaptionService> receiver)
+     : receiver_(this, std::move(receiver)),
+-      session_(base::BindRepeating(&MakeEngine), base::BindRepeating(&MakeTranslator)) {}
++      session_(base::BindRepeating(&MakeEngine), base::BindRepeating(&MakeTranslator)),
++      page_(&session_, base::BindRepeating(&MakeTranslator)) {}
+ 
+ CaptionServiceImpl::~CaptionServiceImpl() = default;
+ 
+@@ -173,4 +174,26 @@
+   session_.Stop();
+ }
+ 
++void CaptionServiceImpl::BindPageTranslator(
++    mojo::PendingReceiver<mojom::PageTranslator> receiver) {
++  page_receivers_.Add(this, std::move(receiver));
++}
++
++void CaptionServiceImpl::TranslateBatch(const std::string& source,
++                                        const std::string& target,
++                                        base::flat_map<std::string, base::File> files,
++                                        const std::vector<std::string>& texts,
++                                        TranslateBatchCallback callback) {
++  std::map<std::string, base::File> by_name;
++  for (auto& [name, file] : files) {
++    by_name.emplace(name, std::move(file));
++  }
++  page_.TranslateBatch(source, target, std::move(by_name), texts,
++                       base::BindOnce(
++                           [](TranslateBatchCallback callback, PageResults results) {
++                             std::move(callback).Run(results);
++                           },
++                           std::move(callback)));
++}
++
+ }  // namespace tark_captions
+--- a/chrome/services/tark_captions/caption_service_impl.h
++++ b/chrome/services/tark_captions/caption_service_impl.h
+@@ -5,17 +5,22 @@
+ #ifndef CHROME_SERVICES_TARK_CAPTIONS_CAPTION_SERVICE_IMPL_H_
+ #define CHROME_SERVICES_TARK_CAPTIONS_CAPTION_SERVICE_IMPL_H_
+ 
++#include <memory>
++
+ #include "chrome/services/tark_captions/caption_session.h"
++#include "chrome/services/tark_captions/page_translator.h"
+ #include "chrome/services/tark_captions/public/mojom/tark_captions.mojom.h"
+ #include "mojo/public/cpp/bindings/pending_receiver.h"
+ #include "mojo/public/cpp/bindings/receiver.h"
++#include "mojo/public/cpp/bindings/receiver_set.h"
+ #include "mojo/public/cpp/bindings/remote.h"
+ 
+ namespace tark_captions {
+ 
+ // The captions process's service: a CaptionSession running Tark's caption
+-// engine on the handed-over files.
+-class CaptionServiceImpl : public mojom::CaptionService {
++// engine on the handed-over files, and page translation sharing its model
++// slot.
++class CaptionServiceImpl : public mojom::CaptionService, public mojom::PageTranslator {
+  public:
+   explicit CaptionServiceImpl(mojo::PendingReceiver<mojom::CaptionService> receiver);
+   CaptionServiceImpl(const CaptionServiceImpl&) = delete;
+@@ -32,11 +37,22 @@
+                  base::flat_map<std::string, base::File> files,
+                  SetTargetCallback callback) override;
+   void Stop() override;
++  void BindPageTranslator(mojo::PendingReceiver<mojom::PageTranslator> receiver) override;
++
++  // mojom::PageTranslator:
++  void TranslateBatch(const std::string& source,
++                      const std::string& target,
++                      base::flat_map<std::string, base::File> files,
++                      const std::vector<std::string>& texts,
++                      TranslateBatchCallback callback) override;
+ 
+  private:
+   mojo::Receiver<mojom::CaptionService> receiver_;
+   mojo::Remote<mojom::CaptionClient> client_;
+   CaptionSession session_;
++  // After `session_`, so it goes first.
++  tark_captions::PageTranslator page_;
++  mojo::ReceiverSet<mojom::PageTranslator> page_receivers_;
+ };
+ 
+ }  // namespace tark_captions
+--- a/chrome/services/tark_captions/caption_session.cc
++++ b/chrome/services/tark_captions/caption_session.cc
+@@ -81,8 +81,22 @@
+ }
+ 
+ bool CaptionSession::SetTarget(const std::string& target, std::map<std::string, base::File> files) {
++  const bool ok = SetTargetInternal(target, std::move(files));
++  if (on_translation_changed_) {
++    on_translation_changed_.Run();
++  }
++  return ok;
++}
++
++void CaptionSession::SetTranslationChangedCallback(base::RepeatingClosure callback) {
++  on_translation_changed_ = std::move(callback);
++}
++
++bool CaptionSession::SetTargetInternal(const std::string& target,
++                                       std::map<std::string, base::File> files) {
+   ++generation_;
+   target_.clear();
++  units_.clear();
+   translator_.reset();  // deleted on the translation sequence
+   if (target.empty()) {
+     return true;
+@@ -113,6 +127,7 @@
+   translator_ = std::unique_ptr<Translator, base::OnTaskRunnerDeleter>(
+       translator.release(), base::OnTaskRunnerDeleter(translation_runner_));
+   target_ = target;
++  units_ = std::move(units);
+   return true;
+ }
+ 
+--- a/chrome/services/tark_captions/caption_session.h
++++ b/chrome/services/tark_captions/caption_session.h
+@@ -10,6 +10,7 @@
+ #include <map>
+ #include <memory>
+ #include <optional>
++#include <set>
+ #include <string>
+ #include <string_view>
+ #include <vector>
+@@ -94,9 +95,24 @@
+   bool SetTarget(const std::string& target, std::map<std::string, base::File> files);
+   void Stop();
+ 
++  // Page translation shares the process's one model slot with captions'
++  // Translate (captions win). The units captions' translator holds now
++  // ("tr_indic_en", ...); empty while Translate is off.
++  const std::set<std::string>& translation_units() const { return units_; }
++  // Captions' translator, for a task posted to translation_runner() before
++  // the next SetTarget (it is deleted on that sequence, after such a task).
++  Translator* shared_translator() const { return translator_.get(); }
++  const scoped_refptr<base::SequencedTaskRunner>& translation_runner() const {
++    return translation_runner_;
++  }
++  // Run at the end of every SetTarget (and Stop), before any caption is
++  // translated with the new translator.
++  void SetTranslationChangedCallback(base::RepeatingClosure callback);
++
+  private:
+   void OnEngineCaption(bool is_final, std::string text);
+   void OnTranslated(uint64_t generation, uint32_t caption_id, std::optional<std::string> text);
++  bool SetTargetInternal(const std::string& target, std::map<std::string, base::File> files);
+ 
+   EngineFactory factory_;
+   TranslatorFactory translator_factory_;
+@@ -110,6 +126,8 @@
+   scoped_refptr<base::SequencedTaskRunner> translation_runner_;
+   std::unique_ptr<Translator, base::OnTaskRunnerDeleter> translator_;
+   std::string target_;
++  std::set<std::string> units_;
++  base::RepeatingClosure on_translation_changed_;
+   uint64_t generation_ = 0;  // a translation for an older target is dropped
+   base::WeakPtrFactory<CaptionSession> weak_factory_{this};
+ };
+--- /dev/null
++++ b/chrome/services/tark_captions/page_translator.cc
+@@ -0,0 +1,228 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/services/tark_captions/page_translator.h"
++
++#include <set>
++#include <utility>
++
++#include "base/containers/contains.h"
++#include "base/functional/bind.h"
++
++namespace tark_captions {
++
++namespace {
++
++constexpr char kIndicToEnglish[] = "tr_indic_en";
++constexpr char kEnglishToIndic[] = "tr_en_indic";
++constexpr char kSpanishToEnglish[] = "tr_es_en";
++
++// The 22 scheduled languages IndicTrans2 covers.
++bool IsIndian(std::string_view code) {
++  static constexpr std::string_view kIndian[] = {
++      "as", "bn", "brx", "doi", "gu",  "hi", "kn", "ks", "kok", "mai", "ml",
++      "mni", "mr", "ne", "or",  "pa", "sa",  "sat", "sd", "ta", "te",  "ur"};
++  return base::Contains(kIndian, code);
++}
++
++// The leg's translation: null when the model fails or gives nothing.
++std::optional<std::string> Checked(std::optional<std::string> text) {
++  if (!text || text->empty()) {
++    return std::nullopt;
++  }
++  return text;
++}
++
++// Captions' translator holds every model the batch needs.
++PageResults TranslateShared(Translator* translator,
++                            const std::string& source,
++                            const std::string& target,
++                            std::vector<std::string> texts) {
++  PageResults results;
++  results.reserve(texts.size());
++  for (const std::string& text : texts) {
++    results.push_back(Checked(translator->Translate(text, source, target)));
++  }
++  return results;
++}
++
++}  // namespace
++
++std::vector<PageLeg> PageLegsFor(std::string_view source, std::string_view target) {
++  std::vector<PageLeg> legs;
++  if (source == target) {
++    return legs;
++  }
++  const std::string to_english = source == "es"     ? kSpanishToEnglish
++                                 : IsIndian(source) ? kIndicToEnglish
++                                                    : "";
++  if (source != "en") {
++    if (to_english.empty()) {
++      return {};
++    }
++    legs.push_back({to_english, std::string(source), "en"});
++  }
++  if (target != "en") {
++    if (!IsIndian(target)) {
++      return {};
++    }
++    legs.push_back({kEnglishToIndic, "en", std::string(target)});
++  }
++  return legs;
++}
++
++struct PageTranslator::Slot {
++  explicit Slot(TranslatorFactory factory) : factory(std::move(factory)) {}
++  TranslatorFactory factory;
++  std::string unit;  // what `translator` was made from
++  std::unique_ptr<Translator> translator;
++};
++
++struct PageTranslator::Batch {
++  std::string source;
++  std::string target;
++  std::vector<PageLeg> legs;
++  std::map<std::string, base::File> files;
++  std::vector<std::string> texts;
++  PageBatchCallback callback;
++};
++
++namespace {
++
++// `slot` holds `unit`'s model afterwards, made from `files` unless it held
++// it already; the previous model is unloaded first. False if a file is
++// missing or the model can't be made.
++bool Load(PageTranslator::Slot* slot,
++          const std::string& unit,
++          std::map<std::string, base::File>& files) {
++  if (slot->translator && slot->unit == unit) {
++    return true;
++  }
++  slot->translator.reset();  // never two models at once
++  slot->unit.clear();
++  std::map<std::string, base::File> unit_files;
++  for (const std::string& name : CaptionSession::TranslationFiles()) {
++    auto it = files.find(unit + "/" + name);
++    if (it == files.end() || !it->second.IsValid()) {
++      return false;
++    }
++    unit_files.emplace(it->first, std::move(it->second));
++  }
++  slot->translator = slot->factory.Run(std::move(unit_files));
++  if (!slot->translator) {
++    return false;
++  }
++  slot->unit = unit;
++  return true;
++}
++
++// The page's own model slot, one leg (one model) at a time.
++PageResults TranslateOwn(PageTranslator::Slot* slot,
++                         std::vector<PageLeg> legs,
++                         std::map<std::string, base::File> files,
++                         std::vector<std::string> texts) {
++  PageResults results(texts.begin(), texts.end());
++  for (const PageLeg& leg : legs) {
++    if (!Load(slot, leg.unit, files)) {
++      return PageResults(texts.size());
++    }
++    for (std::optional<std::string>& text : results) {
++      if (text) {
++        text = Checked(slot->translator->Translate(*text, leg.source, leg.target));
++      }
++    }
++  }
++  return results;
++}
++
++}  // namespace
++
++PageTranslator::PageTranslator(CaptionSession* session, TranslatorFactory factory)
++    : session_(session),
++      runner_(session->translation_runner()),
++      slot_(new Slot(std::move(factory)), base::OnTaskRunnerDeleter(runner_)) {
++  session_->SetTranslationChangedCallback(base::BindRepeating(
++      &PageTranslator::OnCaptionsTranslationChanged, weak_factory_.GetWeakPtr()));
++}
++
++PageTranslator::~PageTranslator() {
++  session_->SetTranslationChangedCallback(base::RepeatingClosure());
++}
++
++void PageTranslator::TranslateBatch(const std::string& source,
++                                    const std::string& target,
++                                    std::map<std::string, base::File> files,
++                                    std::vector<std::string> texts,
++                                    PageBatchCallback callback) {
++  auto batch = std::make_unique<Batch>();
++  batch->source = source;
++  batch->target = target;
++  batch->legs = PageLegsFor(source, target);
++  batch->files = std::move(files);
++  batch->texts = std::move(texts);
++  batch->callback = std::move(callback);
++  queue_.push_back(std::move(batch));
++  Pump();
++}
++
++void PageTranslator::OnCaptionsTranslationChanged() {
++  if (!session_->translation_units().empty()) {
++    DropOwnModel();  // captions win; queued before any caption translates
++  }
++  Pump();
++}
++
++void PageTranslator::DropOwnModel() {
++  runner_->PostTask(FROM_HERE, base::BindOnce(
++                                   [](Slot* slot) {
++                                     slot->translator.reset();
++                                     slot->unit.clear();
++                                   },
++                                   base::Unretained(slot_.get())));
++}
++
++void PageTranslator::Pump() {
++  while (!running_ && !queue_.empty()) {
++    Batch& batch = *queue_.front();
++    if (batch.legs.empty()) {  // no model for the pair: originals stay
++      std::unique_ptr<Batch> done = std::move(queue_.front());
++      queue_.pop_front();
++      std::move(done->callback).Run(PageResults(done->texts.size()));
++      continue;
++    }
++    const std::set<std::string>& held = session_->translation_units();
++    if (!held.empty()) {
++      for (const PageLeg& leg : batch.legs) {
++        if (!held.contains(leg.unit)) {
++          return;  // captions hold another model: wait for them
++        }
++      }
++      running_ = true;
++      // The translator is deleted on the translation sequence, after this.
++      runner_->PostTaskAndReplyWithResult(
++          FROM_HERE,
++          base::BindOnce(&TranslateShared, base::Unretained(session_->shared_translator()),
++                         batch.source, batch.target, std::move(batch.texts)),
++          base::BindOnce(&PageTranslator::OnBatchDone, weak_factory_.GetWeakPtr()));
++      return;
++    }
++    running_ = true;
++    // The slot is deleted on the translation sequence, after this.
++    runner_->PostTaskAndReplyWithResult(
++        FROM_HERE,
++        base::BindOnce(&TranslateOwn, base::Unretained(slot_.get()), batch.legs,
++                       std::move(batch.files), std::move(batch.texts)),
++        base::BindOnce(&PageTranslator::OnBatchDone, weak_factory_.GetWeakPtr()));
++  }
++}
++
++void PageTranslator::OnBatchDone(PageResults results) {
++  running_ = false;
++  std::unique_ptr<Batch> done = std::move(queue_.front());
++  queue_.pop_front();
++  std::move(done->callback).Run(std::move(results));
++  Pump();
++}
++
++}  // namespace tark_captions
+--- /dev/null
++++ b/chrome/services/tark_captions/page_translator.h
+@@ -0,0 +1,93 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_SERVICES_TARK_CAPTIONS_PAGE_TRANSLATOR_H_
++#define CHROME_SERVICES_TARK_CAPTIONS_PAGE_TRANSLATOR_H_
++
++#include <map>
++#include <memory>
++#include <optional>
++#include <string>
++#include <string_view>
++#include <vector>
++
++#include "base/containers/circular_deque.h"
++#include "base/files/file.h"
++#include "base/functional/callback.h"
++#include "base/memory/raw_ptr.h"
++#include "base/memory/weak_ptr.h"
++#include "base/task/sequenced_task_runner.h"
++#include "chrome/services/tark_captions/caption_session.h"
++
++namespace tark_captions {
++
++// One model hop of a page batch: `unit` ("tr_indic_en", ...) translating
++// `source` into `target`.
++struct PageLeg {
++  std::string unit;
++  std::string source;
++  std::string target;
++};
++
++// The hops from `source` into `target` (ISO codes), in order: Indian and
++// Spanish sources go through English, so Indian ↔ Indian is two legs, one
++// model each. Empty when there is no model for the pair (or they are equal).
++std::vector<PageLeg> PageLegsFor(std::string_view source, std::string_view target);
++
++using PageResults = std::vector<std::optional<std::string>>;
++using PageBatchCallback = base::OnceCallback<void(PageResults results)>;
++
++// Tark for Android's page translation, without mojo. It owns no model of its
++// own: it uses the process's one model slot, shared with `session`'s
++// Translate. Never two IndicTrans2 models at once:
++// - captions' Translate holds every model the batch needs: the batch uses
++//   captions' translator (no second load);
++// - captions hold another model: the batch waits until they let it go
++//   (captions win);
++// - captions hold none: the batch loads one model at a time, leg by leg,
++//   unloading the previous one first.
++// Batches run one after another, in order, on the session's translation
++// sequence. Each sentence is translated whole; a failed or empty one comes
++// back null (the page keeps the original).
++class PageTranslator {
++ public:
++  // `session` outlives this; `factory` makes a translator from one unit's
++  // files and is run on the translation sequence.
++  PageTranslator(CaptionSession* session, TranslatorFactory factory);
++  PageTranslator(const PageTranslator&) = delete;
++  PageTranslator& operator=(const PageTranslator&) = delete;
++  ~PageTranslator();
++
++  // `files` are the units for the direction, keyed "<unit>/<name>" (both
++  // legs for Indian ↔ Indian). Results align with `texts`.
++  void TranslateBatch(const std::string& source,
++                      const std::string& target,
++                      std::map<std::string, base::File> files,
++                      std::vector<std::string> texts,
++                      PageBatchCallback callback);
++
++  // The page's own model, on the translation sequence.
++  struct Slot;
++
++ private:
++  struct Batch;
++
++  void OnCaptionsTranslationChanged();
++  // Starts the front batch unless one is running or it has to wait.
++  void Pump();
++  void OnBatchDone(PageResults results);
++  // Unloads the page's own model (captions now hold the slot).
++  void DropOwnModel();
++
++  raw_ptr<CaptionSession> session_;
++  scoped_refptr<base::SequencedTaskRunner> runner_;
++  std::unique_ptr<Slot, base::OnTaskRunnerDeleter> slot_;
++  base::circular_deque<std::unique_ptr<Batch>> queue_;
++  bool running_ = false;
++  base::WeakPtrFactory<PageTranslator> weak_factory_{this};
++};
++
++}  // namespace tark_captions
++
++#endif  // CHROME_SERVICES_TARK_CAPTIONS_PAGE_TRANSLATOR_H_
+--- /dev/null
++++ b/chrome/services/tark_captions/page_translator_unittest.cc
+@@ -0,0 +1,238 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/services/tark_captions/page_translator.h"
++
++#include <algorithm>
++#include <map>
++#include <memory>
++#include <string>
++#include <vector>
++
++#include "base/files/file.h"
++#include "base/files/file_util.h"
++#include "base/files/scoped_temp_dir.h"
++#include "base/functional/bind.h"
++#include "base/memory/raw_ptr.h"
++#include "base/synchronization/lock.h"
++#include "base/test/task_environment.h"
++#include "base/test/test_future.h"
++#include "chrome/services/tark_captions/caption_session.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace tark_captions {
++namespace {
++
++// What every fake translator saw, from any sequence. A model counts as
++// loaded from its first Translate (as TranslationEngine loads on first use)
++// until the translator is deleted.
++struct Models {
++  base::Lock lock;
++  int loaded = 0;
++  int most_loaded = 0;
++  int made = 0;
++  std::vector<std::string> events;  // "load:<unit>", "unload:<unit>"
++  std::vector<std::string> received;
++  std::string fail;   // this text comes back nullopt
++  std::string blank;  // this text comes back ""
++};
++
++class FakeTranslator : public Translator {
++ public:
++  FakeTranslator(Models* models, std::string unit) : models_(models), unit_(std::move(unit)) {
++    base::AutoLock hold(models_->lock);
++    ++models_->made;
++  }
++  ~FakeTranslator() override {
++    base::AutoLock hold(models_->lock);
++    if (loaded_) {
++      --models_->loaded;
++      models_->events.push_back("unload:" + unit_);
++    }
++  }
++  std::optional<std::string> Translate(std::string_view text,
++                                       std::string_view source,
++                                       std::string_view target) override {
++    base::AutoLock hold(models_->lock);
++    if (!loaded_) {
++      loaded_ = true;
++      ++models_->loaded;
++      models_->most_loaded = std::max(models_->most_loaded, models_->loaded);
++      EXPECT_LE(models_->loaded, 1) << "two models at once";
++      models_->events.push_back("load:" + unit_);
++    }
++    models_->received.emplace_back(text);
++    if (text == models_->fail) {
++      return std::nullopt;
++    }
++    if (text == models_->blank) {
++      return "";
++    }
++    return std::string(target) + ":" + std::string(text);
++  }
++
++ private:
++  raw_ptr<Models> models_;
++  std::string unit_;
++  bool loaded_ = false;
++};
++
++class PageTranslatorTest : public testing::Test {
++ protected:
++  void SetUp() override { ASSERT_TRUE(dir_.CreateUniqueTempDir()); }
++
++  TranslatorFactory Factory() {
++    return base::BindRepeating(
++        [](Models* models, std::map<std::string, base::File> files) -> std::unique_ptr<Translator> {
++          std::string units;
++          for (const auto& [name, file] : files) {
++            const std::string unit = name.substr(0, name.find('/'));
++            if (units.find(unit) == std::string::npos) {
++              units += (units.empty() ? "" : "+") + unit;
++            }
++          }
++          return std::make_unique<FakeTranslator>(models, units);
++        },
++        base::Unretained(&models_));
++  }
++
++  // The six files of each translation unit, keyed "<unit>/<name>".
++  std::map<std::string, base::File> Units(const std::vector<std::string>& units) {
++    std::map<std::string, base::File> files;
++    for (const std::string& unit : units) {
++      for (const std::string& name : CaptionSession::TranslationFiles()) {
++        const base::FilePath path = dir_.GetPath().AppendASCII(unit + "/" + name);
++        EXPECT_TRUE(base::CreateDirectory(path.DirName()));
++        EXPECT_TRUE(base::WriteFile(path, "x"));
++        files.emplace(unit + "/" + name,
++                      base::File(path, base::File::FLAG_OPEN | base::File::FLAG_READ));
++      }
++    }
++    return files;
++  }
++
++  PageResults Translate(PageTranslator& page,
++                        const std::string& source,
++                        const std::string& target,
++                        const std::vector<std::string>& units,
++                        std::vector<std::string> texts) {
++    base::test::TestFuture<PageResults> done;
++    page.TranslateBatch(source, target, Units(units), std::move(texts), done.GetCallback());
++    return done.Take();
++  }
++
++  base::test::TaskEnvironment task_environment_;
++  base::ScopedTempDir dir_;
++  Models models_;
++  CaptionSession session_{base::BindRepeating(
++                              [](std::map<std::string, base::File>, const EngineOptions&,
++                                 CaptionCallback) -> std::unique_ptr<SpeechEngine> {
++                                return nullptr;
++                              }),
++                          Factory()};
++};
++
++// hi → ta goes through English: Indian → English loads, translates and
++// unloads before English → Indian loads.
++TEST_F(PageTranslatorTest, IndianToIndianUsesOneModelAtATime) {
++  PageTranslator page(&session_, Factory());
++  const PageResults results =
++      Translate(page, "hi", "ta", {"tr_indic_en", "tr_en_indic"}, {"नमस्ते", "धन्यवाद"});
++  EXPECT_EQ(results, (PageResults{"ta:en:नमस्ते", "ta:en:धन्यवाद"}));
++  base::AutoLock hold(models_.lock);
++  EXPECT_EQ(models_.events, (std::vector<std::string>{"load:tr_indic_en", "unload:tr_indic_en",
++                                                     "load:tr_en_indic"}));
++  EXPECT_EQ(models_.most_loaded, 1);
++}
++
++TEST_F(PageTranslatorTest, FailedSentenceIsNull) {
++  models_.fail = "दो";
++  PageTranslator page(&session_, Factory());
++  const PageResults results = Translate(page, "hi", "en", {"tr_indic_en"}, {"एक", "दो", "तीन"});
++  EXPECT_EQ(results, (PageResults{"en:एक", std::nullopt, "en:तीन"}));
++}
++
++TEST_F(PageTranslatorTest, EmptyOutputIsNull) {
++  models_.blank = "एक";
++  PageTranslator page(&session_, Factory());
++  const PageResults results = Translate(page, "hi", "en", {"tr_indic_en"}, {"एक"});
++  EXPECT_EQ(results, (PageResults{std::nullopt}));
++}
++
++// A sentence mixing scripts is one sentence: it is not split by script.
++TEST_F(PageTranslatorTest, MixedScriptSentenceSentWhole) {
++  PageTranslator page(&session_, Factory());
++  Translate(page, "hi", "en", {"tr_indic_en"}, {"मेरा iPhone नया है"});
++  base::AutoLock hold(models_.lock);
++  EXPECT_EQ(models_.received, (std::vector<std::string>{"मेरा iPhone नया है"}));
++}
++
++// Captions' Translate holds Indian → English and the page asks hi → en: the
++// page uses captions' model, with no second load.
++TEST_F(PageTranslatorTest, SameDirectionAsCaptionsShares) {
++  ASSERT_TRUE(session_.SetTarget("en", Units({"tr_indic_en"})));
++  PageTranslator page(&session_, Factory());
++  const PageResults results = Translate(page, "hi", "en", {"tr_indic_en"}, {"नमस्ते"});
++  EXPECT_EQ(results, (PageResults{"en:नमस्ते"}));
++  base::AutoLock hold(models_.lock);
++  EXPECT_EQ(models_.made, 1);  // captions' translator only
++  EXPECT_EQ(models_.events, (std::vector<std::string>{"load:tr_indic_en"}));
++}
++
++// Captions hold Indian → English and the page asks en → hi: captions win,
++// and the batch completes only once captions' Translate goes off.
++TEST_F(PageTranslatorTest, DifferentModelThanCaptionsWaits) {
++  ASSERT_TRUE(session_.SetTarget("en", Units({"tr_indic_en"})));
++  PageTranslator page(&session_, Factory());
++  base::test::TestFuture<PageResults> done;
++  page.TranslateBatch("en", "hi", Units({"tr_en_indic"}), {"hello"}, done.GetCallback());
++  task_environment_.RunUntilIdle();
++  EXPECT_FALSE(done.IsReady());
++  {
++    base::AutoLock hold(models_.lock);
++    EXPECT_EQ(models_.made, 1);  // the page made no model of its own
++  }
++  ASSERT_TRUE(session_.SetTarget("", {}));
++  EXPECT_EQ(done.Take(), (PageResults{"hi:hello"}));
++  base::AutoLock hold(models_.lock);
++  EXPECT_EQ(models_.most_loaded, 1);
++}
++
++// Batches complete in the order they were asked for.
++TEST_F(PageTranslatorTest, BatchesRunInOrder) {
++  PageTranslator page(&session_, Factory());
++  std::vector<int> order;
++  base::test::TestFuture<void> both;
++  page.TranslateBatch("hi", "en", Units({"tr_indic_en"}), {"एक"},
++                      base::BindOnce([](std::vector<int>* order, PageResults) { order->push_back(1); },
++                                     &order));
++  page.TranslateBatch("en", "ta", Units({"tr_en_indic"}), {"two"},
++                      base::BindOnce(
++                          [](std::vector<int>* order, base::OnceClosure done, PageResults) {
++                            order->push_back(2);
++                            std::move(done).Run();
++                          },
++                          &order, both.GetCallback()));
++  ASSERT_TRUE(both.Wait());
++  EXPECT_EQ(order, (std::vector<int>{1, 2}));
++}
++
++TEST_F(PageTranslatorTest, Legs) {
++  auto units = [](std::string_view source, std::string_view target) {
++    std::vector<std::string> names;
++    for (const PageLeg& leg : PageLegsFor(source, target)) {
++      names.push_back(leg.unit);
++    }
++    return names;
++  };
++  EXPECT_EQ(units("hi", "en"), (std::vector<std::string>{"tr_indic_en"}));
++  EXPECT_EQ(units("en", "mni"), (std::vector<std::string>{"tr_en_indic"}));
++  EXPECT_EQ(units("ta", "hi"), (std::vector<std::string>{"tr_indic_en", "tr_en_indic"}));
++  EXPECT_EQ(units("es", "en"), (std::vector<std::string>{"tr_es_en"}));
++  EXPECT_TRUE(units("fr", "en").empty());
++  EXPECT_TRUE(units("hi", "hi").empty());
++}
++
++}  // namespace
++}  // namespace tark_captions
+--- a/chrome/services/tark_captions/public/mojom/tark_captions.mojom
++++ b/chrome/services/tark_captions/public/mojom/tark_captions.mojom
+@@ -27,6 +27,18 @@
+   OnTranslation(uint32 caption_id, string text);
+ };
+ 
++// Page translation, in this same process: it shares the one model slot with
++// captions' Translate (never two IndicTrans2 models in memory; captions win
++// on a different model, and the two share the same direction).
++interface PageTranslator {
++  // `source`/`target` are ISO codes; `files` the model units for that
++  // direction, keyed "<unit>/<name>" (both legs for Indian↔Indian). Results
++  // align with `texts`; null = failed (keep original).
++  TranslateBatch(string source, string target,
++                 map<string, mojo_base.mojom.ReadOnlyFile> files,
++                 array<string> texts) => (array<string?> results);
++};
++
+ [ServiceSandbox=sandbox.mojom.Sandbox.kUtility]
+ interface CaptionService {
+   // `files`: the model folder's files by name (CaptionSession's list).
+@@ -41,4 +53,6 @@
+   // Speech goes on either way. False if a unit lacks a file.
+   SetTarget(string target, map<string, mojo_base.mojom.ReadOnlyFile> files) => (bool ok);
+   Stop();
++  // Page translation on this process's model slot.
++  BindPageTranslator(pending_receiver<PageTranslator> receiver);
+ };
