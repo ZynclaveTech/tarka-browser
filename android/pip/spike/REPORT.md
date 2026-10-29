@@ -4,9 +4,10 @@
 Tark patch touches them, except ChromeActivity.java (captions-ui.patch and
 speech-language-snackbar.patch, elsewhere in the file).
 
-**Verdict: FLOATS (provisional).** It's shown on the emulator's stock 156-r1 by
-emulating the three hooks from the page. The throwaway build with the real
-hooks hasn't run yet (see "Build").
+**Verdict: FLOATS.** Confirmed on emulator-5554 with a throwaway build of the
+three hooks (job jobs/tark-build-20261029-160149, build and junit passed). YouTube
+floats inline and from fullscreen, keeps playing, and the page never sees
+`hidden`. No page-side tricks were used (see "Spike build result").
 
 ## (d) Why YouTube doesn't float (emulator-5554, m.youtube.com/watch)
 
@@ -100,5 +101,31 @@ There are two paths in 156:
   - `android/desktop-only-patches.txt` lacks `tarka/linux/`, so `tarka/linux/captions.patch` fails.
   - `adblock-desktop.patch`'s `chrome.release` hunk (from #58) assumes the Windows patches, which Android skips.
   - The spike branch works around both.
-- The third job couldn't start: another session began a `--fresh` Linux build on the machine (15:08). **The build is pending.** The emulator confirmation (inline and fullscreen YouTube) still has to run on its APK.
-- The phone isn't run; that needs the user's OK.
+- The 16:01 job ran after the Linux `--fresh` build finished. The base stamp was re-checked first and still read 0b14435744fc. The APK installed over 156-r1 (same key).
+
+## Spike build result (emulator-5554, m.youtube.com, video unmuted, then home)
+
+- **Inline:**
+  - The `<video>` still has `disablePictureInPicture=true`.
+  - On home: `enterpictureinpicture`, `PictureInPictureActivity` pinned, no `visibilitychange`, no `emptied`.
+  - Playing 14.3 s → 29.6 s during 15 s at home. `visibilityState` is still `visible`.
+  - `Tark PiP spike: entering video PiP` was logged once.
+- **Fullscreen** (YouTube's `DIV#player-container-id`):
+  - On home: `enterpictureinpicture`, then `fullscreenchange el=null`, and YouTube doesn't pause.
+  - It floats and plays 41.1 s → 56.4 s.
+- **Not covered by the spike, so Tasks 2–4 must test:**
+  - Releasing the hold when the tab goes quiet (no `OnAudioStateChanged` re-run yet).
+  - A page with nothing playing still getting `hidden`.
+  - Background play with PiP off (sound only).
+  - The Esc toast. Activity PiP is no longer used for media tabs, so it may simply not appear.
+  - Android 12+ `setAutoEnterEnabled`. Not needed: `onUserLeaveHint` worked on API 36.
+  - Settings gating.
+
+## What a phone run would add (not run: needs the user's OK)
+
+- **The user's actual failing case:** real youtube.com and m.youtube.com, signed in, with ads (a pre-roll changes the player count).
+- **Real home gestures:** gesture navigation's swipe-home, which can skip or delay `onUserLeaveHint` compared with the emulator's keyevent.
+- **The lock screen:** the release-gate item.
+- **Background survival:** the media notification's play/pause, and whether the foreground service keeps playback alive under the OEM's battery management.
+- **Network:** QUIC, which fails on the emulator.
+- **Signing:** a release-key-signed APK.
