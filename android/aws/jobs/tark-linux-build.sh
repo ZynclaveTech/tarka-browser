@@ -101,9 +101,10 @@ else
   if (( code != 0 )) && [[ -f $work/build/src/out/Default/build.ninja ]]; then
     echo "keep going: every compile error" >> "$log"
     timeout 2h sudo docker run --rm -u "$(id -u):$(id -g)" \
-      -v "$work:/repo" -v "$repo:$repo:ro" tark-linux-builder \
-      ninja -k 0 -C /repo/build/src/out/Default chrome chromedriver \
-        tark_captions_unittests tark_speech_unittests tark_page_translate_unittests >> "$log" 2>&1
+      -v "$work:/repo" -v "$repo:$repo:ro" tark-linux-builder bash -c \
+      "python3 $repo/linux/fetch_test_fonts.py /repo/build/src;
+       ninja -k 0 -C /repo/build/src/out/Default chrome chromedriver \
+         tark_captions_unittests tark_speech_unittests tark_page_translate_unittests" >> "$log" 2>&1
   fi
 fi
 echo "build exit $code" >> "$log"

@@ -101,6 +101,9 @@ class TestLinuxJob(unittest.TestCase):
         keep = text.find('ninja -k 0 -C /repo/build/src/out/Default chrome chromedriver')
         self.assertTrue(0 < build < keep, (build, keep))
         self.assertIn('tark_page_translate_unittests', text[keep:keep + 300])
+        # The test programs need Chromium's test fonts first (run_tests.sh's).
+        fonts = text.find('linux/fetch_test_fonts.py /repo/build/src', build)
+        self.assertTrue(build < fonts < keep, (build, fonts, keep))
 
     def test_checks_page_translation_on_the_tarball_with_real_models(self):
         # Desktop page translation: the tarball's Tark translates a Hindi
