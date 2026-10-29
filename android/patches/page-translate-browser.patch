@@ -56,7 +56,7 @@
  // {"<unit>": ["captions", "voice"]}. A unit no feature wants may be deleted.
 --- /dev/null
 +++ b/chrome/browser/tark_captions_android/page_translation.cc
-@@ -0,0 +1,156 @@
+@@ -0,0 +1,185 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -68,6 +68,8 @@
 +
 +#include "base/containers/contains.h"
 +#include "base/functional/bind.h"
++#include "base/location.h"
++#include "base/task/sequenced_task_runner.h"
 +
 +namespace tark_captions {
 +namespace {
@@ -134,6 +136,9 @@
 +  pending_[id] = Pending{texts.size(), std::move(callback)};
 +  backend_->SendBatch(source, target, units, texts,
 +                      base::BindOnce(&PageTranslation::OnResults, weak_factory_.GetWeakPtr(), id));
++  base::SequencedTaskRunner::GetCurrentDefault()->PostDelayedTask(
++      FROM_HERE, base::BindOnce(&PageTranslation::OnDeadline, weak_factory_.GetWeakPtr(), id),
++      kBatchDeadline);
 +}
 +
 +bool PageTranslation::ModelsReady(std::string source, std::string target) const {
@@ -156,23 +161,47 @@
 +}
 +
 +void PageTranslation::Cancel() {
++  if (!pending_.empty() && connected_) {
++    backend_->DropSent();
++  }
++  AnswerAllNull();
++  MaybeStartIdleTimer();
++}
++
++void PageTranslation::AnswerAllNull() {
++  // Snapshot first: a callback may translate again.
 +  std::map<uint64_t, Pending> pending = std::move(pending_);
 +  pending_.clear();
 +  for (auto& [id, batch] : pending) {
 +    std::move(batch.callback).Run(Results(batch.size));
 +  }
-+  MaybeStartIdleTimer();
 +}
 +
 +void PageTranslation::OnAppBackgrounded() {
-+  Cancel();
++  // Let go first, then answer: a batch a callback starts connects again.
 +  Unload();
++  AnswerAllNull();
++}
++
++void PageTranslation::OnTabHidden() {
++  OnAppBackgrounded();
 +}
 +
 +void PageTranslation::OnBackendGone() {
 +  connected_ = false;  // nothing to let go
-+  Cancel();
 +  Unload();
++  AnswerAllNull();
++}
++
++void PageTranslation::OnDeadline(uint64_t id) {
++  auto it = pending_.find(id);
++  if (it == pending_.end()) {
++    return;
++  }
++  Pending batch = std::move(it->second);
++  pending_.erase(it);
++  std::move(batch.callback).Run(Results(batch.size));
++  MaybeStartIdleTimer();
 +}
 +
 +void PageTranslation::OnResults(uint64_t id, Results results) {
@@ -215,7 +244,7 @@
 +}  // namespace tark_captions
 --- /dev/null
 +++ b/chrome/browser/tark_captions_android/page_translation.h
-@@ -0,0 +1,116 @@
+@@ -0,0 +1,128 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -259,6 +288,9 @@
 +  using ResultsCallback = base::OnceCallback<void(Results)>;
 +
 +  static constexpr base::TimeDelta kIdleUnload = base::Seconds(180);
++  // A batch not answered by then (it waits while captions hold another
++  // model: captions win) answers all-null; the page keeps its text.
++  static constexpr base::TimeDelta kBatchDeadline = base::Seconds(30);
 +
 +  class Backend {
 +   public:
@@ -269,6 +301,9 @@
 +    virtual void Connect() = 0;
 +    // Lets the translator go; a process started only for the page exits.
 +    virtual void Disconnect() = 0;
++    // Drops what was sent and not answered (the page went): a new
++    // translator for the next batch, so it never queues behind old text.
++    virtual void DropSent() = 0;
 +    // One batch on the connected translator with `units`' files.
 +    virtual void SendBatch(const std::string& source,
 +                           const std::string& target,
@@ -302,6 +337,9 @@
 +  void Cancel();
 +  // The app went to the background: no translating there, the model goes.
 +  void OnAppBackgrounded();
++  // The tab was hidden: only the visible tab holds a page model, so two tabs
++  // never hold one at once.
++  void OnTabHidden();
 +  // The captions process went away (crash, or another tab took the slot).
 +  void OnBackendGone();
 +
@@ -315,6 +353,9 @@
 +  };
 +
 +  void OnResults(uint64_t id, Results results);
++  void OnDeadline(uint64_t id);
++  // Answers every outstanding batch all-null.
++  void AnswerAllNull();
 +  void Unload();
 +  void ReleaseUnits();
 +  void MaybeStartIdleTimer();
@@ -367,7 +408,7 @@
      return;
    }
 +  TarkPageTranslation* page = TarkPageTranslation::FromWebContents(web_contents());
-+  if (page) {
++  if (page && page->WantsProcess()) {
 +    // The page still translating keeps the process, without speech or
 +    // captions' translation.
 +    service_->SetTarget(std::string(), {}, base::DoNothing());
@@ -394,7 +435,7 @@
    explicit TarkCaptionsTab(content::WebContents* web_contents);
 --- /dev/null
 +++ b/chrome/browser/tark_captions_android/tark_page_translation.cc
-@@ -0,0 +1,215 @@
+@@ -0,0 +1,248 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -493,7 +534,7 @@
 +}
 +
 +bool TarkPageTranslation::TakeProcess(mojo::Remote<mojom::CaptionService>& service) {
-+  if (!logic_.connected() || !translator_.is_bound() || !service.is_bound()) {
++  if (!WantsProcess() || !service.is_bound()) {
 +    return false;
 +  }
 +  if (g_page_only_holder && g_page_only_holder != this) {
@@ -511,6 +552,12 @@
 +  logic_.Cancel();
 +}
 +
++void TarkPageTranslation::OnVisibilityChanged(content::Visibility visibility) {
++  if (visibility == content::Visibility::HIDDEN) {
++    logic_.OnTabHidden();
++  }
++}
++
 +void TarkPageTranslation::Connect() {
 +  TarkCaptionsTab* captions = TarkCaptionsTab::FromWebContents(web_contents());
 +  mojom::CaptionService* service = captions ? captions->RunningService() : nullptr;
@@ -525,14 +572,34 @@
 +        content::ServiceProcessHost::Options().WithDisplayName("Tark captions").Pass());
 +    own_service_.set_disconnect_handler(
 +        base::BindOnce(&TarkPageTranslation::OnGone, weak_factory_.GetWeakPtr()));
-+    service = own_service_.get();
++  }
++  BindTranslator();
++}
++
++void TarkPageTranslation::BindTranslator() {
++  mojom::CaptionService* service = own_service_.is_bound() ? own_service_.get() : nullptr;
++  if (!service) {
++    TarkCaptionsTab* captions = TarkCaptionsTab::FromWebContents(web_contents());
++    service = captions ? captions->RunningService() : nullptr;
++  }
++  if (!service) {
++    return;  // the batch answers null (OnFilesOpened)
 +  }
 +  service->BindPageTranslator(translator_.BindNewPipeAndPassReceiver());
 +  translator_.set_disconnect_handler(
 +      base::BindOnce(&TarkPageTranslation::OnGone, weak_factory_.GetWeakPtr()));
 +}
 +
++void TarkPageTranslation::DropSent() {
++  // The old page's batches: their replies never come, and files being opened
++  // for them are not sent. The next batch gets a new translator on the same
++  // process (the model stays).
++  ++generation_;
++  translator_.reset();
++}
++
 +void TarkPageTranslation::Disconnect() {
++  ++generation_;
 +  translator_.reset();
 +  own_service_.reset();  // a page-only process exits with its last remote
 +  if (g_page_only_holder == this) {
@@ -552,15 +619,22 @@
 +  base::ThreadPool::PostTaskAndReplyWithResult(
 +      FROM_HERE, {base::MayBlock(), base::TaskPriority::USER_VISIBLE},
 +      base::BindOnce(&OpenUnits, std::move(dirs)),
-+      base::BindOnce(&TarkPageTranslation::OnFilesOpened, weak_factory_.GetWeakPtr(), source,
-+                     target, texts, std::move(done)));
++      base::BindOnce(&TarkPageTranslation::OnFilesOpened, weak_factory_.GetWeakPtr(),
++                     generation_, source, target, texts, std::move(done)));
 +}
 +
-+void TarkPageTranslation::OnFilesOpened(std::string source,
++void TarkPageTranslation::OnFilesOpened(uint64_t generation,
++                                        std::string source,
 +                                        std::string target,
 +                                        std::vector<std::string> texts,
 +                                        PageTranslation::ResultsCallback done,
 +                                        std::map<std::string, base::File> files) {
++  if (generation != generation_) {
++    return;  // dropped (Cancel or unload): already answered null
++  }
++  if (!translator_.is_bound()) {
++    BindTranslator();  // after DropSent
++  }
 +  if (!translator_.is_bound()) {
 +    std::move(done).Run(PageTranslation::Results(texts.size()));
 +    return;
@@ -612,7 +686,7 @@
 +}  // namespace tark_captions
 --- /dev/null
 +++ b/chrome/browser/tark_captions_android/tark_page_translation.h
-@@ -0,0 +1,105 @@
+@@ -0,0 +1,115 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -675,6 +749,9 @@
 +  // TarkCaptionsTab: captions stopped; whether the page takes `service`
 +  // (still translating) instead of it exiting.
 +  bool TakeProcess(mojo::Remote<mojom::CaptionService>& service);
++  // TarkCaptionsTab: whether TakeProcess would take it. Only TarkCaptionsTab
++  // calls these three.
++  bool WantsProcess() const { return logic_.connected(); }
 +
 + private:
 +  explicit TarkPageTranslation(content::WebContents* web_contents);
@@ -682,10 +759,12 @@
 +
 +  // content::WebContentsObserver:
 +  void PrimaryPageChanged(content::Page& page) override;
++  void OnVisibilityChanged(content::Visibility visibility) override;
 +
 +  // PageTranslation::Backend:
 +  void Connect() override;
 +  void Disconnect() override;
++  void DropSent() override;
 +  void SendBatch(const std::string& source,
 +                 const std::string& target,
 +                 const std::vector<std::string>& units,
@@ -695,7 +774,10 @@
 +  void SetInUse(const std::string& unit, bool in_use) override;
 +  void RequestUnit(const std::string& unit, bool now) override;
 +
-+  void OnFilesOpened(std::string source,
++  // A translator on the process the page uses (captions' or its own).
++  void BindTranslator();
++  void OnFilesOpened(uint64_t generation,
++                     std::string source,
 +                     std::string target,
 +                     std::vector<std::string> texts,
 +                     PageTranslation::ResultsCallback done,
@@ -707,6 +789,8 @@
 +  // Set only while the page holds a process captions do not.
 +  mojo::Remote<mojom::CaptionService> own_service_;
 +  mojo::Remote<mojom::PageTranslator> translator_;
++  // Bumped by DropSent: files opened for a dropped batch are not sent.
++  uint64_t generation_ = 0;
 +  std::unique_ptr<base::android::ApplicationStatusListener> app_status_;
 +  // After the remotes: its destructor lets them go.
 +  PageTranslation logic_;
@@ -720,7 +804,7 @@
 +#endif  // CHROME_BROWSER_TARK_CAPTIONS_ANDROID_TARK_PAGE_TRANSLATION_H_
 --- /dev/null
 +++ b/chrome/browser/tark_captions_android/tark_page_translation_unittest.cc
-@@ -0,0 +1,202 @@
+@@ -0,0 +1,269 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -730,6 +814,7 @@
 +#include <set>
 +
 +#include "base/functional/bind.h"
++#include "base/functional/callback_helpers.h"
 +#include "base/test/task_environment.h"
 +#include "base/values.h"
 +#include "chrome/browser/tark_captions_android/model_files.h"
@@ -750,6 +835,13 @@
 +  void Disconnect() override {
 +    ++disconnects;
 +    connected = false;
++  }
++  void DropSent() override {
++    ++drops;
++    for (auto& done : sent) {
++      dropped.push_back(std::move(done));
++    }
++    sent.clear();
 +  }
 +  void SendBatch(const std::string& source,
 +                 const std::string& target,
@@ -781,6 +873,8 @@
 +  }
 +
 +  int connects = 0;
++  int drops = 0;
++  std::vector<PageTranslation::ResultsCallback> dropped;
 +  int disconnects = 0;
 +  bool connected = false;
 +  std::set<std::string> ready = {"tr_indic_en", "tr_en_indic"};
@@ -856,9 +950,66 @@
 +  EXPECT_EQ(answers_, 1);
 +  EXPECT_EQ(out_, Results(2));
 +  EXPECT_EQ(page.outstanding(), 0u);
-+  backend_.Answer({"one", "two"});  // late: for the old page
++  EXPECT_EQ(backend_.drops, 1);
++  // A late reply for the old page (had the process answered anyway).
++  std::move(backend_.dropped.front()).Run({"one", "two"});
 +  EXPECT_EQ(answers_, 1);
 +  EXPECT_EQ(out_, Results(2));  // nothing applied
++}
++
++TEST_F(TarkPageTranslationTest, NavigationDropsQueuedBatches) {
++  PageTranslation page(&backend_, false);
++  Translate(page, {"पुराना एक"});
++  Translate(page, {"पुराना दो"});
++  page.Cancel();
++  EXPECT_EQ(backend_.drops, 1);  // the process's queue is let go
++  EXPECT_TRUE(backend_.sent.empty());
++  EXPECT_EQ(answers_, 2);
++  Translate(page, {"नया"});
++  EXPECT_EQ(backend_.connects, 1);  // same process, the model stays
++  ASSERT_EQ(backend_.sent.size(), 1u);  // nothing ahead of the new page
++  backend_.Answer({"new"});
++  EXPECT_EQ(out_, (Results{"new"}));
++  page.Cancel();  // nothing outstanding: nothing dropped
++  EXPECT_EQ(backend_.drops, 1);
++}
++
++TEST_F(TarkPageTranslationTest, UnloadsWhenTabHidden) {
++  PageTranslation page(&backend_, false);
++  Translate(page, {"एक"});
++  page.OnTabHidden();
++  EXPECT_FALSE(backend_.connected);
++  EXPECT_EQ(out_, Results(1));
++  EXPECT_TRUE(backend_.in_use_units.empty());
++}
++
++TEST_F(TarkPageTranslationTest, WaitingBatchTimesOutToOriginals) {
++  PageTranslation page(&backend_, false);
++  Translate(page, {"एक", "दो"});  // captions hold another model: no reply
++  task_environment_.FastForwardBy(base::Seconds(29));
++  EXPECT_EQ(answers_, 0);
++  task_environment_.FastForwardBy(base::Seconds(1));
++  EXPECT_EQ(answers_, 1);
++  EXPECT_EQ(out_, Results(2));
++  EXPECT_EQ(page.outstanding(), 0u);
++  backend_.Answer({"one", "two"});  // too late: dropped
++  EXPECT_EQ(answers_, 1);
++  task_environment_.FastForwardBy(PageTranslation::kIdleUnload);
++  EXPECT_FALSE(backend_.connected);  // nothing left hanging
++}
++
++TEST_F(TarkPageTranslationTest, BackgroundCallbackMayTranslateAgain) {
++  PageTranslation page(&backend_, false);
++  page.Translate({"एक"}, "hi", "en", base::BindOnce(
++                                          [](PageTranslation* page, Results) {
++                                            page->Translate({"दो"}, "hi", "en",
++                                                            base::DoNothing());
++                                          },
++                                          base::Unretained(&page)));
++  page.OnAppBackgrounded();
++  EXPECT_TRUE(page.connected());  // the new batch connected after the unload
++  EXPECT_EQ(page.outstanding(), 1u);
++  EXPECT_TRUE(backend_.in_use_units.contains("tr_indic_en"));
 +}
 +
 +TEST_F(TarkPageTranslationTest, IncognitoStoresNothing) {
