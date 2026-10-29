@@ -383,3 +383,67 @@ zynclave-settings-row.patch
 # runs the sign-in with prompt=none, No thanks keeps a salted hash of the
 # account. Private tabs get no observer and make no request.
 zynclave-web-offer.patch
+#
+# Background play (spec: Android background play and Picture in Picture):
+# Settings → Background play and → Picture in Picture, both on by default
+# (TarkMediaPrefs, Chrome's shared preferences tark.media.*). A tab playing
+# media with sound when it's hidden because Tark went to the background (no
+# activity running or paused: Home, another app, the lock screen; not a tab
+# switch inside Tark, which pauses as upstream) keeps telling its page "visible" while a
+# player plays, if Background play is on, or Picture in Picture is on and its
+# video floats (WebContentsImpl's visibility update, asking the tab's
+# WebContentsDelegate), so Blink doesn't pause the video and the page sees no
+# visibilitychange; once no player plays (paused, ended) the page gets
+# "hidden". Only the page's visibility is held: the views are hidden as
+# upstream.
+media-background-play.patch
+
+# Picture in Picture on leave (Tark for Android). Leaving Tark while the
+# current tab plays a video with sound puts the browser activity in Android's
+# Picture in Picture (FullscreenVideoPictureInPictureController: auto-enter on
+# 33+ as upstream, which keeps it off on 31-32 for a display bug;
+# onUserLeaveHint on every level), inline or fullscreen. The page's
+# disablePictureInPicture is about video Picture in Picture and isn't
+# touched. The auto-enter params follow muting/unmuting and the video's size
+# (a native WebContentsObserver, TarkOfferWatcher), the settings, tab
+# switches, navigations, players, fullscreen and resume. As it enters, the
+# video becomes the fullscreen element (media::mojom::MediaPlayer's
+# RequestTarkFullscreenForPictureInPicture; the browser waives user
+# activation for that one request from the player's frame, until the
+# renderer replies; the stated bound: a compromised renderer gets at most one
+# activation-free fullscreen in that frame, within the 1 s Tark armed), and
+# leaves it when the window ends, even if the activity was recreated
+# meanwhile. A muted or silent video never floats, fullscreen included
+# (upstream floats any fullscreen video that allows it). With Background
+# play on, the screen turning off in the window doesn't suspend the media
+# or end fullscreen, neither on stop nor when the stop hides the tab
+# (upstream treats any stop in the window as closing it, and exits
+# fullscreen on stop and on the tab hiding). Tark ending its own fullscreen
+# as the window expands doesn't dismiss the window (which moved the task to
+# the back). The fullscreen notice ("press |Esc|") waits until
+# the window ends; other snackbars are hidden in the window, not dropped.
+# In the window the page keeps seeing a screen-sized window (the widgets'
+# window rect, window.outerWidth/outerHeight): m.youtube.com reads a small
+# window as its mini player and leaves fullscreen and pauses, which closed the
+# window. A page can't bring the activity to the front from the window
+# (activateContents; a fullscreen request activates its contents), which
+# expanded it; fullscreen entered in the window neither moves the task to the
+# front nor asks for the activity's fullscreen mode (requestFullscreenMode,
+# which also took the task out of the window): that one waits until the
+# window is expanded. Diagnostics: a stack is logged when fullscreen ends or the
+# window is dismissed while in it.
+media-pip-on-leave.patch
+
+# Picture in Picture from a tap (Tark for Android): while the current tab
+# plays a video with sound and Settings → Picture in Picture is on (private
+# tabs too), the app menu has "Picture in Picture" (after the tiles) and the
+# address bar's optional button slot shows the Picture in Picture button
+# (TarkPipButtonController, ahead of the adaptive button; it follows the
+# current tab's players, navigations and tab switches, and the same mute and
+# settings signal as auto-enter: TarkPictureInPicture.addOfferObserver).
+# Either enters the same Picture in Picture as leaving Tark
+# (ChromeActivity.tarkEnterPictureInPicture →
+# FullscreenVideoPictureInPictureController.attemptPictureInPicture). The
+# label is upstream's "Picture in Picture" (IDS_CONTEXTMENU_PICTURE_IN_PICTURE,
+# already in Hindi); the icon is Android's Picture in Picture glyph.
+media-pip-button.patch

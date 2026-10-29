@@ -325,6 +325,10 @@ run ninja -C "$_src_dir/out/Default" chrome/browser/tark_xlit:host_unittests
 run "$_src_dir/out/Default/clang_x64/tark_xlit_files_unittests"
 run ninja -C "$_src_dir/out/Default" chrome/browser/tark_update:host_unittests
 run "$_src_dir/out/Default/clang_x64/tark_update_unittests"
+# Background play: when a hidden tab keeps telling its page "visible"
+# (media-background-play.patch).
+run ninja -C "$_src_dir/out/Default" content/browser/web_contents/tark_media:host_unittests
+run "$_src_dir/out/Default/clang_x64/tark_visibility_hold_unittests"
 # Live captions: the engine's own tests (front end, speech model, segmenter,
 # VAD, ONNX Runtime loader), built for this machine.
 (( test_failures == 0 )) || { log "$test_failures test binaries failed"; exit 1; }
