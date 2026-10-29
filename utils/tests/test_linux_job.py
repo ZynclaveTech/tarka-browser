@@ -92,6 +92,16 @@ class TestLinuxJob(unittest.TestCase):
         self.assertTrue(0 < tarball < zynclave, (tarball, zynclave))
         self.assertIn('--production', text[zynclave:zynclave + 200])
 
+    def test_a_failed_compile_keeps_going_to_list_every_error(self):
+        # One run on the machine should show every compile error, not the
+        # first two: after a failed build, ninja -k 0 over the same targets
+        # and Tark's test programs, the job still failing.
+        text = JOB.read_text()
+        build = text.find('tark-linux-builder bash /repo/scripts/build.sh')
+        keep = text.find('ninja -k 0 -C /repo/build/src/out/Default chrome chromedriver')
+        self.assertTrue(0 < build < keep, (build, keep))
+        self.assertIn('tark_page_translate_unittests', text[keep:keep + 300])
+
     def test_checks_page_translation_on_the_tarball_with_real_models(self):
         # Desktop page translation: the tarball's Tark translates a Hindi
         # page (and text its JS adds) on the computer, with the models
