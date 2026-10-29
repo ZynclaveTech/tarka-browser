@@ -75,7 +75,7 @@ if (( code == 0 )); then
   for t in PlayingWithSoundThenHideStaysVisible NothingPlayingThenHideIsHidden MutedThenHideIsHidden \
       HoldReleasedWhenMediaPauses HoldReleasedWhenEnded SilentStretchWhilePlayingKeepsTheHold SettingsOffIsUpstream \
       OnlyPictureInPictureWithoutWindowIsUpstream OnlyPictureInPictureWithWindowIsHeld BackgroundPlayOnlyIsHeld \
-      Allowed LaterHiddenUpdatesKeepTheHold ShowAfterHoldSendsNoEvent NoHoldAgainAfterRelease NeverShownTabIsNotHeld \
+      TabSwitchInsideTarkIsUpstream Allowed LaterHiddenUpdatesKeepTheHold ShowAfterHoldSendsNoEvent NoHoldAgainAfterRelease NeverShownTabIsNotHeld \
       HoldAgainAfterShowingAgain; do
     grep -qE "^\[[0-9]+/[0-9]+\] TarkVisibilityHoldTest\.$t \([0-9]+ ms\)$" $log || { echo "no TarkVisibilityHoldTest.$t test ran" >> $log; code=1; }
     grep -qE "TarkVisibilityHoldTest\.$t.*(SKIPPED|FAILED)|(SKIPPED|FAILED).*TarkVisibilityHoldTest\.$t" $log && { echo "TarkVisibilityHoldTest.$t did not pass" >> $log; code=1; }
