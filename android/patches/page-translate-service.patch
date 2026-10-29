@@ -48,7 +48,7 @@
    }
  
   private:
-@@ -115,7 +113,15 @@
+@@ -115,7 +113,18 @@
  
  CaptionServiceImpl::CaptionServiceImpl(mojo::PendingReceiver<mojom::CaptionService> receiver)
      : receiver_(this, std::move(receiver)),
@@ -59,13 +59,16 @@
 +  page_receivers_.set_disconnect_handler(base::BindRepeating(
 +      [](CaptionServiceImpl* self) {
 +        self->page_.DropBatches(self->page_receivers_.current_receiver());
++        if (self->page_receivers_.empty()) {
++          self->page_.ReleaseModel();  // a hidden or idle tab holds no page model
++        }
 +      },
 +      base::Unretained(this)));
 +}
  
  CaptionServiceImpl::~CaptionServiceImpl() = default;
  
-@@ -171,6 +177,29 @@
+@@ -171,6 +180,29 @@
  
  void CaptionServiceImpl::Stop() {
    session_.Stop();
@@ -224,7 +227,7 @@
  };
 --- /dev/null
 +++ b/chrome/services/tark_captions/page_translator.cc
-@@ -0,0 +1,243 @@
+@@ -0,0 +1,247 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -408,6 +411,10 @@
 +  Pump();
 +}
 +
++void PageTranslator::ReleaseModel() {
++  DropOwnModel();
++}
++
 +void PageTranslator::OnCaptionsTranslationChanged() {
 +  if (!session_->translation_units().empty()) {
 +    DropOwnModel();  // captions win; queued before any caption translates
@@ -470,7 +477,7 @@
 +}  // namespace tark_captions
 --- /dev/null
 +++ b/chrome/services/tark_captions/page_translator.h
-@@ -0,0 +1,100 @@
+@@ -0,0 +1,103 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -546,6 +553,9 @@
 +  // are dropped, not run, so a new page's batches never wait behind them.
 +  // One already running finishes; its result goes nowhere.
 +  void DropBatches(uint64_t owner);
++  // No page is left (the last pipe closed): the page's own model is
++  // unloaded. Captions' model, shared or not, stays for captions.
++  void ReleaseModel();
 +
 +  // The page's own model, on the translation sequence.
 +  struct Slot;
@@ -573,7 +583,7 @@
 +#endif  // CHROME_SERVICES_TARK_CAPTIONS_PAGE_TRANSLATOR_H_
 --- /dev/null
 +++ b/chrome/services/tark_captions/page_translator_unittest.cc
-@@ -0,0 +1,265 @@
+@@ -0,0 +1,289 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -819,6 +829,30 @@
 +  EXPECT_FALSE(old_page.IsReady());
 +  base::AutoLock hold(models_.lock);
 +  EXPECT_EQ(models_.received, (std::vector<std::string>{"new"}));
++}
++
++// The last page went away: the page's own model is unloaded, but a model
++// captions share with the page stays for captions.
++TEST_F(PageTranslatorTest, LastPageDisconnectReleasesPageModel) {
++  {
++    PageTranslator page(&session_, Factory());
++    Translate(page, "en", "hi", {"tr_en_indic"}, {"one"});
++    page.ReleaseModel();
++    task_environment_.RunUntilIdle();
++    base::AutoLock hold(models_.lock);
++    EXPECT_EQ(models_.events,
++              (std::vector<std::string>{"load:tr_en_indic", "unload:tr_en_indic"}));
++    EXPECT_EQ(models_.loaded, 0);
++    models_.events.clear();
++  }
++  ASSERT_TRUE(session_.SetTarget("en", Units({"tr_indic_en"})));
++  PageTranslator page(&session_, Factory());
++  Translate(page, "hi", "en", {"tr_indic_en"}, {"नमस्ते"});
++  page.ReleaseModel();
++  task_environment_.RunUntilIdle();
++  base::AutoLock hold(models_.lock);
++  EXPECT_EQ(models_.events, (std::vector<std::string>{"load:tr_indic_en"}));  // captions'
++  EXPECT_EQ(models_.loaded, 1);
 +}
 +
 +TEST_F(PageTranslatorTest, Legs) {
