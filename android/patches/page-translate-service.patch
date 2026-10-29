@@ -33,7 +33,22 @@
        "//base",
 --- a/chrome/services/tark_captions/caption_service_impl.cc
 +++ b/chrome/services/tark_captions/caption_service_impl.cc
-@@ -115,7 +115,8 @@
+@@ -70,11 +70,9 @@
+   std::optional<std::string> Translate(std::string_view caption,
+                                        std::string_view source,
+                                        std::string_view target) override {
+-    const std::optional<Target> to = TargetFromCode(target);
+-    if (!to) {
+-      return std::nullopt;
+-    }
+-    return engine_->TranslateFrom(caption, source, *to);
++    // TranslateFrom for captions' languages; all 22 Indian languages for a
++    // page.
++    return engine_->TranslatePage(caption, source, target);
+   }
+ 
+  private:
+@@ -115,7 +113,8 @@
  
  CaptionServiceImpl::CaptionServiceImpl(mojo::PendingReceiver<mojom::CaptionService> receiver)
      : receiver_(this, std::move(receiver)),
@@ -43,10 +58,12 @@
  
  CaptionServiceImpl::~CaptionServiceImpl() = default;
  
-@@ -173,4 +174,26 @@
-   session_.Stop();
- }
+@@ -171,6 +170,28 @@
  
+ void CaptionServiceImpl::Stop() {
+   session_.Stop();
++}
++
 +void CaptionServiceImpl::BindPageTranslator(
 +    mojo::PendingReceiver<mojom::PageTranslator> receiver) {
 +  page_receivers_.Add(this, std::move(receiver));
@@ -67,8 +84,8 @@
 +                             std::move(callback).Run(results);
 +                           },
 +                           std::move(callback)));
-+}
-+
+ }
+ 
  }  // namespace tark_captions
 --- a/chrome/services/tark_captions/caption_service_impl.h
 +++ b/chrome/services/tark_captions/caption_service_impl.h
@@ -102,14 +119,14 @@
                   SetTargetCallback callback) override;
    void Stop() override;
 +  void BindPageTranslator(mojo::PendingReceiver<mojom::PageTranslator> receiver) override;
-+
+ 
 +  // mojom::PageTranslator:
 +  void TranslateBatch(const std::string& source,
 +                      const std::string& target,
 +                      base::flat_map<std::string, base::File> files,
 +                      const std::vector<std::string>& texts,
 +                      TranslateBatchCallback callback) override;
- 
++
   private:
    mojo::Receiver<mojom::CaptionService> receiver_;
    mojo::Remote<mojom::CaptionClient> client_;
@@ -526,7 +543,7 @@
 +#endif  // CHROME_SERVICES_TARK_CAPTIONS_PAGE_TRANSLATOR_H_
 --- /dev/null
 +++ b/chrome/services/tark_captions/page_translator_unittest.cc
-@@ -0,0 +1,238 @@
+@@ -0,0 +1,246 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -610,6 +627,12 @@
 +class PageTranslatorTest : public testing::Test {
 + protected:
 +  void SetUp() override { ASSERT_TRUE(dir_.CreateUniqueTempDir()); }
++  // Each test's PageTranslator is gone by now: let its model (and captions')
++  // be deleted on the translation sequence while `models_` is alive.
++  void TearDown() override {
++    session_.Stop();
++    task_environment_.RunUntilIdle();
++  }
 +
 +  TranslatorFactory Factory() {
 +    return base::BindRepeating(
@@ -651,9 +674,11 @@
 +    return done.Take();
 +  }
 +
-+  base::test::TaskEnvironment task_environment_;
++  // Torn down last: the fakes may still be deleted on the pool until the
++  // environment goes.
 +  base::ScopedTempDir dir_;
 +  Models models_;
++  base::test::TaskEnvironment task_environment_;
 +  CaptionSession session_{base::BindRepeating(
 +                              [](std::map<std::string, base::File>, const EngineOptions&,
 +                                 CaptionCallback) -> std::unique_ptr<SpeechEngine> {
@@ -735,14 +760,14 @@
 +  base::test::TestFuture<void> both;
 +  page.TranslateBatch("hi", "en", Units({"tr_indic_en"}), {"एक"},
 +                      base::BindOnce([](std::vector<int>* order, PageResults) { order->push_back(1); },
-+                                     &order));
++                                     base::Unretained(&order)));
 +  page.TranslateBatch("en", "ta", Units({"tr_en_indic"}), {"two"},
 +                      base::BindOnce(
 +                          [](std::vector<int>* order, base::OnceClosure done, PageResults) {
 +                            order->push_back(2);
 +                            std::move(done).Run();
 +                          },
-+                          &order, both.GetCallback()));
++                          base::Unretained(&order), both.GetCallback()));
 +  ASSERT_TRUE(both.Wait());
 +  EXPECT_EQ(order, (std::vector<int>{1, 2}));
 +}
