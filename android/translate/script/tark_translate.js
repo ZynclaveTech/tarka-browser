@@ -11,39 +11,95 @@
 // A null result keeps the original. translatePage's progress counts answered
 // batches and finishes when the page's queue is drained; text the page adds
 // or changes later is still translated, without reporting again.
+// The page is walked in slices (CHUNK_NODES items or CHUNK_MS, then a
+// setTimeout) so a long page never holds the main thread; visible text goes
+// ahead of the rest from the first slice on.
 
 var tarkTranslate = (function() {
   'use strict';
   const B = typeof tarkBatcher !== 'undefined' ? tarkBatcher :
                                                  require('./batcher.js');
+  const CHUNK_NODES = 500;
+  const CHUNK_MS = 16;
+  const MAX_CHARS = 1000;
+  const MAX_ITEMS = 16;
 
   function create(win) {
     const doc = win.document;
     let batcher = null;
     let active = false;
-    let queue = [];
+    let generation = 0;
+    let collecting = false;
     let dirty = false;  // a scroll since the queue was ordered
+    // Unsent items: visible ones first, then the rest; each read from head.
+    let front = [], frontHead = 0, back = [], backHead = 0;
+    let queuedCount = 0, queuedChars = 0;
+    let latest = new Map();  // Text -> its newest queued item
     const inflight = new Map();
     let nextId = 1;
     let answered = 0;
     let reported = false;
     let onProgress = null;
     let sourceLang = '';
+    const stats = {chunks: 0, examined: 0};
 
     const viewport = () => ({top: 0, bottom: win.innerHeight || 0});
     const onScroll = () => { dirty = true; };
+    const now = () => (win.performance ? win.performance.now() : Date.now());
+
+    function push(item, isVisible) {
+      latest.set(item.node, item);
+      (isVisible ? front : back).push(item);
+      queuedCount++;
+      queuedChars += item.text.length;
+    }
 
     function enqueue(items) {
-      const nodes = new Set(items.map(i => i.node));
-      queue = queue.filter(i => !nodes.has(i.node)).concat(items);
-      dirty = true;
+      const vp = viewport();
+      for (const item of items) push(item, B.visible(item.node, vp));
+    }
+
+    function live(item) {
+      return latest.get(item.node) === item && item.node.isConnected &&
+             item.node.nodeValue === item.original;
+    }
+
+    // Only the not-yet-sent items are re-ordered after a scroll.
+    function reorder() {
+      const rest = front.slice(frontHead).concat(back.slice(backHead));
+      front = []; back = []; frontHead = 0; backHead = 0;
+      const vp = viewport();
+      for (const item of rest) {
+        if (live(item)) (B.visible(item.node, vp) ? front : back).push(item);
+      }
+      dirty = false;
     }
 
     function finishIfDrained() {
-      if (reported || queue.length || inflight.size) return false;
+      if (reported || collecting || queuedCount || inflight.size) return false;
       reported = true;
       if (onProgress) onProgress(100, true, 0);
       return true;
+    }
+
+    function collectSlices(gen, it) {
+      const vp = viewport();
+      const start = now();
+      let n = 0;
+      stats.chunks++;
+      for (;;) {
+        const step = it.next();
+        if (step.done) {
+          collecting = false;
+          finishIfDrained();
+          return;
+        }
+        push(step.value, B.visible(step.value.node, vp));
+        if (++n >= CHUNK_NODES || now() - start >= CHUNK_MS) break;
+      }
+      win.setTimeout(() => {
+        if (gen === generation && active) collectSlices(gen, it);
+      }, 0);
     }
 
     function translatePage(src, tgt, progress) {
@@ -55,31 +111,47 @@ var tarkTranslate = (function() {
       sourceLang = src;
       batcher = B.create();
       const root = doc.body || doc.documentElement;
-      queue = batcher.collect(root, viewport());
-      dirty = false;
       batcher.observe(root, enqueue);
       win.addEventListener('scroll', onScroll, {passive: true});
-      finishIfDrained();
+      collecting = true;
+      collectSlices(++generation, batcher.walk(root));
     }
 
     function takeBatch() {
       if (!active) return null;
-      // Drop items the page changed or removed since they were queued.
-      queue = queue.filter(i => i.node.isConnected &&
-                                i.node.nodeValue === i.original);
-      if (dirty) {
-        queue = B.order(queue, viewport());
-        dirty = false;
+      if (dirty) reorder();
+      const texts = [], items = [];
+      let chars = 0;
+      for (;;) {
+        let item;
+        if (frontHead < front.length) item = front[frontHead];
+        else if (backHead < back.length) item = back[backHead];
+        else break;
+        stats.examined++;
+        if (live(item)) {
+          if (items.length && (items.length >= MAX_ITEMS ||
+                               chars + item.text.length > MAX_CHARS)) {
+            break;
+          }
+          items.push(item);
+          texts.push(item.text);
+          chars += item.text.length;
+          latest.delete(item.node);
+        }
+        if (frontHead < front.length) frontHead++;
+        else backHead++;
+        queuedCount--;
+        queuedChars -= item.text.length;
       }
-      if (!queue.length) {
+      if (frontHead === front.length) { front = []; frontHead = 0; }
+      if (backHead === back.length) { back = []; backHead = 0; }
+      if (!items.length) {
         finishIfDrained();
         return null;
       }
-      const batch = B.batches(queue)[0];
-      queue = queue.slice(batch.length);
       const id = nextId++;
-      inflight.set(id, batch);
-      return {id: id, texts: batch.map(i => i.text)};
+      inflight.set(id, items);
+      return {id: id, texts: texts};
     }
 
     function onResult(id, results) {
@@ -89,17 +161,22 @@ var tarkTranslate = (function() {
       batcher.apply(batch, results);
       answered++;
       if (reported || finishIfDrained()) return;
-      const left = inflight.size + B.batches(queue).length;
+      const left = inflight.size + B.estimate(queuedCount, queuedChars);
       if (onProgress) {
-        onProgress(Math.floor(100 * answered / (answered + left)), false, 0);
+        onProgress(Math.floor(100 * answered / (answered + Math.max(left, 1))),
+                   false, 0);
       }
     }
 
     function restore() {
       active = false;
+      collecting = false;
+      generation++;
       win.removeEventListener('scroll', onScroll);
       if (batcher) batcher.revert();
-      queue = [];
+      front = []; back = []; frontHead = 0; backHead = 0;
+      queuedCount = 0; queuedChars = 0;
+      latest = new Map();
       inflight.clear();
     }
 
@@ -118,6 +195,8 @@ var tarkTranslate = (function() {
       },
       takeBatch,
       onResult,
+      stats,
+      isCollecting: () => collecting,
     };
   }
 

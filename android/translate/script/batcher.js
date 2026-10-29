@@ -7,6 +7,7 @@
 // isolated world (bundled ahead of tark_translate.js) and under node's tests.
 // Each text node is sent as is (its leading and trailing whitespace kept
 // aside); a sentence split across inline elements goes as separate pieces.
+// Open shadow roots are walked and watched too.
 
 var tarkBatcher = (function() {
   'use strict';
@@ -16,26 +17,55 @@ var tarkBatcher = (function() {
     'VAR', 'TEXTAREA', 'INPUT', 'SELECT', 'OPTION', 'SVG', 'MATH', 'IFRAME',
     'OBJECT',
   ]);
+  // A node the page keeps rewriting is translated again at most this often.
+  const MAX_RETRANSLATIONS = 3;
 
-  function skipsElement(el) {
+  // Never translated, whatever is inside.
+  function hardSkip(el) {
     if (SKIP_TAGS.has(el.tagName.toUpperCase())) return true;
-    if (el.getAttribute('translate') === 'no') return true;
-    if (el.classList && el.classList.contains('notranslate')) return true;
     const editable = el.getAttribute('contenteditable');
-    if (editable !== null && editable !== 'false') return true;
-    return false;
+    return editable !== null && editable.toLowerCase() !== 'false';
+  }
+
+  // 'no', 'yes' or null: the element's own translate choice.
+  function translateChoice(el) {
+    const t = (el.getAttribute('translate') || '').trim().toLowerCase();
+    if (t === 'no') return 'no';
+    if (t === 'yes' || t === '') {
+      if (el.hasAttribute('translate')) return 'yes';
+    }
+    if (el.classList && el.classList.contains('notranslate')) return 'no';
+    return null;
+  }
+
+  function parentOf(node) {
+    const p = node.parentNode;
+    if (p && p.nodeType === 11 && p.host) return p.host;  // shadow root
+    return p && p.nodeType === 1 ? p : null;
+  }
+
+  function designMode(node) {
+    const doc = node.ownerDocument || node;
+    return (doc.designMode || '').toLowerCase() === 'on';
   }
 
   function insideSkipped(node) {
-    for (let el = node.nodeType === 1 ? node : node.parentElement; el;
-         el = el.parentElement) {
-      if (skipsElement(el)) return true;
+    if (designMode(node)) return true;
+    let decided = false;
+    for (let el = node.nodeType === 1 ? node : parentOf(node); el;
+         el = parentOf(el)) {
+      if (hardSkip(el)) return true;
+      if (!decided) {
+        const c = translateChoice(el);
+        if (c === 'no') return true;
+        if (c === 'yes') decided = true;
+      }
     }
     return false;
   }
 
   function visible(node, viewport) {
-    const el = node.parentElement;
+    const el = parentOf(node);
     if (!el || !viewport) return false;
     const r = el.getBoundingClientRect();
     if (!r.width && !r.height) return false;
@@ -58,6 +88,12 @@ var tarkBatcher = (function() {
     return first.concat(rest);
   }
 
+  // How many batches `items` makes, without making them.
+  function estimate(count, chars, maxChars = 1000, maxItems = 16) {
+    if (!count) return 0;
+    return Math.max(Math.ceil(count / maxItems), Math.ceil(chars / maxChars));
+  }
+
   function batches(items, maxChars = 1000, maxItems = 16) {
     const out = [];
     let cur = [], chars = 0;
@@ -78,33 +114,60 @@ var tarkBatcher = (function() {
   function create() {
     const originals = new Map();  // Text -> the page's own text
     const written = new Map();    // Text -> what Tark last wrote there
+    const cache = new Map();      // source text -> its translation
+    const rewrites = new WeakMap();  // Text or parent -> re-translations
     let observer = null;
 
-    function collect(root, viewport) {
-      if (!root || (root.nodeType !== 9 && insideSkipped(root))) return [];
-      const items = [];
+    // Yields the text items under root in document order (open shadow
+    // roots after their host's light children).
+    function* walk(root) {
+      if (!root || designMode(root)) return;
       if (root.nodeType === 3) {
-        const item = itemFor(root);
-        if (item) items.push(item);
-        return order(items, viewport);
+        if (!insideSkipped(root)) {
+          const item = itemFor(root);
+          if (item) yield item;
+        }
+        return;
       }
-      const doc = root.ownerDocument || root;
-      const NF = doc.defaultView.NodeFilter;
-      const walker = doc.createTreeWalker(
-          root, NF.SHOW_ELEMENT | NF.SHOW_TEXT, {
-            acceptNode(n) {
-              if (n.nodeType === 1) {
-                return skipsElement(n) ? NF.FILTER_REJECT : NF.FILTER_SKIP;
-              }
-              return NF.FILTER_ACCEPT;
-            },
-          });
-      let n;
-      while ((n = walker.nextNode())) {
-        const item = itemFor(n);
-        if (item) items.push(item);
+      if (root.nodeType === 1 && insideSkipped(root)) return;
+      // [node, translate=no inherited]
+      const stack = [[root, false]];
+      while (stack.length) {
+        const [node, no] = stack.pop();
+        if (node.nodeType === 3) {
+          if (!no) {
+            const item = itemFor(node);
+            if (item) yield item;
+          }
+          continue;
+        }
+        let off = no;
+        if (node.nodeType === 1) {
+          if (node !== root && hardSkip(node)) continue;
+          const c = translateChoice(node);
+          if (c) off = c === 'no';
+          if (node.shadowRoot) {
+            watch(node.shadowRoot);
+            stack.push([node.shadowRoot, off]);
+          }
+        }
+        const kids = node.childNodes;
+        for (let i = kids.length - 1; i >= 0; i--) {
+          const k = kids[i];
+          if (k.nodeType === 1 || k.nodeType === 3) stack.push([k, off]);
+        }
       }
-      return order(items, viewport);
+    }
+
+    function collect(root, viewport) {
+      return order([...walk(root)], viewport);
+    }
+
+    function remember(item, r) {
+      if (!originals.has(item.node)) originals.set(item.node, item.original);
+      const value = item.lead + r + item.trail;
+      written.set(item.node, value);
+      item.node.nodeValue = value;
     }
 
     // results[i] is item i's translation; null (or anything not a string)
@@ -114,11 +177,9 @@ var tarkBatcher = (function() {
       items.forEach((item, i) => {
         const r = results ? results[i] : null;
         if (typeof r !== 'string') return;
+        cache.set(item.text, r);
         if (item.node.nodeValue !== item.original) return;
-        if (!originals.has(item.node)) originals.set(item.node, item.original);
-        const value = item.lead + r + item.trail;
-        written.set(item.node, value);
-        item.node.nodeValue = value;
+        remember(item, r);
       });
     }
 
@@ -129,48 +190,64 @@ var tarkBatcher = (function() {
       }
       originals.clear();
       written.clear();
+      cache.clear();
     }
 
-    // onItems(items) gets the text the page added or changed. Tark's own
-    // writes are not reported, so a page that rewrites its text can't loop.
+    // Text the page added or changed: written from the cache when Tark has
+    // translated it before (no model call), otherwise handed to onItems.
+    // Tark's own writes are not reported, and a node (or, for text nodes the
+    // page swaps in, their parent) is re-translated at most
+    // MAX_RETRANSLATIONS times, then left as the page wrote it.
+    function changed(items, key, onItems) {
+      if (!items.length) return;
+      const n = rewrites.get(key) || 0;
+      if (n >= MAX_RETRANSLATIONS) return;
+      rewrites.set(key, n + 1);
+      const fresh = [];
+      for (const item of items) {
+        if (cache.has(item.text)) remember(item, cache.get(item.text));
+        else fresh.push(item);
+      }
+      if (fresh.length) onItems(fresh);
+    }
+
     function observe(root, onItems) {
       disconnect();
       const MO = (root.ownerDocument || root).defaultView.MutationObserver;
       observer = new MO(records => {
-        const items = [];
+        // One look per node: several records for a node read its value now.
         const seen = new Set();
-        const add = list => {
-          for (const it of list) {
-            if (!seen.has(it.node)) {
-              seen.add(it.node);
-              items.push(it);
-            }
-          }
-        };
         for (const rec of records) {
           if (rec.type === 'characterData') {
             const node = rec.target;
+            if (seen.has(node)) continue;
+            seen.add(node);
             if (written.get(node) === node.nodeValue) continue;
             written.delete(node);
-            if (originals.has(node)) originals.delete(node);
-            if (!node.isConnected || insideSkipped(node)) continue;
-            add(collect(node));
+            originals.delete(node);
+            if (!node.isConnected) continue;
+            changed([...walk(node)], node, onItems);
           } else {
             for (const added of rec.addedNodes) {
-              if (!added.isConnected) continue;
-              if (added.nodeType === 3 && written.get(added) === added.nodeValue) {
-                continue;
-              }
-              if (added.nodeType === 3 && insideSkipped(added)) continue;
-              if (added.nodeType === 1 || added.nodeType === 3) {
-                add(collect(added));
+              if (!added.isConnected || seen.has(added)) continue;
+              seen.add(added);
+              if (added.nodeType === 3) {
+                if (written.get(added) === added.nodeValue) continue;
+                changed([...walk(added)], parentOf(added) || added, onItems);
+              } else if (added.nodeType === 1) {
+                changed([...walk(added)], added, onItems);
               }
             }
           }
         }
-        if (items.length) onItems(items);
       });
-      observer.observe(root, {characterData: true, childList: true, subtree: true});
+      watch(root);
+    }
+
+    function watch(root) {
+      if (observer) {
+        observer.observe(root, {characterData: true, childList: true, subtree: true});
+      }
     }
 
     function disconnect() {
@@ -180,10 +257,10 @@ var tarkBatcher = (function() {
       }
     }
 
-    return {collect, batches, apply, revert, observe, disconnect, order};
+    return {walk, collect, apply, revert, observe, disconnect};
   }
 
-  return {create, batches, order};
+  return {create, batches, order, estimate, visible, MAX_RETRANSLATIONS};
 })();
 
 if (typeof module === 'object' && module.exports) {

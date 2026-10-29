@@ -180,3 +180,99 @@ test('restoreDropsLateResults', () => {
   assert.equal(win.document.body.textContent, 'one');
   assert.equal(t.takeBatch(), null);
 });
+
+// Fix round 1.
+
+test('pageRestoresOriginalUsesCacheNoNewBatch', async () => {
+  const {win, t} = translator('<p>one</p><div id="r"><span>two</span></div>');
+  drain(t);
+  const [p] = win.document.querySelectorAll('p');
+  p.firstChild.nodeValue = 'one';  // a re-render puts its own text back
+  const r = win.document.getElementById('r');
+  r.innerHTML = '<span>two</span>';  // or swaps the node for a new one
+  await tick();
+  assert.equal(t.takeBatch(), null, 'no model call for known text');
+  assert.equal(p.textContent, 'ONE');
+  assert.equal(r.textContent, 'TWO');
+});
+
+test('pageFlappingTextIsCapped', async () => {
+  const {win, t} = translator('<p>one</p><p>moving</p>');
+  drain(t);
+  const [p1, p2] = win.document.querySelectorAll('p');
+  // A page that always puts its own text back.
+  let resets = 0;
+  new win.MutationObserver(() => {
+    if (p1.textContent !== 'one') { resets++; p1.firstChild.nodeValue = 'one'; }
+  }).observe(p1, {characterData: true, subtree: true});
+  p1.firstChild.nodeValue = 'one';
+  // And text that changes to new words every time.
+  let sent = 0;
+  for (let i = 0; i < 10; i++) {
+    p2.firstChild.nodeValue = 'word' + i;
+    await tick();
+    sent += drain(t);
+  }
+  for (let i = 0; i < 10; i++) await tick();
+  assert.ok(resets <= 3, `page reset ${resets} times`);
+  assert.equal(p1.textContent, 'one', 'left as the page wrote it');
+  assert.equal(sent, 3);
+  assert.equal(p2.textContent, 'word9');
+  assert.equal(t.takeBatch(), null);
+});
+
+test('largePageNoLongTask', async () => {
+  const n = 20000;
+  const win = dom(Array.from({length: n}, (_, i) => `<p>s${i}</p>`).join(''));
+  const t = T.create(win);
+  const progress = [];
+  const start = performance.now();
+  t.service.translatePage('hi', 'en', (...a) => progress.push(a));
+  assert.ok(performance.now() - start < 200, 'first slice is short');
+  assert.ok(t.isCollecting(), 'the walk yields');
+  const first = t.takeBatch();  // the first slice's text goes out at once
+  assert.equal(first.texts[0], 's0');
+  t.onResult(first.id, first.texts);
+  while (t.isCollecting()) await tick();
+  assert.ok(t.stats.chunks >= n / 500, `${t.stats.chunks} slices`);
+  const before = t.stats.examined;
+  let batch, batchesTaken = 0, sent = first.texts.length;
+  while ((batch = t.takeBatch())) {
+    t.onResult(batch.id, batch.texts.map(() => null));
+    batchesTaken++;
+    sent += batch.texts.length;
+  }
+  assert.equal(sent, n);
+  // O(batch): every item looked at once, plus one look per batch boundary.
+  assert.ok(t.stats.examined - before <= n + batchesTaken + 1);
+  assert.deepEqual(progress.at(-1), [100, true, 0]);
+});
+
+test('translateAttributeCaseYesAndDesignMode', () => {
+  const win = dom(`<div TRANSLATE="NO">a<span translate="yes">b</span></div>
+    <div class="notranslate">c<p translate="">d</p></div><p>e</p>`);
+  assert.deepEqual(texts(B.create().collect(win.document.body)), ['b', 'd', 'e']);
+  win.document.designMode = 'on';
+  assert.deepEqual(texts(B.create().collect(win.document.body)), []);
+});
+
+test('openShadowRootsWalkedAndObserved', async () => {
+  const {win, t} = (() => {
+    const win = dom('<p>light</p><div id="h"></div>');
+    const sr = win.document.getElementById('h').attachShadow({mode: 'open'});
+    sr.innerHTML = '<span>shadow</span>';
+    const t = T.create(win);
+    t.service.translatePage('hi', 'en', () => {});
+    return {win, t};
+  })();
+  const batch = t.takeBatch();
+  assert.deepEqual(batch.texts, ['light', 'shadow']);
+  t.onResult(batch.id, ['LIGHT', 'SHADOW']);
+  const sr = win.document.getElementById('h').shadowRoot;
+  assert.equal(sr.textContent, 'SHADOW');
+  const s = win.document.createElement('b');
+  s.textContent = 'later';
+  sr.appendChild(s);
+  await tick();
+  assert.deepEqual(t.takeBatch().texts, ['later']);
+});
