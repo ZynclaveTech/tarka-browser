@@ -330,7 +330,9 @@ def brand():
 # Firefox favicon): each becomes Tark's mark. App Review rejected a build
 # under 4.1(a) "copycat" for Firefox's branding (stickers, widget name).
 FIREFOX_IMAGESETS = ('faviconFox', 'foxConfirmation', 'foxDefaultBrowser', 'foxWithStars',
-                     'fxHomeHeaderLogoBall', 'fxHomeHeaderLogoText', 'logoFirefoxLarge',
+                     # (fxHomeHeaderLogoBall/Text are Tark's mark and wordmark
+                     # already, from look-tark.patch: not here.)
+                     'logoFirefoxLarge',
                      'onboardingFoxyWindow', 'firefoxLoader', 'firefox-jp', 'Icon-Small', 'splash',
                      # The fox in Firefox's illustrations (onboarding, empty and
                      # error states, the protections panel) and Pocket's logo;
