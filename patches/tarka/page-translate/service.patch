@@ -18,7 +18,7 @@
  // Tark (D4 Phase 2): shows a call's caption in the script the user reads
  // and translates it, in the speech recognition utility process. Bound by
  // the browser through SpeechRecognitionService.BindTarkCaptionTranslator.
-@@ -15,4 +26,18 @@
+@@ -15,4 +26,22 @@
    // missing; `shown` is still filled when only the translation failed.
    Render(string text, string source, string script, string target)
        => (bool ok, string shown, string translation);
@@ -29,8 +29,12 @@
 +  // two IndicTrans2 models for a page; captions win on a different model
 +  // (kBusyOtherModel) and share theirs in the same direction. `results`
 +  // align with `items`; null keeps the original (a failed sentence, an item
-+  // over 4000 characters, or a status other than kOk). The page's model
-+  // unloads after 3 minutes without a batch.
++  // over 4000 characters, or a status other than kOk). One call translates
++  // at most the first 16 items and 2,000 characters in total (the first item
++  // always counts as fitting; items over 4000 are skipped): the items past
++  // that come back null and the browser sends them again, so captions on the
++  // same worker never wait long. The page's model unloads after 3 minutes
++  // without a batch.
 +  TranslatePageBatch(string source, string target, array<string> items)
 +      => (PageBatchStatus status, array<string?> results);
 +
@@ -165,7 +169,7 @@
      }
      // Codes and sizes only: call content stays out of logs.
      VLOG(1) << "Tark translation: " << source_code << " -> " << (script.empty() ? "-" : script)
-@@ -93,10 +118,61 @@
+@@ -93,10 +118,73 @@
      return result;
    }
  
@@ -179,20 +183,32 @@
 +
 +  void DropHolder(uint64_t holder) { slot_.DropHolder(holder); }
 +
-  private:
++  void SetPaths(const base::FilePath& ort_dylib, const base::FilePath& models_dir) {
++    slot_.SetModelSource(TarkPageTranslator::EngineFactory(ort_dylib, models_dir),
++                         TarkPageTranslator::EnginePresent(models_dir));
++  }
++
++ private:
 +  TarkPageTranslator slot_;
 +};
 +
-+// Every translator's worker in the process: they share its model slot.
++// Every translator's worker in the process: they share its one model slot,
++// whatever paths they were bound with.
 +class TarkCaptionTranslator::Shared : public base::RefCounted<Shared> {
 + public:
 +  static scoped_refptr<Shared> Get(const base::FilePath& ort_dylib,
 +                                   const base::FilePath& models_dir) {
-+    if (g_shared && g_shared->ort_dylib_ == ort_dylib && g_shared->models_dir_ == models_dir) {
-+      return base::WrapRefCounted(g_shared);
++    if (!g_shared) {
++      return base::MakeRefCounted<Shared>(ort_dylib, models_dir);
 +    }
-+    // New paths (SetSodaPaths again): translators bound from now on use them.
-+    return base::MakeRefCounted<Shared>(ort_dylib, models_dir);
++    if (g_shared->ort_dylib_ != ort_dylib || g_shared->models_dir_ != models_dir) {
++      // New paths (SetSodaPaths again): the one slot takes them once it holds
++      // no model.
++      g_shared->ort_dylib_ = ort_dylib;
++      g_shared->models_dir_ = models_dir;
++      g_shared->worker_.AsyncCall(&Worker::SetPaths).WithArgs(ort_dylib, models_dir);
++    }
++    return base::WrapRefCounted(g_shared);
 +  }
 +
 +  Shared(const base::FilePath& ort_dylib, const base::FilePath& models_dir)
@@ -209,7 +225,10 @@
 +
 +  base::SequenceBound<Worker>& worker() { return worker_; }
 +
-+ private:
+  private:
+-  const base::FilePath ort_dylib_;
+-  const base::FilePath models_dir_;
+-  std::unique_ptr<tark_captions::TranslationEngine> engine_;
 +  friend class base::RefCounted<Shared>;
 +  ~Shared() {
 +    if (g_shared == this) {
@@ -217,18 +236,17 @@
 +    }
 +  }
 +
-+  // The newest Shared while it is alive. The translators live on the
++  // The one Shared while it is alive. The translators live on the
 +  // service's sequence; so does this.
 +  static inline Shared* g_shared = nullptr;
 +
-   const base::FilePath ort_dylib_;
-   const base::FilePath models_dir_;
--  std::unique_ptr<tark_captions::TranslationEngine> engine_;
++  base::FilePath ort_dylib_;
++  base::FilePath models_dir_;
 +  base::SequenceBound<Worker> worker_;
  };
  
  // static
-@@ -110,20 +186,21 @@
+@@ -110,20 +198,21 @@
  
  TarkCaptionTranslator::TarkCaptionTranslator(const base::FilePath& ort_dylib,
                                               const base::FilePath& models_dir)
@@ -257,7 +275,7 @@
        .Then(base::BindOnce(
            [](RenderCallback callback, Result result) {
              std::move(callback).Run(result.ok, result.shown, result.translation);
-@@ -131,4 +208,21 @@
+@@ -131,4 +220,21 @@
            std::move(callback)));
  }
  
@@ -300,7 +318,7 @@
    deps = [
 --- /dev/null
 +++ b/chrome/services/speech/tark_page_translator.h
-@@ -0,0 +1,146 @@
+@@ -0,0 +1,159 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -358,6 +376,12 @@
 +
 +// A page item longer than this (characters) stays original, not decoded.
 +inline constexpr size_t kTarkPageMaxItemChars = 4000;
++// One TranslatePageBatch translates at most this many items and characters
++// (in total), so captions sharing the worker never wait long behind a page.
++// The first items that fit are translated; the rest come back null and the
++// browser sends them again. The first item always fits.
++inline constexpr size_t kTarkPageMaxBatchItems = 16;
++inline constexpr size_t kTarkPageMaxBatchChars = 2000;
 +// The page's model unloads after this long without a batch.
 +inline constexpr base::TimeDelta kTarkPageIdleUnload = base::Minutes(3);
 +
@@ -406,6 +430,10 @@
 +                                    const base::FilePath& models_dir);
 +  static ModelPresent EnginePresent(const base::FilePath& models_dir);
 +
++  // New model files (SetSodaPaths again): used from the next model made,
++  // once the slot holds none, so there is never a second model.
++  void SetModelSource(ModelFactory make, ModelPresent present);
++
 +  // Captions' `holder` needs `directions` now (empty: none; it no longer
 +  // holds the slot). Any model only a page used goes first (captions win).
 +  // The model to translate with; null when none is needed or it can't be
@@ -435,8 +463,11 @@
 +  void UnloadPageModel();
 +  void ArmIdleTimer();
 +
-+  const ModelFactory make_;
-+  const ModelPresent present_;
++  ModelFactory make_;
++  ModelPresent present_;
++  // Waiting for the slot to empty (SetModelSource).
++  ModelFactory next_make_;
++  ModelPresent next_present_;
 +  std::unique_ptr<TarkTranslationModel> model_;
 +  TarkDirections loaded_;
 +  std::map<uint64_t, TarkDirections> captions_;
@@ -449,7 +480,7 @@
 +#endif  // CHROME_SERVICES_SPEECH_TARK_PAGE_TRANSLATOR_H_
 --- /dev/null
 +++ b/chrome/services/speech/tark_page_translator.cc
-@@ -0,0 +1,350 @@
+@@ -0,0 +1,376 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -613,12 +644,27 @@
 +  return Checked(std::move(joined));
 +}
 +
-+// The item as it goes to the first leg; null when it is too long.
-+std::optional<std::string> Admitted(const std::string& item) {
-+  if (Chars(item) > kTarkPageMaxItemChars) {
-+    return std::nullopt;
++// The items as they go to the first leg: null when an item is too long, or
++// past the batch's bound (kTarkPageMaxBatchItems, kTarkPageMaxBatchChars;
++// the browser sends those again).
++std::vector<std::optional<std::string>> Admitted(const std::vector<std::string>& items) {
++  std::vector<std::optional<std::string>> admitted(items.size());
++  size_t count = 0;
++  size_t total = 0;
++  for (size_t i = 0; i < items.size(); ++i) {
++    const size_t chars = Chars(items[i]);
++    if (chars > kTarkPageMaxItemChars) {
++      continue;  // never translated: it stays original
++    }
++    if (count == kTarkPageMaxBatchItems ||
++        (count > 0 && total + chars > kTarkPageMaxBatchChars)) {
++      break;
++    }
++    ++count;
++    total += chars;
++    admitted[i] = items[i];
 +  }
-+  return item;
++  return admitted;
 +}
 +
 +}  // namespace
@@ -659,6 +705,15 @@
 +TarkPageTranslator::ModelPresent TarkPageTranslator::EnginePresent(
 +    const base::FilePath& models_dir) {
 +  return base::BindRepeating(&EngineModelPresent, models_dir);
++}
++
++void TarkPageTranslator::SetModelSource(ModelFactory make, ModelPresent present) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  next_make_ = std::move(make);
++  next_present_ = std::move(present);
++  if (!model_) {
++    Unload();  // takes them now
++  }
 +}
 +
 +TarkTranslationModel* TarkPageTranslator::ForCaptions(uint64_t holder,
@@ -714,22 +769,20 @@
 +      batch.status = Status::kModelMissing;
 +      return batch;
 +    }
-+    for (size_t i = 0; i < items.size(); ++i) {
-+      if (const std::optional<std::string> item = Admitted(items[i])) {
-+        batch.results[i] = TranslateText(model, *item, source, target);
++    std::vector<std::optional<std::string>> texts = Admitted(items);
++    for (std::optional<std::string>& text : texts) {
++      if (text) {
++        text = TranslateText(model, *text, source, target);
 +      }
 +    }
++    batch.results = std::move(texts);
 +    DVLOG(1) << "tark-page: shared batch items=" << items.size()
 +             << " ms=" << (base::TimeTicks::Now() - start).InMilliseconds();
 +    return batch;
 +  }
 +
 +  // The page's own model, one leg (one model) at a time.
-+  std::vector<std::optional<std::string>> texts;
-+  texts.reserve(items.size());
-+  for (const std::string& item : items) {
-+    texts.push_back(Admitted(item));
-+  }
++  std::vector<std::optional<std::string>> texts = Admitted(items);
 +  for (const TarkPageLeg& leg : legs) {
 +    TarkTranslationModel* model = Hold({leg.direction}, /*keep_captions=*/false);
 +    if (!model) {
@@ -785,6 +838,10 @@
 +void TarkPageTranslator::Unload() {
 +  model_.reset();
 +  loaded_.clear();
++  if (next_make_) {
++    make_ = std::move(next_make_);
++    present_ = std::move(next_present_);
++  }
 +}
 +
 +void TarkPageTranslator::UnloadPageModel() {
@@ -802,7 +859,7 @@
 +}  // namespace speech
 --- /dev/null
 +++ b/chrome/services/speech/tark_page_translator_unittest.cc
-@@ -0,0 +1,367 @@
+@@ -0,0 +1,442 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -846,6 +903,7 @@
 +  std::string fail;   // this text comes back nullopt
 +  std::string blank;  // this text comes back ""
 +  bool factory_fails = false;
++  int other_made = 0;  // models from the second source (NewPathsShareTheOneSlot)
 +  std::set<TranslationDirection> missing;  // not downloaded
 +};
 +
@@ -1089,6 +1147,59 @@
 +  EXPECT_EQ(models_.alive, 1);
 +}
 +
++// 16 items at most, and 2,000 characters in total: the tail comes back null
++// without reaching the model (the browser sends it again).
++TEST_F(TarkPageTranslatorTest, BatchOverBoundReturnsNullTail) {
++  std::vector<std::string> many(kTarkPageMaxBatchItems + 2, "x");
++  const TarkPageTranslator::PageBatch by_count = Translate("hi", "en", many);
++  ASSERT_EQ(by_count.results.size(), many.size());
++  for (size_t i = 0; i < many.size(); ++i) {
++    EXPECT_EQ(by_count.results[i].has_value(), i < kTarkPageMaxBatchItems) << i;
++  }
++  EXPECT_EQ(models_.received.size(), kTarkPageMaxBatchItems);
++
++  models_.received.clear();
++  const std::string big(1500, 'a');  // 1,500 characters each
++  const TarkPageTranslator::PageBatch by_chars = Translate("hi", "en", {big, big, "x"});
++  EXPECT_EQ(by_chars.results, (Results{"en:" + big, std::nullopt, std::nullopt}));
++  EXPECT_EQ(models_.received, (std::vector<std::string>{big}));
++
++  // One item over 2,000 (but within 4,000) still goes: the first always fits.
++  const std::string alone(3000, 'b');
++  EXPECT_EQ(Translate("hi", "en", {alone}).results, (Results{"en:" + alone}));
++}
++
++// SetSodaPaths again while a model is loaded: the slot keeps it (no second
++// model) and the new files are used from the next model made.
++TEST_F(TarkPageTranslatorTest, NewPathsShareTheOneSlot) {
++  Translate("en", "hi", {"one"});
++  page_.SetModelSource(
++      base::BindRepeating(
++          [](Models* models) -> std::unique_ptr<TarkTranslationModel> {
++            ++models->other_made;
++            return std::make_unique<FakeModel>(models);
++          },
++          base::Unretained(&models_)),
++      base::BindRepeating([](TranslationDirection) { return true; }));
++  Translate("en", "hi", {"two"});  // the loaded model, same direction
++  EXPECT_EQ(models_.made, 1);
++  EXPECT_EQ(models_.other_made, 0);
++  page_.ReleasePageModel();
++  Translate("en", "hi", {"three"});
++  EXPECT_EQ(models_.other_made, 1);
++  EXPECT_EQ(models_.most_alive, 1);
++}
++
++// One captions holder switching direction: the old model goes before the new
++// one is made.
++TEST_F(TarkPageTranslatorTest, CaptionsSwitchingDirectionUnloadsFirst) {
++  ASSERT_TRUE(page_.ForCaptions(/*holder=*/1, {TranslationDirection::kIndicToEnglish}));
++  ASSERT_TRUE(page_.ForCaptions(/*holder=*/1, {TranslationDirection::kEnglishToIndic}));
++  EXPECT_EQ(models_.events, (std::vector<std::string>{"make", "unload", "make"}));
++  EXPECT_EQ(models_.most_alive, 1);
++  EXPECT_EQ(page_.LoadedForTesting(), TarkDirections{TranslationDirection::kEnglishToIndic});
++}
++
 +TEST_F(TarkPageTranslatorTest, Legs) {
 +  auto legs = [](std::string_view source, std::string_view target) {
 +    std::vector<std::string> out;
@@ -1154,6 +1265,27 @@
 +  auto missing = Batch(page, "en", "hi", {"hello"});
 +  EXPECT_EQ(missing.first, media::mojom::PageBatchStatus::kModelMissing);
 +  EXPECT_EQ(missing.second, (Results{std::nullopt}));
++}
++
++// Translators bound with other paths (SetSodaPaths again) still share the
++// one slot: captions on the old paths keep a page on the new ones busy.
++TEST_F(TarkPageTranslatorMojoTest, NewPathsShareTheOneSlot) {
++  base::ScopedTempDir other;
++  ASSERT_TRUE(other.CreateUniqueTempDir());
++  ASSERT_TRUE(base::CreateDirectory(other.GetPath().AppendASCII("it2_en_indic")));
++  mojo::Remote<media::mojom::TarkCaptionTranslator> captions, page;
++  Bind(captions);
++  base::test::TestFuture<bool, const std::string&, const std::string&> rendered;
++  captions->Render("नमस्ते", "hi", "", "en", rendered.GetCallback());
++  ASSERT_TRUE(rendered.Wait());
++  TarkCaptionTranslator::Create(
++      page.BindNewPipeAndPassReceiver(),
++      base::FilePath(FILE_PATH_LITERAL("/nonexistent/libonnxruntime.dylib")), other.GetPath());
++  EXPECT_EQ(Batch(page, "en", "hi", {"hello"}).first,
++            media::mojom::PageBatchStatus::kBusyOtherModel);
++  captions.reset();
++  page.reset();
++  env_.RunUntilIdle();
 +}
 +
 +TEST_F(TarkPageTranslatorMojoTest, MissingFolderAndUnsupportedPair) {
