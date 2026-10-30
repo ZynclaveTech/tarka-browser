@@ -299,7 +299,20 @@
  }  // namespace speech
 --- a/chrome/services/speech/BUILD.gn
 +++ b/chrome/services/speech/BUILD.gn
-@@ -24,6 +24,8 @@
+@@ -7,6 +7,12 @@
+ 
+ assert(enable_speech_service)
+ 
++# Tark page translation: how much of a page batch one TranslatePageBatch
++# takes. Header only; the browser's TarkPageTranslation uses it too.
++source_set("tark_page_batch") {
++  sources = [ "tark_page_batch.h" ]
++}
++
+ source_set("lib") {
+   sources = [
+     "audio_source_consumer.h",
+@@ -24,11 +30,14 @@
      "tark_caption_recognizer.h",
      "tark_caption_translator.cc",
      "tark_caption_translator.h",
@@ -308,7 +321,13 @@
    ]
  
    configs += [ "//build/config/compiler:wexit_time_destructors" ]
-@@ -118,6 +120,7 @@
+ 
+   public_deps = [
++    ":tark_page_batch",  # tark_page_translator.h
+     "//media/mojo/mojom",
+     "//mojo/public/cpp/bindings",
+     "//mojo/public/mojom/base",
+@@ -118,6 +127,7 @@
    sources = [
      "tark_caption_recognizer_unittest.cc",
      "tark_caption_translator_unittest.cc",
@@ -317,8 +336,78 @@
    ]
    deps = [
 --- /dev/null
++++ b/chrome/services/speech/tark_page_batch.h
+@@ -0,0 +1,67 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_SERVICES_SPEECH_TARK_PAGE_BATCH_H_
++#define CHROME_SERVICES_SPEECH_TARK_PAGE_BATCH_H_
++
++#include <stddef.h>
++
++#include <algorithm>
++#include <string>
++#include <string_view>
++#include <vector>
++
++namespace speech {
++
++// How much of a page batch one TranslatePageBatch call takes, shared by the
++// speech process (TarkPageTranslator) and the browser (TarkPageTranslation),
++// which sends the rest again. Header only, so the browser needs nothing else
++// of the speech service.
++
++// A page item longer than this (characters) stays original, not decoded.
++inline constexpr size_t kTarkPageMaxItemChars = 4000;
++// One TranslatePageBatch translates at most this many items and characters
++// (in total), so captions sharing the worker never wait long behind a page.
++// The first items that fit are translated; the rest come back null and the
++// browser sends them again. The first item always fits.
++inline constexpr size_t kTarkPageMaxBatchItems = 16;
++inline constexpr size_t kTarkPageMaxBatchChars = 2000;
++
++// Code points, not bytes.
++inline size_t TarkPageChars(std::string_view text) {
++  return static_cast<size_t>(std::ranges::count_if(
++      text, [](char c) { return (static_cast<unsigned char>(c) & 0xC0) != 0x80; }));
++}
++
++// An item over kTarkPageMaxItemChars: never translated, it stays original
++// (a null result for it is final, never sent again).
++inline bool TarkPageItemTooLong(std::string_view text) {
++  return TarkPageChars(text) > kTarkPageMaxItemChars;
++}
++
++// One past the last item a TranslatePageBatch call on `items` takes: the
++// items before it are translated or, too long, skipped; null results from
++// there on are the tail the browser sends again. More than 0 whenever
++// `items` isn't empty, so re-sending the tail always ends.
++inline size_t TarkPageBatchEnd(const std::vector<std::string>& items) {
++  size_t count = 0;
++  size_t total = 0;
++  for (size_t i = 0; i < items.size(); ++i) {
++    const size_t chars = TarkPageChars(items[i]);
++    if (chars > kTarkPageMaxItemChars) {
++      continue;  // skipped, not counted
++    }
++    if (count == kTarkPageMaxBatchItems ||
++        (count > 0 && total + chars > kTarkPageMaxBatchChars)) {
++      return i;
++    }
++    ++count;
++    total += chars;
++  }
++  return items.size();
++}
++
++}  // namespace speech
++
++#endif  // CHROME_SERVICES_SPEECH_TARK_PAGE_BATCH_H_
+--- /dev/null
 +++ b/chrome/services/speech/tark_page_translator.h
-@@ -0,0 +1,159 @@
+@@ -0,0 +1,152 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -342,6 +431,7 @@
 +#include "base/sequence_checker.h"
 +#include "base/time/time.h"
 +#include "base/timer/timer.h"
++#include "chrome/services/speech/tark_page_batch.h"
 +#include "components/tark_captions/translation_engine.h"
 +
 +namespace speech {
@@ -374,14 +464,6 @@
 +// model each. Empty when there is no model for the pair (or they are equal).
 +std::vector<TarkPageLeg> TarkPageLegsFor(std::string_view source, std::string_view target);
 +
-+// A page item longer than this (characters) stays original, not decoded.
-+inline constexpr size_t kTarkPageMaxItemChars = 4000;
-+// One TranslatePageBatch translates at most this many items and characters
-+// (in total), so captions sharing the worker never wait long behind a page.
-+// The first items that fit are translated; the rest come back null and the
-+// browser sends them again. The first item always fits.
-+inline constexpr size_t kTarkPageMaxBatchItems = 16;
-+inline constexpr size_t kTarkPageMaxBatchChars = 2000;
 +// The page's model unloads after this long without a batch.
 +inline constexpr base::TimeDelta kTarkPageIdleUnload = base::Minutes(3);
 +
@@ -480,7 +562,7 @@
 +#endif  // CHROME_SERVICES_SPEECH_TARK_PAGE_TRANSLATOR_H_
 --- /dev/null
 +++ b/chrome/services/speech/tark_page_translator.cc
-@@ -0,0 +1,376 @@
+@@ -0,0 +1,360 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -552,12 +634,6 @@
 +    return std::nullopt;
 +  }
 +  return text;
-+}
-+
-+// Code points, not bytes.
-+size_t Chars(std::string_view text) {
-+  return static_cast<size_t>(std::ranges::count_if(
-+      text, [](char c) { return (static_cast<unsigned char>(c) & 0xC0) != 0x80; }));
 +}
 +
 +// A page text's sentences (Android's PageTranslator): each ends after ".",
@@ -645,24 +721,14 @@
 +}
 +
 +// The items as they go to the first leg: null when an item is too long, or
-+// past the batch's bound (kTarkPageMaxBatchItems, kTarkPageMaxBatchChars;
-+// the browser sends those again).
++// past the batch's bound (TarkPageBatchEnd; the browser sends those again).
 +std::vector<std::optional<std::string>> Admitted(const std::vector<std::string>& items) {
 +  std::vector<std::optional<std::string>> admitted(items.size());
-+  size_t count = 0;
-+  size_t total = 0;
-+  for (size_t i = 0; i < items.size(); ++i) {
-+    const size_t chars = Chars(items[i]);
-+    if (chars > kTarkPageMaxItemChars) {
-+      continue;  // never translated: it stays original
++  const size_t end = TarkPageBatchEnd(items);
++  for (size_t i = 0; i < end; ++i) {
++    if (!TarkPageItemTooLong(items[i])) {
++      admitted[i] = items[i];  // a too-long one stays original
 +    }
-+    if (count == kTarkPageMaxBatchItems ||
-+        (count > 0 && total + chars > kTarkPageMaxBatchChars)) {
-+      break;
-+    }
-+    ++count;
-+    total += chars;
-+    admitted[i] = items[i];
 +  }
 +  return admitted;
 +}
