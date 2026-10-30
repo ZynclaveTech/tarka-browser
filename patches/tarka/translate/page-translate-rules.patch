@@ -1,6 +1,6 @@
 --- a/components/tark_captions/page_translate_rules.h
 +++ b/components/tark_captions/page_translate_rules.h
-@@ -0,0 +1,57 @@
+@@ -0,0 +1,66 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -11,6 +11,9 @@
 +#include <string>
 +#include <string_view>
 +#include <vector>
++
++#include "base/functional/function_ref.h"
++#include "components/tark_captions/model_manifest.h"
 +
 +namespace tark_captions {
 +
@@ -55,12 +58,18 @@
 +};
 +BarMode BarModeFor(PageStep step, bool models_missing, bool downloading);
 +
++// The models a page still needs: those its last request found missing
++// (`reported`) that aren't `ready` now. A download that has finished drops
++// out before any new request says so.
++std::vector<ModelUnit> StillMissing(const std::vector<ModelUnit>& reported,
++                                    base::FunctionRef<bool(ModelUnit)> ready);
++
 +}  // namespace tark_captions
 +
 +#endif  // COMPONENTS_TARK_CAPTIONS_PAGE_TRANSLATE_RULES_H_
 --- a/components/tark_captions/page_translate_rules.cc
 +++ b/components/tark_captions/page_translate_rules.cc
-@@ -0,0 +1,79 @@
+@@ -0,0 +1,90 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -139,16 +148,28 @@
 +  }
 +}
 +
++std::vector<ModelUnit> StillMissing(const std::vector<ModelUnit>& reported,
++                                    base::FunctionRef<bool(ModelUnit)> ready) {
++  std::vector<ModelUnit> missing;
++  for (ModelUnit unit : reported) {
++    if (!ready(unit)) {
++      missing.push_back(unit);
++    }
++  }
++  return missing;
++}
++
 +}  // namespace tark_captions
 --- a/components/tark_captions/page_translate_rules_unittest.cc
 +++ b/components/tark_captions/page_translate_rules_unittest.cc
-@@ -0,0 +1,69 @@
+@@ -0,0 +1,80 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
 +
 +#include "components/tark_captions/page_translate_rules.h"
 +
++#include "components/tark_captions/model_manifest.h"
 +#include "testing/gtest/include/gtest/gtest.h"
 +
 +namespace tark_captions {
@@ -208,6 +229,16 @@
 +  EXPECT_EQ(BarModeFor(PageStep::kError, true, false), BarMode::kNeedsDownload);
 +  EXPECT_EQ(BarModeFor(PageStep::kBefore, true, false), BarMode::kNeedsDownload);
 +  EXPECT_EQ(BarModeFor(PageStep::kError, true, true), BarMode::kDownloading);
++}
++
++TEST(PageTranslateRulesTest, DownloadedModelsAreNoLongerMissing) {
++  // The last request found both missing; the English one has downloaded
++  // since, with no new request to say so.
++  const std::vector<ModelUnit> reported = {ModelUnit::kToEnglish, ModelUnit::kFromEnglish};
++  EXPECT_EQ(StillMissing(reported, [](ModelUnit u) { return u == ModelUnit::kToEnglish; }),
++            std::vector<ModelUnit>{ModelUnit::kFromEnglish});
++  EXPECT_TRUE(StillMissing(reported, [](ModelUnit) { return true; }).empty());
++  EXPECT_TRUE(StillMissing({}, [](ModelUnit) { return false; }).empty());
 +}
 +
 +}  // namespace

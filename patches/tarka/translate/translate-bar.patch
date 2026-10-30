@@ -34,7 +34,7 @@
 +#endif  // CHROME_BROWSER_UI_VIEWS_TRANSLATE_TARK_TRANSLATE_BAR_H_
 --- a/chrome/browser/ui/views/translate/tark_translate_bar.cc
 +++ b/chrome/browser/ui/views/translate/tark_translate_bar.cc
-@@ -0,0 +1,399 @@
+@@ -0,0 +1,411 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -144,7 +144,14 @@
 +  std::vector<tark_captions::ModelUnit> Missing() const {
 +    auto* helper = tark_captions::PageTranslateTabHelper::FromWebContents(web_contents_);
 +    if (helper && !helper->missing().empty()) {
-+      return helper->missing();
++      // What the last request found missing, less what has downloaded
++      // since (no new request has said so yet).
++      std::vector<tark_captions::ModelUnit> still = tark_captions::StillMissing(
++          helper->missing(),
++          [](tark_captions::ModelUnit unit) { return tark_captions::TarkCaptionModels().ready(unit); });
++      if (!still.empty()) {
++        return still;
++      }
 +    }
 +    std::vector<tark_captions::ModelUnit> missing;
 +    const std::optional<tark_captions::Target> t = tark_captions::TargetFromCode(target_);
@@ -241,6 +248,7 @@
 +                                              NameInItself(d->source())));
 +    target_button_->SetText(NameInEnglishUi(d->target()) + u" ▾");
 +    const std::vector<tark_captions::ModelUnit> missing = d->Missing();
++    waiting_for_models_ = !missing.empty();
 +    bool downloading = false;
 +    int64_t done = 0;
 +    int64_t total = 0;
@@ -279,12 +287,13 @@
 +  }
 +
 +  // tark_captions::CaptionModelStore::Observer:
-+  void OnModelStatusChanged(tark_captions::ModelUnit unit) override {
-+    const bool was_missing = !bar()->Missing().empty();
++  void OnModelStatusChanged(tark_captions::ModelUnit) override {
++    // The store has already changed: what the bar showed before this
++    // refresh is the only record that it was waiting.
++    const bool was_waiting = waiting_for_models_;
 +    Refresh();
 +    // Downloaded while the bar waited: translate now.
-+    if (was_missing && bar()->Missing().empty() &&
-+        tark_captions::TarkCaptionModels().ready(unit)) {
++    if (was_waiting && !waiting_for_models_) {
 +      bar()->Translate();
 +    }
 +  }
@@ -344,6 +353,9 @@
 +
 + private:
 +  BarDelegate* bar() { return static_cast<BarDelegate*>(delegate()); }
++
++  // Whether the last Refresh() found models missing.
++  bool waiting_for_models_ = false;
 +
 +  void OnOriginal() {
 +    bar()->ShowOriginal();

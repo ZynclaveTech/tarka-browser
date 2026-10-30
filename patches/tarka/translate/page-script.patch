@@ -1,6 +1,6 @@
 --- a/components/translate/core/browser/resources/tark_page_translate.js
 +++ b/components/translate/core/browser/resources/tark_page_translate.js
-@@ -0,0 +1,364 @@
+@@ -0,0 +1,370 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -336,10 +336,16 @@
 +    },
 +    translatePage(sourceLang, targetLang, progress) {
 +      if (sourceLang !== source || targetLang !== target) {
++        // A batch still out is for the old pair: its reply finds no ids.
 +        cache.clear();
++        waiting.clear();
 +        units.clear();
 +        queue = [];
 +        queued.clear();
++      } else if (failed) {
++        // A failed batch's sentences were dropped: rescanning every block
++        // queues them again (the rest come from the cache).
++        units.clear();
 +      }
 +      source = sourceLang;
 +      target = targetLang;
@@ -618,13 +624,14 @@
 +});</script>
 --- a/chrome/test/data/tark_translate/harness.js
 +++ b/chrome/test/data/tark_translate/harness.js
-@@ -0,0 +1,34 @@
+@@ -0,0 +1,35 @@
 +// Tark page translation test harness: Chromium's translate.js stand-in,
 +// a fake translator (upper case, 100 ms polling like TranslateAgent) and
 +// assertions. Each page calls tarkTest(async (t) => {...}).
 +window.cr = {googleTranslate: {onTranslateElementLoad() {}}};
 +window.tarkPushes = 0;
 +function tarkPump() {
++  if (window.tarkHold) return;
 +  let batch = window.__tarkTranslatePull ? __tarkTranslatePull() : [];
 +  if (batch.length) {
 +    tarkPushes++;
@@ -668,7 +675,7 @@
 @@ -0,0 +1,16 @@
 +<!doctype html><meta charset="utf-8"><title>runner</title><body><pre id=out></pre>
 +<script>
-+const cases = ['static','skips','split_link','adds_by_timer','rewrites','pushstate','iframe_same','long','model_gone'];
++const cases = ['static','skips','split_link','adds_by_timer','rewrites','pushstate','iframe_same','long','model_gone','retry_after_failure','language_change'];
 +(async () => {
 +  const out = document.querySelector('#out'); let all = true;
 +  for (const c of cases) {
@@ -785,4 +792,42 @@
 +  t.check(t.tree() === before, 'tree changed');
 +  t.service.restore();
 +  t.check(t.text('p') === 'पहला वाक्य। दूसरा वाक्य।', 'restore ' + t.text('p'));
++});</script>
+--- a/chrome/test/data/tark_translate/retry_after_failure.html
++++ b/chrome/test/data/tark_translate/retry_after_failure.html
+@@ -0,0 +1,14 @@
++<!doctype html><meta charset="utf-8"><script src="harness.js"></script>
++<body><div id=all></div>
++<script>const all = document.querySelector('#all');
++for (let i = 0; i < 40; i++) { const p = document.createElement('p'); p.textContent = 'पंक्ति ' + i; all.appendChild(p); }
++tarkTest(async t => {
++  // The first batch fails (models missing); once they are back, translating
++  // again translates every paragraph, the failed batch's ones included.
++  let batches = 0;
++  window.tarkFail = () => ++batches === 1;
++  t.translate(); await t.sleep(500);
++  t.translate(); await t.sleep(1000);
++  const left = Array.from(all.children).filter(p => !p.textContent.startsWith('⟦')).length;
++  t.check(left === 0, left + ' of 40 paragraphs left untranslated after the retry');
++});</script>
+--- a/chrome/test/data/tark_translate/language_change.html
++++ b/chrome/test/data/tark_translate/language_change.html
+@@ -0,0 +1,18 @@
++<!doctype html><meta charset="utf-8"><script src="harness.js"></script>
++<body><p id=a>आज मौसम अच्छा है।</p><p id=b>बाज़ार खुला है।</p>
++<script>
++tarkTest(async t => {
++  // A batch for Hindi → English is out when the reader switches to Tamil:
++  // its late reply must not be kept as the Tamil translation.
++  window.tarkHold = true;
++  t.service.translatePage('hi', 'en', () => {});
++  const old = __tarkTranslatePull();
++  t.service.translatePage('hi', 'ta', () => {});
++  __tarkTranslatePush(old.map(b => b[0]), old.map(b => 'EN:' + b[1]), true);
++  window.tarkHold = false;
++  await t.sleep(800);
++  for (const id of ['a', 'b']) {
++    t.check(!t.text('#' + id).includes('EN:'), '#' + id + ' shows the old language: ' + t.text('#' + id));
++    t.check(t.text('#' + id).startsWith('⟦'), '#' + id + ' not translated: ' + t.text('#' + id));
++  }
 +});</script>
