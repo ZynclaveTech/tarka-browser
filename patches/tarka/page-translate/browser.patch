@@ -93,7 +93,7 @@
    # with a fake of the library, so it needs nothing of the browser.
 --- /dev/null
 +++ b/chrome/browser/tark_captions/page_translation.cc
-@@ -0,0 +1,254 @@
+@@ -0,0 +1,256 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -249,6 +249,8 @@
 +      // tail the call didn't take: the service's bound, shared.
 +      const size_t end = speech::TarkPageBatchEnd(items);
 +      if (results.size() != items.size() || end == 0) {
++        DVLOG(1) << "tark-page: browser batch answer malformed results=" << results.size()
++                 << " items=" << items.size();
 +        Finish(id);  // a malformed answer: the rest keep their originals
 +        return;
 +      }
@@ -350,7 +352,7 @@
 +}  // namespace tark_captions
 --- /dev/null
 +++ b/chrome/browser/tark_captions/page_translation.h
-@@ -0,0 +1,164 @@
+@@ -0,0 +1,170 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -381,6 +383,10 @@
 +// download, not the Mac's), or the two are the same.
 +std::vector<ModelUnit> PageUnitsFor(std::string_view source, std::string_view target);
 +
++// Keep in sync with android/patches/page-translate-browser.patch
++// (chrome/browser/tark_captions_android/page_translation.*), which this is
++// copied from; the differences are the Mac's units, statuses and tail.
++//
 +// One tab's page translation on the Mac, without content or mojo
 +// (TarkPageTranslation is the tab's side; this is what it decides, tested on
 +// the build machine). Ported from Android's PageTranslation. Batches go to
@@ -410,6 +416,8 @@
 +  // Captions hold another model (kBusyOtherModel; captions win): the batch
 +  // is sent again after kBusyRetry, at most kMaxBusyRetries times, then fails
 +  // (its texts keep their originals).
++  // The deadline still runs meanwhile: a batch whose busy retries pass
++  // kBatchDeadline answers deferred instead.
 +  static constexpr base::TimeDelta kBusyRetry = base::Seconds(10);
 +  static constexpr int kMaxBusyRetries = 2;
 +
@@ -735,7 +743,7 @@
 +#endif  // CHROME_BROWSER_TARK_CAPTIONS_TARK_PAGE_TRANSLATE_HOST_H_
 --- /dev/null
 +++ b/chrome/browser/tark_captions/tark_page_translation.cc
-@@ -0,0 +1,257 @@
+@@ -0,0 +1,261 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -785,7 +793,11 @@
 +      off_the_record_(web_contents->GetBrowserContext()->IsOffTheRecord()),
 +      logic_(this, off_the_record_) {}
 +
-+TarkPageTranslation::~TarkPageTranslation() = default;
++TarkPageTranslation::~TarkPageTranslation() {
++  // Nothing calls back in while the members go: logic_'s destructor lets the
++  // units go, which notifies the store's observers.
++  StopWaiting();
++}
 +
 +bool TarkPageTranslation::Enabled() const {
 +  return prefs_ && prefs_->GetBoolean(kPageTranslationEnabledPref);
@@ -995,7 +1007,7 @@
 +}  // namespace tark_captions
 --- /dev/null
 +++ b/chrome/browser/tark_captions/tark_page_translation.h
-@@ -0,0 +1,147 @@
+@@ -0,0 +1,150 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -1130,11 +1142,14 @@
 +  mojo::Remote<media::mojom::TarkCaptionTranslator> translator_;
 +  // Start's direction while its models download.
 +  std::optional<Direction> waiting_;
-+  base::ScopedObservation<CaptionModelStore, CaptionModelStore::Observer> models_observation_{
-+      this};
 +  base::ObserverList<Observer> observers_;
 +  // After the remote: its destructor lets it go.
 +  PageTranslation logic_;
++  // After logic_, so it is gone before logic_'s destructor lets the units go
++  // (HoldForPage notifies the store's observers); ~TarkPageTranslation also
++  // resets it first.
++  base::ScopedObservation<CaptionModelStore, CaptionModelStore::Observer> models_observation_{
++      this};
 +  base::WeakPtrFactory<TarkPageTranslation> weak_factory_{this};
 +
 +  WEB_CONTENTS_USER_DATA_KEY_DECL();
@@ -1145,7 +1160,7 @@
 +#endif  // CHROME_BROWSER_TARK_CAPTIONS_TARK_PAGE_TRANSLATION_H_
 --- /dev/null
 +++ b/chrome/browser/tark_captions/tark_page_translation_unittest.cc
-@@ -0,0 +1,402 @@
+@@ -0,0 +1,425 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -1517,6 +1532,29 @@
 +  EXPECT_EQ(page.outstanding(), 0u);
 +}
 +
++// Destroying the logic mid-translation lets the units go and the translator
++// go once, and nothing it calls asks it anything back (the tab's
++// TarkPageTranslation stops observing the store before this runs).
++TEST_F(TarkPageTranslationTest, DestroyWhileWaitingDoesNotReenter) {
++  int sends_after_destroy = 0;
++  {
++    PageTranslation page(&backend_, false);
++    Translate(page, {"एक"});
++    ASSERT_EQ(backend_.holds[ModelUnit::kToEnglish], 1);
++    backend_.sent.clear();
++  }
++  EXPECT_EQ(answers_, 1);
++  EXPECT_EQ(out_, Results(1));  // answered null, not deferred
++  EXPECT_TRUE(backend_.holds.empty());
++  EXPECT_EQ(backend_.releases, 1);
++  EXPECT_EQ(backend_.disconnects, 1);
++  EXPECT_EQ(backend_.connects, 1);  // nothing connected again
++  sends_after_destroy = static_cast<int>(backend_.sent.size());
++  EXPECT_EQ(sends_after_destroy, 0);
++  task_environment_.FastForwardBy(PageTranslation::kBatchDeadline);  // no timer left
++  EXPECT_EQ(answers_, 1);
++}
++
 +TEST(PageUnitsForTest, EveryIndianLanguageThroughEnglish) {
 +  using V = std::vector<ModelUnit>;
 +  EXPECT_EQ(PageUnitsFor("hi", "en"), (V{ModelUnit::kToEnglish}));
@@ -1597,15 +1635,18 @@
        u.status.state == State::kChecking || !Info(unit)) {
      return false;
    }
-@@ -422,6 +422,13 @@
+@@ -422,6 +422,16 @@
    Notify(unit);
  }
  
 +void CaptionModelStore::HoldForPage(ModelUnit unit, bool hold) {
++  const bool was_in_use = in_use(unit);
 +  int& holds = units_[unit].page_holds;
 +  DCHECK(hold || holds > 0);
 +  holds = hold ? holds + 1 : (holds > 0 ? holds - 1 : 0);
-+  Notify(unit);
++  if (in_use(unit) != was_in_use) {
++    Notify(unit);  // only when what observers see changes
++  }
 +}
 +
  int64_t CaptionModelStore::BytesOnDisk() const {
