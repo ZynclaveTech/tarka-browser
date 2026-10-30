@@ -686,7 +686,7 @@
  #include <utility>
  
  #include "base/check_op.h"
-@@ -14,6 +16,8 @@
+@@ -14,6 +16,9 @@
  #include "base/compiler_specific.h"
  #include "base/feature_list.h"
  #include "base/functional/bind.h"
@@ -694,8 +694,9 @@
 +#include "base/json/json_writer.h"
  #include "base/json/string_escape.h"
  #include "base/location.h"
++#include "base/logging.h"
  #include "base/metrics/histogram_functions.h"
-@@ -21,10 +25,12 @@
+@@ -21,10 +26,12 @@
  #include "base/metrics/histogram_macros_local.h"
  #include "base/no_destructor.h"
  #include "base/notreached.h"
@@ -708,7 +709,7 @@
  #include "components/language_detection/content/renderer/language_detection_agent.h"
  #include "components/language_detection/core/constants.h"
  #include "components/language_detection/core/language_detection_provider.h"
-@@ -70,6 +76,22 @@
+@@ -70,6 +77,22 @@
  // finished.
  const int kTranslateStatusCheckDelayMs = 400;
  
@@ -731,7 +732,7 @@
  // Language name passed to the Translate element for it to detect the language.
  const char kAutoDetectionLanguage[] = "auto";
  
-@@ -137,6 +159,7 @@
+@@ -137,6 +160,7 @@
  void TranslateAgent::PrepareForNewDocument() {
    // Navigated to a new document, reset current page translation.
    ResetPage();
@@ -739,7 +740,7 @@
  }
  
  void TranslateAgent::PageCaptured(
-@@ -498,6 +521,7 @@
+@@ -498,6 +522,7 @@
  
    // Any pending translation is now irrelevant.
    CancelPendingTranslation();
@@ -747,7 +748,7 @@
  
    // Set our states.
    translate_callback_pending_ = std::move(callback);
-@@ -547,6 +571,7 @@
+@@ -547,6 +572,7 @@
    }
  
    CancelPendingTranslation();
@@ -755,7 +756,7 @@
  
    ExecuteScript("cr.googleTranslate.revert()");
  }
-@@ -686,6 +711,8 @@
+@@ -686,6 +712,8 @@
    if (!weak_this) {
      return;
    }
@@ -764,7 +765,7 @@
    // Check the status of the translation.
    translate_task_runner_->PostDelayedTask(
        FROM_HERE,
-@@ -729,6 +756,206 @@
+@@ -729,6 +757,224 @@
    delete this;
  }
  
@@ -850,6 +851,24 @@
 +    ++tark_in_flight_;
 +    tark_outstanding_.insert(static_cast<int64_t>(*id));
 +    const size_t count = texts.size();
++    size_t bytes = 0;
++    for (const std::string& text : texts) {
++      bytes += text.size();
++    }
++    // Diagnostics for the phone (logcat "tark-page"): the script's queue left.
++    LOG(WARNING) << "tark-page: renderer sent batch " << static_cast<int64_t>(*id)
++                 << " items=" << count << " bytes=" << bytes
++                 << " queued=" << batch->GetDict().FindInt("queued").value_or(-1)
++                 << " in_flight=" << tark_in_flight_;
++    size_t bytes = 0;
++    for (const std::string& text : texts) {
++      bytes += text.size();
++    }
++    // Diagnostics for the phone (logcat "tark-page"): the script's queue left.
++    LOG(WARNING) << "tark-page: renderer sent batch " << static_cast<int64_t>(*id)
++                 << " items=" << count << " bytes=" << bytes
++                 << " queued=" << batch->GetDict().FindInt("queued").value_or(-1)
++                 << " in_flight=" << tark_in_flight_;
 +    tark_host_->Translate(
 +        std::move(texts), tark_source_, tark_target_,
 +        base::BindOnce(&TranslateAgent::TarkOnResults,

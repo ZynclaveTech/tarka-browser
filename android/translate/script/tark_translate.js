@@ -6,7 +6,7 @@
 // Chromium's translate.js (cr.googleTranslate) drives. Nothing is fetched.
 // The isolated world has no Mojo, so text leaves through a queue that
 // TranslateAgent (renderer C++) drains:
-//   tarkTranslate.takeBatch()        -> {id: number, texts: string[]} | null
+//   tarkTranslate.takeBatch()        -> {id: number, texts: string[], queued: number} | null
 //   tarkTranslate.onResult(id, results)  results: (string|null)[]
 // A null result keeps the original. translatePage's progress counts answered
 // batches and finishes when the page's queue is drained; text the page adds
@@ -163,7 +163,8 @@ var tarkTranslate = (function() {
       }
       const id = nextId++;
       inflight.set(id, items);
-      return {id: id, texts: texts};
+      // queued: what is left after this batch (the agent logs it).
+      return {id: id, texts: texts, queued: queuedCount};
     }
 
     function onResult(id, results) {

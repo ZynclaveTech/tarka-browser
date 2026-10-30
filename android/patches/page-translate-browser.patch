@@ -56,7 +56,7 @@
  // {"<unit>": ["captions", "voice"]}. A unit no feature wants may be deleted.
 --- /dev/null
 +++ b/chrome/browser/tark_captions_android/page_translation.cc
-@@ -0,0 +1,184 @@
+@@ -0,0 +1,194 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -68,6 +68,7 @@
 +
 +#include "base/functional/bind.h"
 +#include "base/location.h"
++#include "base/logging.h"
 +#include "base/task/sequenced_task_runner.h"
 +
 +namespace tark_captions {
@@ -132,7 +133,11 @@
 +    }
 +  }
 +  const uint64_t id = next_id_++;
-+  pending_[id] = Pending{texts.size(), std::move(callback)};
++  size_t bytes = 0;
++  for (const std::string& text : texts) {
++    bytes += text.size();
++  }
++  pending_[id] = Pending{texts.size(), std::move(callback), base::TimeTicks::Now(), bytes};
 +  backend_->SendBatch(source, target, units, texts,
 +                      base::BindOnce(&PageTranslation::OnResults, weak_factory_.GetWeakPtr(), id));
 +  base::SequencedTaskRunner::GetCurrentDefault()->PostDelayedTask(
@@ -199,6 +204,8 @@
 +  }
 +  Pending batch = std::move(it->second);
 +  pending_.erase(it);
++  LOG(WARNING) << "tark-page: browser batch deadline items=" << batch.size
++               << " bytes=" << batch.bytes << " pending=" << pending_.size();
 +  std::move(batch.callback).Run(Results(batch.size));
 +  MaybeStartIdleTimer();
 +}
@@ -213,6 +220,9 @@
 +  if (results.size() != batch.size) {
 +    results = Results(batch.size);
 +  }
++  LOG(WARNING) << "tark-page: browser batch done items=" << batch.size << " bytes=" << batch.bytes
++               << " ms=" << (base::TimeTicks::Now() - batch.sent).InMilliseconds()
++               << " pending=" << pending_.size();
 +  std::move(batch.callback).Run(std::move(results));
 +  MaybeStartIdleTimer();
 +}
@@ -243,7 +253,7 @@
 +}  // namespace tark_captions
 --- /dev/null
 +++ b/chrome/browser/tark_captions_android/page_translation.h
-@@ -0,0 +1,128 @@
+@@ -0,0 +1,130 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -349,6 +359,8 @@
 +  struct Pending {
 +    size_t size = 0;
 +    ResultsCallback callback;
++    base::TimeTicks sent;  // diagnostics: logcat "tark-page"
++    size_t bytes = 0;
 +  };
 +
 +  void OnResults(uint64_t id, Results results);
