@@ -246,8 +246,11 @@ look-settings-padding.patch
 # Google's Chrome help; they open Tark's help page, the screen's section.
 look-help-on-gettarka.patch
 #
-# A3 (the user: fix the Google Translate row): Translate is off without a
-# server (ungoogled-chromium), so its settings go unless one is given, as on the Mac.
+# A3 (the user: fix the Google Translate row): Google's Translate rows (Offer
+# to translate, the target, always and never translate) stay gone, with or
+# without --translate-script-url; Settings › Languages › Page translation
+# (tark.page_translation.enabled, registered on by default here) is Tark's own
+# translator on the phone (page-translate-ui.patch reads it). English and Hindi.
 translate-settings-off.patch
 #
 # Faster Indian-language rows (the user, 2026-10-21): a decoder step's
@@ -291,6 +294,13 @@ captions-downloads.patch
 # machine.
 captions-service.patch
 #
+# Page translation: the engine. The captions process also translates a
+# page's text in batches (PageTranslator) on its one model slot, shared with
+# captions' Translate: never two IndicTrans2 models at once (Indian ↔ Indian
+# a leg at a time; captions win on a different model, the two share the same
+# direction). A failed sentence comes back null and the page keeps it.
+page-translate-service.patch
+#
 # Live captions: a tab's media audio. Chromium's speech-recognition hook in
 # the media player (desktop Live Caption's) is built on Android too; Tark's
 # client sends the audio to the browser only while captions are on in the
@@ -302,11 +312,54 @@ captions-audio.patch
 # build machine), and the bridge to the caption bar.
 captions-tab.patch
 #
+# Page translation: each tab's batches (TarkPageTranslation, tied to the main
+# document; decided by PageTranslation, tested on the build machine). They go
+# to the tab's captions process, captions' own when captions are on, else one
+# started without speech: never two in a tab, and one page-only process in
+# the browser. Let go after 3 idle minutes or in the background; models are
+# captions' downloads (owner page_translation, nothing written in Private).
+page-translate-browser.patch
+#
+# Page translation: Tark's translate script (android/translate/script.py from
+# android/translate/script/), IDR_TARK_TRANSLATE_JS: google.translate's
+# TranslateService for translate.js. It sends each text node as is, visible
+# ones first, through a queue TranslateAgent drains (takeBatch / onResult);
+# a null result keeps the original, revert puts back the exact text, and the
+# page's own later text is translated without resending Tark's writes.
+page-translate-script.patch
+#
+# Page translation: the wiring. TranslateScript serves Tark's script from the
+# APK and never fetches element.js; translate needs no API key, no
+# --translate-script-url and no network (Tark's translator is on the phone),
+# and offers by default. TranslateAgent pumps the script's queue from the
+# translate world to the browser (tark.mojom.PageTranslateHost, one per main
+# document; two batches out at a time, the next sent as one answers, the
+# queue looked at every 400 ms, 2 s once idle, until Show original or a new
+# document; held while the page is hidden; a batch that can't be read or
+# whose pipe closes is answered with originals) and into TarkPageTranslation;
+# a null answer keeps the original. Nothing reaches Google even with
+# --translate-script-url (no language list, no securityOrigin).
+page-translate-wiring.patch
+#
 # Live captions: the caption bar (the mockup: the mark · Captions · the
 # language · ✕, the first download, the captions) in the bottom container,
 # Settings › Accessibility › Live captions (caption style, languages on the
 # phone), the "What Tark connects to" row, English and Hindi.
 captions-ui.patch
+#
+# Page translation: the UI. Settings › Languages › Page translation
+# (tark.page_translation.enabled, on by default; Google's Translate rows stay
+# gone); the offer and the menu's Translate only while it is on; Translate's
+# languages are the translator's (the 22 of India, English, Spanish; Spanish
+# only into English): the target menu keeps only the directions it has from
+# the page's language and a target it hasn't (Hindi → Spanish) becomes
+# English, so a tap never does nothing. The first translation of a direction shows captions'
+# download card ("Getting translation ready · 221 MB", on Wi-Fi unless
+# "Download now") instead and translates once the models are on the phone;
+# the page stays as it is meanwhile, with no error. A Private tab never starts
+# a download ("Download in a regular tab first"). After captions-ui.patch,
+# whose TarkCaptionsBridge and strings it uses. English and Hindi.
+page-translate-ui.patch
 #
 # Voice (spec: Android voice): the Web Speech API on the device only. Android's
 # on-device recognizer (Android 12+), never the online one; below 12 or

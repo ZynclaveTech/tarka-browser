@@ -103,7 +103,9 @@ fi
 # The junit tests of the speech and voice patches (voice input) and of the
 # Private button (private-tab-button.patch), of Sign in with Zynclave
 # (zynclave-*.patch), of Background play (media-background-play.patch) and of
-# Picture in Picture on leave (media-pip-on-leave.patch), built and
+# Picture in Picture on leave (media-pip-on-leave.patch), of Page translation's
+# setting (translate-settings-off.patch) and offer and download card
+# (page-translate-ui.patch), built and
 # run here on the same tree (the runners with a venv's Python: there is no
 # vpython3); a failure, or a filter that runs no test, fails the job.
 if (( code == 0 )); then
@@ -134,18 +136,24 @@ if (( code == 0 )); then
       /tark/junit-venv/bin/python $o/bin/run_chrome_junit_tests --gtest_filter='*SpeechLanguageSnackbarTest*:*VoiceDetectionTest*:*VoiceLanguagesTest*:*VoiceLanguageSignalsTest*:*VoiceLanguagesSettingsTest*:*AndroidVoicePlatformTest*:*VoiceSiteLanguagesTest*:*VoiceLanguageOfferTest*' &&
       /tark/junit-venv/bin/python $o/bin/run_chrome_junit_tests --gtest_filter='*IncognitoTabSwitcherPaneUnitTest*' &&
       /tark/junit-venv/bin/python $o/bin/run_chrome_junit_tests --gtest_filter='*ZynclaveAuthFlowTest*:*AuthStateStoreTest*:*ZynclaveAccountTest*:*ZynclaveAccountRowTest*:*ZynclaveNoTokenLogsTest*:*ZynclaveRedirectTest*:*ZynclaveWebOfferTest*' &&
-      /tark/junit-venv/bin/python $o/bin/run_chrome_junit_tests --gtest_filter='*TarkMediaPrefsTest*:*TarkLeaveDecisionTest*:*TarkExclusiveAccessPipTest*:*TarkPipEntryPointsTest*:*TarkAutoPictureInPictureTest*:*FullscreenVideoPictureInPictureControllerUnitTest*:*TarkFullscreenPipTest*'
+      /tark/junit-venv/bin/python $o/bin/run_chrome_junit_tests --gtest_filter='*TarkMediaPrefsTest*:*TarkLeaveDecisionTest*:*TarkExclusiveAccessPipTest*:*TarkPipEntryPointsTest*:*TarkAutoPictureInPictureTest*:*FullscreenVideoPictureInPictureControllerUnitTest*:*TarkFullscreenPipTest*' &&
+      /tark/junit-venv/bin/python $o/bin/run_chrome_junit_tests --gtest_filter='*PageTranslationSettingsTest*:*PageTranslationOfferTest*'
     } > /tark/junit.log 2>&1
     code=$?
     # A filter that matches nothing "passes" with no test run.
     for t in SpeechRecognitionImplTest SpeechLanguageSnackbarTest VoiceDetectionTest VoiceLanguagesTest VoiceLanguageSignalsTest VoiceLanguagesSettingsTest AndroidVoicePlatformTest VoiceSiteLanguagesTest VoiceLanguageOfferTest IncognitoTabSwitcherPaneUnitTest \
         ZynclaveAuthFlowTest AuthStateStoreTest ZynclaveAccountTest ZynclaveAccountRowTest ZynclaveNoTokenLogsTest ZynclaveRedirectTest ZynclaveWebOfferTest \
         TarkMediaPrefsTest TarkLeaveDecisionTest TarkExclusiveAccessPipTest TarkPipEntryPointsTest \
-        TarkAutoPictureInPictureTest FullscreenVideoPictureInPictureControllerUnitTest TarkFullscreenPipTest; do
+        TarkAutoPictureInPictureTest FullscreenVideoPictureInPictureControllerUnitTest TarkFullscreenPipTest \
+        PageTranslationSettingsTest PageTranslationOfferTest; do
       grep -q "OK \] .*$t\." /tark/junit.log || { echo "junit: no $t test ran" >> $log; code=1; }
     done
     upload /tark/junit.log junit.log
   fi
   echo "junit exit $code" >> $log
 fi
+# Page translation's browser tests (TarkPageTranslateBrowserTest in
+# page-translate-wiring.patch) are not built: android_browsertests needs
+# chrome/test/base, which doesn't compile without safe_browsing (ungoogled).
+# Their behaviours are checked by hand on the emulator (android/emulator/README.md).
 exit $code

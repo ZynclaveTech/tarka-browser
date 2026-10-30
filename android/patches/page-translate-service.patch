@@ -1,0 +1,1604 @@
+--- a/chrome/services/tark_captions/BUILD.gn
++++ b/chrome/services/tark_captions/BUILD.gn
+@@ -4,7 +4,8 @@
+ #
+ # Tark for Android's live captions process: the caption engine on the model
+ # files the browser hands over. CaptionSession has no mojo or engine
+-# dependencies, so its tests build for the build machine.
++# dependencies, so its tests build for the build machine; so has
++# PageTranslator (page translation on the same model slot).
+ 
+ import("//testing/test.gni")
+ 
+@@ -12,6 +13,8 @@
+   sources = [
+     "caption_session.cc",
+     "caption_session.h",
++    "page_translator.cc",
++    "page_translator.h",
+   ]
+   deps = [ "//base" ]
+ }
+@@ -32,7 +35,10 @@
+ 
+ if (!is_android) {
+   test("tark_captions_session_unittests") {
+-    sources = [ "caption_session_unittest.cc" ]
++    sources = [
++      "caption_session_unittest.cc",
++      "page_translator_unittest.cc",
++    ]
+     deps = [
+       ":session",
+       "//base",
+--- a/chrome/services/tark_captions/caption_service_impl.cc
++++ b/chrome/services/tark_captions/caption_service_impl.cc
+@@ -70,11 +70,9 @@
+   std::optional<std::string> Translate(std::string_view caption,
+                                        std::string_view source,
+                                        std::string_view target) override {
+-    const std::optional<Target> to = TargetFromCode(target);
+-    if (!to) {
+-      return std::nullopt;
+-    }
+-    return engine_->TranslateFrom(caption, source, *to);
++    // TranslateFrom for captions' languages; all 22 Indian languages for a
++    // page.
++    return engine_->TranslatePage(caption, source, target);
+   }
+ 
+  private:
+@@ -115,7 +113,19 @@
+ 
+ CaptionServiceImpl::CaptionServiceImpl(mojo::PendingReceiver<mojom::CaptionService> receiver)
+     : receiver_(this, std::move(receiver)),
+-      session_(base::BindRepeating(&MakeEngine), base::BindRepeating(&MakeTranslator)) {}
++      session_(base::BindRepeating(&MakeEngine), base::BindRepeating(&MakeTranslator)),
++      page_(&session_, base::BindRepeating(&MakeTranslator)) {
++  // A page's pipe closes on navigation or a deadline: its queued batches go
++  // with it.
++  page_receivers_.set_disconnect_handler(base::BindRepeating(
++      [](CaptionServiceImpl* self) {
++        // The model stays: the browser drops a pipe to let go of its queue
++        // (deadline, navigation) and binds a new one for the next batch. It
++        // says Release when it lets the model go.
++        self->page_.DropBatches(self->page_receivers_.current_receiver());
++      },
++      base::Unretained(this)));
++}
+ 
+ CaptionServiceImpl::~CaptionServiceImpl() = default;
+ 
+@@ -171,6 +181,33 @@
+ 
+ void CaptionServiceImpl::Stop() {
+   session_.Stop();
++}
++
++void CaptionServiceImpl::BindPageTranslator(
++    mojo::PendingReceiver<mojom::PageTranslator> receiver) {
++  page_receivers_.Add(this, std::move(receiver));
++}
++
++void CaptionServiceImpl::TranslateBatch(const std::string& source,
++                                        const std::string& target,
++                                        base::flat_map<std::string, base::File> files,
++                                        const std::vector<std::string>& texts,
++                                        TranslateBatchCallback callback) {
++  std::map<std::string, base::File> by_name;
++  for (auto& [name, file] : files) {
++    by_name.emplace(name, std::move(file));
++  }
++  page_.TranslateBatch(source, target, std::move(by_name), texts,
++                       base::BindOnce(
++                           [](TranslateBatchCallback callback, PageResults results) {
++                             std::move(callback).Run(results);
++                           },
++                           std::move(callback)),
++                       page_receivers_.current_receiver());
++}
++
++void CaptionServiceImpl::Release() {
++  page_.ReleaseModel();
+ }
+ 
+ }  // namespace tark_captions
+--- a/chrome/services/tark_captions/caption_service_impl.h
++++ b/chrome/services/tark_captions/caption_service_impl.h
+@@ -5,17 +5,22 @@
+ #ifndef CHROME_SERVICES_TARK_CAPTIONS_CAPTION_SERVICE_IMPL_H_
+ #define CHROME_SERVICES_TARK_CAPTIONS_CAPTION_SERVICE_IMPL_H_
+ 
++#include <memory>
++
+ #include "chrome/services/tark_captions/caption_session.h"
++#include "chrome/services/tark_captions/page_translator.h"
+ #include "chrome/services/tark_captions/public/mojom/tark_captions.mojom.h"
+ #include "mojo/public/cpp/bindings/pending_receiver.h"
+ #include "mojo/public/cpp/bindings/receiver.h"
++#include "mojo/public/cpp/bindings/receiver_set.h"
+ #include "mojo/public/cpp/bindings/remote.h"
+ 
+ namespace tark_captions {
+ 
+ // The captions process's service: a CaptionSession running Tark's caption
+-// engine on the handed-over files.
+-class CaptionServiceImpl : public mojom::CaptionService {
++// engine on the handed-over files, and page translation sharing its model
++// slot.
++class CaptionServiceImpl : public mojom::CaptionService, public mojom::PageTranslator {
+  public:
+   explicit CaptionServiceImpl(mojo::PendingReceiver<mojom::CaptionService> receiver);
+   CaptionServiceImpl(const CaptionServiceImpl&) = delete;
+@@ -32,11 +37,23 @@
+                  base::flat_map<std::string, base::File> files,
+                  SetTargetCallback callback) override;
+   void Stop() override;
++  void BindPageTranslator(mojo::PendingReceiver<mojom::PageTranslator> receiver) override;
+ 
++  // mojom::PageTranslator:
++  void TranslateBatch(const std::string& source,
++                      const std::string& target,
++                      base::flat_map<std::string, base::File> files,
++                      const std::vector<std::string>& texts,
++                      TranslateBatchCallback callback) override;
++  void Release() override;
++
+  private:
+   mojo::Receiver<mojom::CaptionService> receiver_;
+   mojo::Remote<mojom::CaptionClient> client_;
+   CaptionSession session_;
++  // After `session_`, so it goes first.
++  tark_captions::PageTranslator page_;
++  mojo::ReceiverSet<mojom::PageTranslator> page_receivers_;
+ };
+ 
+ }  // namespace tark_captions
+--- a/chrome/services/tark_captions/caption_session.cc
++++ b/chrome/services/tark_captions/caption_session.cc
+@@ -81,8 +81,22 @@
+ }
+ 
+ bool CaptionSession::SetTarget(const std::string& target, std::map<std::string, base::File> files) {
++  const bool ok = SetTargetInternal(target, std::move(files));
++  if (on_translation_changed_) {
++    on_translation_changed_.Run();
++  }
++  return ok;
++}
++
++void CaptionSession::SetTranslationChangedCallback(base::RepeatingClosure callback) {
++  on_translation_changed_ = std::move(callback);
++}
++
++bool CaptionSession::SetTargetInternal(const std::string& target,
++                                       std::map<std::string, base::File> files) {
+   ++generation_;
+   target_.clear();
++  units_.clear();
+   translator_.reset();  // deleted on the translation sequence
+   if (target.empty()) {
+     return true;
+@@ -113,6 +127,7 @@
+   translator_ = std::unique_ptr<Translator, base::OnTaskRunnerDeleter>(
+       translator.release(), base::OnTaskRunnerDeleter(translation_runner_));
+   target_ = target;
++  units_ = std::move(units);
+   return true;
+ }
+ 
+--- a/chrome/services/tark_captions/caption_session.h
++++ b/chrome/services/tark_captions/caption_session.h
+@@ -10,6 +10,7 @@
+ #include <map>
+ #include <memory>
+ #include <optional>
++#include <set>
+ #include <string>
+ #include <string_view>
+ #include <vector>
+@@ -94,9 +95,24 @@
+   bool SetTarget(const std::string& target, std::map<std::string, base::File> files);
+   void Stop();
+ 
++  // Page translation shares the process's one model slot with captions'
++  // Translate (captions win). The units captions' translator holds now
++  // ("tr_indic_en", ...); empty while Translate is off.
++  const std::set<std::string>& translation_units() const { return units_; }
++  // Captions' translator, for a task posted to translation_runner() before
++  // the next SetTarget (it is deleted on that sequence, after such a task).
++  Translator* shared_translator() const { return translator_.get(); }
++  const scoped_refptr<base::SequencedTaskRunner>& translation_runner() const {
++    return translation_runner_;
++  }
++  // Run at the end of every SetTarget (and Stop), before any caption is
++  // translated with the new translator.
++  void SetTranslationChangedCallback(base::RepeatingClosure callback);
++
+  private:
+   void OnEngineCaption(bool is_final, std::string text);
+   void OnTranslated(uint64_t generation, uint32_t caption_id, std::optional<std::string> text);
++  bool SetTargetInternal(const std::string& target, std::map<std::string, base::File> files);
+ 
+   EngineFactory factory_;
+   TranslatorFactory translator_factory_;
+@@ -110,6 +126,8 @@
+   scoped_refptr<base::SequencedTaskRunner> translation_runner_;
+   std::unique_ptr<Translator, base::OnTaskRunnerDeleter> translator_;
+   std::string target_;
++  std::set<std::string> units_;
++  base::RepeatingClosure on_translation_changed_;
+   uint64_t generation_ = 0;  // a translation for an older target is dropped
+   base::WeakPtrFactory<CaptionSession> weak_factory_{this};
+ };
+--- /dev/null
++++ b/chrome/services/tark_captions/page_translator.cc
+@@ -0,0 +1,357 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/services/tark_captions/page_translator.h"
++
++#include <algorithm>
++#include <set>
++#include <utility>
++
++#include "base/functional/bind.h"
++#include "base/logging.h"
++#include "base/strings/string_util.h"
++#include "base/time/time.h"
++
++namespace tark_captions {
++
++namespace {
++
++constexpr char kIndicToEnglish[] = "tr_indic_en";
++constexpr char kEnglishToIndic[] = "tr_en_indic";
++constexpr char kSpanishToEnglish[] = "tr_es_en";
++
++// The 22 scheduled languages IndicTrans2 covers.
++bool IsIndian(std::string_view code) {
++  static constexpr std::string_view kIndian[] = {
++      "as", "bn", "brx", "doi", "gu",  "hi", "kn", "ks", "kok", "mai", "ml",
++      "mni", "mr", "ne", "or",  "pa", "sa",  "sat", "sd", "ta", "te",  "ur"};
++  return std::ranges::contains(kIndian, code);
++}
++
++// The leg's translation: null when the model fails or gives nothing.
++std::optional<std::string> Checked(std::optional<std::string> text) {
++  if (!text || text->empty()) {
++    return std::nullopt;
++  }
++  return text;
++}
++
++// Captions' translator holds every model the batch needs.
++// A page text's sentences: each ends after ".", "?" or "!" followed by white
++// space or the end, after a danda or double danda (। ॥), an Urdu full stop or
++// question mark (۔ ؟), an Ol Chiki full stop (᱾), or at a line break. "3.5"
++// and "e.g.x" stay whole. A sentence running past kLongSentence characters
++// with none of those ends at its next space or comma, so a run-on line isn't
++// cut off by the models' 255-token input. `line_break`: a "\n" ended it.
++struct Sentence {
++  std::string_view text;
++  bool line_break = false;
++};
++
++constexpr size_t kLongSentence = 200;
++
++std::vector<Sentence> Sentences(std::string_view text) {
++  std::vector<Sentence> sentences;
++  size_t start = 0;
++  size_t chars = 0;  // code points since `start`
++  for (size_t i = 0; i < text.size(); ++i) {
++    size_t end = 0;  // one past the sentence's end
++    bool line_break = false;
++    const char c = text[i];
++    const std::string_view rest = text.substr(i);
++    if ((static_cast<unsigned char>(c) & 0xC0) != 0x80) {
++      ++chars;
++    }
++    if (c == '\n') {
++      end = i + 1;
++      line_break = true;
++    } else if (c == '.' || c == '?' || c == '!') {
++      if (i + 1 == text.size() || text[i + 1] == ' ' || text[i + 1] == '\n' ||
++          text[i + 1] == '\t') {
++        end = i + 1;
++      }
++    } else if (rest.starts_with("\xE0\xA5\xA4") || rest.starts_with("\xE0\xA5\xA5") ||
++               rest.starts_with("\xE1\xB1\xBE")) {
++      end = i + 3;  // । ॥ ᱾
++    } else if (rest.starts_with("\xDB\x94") || rest.starts_with("\xD8\x9F")) {
++      end = i + 2;  // ۔ ؟
++    } else if (chars > kLongSentence && (c == ' ' || c == ',' || rest.starts_with("\xD8\x8C"))) {
++      end = c == ' ' || c == ',' ? i + 1 : i + 2;  // a space, a comma or ،
++    }
++    if (end) {
++      sentences.push_back({text.substr(start, end - start), line_break});
++      start = end;
++      chars = 0;
++      i = end - 1;
++    }
++  }
++  if (start < text.size()) {
++    sentences.push_back({text.substr(start), false});
++  }
++  return sentences;
++}
++
++// A page text goes to the model a sentence at a time, as captions do: the
++// models read at most 255 source tokens and write at most 128, so a whole
++// paragraph was cut short, and each decoder step costs more the longer the
++// output, so it was also many times slower than its sentences. Any sentence
++// that fails keeps the whole text original.
++std::optional<std::string> TranslateText(Translator* translator,
++                                         std::string_view text,
++                                         std::string_view source,
++                                         std::string_view target) {
++  std::string joined;
++  bool after_line_break = false;
++  for (const Sentence& sentence : Sentences(text)) {
++    const std::string_view trimmed = base::TrimWhitespaceASCII(sentence.text, base::TRIM_ALL);
++    if (trimmed.empty()) {
++      after_line_break |= sentence.line_break;
++      continue;
++    }
++    std::optional<std::string> done = Checked(translator->Translate(trimmed, source, target));
++    if (!done) {
++      return std::nullopt;
++    }
++    if (!joined.empty()) {
++      joined += after_line_break ? '\n' : ' ';  // the page's line breaks stay
++    }
++    joined += *done;
++    after_line_break = sentence.line_break;
++  }
++  return Checked(std::move(joined));
++}
++
++size_t Chars(const std::vector<std::string>& texts) {
++  size_t chars = 0;
++  for (const std::string& text : texts) {
++    chars += text.size();
++  }
++  return chars;
++}
++
++// Diagnostics (DVLOG): one line per batch.
++void LogBatch(const char* how, size_t count, size_t chars, base::TimeTicks start) {
++  DVLOG(1) << "tark-page: service batch " << how << " items=" << count << " bytes=" << chars
++           << " ms=" << (base::TimeTicks::Now() - start).InMilliseconds();
++}
++
++PageResults TranslateShared(Translator* translator,
++                            const std::string& source,
++                            const std::string& target,
++                            std::vector<std::string> texts) {
++  const base::TimeTicks start = base::TimeTicks::Now();
++  PageResults results;
++  results.reserve(texts.size());
++  for (const std::string& text : texts) {
++    results.push_back(TranslateText(translator, text, source, target));
++  }
++  LogBatch("shared", texts.size(), Chars(texts), start);
++  return results;
++}
++
++}  // namespace
++
++std::vector<PageLeg> PageLegsFor(std::string_view source, std::string_view target) {
++  std::vector<PageLeg> legs;
++  if (source == target) {
++    return legs;
++  }
++  const std::string to_english = source == "es"     ? kSpanishToEnglish
++                                 : IsIndian(source) ? kIndicToEnglish
++                                                    : "";
++  if (source != "en") {
++    if (to_english.empty()) {
++      return {};
++    }
++    legs.push_back({to_english, std::string(source), "en"});
++  }
++  if (target != "en") {
++    if (!IsIndian(target)) {
++      return {};
++    }
++    legs.push_back({kEnglishToIndic, "en", std::string(target)});
++  }
++  return legs;
++}
++
++struct PageTranslator::Slot {
++  explicit Slot(TranslatorFactory factory) : factory(std::move(factory)) {}
++  TranslatorFactory factory;
++  std::string unit;  // what `translator` was made from
++  std::unique_ptr<Translator> translator;
++};
++
++struct PageTranslator::Batch {
++  std::string source;
++  std::string target;
++  std::vector<PageLeg> legs;
++  std::map<std::string, base::File> files;
++  std::vector<std::string> texts;
++  PageBatchCallback callback;
++  uint64_t owner = 0;
++};
++
++namespace {
++
++// `slot` holds `unit`'s model afterwards, made from `files` unless it held
++// it already; the previous model is unloaded first. False if a file is
++// missing or the model can't be made.
++bool Load(PageTranslator::Slot* slot,
++          const std::string& unit,
++          std::map<std::string, base::File>& files) {
++  if (slot->translator && slot->unit == unit) {
++    return true;
++  }
++  slot->translator.reset();  // never two models at once
++  slot->unit.clear();
++  std::map<std::string, base::File> unit_files;
++  for (const std::string& name : CaptionSession::TranslationFiles()) {
++    auto it = files.find(unit + "/" + name);
++    if (it == files.end() || !it->second.IsValid()) {
++      return false;
++    }
++    unit_files.emplace(it->first, std::move(it->second));
++  }
++  slot->translator = slot->factory.Run(std::move(unit_files));
++  if (!slot->translator) {
++    return false;
++  }
++  slot->unit = unit;
++  return true;
++}
++
++// The page's own model slot, one leg (one model) at a time.
++PageResults TranslateOwn(PageTranslator::Slot* slot,
++                         std::vector<PageLeg> legs,
++                         std::map<std::string, base::File> files,
++                         std::vector<std::string> texts) {
++  const base::TimeTicks start = base::TimeTicks::Now();
++  PageResults results(texts.begin(), texts.end());
++  for (const PageLeg& leg : legs) {
++    const base::TimeTicks load_start = base::TimeTicks::Now();
++    const bool had = slot->translator && slot->unit == leg.unit;
++    if (!Load(slot, leg.unit, files)) {
++      return PageResults(texts.size());
++    }
++    if (!had) {
++      DVLOG(1) << "tark-page: service made translator " << leg.unit << " ms="
++               << (base::TimeTicks::Now() - load_start).InMilliseconds();
++    }
++    for (std::optional<std::string>& text : results) {
++      if (text) {
++        text = TranslateText(slot->translator.get(), *text, leg.source, leg.target);
++      }
++    }
++  }
++  LogBatch("own", texts.size(), Chars(texts), start);
++  return results;
++}
++
++}  // namespace
++
++PageTranslator::PageTranslator(CaptionSession* session, TranslatorFactory factory)
++    : session_(session),
++      runner_(session->translation_runner()),
++      slot_(new Slot(std::move(factory)), base::OnTaskRunnerDeleter(runner_)) {
++  session_->SetTranslationChangedCallback(base::BindRepeating(
++      &PageTranslator::OnCaptionsTranslationChanged, weak_factory_.GetWeakPtr()));
++}
++
++PageTranslator::~PageTranslator() {
++  session_->SetTranslationChangedCallback(base::RepeatingClosure());
++}
++
++void PageTranslator::TranslateBatch(const std::string& source,
++                                    const std::string& target,
++                                    std::map<std::string, base::File> files,
++                                    std::vector<std::string> texts,
++                                    PageBatchCallback callback,
++                                    uint64_t owner) {
++  auto batch = std::make_unique<Batch>();
++  batch->owner = owner;
++  batch->source = source;
++  batch->target = target;
++  batch->legs = PageLegsFor(source, target);
++  batch->files = std::move(files);
++  batch->texts = std::move(texts);
++  batch->callback = std::move(callback);
++  queue_.push_back(std::move(batch));
++  Pump();
++}
++
++void PageTranslator::DropBatches(uint64_t owner) {
++  // The front batch is running when `running_`: it stays until it is done.
++  auto first = queue_.begin() + (running_ ? 1 : 0);
++  queue_.erase(std::remove_if(first, queue_.end(),
++                              [owner](const std::unique_ptr<Batch>& batch) {
++                                return batch->owner == owner;
++                              }),
++               queue_.end());
++  Pump();
++}
++
++void PageTranslator::ReleaseModel() {
++  DropOwnModel();
++}
++
++void PageTranslator::OnCaptionsTranslationChanged() {
++  if (!session_->translation_units().empty()) {
++    DropOwnModel();  // captions win; queued before any caption translates
++  }
++  Pump();
++}
++
++void PageTranslator::DropOwnModel() {
++  runner_->PostTask(FROM_HERE, base::BindOnce(
++                                   [](Slot* slot) {
++                                     slot->translator.reset();
++                                     slot->unit.clear();
++                                   },
++                                   base::Unretained(slot_.get())));
++}
++
++void PageTranslator::Pump() {
++  while (!running_ && !queue_.empty()) {
++    Batch& batch = *queue_.front();
++    if (batch.legs.empty()) {  // no model for the pair: originals stay
++      std::unique_ptr<Batch> done = std::move(queue_.front());
++      queue_.pop_front();
++      std::move(done->callback).Run(PageResults(done->texts.size()));
++      continue;
++    }
++    const std::set<std::string>& held = session_->translation_units();
++    if (!held.empty()) {
++      for (const PageLeg& leg : batch.legs) {
++        if (!held.contains(leg.unit)) {
++          return;  // captions hold another model: wait for them
++        }
++      }
++      running_ = true;
++      // The translator is deleted on the translation sequence, after this.
++      runner_->PostTaskAndReplyWithResult(
++          FROM_HERE,
++          base::BindOnce(&TranslateShared, base::Unretained(session_->shared_translator()),
++                         batch.source, batch.target, std::move(batch.texts)),
++          base::BindOnce(&PageTranslator::OnBatchDone, weak_factory_.GetWeakPtr()));
++      return;
++    }
++    running_ = true;
++    // The slot is deleted on the translation sequence, after this.
++    runner_->PostTaskAndReplyWithResult(
++        FROM_HERE,
++        base::BindOnce(&TranslateOwn, base::Unretained(slot_.get()), batch.legs,
++                       std::move(batch.files), std::move(batch.texts)),
++        base::BindOnce(&PageTranslator::OnBatchDone, weak_factory_.GetWeakPtr()));
++  }
++}
++
++void PageTranslator::OnBatchDone(PageResults results) {
++  running_ = false;
++  std::unique_ptr<Batch> done = std::move(queue_.front());
++  queue_.pop_front();
++  std::move(done->callback).Run(std::move(results));
++  Pump();
++}
++
++}  // namespace tark_captions
+--- /dev/null
++++ b/chrome/services/tark_captions/page_translator.h
+@@ -0,0 +1,103 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_SERVICES_TARK_CAPTIONS_PAGE_TRANSLATOR_H_
++#define CHROME_SERVICES_TARK_CAPTIONS_PAGE_TRANSLATOR_H_
++
++#include <stdint.h>
++
++#include <map>
++#include <memory>
++#include <optional>
++#include <string>
++#include <string_view>
++#include <vector>
++
++#include "base/containers/circular_deque.h"
++#include "base/files/file.h"
++#include "base/functional/callback.h"
++#include "base/memory/raw_ptr.h"
++#include "base/memory/weak_ptr.h"
++#include "base/task/sequenced_task_runner.h"
++#include "chrome/services/tark_captions/caption_session.h"
++
++namespace tark_captions {
++
++// One model hop of a page batch: `unit` ("tr_indic_en", ...) translating
++// `source` into `target`.
++struct PageLeg {
++  std::string unit;
++  std::string source;
++  std::string target;
++};
++
++// The hops from `source` into `target` (ISO codes), in order: Indian and
++// Spanish sources go through English, so Indian ↔ Indian is two legs, one
++// model each. Empty when there is no model for the pair (or they are equal).
++std::vector<PageLeg> PageLegsFor(std::string_view source, std::string_view target);
++
++using PageResults = std::vector<std::optional<std::string>>;
++using PageBatchCallback = base::OnceCallback<void(PageResults results)>;
++
++// Tark for Android's page translation, without mojo. It owns no model of its
++// own: it uses the process's one model slot, shared with `session`'s
++// Translate. Never two IndicTrans2 models at once:
++// - captions' Translate holds every model the batch needs: the batch uses
++//   captions' translator (no second load);
++// - captions hold another model: the batch waits until they let it go
++//   (captions win);
++// - captions hold none: the batch loads one model at a time, leg by leg,
++//   unloading the previous one first.
++// Batches run one after another, in order, on the session's translation
++// sequence. Each sentence is translated whole; a failed or empty one comes
++// back null (the page keeps the original).
++class PageTranslator {
++ public:
++  // `session` outlives this; `factory` makes a translator from one unit's
++  // files and is run on the translation sequence.
++  PageTranslator(CaptionSession* session, TranslatorFactory factory);
++  PageTranslator(const PageTranslator&) = delete;
++  PageTranslator& operator=(const PageTranslator&) = delete;
++  ~PageTranslator();
++
++  // `files` are the units for the direction, keyed "<unit>/<name>" (both
++  // legs for Indian ↔ Indian). Results align with `texts`.
++  void TranslateBatch(const std::string& source,
++                      const std::string& target,
++                      std::map<std::string, base::File> files,
++                      std::vector<std::string> texts,
++                      PageBatchCallback callback,
++                      uint64_t owner = 0);
++  // `owner`'s pipe is gone (the page navigated): its batches still queued
++  // are dropped, not run, so a new page's batches never wait behind them.
++  // One already running finishes; its result goes nowhere.
++  void DropBatches(uint64_t owner);
++  // No page is left (the last pipe closed): the page's own model is
++  // unloaded. Captions' model, shared or not, stays for captions.
++  void ReleaseModel();
++
++  // The page's own model, on the translation sequence.
++  struct Slot;
++
++ private:
++  struct Batch;
++
++  void OnCaptionsTranslationChanged();
++  // Starts the front batch unless one is running or it has to wait.
++  void Pump();
++  void OnBatchDone(PageResults results);
++  // Unloads the page's own model (captions now hold the slot).
++  void DropOwnModel();
++
++  raw_ptr<CaptionSession> session_;
++  scoped_refptr<base::SequencedTaskRunner> runner_;
++  std::unique_ptr<Slot, base::OnTaskRunnerDeleter> slot_;
++  base::circular_deque<std::unique_ptr<Batch>> queue_;
++  bool running_ = false;
++  base::WeakPtrFactory<PageTranslator> weak_factory_{this};
++};
++
++}  // namespace tark_captions
++
++#endif  // CHROME_SERVICES_TARK_CAPTIONS_PAGE_TRANSLATOR_H_
+--- /dev/null
++++ b/chrome/services/tark_captions/page_translator_unittest.cc
+@@ -0,0 +1,342 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/services/tark_captions/page_translator.h"
++
++#include <algorithm>
++#include <map>
++#include <memory>
++#include <string>
++#include <vector>
++
++#include "base/files/file.h"
++#include "base/files/file_util.h"
++#include "base/files/scoped_temp_dir.h"
++#include "base/functional/bind.h"
++#include "base/memory/raw_ptr.h"
++#include "base/synchronization/lock.h"
++#include "base/test/task_environment.h"
++#include "base/test/test_future.h"
++#include "chrome/services/tark_captions/caption_session.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace tark_captions {
++namespace {
++
++// What every fake translator saw, from any sequence. A model counts as
++// loaded from its first Translate (as TranslationEngine loads on first use)
++// until the translator is deleted.
++struct Models {
++  base::Lock lock;
++  int loaded = 0;
++  int most_loaded = 0;
++  int made = 0;
++  std::vector<std::string> events;  // "load:<unit>", "unload:<unit>"
++  std::vector<std::string> received;
++  std::string fail;   // this text comes back nullopt
++  std::string blank;  // this text comes back ""
++};
++
++class FakeTranslator : public Translator {
++ public:
++  FakeTranslator(Models* models, std::string unit) : models_(models), unit_(std::move(unit)) {
++    base::AutoLock hold(models_->lock);
++    ++models_->made;
++  }
++  ~FakeTranslator() override {
++    base::AutoLock hold(models_->lock);
++    if (loaded_) {
++      --models_->loaded;
++      models_->events.push_back("unload:" + unit_);
++    }
++  }
++  std::optional<std::string> Translate(std::string_view text,
++                                       std::string_view source,
++                                       std::string_view target) override {
++    base::AutoLock hold(models_->lock);
++    if (!loaded_) {
++      loaded_ = true;
++      ++models_->loaded;
++      models_->most_loaded = std::max(models_->most_loaded, models_->loaded);
++      EXPECT_LE(models_->loaded, 1) << "two models at once";
++      models_->events.push_back("load:" + unit_);
++    }
++    models_->received.emplace_back(text);
++    if (text == models_->fail) {
++      return std::nullopt;
++    }
++    if (text == models_->blank) {
++      return "";
++    }
++    return std::string(target) + ":" + std::string(text);
++  }
++
++ private:
++  raw_ptr<Models> models_;
++  std::string unit_;
++  bool loaded_ = false;
++};
++
++class PageTranslatorTest : public testing::Test {
++ protected:
++  void SetUp() override { ASSERT_TRUE(dir_.CreateUniqueTempDir()); }
++  // Each test's PageTranslator is gone by now: let its model (and captions')
++  // be deleted on the translation sequence while `models_` is alive.
++  void TearDown() override {
++    session_.Stop();
++    task_environment_.RunUntilIdle();
++  }
++
++  TranslatorFactory Factory() {
++    return base::BindRepeating(
++        [](Models* models, std::map<std::string, base::File> files) -> std::unique_ptr<Translator> {
++          std::string units;
++          for (const auto& [name, file] : files) {
++            const std::string unit = name.substr(0, name.find('/'));
++            if (units.find(unit) == std::string::npos) {
++              units += (units.empty() ? "" : "+") + unit;
++            }
++          }
++          return std::make_unique<FakeTranslator>(models, units);
++        },
++        base::Unretained(&models_));
++  }
++
++  // The six files of each translation unit, keyed "<unit>/<name>".
++  std::map<std::string, base::File> Units(const std::vector<std::string>& units) {
++    std::map<std::string, base::File> files;
++    for (const std::string& unit : units) {
++      for (const std::string& name : CaptionSession::TranslationFiles()) {
++        const base::FilePath path = dir_.GetPath().AppendASCII(unit + "/" + name);
++        EXPECT_TRUE(base::CreateDirectory(path.DirName()));
++        EXPECT_TRUE(base::WriteFile(path, "x"));
++        files.emplace(unit + "/" + name,
++                      base::File(path, base::File::FLAG_OPEN | base::File::FLAG_READ));
++      }
++    }
++    return files;
++  }
++
++  PageResults Translate(PageTranslator& page,
++                        const std::string& source,
++                        const std::string& target,
++                        const std::vector<std::string>& units,
++                        std::vector<std::string> texts) {
++    base::test::TestFuture<PageResults> done;
++    page.TranslateBatch(source, target, Units(units), std::move(texts), done.GetCallback());
++    return done.Take();
++  }
++
++  // Torn down last: the fakes may still be deleted on the pool until the
++  // environment goes.
++  base::ScopedTempDir dir_;
++  Models models_;
++  base::test::TaskEnvironment task_environment_;
++  CaptionSession session_{base::BindRepeating(
++                              [](std::map<std::string, base::File>, const EngineOptions&,
++                                 CaptionCallback) -> std::unique_ptr<SpeechEngine> {
++                                return nullptr;
++                              }),
++                          Factory()};
++};
++
++// hi → ta goes through English: Indian → English loads, translates and
++// unloads before English → Indian loads.
++TEST_F(PageTranslatorTest, IndianToIndianUsesOneModelAtATime) {
++  PageTranslator page(&session_, Factory());
++  const PageResults results =
++      Translate(page, "hi", "ta", {"tr_indic_en", "tr_en_indic"}, {"नमस्ते", "धन्यवाद"});
++  EXPECT_EQ(results, (PageResults{"ta:en:नमस्ते", "ta:en:धन्यवाद"}));
++  base::AutoLock hold(models_.lock);
++  EXPECT_EQ(models_.events, (std::vector<std::string>{"load:tr_indic_en", "unload:tr_indic_en",
++                                                     "load:tr_en_indic"}));
++  EXPECT_EQ(models_.most_loaded, 1);
++}
++
++TEST_F(PageTranslatorTest, FailedSentenceIsNull) {
++  models_.fail = "दो";
++  PageTranslator page(&session_, Factory());
++  const PageResults results = Translate(page, "hi", "en", {"tr_indic_en"}, {"एक", "दो", "तीन"});
++  EXPECT_EQ(results, (PageResults{"en:एक", std::nullopt, "en:तीन"}));
++}
++
++TEST_F(PageTranslatorTest, EmptyOutputIsNull) {
++  models_.blank = "एक";
++  PageTranslator page(&session_, Factory());
++  const PageResults results = Translate(page, "hi", "en", {"tr_indic_en"}, {"एक"});
++  EXPECT_EQ(results, (PageResults{std::nullopt}));
++}
++
++// A sentence mixing scripts is one sentence: it is not split by script.
++TEST_F(PageTranslatorTest, MixedScriptSentenceSentWhole) {
++  PageTranslator page(&session_, Factory());
++  Translate(page, "hi", "en", {"tr_indic_en"}, {"मेरा iPhone नया है"});
++  base::AutoLock hold(models_.lock);
++  EXPECT_EQ(models_.received, (std::vector<std::string>{"मेरा iPhone नया है"}));
++}
++
++// A paragraph goes to the model a sentence at a time (danda, "?", ". " and line
++// breaks end one; "3.5" doesn't) and comes back joined by spaces, or by the
++// page's own line break.
++TEST_F(PageTranslatorTest, ParagraphTranslatedSentenceBySentence) {
++  PageTranslator page(&session_, Factory());
++  const PageResults results = Translate(page, "hi", "en", {"tr_indic_en"},
++                                        {"गंगा लंबी है। क्या 3.5 है? हाँ\n  अंत"});
++  EXPECT_EQ(results, (PageResults{"en:गंगा लंबी है। en:क्या 3.5 है? en:हाँ\nen:अंत"}));
++  base::AutoLock hold(models_.lock);
++  EXPECT_EQ(models_.received, (std::vector<std::string>{"गंगा लंबी है।", "क्या 3.5 है?", "हाँ",
++                                                        "अंत"}));
++}
++
++// Urdu's full stop and question mark and Ol Chiki's full stop end sentences
++// too; a long run with none of them is split at a space past ~200 characters.
++TEST_F(PageTranslatorTest, OtherScriptsEndsAndLongRuns) {
++  PageTranslator page(&session_, Factory());
++  std::string run;
++  for (int i = 0; i < 60; ++i) {
++    run += "शब्द ";  // 5 characters, 13 bytes
++  }
++  Translate(page, "ur", "en", {"tr_indic_en"},
++            {"\xDB\x8C\xDB\x81 \xDB\x94 \xDA\xA9\xDB\x8C\xD8\xA7\xD8\x9F \xDB\x81\xD8\xA7\xDA\xBA"});
++  Translate(page, "sat", "en", {"tr_indic_en"}, {"\xE1\xB1\x9A\xE1\xB1\x9E\xE1\xB1\xBE \xE1\xB1\xA5"});
++  Translate(page, "hi", "en", {"tr_indic_en"}, {run});
++  base::AutoLock hold(models_.lock);
++  ASSERT_EQ(models_.received.size(), 7u);
++  EXPECT_EQ(models_.received[0], "\xDB\x8C\xDB\x81 \xDB\x94");      // ۔
++  EXPECT_EQ(models_.received[1], "\xDA\xA9\xDB\x8C\xD8\xA7\xD8\x9F");  // ؟
++  EXPECT_EQ(models_.received[3], "\xE1\xB1\x9A\xE1\xB1\x9E\xE1\xB1\xBE");  // ᱾
++  EXPECT_LT(models_.received[5].size(), run.size());  // the long run, split once
++  EXPECT_GE(models_.received[5].size(), 200u);
++}
++
++// Captions' Translate holds Indian → English and the page asks hi → en: the
++// page uses captions' model, with no second load.
++TEST_F(PageTranslatorTest, SameDirectionAsCaptionsShares) {
++  ASSERT_TRUE(session_.SetTarget("en", Units({"tr_indic_en"})));
++  PageTranslator page(&session_, Factory());
++  const PageResults results = Translate(page, "hi", "en", {"tr_indic_en"}, {"नमस्ते"});
++  EXPECT_EQ(results, (PageResults{"en:नमस्ते"}));
++  base::AutoLock hold(models_.lock);
++  EXPECT_EQ(models_.made, 1);  // captions' translator only
++  EXPECT_EQ(models_.events, (std::vector<std::string>{"load:tr_indic_en"}));
++}
++
++// Captions hold Indian → English and the page asks en → hi: captions win,
++// and the batch completes only once captions' Translate goes off.
++TEST_F(PageTranslatorTest, DifferentModelThanCaptionsWaits) {
++  ASSERT_TRUE(session_.SetTarget("en", Units({"tr_indic_en"})));
++  PageTranslator page(&session_, Factory());
++  base::test::TestFuture<PageResults> done;
++  page.TranslateBatch("en", "hi", Units({"tr_en_indic"}), {"hello"}, done.GetCallback());
++  task_environment_.RunUntilIdle();
++  EXPECT_FALSE(done.IsReady());
++  {
++    base::AutoLock hold(models_.lock);
++    EXPECT_EQ(models_.made, 1);  // the page made no model of its own
++  }
++  ASSERT_TRUE(session_.SetTarget("", {}));
++  EXPECT_EQ(done.Take(), (PageResults{"hi:hello"}));
++  base::AutoLock hold(models_.lock);
++  EXPECT_EQ(models_.most_loaded, 1);
++}
++
++// Batches complete in the order they were asked for.
++TEST_F(PageTranslatorTest, BatchesRunInOrder) {
++  PageTranslator page(&session_, Factory());
++  std::vector<int> order;
++  base::test::TestFuture<void> both;
++  page.TranslateBatch("hi", "en", Units({"tr_indic_en"}), {"एक"},
++                      base::BindOnce([](std::vector<int>* order, PageResults) { order->push_back(1); },
++                                     base::Unretained(&order)));
++  page.TranslateBatch("en", "ta", Units({"tr_en_indic"}), {"two"},
++                      base::BindOnce(
++                          [](std::vector<int>* order, base::OnceClosure done, PageResults) {
++                            order->push_back(2);
++                            std::move(done).Run();
++                          },
++                          base::Unretained(&order), both.GetCallback()));
++  ASSERT_TRUE(both.Wait());
++  EXPECT_EQ(order, (std::vector<int>{1, 2}));
++}
++
++// The page navigated: its pipe closed, so its batches still queued are
++// dropped rather than run, and the next page's batch does not wait for them.
++TEST_F(PageTranslatorTest, DisconnectedPipeBatchesAreDropped) {
++  ASSERT_TRUE(session_.SetTarget("en", Units({"tr_indic_en"})));
++  PageTranslator page(&session_, Factory());
++  base::test::TestFuture<PageResults> old_page, new_page;
++  // Captions hold another model, so the old page's batch waits in the queue.
++  page.TranslateBatch("en", "hi", Units({"tr_en_indic"}), {"old"}, old_page.GetCallback(),
++                      /*owner=*/1);
++  page.DropBatches(1);
++  ASSERT_TRUE(session_.SetTarget("", {}));
++  page.TranslateBatch("en", "hi", Units({"tr_en_indic"}), {"new"}, new_page.GetCallback(),
++                      /*owner=*/2);
++  EXPECT_EQ(new_page.Take(), (PageResults{"hi:new"}));
++  EXPECT_FALSE(old_page.IsReady());
++  base::AutoLock hold(models_.lock);
++  EXPECT_EQ(models_.received, (std::vector<std::string>{"new"}));
++}
++
++// A dropped pipe (DropBatches) keeps the page's model loaded for the next
++// batch; Release lets it go.
++TEST_F(PageTranslatorTest, DroppedPipeKeepsModelReleaseUnloads) {
++  PageTranslator page(&session_, Factory());
++  Translate(page, "en", "hi", {"tr_en_indic"}, {"one"});
++  page.DropBatches(/*owner=*/0);
++  task_environment_.RunUntilIdle();
++  {
++    base::AutoLock hold(models_.lock);
++    EXPECT_EQ(models_.loaded, 1);
++    EXPECT_EQ(models_.events, (std::vector<std::string>{"load:tr_en_indic"}));
++  }
++  page.ReleaseModel();
++  task_environment_.RunUntilIdle();
++  base::AutoLock hold(models_.lock);
++  EXPECT_EQ(models_.loaded, 0);
++  EXPECT_EQ(models_.events.back(), "unload:tr_en_indic");
++}
++
++// Release: the page's own model is unloaded, but a model captions share with
++// the page stays for captions.
++TEST_F(PageTranslatorTest, LastPageDisconnectReleasesPageModel) {
++  {
++    PageTranslator page(&session_, Factory());
++    Translate(page, "en", "hi", {"tr_en_indic"}, {"one"});
++    page.ReleaseModel();
++    task_environment_.RunUntilIdle();
++    base::AutoLock hold(models_.lock);
++    EXPECT_EQ(models_.events,
++              (std::vector<std::string>{"load:tr_en_indic", "unload:tr_en_indic"}));
++    EXPECT_EQ(models_.loaded, 0);
++    models_.events.clear();
++  }
++  ASSERT_TRUE(session_.SetTarget("en", Units({"tr_indic_en"})));
++  PageTranslator page(&session_, Factory());
++  Translate(page, "hi", "en", {"tr_indic_en"}, {"नमस्ते"});
++  page.ReleaseModel();
++  task_environment_.RunUntilIdle();
++  base::AutoLock hold(models_.lock);
++  EXPECT_EQ(models_.events, (std::vector<std::string>{"load:tr_indic_en"}));  // captions'
++  EXPECT_EQ(models_.loaded, 1);
++}
++
++TEST_F(PageTranslatorTest, Legs) {
++  auto units = [](std::string_view source, std::string_view target) {
++    std::vector<std::string> names;
++    for (const PageLeg& leg : PageLegsFor(source, target)) {
++      names.push_back(leg.unit);
++    }
++    return names;
++  };
++  EXPECT_EQ(units("hi", "en"), (std::vector<std::string>{"tr_indic_en"}));
++  EXPECT_EQ(units("en", "mni"), (std::vector<std::string>{"tr_en_indic"}));
++  EXPECT_EQ(units("ta", "hi"), (std::vector<std::string>{"tr_indic_en", "tr_en_indic"}));
++  EXPECT_EQ(units("es", "en"), (std::vector<std::string>{"tr_es_en"}));
++  EXPECT_TRUE(units("fr", "en").empty());
++  EXPECT_TRUE(units("hi", "hi").empty());
++}
++
++}  // namespace
++}  // namespace tark_captions
+--- a/chrome/services/tark_captions/public/mojom/tark_captions.mojom
++++ b/chrome/services/tark_captions/public/mojom/tark_captions.mojom
+@@ -27,6 +27,22 @@
+   OnTranslation(uint32 caption_id, string text);
+ };
+ 
++// Page translation, in this same process: it shares the one model slot with
++// captions' Translate (never two IndicTrans2 models in memory; captions win
++// on a different model, and the two share the same direction).
++interface PageTranslator {
++  // `source`/`target` are ISO codes; `files` the model units for that
++  // direction, keyed "<unit>/<name>" (both legs for Indian↔Indian). Results
++  // align with `texts`; null = failed (keep original).
++  TranslateBatch(string source, string target,
++                 map<string, mojo_base.mojom.ReadOnlyFile> files,
++                 array<string> texts) => (array<string?> results);
++  // The page lets its model go (idle, app in the background, tab hidden,
++  // another tab took the process). A closed pipe alone doesn't: the browser
++  // drops pipes to cancel what they queued.
++  Release();
++};
++
+ [ServiceSandbox=sandbox.mojom.Sandbox.kUtility]
+ interface CaptionService {
+   // `files`: the model folder's files by name (CaptionSession's list).
+@@ -41,4 +57,6 @@
+   // Speech goes on either way. False if a unit lacks a file.
+   SetTarget(string target, map<string, mojo_base.mojom.ReadOnlyFile> files) => (bool ok);
+   Stop();
++  // Page translation on this process's model slot.
++  BindPageTranslator(pending_receiver<PageTranslator> receiver);
+ };
+--- a/components/tark_captions/translation_engine.cc
++++ b/components/tark_captions/translation_engine.cc
+@@ -14,7 +14,9 @@
+ #include "base/memory/ptr_util.h"
+ #include "base/strings/string_util.h"
+ #include "base/strings/utf_string_conversions.h"
++#include "base/time/time.h"
+ #include "components/tark_captions/english_text.h"
++#include "components/tark_captions/flat_vocab.h"
+ #include "components/tark_captions/indic_text.h"
+ #include "components/tark_captions/model_source.h"
+ #include "components/tark_captions/ort_runtime.h"
+@@ -53,6 +55,12 @@
+   }
+ }
+ 
++// A dict.*.json's {"token": id} entries: ParseFlatVocab, or base::JSONReader
++// when that declines (same result, slower). Nullopt when missing or not all
++// values are ints.
++std::optional<std::vector<std::pair<std::string, int>>> ReadVocab(const ModelSource& source,
++                                                                   std::string_view name);
++
+ std::optional<base::DictValue> ReadJsonDict(const ModelSource& source, std::string_view name) {
+   std::optional<base::span<const uint8_t>> bytes = source.Read(name);
+   if (!bytes) {
+@@ -66,6 +74,36 @@
+   return std::move(*value).TakeDict();
+ }
+ 
++std::optional<std::vector<std::pair<std::string, int>>> ReadVocab(const ModelSource& source,
++                                                                   std::string_view name) {
++  std::optional<base::span<const uint8_t>> bytes = source.Read(name);
++  if (!bytes) {
++    return std::nullopt;
++  }
++  const char* why = "";
++  size_t at = 0;
++  if (auto entries = ParseFlatVocab(base::as_string_view(*bytes), &why, &at)) {
++    DVLOG(1) << "tark-page: vocab " << name << " fast entries=" << entries->size();
++    return entries;
++  }
++  // The slow path is ~20 s on a phone: worth a warning.
++  LOG(WARNING) << "Tark translation: " << name << " fast path declined (" << why << " at byte "
++               << at << "), using base::JSONReader";
++  std::optional<base::DictValue> dict = ReadJsonDict(source, name);
++  if (!dict) {
++    return std::nullopt;
++  }
++  std::vector<std::pair<std::string, int>> entries;
++  entries.reserve(dict->size());
++  for (const auto [key, value] : *dict) {
++    if (!value.is_int()) {
++      return std::nullopt;
++    }
++    entries.emplace_back(key, value.GetInt());
++  }
++  return entries;
++}
++
+ bool IsIndianCode(std::string_view code) {
+   return code == "hi" || code == "ta" || code == "bn";
+ }
+@@ -123,9 +161,18 @@
+   // encoder.int8.onnx and decoder_step.int8.onnx, from `source`.
+   static std::unique_ptr<Direction> Load(OrtRuntime* runtime, const ModelSource& source) {
+     auto d = base::WrapUnique(new Direction());
++    // Diagnostics (DVLOG): where a model's load time goes.
++    const base::TimeTicks load_start = base::TimeTicks::Now();
++    auto ms = [](base::TimeTicks since) {
++      return (base::TimeTicks::Now() - since).InMilliseconds();
++    };
+     std::optional<base::DictValue> config = ReadJsonDict(source, "config.json");
+-    std::optional<base::DictValue> src = ReadJsonDict(source, "dict.SRC.json");
+-    std::optional<base::DictValue> tgt = ReadJsonDict(source, "dict.TGT.json");
++    std::optional<std::vector<std::pair<std::string, int>>> src =
++        ReadVocab(source, "dict.SRC.json");
++    std::optional<std::vector<std::pair<std::string, int>>> tgt =
++        ReadVocab(source, "dict.TGT.json");
++    const int64_t dicts_ms = ms(load_start);
++    const base::TimeTicks spm_start = base::TimeTicks::Now();
+     std::optional<base::span<const uint8_t>> spm = source.Read("model.SRC");
+     if (!config || !src || !tgt || !spm ||
+         !d->spm_.LoadFromSerializedProto(base::as_string_view(*spm)).ok()) {
+@@ -147,22 +194,28 @@
+     d->head_dim_ = *dim / *heads;
+     d->start_ = *start;
+     d->eos_ = *eos;
++    // A key given twice keeps its last id, as base::JSONReader did: flat_map
++    // keeps the first of equal keys, so the entries go in newest first.
+     std::vector<std::pair<std::string, int64_t>> src_entries;
+-    for (const auto [piece, id] : *src) {
+-      if (!id.is_int()) {
+-        return nullptr;
+-      }
+-      src_entries.emplace_back(piece, id.GetInt());
++    src_entries.reserve(src->size());
++    for (auto it = src->rbegin(); it != src->rend(); ++it) {
++      src_entries.emplace_back(std::move(it->first), it->second);
+     }
+     d->src_vocab_ = base::flat_map<std::string, int64_t>(std::move(src_entries));
+-    for (const auto [token, id] : *tgt) {
+-      if (!id.is_int() || id.GetInt() < 0) {
++    // The same for the target: one id per token, the last one given, then
++    // read in key order, so ids given twice resolve as base::JSONReader's
++    // sorted DictValue did.
++    std::vector<std::pair<std::string, int>> tgt_newest_first(
++        std::make_move_iterator(tgt->rbegin()), std::make_move_iterator(tgt->rend()));
++    const base::flat_map<std::string, int> tgt_map(std::move(tgt_newest_first));
++    for (const auto& [token, id] : tgt_map) {
++      if (id < 0) {
+         return nullptr;
+       }
+-      if (static_cast<size_t>(id.GetInt()) >= d->tgt_vocab_.size()) {
+-        d->tgt_vocab_.resize(id.GetInt() + 1);
++      if (static_cast<size_t>(id) >= d->tgt_vocab_.size()) {
++        d->tgt_vocab_.resize(id + 1);
+       }
+-      d->tgt_vocab_[id.GetInt()] = token;
++      d->tgt_vocab_[id] = token;
+     }
+     auto unk = d->src_vocab_.find("<unk>");
+     auto end = d->src_vocab_.find("</s>");
+@@ -171,8 +224,16 @@
+     }
+     d->unk_ = unk->second;
+     d->end_ = end->second;
++    const int64_t vocab_ms = ms(spm_start);  // SentencePiece and the vocabularies' maps
++    const base::TimeTicks encoder_start = base::TimeTicks::Now();
+     d->encoder_ = runtime->LoadModel(source, "encoder.int8.onnx", kThreads);
++    const int64_t encoder_ms = ms(encoder_start);
++    const base::TimeTicks decoder_start = base::TimeTicks::Now();
+     d->decoder_ = runtime->LoadModel(source, "decoder_step.int8.onnx", kThreads);
++    const int64_t decoder_ms = ms(decoder_start);
++    DVLOG(1) << "tark-page: model load json_dicts_ms=" << dicts_ms << " vocab_ms=" << vocab_ms
++             << " encoder_session_ms=" << encoder_ms << " decoder_session_ms=" << decoder_ms
++             << " total_ms=" << ms(load_start);
+     if (!d->encoder_ || !d->decoder_) {
+       LOG(ERROR) << "Tark translation: models not loaded";
+       return nullptr;
+@@ -206,6 +267,7 @@
+   }
+ 
+   std::optional<std::vector<int64_t>> Greedy(const std::vector<int64_t>& ids) {
++    const base::TimeTicks start = base::TimeTicks::Now();
+     std::vector<Tensor> encoded;
+     if (!encoder_->Run({Tensor{.name = "ids",
+                                .shape = {1, static_cast<int64_t>(ids.size())},
+@@ -213,6 +275,7 @@
+                        {"cross_mask", "cross_k", "cross_v"}, &encoded)) {
+       return std::nullopt;
+     }
++    const base::TimeDelta encoder_time = base::TimeTicks::Now() - start;
+     const std::vector<int64_t> empty_cache = {layers_, 1, heads_, 0, head_dim_};
+     std::vector<Tensor> inputs = {
+         Tensor{.name = "token", .shape = {1, 1}, .i64 = {start_}},
+@@ -243,6 +306,19 @@
+       inputs[3] = std::move(step_out[2]);
+       inputs[3].name = "past_v";
+     }
++    if (!ran_) {  // the first inference after a load (diagnostics)
++      ran_ = true;
++      DVLOG(1) << "tark-page: first inference source_tokens=" << ids.size()
++               << " output_tokens=" << out.size()
++               << " encoder_ms=" << encoder_time.InMilliseconds()
++               << " total_ms=" << (base::TimeTicks::Now() - start).InMilliseconds();
++    }
++    if (out.size() == static_cast<size_t>(kMaxOutputTokens)) {
++      // No end token within the output limit: the translation was cut off.
++      // Nullopt keeps the original (a page's text, or a caption shown alone)
++      // rather than half a sentence.
++      return std::nullopt;
++    }
+     return out;
+   }
+ 
+@@ -280,6 +356,7 @@
+   int64_t unk_ = 0;
+   int64_t end_ = 0;
+   bool language_tags_ = true;
++  bool ran_ = false;
+ };
+ 
+ // static
+--- /dev/null
++++ b/components/tark_captions/flat_vocab.h
+@@ -0,0 +1,254 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef COMPONENTS_TARK_CAPTIONS_FLAT_VOCAB_H_
++#define COMPONENTS_TARK_CAPTIONS_FLAT_VOCAB_H_
++
++#include <cstdint>
++#include <optional>
++#include <string>
++#include <string_view>
++#include <utility>
++#include <vector>
++
++#include "base/strings/string_util.h"
++
++namespace tark_captions {
++
++// A flat JSON object of string keys and int32 values, {"token": id, ...}, as
++// IndicTrans2's and opus-mt's dict.SRC.json and dict.TGT.json are: its
++// entries in file order, in one pass. base::JSONReader builds a
++// base::DictValue, a sorted flat_map that moves the entries after each new
++// key: those files list their keys by id, not in key order, so
++// dict.SRC.json's 122,706 keys took about 3.6 billion element moves (18.7 s
++// on a Snapdragon 695, Tark for Android round 11).
++// Nullopt for anything else (another value type, a number that is not an
++// int32, a bad escape, invalid UTF-8, trailing text): the caller then uses
++// base::JSONReader, so a file never loads differently, only faster. Then
++// `why` (when given) says what and `at` where, for the log.
++// Keys may hold Unicode noncharacters (dict.SRC.json of it2_indic_en has
++// eight, U+FDDB..U+FDEB): base::JSONReader takes them, so this does too.
++inline std::optional<std::vector<std::pair<std::string, int>>> ParseFlatVocab(
++    std::string_view json,
++    const char** why = nullptr,
++    size_t* at = nullptr) {
++  size_t i = 0;
++  auto decline = [&](const char* reason) {
++    if (why) {
++      *why = reason;
++    }
++    if (at) {
++      *at = i;
++    }
++    return std::nullopt;
++  };
++  const size_t n = json.size();
++  auto skip_space = [&] {
++    while (i < n && (json[i] == ' ' || json[i] == '\n' || json[i] == '\r' || json[i] == '\t')) {
++      ++i;
++    }
++  };
++  auto hex4 = [&](uint32_t* out) {
++    if (n - i < 4) {
++      return false;
++    }
++    uint32_t v = 0;
++    for (int k = 0; k < 4; ++k) {
++      const char c = json[i++];
++      v <<= 4;
++      if (c >= '0' && c <= '9') {
++        v |= static_cast<uint32_t>(c - '0');
++      } else if (c >= 'a' && c <= 'f') {
++        v |= static_cast<uint32_t>(c - 'a' + 10);
++      } else if (c >= 'A' && c <= 'F') {
++        v |= static_cast<uint32_t>(c - 'A' + 10);
++      } else {
++        return false;
++      }
++    }
++    *out = v;
++    return true;
++  };
++  auto append_utf8 = [](uint32_t cp, std::string* s) {
++    if (cp < 0x80) {
++      s->push_back(static_cast<char>(cp));
++    } else if (cp < 0x800) {
++      s->push_back(static_cast<char>(0xC0 | (cp >> 6)));
++      s->push_back(static_cast<char>(0x80 | (cp & 0x3F)));
++    } else if (cp < 0x10000) {
++      s->push_back(static_cast<char>(0xE0 | (cp >> 12)));
++      s->push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
++      s->push_back(static_cast<char>(0x80 | (cp & 0x3F)));
++    } else {
++      s->push_back(static_cast<char>(0xF0 | (cp >> 18)));
++      s->push_back(static_cast<char>(0x80 | ((cp >> 12) & 0x3F)));
++      s->push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
++      s->push_back(static_cast<char>(0x80 | (cp & 0x3F)));
++    }
++  };
++  auto read_string = [&](std::string* s) {
++    if (i >= n || json[i] != '"') {
++      return false;
++    }
++    ++i;
++    s->clear();
++    while (i < n) {
++      const unsigned char c = static_cast<unsigned char>(json[i]);
++      if (c == '"') {
++        ++i;
++        return true;
++      }
++      if (c < 0x20) {
++        return false;
++      }
++      if (c != '\\') {
++        // A run of plain bytes at once.
++        size_t end = i + 1;
++        while (end < n && json[end] != '"' && json[end] != '\\' &&
++               static_cast<unsigned char>(json[end]) >= 0x20) {
++          ++end;
++        }
++        s->append(json.substr(i, end - i));
++        i = end;
++        continue;
++      }
++      if (++i >= n) {
++        return false;
++      }
++      const char e = json[i++];
++      switch (e) {
++        case '"':
++          s->push_back('"');
++          break;
++        case '\\':
++          s->push_back('\\');
++          break;
++        case '/':
++          s->push_back('/');
++          break;
++        case 'b':
++          s->push_back('\b');
++          break;
++        case 'f':
++          s->push_back('\f');
++          break;
++        case 'n':
++          s->push_back('\n');
++          break;
++        case 'r':
++          s->push_back('\r');
++          break;
++        case 't':
++          s->push_back('\t');
++          break;
++        case 'u': {
++          uint32_t cp = 0;
++          if (!hex4(&cp)) {
++            return false;
++          }
++          if (cp >= 0xD800 && cp <= 0xDBFF) {  // a high surrogate: its low half follows
++            uint32_t low = 0;
++            if (n - i < 2 || json[i] != '\\' || json[i + 1] != 'u') {
++              return false;
++            }
++            i += 2;
++            if (!hex4(&low) || low < 0xDC00 || low > 0xDFFF) {
++              return false;
++            }
++            cp = 0x10000 + ((cp - 0xD800) << 10) + (low - 0xDC00);
++          } else if (cp >= 0xDC00 && cp <= 0xDFFF) {
++            return false;  // a lone low surrogate
++          }
++          append_utf8(cp, s);
++          break;
++        }
++        default:
++          return false;
++      }
++    }
++    return false;  // no closing quote
++  };
++  auto read_int = [&](int* out) {
++    bool negative = false;
++    if (i < n && json[i] == '-') {
++      negative = true;
++      ++i;
++    }
++    if (i >= n || json[i] < '0' || json[i] > '9') {
++      return false;
++    }
++    if (json[i] == '0' && i + 1 < n && json[i + 1] >= '0' && json[i + 1] <= '9') {
++      return false;  // a leading zero is not JSON
++    }
++    int64_t v = 0;
++    while (i < n && json[i] >= '0' && json[i] <= '9') {
++      v = v * 10 + (json[i] - '0');
++      if (v > int64_t{2147483648}) {
++        return false;
++      }
++      ++i;
++    }
++    if (i < n && (json[i] == '.' || json[i] == 'e' || json[i] == 'E')) {
++      return false;  // a double: base::JSONReader's int check decides
++    }
++    v = negative ? -v : v;
++    if (v > int64_t{2147483647} || v < -int64_t{2147483648}) {
++      return false;
++    }
++    *out = static_cast<int>(v);
++    return true;
++  };
++
++  std::vector<std::pair<std::string, int>> entries;
++  skip_space();
++  if (i >= n || json[i] != '{') {
++    return decline("not an object");
++  }
++  ++i;
++  skip_space();
++  if (i < n && json[i] == '}') {
++    ++i;
++  } else {
++    std::string key;
++    for (;;) {
++      skip_space();
++      if (!read_string(&key)) {
++        return decline("key");
++      }
++      skip_space();
++      if (i >= n || json[i] != ':') {
++        return decline("no colon");
++      }
++      ++i;
++      skip_space();
++      int value = 0;
++      if (!read_int(&value)) {
++        return decline("value not an int32");
++      }
++      if (!base::IsStringUTF8AllowingNoncharacters(key)) {
++        return decline("key not UTF-8");
++      }
++      entries.emplace_back(std::move(key), value);
++      skip_space();
++      if (i < n && json[i] == ',') {
++        ++i;
++        continue;
++      }
++      if (i < n && json[i] == '}') {
++        ++i;
++        break;
++      }
++      return decline("no comma or brace");
++    }
++  }
++  skip_space();
++  if (i != n) {
++    return decline("text after the object");
++  }
++  return entries;
++}
++
++}  // namespace tark_captions
++
++#endif  // COMPONENTS_TARK_CAPTIONS_FLAT_VOCAB_H_
+--- a/components/tark_captions/translation_engine_unittest.cc
++++ b/components/tark_captions/translation_engine_unittest.cc
+@@ -11,6 +11,10 @@
+ 
+ #include "base/files/file_util.h"
+ #include "base/files/scoped_temp_dir.h"
++#include "base/json/json_reader.h"
++#include "base/time/time.h"
++#include "base/values.h"
++#include "components/tark_captions/flat_vocab.h"
+ #include "components/tark_captions/model_source.h"
+ #include "components/tark_captions/ort_runtime.h"
+ #include "components/tark_captions/test_util.h"
+@@ -295,5 +299,74 @@
+   EXPECT_EQ(engine_->TranslatePage("  ", "ml", "en"), std::string());
+ }
+ 
++// ParseFlatVocab gives what base::JSONReader gives for a flat {"token": id}
++// file, escapes and all (dict.*.json write Devanagari raw, but a file may
++// escape it).
++TEST(FlatVocabTest, MatchesJsonReader) {
++  const std::string json =
++      "{\n  \"<s>\": 0,\n  \"a\\\"b\": 1, \"\\\\\": 2, \"\\u0905\\u093e\": 3,\n"
++      "  \"\\ud83d\\ude00\": 4, \"tab\\there\": 5, \"\\/x\": -6,\n"
++      "  \"\xE2\x96\x81\xE0\xA5\xA4\": 7, \"z\": 2147483647, \"y\": -2147483648 }\n";
++  std::optional<std::vector<std::pair<std::string, int>>> fast = ParseFlatVocab(json);
++  ASSERT_TRUE(fast);
++  std::optional<base::Value> slow = base::JSONReader::Read(json, base::JSON_PARSE_RFC);
++  ASSERT_TRUE(slow && slow->is_dict());
++  ASSERT_EQ(fast->size(), slow->GetDict().size());
++  for (const auto& [key, id] : *fast) {
++    EXPECT_EQ(slow->GetDict().FindInt(key), id) << key;
++  }
++  EXPECT_EQ((*fast)[2].first, "\\");
++  EXPECT_EQ((*fast)[3].first, "\xE0\xA4\x85\xE0\xA4\xBE");      // अा
++  EXPECT_EQ((*fast)[4].first, "\xF0\x9F\x98\x80");              // a surrogate pair
++  EXPECT_EQ((*fast)[0].first, "<s>");                           // file order
++}
++
++// it2_indic_en's dict.SRC.json has keys with Unicode noncharacters
++// (U+FDDB..U+FDEB). base::JSONReader takes them, and so must the fast path: with
++// base::IsStringUTF8 it declined that file on the phone (round 12) and fell
++// back to the 18 s path.
++TEST(FlatVocabTest, NoncharacterKeysTaken) {
++  const std::string json = "{\"\xEF\xB7\x9C\": 5, \"\\ufdeb\": 6}";
++  const char* why = "";
++  std::optional<std::vector<std::pair<std::string, int>>> fast = ParseFlatVocab(json, &why);
++  ASSERT_TRUE(fast) << why;
++  std::optional<base::Value> slow = base::JSONReader::Read(json, base::JSON_PARSE_RFC);
++  ASSERT_TRUE(slow && slow->is_dict());
++  ASSERT_EQ(fast->size(), slow->GetDict().size());
++  for (const auto& [key, id] : *fast) {
++    EXPECT_EQ(slow->GetDict().FindInt(key), id);
++  }
++}
++
++// Anything that is not a flat object of int32s goes back to base::JSONReader.
++TEST(FlatVocabTest, DeclinesWhatItDoesNotHandle) {
++  for (const char* json :
++       {"{\"a\": 1.0}", "{\"a\": 1e2}", "{\"a\": 01}", "{\"a\": \"1\"}", "{\"a\": [1]}",
++        "{\"a\": 2147483648}", "{\"\\ud800\": 1}", "{\"\\udc00\": 1}", "{\"\\x41\": 1}",
++        "{\"a\": 1,}", "{\"a\": 1} x", "[1]", "", "{\"\xFF\": 1}", "{\"a\nb\": 1}"}) {
++    EXPECT_FALSE(ParseFlatVocab(json)) << json;
++  }
++  EXPECT_EQ(ParseFlatVocab(" {} "), (std::vector<std::pair<std::string, int>>{}));
++}
++
++// The size of IndicTrans2's dict.SRC.json, keys in id order (not key order),
++// as on the phone, where base::JSONReader took 18.7 s: well under a second.
++TEST(FlatVocabTest, LargeVocabularyIsFast) {
++  std::string json = "{";
++  for (int id = 0; id < 122706; ++id) {
++    json += (id ? ",\n  \"" : "\n  \"");
++    json += "\xE2\x96\x81\xE0\xA4\x95";  // ▁क
++    json += std::to_string((id * 7919) % 122706);
++    json += "\": " + std::to_string(id);
++  }
++  json += "\n}\n";
++  const base::TimeTicks start = base::TimeTicks::Now();
++  std::optional<std::vector<std::pair<std::string, int>>> entries = ParseFlatVocab(json);
++  const base::TimeDelta took = base::TimeTicks::Now() - start;
++  ASSERT_TRUE(entries);
++  EXPECT_EQ(entries->size(), 122706u);
++  EXPECT_LT(took, base::Seconds(1));
++}
++
+ }  // namespace
+ }  // namespace tark_captions
