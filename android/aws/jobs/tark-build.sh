@@ -100,14 +100,6 @@ if (( code == 0 )); then
   tar -czf /tark/xlit-files.tgz -C /tark/work/src/third_party/indicxlit android
   upload /tark/xlit-files.tgz xlit-files.tgz
 fi
-# Page translation's browser tests (page-translate-wiring.patch,
-# TarkPageTranslateBrowserTest) are in android_browsertests, which needs a
-# device: built here, the APK goes up for the emulator (android/emulator/
-# README.md); a build that cannot build them fails.
-if (( code == 0 )); then
-  ninja -C /tark/work/src/out/Default android_browsertests >> $log 2>&1 || { echo "android_browsertests did not build" >> $log; code=1; }
-  (( code == 0 )) && upload /tark/work/src/out/Default/apks/AndroidBrowserTests.apk AndroidBrowserTests.apk
-fi
 # The junit tests of the speech and voice patches (voice input) and of the
 # Private button (private-tab-button.patch), of Sign in with Zynclave
 # (zynclave-*.patch), of Background play (media-background-play.patch) and of
@@ -159,5 +151,14 @@ if (( code == 0 )); then
     upload /tark/junit.log junit.log
   fi
   echo "junit exit $code" >> $log
+fi
+# Page translation's browser tests (page-translate-wiring.patch,
+# TarkPageTranslateBrowserTest) are in android_browsertests, which needs a
+# device: built here, the APK goes up for the emulator (android/emulator/
+# README.md); a build that cannot build them fails.
+# After the junit run, so a browser-test build failure doesn't hide junit results.
+if (( code == 0 )); then
+  ninja -C /tark/work/src/out/Default android_browsertests >> $log 2>&1 || { echo "android_browsertests did not build" >> $log; code=1; }
+  (( code == 0 )) && upload /tark/work/src/out/Default/apks/AndroidBrowserTests.apk AndroidBrowserTests.apk
 fi
 exit $code
