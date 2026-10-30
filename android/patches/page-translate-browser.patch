@@ -56,7 +56,7 @@
  // {"<unit>": ["captions", "voice"]}. A unit no feature wants may be deleted.
 --- /dev/null
 +++ b/chrome/browser/tark_captions_android/page_translation.cc
-@@ -0,0 +1,205 @@
+@@ -0,0 +1,229 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -117,6 +117,16 @@
 +                                std::string source,
 +                                std::string target,
 +                                ResultsCallback callback) {
++  if (!off_the_record_ && !texts.empty() && ModelsReady(source, target)) {
++    backend_->RememberTranslated(source, target);  // Warm may load it next time
++  }
++  Send(std::move(texts), std::move(source), std::move(target), std::move(callback));
++}
++
++void PageTranslation::Send(std::vector<std::string> texts,
++                           std::string source,
++                           std::string target,
++                           ResultsCallback callback) {
 +  const std::vector<std::string> units = PageUnitsFor(source, target);
 +  if (texts.empty() || !ModelsReady(source, target)) {
 +    std::move(callback).Run(Results(texts.size()));
@@ -125,7 +135,7 @@
 +  idle_.Stop();
 +  if (!connected_) {
 +    connected_ = true;
-+    LOG(WARNING) << "tark-page: browser connecting to the captions process";
++    DVLOG(1) << "tark-page: browser connecting to the captions process";
 +    backend_->Connect();
 +  }
 +  for (const std::string& unit : units) {
@@ -149,11 +159,11 @@
 +
 +void PageTranslation::Warm(std::string source, std::string target) {
 +  if (connected_ || !pending_.empty() || !ModelsReady(source, target) ||
-+      !backend_->CanWarm()) {
++      !backend_->TranslatedBefore(source, target) || !backend_->CanWarm()) {
 +    return;
 +  }
-+  LOG(WARNING) << "tark-page: browser warming " << source << " -> " << target;
-+  Translate({"."}, std::move(source), std::move(target), base::DoNothing());
++  DVLOG(1) << "tark-page: browser warming " << source << " -> " << target;
++  Send({"."}, std::move(source), std::move(target), base::DoNothing());
 +}
 +
 +bool PageTranslation::ModelsReady(std::string source, std::string target) const {
@@ -192,10 +202,19 @@
 +  }
 +}
 +
++void PageTranslation::AnswerAllDeferred() {
++  // Snapshot first: a callback may translate again.
++  std::map<uint64_t, Pending> pending = std::move(pending_);
++  pending_.clear();
++  for (auto& [id, batch] : pending) {
++    std::move(batch.callback).Run(Results());
++  }
++}
++
 +void PageTranslation::OnAppBackgrounded() {
 +  // Let go first, then answer: a batch a callback starts connects again.
 +  Unload();
-+  AnswerAllNull();
++  AnswerAllDeferred();
 +}
 +
 +void PageTranslation::OnTabHidden() {
@@ -213,11 +232,16 @@
 +  if (it == pending_.end()) {
 +    return;
 +  }
-+  Pending batch = std::move(it->second);
-+  pending_.erase(it);
-+  LOG(WARNING) << "tark-page: browser batch deadline items=" << batch.size
-+               << " bytes=" << batch.bytes << " pending=" << pending_.size();
-+  std::move(batch.callback).Run(Results(batch.size));
++  DVLOG(1) << "tark-page: browser batch deadline items=" << it->second.size
++           << " bytes=" << it->second.bytes << " pending=" << pending_.size();
++  // A new translator pipe: the service drops what was queued on the old one
++  // (PageTranslator::DropBatches), so nothing keeps computing for answers
++  // that would be thrown away. Everything outstanding was on that pipe, so
++  // it all answers deferred and the script sends it again.
++  if (connected_) {
++    backend_->DropSent();
++  }
++  AnswerAllDeferred();
 +  MaybeStartIdleTimer();
 +}
 +
@@ -231,9 +255,9 @@
 +  if (results.size() != batch.size) {
 +    results = Results(batch.size);
 +  }
-+  LOG(WARNING) << "tark-page: browser batch done items=" << batch.size << " bytes=" << batch.bytes
-+               << " ms=" << (base::TimeTicks::Now() - batch.sent).InMilliseconds()
-+               << " pending=" << pending_.size();
++  DVLOG(1) << "tark-page: browser batch done items=" << batch.size << " bytes=" << batch.bytes
++           << " ms=" << (base::TimeTicks::Now() - batch.sent).InMilliseconds()
++           << " pending=" << pending_.size();
 +  std::move(batch.callback).Run(std::move(results));
 +  MaybeStartIdleTimer();
 +}
@@ -264,7 +288,7 @@
 +}  // namespace tark_captions
 --- /dev/null
 +++ b/chrome/browser/tark_captions_android/page_translation.h
-@@ -0,0 +1,140 @@
+@@ -0,0 +1,135 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -304,6 +328,11 @@
 +// nothing is written to prefs.
 +class PageTranslation {
 + public:
++  // One per text; null keeps that text's original. An empty Results for a
++  // non-empty batch means "deferred": nothing was wrong with the texts, the
++  // batch was let go (tab hidden, app in the background, another tab took
++  // the process, or the deadline passed), and the page's script sends them
++  // again.
 +  using Results = std::vector<std::optional<std::string>>;
 +  using ResultsCallback = base::OnceCallback<void(Results)>;
 +
@@ -340,6 +369,11 @@
 +    // phone or one short of memory, and not while captions run (captions
 +    // win: they may hold another model).
 +    virtual bool CanWarm() const = 0;
++    // The directions this profile has translated a page in
++    // ("tark.page_translation.warm_directions"); Warm only loads those.
++    virtual bool TranslatedBefore(const std::string& source, const std::string& target) const = 0;
++    // A real translation in `source` -> `target` (never called off the record).
++    virtual void RememberTranslated(const std::string& source, const std::string& target) = 0;
 +  };
 +
 +  PageTranslation(Backend* backend, bool off_the_record);
@@ -354,8 +388,9 @@
 +                 std::string target,
 +                 ResultsCallback callback);
 +  bool ModelsReady(std::string source, std::string target) const;
-+  // The Translate offer is showing: when the pair's models are on the phone
-+  // and the backend allows it, loads the model now (a one-sentence batch
++  // The Translate offer is showing: when the pair's models are on the phone,
++  // this profile has translated that direction before (Backend::
++  // TranslatedBefore) and the backend allows it, loads the model now (a one-sentence batch
 +  // whose answer is dropped), so the tap doesn't wait for the load. With no
 +  // tap the usual idle unload lets it go after kIdleUnload. It costs that
 +  // memory for those three minutes even for people who never tap.
@@ -365,7 +400,8 @@
 +  bool RequestModels(std::string source, std::string target, bool now);
 +  // The page went (a navigation): outstanding batches answer all-null now.
 +  void Cancel();
-+  // The app went to the background: no translating there, the model goes.
++  // The app went to the background: no translating there, the model goes;
++  // outstanding batches answer deferred.
 +  void OnAppBackgrounded();
 +  // The tab was hidden: only the visible tab holds a page model, so two tabs
 +  // never hold one at once.
@@ -380,14 +416,21 @@
 +  struct Pending {
 +    size_t size = 0;
 +    ResultsCallback callback;
-+    base::TimeTicks sent;  // diagnostics: logcat "tark-page"
++    base::TimeTicks sent;  // diagnostics (DVLOG)
 +    size_t bytes = 0;
 +  };
 +
++  void Send(std::vector<std::string> texts,
++            std::string source,
++            std::string target,
++            ResultsCallback callback);
+
 +  void OnResults(uint64_t id, Results results);
 +  void OnDeadline(uint64_t id);
 +  // Answers every outstanding batch all-null.
 +  void AnswerAllNull();
++  // Answers every outstanding batch deferred (an empty Results).
++  void AnswerAllDeferred();
 +  void Unload();
 +  void ReleaseUnits();
 +  void MaybeStartIdleTimer();
@@ -467,13 +510,14 @@
    explicit TarkCaptionsTab(content::WebContents* web_contents);
 --- /dev/null
 +++ b/chrome/browser/tark_captions_android/tark_page_translation.cc
-@@ -0,0 +1,273 @@
+@@ -0,0 +1,308 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
 +
 +#include "chrome/browser/tark_captions_android/tark_page_translation.h"
 +
++#include <algorithm>
 +#include <utility>
 +
 +#include "base/android/application_status_listener.h"
@@ -483,10 +527,14 @@
 +#include "base/no_destructor.h"
 +#include "base/system/sys_info.h"
 +#include "base/task/thread_pool.h"
++#include "base/values.h"
 +#include "chrome/browser/tark_captions_android/caption_downloads.h"
 +#include "chrome/browser/tark_captions_android/model_files.h"
 +#include "chrome/browser/tark_captions_android/tark_captions_tab.h"
 +#include "chrome/browser/tark_captions_android/tark_page_translation_warm.h"
++#include "components/prefs/pref_service.h"
++#include "components/prefs/scoped_user_pref_update.h"
++#include "components/user_prefs/user_prefs.h"
 +#include "content/public/browser/browser_context.h"
 +#include "content/public/browser/service_process_host.h"
 +#include "content/public/browser/web_contents.h"
@@ -724,6 +772,36 @@
 +  return !(captions && captions->RunningService());
 +}
 +
++namespace {
++// Profile pref (browser_ui_prefs.cc): "<source>><target>" for each direction
++// this profile has translated a page in. Read off the record (it inherits the
++// regular profile's), written only on it.
++constexpr char kWarmDirections[] = "tark.page_translation.warm_directions";
++
++std::string DirectionKey(const std::string& source, const std::string& target) {
++  return source + ">" + target;
++}
++}  // namespace
++
++bool TarkPageTranslation::TranslatedBefore(const std::string& source,
++                                           const std::string& target) const {
++  PrefService* prefs = user_prefs::UserPrefs::Get(web_contents()->GetBrowserContext());
++  return prefs && std::ranges::contains(prefs->GetList(kWarmDirections),
++                                        base::Value(DirectionKey(source, target)));
++}
++
++void TarkPageTranslation::RememberTranslated(const std::string& source,
++                                             const std::string& target) {
++  if (web_contents()->GetBrowserContext()->IsOffTheRecord() ||
++      TranslatedBefore(source, target)) {
++    return;
++  }
++  PrefService* prefs = user_prefs::UserPrefs::Get(web_contents()->GetBrowserContext());
++  if (prefs) {
++    ScopedListPrefUpdate(prefs, kWarmDirections)->Append(DirectionKey(source, target));
++  }
++}
++
 +void TarkPageTranslation::OnGone() {
 +  translator_.reset();
 +  own_service_.reset();
@@ -743,7 +821,7 @@
 +}  // namespace tark_captions
 --- /dev/null
 +++ b/chrome/browser/tark_captions_android/tark_page_translation.h
-@@ -0,0 +1,118 @@
+@@ -0,0 +1,120 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -833,6 +911,8 @@
 +  void SetInUse(const std::string& unit, bool in_use) override;
 +  void RequestUnit(const std::string& unit, bool now) override;
 +  bool CanWarm() const override;
++  bool TranslatedBefore(const std::string& source, const std::string& target) const override;
++  void RememberTranslated(const std::string& source, const std::string& target) override;
 +
 +  // A translator on the process the page uses (captions' or its own).
 +  void BindTranslator();
@@ -864,7 +944,7 @@
 +#endif  // CHROME_BROWSER_TARK_CAPTIONS_ANDROID_TARK_PAGE_TRANSLATION_H_
 --- /dev/null
 +++ b/chrome/browser/tark_captions_android/tark_page_translation_unittest.cc
-@@ -0,0 +1,316 @@
+@@ -0,0 +1,354 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -925,6 +1005,12 @@
 +    ++pref_writes;
 +  }
 +  bool CanWarm() const override { return can_warm; }
++  bool TranslatedBefore(const std::string& source, const std::string& target) const override {
++    return translated.contains(source + ">" + target);
++  }
++  void RememberTranslated(const std::string& source, const std::string& target) override {
++    translated.insert(source + ">" + target);
++  }
 +
 +  // The captions process answers the oldest batch.
 +  void Answer(Results results) {
@@ -945,6 +1031,7 @@
 +  UnitOwners owners;
 +  int pref_writes = 0;
 +  bool can_warm = true;
++  std::set<std::string> translated;  // directions translated before
 +};
 +
 +class TarkPageTranslationTest : public testing::Test {
@@ -1001,7 +1088,7 @@
 +  page.OnAppBackgrounded();
 +  EXPECT_FALSE(backend_.connected);
 +  EXPECT_EQ(answers_, 1);
-+  EXPECT_EQ(out_, Results(2));  // the page keeps its text
++  EXPECT_EQ(out_, Results());  // deferred: the script sends them again
 +  EXPECT_TRUE(backend_.in_use_units.empty());
 +}
 +
@@ -1041,20 +1128,21 @@
 +  Translate(page, {"एक"});
 +  page.OnTabHidden();
 +  EXPECT_FALSE(backend_.connected);
-+  EXPECT_EQ(out_, Results(1));
++  EXPECT_EQ(out_, Results());  // deferred
 +  EXPECT_TRUE(backend_.in_use_units.empty());
 +}
 +
-+TEST_F(TarkPageTranslationTest, WaitingBatchTimesOutToOriginals) {
++TEST_F(TarkPageTranslationTest, WaitingBatchTimesOutDeferred) {
 +  PageTranslation page(&backend_, false);
 +  Translate(page, {"एक", "दो"});  // captions hold another model: no reply
 +  task_environment_.FastForwardBy(base::Seconds(29));
 +  EXPECT_EQ(answers_, 0);
 +  task_environment_.FastForwardBy(base::Seconds(1));
 +  EXPECT_EQ(answers_, 1);
-+  EXPECT_EQ(out_, Results(2));
++  EXPECT_EQ(out_, Results());  // deferred, not originals
 +  EXPECT_EQ(page.outstanding(), 0u);
-+  backend_.Answer({"one", "two"});  // too late: dropped
++  EXPECT_EQ(backend_.drops, 1);  // a new pipe: the service drops the old queue
++  std::move(backend_.dropped.front()).Run({"one", "two"});  // too late: dropped
 +  EXPECT_EQ(answers_, 1);
 +  task_environment_.FastForwardBy(PageTranslation::kIdleUnload);
 +  EXPECT_FALSE(backend_.connected);  // nothing left hanging
@@ -1138,6 +1226,7 @@
 +// tap it goes after the idle unload, like any batch.
 +TEST_F(TarkPageTranslationTest, WarmLoadsAheadAndUnloadsWhenIdle) {
 +  PageTranslation page(&backend_, false);
++  backend_.translated = {"hi>en"};
 +  page.Warm("hi", "en");
 +  EXPECT_EQ(backend_.connects, 1);
 +  EXPECT_EQ(backend_.sent_units, (std::vector<std::string>{"tr_indic_en"}));
@@ -1148,9 +1237,35 @@
 +  EXPECT_TRUE(backend_.in_use_units.empty());
 +}
 +
++// A real translation remembers its direction (warm-up may load it on the next
++// offer); the warm-up itself and a Private profile don't.
++TEST_F(TarkPageTranslationTest, RealTranslateRemembersDirection) {
++  PageTranslation page(&backend_, false);
++  Translate(page, {"एक"});
++  EXPECT_TRUE(backend_.translated.contains("hi>en"));
++  PageTranslation incognito(&backend_, /*off_the_record=*/true);
++  incognito.Translate({"one"}, "en", "hi", base::DoNothing());
++  EXPECT_FALSE(backend_.translated.contains("en>hi"));
++}
++
++// The deadline lets the whole pipe go: both batches on it answer deferred.
++TEST_F(TarkPageTranslationTest, DeadlineDefersEverythingOnThePipe) {
++  PageTranslation page(&backend_, false);
++  int deferred = 0;
++  auto count = base::BindRepeating([](int* n, Results r) { *n += r.empty(); }, &deferred);
++  page.Translate({"एक"}, "hi", "en", count);
++  task_environment_.FastForwardBy(base::Seconds(10));
++  page.Translate({"दो"}, "hi", "en", count);
++  task_environment_.FastForwardBy(base::Seconds(20));  // the first's deadline
++  EXPECT_EQ(deferred, 2);
++  EXPECT_EQ(backend_.drops, 1);
++  EXPECT_EQ(page.outstanding(), 0u);
++}
++
 +// A tap right after the offer uses the warmed process: no second connect.
 +TEST_F(TarkPageTranslationTest, WarmThenTranslateSharesTheProcess) {
 +  PageTranslation page(&backend_, false);
++  backend_.translated = {"hi>en"};
 +  page.Warm("hi", "en");
 +  backend_.Answer({"."});
 +  Translate(page, {"एक"});
@@ -1164,6 +1279,9 @@
 +// or when a translation is already connected.
 +TEST_F(TarkPageTranslationTest, WarmSkipped) {
 +  PageTranslation page(&backend_, false);
++  page.Warm("hi", "en");  // never translated hi -> en here
++  EXPECT_EQ(backend_.connects, 0);
++  backend_.translated = {"hi>en"};
 +  backend_.can_warm = false;
 +  page.Warm("hi", "en");
 +  EXPECT_EQ(backend_.connects, 0);

@@ -227,7 +227,7 @@
  };
 --- /dev/null
 +++ b/chrome/services/tark_captions/page_translator.cc
-@@ -0,0 +1,331 @@
+@@ -0,0 +1,357 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -268,33 +268,56 @@
 +}
 +
 +// Captions' translator holds every model the batch needs.
-+// A page text's sentences, each with what ends it: after ".", "?" or "!"
-+// followed by white space, after a danda or double danda, or at a line break.
-+// "3.5" and "e.g.x" stay whole.
-+std::vector<std::string_view> Sentences(std::string_view text) {
-+  std::vector<std::string_view> sentences;
++// A page text's sentences: each ends after ".", "?" or "!" followed by white
++// space or the end, after a danda or double danda (। ॥), an Urdu full stop or
++// question mark (۔ ؟), an Ol Chiki full stop (᱾), or at a line break. "3.5"
++// and "e.g.x" stay whole. A sentence running past kLongSentence characters
++// with none of those ends at its next space or comma, so a run-on line isn't
++// cut off by the models' 255-token input. `line_break`: a "\n" ended it.
++struct Sentence {
++  std::string_view text;
++  bool line_break = false;
++};
++
++constexpr size_t kLongSentence = 200;
++
++std::vector<Sentence> Sentences(std::string_view text) {
++  std::vector<Sentence> sentences;
 +  size_t start = 0;
++  size_t chars = 0;  // code points since `start`
 +  for (size_t i = 0; i < text.size(); ++i) {
 +    size_t end = 0;  // one past the sentence's end
++    bool line_break = false;
 +    const char c = text[i];
++    const std::string_view rest = text.substr(i);
++    if ((static_cast<unsigned char>(c) & 0xC0) != 0x80) {
++      ++chars;
++    }
 +    if (c == '\n') {
 +      end = i + 1;
++      line_break = true;
 +    } else if (c == '.' || c == '?' || c == '!') {
 +      if (i + 1 == text.size() || text[i + 1] == ' ' || text[i + 1] == '\n' ||
 +          text[i + 1] == '\t') {
 +        end = i + 1;
 +      }
-+    } else if (text.substr(i, 3) == "\xE0\xA5\xA4" || text.substr(i, 3) == "\xE0\xA5\xA5") {
-+      end = i + 3;  // । ॥
++    } else if (rest.starts_with("\xE0\xA5\xA4") || rest.starts_with("\xE0\xA5\xA5") ||
++               rest.starts_with("\xE1\xB1\xBE")) {
++      end = i + 3;  // । ॥ ᱾
++    } else if (rest.starts_with("\xDB\x94") || rest.starts_with("\xD8\x9F")) {
++      end = i + 2;  // ۔ ؟
++    } else if (chars > kLongSentence && (c == ' ' || c == ',' || rest.starts_with("\xD8\x8C"))) {
++      end = c == ' ' || c == ',' ? i + 1 : i + 2;  // a space, a comma or ،
 +    }
 +    if (end) {
-+      sentences.push_back(text.substr(start, end - start));
++      sentences.push_back({text.substr(start, end - start), line_break});
 +      start = end;
++      chars = 0;
 +      i = end - 1;
 +    }
 +  }
 +  if (start < text.size()) {
-+    sentences.push_back(text.substr(start));
++    sentences.push_back({text.substr(start), false});
 +  }
 +  return sentences;
 +}
@@ -309,9 +332,11 @@
 +                                         std::string_view source,
 +                                         std::string_view target) {
 +  std::string joined;
-+  for (std::string_view sentence : Sentences(text)) {
-+    const std::string_view trimmed = base::TrimWhitespaceASCII(sentence, base::TRIM_ALL);
++  bool after_line_break = false;
++  for (const Sentence& sentence : Sentences(text)) {
++    const std::string_view trimmed = base::TrimWhitespaceASCII(sentence.text, base::TRIM_ALL);
 +    if (trimmed.empty()) {
++      after_line_break |= sentence.line_break;
 +      continue;
 +    }
 +    std::optional<std::string> done = Checked(translator->Translate(trimmed, source, target));
@@ -319,9 +344,10 @@
 +      return std::nullopt;
 +    }
 +    if (!joined.empty()) {
-+      joined += ' ';
++      joined += after_line_break ? '\n' : ' ';  // the page's line breaks stay
 +    }
 +    joined += *done;
++    after_line_break = sentence.line_break;
 +  }
 +  return Checked(std::move(joined));
 +}
@@ -334,10 +360,10 @@
 +  return chars;
 +}
 +
-+// Diagnostics for the phone (logcat "tark-page"): one line per batch.
++// Diagnostics (DVLOG): one line per batch.
 +void LogBatch(const char* how, size_t count, size_t chars, base::TimeTicks start) {
-+  LOG(WARNING) << "tark-page: service batch " << how << " items=" << count
-+               << " bytes=" << chars << " ms=" << (base::TimeTicks::Now() - start).InMilliseconds();
++  DVLOG(1) << "tark-page: service batch " << how << " items=" << count << " bytes=" << chars
++           << " ms=" << (base::TimeTicks::Now() - start).InMilliseconds();
 +}
 +
 +PageResults TranslateShared(Translator* translator,
@@ -439,8 +465,8 @@
 +      return PageResults(texts.size());
 +    }
 +    if (!had) {
-+      LOG(WARNING) << "tark-page: service made translator " << leg.unit << " ms="
-+                   << (base::TimeTicks::Now() - load_start).InMilliseconds();
++      DVLOG(1) << "tark-page: service made translator " << leg.unit << " ms="
++               << (base::TimeTicks::Now() - load_start).InMilliseconds();
 +    }
 +    for (std::optional<std::string>& text : results) {
 +      if (text) {
@@ -667,7 +693,7 @@
 +#endif  // CHROME_SERVICES_TARK_CAPTIONS_PAGE_TRANSLATOR_H_
 --- /dev/null
 +++ b/chrome/services/tark_captions/page_translator_unittest.cc
-@@ -0,0 +1,301 @@
+@@ -0,0 +1,323 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -847,15 +873,37 @@
 +}
 +
 +// A paragraph goes to the model a sentence at a time (danda, "?", ". " and line
-+// breaks end one; "3.5" doesn't) and comes back joined by spaces.
++// breaks end one; "3.5" doesn't) and comes back joined by spaces, or by the
++// page's own line break.
 +TEST_F(PageTranslatorTest, ParagraphTranslatedSentenceBySentence) {
 +  PageTranslator page(&session_, Factory());
 +  const PageResults results = Translate(page, "hi", "en", {"tr_indic_en"},
 +                                        {"गंगा लंबी है। क्या 3.5 है? हाँ\n  अंत"});
-+  EXPECT_EQ(results, (PageResults{"en:गंगा लंबी है। en:क्या 3.5 है? en:हाँ en:अंत"}));
++  EXPECT_EQ(results, (PageResults{"en:गंगा लंबी है। en:क्या 3.5 है? en:हाँ\nen:अंत"}));
 +  base::AutoLock hold(models_.lock);
 +  EXPECT_EQ(models_.received, (std::vector<std::string>{"गंगा लंबी है।", "क्या 3.5 है?", "हाँ",
 +                                                        "अंत"}));
++}
++
++// Urdu's full stop and question mark and Ol Chiki's full stop end sentences
++// too; a long run with none of them is split at a space past ~200 characters.
++TEST_F(PageTranslatorTest, OtherScriptsEndsAndLongRuns) {
++  PageTranslator page(&session_, Factory());
++  std::string run;
++  for (int i = 0; i < 60; ++i) {
++    run += "शब्द ";  // 5 characters, 13 bytes
++  }
++  Translate(page, "ur", "en", {"tr_indic_en"},
++            {"\xDB\x8C\xDB\x81 \xDB\x94 \xDA\xA9\xDB\x8C\xD8\xA7\xD8\x9F \xDB\x81\xD8\xA7\xDA\xBA"});
++  Translate(page, "sat", "en", {"tr_indic_en"}, {"\xE1\xB1\x9A\xE1\xB1\x9E\xE1\xB1\xBE \xE1\xB1\xA5"});
++  Translate(page, "hi", "en", {"tr_indic_en"}, {run});
++  base::AutoLock hold(models_.lock);
++  ASSERT_EQ(models_.received.size(), 7u);
++  EXPECT_EQ(models_.received[0], "\xDB\x8C\xDB\x81 \xDB\x94");      // ۔
++  EXPECT_EQ(models_.received[1], "\xDA\xA9\xDB\x8C\xD8\xA7\xD8\x9F");  // ؟
++  EXPECT_EQ(models_.received[3], "\xE1\xB1\x9A\xE1\xB1\x9E\xE1\xB1\xBE");  // ᱾
++  EXPECT_LT(models_.received[5].size(), run.size());  // the long run, split once
++  EXPECT_GE(models_.received[5].size(), 200u);
 +}
 +
 +// Captions' Translate holds Indian → English and the page asks hi → en: the
@@ -1035,12 +1083,12 @@
 +  const char* why = "";
 +  size_t at = 0;
 +  if (auto entries = ParseFlatVocab(base::as_string_view(*bytes), &why, &at)) {
-+    LOG(WARNING) << "tark-page: vocab " << name << " fast entries=" << entries->size();
++    DVLOG(1) << "tark-page: vocab " << name << " fast entries=" << entries->size();
 +    return entries;
 +  }
-+  // Diagnostics (logcat "tark-page"): the slow path is ~20 s on a phone.
-+  LOG(WARNING) << "tark-page: vocab " << name << " fast path declined (" << why << " at byte "
-+               << at << "), base::JSONReader";
++  // The slow path is ~20 s on a phone: worth a warning.
++  LOG(WARNING) << "Tark translation: " << name << " fast path declined (" << why << " at byte "
++               << at << "), using base::JSONReader";
 +  std::optional<base::DictValue> dict = ReadJsonDict(source, name);
 +  if (!dict) {
 +    return std::nullopt;
@@ -1063,7 +1111,7 @@
    // encoder.int8.onnx and decoder_step.int8.onnx, from `source`.
    static std::unique_ptr<Direction> Load(OrtRuntime* runtime, const ModelSource& source) {
      auto d = base::WrapUnique(new Direction());
-+    // Diagnostics (logcat "tark-page"): where a model's load time goes.
++    // Diagnostics (DVLOG): where a model's load time goes.
 +    const base::TimeTicks load_start = base::TimeTicks::Now();
 +    auto ms = [](base::TimeTicks since) {
 +      return (base::TimeTicks::Now() - since).InMilliseconds();
@@ -1080,7 +1128,7 @@
      std::optional<base::span<const uint8_t>> spm = source.Read("model.SRC");
      if (!config || !src || !tgt || !spm ||
          !d->spm_.LoadFromSerializedProto(base::as_string_view(*spm)).ok()) {
-@@ -147,22 +194,22 @@
+@@ -147,22 +194,28 @@
      d->head_dim_ = *dim / *heads;
      d->start_ = *start;
      d->eos_ = *eos;
@@ -1099,7 +1147,13 @@
      d->src_vocab_ = base::flat_map<std::string, int64_t>(std::move(src_entries));
 -    for (const auto [token, id] : *tgt) {
 -      if (!id.is_int() || id.GetInt() < 0) {
-+    for (auto& [token, id] : *tgt) {
++    // The same for the target: one id per token, the last one given, then
++    // read in key order, so ids given twice resolve as base::JSONReader's
++    // sorted DictValue did.
++    std::vector<std::pair<std::string, int>> tgt_newest_first(
++        std::make_move_iterator(tgt->rbegin()), std::make_move_iterator(tgt->rend()));
++    const base::flat_map<std::string, int> tgt_map(std::move(tgt_newest_first));
++    for (const auto& [token, id] : tgt_map) {
 +      if (id < 0) {
          return nullptr;
        }
@@ -1109,11 +1163,11 @@
 +        d->tgt_vocab_.resize(id + 1);
        }
 -      d->tgt_vocab_[id.GetInt()] = token;
-+      d->tgt_vocab_[id] = std::move(token);
++      d->tgt_vocab_[id] = token;
      }
      auto unk = d->src_vocab_.find("<unk>");
      auto end = d->src_vocab_.find("</s>");
-@@ -171,8 +218,16 @@
+@@ -171,8 +224,16 @@
      }
      d->unk_ = unk->second;
      d->end_ = end->second;
@@ -1124,13 +1178,13 @@
 +    const base::TimeTicks decoder_start = base::TimeTicks::Now();
      d->decoder_ = runtime->LoadModel(source, "decoder_step.int8.onnx", kThreads);
 +    const int64_t decoder_ms = ms(decoder_start);
-+    LOG(WARNING) << "tark-page: model load json_dicts_ms=" << dicts_ms << " vocab_ms=" << vocab_ms
-+                 << " encoder_session_ms=" << encoder_ms << " decoder_session_ms=" << decoder_ms
-+                 << " total_ms=" << ms(load_start);
++    DVLOG(1) << "tark-page: model load json_dicts_ms=" << dicts_ms << " vocab_ms=" << vocab_ms
++             << " encoder_session_ms=" << encoder_ms << " decoder_session_ms=" << decoder_ms
++             << " total_ms=" << ms(load_start);
      if (!d->encoder_ || !d->decoder_) {
        LOG(ERROR) << "Tark translation: models not loaded";
        return nullptr;
-@@ -206,6 +261,7 @@
+@@ -206,6 +267,7 @@
    }
  
    std::optional<std::vector<int64_t>> Greedy(const std::vector<int64_t>& ids) {
@@ -1138,7 +1192,7 @@
      std::vector<Tensor> encoded;
      if (!encoder_->Run({Tensor{.name = "ids",
                                 .shape = {1, static_cast<int64_t>(ids.size())},
-@@ -213,6 +269,7 @@
+@@ -213,6 +275,7 @@
                         {"cross_mask", "cross_k", "cross_v"}, &encoded)) {
        return std::nullopt;
      }
@@ -1146,21 +1200,27 @@
      const std::vector<int64_t> empty_cache = {layers_, 1, heads_, 0, head_dim_};
      std::vector<Tensor> inputs = {
          Tensor{.name = "token", .shape = {1, 1}, .i64 = {start_}},
-@@ -243,6 +300,13 @@
+@@ -243,6 +306,19 @@
        inputs[3] = std::move(step_out[2]);
        inputs[3].name = "past_v";
      }
 +    if (!ran_) {  // the first inference after a load (diagnostics)
 +      ran_ = true;
-+      LOG(WARNING) << "tark-page: first inference source_tokens=" << ids.size()
-+                   << " output_tokens=" << out.size()
-+                   << " encoder_ms=" << encoder_time.InMilliseconds()
-+                   << " total_ms=" << (base::TimeTicks::Now() - start).InMilliseconds();
++      DVLOG(1) << "tark-page: first inference source_tokens=" << ids.size()
++               << " output_tokens=" << out.size()
++               << " encoder_ms=" << encoder_time.InMilliseconds()
++               << " total_ms=" << (base::TimeTicks::Now() - start).InMilliseconds();
++    }
++    if (out.size() == static_cast<size_t>(kMaxOutputTokens)) {
++      // No end token within the output limit: the translation was cut off.
++      // Nullopt keeps the original (a page's text, or a caption shown alone)
++      // rather than half a sentence.
++      return std::nullopt;
 +    }
      return out;
    }
  
-@@ -280,6 +344,7 @@
+@@ -280,6 +356,7 @@
    int64_t unk_ = 0;
    int64_t end_ = 0;
    bool language_tags_ = true;

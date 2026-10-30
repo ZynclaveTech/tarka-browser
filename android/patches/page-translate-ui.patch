@@ -454,7 +454,7 @@
      public static final String LANGUAGE_ID_UNIT = "language_id";
 --- /dev/null
 +++ b/chrome/browser/tark_captions_android/android/java/src/org/chromium/chrome/browser/tark_captions/TarkPageTranslationCard.java
-@@ -0,0 +1,429 @@
+@@ -0,0 +1,447 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -555,6 +555,9 @@
 +    // The card is up: later changes update it in place. Gone (its timer), it isn't shown again.
 +    private boolean mShowing;
 +    private boolean mShownOnce;
++    // The navigation entry (its unique id) the card was asked for: a card
++    // left from another page never translates this one.
++    private int mPageId;
 +
 +    @VisibleForTesting
 +    public TarkPageTranslationCard(
@@ -731,12 +734,14 @@
 +            WebContents webContents,
 +            @JniType("std::string") String source,
 +            @JniType("std::string") String target,
-+            boolean offTheRecord) {
++            boolean offTheRecord,
++            int pageId) {
 +        TarkPageTranslationCard card = sCards.get(webContents);
 +        if (card == null
 +                || !card.mSource.equals(source)
 +                || !card.mTarget.equals(target)
-+                || card.mOffTheRecord != offTheRecord) {
++                || card.mOffTheRecord != offTheRecord
++                || card.mPageId != pageId) {
 +            if (card != null) {
 +                card.stopWaiting();
 +                card.mSurface.dismiss();
@@ -746,28 +751,40 @@
 +                            ContextUtils.getApplicationContext(),
 +                            new BridgeDownloads(),
 +                            new MessageSurface(webContents),
-+                            new TabTranslator(webContents),
++                            new TabTranslator(webContents, pageId),
 +                            offTheRecord,
 +                            source,
 +                            target);
++            card.mPageId = pageId;
 +            sCards.put(webContents, card);
 +        }
 +        return card.onTranslateTapped();
 +    }
 +
++    /** The tab shows another page: its card stops waiting and goes. */
++    @CalledByNative
++    static void onPageChanged(WebContents webContents) {
++        TarkPageTranslationCard card = sCards.remove(webContents);
++        if (card == null) return;
++        card.stopWaiting();
++        card.mSurface.dismiss();
++    }
++
 +    /** The card holds its tab weakly, so the per-tab map (weak keys) lets go of a closed tab. */
 +    private static final class TabTranslator implements Translator {
 +        private final WeakReference<WebContents> mWebContents;
++        private final int mPageId;
 +
-+        TabTranslator(WebContents webContents) {
++        TabTranslator(WebContents webContents, int pageId) {
 +            mWebContents = new WeakReference<>(webContents);
++            mPageId = pageId;
 +        }
 +
 +        @Override
 +        public void translate(String source, String target) {
 +            WebContents webContents = mWebContents.get();
 +            if (webContents == null || webContents.isDestroyed()) return;
-+            TarkPageTranslationCardJni.get().translate(webContents, source, target);
++            TarkPageTranslationCardJni.get().translate(webContents, source, target, mPageId);
 +        }
 +    }
 +
@@ -881,7 +898,8 @@
 +        void translate(
 +                WebContents webContents,
 +                @JniType("std::string") String source,
-+                @JniType("std::string") String target);
++                @JniType("std::string") String target,
++                int pageId);
 +    }
 +}
 --- /dev/null
@@ -1175,7 +1193,7 @@
  #include "base/command_line.h"
  #include "base/feature_list.h"
  #include "base/functional/bind.h"
-@@ -70,7 +71,11 @@
+@@ -70,7 +71,13 @@
  #include "url/gurl.h"
  
  #if BUILDFLAG(IS_ANDROID)
@@ -1186,8 +1204,10 @@
 +#include "chrome/browser/tark_captions_android/tark_page_translation_warm.h"
  #include "chrome/browser/translate/android/auto_translate_snackbar_controller.h"
  #include "components/translate/content/android/translate_message.h"
++#include "content/public/browser/navigation_controller.h"
++#include "content/public/browser/navigation_entry.h"
  #include "content/public/browser/page.h"
-@@ -333,6 +338,10 @@
+@@ -333,6 +340,10 @@
            web_contents(), translate_manager_->GetWeakPtr(),
            base::BindRepeating([]() {}));
      }
@@ -1198,11 +1218,20 @@
      translate_message_->ShowTranslateStep(step, source_language,
                                            target_language);
    }
-@@ -402,6 +411,70 @@
+@@ -402,6 +413,83 @@
    return TranslateService::IsTranslatableURL(url);
  }
  
 +#if BUILDFLAG(IS_ANDROID)
++namespace tark_captions {
++// The page a Tark download card is for: the committed navigation entry's
++// unique id (0 with none).
++int PageIdOf(content::WebContents* web_contents) {
++  content::NavigationEntry* entry = web_contents->GetController().GetLastCommittedEntry();
++  return entry ? entry->GetUniqueID() : 0;
++}
++}  // namespace tark_captions
++
 +namespace {
 +std::optional<bool>& TarkReadyForTesting() {
 +  static std::optional<bool> ready;
@@ -1228,22 +1257,26 @@
 +  return tark_captions::Java_TarkPageTranslationCard_readyOrShowCard(
 +      base::android::AttachCurrentThread(),
 +      web_contents()->GetJavaWebContents(), source_language, target_language,
-+      web_contents()->GetBrowserContext()->IsOffTheRecord());
++      web_contents()->GetBrowserContext()->IsOffTheRecord(),
++      tark_captions::PageIdOf(web_contents()));
 +}
 +
 +namespace tark_captions {
 +
 +// The card's models are on the phone: translate, if the tab still shows the
-+// page it was asked for, untranslated, and is in front.
++// page it was asked for (the same navigation entry), untranslated, and is in
++// front.
 +static void JNI_TarkPageTranslationCard_Translate(
 +    JNIEnv* env,
 +    const base::android::JavaRef<jobject>& jweb_contents,
 +    const std::string& source_language,
-+    const std::string& target_language) {
++    const std::string& target_language,
++    jint page_id) {
 +  content::WebContents* web_contents =
 +      content::WebContents::FromJavaWebContents(jweb_contents);
 +  if (!web_contents ||
-+      web_contents->GetVisibility() != content::Visibility::VISIBLE) {
++      web_contents->GetVisibility() != content::Visibility::VISIBLE ||
++      PageIdOf(web_contents) != page_id) {
 +    return;
 +  }
 +  ChromeTranslateClient* client =
@@ -1269,6 +1302,16 @@
  void ChromeTranslateClient::UndoTranslate() {
    std::string source_language = GetLanguageState().source_language();
    std::string target_language = GetLanguageState().current_language();
+@@ -430,6 +518,9 @@
+ 
+ #if BUILDFLAG(IS_ANDROID)
+ void ChromeTranslateClient::PrimaryPageChanged(content::Page& page) {
++  // Tark: a card from the old page stops waiting (it never translates this one).
++  tark_captions::Java_TarkPageTranslationCard_onPageChanged(
++      base::android::AttachCurrentThread(), web_contents()->GetJavaWebContents());
+   if (auto_translate_snackbar_controller_ &&
+       auto_translate_snackbar_controller_->IsShowing()) {
+     auto_translate_snackbar_controller_->NativeDismissSnackbar();
 --- a/chrome/browser/translate/chrome_translate_client.h
 +++ b/chrome/browser/translate/chrome_translate_client.h
 @@ -6,6 +6,7 @@

@@ -353,3 +353,42 @@ test('movedTranslatedNodesNotResent', async () => {
   assert.equal(win.document.body.textContent, 'ONETWO');
   t.service.restore();
 });
+
+test('deferredBatchResentAtFrontAtMostTwice', async () => {
+  // The browser let the batch go (tab hidden, app in the background, the
+  // deadline): its texts go back at the front, at most twice, then stay.
+  const {win, t, progress} = translator('<p>one</p><p>two</p>');
+  for (let round = 0; round < 2; round++) {
+    const batch = t.takeBatch();
+    assert.deepEqual(batch.texts, ['one', 'two']);
+    t.onResult(batch.id, null);
+    assert.equal(progress.filter(p => p[1]).length, 0, 'not finished while resending');
+  }
+  const last = t.takeBatch();
+  assert.deepEqual(last.texts, ['one', 'two']);
+  t.onResult(last.id, null);  // the third deferral: left original
+  assert.equal(t.takeBatch(), null);
+  assert.equal(win.document.body.textContent, 'onetwo');
+  assert.equal(progress.filter(p => p[1]).length, 1, 'finished once');
+  t.service.restore();
+});
+
+test('failedSentencesAreFinalNotResent', () => {
+  const {win, t} = translator('<p>one</p><p>two</p>');
+  const batch = t.takeBatch();
+  t.onResult(batch.id, [null, 'TWO']);  // the model failed "one": it stays
+  assert.equal(t.takeBatch(), null);
+  assert.equal(win.document.body.textContent, 'oneTWO');
+  t.service.restore();
+});
+
+test('deferredTextChangedByThePageIsNotResent', async () => {
+  const {win, t} = translator('<p>one</p><p>two</p>');
+  const batch = t.takeBatch();
+  win.document.querySelector('p').firstChild.nodeValue = 'changed';
+  await tick();  // the observer queues "changed" itself
+  t.onResult(batch.id, null);
+  const again = t.takeBatch();
+  assert.deepEqual(again.texts.sort(), ['changed', 'two']);
+  t.service.restore();
+});

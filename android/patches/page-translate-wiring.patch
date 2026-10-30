@@ -628,18 +628,6 @@
        user_prefs::PrefRegistrySyncable::SYNCABLE_PREF);
    registry->RegisterDictionaryPref(prefs::kBrowserWindowPlacement);
    registry->RegisterDictionaryPref(prefs::kBrowserWindowPlacementPopup);
---- a/chrome/test/BUILD.gn
-+++ b/chrome/test/BUILD.gn
-@@ -1132,6 +1132,9 @@
-       "../renderer/wallet/boarding_pass_extractor_browsertest.cc",
-       "android/browsertests_apk/android_browsertests_jni_onload.cc",
-       "base/android/android_browser_test_browsertest_android.cc",
-+
-+      # Tark: page translation end to end (page-translate-wiring.patch).
-+      "../browser/tark_captions_android/tark_page_translate_browsertest.cc",
-     ]
- 
-     deps = [
 --- a/components/translate/content/common/BUILD.gn
 +++ b/components/translate/content/common/BUILD.gn
 @@ -6,7 +6,11 @@
@@ -765,7 +753,7 @@
    // Check the status of the translation.
    translate_task_runner_->PostDelayedTask(
        FROM_HERE,
-@@ -729,6 +757,215 @@
+@@ -729,6 +757,219 @@
    delete this;
  }
  
@@ -851,15 +839,10 @@
 +    ++tark_in_flight_;
 +    tark_outstanding_.insert(static_cast<int64_t>(*id));
 +    const size_t count = texts.size();
-+    size_t bytes = 0;
-+    for (const std::string& text : texts) {
-+      bytes += text.size();
-+    }
-+    // Diagnostics for the phone (logcat "tark-page"): the script's queue left.
-+    LOG(WARNING) << "tark-page: renderer sent batch " << static_cast<int64_t>(*id)
-+                 << " items=" << count << " bytes=" << bytes
-+                 << " queued=" << batch->GetDict().FindInt("queued").value_or(-1)
-+                 << " in_flight=" << tark_in_flight_;
++    DVLOG(1) << "tark-page: renderer sent batch " << static_cast<int64_t>(*id)
++             << " items=" << count
++             << " queued=" << batch->GetDict().FindInt("queued").value_or(-1)
++             << " in_flight=" << tark_in_flight_;
 +    tark_host_->Translate(
 +        std::move(texts), tark_source_, tark_target_,
 +        base::BindOnce(&TranslateAgent::TarkOnResults,
@@ -947,6 +930,16 @@
 +  }
 +  --tark_in_flight_;
 +  tark_outstanding_.erase(id);
++  auto weak_this = weak_pointer_factory_.GetWeakPtr();
++  if (count && results.empty()) {
++    // Deferred (tab hidden, app in the background, the deadline): the script
++    // queues these texts again at the front.
++    TarkExecuteUtf8Script("tarkTranslate.onResult(" + base::NumberToString(id) + ",null)");
++    if (weak_this) {
++      TarkPump();
++    }
++    return;
++  }
 +  base::ListValue list;
 +  for (size_t i = 0; i < count; ++i) {
 +    // A missing or null result keeps the original.
@@ -957,7 +950,6 @@
 +    }
 +  }
 +  std::optional<std::string> json = base::WriteJson(list);
-+  auto weak_this = weak_pointer_factory_.GetWeakPtr();
 +  TarkExecuteUtf8Script(
 +      "tarkTranslate.onResult(" + base::NumberToString(id) + "," +
 +      json.value_or(std::string("[]")) + ")");

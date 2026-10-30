@@ -7,7 +7,7 @@
 // The isolated world has no Mojo, so text leaves through a queue that
 // TranslateAgent (renderer C++) drains:
 //   tarkTranslate.takeBatch()        -> {id: number, texts: string[], queued: number} | null
-//   tarkTranslate.onResult(id, results)  results: (string|null)[]
+//   tarkTranslate.onResult(id, results)  results: (string|null)[], or null when deferred
 // A null result keeps the original. translatePage's progress counts answered
 // batches and finishes when the page's queue is drained; text the page adds
 // or changes later is still translated, without reporting again.
@@ -26,6 +26,10 @@ var tarkTranslate = (function() {
   // A text longer than this stays as it is and is never sent (a whole .txt
   // file, a huge <pre>-like block): the browser bounds a batch at 64 KiB.
   const MAX_ITEM_CHARS = 4000;
+  // A batch the browser let go (null results: tab hidden, app in the
+  // background, the deadline) goes back at the front of the queue, each text
+  // at most this many times; then it stays original.
+  const MAX_DEFERRALS = 2;
 
   function create(win) {
     const doc = win.document;
@@ -39,6 +43,7 @@ var tarkTranslate = (function() {
     let queuedCount = 0, queuedChars = 0;
     let latest = new Map();  // Text -> its newest queued item
     const inflight = new Map();
+    let deferrals = new WeakMap();  // Text -> times its batch was deferred
     let nextId = 1;
     let answered = 0;
     let reported = false;
@@ -122,6 +127,7 @@ var tarkTranslate = (function() {
       onProgress = progress;
       sourceLang = src;
       batcher = B.create();
+      deferrals = new WeakMap();
       const root = doc.body || doc.documentElement;
       batcher.observe(root, enqueue);
       win.addEventListener('scroll', onScroll, {passive: true});
@@ -171,6 +177,10 @@ var tarkTranslate = (function() {
       const batch = inflight.get(id);
       if (!active || !batch) return;
       inflight.delete(id);
+      if (results === null) {
+        requeue(batch);
+        return;
+      }
       batcher.apply(batch, results);
       answered++;
       if (reported || finishIfDrained()) return;
@@ -179,6 +189,27 @@ var tarkTranslate = (function() {
         onProgress(Math.floor(100 * answered / (answered + Math.max(left, 1))),
                    false, 0);
       }
+    }
+
+    // Deferred: the batch's texts that the page hasn't changed go back at the
+    // front, in order, unless they were deferred MAX_DEFERRALS times already.
+    function requeue(items) {
+      const again = [];
+      for (const item of items) {
+        const n = deferrals.get(item.node) || 0;
+        if (n >= MAX_DEFERRALS || latest.has(item.node) || !item.node.isConnected ||
+            item.node.nodeValue !== item.original) {
+          continue;
+        }
+        deferrals.set(item.node, n + 1);
+        latest.set(item.node, item);
+        again.push(item);
+        queuedCount++;
+        queuedChars += item.text.length;
+      }
+      front = again.concat(front.slice(frontHead));
+      frontHead = 0;
+      finishIfDrained();
     }
 
     function restore() {
