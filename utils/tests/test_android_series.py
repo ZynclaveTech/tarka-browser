@@ -61,6 +61,21 @@ class TestAndroidSeries(unittest.TestCase):
         self.assertTrue([e for e in self.tark if e.startswith('tarka/translate/')])
         self.assertFalse([e for e in self.series if e.startswith('tarka/translate/')])
 
+    def test_linux_patches_stay_off_android(self):
+        # The portable Linux build's patches (update notice, captions,
+        # sandbox) are desktop Linux only.
+        self.assertIn('tarka/linux/', self.skip)
+        self.assertTrue([e for e in self.tark if e.startswith('tarka/linux/')])
+        self.assertFalse([e for e in self.series if e.startswith('tarka/linux/')])
+
+    def test_no_android_patch_edits_the_windows_installer(self):
+        # chrome.release's context comes from the Windows patches, which
+        # Android leaves out: a hunk for it in a shared patch cannot apply.
+        for e in self.series:
+            if e.startswith('tarka/'):
+                text = (REPO / 'patches' / e).read_text(errors='replace')
+                self.assertNotIn('+++ b/chrome/installer/mini_installer/chrome.release', text, e)
+
     def test_locales_fix_is_android_only(self):
         self.assertIn('android/locales-android-branch.patch', self.series)
         self.assertNotIn('android/locales-android-branch.patch',

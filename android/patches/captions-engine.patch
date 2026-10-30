@@ -9422,7 +9422,7 @@
 +#endif  // COMPONENTS_TARK_CAPTIONS_TEST_UTIL_H_
 --- /dev/null
 +++ b/components/tark_captions/translation_engine.cc
-@@ -0,0 +1,445 @@
+@@ -0,0 +1,594 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -9867,10 +9867,159 @@
 +      base::UTF8ToUTF16(from_english->Decode(*out)), Script::kDevanagari, ScriptOf(target))));
 +}
 +
++// Page translation: the 22 Indian languages.
++
++namespace {
++
++constexpr IndicLanguage kIndicLanguages[] = {
++    {"as", "asm_Beng", 0x0980},  {"bn", "ben_Beng", 0x0980}, {"brx", "brx_Deva", 0x0900},
++    {"doi", "doi_Deva", 0x0900}, {"gu", "guj_Gujr", 0x0A80}, {"hi", "hin_Deva", 0x0900},
++    {"kn", "kan_Knda", 0x0C80},  {"ks", "kas_Arab", 0},      {"kok", "gom_Deva", 0x0900},
++    {"mai", "mai_Deva", 0x0900}, {"ml", "mal_Mlym", 0x0D00}, {"mni", "mni_Beng", 0x0980},
++    {"mr", "mar_Deva", 0x0900},  {"ne", "npi_Deva", 0x0900}, {"or", "ory_Orya", 0x0B00},
++    {"pa", "pan_Guru", 0x0A00},  {"sa", "san_Deva", 0x0900}, {"sat", "sat_Olck", 0},
++    {"sd", "snd_Arab", 0},       {"ta", "tam_Taml", 0x0B80}, {"te", "tel_Telu", 0x0C00},
++    {"ur", "urd_Arab", 0},
++};
++
++// IndicNLP's UnicodeIndicTransliterator between two Brahmi blocks: the
++// letter at the same offset (dandas kept); a 0 block leaves the text alone.
++std::u16string ShiftBlock(std::u16string_view text, char16_t from, char16_t to) {
++  if (from == 0 || to == 0 || from == to) {
++    return std::u16string(text);
++  }
++  std::u16string out;
++  out.reserve(text.size());
++  for (char16_t c : text) {
++    const int offset = static_cast<int>(c) - from;
++    if (offset >= 0 && offset <= 0x6F && c != u'\u0964' && c != u'\u0965') {
++      out.push_back(static_cast<char16_t>(to + offset));
++    } else {
++      out.push_back(c);
++    }
++  }
++  return out;
++}
++
++// What IndicTransToolkit feeds the model for page text in `language`:
++// spaces collapsed, tokenised, in Devanagari for a Brahmi script.
++std::string PageModelInput(std::string_view text, const IndicLanguage& language) {
++  std::u16string s = base::UTF8ToUTF16(text);
++  s = std::u16string(base::CollapseWhitespace(s, /*trim_sequences_with_line_breaks=*/true));
++  s = TokenizeIndic(s);
++  s = ShiftBlock(s, language.block, 0x0900);
++  base::ReplaceSubstringsAfterOffset(&s, 0, u" \u094D ", u"\u094D");
++  return base::UTF16ToUTF8(base::TrimWhitespace(s, base::TRIM_ALL));
++}
++
++bool IsCaptionsCode(std::string_view code) {
++  return code == "hi" || code == "ta" || code == "bn" || code == "en" || code == "es";
++}
++
++}  // namespace
++
++base::span<const IndicLanguage> IndicLanguages() {
++  return kIndicLanguages;
++}
++
++const IndicLanguage* IndicLanguageFromCode(std::string_view code) {
++  for (const IndicLanguage& language : kIndicLanguages) {
++    if (language.code == code) {
++      return &language;
++    }
++  }
++  return nullptr;
++}
++
++std::vector<TranslationDirection> PageDirectionsFor(std::string_view source_code,
++                                                    std::string_view target_code) {
++  using D = TranslationDirection;
++  if (source_code == target_code) {
++    return {};
++  }
++  std::vector<D> directions;
++  if (IndicLanguageFromCode(source_code)) {
++    directions.push_back(D::kIndicToEnglish);
++  } else if (source_code == "es") {
++    directions.push_back(D::kSpanishToEnglish);
++  } else if (source_code != "en") {
++    return {};
++  }
++  if (IndicLanguageFromCode(target_code)) {
++    directions.push_back(D::kEnglishToIndic);
++  } else if (target_code != "en") {
++    return {};
++  }
++  return directions;
++}
++
++std::optional<std::string> TranslationEngine::TranslatePage(std::string_view text,
++                                                            std::string_view source_code,
++                                                            std::string_view target_code) {
++  if (base::TrimWhitespaceASCII(text, base::TRIM_ALL).empty() ||
++      PageDirectionsFor(source_code, target_code).empty()) {
++    return std::string();
++  }
++  const std::optional<Target> captions_target = TargetFromCode(target_code);
++  if (IsCaptionsCode(source_code) && captions_target) {
++    return TranslateFrom(text, source_code, *captions_target);
++  }
++  const IndicLanguage* target = IndicLanguageFromCode(target_code);  // null: English
++  std::string english;        // the English model input for the second hop
++  if (source_code == "en") {
++    english = EnglishModelInput(text);
++  } else if (source_code == "es") {
++    std::optional<std::string> spanish = TranslateFrom(text, "es", Target::kEnglish);
++    if (!spanish || spanish->empty()) {
++      return std::nullopt;
++    }
++    english = EnglishModelInput(*spanish);
++  } else {
++    const IndicLanguage* source = IndicLanguageFromCode(source_code);
++    Direction* to_english = Get(TranslationDirection::kIndicToEnglish);
++    if (!to_english) {
++      return std::nullopt;
++    }
++    // Hindi, Tamil and Bengali keep captions' normaliser.
++    const std::optional<Language> captions_source = LanguageFromCode(source_code);
++    std::optional<std::vector<int64_t>> out_ids = to_english->Greedy(to_english->Encode(
++        source->tag, kEnglishTag,
++        captions_source ? ModelInput(text, *captions_source) : PageModelInput(text, *source)));
++    if (!out_ids) {
++      return std::nullopt;
++    }
++    english = to_english->Decode(*out_ids);
++    if (!target) {
++      return DetokenizeEnglish(english);
++    }
++  }
++  // Hindi, Tamil (its own letter mapping) and Bengali as captions write them.
++  if (const std::optional<Language> indian = LanguageFromCode(target_code)) {
++    return IntoIndian(english, *indian, nullptr, nullptr);
++  }
++  return IntoTag(english, *target);
++}
++
++std::optional<std::string> TranslationEngine::IntoTag(std::string_view model_input,
++                                                      const IndicLanguage& target) {
++  Direction* from_english = Get(TranslationDirection::kEnglishToIndic);
++  if (!from_english) {
++    return std::nullopt;
++  }
++  std::optional<std::vector<int64_t>> out =
++      from_english->Greedy(from_english->Encode(kEnglishTag, target.tag, model_input));
++  if (!out) {
++    return std::nullopt;
++  }
++  // IndicTrans2 writes every Brahmi script in Devanagari.
++  return base::UTF16ToUTF8(DetokenizeIndic(
++      ShiftBlock(base::UTF8ToUTF16(from_english->Decode(*out)), 0x0900, target.block)));
++}
++
 +}  // namespace tark_captions
 --- /dev/null
 +++ b/components/tark_captions/translation_engine.h
-@@ -0,0 +1,120 @@
+@@ -0,0 +1,151 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -9886,6 +10035,7 @@
 +#include <string_view>
 +#include <vector>
 +
++#include "base/containers/span.h"
 +#include "base/files/file_path.h"
 +#include "components/tark_captions/asr_model.h"
 +
@@ -9910,6 +10060,24 @@
 +// through English. Empty when nothing is translated (no target, the same
 +// language, a source with no model).
 +std::vector<TranslationDirection> DirectionsFor(std::string_view source_code, Target target);
++
++// Page translation (Tark for Android): the 22 Indian languages IndicTrans2
++// covers, by ISO code, with the model's language tag and the Unicode block of
++// the script IndicTrans2 unifies into Devanagari (0 when the script is not
++// a Brahmi one and the model reads and writes it as it is: Perso-Arabic,
++// Ol Chiki).
++struct IndicLanguage {
++  std::string_view code;  // "hi", "kok", "mni"...
++  std::string_view tag;   // "hin_Deva", "gom_Deva", "mni_Beng"...
++  char16_t block;         // 0x0900 Devanagari, 0x0B80 Tamil...; 0 for none
++};
++base::span<const IndicLanguage> IndicLanguages();
++// Null when `code` is not one of the 22.
++const IndicLanguage* IndicLanguageFromCode(std::string_view code);
++// DirectionsFor with codes on both sides: any of the 22, "en" or (as a
++// source) "es". Empty when nothing is translated.
++std::vector<TranslationDirection> PageDirectionsFor(std::string_view source_code,
++                                                    std::string_view target_code);
 +
 +// A translation stops after this many tokens (a caption is a few seconds).
 +inline constexpr int kMaxOutputTokens = 128;
@@ -9967,6 +10135,15 @@
 +                                           Target target,
 +                                           TranslationTrace* trace = nullptr);
 +
++  // A page's sentence in `source_code` into `target_code`
++  // (PageDirectionsFor): hi, ta, bn, en and es into en, hi, ta and bn are
++  // exactly TranslateFrom; the other Indian languages go through the same
++  // models with their own tags and scripts. "" when nothing is translated,
++  // nullopt when a model it needs is missing or fails.
++  std::optional<std::string> TranslatePage(std::string_view text,
++                                           std::string_view source_code,
++                                           std::string_view target_code);
++
 +  int LoadedDirectionsForTesting() const;
 +
 + private:
@@ -9983,6 +10160,9 @@
 +                                        std::vector<int64_t>* src_ids,
 +                                        std::vector<int64_t>* out_ids);
 +
++  // English model input into one of the 22 (its tag and script).
++  std::optional<std::string> IntoTag(std::string_view model_input, const IndicLanguage& target);
++
 +  std::unique_ptr<OrtRuntime> runtime_;
 +  std::map<TranslationDirection, std::unique_ptr<ModelSource>> sources_;
 +  std::map<TranslationDirection, std::unique_ptr<Direction>> loaded_;
@@ -9993,7 +10173,7 @@
 +#endif  // COMPONENTS_TARK_CAPTIONS_TRANSLATION_ENGINE_H_
 --- /dev/null
 +++ b/components/tark_captions/translation_engine_unittest.cc
-@@ -0,0 +1,258 @@
+@@ -0,0 +1,299 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -10248,6 +10428,47 @@
 +  EXPECT_EQ(TargetFromCode("en"), Target::kEnglish);
 +  EXPECT_EQ(TargetFromCode("ta"), Target::kTamil);
 +  EXPECT_EQ(TargetFromCode("fr"), std::nullopt);
++}
++
++// Page translation: each of the 22 Indian languages has an IndicTrans2 tag
++// and goes both ways through English.
++TEST(TranslationEngineNoRuntimeTest, EveryIndianLanguageHasATagAndDirections) {
++  using D = TranslationDirection;
++  static constexpr const char* kCodes[] = {"as", "bn",  "brx", "doi", "gu", "hi", "kn", "ks",
++                                           "kok", "mai", "ml", "mni", "mr", "ne", "or", "pa",
++                                           "sa", "sat", "sd", "ta",  "te", "ur"};
++  EXPECT_EQ(IndicLanguages().size(), 22u);
++  for (const char* code : kCodes) {
++    const IndicLanguage* language = IndicLanguageFromCode(code);
++    ASSERT_TRUE(language) << code;
++    EXPECT_EQ(language->tag.size(), 8u) << code;  // "hin_Deva"
++    EXPECT_EQ(language->tag[3], '_') << code;
++    EXPECT_EQ(PageDirectionsFor(code, "en"), (std::vector<D>{D::kIndicToEnglish})) << code;
++    EXPECT_EQ(PageDirectionsFor("en", code), (std::vector<D>{D::kEnglishToIndic})) << code;
++    EXPECT_EQ(PageDirectionsFor("es", code),
++              (std::vector<D>{D::kSpanishToEnglish, D::kEnglishToIndic}))
++        << code;
++  }
++  EXPECT_EQ(PageDirectionsFor("ml", "pa"),
++            (std::vector<D>{D::kIndicToEnglish, D::kEnglishToIndic}));
++  EXPECT_EQ(IndicLanguageFromCode("kok")->tag, "gom_Deva");
++  EXPECT_EQ(IndicLanguageFromCode("ne")->tag, "npi_Deva");
++  EXPECT_EQ(IndicLanguageFromCode("ur")->block, 0);
++  EXPECT_TRUE(PageDirectionsFor("hi", "hi").empty());
++  EXPECT_TRUE(PageDirectionsFor("fr", "en").empty());
++  EXPECT_TRUE(PageDirectionsFor("en", "fr").empty());
++  EXPECT_FALSE(IndicLanguageFromCode("fr"));
++}
++
++TEST_F(TranslationEngineTest, PageTextInCaptionsLanguagesIsTranslateFrom) {
++  for (const base::Value& v : cases_) {
++    const base::DictValue& c = v.GetDict();
++    EXPECT_EQ(engine_->TranslatePage(*c.FindString("caption"), *c.FindString("lang"), "en"),
++              engine_->TranslateFrom(*c.FindString("caption"), *c.FindString("lang"),
++                                     Target::kEnglish))
++        << *c.FindString("id");
++  }
++  EXPECT_EQ(engine_->TranslatePage("  ", "ml", "en"), std::string());
 +}
 +
 +}  // namespace
