@@ -1,38 +1,261 @@
+--- a/chrome/browser/language/android/BUILD.gn
++++ b/chrome/browser/language/android/BUILD.gn
+@@ -186,6 +186,7 @@
+     "java/src/org/chromium/chrome/browser/language/LanguageBridgeTest.java",
+     "java/src/org/chromium/chrome/browser/language/LanguageTestUtils.java",
+     "java/src/org/chromium/chrome/browser/language/settings/LanguagesManagerTest.java",
++    "java/src/org/chromium/chrome/browser/language/settings/PageTranslationSettingsTest.java",
+     "java/src/org/chromium/chrome/browser/language/settings/SelectLanguageFragmentTest.java",
+     "java/src/org/chromium/chrome/browser/translate/FakeTranslateBridgeJni.java",
+   ]
 --- a/chrome/browser/language/android/java/src/org/chromium/chrome/browser/language/settings/LanguageSettings.java
 +++ b/chrome/browser/language/android/java/src/org/chromium/chrome/browser/language/settings/LanguageSettings.java
-@@ -17,6 +17,7 @@
+@@ -15,6 +15,7 @@
+ import androidx.annotation.VisibleForTesting;
+ import androidx.preference.Preference;
  import androidx.preference.PreferenceCategory;
++import androidx.preference.PreferenceGroup;
  
  import org.chromium.base.ApkInfo;
-+import org.chromium.base.CommandLine;
  import org.chromium.base.Log;
- import org.chromium.base.supplier.MonotonicObservableSupplier;
- import org.chromium.base.supplier.ObservableSuppliers;
-@@ -199,6 +200,19 @@
-                         return getPrefService().isManagedPreference(Pref.OFFER_TRANSLATE_ENABLED);
-                     }
-                 });
-+        hideTranslateWithoutAServer();
+@@ -70,6 +71,13 @@
+     static final String ALWAYS_LANGUAGES_KEY = "translate_settings_always_languages";
+     static final String NEVER_LANGUAGES_KEY = "translate_settings_never_languages";
+ 
++    // Tark: page translation with Tark's translator on the phone (on by default; the browser
++    // registers the pref in browser_ui_prefs.cc).
++    static final String TARK_PAGE_TRANSLATION_KEY = "tark_page_translation";
++    static final String TARK_PAGE_TRANSLATION_PREF = "tark.page_translation.enabled";
++    // Google's Translate rows: the section (detailed page) or the switch (basic page).
++    static final String TRANSLATION_SETTINGS_SECTION = "translation_settings_section";
++
+     private static final String TAG = "LanguageSettings";
+ 
+     private final AppLanguagePreferenceDelegate mAppLanguageDelegate =
+@@ -94,6 +102,11 @@
+ 
+         listenForSelectedLanguages(detailed);
+ 
++        hideGoogleTranslateRows(getPreferenceScreen());
++        getPreferenceScreen()
++                .addPreference(
++                        createTarkPageTranslationSwitch(
++                                getPreferenceManager().getContext(), new ProfilePrefs()));
+         LanguagesManager.recordImpression(LanguagesManager.LanguageSettingsPageType.PAGE_MAIN);
+     }
+ 
+@@ -207,6 +220,58 @@
+         updateTarkXlitSummary();
+     }
+ 
++    /** The prefs the Page translation switch reads and writes (a fake in tests). */
++    interface TarkPrefs {
++        boolean getBoolean(String pref);
++
++        void setBoolean(String pref, boolean value);
++    }
++
++    private final class ProfilePrefs implements TarkPrefs {
++        @Override
++        public boolean getBoolean(String pref) {
++            return getPrefService().getBoolean(pref);
++        }
++
++        @Override
++        public void setBoolean(String pref, boolean value) {
++            getPrefService().setBoolean(pref, value);
++        }
 +    }
 +
 +    /**
-+     * Tark (A3): ungoogled-chromium translates only with a server the user brings
-+     * (--translate-script-url); without one, Translate's settings would offer Google Translate,
-+     * which Tark never contacts. They go, as on the Mac.
++     * Tark: Google's Translate rows (Offer to translate, the target language, always and never
++     * translate) would send pages to Google Translate, which Tark never contacts. They stay gone,
++     * with or without --translate-script-url; Tark's own Page translation switch replaces them.
 +     */
-+    private void hideTranslateWithoutAServer() {
-+        if (CommandLine.getInstance().hasSwitch("translate-script-url")) return;
-+        Preference section = findPreference("translation_settings_section");
-+        if (section == null) section = findPreference(TRANSLATE_SWITCH_KEY);
-+        if (section != null) section.setVisible(false);
-     }
++    static void hideGoogleTranslateRows(PreferenceGroup screen) {
++        for (String key : new String[] {TRANSLATION_SETTINGS_SECTION, TRANSLATE_SWITCH_KEY}) {
++            Preference row = screen.findPreference(key);
++            if (row != null) row.setVisible(false);
++        }
++    }
++
++    /**
++     * Tark: Page translation. On, pages in a language that isn't one of the person's are offered
++     * in theirs and Translate is in the menu; Tark's own model translates them on the phone.
++     */
++    static ChromeSwitchPreference createTarkPageTranslationSwitch(
++            Context context, TarkPrefs prefs) {
++        ChromeSwitchPreference pageSwitch = new ChromeSwitchPreference(context);
++        pageSwitch.setKey(TARK_PAGE_TRANSLATION_KEY);
++        // The profile's pref is the truth, not a stored copy.
++        pageSwitch.setPersistent(false);
++        pageSwitch.setTitle(R.string.tark_page_translation_title);
++        pageSwitch.setSummary(R.string.tark_page_translation_summary);
++        pageSwitch.setChecked(prefs.getBoolean(TARK_PAGE_TRANSLATION_PREF));
++        pageSwitch.setOnPreferenceChangeListener(
++                (preference, newValue) -> {
++                    prefs.setBoolean(TARK_PAGE_TRANSLATION_PREF, (boolean) newValue);
++                    return true;
++                });
++        return pageSwitch;
++    }
++
+     /** Create the old language and translate settings page. Delete once no longer used. */
+     private void createBasicPreferences() {
+         SettingsUtils.addPreferencesFromResource(this, R.xml.languages_preferences);
+--- /dev/null
++++ b/chrome/browser/language/android/java/src/org/chromium/chrome/browser/language/settings/PageTranslationSettingsTest.java
+@@ -0,0 +1,115 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++package org.chromium.chrome.browser.language.settings;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.assertTrue;
++
++import android.content.Context;
++
++import androidx.preference.Preference;
++import androidx.preference.PreferenceCategory;
++import androidx.preference.PreferenceManager;
++import androidx.preference.PreferenceScreen;
++
++import org.junit.Before;
++import org.junit.Test;
++import org.junit.runner.RunWith;
++import org.robolectric.RuntimeEnvironment;
++import org.robolectric.annotation.Config;
++
++import org.chromium.base.test.BaseRobolectricTestRunner;
++import org.chromium.chrome.browser.language.R;
++import org.chromium.components.browser_ui.settings.ChromeSwitchPreference;
++
++import java.util.HashMap;
++import java.util.Map;
++
++/** Settings › Languages › Page translation, and Google's Translate rows staying gone. */
++@RunWith(BaseRobolectricTestRunner.class)
++public class PageTranslationSettingsTest {
++    /** The profile's prefs: a pref nobody has set reads as the browser registered it. */
++    private static final class FakePrefs implements LanguageSettings.TarkPrefs {
++        // browser_ui_prefs.cc: RegisterBooleanPref("tark.page_translation.enabled", true).
++        static final boolean REGISTERED_DEFAULT = true;
++        final Map<String, Boolean> mValues = new HashMap<>();
++
++        @Override
++        public boolean getBoolean(String pref) {
++            assertEquals(LanguageSettings.TARK_PAGE_TRANSLATION_PREF, pref);
++            Boolean value = mValues.get(pref);
++            return value == null ? REGISTERED_DEFAULT : value;
++        }
++
++        @Override
++        public void setBoolean(String pref, boolean value) {
++            mValues.put(pref, value);
++        }
++    }
++
++    private Context mContext;
++    private final FakePrefs mPrefs = new FakePrefs();
++
++    @Before
++    public void setUp() {
++        mContext = RuntimeEnvironment.getApplication();
++    }
++
++    @Test
++    public void switchDefaultsOn() {
++        assertEquals("tark.page_translation.enabled", LanguageSettings.TARK_PAGE_TRANSLATION_PREF);
++        ChromeSwitchPreference pageSwitch =
++                LanguageSettings.createTarkPageTranslationSwitch(mContext, mPrefs);
++        assertTrue(pageSwitch.isChecked());
++        assertEquals(mContext.getString(R.string.tark_page_translation_title), pageSwitch.getTitle());
++        assertEquals(
++                "Translates pages on your phone with Tark's own model. Pages never leave your"
++                        + " phone.",
++                pageSwitch.getSummary().toString());
++
++        // Turning it off is stored in the profile, and it reads back off.
++        assertTrue(pageSwitch.callChangeListener(false));
++        assertFalse(mPrefs.getBoolean(LanguageSettings.TARK_PAGE_TRANSLATION_PREF));
++        assertFalse(
++                LanguageSettings.createTarkPageTranslationSwitch(mContext, mPrefs).isChecked());
++    }
++
++    @Test
++    public void googleRowsStayHidden() {
++        PreferenceManager manager = new PreferenceManager(mContext);
++        PreferenceScreen screen = manager.createPreferenceScreen(mContext);
++        // The detailed page: the section holding Offer to translate and its advanced rows.
++        PreferenceCategory section = new PreferenceCategory(mContext);
++        section.setKey(LanguageSettings.TRANSLATION_SETTINGS_SECTION);
++        screen.addPreference(section);
++        // The basic page: the switch alone.
++        ChromeSwitchPreference googleSwitch = new ChromeSwitchPreference(mContext);
++        googleSwitch.setKey(LanguageSettings.TRANSLATE_SWITCH_KEY);
++        screen.addPreference(googleSwitch);
++        Preference languages = new Preference(mContext);
++        languages.setKey(LanguageSettings.CONTENT_LANGUAGES_KEY);
++        screen.addPreference(languages);
++
++        LanguageSettings.hideGoogleTranslateRows(screen);
++        screen.addPreference(LanguageSettings.createTarkPageTranslationSwitch(mContext, mPrefs));
++
++        assertFalse(section.isVisible());
++        assertFalse(googleSwitch.isVisible());
++        assertTrue(languages.isVisible());
++        Preference pageSwitch = screen.findPreference(LanguageSettings.TARK_PAGE_TRANSLATION_KEY);
++        assertTrue(pageSwitch != null && pageSwitch.isVisible());
++    }
++
++    @Test
++    @Config(qualifiers = "hi")
++    public void hindiStringsPresent() {
++        assertEquals("पेज का अनुवाद", mContext.getString(R.string.tark_page_translation_title));
++        assertEquals(
++                "Tark के अपने मॉडल से पेजों का अनुवाद आपके फ़ोन पर ही होता है. पेज कभी आपके फ़ोन"
++                        + " से बाहर नहीं जाते.",
++                mContext.getString(R.string.tark_page_translation_summary));
++    }
++}
+--- a/chrome/browser/ui/android/strings/android_chrome_strings.grd
++++ b/chrome/browser/ui/android/strings/android_chrome_strings.grd
+@@ -882,6 +882,12 @@
+       <message name="IDS_TARK_CONNECTS_XLIT" desc="Tark: item in the list of services Tark connects to: the Indian-language suggestions' download from Tark's site, only when the person asks, with its host name.">
+         Indian-language suggestions, downloaded once when you ask (gettarka.com)
+       </message>
++      <message name="IDS_TARK_PAGE_TRANSLATION_TITLE" desc="Tark: switch in Settings > Languages: translating web pages with Tark's own translation model, on the phone.">
++        Page translation
++      </message>
++      <message name="IDS_TARK_PAGE_TRANSLATION_SUMMARY" desc="Tark: summary of the Page translation switch in Settings > Languages.">
++        Translates pages on your phone with Tark's own model. Pages never leave your phone.
++      </message>
+       <message name="IDS_TARK_XLIT_SWITCH_TITLE" desc="Tark: switch in Settings > Languages: suggestions in the person's Indian languages while typing English letters in the address bar.">
+         Indian-language suggestions
+       </message>
+--- a/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb
++++ b/chrome/browser/ui/android/strings/translations/android_chrome_strings_hi.xtb
+@@ -2153,6 +2153,8 @@
+ <translation id="854019961256078494">Wi-Fi पर डाउनलोड करें</translation>
+ <translation id="8273905181216423293">अभी डाउनलोड करें</translation>
+ <translation id="8533623660476485480">भारतीय भाषाओं के सुझाव, आपके मांगने पर एक बार डाउनलोड (gettarka.com)</translation>
++<translation id="3383365440282937201">पेज का अनुवाद</translation>
++<translation id="1662596373148207165">Tark के अपने मॉडल से पेजों का अनुवाद आपके फ़ोन पर ही होता है. पेज कभी आपके फ़ोन से बाहर नहीं जाते.</translation>
+ <translation id="6612875707773743625">भारतीय भाषाओं में सुझाव</translation>
+ <translation id="8304126055697421220">Wi-Fi का इंतज़ार है</translation>
+ <translation id="9054517922063697959">डाउनलोड हो गए: <ph name="LANGUAGES"/></translation>
+--- a/chrome/browser/ui/browser_ui_prefs.cc
++++ b/chrome/browser/ui/browser_ui_prefs.cc
+@@ -199,6 +199,9 @@
  
-     /**
-@@ -220,6 +234,7 @@
-         languageListPref.initialize(this, getProfile(), getPrefService());
+ #if BUILDFLAG(IS_ANDROID)
+   registry->RegisterBooleanPref(prefs::kAllowFileSelectionDialogs, true);
++  // Tark: Settings › Languages › Page translation (Tark's translator on the
++  // phone; LanguageSettings.TARK_PAGE_TRANSLATION_PREF).
++  registry->RegisterBooleanPref("tark.page_translation.enabled", true);
+ #endif
  
-         setupTranslateSection(languageListPref);
-+        hideTranslateWithoutAServer();
-     }
- 
-     /** Setup the App Language section with a title and preference to choose the app language. */
+   registry->RegisterBooleanPref(prefs::kEnterpriseHardwarePlatformAPIEnabled,

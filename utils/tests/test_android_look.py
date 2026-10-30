@@ -522,26 +522,25 @@ class TestTarkHelp(unittest.TestCase):
 
 
 class TestNoTranslateSettings(unittest.TestCase):
-    """A3 (the user: fix the Google Translate row): ungoogled-chromium turns
-    Translate off without --translate-script-url, yet Languages still showed
-    "Offer to send pages in other languages to Google Translate". As on the
-    Mac (removals/translate.patch), its settings show only with a server."""
+    """A3 (the user: fix the Google Translate row): Languages showed "Offer to
+    send pages in other languages to Google Translate". Google's Translate
+    rows stay gone, with or without --translate-script-url; page translation
+    (Task 6) adds Tark's own Page translation switch in their place."""
 
     def setUp(self):
         self.patch = (ANDROID / 'patches' / 'translate-settings-off.patch').read_text()
 
-    def test_hidden_without_a_translate_server(self):
+    def test_google_rows_hidden_whatever_the_switches(self):
         self.assertIn('+++ b/chrome/browser/language/android/java/src/org/chromium/chrome/browser/'
                       'language/settings/LanguageSettings.java', self.patch)
-        self.assertIn('+        if (CommandLine.getInstance().hasSwitch("translate-script-url")) return;',
-                      self.patch)
-        self.assertIn('+import org.chromium.base.CommandLine;', self.patch)
+        self.assertNotIn('translate-script-url")', self.patch)
+        self.assertNotIn('+import org.chromium.base.CommandLine;', self.patch)
 
     def test_both_pages(self):
         # The detailed page's whole section, and the basic page's switch.
-        self.assertIn('findPreference("translation_settings_section")', self.patch)
-        self.assertIn('findPreference(TRANSLATE_SWITCH_KEY)', self.patch)
-        self.assertEqual(self.patch.count('+        hideTranslateWithoutAServer();'), 2)
+        self.assertIn('TRANSLATION_SETTINGS_SECTION = "translation_settings_section"', self.patch)
+        self.assertIn('{TRANSLATION_SETTINGS_SECTION, TRANSLATE_SWITCH_KEY}', self.patch)
+        self.assertEqual(self.patch.count('+        hideGoogleTranslateRows(getPreferenceScreen());'), 1)
 
     def test_in_the_series_after_the_languages_row(self):
         series = (ANDROID / 'patches' / 'series').read_text().split()
