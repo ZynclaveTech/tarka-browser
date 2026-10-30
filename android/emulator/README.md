@@ -22,19 +22,16 @@ off, automatic time off); an idle capture of the same emulator saved as
 
 ## Page translation's browser tests
 
-`tark-build.sh` builds `android_browsertests` and uploads
-`AndroidBrowserTests.apk` beside the APK. On `emulator-5554` (never the phone):
+`TarkPageTranslateBrowserTest` (page-translate-wiring.patch) stays in the
+patches but is not built: `android_browsertests` needs `chrome/test/base`,
+which does not compile without safe_browsing, and ungoogled removes it. Its
+behaviours are checked by hand on `emulator-5554` (never the phone) with the
+build's APK and local pages served over `adb reverse`:
 
-    adb -s emulator-5554 install -r AndroidBrowserTests.apk
-    adb -s emulator-5554 shell am instrument -w \
-      -e org.chromium.native_test.NativeTest.CommandLineFlags \
-      "--gtest_filter=TarkPageTranslate*" \
-      org.chromium.android_browsertests_apk/org.chromium.build.gtest_apk.NativeTestInstrumentationTestRunner
-
-Filter `--gtest_filter=TarkPageTranslate*` (two fixtures). All must run and
-pass: TranslatesLocalHindiPageInPlace, ShowOriginalRestoresWithoutReload,
-LoadMoreTextTranslated, NoScriptRequestOnNetwork (in both fixtures, the second
-with --translate-script-url), HiddenTabDefersThenResumes,
-UnparseableBatchStillFinishes, NotInjectedBeforeTap. The instrumentation's
-package and runner names are from the build's AndroidManifest.xml; check them
-there if `am instrument` can't find the runner.
+- a Hindi page: the offer shows, and Translate translates the page in place;
+- Show original restores the text without a reload;
+- text added after "finished" (a "load more" button) is translated too;
+- a Private tab: translation works and nothing is stored (no download card);
+- Settings › Languages › Page translation off: no offer and no menu Translate;
+- the net log over load, translate and undo: `android/check_netlog.sh` finds no
+  translate script, Google or translate host.
