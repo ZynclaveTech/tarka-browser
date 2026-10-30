@@ -70,7 +70,12 @@ var tarkTranslate = (function() {
       front = []; back = []; frontHead = 0; backHead = 0;
       const vp = viewport();
       for (const item of rest) {
-        if (live(item)) (B.visible(item.node, vp) ? front : back).push(item);
+        if (live(item)) {
+          (B.visible(item.node, vp) ? front : back).push(item);
+        } else {
+          queuedCount--;
+          queuedChars -= item.text.length;
+        }
       }
       dirty = false;
     }
@@ -94,7 +99,10 @@ var tarkTranslate = (function() {
           finishIfDrained();
           return;
         }
-        push(step.value, B.visible(step.value.node, vp));
+        // The observer may have translated this node already.
+        if (!batcher.owned(step.value.node)) {
+          push(step.value, B.visible(step.value.node, vp));
+        }
         if (++n >= CHUNK_NODES || now() - start >= CHUNK_MS) break;
       }
       win.setTimeout(() => {

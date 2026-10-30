@@ -276,3 +276,53 @@ test('openShadowRootsWalkedAndObserved', async () => {
   await tick();
   assert.deepEqual(t.takeBatch().texts, ['later']);
 });
+
+// Fix round 2.
+
+test('scrollWithDeadItemsStillFinishes', async () => {
+  const {win, t, progress} = translator('<p>a</p><p>b</p><p>c</p>');
+  win.document.querySelector('p').remove();  // a queued item dies
+  await tick();
+  win.dispatchEvent(new win.Event('scroll'));
+  const batch = t.takeBatch();
+  assert.deepEqual(batch.texts, ['b', 'c']);
+  t.onResult(batch.id, ['B', 'C']);
+  assert.deepEqual(progress.at(-1), [100, true, 0]);
+});
+
+test('walkDoesNotRequeueObserverTranslatedText', async () => {
+  const n = 3000;
+  const win = dom(Array.from({length: n}, (_, i) => `<p>s${i}</p>`).join(''));
+  const t = T.create(win);
+  t.service.translatePage('hi', 'en', () => {});
+  const first = t.takeBatch();
+  t.onResult(first.id, first.texts.map(s => s.toUpperCase()));  // caches s0..
+  // Before the walk reaches it, the page sets the last node to known text.
+  assert.ok(t.isCollecting());
+  const p = win.document.body.lastElementChild;
+  p.firstChild.nodeValue = 's0';
+  await Promise.resolve();  // the observer runs, the walk has not moved on
+  assert.equal(p.textContent, 'S0');  // from the cache
+  while (t.isCollecting()) await tick();
+  let batch, texts = [];
+  while ((batch = t.takeBatch())) {
+    texts.push(...batch.texts);
+    t.onResult(batch.id, batch.texts);
+  }
+  assert.equal(texts.filter(s => /^s0$/i.test(s)).length, 0);
+  assert.equal(texts.length, n - first.texts.length - 1);
+});
+
+test('cacheHitsDoNotUseTheModelCap', async () => {
+  const {win, t} = translator('<p>one</p>');
+  drain(t);
+  const node = win.document.querySelector('p').firstChild;
+  for (let i = 0; i < 3; i++) {  // the page puts its original back 3 times
+    node.nodeValue = 'one';
+    await tick();
+  }
+  assert.equal(node.nodeValue, 'ONE');
+  node.nodeValue = 'two';  // new text still gets a model call
+  await tick();
+  assert.deepEqual(t.takeBatch().texts, ['two']);
+});

@@ -115,7 +115,8 @@ var tarkBatcher = (function() {
     const originals = new Map();  // Text -> the page's own text
     const written = new Map();    // Text -> what Tark last wrote there
     const cache = new Map();      // source text -> its translation
-    const rewrites = new WeakMap();  // Text or parent -> re-translations
+    const rewrites = new WeakMap();  // Text or parent -> model re-translations
+    const cacheWrites = new WeakMap();  // Text or parent -> cache rewrites
     let observer = null;
 
     // Yields the text items under root in document order (open shadow
@@ -198,17 +199,34 @@ var tarkBatcher = (function() {
     // Tark's own writes are not reported, and a node (or, for text nodes the
     // page swaps in, their parent) is re-translated at most
     // MAX_RETRANSLATIONS times, then left as the page wrote it.
+    // Model calls and cache rewrites are capped separately: a page that
+    // keeps putting its original back stops after MAX_RETRANSLATIONS cache
+    // writes without using up its model re-translations, and vice versa.
     function changed(items, key, onItems) {
       if (!items.length) return;
-      const n = rewrites.get(key) || 0;
-      if (n >= MAX_RETRANSLATIONS) return;
-      rewrites.set(key, n + 1);
-      const fresh = [];
+      const hits = [], fresh = [];
       for (const item of items) {
-        if (cache.has(item.text)) remember(item, cache.get(item.text));
-        else fresh.push(item);
+        (cache.has(item.text) ? hits : fresh).push(item);
       }
-      if (fresh.length) onItems(fresh);
+      if (hits.length) {
+        const n = cacheWrites.get(key) || 0;
+        if (n < MAX_RETRANSLATIONS) {
+          cacheWrites.set(key, n + 1);
+          for (const item of hits) remember(item, cache.get(item.text));
+        }
+      }
+      if (fresh.length) {
+        const n = rewrites.get(key) || 0;
+        if (n < MAX_RETRANSLATIONS) {
+          rewrites.set(key, n + 1);
+          onItems(fresh);
+        }
+      }
+    }
+
+    // True when the node shows what Tark wrote there.
+    function owned(node) {
+      return written.has(node) && written.get(node) === node.nodeValue;
     }
 
     function observe(root, onItems) {
@@ -257,7 +275,7 @@ var tarkBatcher = (function() {
       }
     }
 
-    return {walk, collect, apply, revert, observe, disconnect};
+    return {walk, owned, collect, apply, revert, observe, disconnect};
   }
 
   return {create, batches, order, estimate, visible, MAX_RETRANSLATIONS};
