@@ -107,6 +107,23 @@ class TestUiPatch(unittest.TestCase):
         self.assertIn('Java_TarkPageTranslationCard_readyOrShowCard', client)
         self.assertIn('IsOffTheRecord()', client)
 
+    def test_directions_offer_menu_and_fallback(self):
+        header = added(section(self.patch, 'components/translate/core/browser/tark_translate_directions.h'))
+        kindian = header[header.index('kIndian[] = {'):]
+        self.assertEqual(re.findall(r'"([a-z]{2,3})"', kindian[:kindian.index('};')]), INDIAN)
+        manager = added(section(self.patch, 'components/translate/core/browser/translate_manager.cc'))
+        self.assertIn('TarkTargetFor(original_source_lang, target_lang)', manager)
+        self.assertIn('TarkSupportsDirection(page_language_code, target_lang)', manager)
+        message = added(section(self.patch, 'components/translate/content/android/translate_message.cc'))
+        self.assertEqual(message.count('TarkSupportsDirection('), 2)
+        # The blocked-language branch keeps upstream's label.
+        self.assertNotIn('-        TriggerDecision::kDisabledNeverTranslateLanguage);', self.patch)
+
+    def test_card_stays_ten_minutes(self):
+        card = added(section(self.patch, 'chrome/browser/tark_captions_android/android/java/src/org/chromium/chrome/browser/tark_captions/TarkPageTranslationCard.java'))
+        self.assertIn('DISMISSAL_DURATION_MS = 600_000L', card)
+        self.assertNotIn('showOffer', added(self.patch))
+
     def test_owner_page_translation(self):
         java = added(section(self.patch, 'chrome/browser/tark_captions_android/android/java/src/org/chromium/chrome/browser/tark_captions/TarkCaptionsBridge.java'))
         self.assertIn('OWNER_PAGE_TRANSLATION = 2', java)

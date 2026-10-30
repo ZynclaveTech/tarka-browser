@@ -81,7 +81,7 @@
  }
 --- /dev/null
 +++ b/chrome/browser/tark_captions_android/android/java/src/org/chromium/chrome/browser/tark_captions/PageTranslationOfferTest.java
-@@ -0,0 +1,312 @@
+@@ -0,0 +1,351 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -169,6 +169,8 @@
 +    /** The card as drawn: its text, or nothing. */
 +    private static final class FakeSurface implements TarkPageTranslationCard.Surface {
 +        boolean mShown;
++        int mShows;
++        int mUpdates;
 +        int mDismissals;
 +        String mTitle = "";
 +        String mLine = "";
@@ -178,6 +180,16 @@
 +        public void show(
 +                TarkPageTranslationCard card, String title, String line, @Nullable String action) {
 +            mShown = true;
++            mShows++;
++            mTitle = title;
++            mLine = line;
++            mAction = action;
++        }
++
++        @Override
++        public void update(String title, String line, @Nullable String action) {
++            assertTrue("updated while not showing", mShown);
++            mUpdates++;
 +            mTitle = title;
 +            mLine = line;
 +            mAction = action;
@@ -214,18 +226,45 @@
 +                target);
 +    }
 +
++    /**
++     * The menu's half (TranslateUtils.canTranslateCurrentTab); the offer's, and the real pref
++     * through translate_manager.cc, are TarkPageTranslateBrowserTest.SwitchOffHidesOfferAndMenu.
++     */
 +    @Test
 +    public void switchOffHidesOfferAndMenu() {
-+        List<String> english = Collections.singletonList("en-US");
-+        assertTrue(TarkPageTranslationOffer.showOffer(true, "hi", english));
-+        assertFalse(TarkPageTranslationOffer.showOffer(false, "hi", english));
 +        assertTrue(TarkPageTranslationOffer.showMenu(true, true));
 +        assertFalse(TarkPageTranslationOffer.showMenu(false, true));
 +        assertFalse(TarkPageTranslationOffer.showMenu(true, false));
-+        // Never one of the person's own languages, nor one Tark can't translate.
-+        assertFalse(TarkPageTranslationOffer.showOffer(true, "hi-IN", Arrays.asList("en", "hi")));
-+        assertFalse(TarkPageTranslationOffer.showOffer(true, "fr", english));
 +        assertEquals("tark.page_translation.enabled", TarkPageTranslationOffer.PREF);
++    }
++
++    @Test
++    public void cardStaysForWholeDownloadAndUpdatesInPlace() {
++        // Ten minutes, in the milliseconds the message wants (not 600 ms or 10 s).
++        assertEquals(600_000L, TarkPageTranslationCard.DISMISSAL_DURATION_MS);
++        mDownloads.mOnWifi = true;
++        TarkPageTranslationCard card = card(false, "hi", "en");
++        assertFalse(card.onTranslateTapped());
++        assertEquals(1, mSurface.mShows);
++
++        for (long bytes = 10_000_000L; bytes < INDIC_EN_BYTES; bytes += 10_000_000L) {
++            mDownloads.change("tr_indic_en", TarkCaptionsBridge.UNIT_DOWNLOADING, bytes);
++        }
++        // Every tick changed the one card; none put up another.
++        assertEquals(1, mSurface.mShows);
++        assertEquals(22, mSurface.mUpdates);
++        assertTrue(mSurface.mLine.endsWith("% · On Wi-Fi · stays on this phone"));
++
++        // Its timer took it down: further ticks don't bring it back...
++        mSurface.mShown = false;
++        card.onDismissed(/* byTimer= */ true);
++        mDownloads.change("tr_indic_en", TarkCaptionsBridge.UNIT_DOWNLOADING, 220_000_000L);
++        assertEquals(1, mSurface.mShows);
++        // ...a tap does, and the download finishing still translates.
++        assertFalse(card.onTranslateTapped());
++        assertEquals(2, mSurface.mShows);
++        mDownloads.change("tr_indic_en", TarkCaptionsBridge.UNIT_READY, INDIC_EN_BYTES);
++        assertEquals(Collections.singletonList("hi>en"), mTranslations);
 +    }
 +
 +    @Test
@@ -406,7 +445,7 @@
      public static final String LANGUAGE_ID_UNIT = "language_id";
 --- /dev/null
 +++ b/chrome/browser/tark_captions_android/android/java/src/org/chromium/chrome/browser/tark_captions/TarkPageTranslationCard.java
-@@ -0,0 +1,385 @@
+@@ -0,0 +1,425 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -437,6 +476,7 @@
 +import org.chromium.content_public.browser.WebContents;
 +import org.chromium.ui.modelutil.PropertyModel;
 +
++import java.lang.ref.WeakReference;
 +import java.text.NumberFormat;
 +import java.util.List;
 +import java.util.Map;
@@ -468,8 +508,11 @@
 +
 +    /** Where the card is drawn (a message); a fake in tests. */
 +    public interface Surface {
-+        /** Shows the card, or changes it. The action is null when there is no button. */
++        /** Shows the card (once). The action is null when there is no button. */
 +        void show(TarkPageTranslationCard card, String title, String line, @Nullable String action);
++
++        /** Changes the card while it shows, in place (each download tick). */
++        void update(String title, String line, @Nullable String action);
 +
 +        void dismiss();
 +    }
@@ -478,6 +521,12 @@
 +    public interface Translator {
 +        void translate(String source, String target);
 +    }
++
++    /**
++     * How long the message stays up (MessageBannerProperties.DISMISSAL_DURATION is in
++     * milliseconds): long enough for a download on Wi-Fi; it goes when the models are there.
++     */
++    static final long DISMISSAL_DURATION_MS = 600_000L;
 +
 +    private static final Map<WebContents, TarkPageTranslationCard> sCards = new WeakHashMap<>();
 +
@@ -490,6 +539,9 @@
 +    private final String mTarget;
 +    private final List<String> mUnits;
 +    private boolean mWaiting;
++    // The card is up: later changes update it in place. Gone (its timer), it isn't shown again.
++    private boolean mShowing;
++    private boolean mShownOnce;
 +
 +    @VisibleForTesting
 +    public TarkPageTranslationCard(
@@ -532,6 +584,8 @@
 +            mWaiting = true;
 +            mDownloads.addListener(this);
 +        }
++        // A tap puts the card up again if its timer took it down.
++        if (!mShowing) mShownOnce = false;
 +        render();
 +        return false;
 +    }
@@ -546,6 +600,7 @@
 +        if (!mWaiting || !mUnits.contains(unit)) return;
 +        if (allReady()) {
 +            stopWaiting();
++            mShowing = false;
 +            mSurface.dismiss();
 +            mTranslator.translate(mSource, mTarget);
 +            return;
@@ -569,9 +624,12 @@
 +
 +    /**
 +     * The card went. By its timer the download goes on and the page still translates when it
-+     * finishes; swiped away, closed or a new page, it doesn't (the download itself goes on).
++     * finishes (the card isn't put up again); swiped away, closed or a new page, it doesn't (the
++     * download itself goes on). A Private tab waits the same way: it starts no download, but if
++     * a regular tab gets the models meanwhile, the Private page translates then.
 +     */
 +    public void onDismissed(boolean byTimer) {
++        mShowing = false;
 +        if (!byTimer) stopWaiting();
 +    }
 +
@@ -646,7 +704,13 @@
 +                    break;
 +            }
 +        }
-+        mSurface.show(this, title, line, action);
++        if (mShowing) {
++            mSurface.update(title, line, action);
++        } else if (!mShownOnce) {
++            mShowing = true;
++            mShownOnce = true;
++            mSurface.show(this, title, line, action);
++        }
 +    }
 +
 +    /** Asked by the browser before each translation. True: translate now. */
@@ -670,18 +734,29 @@
 +                            ContextUtils.getApplicationContext(),
 +                            new BridgeDownloads(),
 +                            new MessageSurface(webContents),
-+                            (from, to) -> {
-+                                if (!webContents.isDestroyed()) {
-+                                    TarkPageTranslationCardJni.get()
-+                                            .translate(webContents, from, to);
-+                                }
-+                            },
++                            new TabTranslator(webContents),
 +                            offTheRecord,
 +                            source,
 +                            target);
 +            sCards.put(webContents, card);
 +        }
 +        return card.onTranslateTapped();
++    }
++
++    /** The card holds its tab weakly, so the per-tab map (weak keys) lets go of a closed tab. */
++    private static final class TabTranslator implements Translator {
++        private final WeakReference<WebContents> mWebContents;
++
++        TabTranslator(WebContents webContents) {
++            mWebContents = new WeakReference<>(webContents);
++        }
++
++        @Override
++        public void translate(String source, String target) {
++            WebContents webContents = mWebContents.get();
++            if (webContents == null || webContents.isDestroyed()) return;
++            TarkPageTranslationCardJni.get().translate(webContents, source, target);
++        }
 +    }
 +
 +    private static final class BridgeDownloads implements Downloads {
@@ -708,24 +783,25 @@
 +
 +    /** The card as a message over the tab, like Translate's own. */
 +    private static final class MessageSurface implements Surface {
-+        // Long enough for a download on Wi-Fi; the card goes when the models are there.
-+        private static final int DISMISSAL_DURATION_SECONDS = 600;
-+        private final WebContents mWebContents;
++        private final WeakReference<WebContents> mWebContents;
 +        private @Nullable PropertyModel mModel;
 +        private @Nullable MessageDispatcher mDispatcher;
 +
 +        MessageSurface(WebContents webContents) {
-+            mWebContents = webContents;
++            mWebContents = new WeakReference<>(webContents);
 +        }
 +
 +        @Override
 +        public void show(
 +                TarkPageTranslationCard card, String title, String line, @Nullable String action) {
 +            if (mModel == null) {
-+                if (mWebContents.isDestroyed() || mWebContents.getTopLevelNativeWindow() == null) {
++                WebContents webContents = mWebContents.get();
++                if (webContents == null
++                        || webContents.isDestroyed()
++                        || webContents.getTopLevelNativeWindow() == null) {
 +                    return;
 +                }
-+                mDispatcher = MessageDispatcherProvider.from(mWebContents.getTopLevelNativeWindow());
++                mDispatcher = MessageDispatcherProvider.from(webContents.getTopLevelNativeWindow());
 +                if (mDispatcher == null) return;
 +                mModel =
 +                        new PropertyModel.Builder(MessageBannerProperties.ALL_KEYS)
@@ -740,7 +816,7 @@
 +                                        MessageBannerProperties.TINT_NONE)
 +                                .with(
 +                                        MessageBannerProperties.DISMISSAL_DURATION,
-+                                        DISMISSAL_DURATION_SECONDS)
++                                        DISMISSAL_DURATION_MS)
 +                                .with(
 +                                        MessageBannerProperties.ON_PRIMARY_ACTION,
 +                                        () -> {
@@ -757,9 +833,12 @@
 +                set(title, line, action);
 +                // Over Translate's own message, which stays at "Translate page?".
 +                mDispatcher.enqueueMessage(
-+                        mModel, mWebContents, MessageScopeType.NAVIGATION, /* highPriority= */ true);
-+                return;
++                        mModel, webContents, MessageScopeType.NAVIGATION, /* highPriority= */ true);
 +            }
++        }
++
++        @Override
++        public void update(String title, String line, @Nullable String action) {
 +            set(title, line, action);
 +        }
 +
@@ -794,7 +873,7 @@
 +}
 --- /dev/null
 +++ b/chrome/browser/tark_captions_android/android/java/src/org/chromium/chrome/browser/tark_captions/TarkPageTranslationOffer.java
-@@ -0,0 +1,106 @@
+@@ -0,0 +1,88 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -805,7 +884,6 @@
 +
 +import java.util.ArrayList;
 +import java.util.Arrays;
-+import java.util.Collection;
 +import java.util.Collections;
 +import java.util.List;
 +import java.util.Locale;
@@ -814,8 +892,10 @@
 + * Tark for Android's page translation: when Translate is offered or in the menu, and which
 + * languages it translates between. The translator is Tark's own on the phone (the captions
 + * process): the 22 languages of India and English both ways, Indian ↔ Indian through English,
-+ * and Spanish into English. Translate's language list in the browser
-+ * (translate_language_list.cc) and the captions process (PageDirectionsFor) agree with this.
++ * and Spanish into English. Translate's language list (translate_language_list.cc), its
++ * directions (tark_translate_directions.h: the offer, its target menu, the English fallback) and
++ * the captions process (PageDirectionsFor) agree with this. The offer itself is the browser's
++ * (translate_manager.cc), off with the pref.
 + */
 +@NullMarked
 +public final class TarkPageTranslationOffer {
@@ -839,11 +919,6 @@
 +        String lower = language.toLowerCase(Locale.ROOT).replace('_', '-');
 +        int dash = lower.indexOf('-');
 +        return dash < 0 ? lower : lower.substring(0, dash);
-+    }
-+
-+    public static boolean isSupportedSource(String language) {
-+        String code = base(language);
-+        return code.equals(ENGLISH) || code.equals(SPANISH) || INDIAN.contains(code);
 +    }
 +
 +    /** What a page in this language can be translated into, English first. */
@@ -882,20 +957,6 @@
 +        return units;
 +    }
 +
-+    /**
-+     * Whether a page is offered by itself: Page translation is on, Tark translates its language,
-+     * and it isn't one of the person's languages (Accept-Languages, the app's language).
-+     */
-+    public static boolean showOffer(
-+            boolean enabled, String pageLanguage, Collection<String> personLanguages) {
-+        if (!enabled || !isSupportedSource(pageLanguage)) return false;
-+        String page = base(pageLanguage);
-+        for (String language : personLanguages) {
-+            if (base(language).equals(page)) return false;
-+        }
-+        return true;
-+    }
-+
 +    /** Whether the menu has Translate: Page translation is on and the tab can be translated. */
 +    public static boolean showMenu(boolean enabled, boolean canManuallyTranslate) {
 +        return enabled && canManuallyTranslate;
@@ -916,6 +977,109 @@
    return owner == 1 ? Owner::kVoice : Owner::kCaptions;
  }
  
+--- a/chrome/browser/tark_captions_android/tark_page_translate_browsertest.cc
++++ b/chrome/browser/tark_captions_android/tark_page_translate_browsertest.cc
+@@ -27,7 +27,10 @@
+ #include "chrome/common/chrome_isolated_world_ids.h"
+ #include "chrome/test/base/chrome_test_utils.h"
+ #include "chrome/test/base/platform_browser_test.h"
++#include "components/prefs/pref_service.h"
++#include "components/translate/core/browser/tark_translate_directions.h"
+ #include "components/translate/core/browser/translate_download_manager.h"
++#include "components/user_prefs/user_prefs.h"
+ #include "components/translate/core/browser/translate_script.h"
+ #include "components/translate/core/common/translate_switches.h"
+ #include "components/translate/core/browser/language_state.h"
+@@ -92,10 +95,14 @@
+     ASSERT_TRUE(embedded_test_server()->Start());
+     TarkPageTranslateHost::SetTranslatorForTesting(base::BindRepeating(
+         &TarkPageTranslateBrowserTest::FakeTranslate, base::Unretained(this)));
++    // The models count as on the phone (page-translate-ui.patch's download
++    // card is TarkPageTranslationCard's, tested by Robolectric).
++    ChromeTranslateClient::SetTarkReadyForTesting(true);
+   }
+ 
+   void TearDownOnMainThread() override {
+     TarkPageTranslateHost::SetTranslatorForTesting({});
++    ChromeTranslateClient::SetTarkReadyForTesting(std::nullopt);
+     interceptor_.reset();
+     PlatformBrowserTest::TearDownOnMainThread();
+   }
+@@ -373,5 +380,74 @@
+   EXPECT_GT(batches_, 0);
+ }
+ 
++// Settings › Languages › Page translation off: no offer, no menu Translate
++// (translate_manager.cc's TarkPageTranslationEnabled); on, both.
++IN_PROC_BROWSER_TEST_F(TarkPageTranslateBrowserTest,
++                       SwitchOffHidesOfferAndMenu) {
++  PrefService* prefs = user_prefs::UserPrefs::Get(
++      web_contents()->GetBrowserContext());
++  ASSERT_TRUE(prefs->GetBoolean("tark.page_translation.enabled"));
++  LoadHindiPage();
++  ASSERT_TRUE(base::test::RunUntil(
++      [&] { return manager()->GetLanguageState()->translate_enabled(); }));
++  EXPECT_TRUE(manager()->CanManuallyTranslate(/*menu_logging=*/false));
++
++  prefs->SetBoolean("tark.page_translation.enabled", false);
++  LoadHindiPage();
++  WaitSeconds(1);
++  EXPECT_FALSE(manager()->GetLanguageState()->translate_enabled());
++  EXPECT_FALSE(manager()->CanManuallyTranslate(/*menu_logging=*/false));
++  prefs->SetBoolean("tark.page_translation.enabled", true);
++}
++
++// Hindi → Spanish isn't a direction Tark has: the page is translated into
++// English, never a tap that does nothing.
++IN_PROC_BROWSER_TEST_F(TarkPageTranslateBrowserTest,
++                       UnsupportedDefaultTargetFallsBackToEnglish) {
++  EXPECT_EQ("en", translate::TarkTargetFor("hi", "es"));
++  EXPECT_EQ("ta", translate::TarkTargetFor("hi", "ta"));
++  EXPECT_EQ("en", translate::TarkTargetFor("es", "hi"));
++  // An English page has no English fallback: no offer.
++  EXPECT_EQ("es", translate::TarkTargetFor("en", "es"));
++  EXPECT_FALSE(translate::TarkSupportsDirection("en", "es"));
++
++  LoadHindiPage();
++  const std::string a = Text("a");
++  manager()->TranslatePage("hi", "es", /*triggered_from_menu=*/true);
++  EXPECT_TRUE(WaitForText("a", Fake(a)));
++  EXPECT_EQ("en", last_target_);
++  ASSERT_TRUE(base::test::RunUntil(
++      [&] { return manager()->GetLanguageState()->IsPageTranslated(); }));
++  EXPECT_EQ("en", manager()->GetLanguageState()->current_language());
++}
++
++// The target menu (TranslateMessage::ConstructLanguagePickerMenu) keeps only
++// the directions Tark has from the page's language, out of Translate's list.
++IN_PROC_BROWSER_TEST_F(TarkPageTranslateBrowserTest,
++                       MenuTargetsFilteredPerSource) {
++  std::vector<std::string> languages;
++  translate::TranslateDownloadManager::GetSupportedLanguages(
++      /*translate_allowed=*/false, &languages);
++  ASSERT_EQ(24u, languages.size());
++  auto targets = [&](const std::string& source) {
++    std::vector<std::string> kept;
++    for (const std::string& code : languages) {
++      if (translate::TarkSupportsDirection(source, code)) {
++        kept.push_back(code);
++      }
++    }
++    return kept;
++  };
++  EXPECT_EQ(std::vector<std::string>{"en"}, targets("es"));
++  const std::vector<std::string> from_hindi = targets("hi");
++  EXPECT_EQ(22u, from_hindi.size());
++  EXPECT_TRUE(base::Contains(from_hindi, "en"));
++  EXPECT_FALSE(base::Contains(from_hindi, "es"));
++  EXPECT_FALSE(base::Contains(from_hindi, "hi"));
++  const std::vector<std::string> from_english = targets("en");
++  EXPECT_EQ(22u, from_english.size());
++  EXPECT_FALSE(base::Contains(from_english, "es"));
++}
++
+ }  // namespace
+ }  // namespace tark_captions
 --- a/chrome/browser/translate/BUILD.gn
 +++ b/chrome/browser/translate/BUILD.gn
 @@ -69,6 +69,7 @@
@@ -938,16 +1102,31 @@
  #include "chrome/browser/translate/android/auto_translate_snackbar_controller.h"
  #include "components/translate/content/android/translate_message.h"
  #include "content/public/browser/page.h"
-@@ -402,6 +404,52 @@
+@@ -402,6 +404,67 @@
    return TranslateService::IsTranslatableURL(url);
  }
  
 +#if BUILDFLAG(IS_ANDROID)
++namespace {
++std::optional<bool>& TarkReadyForTesting() {
++  static std::optional<bool> ready;
++  return ready;
++}
++}  // namespace
++
++// static
++void ChromeTranslateClient::SetTarkReadyForTesting(std::optional<bool> ready) {
++  TarkReadyForTesting() = ready;
++}
++
 +bool ChromeTranslateClient::TarkReadyToTranslate(
 +    const std::string& source_language,
 +    const std::string& target_language) {
 +  if (!web_contents()) {
 +    return false;
++  }
++  if (TarkReadyForTesting().has_value()) {
++    return *TarkReadyForTesting();
 +  }
 +  return tark_captions::Java_TarkPageTranslationCard_readyOrShowCard(
 +      base::android::AttachCurrentThread(),
@@ -993,7 +1172,15 @@
    std::string target_language = GetLanguageState().current_language();
 --- a/chrome/browser/translate/chrome_translate_client.h
 +++ b/chrome/browser/translate/chrome_translate_client.h
-@@ -125,6 +125,12 @@
+@@ -6,6 +6,7 @@
+ #define CHROME_BROWSER_TRANSLATE_CHROME_TRANSLATE_CLIENT_H_
+ 
+ #include <memory>
++#include <optional>
+ #include <string>
+ 
+ #include "base/functional/callback_forward.h"
+@@ -125,6 +126,15 @@
                         translate::TranslateErrors error_type,
                         bool triggered_from_menu) override;
    bool IsTranslatableURL(const GURL& url) override;
@@ -1002,6 +1189,9 @@
 +  // shows (TarkPageTranslationCard.java) and translates once they are.
 +  bool TarkReadyToTranslate(const std::string& source_language,
 +                            const std::string& target_language) override;
++  // Tests: every direction's models count as on the phone (true), or as
++  // missing (false), with no card; nullopt asks the card as in the product.
++  static void SetTarkReadyForTesting(std::optional<bool> ready);
 +#endif
    void TriggerPdfTranslation() override;
    void RevertPdfTranslation() override;
@@ -1028,6 +1218,116 @@
  <translation id="8719712412643450199">अनुवाद: <ph name="DIRECTION" /></translation>
  <translation id="195340938105802143">भारतीय भाषाएँ → अंग्रेज़ी</translation>
  <translation id="7368609417442888023">अंग्रेज़ी → भारतीय भाषाएँ</translation>
+--- a/components/translate/content/android/translate_message.cc
++++ b/components/translate/content/android/translate_message.cc
+@@ -24,6 +24,7 @@
+ #include "components/messages/android/message_enums.h"
+ #include "components/strings/grit/components_strings.h"
+ #include "components/translate/core/browser/language_state.h"
++#include "components/translate/core/browser/tark_translate_directions.h"
+ #include "components/translate/core/browser/translate_download_manager.h"
+ #include "components/translate/core/browser/translate_metrics_logger.h"
+ #include "components/translate/core/browser/translate_ui_delegate.h"
+@@ -650,6 +651,11 @@
+     if (std::ranges::contains(skip_language_codes, content_language_code)) {
+       continue;
+     }
++    if (overflow_menu_item_id == OverflowMenuItemId::kChangeTargetLanguage &&
++        !TarkSupportsDirection(ui_languages_manager_->GetSourceLanguageCode(),
++                               content_language_code)) {
++      continue;
++    }
+ 
+     titles.emplace_back(l10n_util::GetDisplayNameForLocale(
+         content_language_code,
+@@ -672,12 +678,18 @@
+     language_codes.emplace_back(std::string());
+   }
+ 
+-  // Add the full list of languages to the menu.
++  // Add the full list of languages to the menu. Tark: as targets, only the
++  // directions Tark's translator has from the page's language.
++  const std::string tark_source = ui_languages_manager_->GetSourceLanguageCode();
+   for (size_t i = 0U; i < ui_languages_manager_->GetNumberOfLanguages(); ++i) {
+     std::string code = ui_languages_manager_->GetLanguageCodeAt(i);
+     if (std::ranges::contains(skip_language_codes, code)) {
+       continue;
+     }
++    if (overflow_menu_item_id == OverflowMenuItemId::kChangeTargetLanguage &&
++        !TarkSupportsDirection(tark_source, code)) {
++      continue;
++    }
+ 
+     titles.emplace_back(ui_languages_manager_->GetLanguageNameAt(i));
+     subtitles.emplace_back();
+--- a/components/translate/core/browser/BUILD.gn
++++ b/components/translate/core/browser/BUILD.gn
+@@ -29,6 +29,7 @@
+     "translate_event_details.h",
+     "translate_init_details.cc",
+     "translate_init_details.h",
++    "tark_translate_directions.h",
+     "translate_language_list.cc",
+     "translate_language_list.h",
+     "translate_manager.cc",
+--- /dev/null
++++ b/components/translate/core/browser/tark_translate_directions.h
+@@ -0,0 +1,55 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef COMPONENTS_TRANSLATE_CORE_BROWSER_TARK_TRANSLATE_DIRECTIONS_H_
++#define COMPONENTS_TRANSLATE_CORE_BROWSER_TARK_TRANSLATE_DIRECTIONS_H_
++
++#include <algorithm>
++#include <string>
++#include <string_view>
++
++namespace translate {
++
++// Tark for Android: the directions Tark's translator has (the captions
++// process's PageDirectionsFor; TarkPageTranslationOffer.java): the 22
++// languages of India ↔ English, Indian ↔ Indian (through English), and
++// Spanish → English.
++inline bool TarkIsIndianLanguage(std::string_view code) {
++  static constexpr std::string_view kIndian[] = {
++      "as", "bn",  "brx", "doi", "gu", "hi", "kn", "ks", "kok", "mai", "ml",
++      "mni", "mr", "ne",  "or",  "pa", "sa", "sat", "sd", "ta",  "te",  "ur",
++  };
++  return std::ranges::find(kIndian, code) != std::end(kIndian);
++}
++
++inline bool TarkSupportsDirection(std::string_view source,
++                                  std::string_view target) {
++  if (source == target) {
++    return false;
++  }
++  if (TarkIsIndianLanguage(source)) {
++    return target == "en" || TarkIsIndianLanguage(target);
++  }
++  if (source == "en") {
++    return TarkIsIndianLanguage(target);
++  }
++  return source == "es" && target == "en";
++}
++
++// The target for a page in `source`: `target` when Tark translates that way,
++// else English when it translates the source into English (Hindi → Spanish
++// becomes Hindi → English), else `target` unchanged (the offer is then
++// suppressed: TarkSupportsDirection is false).
++inline std::string TarkTargetFor(std::string_view source,
++                                 std::string_view target) {
++  if (!TarkSupportsDirection(source, target) &&
++      TarkSupportsDirection(source, "en")) {
++    return "en";
++  }
++  return std::string(target);
++}
++
++}  // namespace translate
++
++#endif  // COMPONENTS_TRANSLATE_CORE_BROWSER_TARK_TRANSLATE_DIRECTIONS_H_
 --- a/components/translate/core/browser/translate_client.h
 +++ b/components/translate/core/browser/translate_client.h
 @@ -71,6 +71,14 @@
@@ -1080,7 +1380,15 @@
  
 --- a/components/translate/core/browser/translate_manager.cc
 +++ b/components/translate/core/browser/translate_manager.cc
-@@ -71,6 +71,16 @@
+@@ -30,6 +30,7 @@
+ #include "components/prefs/pref_service.h"
+ #include "components/translate/core/browser/language_state.h"
+ #include "components/translate/core/browser/page_translated_details.h"
++#include "components/translate/core/browser/tark_translate_directions.h"
+ #include "components/translate/core/browser/translate_browser_metrics.h"
+ #include "components/translate/core/browser/translate_client.h"
+ #include "components/translate/core/browser/translate_download_manager.h"
+@@ -71,6 +72,16 @@
  // translate needs no API key, no --translate-script-url and no network.
  constexpr bool kTarkBundledTranslator = true;
  
@@ -1097,7 +1405,22 @@
  // Callbacks for translate errors.
  TranslateManager::TranslateErrorCallbackList* g_error_callback_list_ = nullptr;
  
-@@ -194,6 +204,11 @@
+@@ -157,9 +168,12 @@
+       TranslateDownloadManager::GetLanguageCode(page_lang);
+   TranslateBrowserMetrics::TargetLanguageOrigin target_language_origin =
+       TranslateBrowserMetrics::TargetLanguageOrigin::kUninitialized;
+-  std::string target_lang =
++  // Tark: a direction Tark's translator has (Hindi → Spanish is offered as
++  // Hindi → English).
++  std::string target_lang = TarkTargetFor(
++      page_language_code,
+       GetTargetLanguage(translate_prefs.get(), language_model_,
+-                        page_language_code, target_language_origin);
++                        page_language_code, target_language_origin));
+ 
+   // TODO(crbug.com/40610937): The ranker event shouldn't be a global on this
+   // object. It should instead be passed around to code that uses it.
+@@ -194,6 +208,11 @@
  bool TranslateManager::CanManuallyTranslate(bool menu_logging) {
    bool can_translate = true;
  
@@ -1109,10 +1432,16 @@
    // Tark: the translator is on the phone (see kTarkBundledTranslator).
    if (!kTarkBundledTranslator && net::NetworkChangeNotifier::IsOffline()) {
      if (!menu_logging) {
-@@ -391,6 +406,14 @@
+@@ -391,6 +410,20 @@
      return;
    }
  
++  // Tark: a target Tark's translator doesn't have from this source becomes
++  // English (never a tap that does nothing).
++  const std::string tark_target =
++      TarkTargetFor(original_source_lang, target_lang);
++  target_lang = tark_target;
++
 +  // Tark: the direction's models first. Without them on the phone the embedder
 +  // shows their download (and translates once they are there); the page and
 +  // translate's state stay as they are, with no error.
@@ -1124,7 +1453,7 @@
    translate_driver_->PrepareToTranslatePage(page_seq_no_, original_source_lang,
                                              target_lang, triggered_from_menu);
  
-@@ -940,6 +963,13 @@
+@@ -940,6 +973,21 @@
          TriggerDecision::kDisabledDoesntNeedTranslation);
    }
  
@@ -1135,15 +1464,14 @@
 +        TriggerDecision::kDisabledTranslationFeatureDisabled);
 +  }
 +
++  // Tark: never an offer Tark's translator can't do (an English page for a
++  // Spanish reader).
++  if (!TarkSupportsDirection(page_language_code, target_lang)) {
++    decision->PreventAllTriggering();
++    GetActiveTranslateMetricsLogger()->LogTriggerDecision(
++        TriggerDecision::kDisabledUnsupportedLanguage);
++  }
++
    // Also, skip if the connection is currently offline - initiation doesn't make
    // sense there, either. Tark: not for the translator on the phone.
    if (!kTarkBundledTranslator && net::NetworkChangeNotifier::IsOffline()) {
-@@ -1073,7 +1103,7 @@
-     decision->ranker_events.push_back(
-         metrics::TranslateEventProto::LANGUAGE_DISABLED_BY_USER_CONFIG);
-     GetActiveTranslateMetricsLogger()->LogTriggerDecision(
--        TriggerDecision::kDisabledNeverTranslateLanguage);
-+        TriggerDecision::kDisabledTranslationFeatureDisabled);
-   }
- 
-   // Don't translate any user blocklisted URLs.
