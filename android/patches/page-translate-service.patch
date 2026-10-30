@@ -48,27 +48,28 @@
    }
  
   private:
-@@ -115,7 +113,18 @@
+@@ -115,7 +113,19 @@
  
  CaptionServiceImpl::CaptionServiceImpl(mojo::PendingReceiver<mojom::CaptionService> receiver)
      : receiver_(this, std::move(receiver)),
 -      session_(base::BindRepeating(&MakeEngine), base::BindRepeating(&MakeTranslator)) {}
 +      session_(base::BindRepeating(&MakeEngine), base::BindRepeating(&MakeTranslator)),
 +      page_(&session_, base::BindRepeating(&MakeTranslator)) {
-+  // A page's pipe closes on navigation: its queued batches go with it.
++  // A page's pipe closes on navigation or a deadline: its queued batches go
++  // with it.
 +  page_receivers_.set_disconnect_handler(base::BindRepeating(
 +      [](CaptionServiceImpl* self) {
++        // The model stays: the browser drops a pipe to let go of its queue
++        // (deadline, navigation) and binds a new one for the next batch. It
++        // says Release when it lets the model go.
 +        self->page_.DropBatches(self->page_receivers_.current_receiver());
-+        if (self->page_receivers_.empty()) {
-+          self->page_.ReleaseModel();  // a hidden or idle tab holds no page model
-+        }
 +      },
 +      base::Unretained(this)));
 +}
  
  CaptionServiceImpl::~CaptionServiceImpl() = default;
  
-@@ -171,6 +180,29 @@
+@@ -171,6 +181,33 @@
  
  void CaptionServiceImpl::Stop() {
    session_.Stop();
@@ -95,6 +96,10 @@
 +                           },
 +                           std::move(callback)),
 +                       page_receivers_.current_receiver());
++}
++
++void CaptionServiceImpl::Release() {
++  page_.ReleaseModel();
  }
  
  }  // namespace tark_captions
@@ -125,7 +130,7 @@
   public:
    explicit CaptionServiceImpl(mojo::PendingReceiver<mojom::CaptionService> receiver);
    CaptionServiceImpl(const CaptionServiceImpl&) = delete;
-@@ -32,11 +37,22 @@
+@@ -32,11 +37,23 @@
                   base::flat_map<std::string, base::File> files,
                   SetTargetCallback callback) override;
    void Stop() override;
@@ -137,6 +142,7 @@
 +                      base::flat_map<std::string, base::File> files,
 +                      const std::vector<std::string>& texts,
 +                      TranslateBatchCallback callback) override;
++  void Release() override;
 +
   private:
    mojo::Receiver<mojom::CaptionService> receiver_;
@@ -693,7 +699,7 @@
 +#endif  // CHROME_SERVICES_TARK_CAPTIONS_PAGE_TRANSLATOR_H_
 --- /dev/null
 +++ b/chrome/services/tark_captions/page_translator_unittest.cc
-@@ -0,0 +1,323 @@
+@@ -0,0 +1,342 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -975,8 +981,27 @@
 +  EXPECT_EQ(models_.received, (std::vector<std::string>{"new"}));
 +}
 +
-+// The last page went away: the page's own model is unloaded, but a model
-+// captions share with the page stays for captions.
++// A dropped pipe (DropBatches) keeps the page's model loaded for the next
++// batch; Release lets it go.
++TEST_F(PageTranslatorTest, DroppedPipeKeepsModelReleaseUnloads) {
++  PageTranslator page(&session_, Factory());
++  Translate(page, "en", "hi", {"tr_en_indic"}, {"one"});
++  page.DropBatches(/*owner=*/0);
++  task_environment_.RunUntilIdle();
++  {
++    base::AutoLock hold(models_.lock);
++    EXPECT_EQ(models_.loaded, 1);
++    EXPECT_EQ(models_.events, (std::vector<std::string>{"load:tr_en_indic"}));
++  }
++  page.ReleaseModel();
++  task_environment_.RunUntilIdle();
++  base::AutoLock hold(models_.lock);
++  EXPECT_EQ(models_.loaded, 0);
++  EXPECT_EQ(models_.events.back(), "unload:tr_en_indic");
++}
++
++// Release: the page's own model is unloaded, but a model captions share with
++// the page stays for captions.
 +TEST_F(PageTranslatorTest, LastPageDisconnectReleasesPageModel) {
 +  {
 +    PageTranslator page(&session_, Factory());
@@ -1019,7 +1044,7 @@
 +}  // namespace tark_captions
 --- a/chrome/services/tark_captions/public/mojom/tark_captions.mojom
 +++ b/chrome/services/tark_captions/public/mojom/tark_captions.mojom
-@@ -27,6 +27,18 @@
+@@ -27,6 +27,22 @@
    OnTranslation(uint32 caption_id, string text);
  };
  
@@ -1033,12 +1058,16 @@
 +  TranslateBatch(string source, string target,
 +                 map<string, mojo_base.mojom.ReadOnlyFile> files,
 +                 array<string> texts) => (array<string?> results);
++  // The page lets its model go (idle, app in the background, tab hidden,
++  // another tab took the process). A closed pipe alone doesn't: the browser
++  // drops pipes to cancel what they queued.
++  Release();
 +};
 +
  [ServiceSandbox=sandbox.mojom.Sandbox.kUtility]
  interface CaptionService {
    // `files`: the model folder's files by name (CaptionSession's list).
-@@ -41,4 +53,6 @@
+@@ -41,4 +57,6 @@
    // Speech goes on either way. False if a unit lacks a file.
    SetTarget(string target, map<string, mojo_base.mojom.ReadOnlyFile> files) => (bool ok);
    Stop();

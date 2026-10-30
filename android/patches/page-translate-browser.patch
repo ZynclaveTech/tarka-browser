@@ -56,7 +56,7 @@
  // {"<unit>": ["captions", "voice"]}. A unit no feature wants may be deleted.
 --- /dev/null
 +++ b/chrome/browser/tark_captions_android/page_translation.cc
-@@ -0,0 +1,229 @@
+@@ -0,0 +1,230 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -273,6 +273,7 @@
 +  idle_.Stop();
 +  if (connected_) {
 +    connected_ = false;
++    backend_->ReleaseModel();
 +    backend_->Disconnect();
 +  }
 +  ReleaseUnits();
@@ -288,7 +289,7 @@
 +}  // namespace tark_captions
 --- /dev/null
 +++ b/chrome/browser/tark_captions_android/page_translation.h
-@@ -0,0 +1,159 @@
+@@ -0,0 +1,162 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -350,6 +351,9 @@
 +    virtual void Connect() = 0;
 +    // Lets the translator go; a process started only for the page exits.
 +    virtual void Disconnect() = 0;
++    // Tells the captions process to let the page's model go (mojom
++    // PageTranslator.Release). Dropping a pipe doesn't: DropSent keeps it.
++    virtual void ReleaseModel() = 0;
 +    // Drops what was sent and not answered (the page went): a new
 +    // translator for the next batch, so it never queues behind old text.
 +    virtual void DropSent() = 0;
@@ -458,7 +462,7 @@
  #include "components/prefs/pref_service.h"
  #include "content/public/browser/render_frame_host.h"
  #include "content/public/browser/service_process_host.h"
-@@ -463,9 +464,16 @@ void TarkCaptionsTab::StartEngine() {
+@@ -463,9 +464,18 @@ void TarkCaptionsTab::StartEngine() {
    style_ = StyleForDevice(FastestCoreKhz(),
                            static_cast<int>(base::SysInfo::AmountOfTotalPhysicalMemory().InMiB()),
                            g_browser_process->local_state()->GetInteger(kStylePref));
@@ -467,7 +471,9 @@
 -      content::ServiceProcessHost::Options().WithDisplayName("Tark captions").Pass());
 +  // A process the page's translation started takes captions too: never two
 +  // captions processes in a tab.
-+  if (TarkPageTranslation* page = TarkPageTranslation::FromWebContents(web_contents())) {
++  // web_contents() is null once the tab is being destroyed.
++  if (TarkPageTranslation* page =
++          web_contents() ? TarkPageTranslation::FromWebContents(web_contents()) : nullptr) {
 +    service_ = page->HandOverProcess();
 +  }
 +  if (!service_.is_bound()) {
@@ -478,11 +484,14 @@
    service_.set_disconnect_handler(
        base::BindOnce(&TarkCaptionsTab::OnServiceGone, weak_factory_.GetWeakPtr()));
    engine_unit_ = unit;
-@@ -575,6 +583,15 @@ void TarkCaptionsTab::StopEngine() {
+@@ -575,6 +585,18 @@ void TarkCaptionsTab::StopEngine() {
    if (!service_.is_bound()) {
      return;
    }
-+  TarkPageTranslation* page = TarkPageTranslation::FromWebContents(web_contents());
++  // From ~TarkCaptionsTab the WebContents is already gone (web_contents() is
++  // null): no page to hand the process to, it just exits.
++  TarkPageTranslation* page =
++      web_contents() ? TarkPageTranslation::FromWebContents(web_contents()) : nullptr;
 +  if (page && page->WantsProcess()) {
 +    // The page still translating keeps the process, without speech or
 +    // captions' translation.
@@ -510,7 +519,7 @@
    explicit TarkCaptionsTab(content::WebContents* web_contents);
 --- /dev/null
 +++ b/chrome/browser/tark_captions_android/tark_page_translation.cc
-@@ -0,0 +1,308 @@
+@@ -0,0 +1,323 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -671,7 +680,7 @@
 +
 +void TarkPageTranslation::BindTranslator() {
 +  mojom::CaptionService* service = own_service_.is_bound() ? own_service_.get() : nullptr;
-+  if (!service) {
++  if (!service && web_contents()) {
 +    TarkCaptionsTab* captions = TarkCaptionsTab::FromWebContents(web_contents());
 +    service = captions ? captions->RunningService() : nullptr;
 +  }
@@ -689,6 +698,18 @@
 +  // process (the model stays).
 +  ++generation_;
 +  translator_.reset();
++}
++
++void TarkPageTranslation::ReleaseModel() {
++  // After DropSent there may be no pipe: a new one carries the Release (its
++  // order against the dropped pipe doesn't matter, the pipe close keeps the
++  // model). Not from the destructor's path, where web_contents() is null.
++  if (!translator_.is_bound() && web_contents()) {
++    BindTranslator();
++  }
++  if (translator_.is_bound()) {
++    translator_->Release();
++  }
 +}
 +
 +void TarkPageTranslation::Disconnect() {
@@ -763,7 +784,7 @@
 +bool TarkPageTranslation::CanWarm() const {
 +  // A one-model load is ~0.4 GB: not on a low-RAM phone or with under 1 GiB
 +  // free, not in a tab behind others, and not while this tab's captions run.
-+  if (base::SysInfo::IsLowEndDevice() ||
++  if (!web_contents() || base::SysInfo::IsLowEndDevice() ||
 +      base::SysInfo::AmountOfAvailablePhysicalMemory().InMiB() < 1024 ||
 +      web_contents()->GetVisibility() != content::Visibility::VISIBLE) {
 +    return false;
@@ -785,6 +806,9 @@
 +
 +bool TarkPageTranslation::TranslatedBefore(const std::string& source,
 +                                           const std::string& target) const {
++  if (!web_contents()) {
++    return false;
++  }
 +  PrefService* prefs = user_prefs::UserPrefs::Get(web_contents()->GetBrowserContext());
 +  return prefs && std::ranges::contains(prefs->GetList(kWarmDirections),
 +                                        base::Value(DirectionKey(source, target)));
@@ -792,7 +816,7 @@
 +
 +void TarkPageTranslation::RememberTranslated(const std::string& source,
 +                                             const std::string& target) {
-+  if (web_contents()->GetBrowserContext()->IsOffTheRecord() ||
++  if (!web_contents() || web_contents()->GetBrowserContext()->IsOffTheRecord() ||
 +      TranslatedBefore(source, target)) {
 +    return;
 +  }
@@ -821,7 +845,7 @@
 +}  // namespace tark_captions
 --- /dev/null
 +++ b/chrome/browser/tark_captions_android/tark_page_translation.h
-@@ -0,0 +1,120 @@
+@@ -0,0 +1,121 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -901,6 +925,7 @@
 +  // PageTranslation::Backend:
 +  void Connect() override;
 +  void Disconnect() override;
++  void ReleaseModel() override;
 +  void DropSent() override;
 +  void SendBatch(const std::string& source,
 +                 const std::string& target,
@@ -944,7 +969,7 @@
 +#endif  // CHROME_BROWSER_TARK_CAPTIONS_ANDROID_TARK_PAGE_TRANSLATION_H_
 --- /dev/null
 +++ b/chrome/browser/tark_captions_android/tark_page_translation_unittest.cc
-@@ -0,0 +1,354 @@
+@@ -0,0 +1,359 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -976,6 +1001,7 @@
 +    ++disconnects;
 +    connected = false;
 +  }
++  void ReleaseModel() override { ++releases; }
 +  void DropSent() override {
 +    ++drops;
 +    for (auto& done : sent) {
@@ -1023,6 +1049,7 @@
 +  int drops = 0;
 +  std::vector<PageTranslation::ResultsCallback> dropped;
 +  int disconnects = 0;
++  int releases = 0;
 +  bool connected = false;
 +  std::set<std::string> ready = {"tr_indic_en", "tr_en_indic"};
 +  std::set<std::string> in_use_units;
@@ -1077,6 +1104,7 @@
 +  task_environment_.FastForwardBy(base::Seconds(1));
 +  EXPECT_FALSE(backend_.connected);
 +  EXPECT_EQ(backend_.disconnects, 1);
++  EXPECT_EQ(backend_.releases, 1);  // the model is let go explicitly
 +  EXPECT_TRUE(backend_.in_use_units.empty());
 +  Translate(page, {"दो"});  // the next batch starts it again
 +  EXPECT_EQ(backend_.connects, 2);
@@ -1087,6 +1115,7 @@
 +  Translate(page, {"एक", "दो"});
 +  page.OnAppBackgrounded();
 +  EXPECT_FALSE(backend_.connected);
++  EXPECT_EQ(backend_.releases, 1);
 +  EXPECT_EQ(answers_, 1);
 +  EXPECT_EQ(out_, Results());  // deferred: the script sends them again
 +  EXPECT_TRUE(backend_.in_use_units.empty());
@@ -1142,6 +1171,7 @@
 +  EXPECT_EQ(out_, Results());  // deferred, not originals
 +  EXPECT_EQ(page.outstanding(), 0u);
 +  EXPECT_EQ(backend_.drops, 1);  // a new pipe: the service drops the old queue
++  EXPECT_EQ(backend_.releases, 0);  // and keeps the model for the resend
 +  std::move(backend_.dropped.front()).Run({"one", "two"});  // too late: dropped
 +  EXPECT_EQ(answers_, 1);
 +  task_environment_.FastForwardBy(PageTranslation::kIdleUnload);
