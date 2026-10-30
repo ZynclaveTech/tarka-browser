@@ -1022,7 +1022,7 @@
  std::optional<base::DictValue> ReadJsonDict(const ModelSource& source, std::string_view name) {
    std::optional<base::span<const uint8_t>> bytes = source.Read(name);
    if (!bytes) {
-@@ -66,6 +74,30 @@
+@@ -66,6 +74,36 @@
    return std::move(*value).TakeDict();
  }
  
@@ -1032,9 +1032,15 @@
 +  if (!bytes) {
 +    return std::nullopt;
 +  }
-+  if (auto entries = ParseFlatVocab(base::as_string_view(*bytes))) {
++  const char* why = "";
++  size_t at = 0;
++  if (auto entries = ParseFlatVocab(base::as_string_view(*bytes), &why, &at)) {
++    LOG(WARNING) << "tark-page: vocab " << name << " fast entries=" << entries->size();
 +    return entries;
 +  }
++  // Diagnostics (logcat "tark-page"): the slow path is ~20 s on a phone.
++  LOG(WARNING) << "tark-page: vocab " << name << " fast path declined (" << why << " at byte "
++               << at << "), base::JSONReader";
 +  std::optional<base::DictValue> dict = ReadJsonDict(source, name);
 +  if (!dict) {
 +    return std::nullopt;
@@ -1053,7 +1059,7 @@
  bool IsIndianCode(std::string_view code) {
    return code == "hi" || code == "ta" || code == "bn";
  }
-@@ -123,9 +155,18 @@
+@@ -123,9 +161,18 @@
    // encoder.int8.onnx and decoder_step.int8.onnx, from `source`.
    static std::unique_ptr<Direction> Load(OrtRuntime* runtime, const ModelSource& source) {
      auto d = base::WrapUnique(new Direction());
@@ -1074,7 +1080,7 @@
      std::optional<base::span<const uint8_t>> spm = source.Read("model.SRC");
      if (!config || !src || !tgt || !spm ||
          !d->spm_.LoadFromSerializedProto(base::as_string_view(*spm)).ok()) {
-@@ -147,22 +188,22 @@
+@@ -147,22 +194,22 @@
      d->head_dim_ = *dim / *heads;
      d->start_ = *start;
      d->eos_ = *eos;
@@ -1107,7 +1113,7 @@
      }
      auto unk = d->src_vocab_.find("<unk>");
      auto end = d->src_vocab_.find("</s>");
-@@ -171,8 +212,16 @@
+@@ -171,8 +218,16 @@
      }
      d->unk_ = unk->second;
      d->end_ = end->second;
@@ -1124,7 +1130,7 @@
      if (!d->encoder_ || !d->decoder_) {
        LOG(ERROR) << "Tark translation: models not loaded";
        return nullptr;
-@@ -206,6 +255,7 @@
+@@ -206,6 +261,7 @@
    }
  
    std::optional<std::vector<int64_t>> Greedy(const std::vector<int64_t>& ids) {
@@ -1132,7 +1138,7 @@
      std::vector<Tensor> encoded;
      if (!encoder_->Run({Tensor{.name = "ids",
                                 .shape = {1, static_cast<int64_t>(ids.size())},
-@@ -213,6 +263,7 @@
+@@ -213,6 +269,7 @@
                         {"cross_mask", "cross_k", "cross_v"}, &encoded)) {
        return std::nullopt;
      }
@@ -1140,7 +1146,7 @@
      const std::vector<int64_t> empty_cache = {layers_, 1, heads_, 0, head_dim_};
      std::vector<Tensor> inputs = {
          Tensor{.name = "token", .shape = {1, 1}, .i64 = {start_}},
-@@ -243,6 +294,13 @@
+@@ -243,6 +300,13 @@
        inputs[3] = std::move(step_out[2]);
        inputs[3].name = "past_v";
      }
@@ -1154,7 +1160,7 @@
      return out;
    }
  
-@@ -280,6 +338,7 @@
+@@ -280,6 +344,7 @@
    int64_t unk_ = 0;
    int64_t end_ = 0;
    bool language_tags_ = true;
@@ -1164,7 +1170,7 @@
  // static
 --- /dev/null
 +++ b/components/tark_captions/flat_vocab.h
-@@ -0,0 +1,237 @@
+@@ -0,0 +1,254 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -1192,10 +1198,24 @@
 +// on a Snapdragon 695, Tark for Android round 11).
 +// Nullopt for anything else (another value type, a number that is not an
 +// int32, a bad escape, invalid UTF-8, trailing text): the caller then uses
-+// base::JSONReader, so a file never loads differently, only faster.
++// base::JSONReader, so a file never loads differently, only faster. Then
++// `why` (when given) says what and `at` where, for the log.
++// Keys may hold Unicode noncharacters (dict.SRC.json of it2_indic_en has
++// eight, U+FDDB..U+FDEB): base::JSONReader takes them, so this does too.
 +inline std::optional<std::vector<std::pair<std::string, int>>> ParseFlatVocab(
-+    std::string_view json) {
++    std::string_view json,
++    const char** why = nullptr,
++    size_t* at = nullptr) {
 +  size_t i = 0;
++  auto decline = [&](const char* reason) {
++    if (why) {
++      *why = reason;
++    }
++    if (at) {
++      *at = i;
++    }
++    return std::nullopt;
++  };
 +  const size_t n = json.size();
 +  auto skip_space = [&] {
 +    while (i < n && (json[i] == ' ' || json[i] == '\n' || json[i] == '\r' || json[i] == '\t')) {
@@ -1356,7 +1376,7 @@
 +  std::vector<std::pair<std::string, int>> entries;
 +  skip_space();
 +  if (i >= n || json[i] != '{') {
-+    return std::nullopt;
++    return decline("not an object");
 +  }
 +  ++i;
 +  skip_space();
@@ -1367,17 +1387,20 @@
 +    for (;;) {
 +      skip_space();
 +      if (!read_string(&key)) {
-+        return std::nullopt;
++        return decline("key");
 +      }
 +      skip_space();
 +      if (i >= n || json[i] != ':') {
-+        return std::nullopt;
++        return decline("no colon");
 +      }
 +      ++i;
 +      skip_space();
 +      int value = 0;
-+      if (!read_int(&value) || !base::IsStringUTF8(key)) {
-+        return std::nullopt;
++      if (!read_int(&value)) {
++        return decline("value not an int32");
++      }
++      if (!base::IsStringUTF8AllowingNoncharacters(key)) {
++        return decline("key not UTF-8");
 +      }
 +      entries.emplace_back(std::move(key), value);
 +      skip_space();
@@ -1389,12 +1412,12 @@
 +        ++i;
 +        break;
 +      }
-+      return std::nullopt;
++      return decline("no comma or brace");
 +    }
 +  }
 +  skip_space();
 +  if (i != n) {
-+    return std::nullopt;
++    return decline("text after the object");
 +  }
 +  return entries;
 +}
@@ -1415,7 +1438,7 @@
  #include "components/tark_captions/model_source.h"
  #include "components/tark_captions/ort_runtime.h"
  #include "components/tark_captions/test_util.h"
-@@ -295,5 +299,57 @@
+@@ -295,5 +299,74 @@
    EXPECT_EQ(engine_->TranslatePage("  ", "ml", "en"), std::string());
  }
  
@@ -1439,6 +1462,23 @@
 +  EXPECT_EQ((*fast)[3].first, "\xE0\xA4\x85\xE0\xA4\xBE");      // अा
 +  EXPECT_EQ((*fast)[4].first, "\xF0\x9F\x98\x80");              // a surrogate pair
 +  EXPECT_EQ((*fast)[0].first, "<s>");                           // file order
++}
++
++// it2_indic_en's dict.SRC.json has keys with Unicode noncharacters
++// (U+FDDB..U+FDEB). base::JSONReader takes them, and so must the fast path: with
++// base::IsStringUTF8 it declined that file on the phone (round 12) and fell
++// back to the 18 s path.
++TEST(FlatVocabTest, NoncharacterKeysTaken) {
++  const std::string json = "{\"\xEF\xB7\x9C\": 5, \"\\ufdeb\": 6}";
++  const char* why = "";
++  std::optional<std::vector<std::pair<std::string, int>>> fast = ParseFlatVocab(json, &why);
++  ASSERT_TRUE(fast) << why;
++  std::optional<base::Value> slow = base::JSONReader::Read(json, base::JSON_PARSE_RFC);
++  ASSERT_TRUE(slow && slow->is_dict());
++  ASSERT_EQ(fast->size(), slow->GetDict().size());
++  for (const auto& [key, id] : *fast) {
++    EXPECT_EQ(slow->GetDict().FindInt(key), id);
++  }
 +}
 +
 +// Anything that is not a flat object of int32s goes back to base::JSONReader.
