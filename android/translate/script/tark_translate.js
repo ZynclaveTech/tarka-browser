@@ -23,6 +23,9 @@ var tarkTranslate = (function() {
   const CHUNK_MS = 16;
   const MAX_CHARS = 1000;
   const MAX_ITEMS = 16;
+  // A text longer than this stays as it is and is never sent (a whole .txt
+  // file, a huge <pre>-like block): the browser bounds a batch at 64 KiB.
+  const MAX_ITEM_CHARS = 4000;
 
   function create(win) {
     const doc = win.document;
@@ -48,6 +51,7 @@ var tarkTranslate = (function() {
     const now = () => (win.performance ? win.performance.now() : Date.now());
 
     function push(item, isVisible) {
+      if (item.text.length > MAX_ITEM_CHARS) return;  // left original
       latest.set(item.node, item);
       (isVisible ? front : back).push(item);
       queuedCount++;

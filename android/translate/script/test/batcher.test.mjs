@@ -166,6 +166,17 @@ test('progressCountsAnsweredBatchesAndNullKeepsOriginal', () => {
   assert.equal(t.service.getDetectedLanguage(), 'hi');
 });
 
+test('longItemNotSent', () => {
+  const long = 'क'.repeat(4001);
+  const {win, t, progress} = translator(`<p>${long}</p><p>short</p>`);
+  const b = t.takeBatch();
+  assert.deepEqual(b.texts, ['short']);
+  assert.equal(t.takeBatch(), null);
+  t.onResult(b.id, ['SHORT']);
+  assert.deepEqual(progress.at(-1), [100, true, 0]);
+  assert.equal(win.document.querySelector('p').textContent, long);
+});
+
 test('emptyPageFinishesAtOnce', () => {
   const {t, progress} = translator('<script>x</script>');
   assert.deepEqual(progress, [[100, true, 0]]);

@@ -28,11 +28,13 @@ off, automatic time off); an idle capture of the same emulator saved as
     adb -s emulator-5554 install -r AndroidBrowserTests.apk
     adb -s emulator-5554 shell am instrument -w \
       -e org.chromium.native_test.NativeTest.CommandLineFlags \
-      "--gtest_filter=TarkPageTranslateBrowserTest.*" \
+      "--gtest_filter=TarkPageTranslate*" \
       org.chromium.android_browsertests_apk/org.chromium.build.gtest_apk.NativeTestInstrumentationTestRunner
 
-All five must run and pass: TranslatesLocalHindiPageInPlace,
-ShowOriginalRestoresWithoutReload, LoadMoreTextTranslated,
-NoScriptRequestOnNetwork, NotInjectedBeforeTap. The instrumentation's
+Filter `--gtest_filter=TarkPageTranslate*` (two fixtures). All must run and
+pass: TranslatesLocalHindiPageInPlace, ShowOriginalRestoresWithoutReload,
+LoadMoreTextTranslated, NoScriptRequestOnNetwork (in both fixtures, the second
+with --translate-script-url), HiddenTabDefersThenResumes,
+UnparseableBatchStillFinishes, NotInjectedBeforeTap. The instrumentation's
 package and runner names are from the build's AndroidManifest.xml; check them
 there if `am instrument` can't find the runner.

@@ -41,7 +41,7 @@
  
 --- /dev/null
 +++ b/chrome/browser/tark_captions_android/tark_page_translate_browsertest.cc
-@@ -0,0 +1,251 @@
+@@ -0,0 +1,377 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -62,12 +62,18 @@
 +#include "base/functional/bind.h"
 +#include "base/strings/string_util.h"
 +#include "base/test/bind.h"
++#include "base/run_loop.h"
++#include "base/task/single_thread_task_runner.h"
 +#include "base/test/run_until.h"
++#include "base/time/time.h"
 +#include "chrome/browser/tark_captions_android/tark_page_translate_host.h"
 +#include "chrome/browser/translate/chrome_translate_client.h"
 +#include "chrome/common/chrome_isolated_world_ids.h"
 +#include "chrome/test/base/chrome_test_utils.h"
 +#include "chrome/test/base/platform_browser_test.h"
++#include "components/translate/core/browser/translate_download_manager.h"
++#include "components/translate/core/browser/translate_script.h"
++#include "components/translate/core/common/translate_switches.h"
 +#include "components/translate/core/browser/language_state.h"
 +#include "components/translate/core/browser/translate_manager.h"
 +#include "content/public/browser/navigation_controller.h"
@@ -110,6 +116,20 @@
 +class TarkPageTranslateBrowserTest : public PlatformBrowserTest {
 + protected:
 +  void SetUpOnMainThread() override {
++    // Counts, from as early as a test can, every request to a translate or
++    // Google API host and every script; lets them through.
++    interceptor_ = std::make_unique<content::URLLoaderInterceptor>(
++        base::BindLambdaForTesting(
++            [this](content::URLLoaderInterceptor::RequestParams* params) {
++              const GURL& url = params->url_request.url;
++              if (base::Contains(url.host(), "translate") ||
++                  base::Contains(url.host(), "googleapis") ||
++                  base::Contains(url.host(), "example.invalid") ||
++                  base::EndsWith(url.path(), ".js")) {
++                ++translate_requests_;
++              }
++              return false;
++            }));
 +    PlatformBrowserTest::SetUpOnMainThread();
 +    embedded_test_server()->RegisterRequestHandler(
 +        base::BindRepeating(&ServeHindiPage));
@@ -120,6 +140,7 @@
 +
 +  void TearDownOnMainThread() override {
 +    TarkPageTranslateHost::SetTranslatorForTesting({});
++    interceptor_.reset();
 +    PlatformBrowserTest::TearDownOnMainThread();
 +  }
 +
@@ -129,6 +150,12 @@
 +      std::string target,
 +      base::OnceCallback<void(std::vector<std::optional<std::string>>)> done) {
 +    ++batches_;
++    if (hold_next_) {
++      hold_next_ = false;
++      held_texts_ = texts;
++      held_ = std::move(done);
++      return;
++    }
 +    last_source_ = source;
 +    last_target_ = target;
 +    std::vector<std::optional<std::string>> results;
@@ -185,7 +212,25 @@
 +    manager()->TranslatePage("hi", "en", /*triggered_from_menu=*/true);
 +  }
 +
-+  // Whether Tark's script is in the translate world.
++  // Answers the held batch.
++  void ReleaseHeld() {
++    std::vector<std::optional<std::string>> results;
++    for (const std::string& text : held_texts_) {
++      results.push_back(Fake(text));
++    }
++    std::move(held_).Run(std::move(results));
++  }
++
++  void WaitSeconds(int seconds) {
++    base::RunLoop loop;
++    base::SingleThreadTaskRunner::GetCurrentDefault()->PostDelayedTask(
++        FROM_HERE, loop.QuitClosure(), base::Seconds(seconds));
++    loop.Run();
++  }
++
++  // Whether Tark's script is in the translate world. Only after the tap:
++  // evaluating there earlier would create the world before translate sets it
++  // up.
 +  bool ScriptInjected() {
 +    return content::EvalJs(web_contents(),
 +                           "typeof cr !== 'undefined' && "
@@ -195,6 +240,11 @@
 +        .ExtractBool();
 +  }
 +
++  std::unique_ptr<content::URLLoaderInterceptor> interceptor_;
++  std::atomic<int> translate_requests_{0};
++  bool hold_next_ = false;
++  std::vector<std::string> held_texts_;
++  base::OnceCallback<void(std::vector<std::optional<std::string>>)> held_;
 +  int batches_ = 0;
 +  std::string last_source_;
 +  std::string last_target_;
@@ -257,30 +307,106 @@
 +}
 +
 +IN_PROC_BROWSER_TEST_F(TarkPageTranslateBrowserTest, NoScriptRequestOnNetwork) {
-+  std::atomic<int> translate_requests{0};
-+  content::URLLoaderInterceptor interceptor(base::BindLambdaForTesting(
-+      [&](content::URLLoaderInterceptor::RequestParams* params) {
-+        const GURL& url = params->url_request.url;
-+        if (base::Contains(url.host(), "translate") ||
-+            base::Contains(url.host(), "googleapis") ||
-+            base::EndsWith(url.path(), ".js")) {
-+          ++translate_requests;
-+        }
-+        return false;  // Let it through; only count.
-+      }));
 +  LoadHindiPage();
 +  const std::string a = Text("a");
 +  TranslateHindiToEnglish();
 +  ASSERT_TRUE(WaitForText("a", Fake(a)));
 +  ASSERT_TRUE(base::test::RunUntil(
 +      [&] { return manager()->GetLanguageState()->IsPageTranslated(); }));
-+  EXPECT_EQ(0, translate_requests.load());
++  EXPECT_EQ(0, translate_requests_.load());
++}
++
++// The same with ungoogled's switch given: still nothing (no language list, no
++// script, no origin for translate.js to load from).
++class TarkPageTranslateWithScriptUrlBrowserTest
++    : public TarkPageTranslateBrowserTest {
++ protected:
++  void SetUpCommandLine(base::CommandLine* command_line) override {
++    TarkPageTranslateBrowserTest::SetUpCommandLine(command_line);
++    command_line->AppendSwitchASCII(translate::switches::kTranslateScriptURL,
++                                    "https://example.invalid/element.js");
++  }
++};
++
++IN_PROC_BROWSER_TEST_F(TarkPageTranslateWithScriptUrlBrowserTest,
++                       NoScriptRequestOnNetwork) {
++  LoadHindiPage();
++  const std::string a = Text("a");
++  TranslateHindiToEnglish();
++  ASSERT_TRUE(WaitForText("a", Fake(a)));
++  ASSERT_TRUE(base::test::RunUntil(
++      [&] { return manager()->GetLanguageState()->IsPageTranslated(); }));
++  EXPECT_EQ(0, translate_requests_.load());
++  EXPECT_EQ(false, content::EvalJs(web_contents(),
++                                   "securityOrigin !== ''",
++                                   content::EXECUTE_SCRIPT_DEFAULT_OPTIONS,
++                                   ISOLATED_WORLD_ID_TRANSLATE));
++}
++
++IN_PROC_BROWSER_TEST_F(TarkPageTranslateBrowserTest,
++                       HiddenTabDefersThenResumes) {
++  LoadHindiPage();
++  const std::string a = Text("a");
++  web_contents()->WasHidden();
++  ASSERT_EQ("hidden",
++            content::EvalJs(web_contents(), "document.visibilityState"));
++  TranslateHindiToEnglish();
++  WaitSeconds(2);
++  // Nothing sent while hidden, and nothing given up as original.
++  EXPECT_EQ(0, batches_);
++  EXPECT_EQ(a, Text("a"));
++  web_contents()->WasShown();
++  EXPECT_TRUE(WaitForText("a", Fake(a)));
++  EXPECT_GT(batches_, 0);
++}
++
++IN_PROC_BROWSER_TEST_F(TarkPageTranslateBrowserTest,
++                       UnparseableBatchStillFinishes) {
++  LoadHindiPage();
++  const std::string a = Text("a");
++  hold_next_ = true;
++  TranslateHindiToEnglish();
++  ASSERT_TRUE(base::test::RunUntil([&] { return !held_.is_null(); }));
++  // The next batch the agent reads has no readable texts.
++  ASSERT_TRUE(content::ExecJs(
++      web_contents(),
++      "const take = tarkTranslate.takeBatch;"
++      "tarkTranslate.takeBatch = () => {"
++      "  const b = take();"
++      "  if (b) b.texts = 'unreadable';"
++      "  return b;"
++      "};",
++      content::EXECUTE_SCRIPT_DEFAULT_OPTIONS, ISOLATED_WORLD_ID_TRANSLATE));
++  const std::string more = "यह अनुच्छेद बाद में आया।";
++  ASSERT_TRUE(content::ExecJs(
++      web_contents(),
++      content::JsReplace("const p = document.createElement('p');"
++                         "p.id = 'more';"
++                         "p.textContent = $1;"
++                         "document.body.appendChild(p);",
++                         more)));
++  WaitSeconds(2);
++  ReleaseHeld();
++  // Finished is reported only once every batch was answered, the unreadable
++  // one included (with originals).
++  ASSERT_TRUE(base::test::RunUntil(
++      [&] { return manager()->GetLanguageState()->IsPageTranslated(); }));
++  EXPECT_TRUE(WaitForText("a", Fake(a)));
++  EXPECT_EQ(more, Text("more"));
++  EXPECT_EQ(1, batches_);
 +}
 +
 +IN_PROC_BROWSER_TEST_F(TarkPageTranslateBrowserTest, NotInjectedBeforeTap) {
 +  LoadHindiPage();
-+  // The offer may show; nothing runs in the page until Translate is tapped.
-+  EXPECT_FALSE(ScriptInjected());
++  // The offer may show; nothing runs in the page until Translate is tapped:
++  // no script loaded in the browser, nothing in the page, no batch.
++  EXPECT_TRUE(translate::TranslateDownloadManager::GetInstance()
++                  ->script()
++                  ->data()
++                  .empty());
++  EXPECT_EQ(true, content::EvalJs(web_contents(),
++                                  "typeof tarkTranslate === 'undefined' && "
++                                  "typeof cr === 'undefined'"));
 +  EXPECT_EQ(0, batches_);
 +  const std::string a = Text("a");
 +  EXPECT_EQ(a, Text("a"));
@@ -295,7 +421,7 @@
 +}  // namespace tark_captions
 --- /dev/null
 +++ b/chrome/browser/tark_captions_android/tark_page_translate_host.cc
-@@ -0,0 +1,119 @@
+@@ -0,0 +1,120 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -388,9 +514,9 @@
 +    ReportBadMessageAndDeleteThis("Tark page translation: batch too large");
 +    return;
 +  }
-+  // An unknown pair (the script's "und", a code with a script subtag Tark
-+  // doesn't name) keeps the originals; TarkPageTranslation answers a pair
-+  // without models the same way.
++  // A malformed code keeps the originals. A well-formed one Tark has no
++  // model for (the script's "und" for a page without lang, say) goes on:
++  // TarkPageTranslation answers a pair without models with originals too.
 +  if (!IsLanguageCode(source) || !IsLanguageCode(target)) {
 +    std::move(callback).Run(AllOriginals(texts.size()));
 +    return;
@@ -398,7 +524,8 @@
 +  content::WebContents* web_contents =
 +      content::WebContents::FromRenderFrameHost(&render_frame_host());
 +  // Never in the background, never for a document that is no longer the
-+  // tab's page (back/forward cache, a page being replaced).
++  // tab's page (back/forward cache, a page being replaced). TranslateAgent
++  // already holds its queue while the page is hidden; this is a backstop.
 +  if (!render_frame_host().IsInPrimaryMainFrame() || !web_contents ||
 +      web_contents->GetVisibility() == content::Visibility::HIDDEN) {
 +    std::move(callback).Run(AllOriginals(texts.size()));
@@ -549,7 +676,17 @@
 +};
 --- a/components/translate/content/renderer/translate_agent.cc
 +++ b/components/translate/content/renderer/translate_agent.cc
-@@ -14,6 +14,8 @@
+@@ -6,7 +6,9 @@
+ 
+ #include <stddef.h>
+ 
++#include <set>
+ #include <string>
++#include <string_view>
+ #include <utility>
+ 
+ #include "base/check_op.h"
+@@ -14,6 +16,8 @@
  #include "base/compiler_specific.h"
  #include "base/feature_list.h"
  #include "base/functional/bind.h"
@@ -558,7 +695,7 @@
  #include "base/json/string_escape.h"
  #include "base/location.h"
  #include "base/metrics/histogram_functions.h"
-@@ -21,10 +23,12 @@
+@@ -21,10 +25,12 @@
  #include "base/metrics/histogram_macros_local.h"
  #include "base/no_destructor.h"
  #include "base/notreached.h"
@@ -571,7 +708,7 @@
  #include "components/language_detection/content/renderer/language_detection_agent.h"
  #include "components/language_detection/core/constants.h"
  #include "components/language_detection/core/language_detection_provider.h"
-@@ -70,6 +74,19 @@
+@@ -70,6 +76,22 @@
  // finished.
  const int kTranslateStatusCheckDelayMs = 400;
  
@@ -580,6 +717,9 @@
 +// for the browser at a time.
 +const int kTarkPumpDelayMs = 400;
 +const int kTarkMaxInFlight = 2;
++// After this many empty looks in a row, look every 2 s instead.
++const int kTarkIdlePollsBeforeBackoff = 5;
++const int kTarkIdlePumpDelayMs = 2000;
 +
 +// Tark: the next batch of the translate script's queue, as JSON
 +// ({"id": n, "texts": [...]}), or "null".
@@ -591,7 +731,7 @@
  // Language name passed to the Translate element for it to detect the language.
  const char kAutoDetectionLanguage[] = "auto";
  
-@@ -137,6 +154,7 @@
+@@ -137,6 +159,7 @@
  void TranslateAgent::PrepareForNewDocument() {
    // Navigated to a new document, reset current page translation.
    ResetPage();
@@ -599,7 +739,7 @@
  }
  
  void TranslateAgent::PageCaptured(
-@@ -498,6 +516,7 @@
+@@ -498,6 +521,7 @@
  
    // Any pending translation is now irrelevant.
    CancelPendingTranslation();
@@ -607,7 +747,7 @@
  
    // Set our states.
    translate_callback_pending_ = std::move(callback);
-@@ -547,6 +566,7 @@
+@@ -547,6 +571,7 @@
    }
  
    CancelPendingTranslation();
@@ -615,7 +755,7 @@
  
    ExecuteScript("cr.googleTranslate.revert()");
  }
-@@ -686,6 +706,8 @@
+@@ -686,6 +711,8 @@
    if (!weak_this) {
      return;
    }
@@ -624,7 +764,7 @@
    // Check the status of the translation.
    translate_task_runner_->PostDelayedTask(
        FROM_HERE,
-@@ -729,6 +751,121 @@
+@@ -729,6 +756,206 @@
    delete this;
  }
  
@@ -650,11 +790,13 @@
 +  // Answers still to come belong to the stopped pump.
 +  ++tark_generation_;
 +  tark_in_flight_ = 0;
++  tark_outstanding_.clear();
++  tark_idle_polls_ = 0;
 +  tark_timer_.Stop();
 +}
 +
 +void TranslateAgent::TarkPump() {
-+  if (!tark_pumping_) {
++  if (!tark_pumping_ || tark_hidden_) {
 +    return;
 +  }
 +  // Executing script may spin a nested run loop that detaches the frame and
@@ -665,14 +807,30 @@
 +    if (!weak_this || !tark_pumping_) {
 +      return;
 +    }
-+    std::optional<base::Value> batch = base::JSONReader::Read(json);
-+    if (!batch || !batch->is_dict()) {
++    if (json.empty() || json == "null") {
 +      break;  // Nothing queued.
 +    }
-+    std::optional<double> id = batch->GetDict().FindDouble("id");
-+    const base::Value::List* list = batch->GetDict().FindList("texts");
++    std::optional<base::Value> batch = base::JSONReader::Read(
++        json, base::JSON_PARSE_RFC | base::JSON_REPLACE_INVALID_CHARACTERS);
++    std::optional<double> id;
++    const base::ListValue* list = nullptr;
++    if (batch && batch->is_dict()) {
++      id = batch->GetDict().FindDouble("id");
++      list = batch->GetDict().FindList("texts");
++    }
 +    if (!id || !list) {
-+      break;
++      // The script already counts the batch as sent: answer it (all
++      // originals) so the translation can still finish.
++      std::optional<int64_t> taken = id ? std::optional<int64_t>(*id)
++                                        : TarkBatchIdFromJson(json);
++      if (!taken) {
++        break;
++      }
++      TarkAnswerOriginals(*taken);
++      if (!weak_this || !tark_pumping_) {
++        return;
++      }
++      continue;
 +    }
 +    std::vector<std::string> texts;
 +    texts.reserve(list->size());
@@ -687,10 +845,10 @@
 +      // A closed pipe drops its callbacks: their slots are free again (the
 +      // script keeps those nodes' originals).
 +      tark_host_.set_disconnect_handler(base::BindOnce(
-+          [](TranslateAgent* agent) { agent->tark_in_flight_ = 0; },
-+          base::Unretained(this)));
++          &TranslateAgent::TarkOnHostGone, base::Unretained(this)));
 +    }
 +    ++tark_in_flight_;
++    tark_outstanding_.insert(static_cast<int64_t>(*id));
 +    const size_t count = texts.size();
 +    tark_host_->Translate(
 +        std::move(texts), tark_source_, tark_target_,
@@ -698,9 +856,75 @@
 +                       weak_pointer_factory_.GetWeakPtr(), tark_generation_,
 +                       static_cast<int64_t>(*id), count));
 +  }
-+  tark_timer_.Start(FROM_HERE, AdjustDelay(kTarkPumpDelayMs),
-+                    base::BindOnce(&TranslateAgent::TarkPump,
-+                                   base::Unretained(this)));
++  // Looks again while batches are out or the queue was not empty; idle, the
++  // poll backs off to kTarkIdlePumpDelayMs.
++  tark_idle_polls_ = tark_in_flight_ ? 0 : tark_idle_polls_ + 1;
++  tark_timer_.Start(
++      FROM_HERE,
++      AdjustDelay(tark_idle_polls_ > kTarkIdlePollsBeforeBackoff
++                      ? kTarkIdlePumpDelayMs
++                      : kTarkPumpDelayMs),
++      base::BindOnce(&TranslateAgent::TarkPump, base::Unretained(this)));
++}
++
++void TranslateAgent::TarkAnswerOriginals(int64_t id) {
++  // An empty answer is padded to all-null by the script: originals.
++  TarkExecuteUtf8Script("tarkTranslate.onResult(" + base::NumberToString(id) +
++                        ",[])");
++}
++
++void TranslateAgent::TarkOnHostGone() {
++  tark_host_.reset();
++  // The pipe dropped the callbacks: answer those batches with originals.
++  std::set<int64_t> outstanding = std::move(tark_outstanding_);
++  tark_outstanding_.clear();
++  tark_in_flight_ = 0;
++  if (!tark_pumping_) {
++    return;
++  }
++  auto weak_this = weak_pointer_factory_.GetWeakPtr();
++  for (int64_t id : outstanding) {
++    TarkAnswerOriginals(id);
++    if (!weak_this) {
++      return;
++    }
++  }
++}
++
++// static
++std::optional<int64_t> TranslateAgent::TarkBatchIdFromJson(
++    const std::string& json) {
++  // JSON.stringify({id, texts}) starts with {"id":N.
++  static constexpr char kPrefix[] = "{\"id\":";
++  if (!base::StartsWith(json, kPrefix)) {
++    return std::nullopt;
++  }
++  size_t end = sizeof(kPrefix) - 1;
++  while (end < json.size() && base::IsAsciiDigit(json[end])) {
++    ++end;
++  }
++  int64_t id = 0;
++  if (!base::StringToInt64(
++          std::string_view(json).substr(sizeof(kPrefix) - 1,
++                                        end - (sizeof(kPrefix) - 1)),
++          &id)) {
++    return std::nullopt;
++  }
++  return id;
++}
++
++void TranslateAgent::WasHidden() {
++  // Never translate in the background: the queue waits for the page.
++  tark_hidden_ = true;
++  tark_timer_.Stop();
++}
++
++void TranslateAgent::WasShown() {
++  tark_hidden_ = false;
++  if (tark_pumping_) {
++    tark_idle_polls_ = 0;
++    TarkPump();
++  }
 +}
 +
 +void TranslateAgent::TarkOnResults(
@@ -712,7 +936,8 @@
 +    return;
 +  }
 +  --tark_in_flight_;
-+  base::Value::List list;
++  tark_outstanding_.erase(id);
++  base::ListValue list;
 +  for (size_t i = 0; i < count; ++i) {
 +    // A missing or null result keeps the original.
 +    if (i < results.size() && results[i]) {
@@ -748,13 +973,14 @@
      const std::string& source_lang,
 --- a/components/translate/content/renderer/translate_agent.h
 +++ b/components/translate/content/renderer/translate_agent.h
-@@ -5,16 +5,20 @@
+@@ -5,16 +5,21 @@
  #ifndef COMPONENTS_TRANSLATE_CONTENT_RENDERER_TRANSLATE_AGENT_H_
  #define COMPONENTS_TRANSLATE_CONTENT_RENDERER_TRANSLATE_AGENT_H_
  
 +#include <cstdint>
  #include <memory>
  #include <optional>
++#include <set>
  #include <string>
 +#include <vector>
  
@@ -769,7 +995,7 @@
  #include "components/translate/content/common/translate.mojom.h"
  #include "components/translate/core/common/translate_errors.h"
  #include "components/translate/core/language_detection/language_detection_model.h"
-@@ -177,6 +181,20 @@
+@@ -177,6 +182,29 @@
    // if the page is being closed.
    blink::WebLocalFrame* GetMainFrame();
  
@@ -786,11 +1012,20 @@
 +                     const std::vector<std::optional<std::string>>& results);
 +  // Like ExecuteScript, for UTF-8 source (the translations).
 +  void TarkExecuteUtf8Script(const std::string& script);
++  // Answers batch `id` with originals (a batch that could not be read or
++  // whose pipe closed), so the script can still report finished.
++  void TarkAnswerOriginals(int64_t id);
++  void TarkOnHostGone();
++  static std::optional<int64_t> TarkBatchIdFromJson(const std::string& json);
++
++  // RenderFrameObserver: the pump waits while the page is hidden.
++  void WasHidden() override;
++  void WasShown() override;
 +
    // The states associated with the current translation.
    TranslateFrameCallback translate_callback_pending_;
    std::string source_lang_;
-@@ -208,6 +226,17 @@
+@@ -208,6 +236,20 @@
  
    mojo::Receiver<mojom::TranslateAgent> receiver_{this};
  
@@ -802,12 +1037,27 @@
 +  std::string tark_source_;
 +  std::string tark_target_;
 +  int tark_in_flight_ = 0;
++  std::set<int64_t> tark_outstanding_;
++  int tark_idle_polls_ = 0;
++  bool tark_hidden_ = false;
 +  uint64_t tark_generation_ = 0;
 +  base::OneShotTimer tark_timer_;
 +
    // Method factory used to make calls to TranslatePageImpl.
    base::WeakPtrFactory<TranslateAgent> weak_method_factory_{this};
  
+--- a/components/translate/core/browser/translate_language_list.cc
++++ b/components/translate/core/browser/translate_language_list.cc
+@@ -277,7 +277,8 @@
+ 
+ void TranslateLanguageList::RequestLanguageList() {
+   const base::CommandLine& command_line = *base::CommandLine::ForCurrentProcess();
+-  if (!command_line.HasSwitch(translate::switches::kTranslateScriptURL))
++  // Tark: never fetched, whatever the command line says (the built-in list).
++  if ((true) || !command_line.HasSwitch(translate::switches::kTranslateScriptURL))
+     return;
+   // If resource requests are not allowed, we'll get a callback when they are.
+   if (!resource_requests_allowed_) {
 --- a/components/translate/core/browser/translate_manager.cc
 +++ b/components/translate/core/browser/translate_manager.cc
 @@ -66,6 +66,11 @@
@@ -897,3 +1147,14 @@
  
    if (fetcher_) {
      // If there is already a request in progress, do nothing. |callback| will be
+@@ -217,7 +231,9 @@
+ 
+     GURL security_origin = translate::GetTranslateSecurityOrigin();
+     const base::CommandLine& command_line = *base::CommandLine::ForCurrentProcess();
+-    if (command_line.HasSwitch(translate::switches::kTranslateScriptURL)) {
++    // Tark: no origin for translate.js to load anything from, ever.
++    if ((false) &&
++        command_line.HasSwitch(translate::switches::kTranslateScriptURL)) {
+       base::StringAppendF(&data_, "var securityOrigin = '%s';\n",
+                           security_origin.spec().c_str());
+     } else {
