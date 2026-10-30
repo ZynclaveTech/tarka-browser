@@ -227,7 +227,7 @@
  };
 --- /dev/null
 +++ b/chrome/services/tark_captions/page_translator.cc
-@@ -0,0 +1,325 @@
+@@ -0,0 +1,331 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -433,8 +433,14 @@
 +  const base::TimeTicks start = base::TimeTicks::Now();
 +  PageResults results(texts.begin(), texts.end());
 +  for (const PageLeg& leg : legs) {
++    const base::TimeTicks load_start = base::TimeTicks::Now();
++    const bool had = slot->translator && slot->unit == leg.unit;
 +    if (!Load(slot, leg.unit, files)) {
 +      return PageResults(texts.size());
++    }
++    if (!had) {
++      LOG(WARNING) << "tark-page: service made translator " << leg.unit << " ms="
++                   << (base::TimeTicks::Now() - load_start).InMilliseconds();
 +    }
 +    for (std::optional<std::string>& text : results) {
 +      if (text) {
@@ -991,3 +997,85 @@
 +  // Page translation on this process's model slot.
 +  BindPageTranslator(pending_receiver<PageTranslator> receiver);
  };
+--- a/components/tark_captions/translation_engine.cc
++++ b/components/tark_captions/translation_engine.cc
+@@ -14,6 +14,7 @@
+ #include "base/memory/ptr_util.h"
+ #include "base/strings/string_util.h"
+ #include "base/strings/utf_string_conversions.h"
++#include "base/time/time.h"
+ #include "components/tark_captions/english_text.h"
+ #include "components/tark_captions/indic_text.h"
+ #include "components/tark_captions/model_source.h"
+@@ -123,9 +124,16 @@
+   // encoder.int8.onnx and decoder_step.int8.onnx, from `source`.
+   static std::unique_ptr<Direction> Load(OrtRuntime* runtime, const ModelSource& source) {
+     auto d = base::WrapUnique(new Direction());
++    // Diagnostics (logcat "tark-page"): where a model's load time goes.
++    const base::TimeTicks start = base::TimeTicks::Now();
++    auto ms = [](base::TimeTicks since) {
++      return (base::TimeTicks::Now() - since).InMilliseconds();
++    };
+     std::optional<base::DictValue> config = ReadJsonDict(source, "config.json");
+     std::optional<base::DictValue> src = ReadJsonDict(source, "dict.SRC.json");
+     std::optional<base::DictValue> tgt = ReadJsonDict(source, "dict.TGT.json");
++    const int64_t dicts_ms = ms(start);
++    const base::TimeTicks spm_start = base::TimeTicks::Now();
+     std::optional<base::span<const uint8_t>> spm = source.Read("model.SRC");
+     if (!config || !src || !tgt || !spm ||
+         !d->spm_.LoadFromSerializedProto(base::as_string_view(*spm)).ok()) {
+@@ -171,8 +179,16 @@
+     }
+     d->unk_ = unk->second;
+     d->end_ = end->second;
++    const int64_t vocab_ms = ms(spm_start);  // SentencePiece and the vocabularies' maps
++    const base::TimeTicks encoder_start = base::TimeTicks::Now();
+     d->encoder_ = runtime->LoadModel(source, "encoder.int8.onnx", kThreads);
++    const int64_t encoder_ms = ms(encoder_start);
++    const base::TimeTicks decoder_start = base::TimeTicks::Now();
+     d->decoder_ = runtime->LoadModel(source, "decoder_step.int8.onnx", kThreads);
++    const int64_t decoder_ms = ms(decoder_start);
++    LOG(WARNING) << "tark-page: model load json_dicts_ms=" << dicts_ms << " vocab_ms=" << vocab_ms
++                 << " encoder_session_ms=" << encoder_ms << " decoder_session_ms=" << decoder_ms
++                 << " total_ms=" << ms(start);
+     if (!d->encoder_ || !d->decoder_) {
+       LOG(ERROR) << "Tark translation: models not loaded";
+       return nullptr;
+@@ -206,6 +222,7 @@
+   }
+ 
+   std::optional<std::vector<int64_t>> Greedy(const std::vector<int64_t>& ids) {
++    const base::TimeTicks start = base::TimeTicks::Now();
+     std::vector<Tensor> encoded;
+     if (!encoder_->Run({Tensor{.name = "ids",
+                                .shape = {1, static_cast<int64_t>(ids.size())},
+@@ -213,6 +230,7 @@
+                        {"cross_mask", "cross_k", "cross_v"}, &encoded)) {
+       return std::nullopt;
+     }
++    const base::TimeDelta encoder_time = base::TimeTicks::Now() - start;
+     const std::vector<int64_t> empty_cache = {layers_, 1, heads_, 0, head_dim_};
+     std::vector<Tensor> inputs = {
+         Tensor{.name = "token", .shape = {1, 1}, .i64 = {start_}},
+@@ -243,6 +261,13 @@
+       inputs[3] = std::move(step_out[2]);
+       inputs[3].name = "past_v";
+     }
++    if (!ran_) {  // the first inference after a load (diagnostics)
++      ran_ = true;
++      LOG(WARNING) << "tark-page: first inference source_tokens=" << ids.size()
++                   << " output_tokens=" << out.size()
++                   << " encoder_ms=" << encoder_time.InMilliseconds()
++                   << " total_ms=" << (base::TimeTicks::Now() - start).InMilliseconds();
++    }
+     return out;
+   }
+ 
+@@ -280,6 +305,7 @@
+   int64_t unk_ = 0;
+   int64_t end_ = 0;
+   bool language_tags_ = true;
++  bool ran_ = false;
+ };
+ 
+ // static

@@ -56,7 +56,7 @@
  // {"<unit>": ["captions", "voice"]}. A unit no feature wants may be deleted.
 --- /dev/null
 +++ b/chrome/browser/tark_captions_android/page_translation.cc
-@@ -0,0 +1,194 @@
+@@ -0,0 +1,205 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -67,6 +67,7 @@
 +#include <utility>
 +
 +#include "base/functional/bind.h"
++#include "base/functional/callback_helpers.h"
 +#include "base/location.h"
 +#include "base/logging.h"
 +#include "base/task/sequenced_task_runner.h"
@@ -124,6 +125,7 @@
 +  idle_.Stop();
 +  if (!connected_) {
 +    connected_ = true;
++    LOG(WARNING) << "tark-page: browser connecting to the captions process";
 +    backend_->Connect();
 +  }
 +  for (const std::string& unit : units) {
@@ -143,6 +145,15 @@
 +  base::SequencedTaskRunner::GetCurrentDefault()->PostDelayedTask(
 +      FROM_HERE, base::BindOnce(&PageTranslation::OnDeadline, weak_factory_.GetWeakPtr(), id),
 +      kBatchDeadline);
++}
++
++void PageTranslation::Warm(std::string source, std::string target) {
++  if (connected_ || !pending_.empty() || !ModelsReady(source, target) ||
++      !backend_->CanWarm()) {
++    return;
++  }
++  LOG(WARNING) << "tark-page: browser warming " << source << " -> " << target;
++  Translate({"."}, std::move(source), std::move(target), base::DoNothing());
 +}
 +
 +bool PageTranslation::ModelsReady(std::string source, std::string target) const {
@@ -253,7 +264,7 @@
 +}  // namespace tark_captions
 --- /dev/null
 +++ b/chrome/browser/tark_captions_android/page_translation.h
-@@ -0,0 +1,130 @@
+@@ -0,0 +1,140 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -325,6 +336,10 @@
 +    // Downloads `unit` for page translation (owner "page_translation" in
 +    // tark.captions.owners: a pref write).
 +    virtual void RequestUnit(const std::string& unit, bool now) = 0;
++    // Whether a model may be loaded ahead of a tap (Warm): not on a low-RAM
++    // phone or one short of memory, and not while captions run (captions
++    // win: they may hold another model).
++    virtual bool CanWarm() const = 0;
 +  };
 +
 +  PageTranslation(Backend* backend, bool off_the_record);
@@ -339,6 +354,12 @@
 +                 std::string target,
 +                 ResultsCallback callback);
 +  bool ModelsReady(std::string source, std::string target) const;
++  // The Translate offer is showing: when the pair's models are on the phone
++  // and the backend allows it, loads the model now (a one-sentence batch
++  // whose answer is dropped), so the tap doesn't wait for the load. With no
++  // tap the usual idle unload lets it go after kIdleUnload. It costs that
++  // memory for those three minutes even for people who never tap.
++  void Warm(std::string source, std::string target);
 +  // Asks for the pair's missing models; false (nothing asked, nothing
 +  // written) off the record.
 +  bool RequestModels(std::string source, std::string target, bool now);
@@ -446,7 +467,7 @@
    explicit TarkCaptionsTab(content::WebContents* web_contents);
 --- /dev/null
 +++ b/chrome/browser/tark_captions_android/tark_page_translation.cc
-@@ -0,0 +1,248 @@
+@@ -0,0 +1,273 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -460,10 +481,12 @@
 +#include "base/files/file_path.h"
 +#include "base/functional/bind.h"
 +#include "base/no_destructor.h"
++#include "base/system/sys_info.h"
 +#include "base/task/thread_pool.h"
 +#include "chrome/browser/tark_captions_android/caption_downloads.h"
 +#include "chrome/browser/tark_captions_android/model_files.h"
 +#include "chrome/browser/tark_captions_android/tark_captions_tab.h"
++#include "chrome/browser/tark_captions_android/tark_page_translation_warm.h"
 +#include "content/public/browser/browser_context.h"
 +#include "content/public/browser/service_process_host.h"
 +#include "content/public/browser/web_contents.h"
@@ -525,6 +548,17 @@
 +
 +bool TarkPageTranslation::ModelsReady(std::string source, std::string target) {
 +  return logic_.ModelsReady(std::move(source), std::move(target));
++}
++
++void TarkPageTranslation::Warm(std::string source, std::string target) {
++  logic_.Warm(std::move(source), std::move(target));
++}
++
++void WarmPageTranslation(content::WebContents* web_contents,
++                         const std::string& source,
++                         const std::string& target) {
++  TarkPageTranslation::CreateForWebContents(web_contents);
++  TarkPageTranslation::FromWebContents(web_contents)->Warm(source, target);
 +}
 +
 +bool TarkPageTranslation::RequestModels(std::string source, std::string target, bool now) {
@@ -678,6 +712,18 @@
 +  CaptionDownloads::Get().Request(unit, now, Owner::kPageTranslation);
 +}
 +
++bool TarkPageTranslation::CanWarm() const {
++  // A one-model load is ~0.4 GB: not on a low-RAM phone or with under 1 GiB
++  // free, not in a tab behind others, and not while this tab's captions run.
++  if (base::SysInfo::IsLowEndDevice() ||
++      base::SysInfo::AmountOfAvailablePhysicalMemory().InMiB() < 1024 ||
++      web_contents()->GetVisibility() != content::Visibility::VISIBLE) {
++    return false;
++  }
++  TarkCaptionsTab* captions = TarkCaptionsTab::FromWebContents(web_contents());
++  return !(captions && captions->RunningService());
++}
++
 +void TarkPageTranslation::OnGone() {
 +  translator_.reset();
 +  own_service_.reset();
@@ -697,7 +743,7 @@
 +}  // namespace tark_captions
 --- /dev/null
 +++ b/chrome/browser/tark_captions_android/tark_page_translation.h
-@@ -0,0 +1,115 @@
+@@ -0,0 +1,118 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -749,6 +795,8 @@
 +                 std::string target,
 +                 base::OnceCallback<void(std::vector<std::optional<std::string>>)> callback);
 +  bool ModelsReady(std::string source, std::string target);
++  // The Translate offer is showing for the pair: PageTranslation::Warm.
++  void Warm(std::string source, std::string target);
 +  // Asks captions' downloads for the pair's missing models (Wi-Fi unless
 +  // `now`); false in a Private tab, which writes nothing.
 +  bool RequestModels(std::string source, std::string target, bool now);
@@ -784,6 +832,7 @@
 +  bool UnitReady(const std::string& unit) const override;
 +  void SetInUse(const std::string& unit, bool in_use) override;
 +  void RequestUnit(const std::string& unit, bool now) override;
++  bool CanWarm() const override;
 +
 +  // A translator on the process the page uses (captions' or its own).
 +  void BindTranslator();
@@ -815,7 +864,7 @@
 +#endif  // CHROME_BROWSER_TARK_CAPTIONS_ANDROID_TARK_PAGE_TRANSLATION_H_
 --- /dev/null
 +++ b/chrome/browser/tark_captions_android/tark_page_translation_unittest.cc
-@@ -0,0 +1,269 @@
+@@ -0,0 +1,316 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -875,6 +924,7 @@
 +    owners.SetWanted(unit, Owner::kPageTranslation, true);
 +    ++pref_writes;
 +  }
++  bool CanWarm() const override { return can_warm; }
 +
 +  // The captions process answers the oldest batch.
 +  void Answer(Results results) {
@@ -894,6 +944,7 @@
 +  std::vector<PageTranslation::ResultsCallback> sent;
 +  UnitOwners owners;
 +  int pref_writes = 0;
++  bool can_warm = true;
 +};
 +
 +class TarkPageTranslationTest : public testing::Test {
@@ -1083,5 +1134,79 @@
 +  EXPECT_TRUE(PageUnitsFor("hi", "es").empty());
 +}
 +
++// The offer showing loads the model (one sentence, answer dropped); with no
++// tap it goes after the idle unload, like any batch.
++TEST_F(TarkPageTranslationTest, WarmLoadsAheadAndUnloadsWhenIdle) {
++  PageTranslation page(&backend_, false);
++  page.Warm("hi", "en");
++  EXPECT_EQ(backend_.connects, 1);
++  EXPECT_EQ(backend_.sent_units, (std::vector<std::string>{"tr_indic_en"}));
++  EXPECT_TRUE(backend_.in_use_units.contains("tr_indic_en"));
++  backend_.Answer({"."});
++  task_environment_.FastForwardBy(PageTranslation::kIdleUnload);
++  EXPECT_FALSE(backend_.connected);
++  EXPECT_TRUE(backend_.in_use_units.empty());
++}
++
++// A tap right after the offer uses the warmed process: no second connect.
++TEST_F(TarkPageTranslationTest, WarmThenTranslateSharesTheProcess) {
++  PageTranslation page(&backend_, false);
++  page.Warm("hi", "en");
++  backend_.Answer({"."});
++  Translate(page, {"एक"});
++  EXPECT_EQ(backend_.connects, 1);
++  backend_.Answer({"one"});
++  EXPECT_EQ(out_, (Results{"one"}));
++}
++
++// No warm-up when the backend says no (low RAM, little memory free, a tab
++// behind others, captions running), when the models aren't on the phone,
++// or when a translation is already connected.
++TEST_F(TarkPageTranslationTest, WarmSkipped) {
++  PageTranslation page(&backend_, false);
++  backend_.can_warm = false;
++  page.Warm("hi", "en");
++  EXPECT_EQ(backend_.connects, 0);
++  backend_.can_warm = true;
++  backend_.ready.clear();
++  page.Warm("hi", "en");
++  EXPECT_EQ(backend_.connects, 0);
++  backend_.ready = {"tr_indic_en", "tr_en_indic"};
++  page.Warm("hi", "hi");  // no direction
++  EXPECT_EQ(backend_.connects, 0);
++  Translate(page, {"एक"});
++  page.Warm("hi", "en");
++  EXPECT_EQ(backend_.sent.size(), 1u);  // not a second batch
++}
++
 +}  // namespace
 +}  // namespace tark_captions
+--- /dev/null
++++ b/chrome/browser/tark_captions_android/tark_page_translation_warm.h
+@@ -0,0 +1,26 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_TARK_CAPTIONS_ANDROID_TARK_PAGE_TRANSLATION_WARM_H_
++#define CHROME_BROWSER_TARK_CAPTIONS_ANDROID_TARK_PAGE_TRANSLATION_WARM_H_
++
++#include <string>
++
++namespace content {
++class WebContents;
++}
++
++namespace tark_captions {
++
++// ChromeTranslateClient: the Translate offer is showing for the pair in
++// `web_contents`. Loads the model ahead of the tap when allowed
++// (TarkPageTranslation::Warm). Kept apart from tark_page_translation.h so the
++// translate target needs none of the captions mojom.
++void WarmPageTranslation(content::WebContents* web_contents,
++                         const std::string& source,
++                         const std::string& target);
++
++}  // namespace tark_captions
++
++#endif  // CHROME_BROWSER_TARK_CAPTIONS_ANDROID_TARK_PAGE_TRANSLATION_WARM_H_

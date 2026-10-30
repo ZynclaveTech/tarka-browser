@@ -203,6 +203,8 @@ var tarkBatcher = (function() {
     // keeps putting its original back stops after MAX_RETRANSLATIONS cache
     // writes without using up its model re-translations, and vice versa.
     function changed(items, key, onItems) {
+      // A moved node still showing Tark's write is not the page's text.
+      items = items.filter(item => !owned(item.node));
       if (!items.length) return;
       const hits = [], fresh = [];
       for (const item of items) {

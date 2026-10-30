@@ -337,3 +337,19 @@ test('cacheHitsDoNotUseTheModelCap', async () => {
   await tick();
   assert.deepEqual(t.takeBatch().texts, ['two']);
 });
+
+test('movedTranslatedNodesNotResent', async () => {
+  // A page that moves already-translated paragraphs (a carousel, a re-render
+  // that re-inserts the same nodes) must not send Tark's English back to the
+  // model as if it were the page's Hindi.
+  const {win, t} = translator('<div id="a"><p>one</p><p>two</p></div><div id="b"></div>');
+  drain(t);
+  assert.equal(win.document.body.textContent, 'ONETWO');
+  const [p1, p2] = win.document.querySelectorAll('p');
+  win.document.getElementById('b').appendChild(p1);  // moved: an added element
+  win.document.getElementById('b').appendChild(p2.firstChild);  // a moved text node
+  await tick();
+  assert.equal(t.takeBatch(), null);
+  assert.equal(win.document.body.textContent, 'ONETWO');
+  t.service.restore();
+});
