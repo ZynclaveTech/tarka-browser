@@ -19,3 +19,20 @@ none of the traffic; Play Services and Android's own probes off
 (`pm disable-user`, `settings put global captive_portal_mode 0`, private DNS
 off, automatic time off); an idle capture of the same emulator saved as
 `build/android/sessions/baseline.pcap`.
+
+## Page translation's browser tests
+
+`tark-build.sh` builds `android_browsertests` and uploads
+`AndroidBrowserTests.apk` beside the APK. On `emulator-5554` (never the phone):
+
+    adb -s emulator-5554 install -r AndroidBrowserTests.apk
+    adb -s emulator-5554 shell am instrument -w \
+      -e org.chromium.native_test.NativeTest.CommandLineFlags \
+      "--gtest_filter=TarkPageTranslateBrowserTest.*" \
+      org.chromium.android_browsertests_apk/org.chromium.build.gtest_apk.NativeTestInstrumentationTestRunner
+
+All five must run and pass: TranslatesLocalHindiPageInPlace,
+ShowOriginalRestoresWithoutReload, LoadMoreTextTranslated,
+NoScriptRequestOnNetwork, NotInjectedBeforeTap. The instrumentation's
+package and runner names are from the build's AndroidManifest.xml; check them
+there if `am instrument` can't find the runner.
