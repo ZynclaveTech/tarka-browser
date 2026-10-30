@@ -16,7 +16,9 @@ bubble's line is "Hindi → English · Show original". No Google branding:
 the plain translate icon, no wordmark, no always-translate rules. The
 Languages page gets the Page translation switch where Google's Translate
 card was (removals/translate.patch). Supported languages: the 22 of India
-and English. Browser tests: tark_page_translate_browsertest.cc.
+and English. Browser tests: tark_page_translate_browsertest.cc; they give
+captions' model store a temporary folder (--tark-captions-models-dir-for-
+testing, honoured only in tests), never the person's own.
 
 --- a/chrome/app/tark_captions_strings.grdp
 +++ b/chrome/app/tark_captions_strings.grdp
@@ -31,7 +33,7 @@ and English. Browser tests: tark_page_translate_browsertest.cc.
 +    Show original
 +  </message>
 +  <message name="IDS_TARK_PAGE_TRANSLATE_BUBBLE_GETTING_READY" desc="Tark page translation: under the translate bubble while the translation model downloads, the first time a language pair is translated. $1 is its size in megabytes.">
-+    Getting translation ready · <ph name="SIZE">$1<ex>221</ex></ph> MB
++    Getting translation ready · <ph name="SIZE">$1<ex>238</ex></ph> MB
 +  </message>
 +  <message name="IDS_SETTINGS_TARK_PAGE_TRANSLATION" desc="Settings › Languages: the switch for translating web pages with Tark's own translation model, on the Mac.">
 +    Page translation
@@ -103,9 +105,49 @@ and English. Browser tests: tark_page_translate_browsertest.cc.
          'no-animation');
    }
  
+--- a/chrome/browser/tark_captions/caption_models.cc
++++ b/chrome/browser/tark_captions/caption_models.cc
+@@ -6,7 +6,9 @@
+ 
+ #include <memory>
+ 
++#include "base/check_is_test.h"
+ #include "base/command_line.h"
++#include "base/files/file_path.h"
+ #include "base/no_destructor.h"
+ #include "chrome/browser/browser_process.h"
+ #include "chrome/browser/speech/chrome_speech_recognition_service.h"
+@@ -19,6 +21,18 @@
+ 
+ constexpr char kModelsUrlSwitch[] = "tark-captions-models-url";
+ constexpr char kModelsUrl[] = "https://gettarka.com/models/captions/v1/";
++// Tests only (kModelsDirSwitch): the models folder, instead of the
++// person's own under Application Support.
++constexpr char kModelsDirSwitch[] = "tark-captions-models-dir-for-testing";
++
++base::FilePath ModelsDir() {
++  const base::CommandLine& command_line = *base::CommandLine::ForCurrentProcess();
++  if (command_line.HasSwitch(kModelsDirSwitch)) {
++    CHECK_IS_TEST();
++    return command_line.GetSwitchValuePath(kModelsDirSwitch);
++  }
++  return speech::ChromeSpeechRecognitionService::TarkCaptionsModelsDir();
++}
+ 
+ constexpr net::NetworkTrafficAnnotationTag kAnnotation =
+     net::DefineNetworkTrafficAnnotation("tark_captions_models", R"(
+@@ -49,7 +63,7 @@
+ 
+ CaptionModelStore& TarkCaptionModels() {
+   static base::NoDestructor<CaptionModelStore> store(
+-      speech::ChromeSpeechRecognitionService::TarkCaptionsModelsDir(),
++      ModelsDir(),
+       g_browser_process->shared_url_loader_factory(),
+       GURL(base::CommandLine::ForCurrentProcess()->HasSwitch(kModelsUrlSwitch)
+                ? base::CommandLine::ForCurrentProcess()->GetSwitchValueASCII(kModelsUrlSwitch)
 --- /dev/null
 +++ b/chrome/browser/tark_captions/tark_page_translate_browsertest.cc
-@@ -0,0 +1,526 @@
+@@ -0,0 +1,560 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -123,12 +165,14 @@ and English. Browser tests: tark_page_translate_browsertest.cc.
 +#include <string>
 +#include <vector>
 +
++#include "base/files/scoped_temp_dir.h"
 +#include "base/functional/bind.h"
 +#include "base/logging.h"
 +#include "base/strings/string_number_conversions.h"
 +#include "base/synchronization/lock.h"
 +#include "base/test/bind.h"
 +#include "base/test/run_until.h"
++#include "base/threading/thread_restrictions.h"
 +#include "base/thread_annotations.h"
 +#include "chrome/app/chrome_command_ids.h"
 +#include "chrome/browser/profiles/profile.h"
@@ -211,6 +255,21 @@ and English. Browser tests: tark_page_translate_browsertest.cc.
 +
 +class TarkPageTranslateBrowserTest : public InProcessBrowserTest {
 + protected:
++  ~TarkPageTranslateBrowserTest() override {
++    base::ScopedAllowBlockingForTesting allow_blocking;
++    EXPECT_TRUE(models_dir_.Delete());
++  }
++
++  // Captions' model store (TarkCaptionModels, made on first use, after this)
++  // uses an empty folder of the test's, never the person's own.
++  void SetUpCommandLine(base::CommandLine* command_line) override {
++    InProcessBrowserTest::SetUpCommandLine(command_line);
++    base::ScopedAllowBlockingForTesting allow_blocking;
++    ASSERT_TRUE(models_dir_.CreateUniqueTempDir());
++    command_line->AppendSwitchPath("tark-captions-models-dir-for-testing",
++                                   models_dir_.GetPath());
++  }
++
 +  void SetUpOnMainThread() override {
 +    // Every http(s) request from as early as a test can: the test server's
 +    // are fine; gettarka.com/models (the models' download) is held, never
@@ -361,6 +420,7 @@ and English. Browser tests: tark_page_translate_browsertest.cc.
 +    return model.GetIndexOfCommandId(IDC_SHOW_TRANSLATE).has_value();
 +  }
 +
++  base::ScopedTempDir models_dir_;
 +  base::Lock lock_;
 +  std::unique_ptr<content::URLLoaderInterceptor> interceptor_;
 +  std::vector<mojo::PendingRemote<network::mojom::URLLoaderClient>> held_
@@ -413,6 +473,24 @@ and English. Browser tests: tark_page_translate_browsertest.cc.
 +  EXPECT_EQ(7, content::EvalJs(web_contents(), "window.tarkMark"));
 +  EXPECT_EQ(entries, controller.GetEntryCount());
 +  EXPECT_EQ(entry_id, controller.GetLastCommittedEntry()->GetUniqueID());
++}
++
++// The bubble's lines, exactly (the same functions draw them; no window
++// needed): the translated line with its link, and the download card with
++// the Mac manifest's size.
++IN_PROC_BROWSER_TEST_F(TarkPageTranslateBrowserTest, BubbleLinesExact) {
++  std::vector<size_t> offsets;
++  const std::u16string line =
++      TranslateBubbleView::TarkTranslatedLine(u"Hindi", u"English", &offsets);
++  EXPECT_EQ(u"Hindi → English · Show original", line);
++  ASSERT_EQ(3u, offsets.size());
++  EXPECT_EQ(u"Show original", line.substr(offsets[2]));
++  EXPECT_EQ(u"Getting translation ready · 238 MB",
++            TranslateBubbleView::TarkGettingReadyLine(
++                UnitSize(ModelUnit::kToEnglish)));
++  EXPECT_EQ(u"Getting translation ready · 282 MB",
++            TranslateBubbleView::TarkGettingReadyLine(
++                UnitSize(ModelUnit::kFromEnglish)));
 +}
 +
 +// Text the page adds after the translation finished is translated too.
@@ -574,10 +652,8 @@ and English. Browser tests: tark_page_translate_browsertest.cc.
 +  EXPECT_FALSE(manager()->GetLanguageState()->IsPageTranslated());
 +
 +  if (TranslateBubbleView* bubble = Bubble()) {
-+    EXPECT_EQ(u"Getting translation ready · " +
-+                  base::NumberToString16(
-+                      Megabytes(UnitSize(ModelUnit::kToEnglish))) +
-+                  u" MB",
++    EXPECT_EQ(TranslateBubbleView::TarkGettingReadyLine(
++                  UnitSize(ModelUnit::kToEnglish)),
 +              bubble->tark_footnote_text_for_testing());
 +  } else {
 +    LOG(WARNING) << "No bubble (window not active); the card is unchecked.";
@@ -1076,7 +1152,7 @@ and English. Browser tests: tark_page_translate_browsertest.cc.
    model_->RevertTranslation();
    SwitchView(TranslateBubbleModel::VIEW_STATE_BEFORE_TRANSLATE);
  }
-@@ -1070,13 +1068,65 @@
+@@ -1070,13 +1068,78 @@
  }
  
  std::unique_ptr<views::ImageView> TranslateBubbleView::CreateTranslateIcon() {
@@ -1090,6 +1166,25 @@ and English. Browser tests: tark_page_translate_browsertest.cc.
    return language_icon;
  }
  
++// static
++std::u16string TranslateBubbleView::TarkTranslatedLine(
++    const std::u16string& source_name,
++    const std::u16string& target_name,
++    std::vector<size_t>* offsets) {
++  return l10n_util::GetStringFUTF16(
++      IDS_TARK_PAGE_TRANSLATE_BUBBLE_TRANSLATED,
++      {source_name, target_name,
++       l10n_util::GetStringUTF16(IDS_TARK_PAGE_TRANSLATE_BUBBLE_SHOW_ORIGINAL)},
++      offsets);
++}
++
++// static
++std::u16string TranslateBubbleView::TarkGettingReadyLine(int64_t bytes) {
++  return l10n_util::GetStringFUTF16(
++      IDS_TARK_PAGE_TRANSLATE_BUBBLE_GETTING_READY,
++      base::NumberToString16(tark_captions::Megabytes(bytes)));
++}
++
 +std::unique_ptr<views::View> TranslateBubbleView::CreateTarkFootnote(
 +    TranslateBubbleModel::ViewState view_state) {
 +  tark_footnote_text_.clear();
@@ -1099,10 +1194,7 @@ and English. Browser tests: tark_page_translate_browsertest.cc.
 +          : nullptr;
 +  // The download card: the person's Translate waits for the models.
 +  if (page && page->waiting()) {
-+    tark_footnote_text_ = l10n_util::GetStringFUTF16(
-+        IDS_TARK_PAGE_TRANSLATE_BUBBLE_GETTING_READY,
-+        base::NumberToString16(
-+            tark_captions::Megabytes(page->waiting_bytes())));
++    tark_footnote_text_ = TarkGettingReadyLine(page->waiting_bytes());
 +    auto card = std::make_unique<views::Label>(
 +        tark_footnote_text_, views::style::CONTEXT_BUBBLE_FOOTER);
 +    card->SetHorizontalAlignment(gfx::ALIGN_LEFT);
@@ -1114,15 +1206,12 @@ and English. Browser tests: tark_page_translate_browsertest.cc.
 +  }
 +  // "Hindi → English · Show original"; Show original restores the page
 +  // with no reload.
-+  const std::u16string show_original =
-+      l10n_util::GetStringUTF16(IDS_TARK_PAGE_TRANSLATE_BUBBLE_SHOW_ORIGINAL);
 +  std::vector<size_t> offsets;
-+  tark_footnote_text_ = l10n_util::GetStringFUTF16(
-+      IDS_TARK_PAGE_TRANSLATE_BUBBLE_TRANSLATED,
-+      {model_->GetSourceLanguageNameAt(model_->GetSourceLanguageIndex()),
-+       model_->GetTargetLanguageNameAt(model_->GetTargetLanguageIndex()),
-+       show_original},
++  tark_footnote_text_ = TarkTranslatedLine(
++      model_->GetSourceLanguageNameAt(model_->GetSourceLanguageIndex()),
++      model_->GetTargetLanguageNameAt(model_->GetTargetLanguageIndex()),
 +      &offsets);
++  const size_t link_length = tark_footnote_text_.size() - offsets[2];
 +  auto line = std::make_unique<views::StyledLabel>();
 +  line->SetText(tark_footnote_text_);
 +  line->SetTextContext(views::style::CONTEXT_BUBBLE_FOOTER);
@@ -1130,7 +1219,7 @@ and English. Browser tests: tark_page_translate_browsertest.cc.
 +  // Posted: Show original replaces this line, which mustn't go while its
 +  // own link runs.
 +  line->AddStyleRange(
-+      gfx::Range(offsets[2], offsets[2] + show_original.length()),
++      gfx::Range(offsets[2], offsets[2] + link_length),
 +      views::StyledLabel::RangeStyleInfo::CreateForLink(base::BindRepeating(
 +          [](base::WeakPtr<TranslateBubbleView> bubble) {
 +            base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
@@ -1144,7 +1233,7 @@ and English. Browser tests: tark_page_translate_browsertest.cc.
  std::unique_ptr<views::Button> TranslateBubbleView::CreateOptionsMenuButton() {
    // Three dots options menu button
    auto tab_translate_options_button =
-@@ -1163,7 +1213,7 @@
+@@ -1163,7 +1226,7 @@
        view_state == TranslateBubbleModel::VIEW_STATE_TARGET_LANGUAGE) {
      GetBubbleFrameView()->SetFootnoteView(nullptr);
    } else {
@@ -1155,7 +1244,15 @@ and English. Browser tests: tark_page_translate_browsertest.cc.
    SwitchTabForViewState(view_state);
 --- a/chrome/browser/ui/views/translate/translate_bubble_view.h
 +++ b/chrome/browser/ui/views/translate/translate_bubble_view.h
-@@ -11,6 +11,7 @@
+@@ -5,12 +5,15 @@
+ #ifndef CHROME_BROWSER_UI_VIEWS_TRANSLATE_TRANSLATE_BUBBLE_VIEW_H_
+ #define CHROME_BROWSER_UI_VIEWS_TRANSLATE_TRANSLATE_BUBBLE_VIEW_H_
+ 
++#include <cstdint>
+ #include <memory>
+ #include <string>
++#include <vector>
+ 
  #include "base/functional/callback_forward.h"
  #include "base/gtest_prod_util.h"
  #include "base/memory/raw_ptr.h"
@@ -1163,10 +1260,19 @@ and English. Browser tests: tark_page_translate_browsertest.cc.
  #include "base/strings/utf_string_conversions.h"
  #include "chrome/browser/translate/chrome_translate_client.h"
  #include "chrome/browser/ui/translate/source_language_combobox_model.h"
-@@ -94,6 +95,12 @@
+@@ -94,6 +97,21 @@
  
    TranslateBubbleModel* model() { return model_.get(); }
  
++  // Tark: the footnote's lines (CreateTarkFootnote uses these). Translated:
++  // "Hindi → English · Show original", with `offsets` (may be null) at
++  // the three parts, the last being the link. While the models download:
++  // "Getting translation ready · 238 MB" for `bytes`.
++  static std::u16string TarkTranslatedLine(const std::u16string& source_name,
++                                           const std::u16string& target_name,
++                                           std::vector<size_t>* offsets);
++  static std::u16string TarkGettingReadyLine(int64_t bytes);
++
 +  // Tark: the line under the bubble as shown (the download card, or
 +  // "Hindi → English · Show original"); empty with none.
 +  const std::u16string& tark_footnote_text_for_testing() const {
@@ -1176,7 +1282,7 @@ and English. Browser tests: tark_page_translate_browsertest.cc.
    // LocationBarBubbleDelegateView:
    void Init() override;
    View* GetInitiallyFocusedView() override;
-@@ -233,6 +240,11 @@
+@@ -233,6 +251,11 @@
    // should only be used on non-Chrome-branded builds.
    std::unique_ptr<views::ImageView> CreateTranslateIcon();
  
@@ -1188,7 +1294,7 @@ and English. Browser tests: tark_page_translate_browsertest.cc.
    // Creates a three dot options menu button.
    std::unique_ptr<views::Button> CreateOptionsMenuButton();
  
-@@ -331,6 +343,10 @@
+@@ -331,6 +354,10 @@
    std::unique_ptr<WebContentMouseHandler> mouse_handler_;
  
    base::OnceClosure on_closing_;
@@ -1335,18 +1441,28 @@ and English. Browser tests: tark_page_translate_browsertest.cc.
    if (menu_logging) {
      UMA_HISTOGRAM_BOOLEAN("Translate.MenuTranslation.IsAvailable",
                            can_translate);
-@@ -301,6 +317,10 @@
+@@ -301,18 +317,8 @@
  }
  
  bool TranslateManager::CanPartiallyTranslateTargetLanguage() {
+-  std::unique_ptr<TranslatePrefs> translate_prefs(
+-      translate_client_->GetTranslatePrefs());
+-  const std::string& source_language = language_state_.source_language();
+-  const std::string target_lang = GetTargetLanguage(
+-      translate_prefs.get(), language_model_,
+-      TranslateDownloadManager::GetLanguageCode(source_language));
+-
+-  if (target_lang.empty()) {
+-    return false;
+-  }
+-  return TranslateLanguageList::IsSupportedPartialTranslateLanguage(
+-      target_lang);
 +  // Tark: no Partial Translate; it sends the selection to Google's servers.
-+  if ((true)) {
-+    return false;
-+  }
-   std::unique_ptr<TranslatePrefs> translate_prefs(
-       translate_client_->GetTranslatePrefs());
-   const std::string& source_language = language_state_.source_language();
-@@ -391,6 +411,28 @@
++  return false;
+ }
+ 
+ bool TranslateManager::IsMimeTypeSupported(std::string_view mime_type) {
+@@ -391,6 +397,28 @@
      return;
    }
  
@@ -1375,7 +1491,7 @@ and English. Browser tests: tark_page_translate_browsertest.cc.
    translate_driver_->PrepareToTranslatePage(page_seq_no_, original_source_lang,
                                              target_lang, triggered_from_menu);
  
-@@ -978,6 +1020,16 @@
+@@ -978,6 +1006,16 @@
          TriggerDecision::kDisabledURLNotSupported);
    }
  
