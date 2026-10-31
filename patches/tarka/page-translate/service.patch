@@ -169,7 +169,7 @@
      }
      // Codes and sizes only: call content stays out of logs.
      VLOG(1) << "Tark translation: " << source_code << " -> " << (script.empty() ? "-" : script)
-@@ -93,10 +118,73 @@
+@@ -93,10 +118,75 @@
      return result;
    }
  
@@ -214,8 +214,10 @@
 +  Shared(const base::FilePath& ort_dylib, const base::FilePath& models_dir)
 +      : ort_dylib_(ort_dylib),
 +        models_dir_(models_dir),
++        // Sync primitives: a page batch joins its sentence threads.
 +        worker_(base::ThreadPool::CreateSequencedTaskRunner(
-+                    {base::MayBlock(), base::TaskPriority::USER_VISIBLE}),
++                    {base::MayBlock(), base::WithBaseSyncPrimitives(),
++                     base::TaskPriority::USER_VISIBLE}),
 +                ort_dylib,
 +                models_dir) {
 +    g_shared = this;
@@ -246,7 +248,7 @@
  };
  
  // static
-@@ -110,20 +198,21 @@
+@@ -110,20 +200,21 @@
  
  TarkCaptionTranslator::TarkCaptionTranslator(const base::FilePath& ort_dylib,
                                               const base::FilePath& models_dir)
@@ -275,7 +277,7 @@
        .Then(base::BindOnce(
            [](RenderCallback callback, Result result) {
              std::move(callback).Run(result.ok, result.shown, result.translation);
-@@ -131,4 +220,21 @@
+@@ -131,4 +222,21 @@
            std::move(callback)));
  }
  
@@ -407,7 +409,7 @@
 +#endif  // CHROME_SERVICES_SPEECH_TARK_PAGE_BATCH_H_
 --- /dev/null
 +++ b/chrome/services/speech/tark_page_translator.h
-@@ -0,0 +1,152 @@
+@@ -0,0 +1,170 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -443,10 +445,13 @@
 +class TarkTranslationModel {
 + public:
 +  virtual ~TarkTranslationModel() = default;
-+  // A page's sentence (TranslationEngine::TranslatePage).
-+  virtual std::optional<std::string> TranslatePage(std::string_view text,
-+                                                   std::string_view source,
-+                                                   std::string_view target) = 0;
++  // A page's sentences, aligned with `texts`, `parallel` at a time on
++  // threads sharing the model (TranslationEngine::TranslatePages).
++  virtual std::vector<std::optional<std::string>> TranslatePages(
++      const std::vector<std::string>& texts,
++      std::string_view source,
++      std::string_view target,
++      int parallel) = 0;
 +  // The engine, for captions' Render; null in tests.
 +  virtual tark_captions::TranslationEngine* engine() = 0;
 +};
@@ -467,6 +472,13 @@
 +// The page's model unloads after this long without a batch.
 +inline constexpr base::TimeDelta kTarkPageIdleUnload = base::Minutes(3);
 +
++// A model only the page uses runs kTarkPageParallel sentences at once, on
++// kTarkPageOwnThreads ONNX Runtime threads each. Captions' model (and one
++// they share with the page) keeps tark_captions::kTranslationThreads, one
++// sentence at a time, so live captions aren't starved.
++inline constexpr int kTarkPageOwnThreads = 1;
++inline constexpr int kTarkPageParallel = 4;
++
 +// The speech process's one translation model slot, shared by captions'
 +// Render (any number of TarkCaptionTranslators, the "holders") and page
 +// batches (Tark's page translation, ported from Android's PageTranslator).
@@ -480,12 +492,19 @@
 +// A page's model unloads after kTarkPageIdleUnload without a batch, on
 +// ReleasePageModel(), or as soon as captions need the slot. Captions' own
 +// models stay while captions hold them. Each sentence of an item is
-+// translated whole; an item with a failed or empty sentence, or longer than
++// translated whole, every sentence of the batch in one call per leg;
++// an item with a failed or empty sentence, or longer than
 +// kTarkPageMaxItemChars, comes back null (the page keeps the original).
++// A model loads with kTarkPageOwnThreads when only the page uses it (and
++// translates kTarkPageParallel sentences at once), else with captions'
++// thread count; a model loaded for the other kind of use is unloaded first.
++// The sequence must allow base sync primitives (parallel sentences join
++// threads).
 +// Use on one sequence; it blocks while a model loads or decodes.
 +class TarkPageTranslator {
 + public:
-+  using ModelFactory = base::RepeatingCallback<std::unique_ptr<TarkTranslationModel>()>;
++  // Makes the model with `threads` ONNX Runtime intra-op threads per model.
++  using ModelFactory = base::RepeatingCallback<std::unique_ptr<TarkTranslationModel>(int threads)>;
 +  // Whether `direction`'s model is downloaded.
 +  using ModelPresent = base::RepeatingCallback<bool(tark_captions::TranslationDirection)>;
 +
@@ -551,6 +570,7 @@
 +  ModelFactory next_make_;
 +  ModelPresent next_present_;
 +  std::unique_ptr<TarkTranslationModel> model_;
++  int model_threads_ = 0;  // what model_ was made with
 +  TarkDirections loaded_;
 +  std::map<uint64_t, TarkDirections> captions_;
 +  base::OneShotTimer idle_;
@@ -562,7 +582,7 @@
 +#endif  // CHROME_SERVICES_SPEECH_TARK_PAGE_TRANSLATOR_H_
 --- /dev/null
 +++ b/chrome/services/speech/tark_page_translator.cc
-@@ -0,0 +1,360 @@
+@@ -0,0 +1,395 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -603,10 +623,11 @@
 +  explicit EngineModel(std::unique_ptr<tark_captions::TranslationEngine> engine)
 +      : engine_(std::move(engine)) {}
 +
-+  std::optional<std::string> TranslatePage(std::string_view text,
-+                                           std::string_view source,
-+                                           std::string_view target) override {
-+    return engine_->TranslatePage(text, source, target);
++  std::vector<std::optional<std::string>> TranslatePages(const std::vector<std::string>& texts,
++                                                         std::string_view source,
++                                                         std::string_view target,
++                                                         int parallel) override {
++    return engine_->TranslatePages(texts, source, target, parallel);
 +  }
 +  tark_captions::TranslationEngine* engine() override { return engine_.get(); }
 +
@@ -615,9 +636,10 @@
 +};
 +
 +std::unique_ptr<TarkTranslationModel> MakeEngineModel(const base::FilePath& ort_dylib,
-+                                                      const base::FilePath& models_dir) {
++                                                      const base::FilePath& models_dir,
++                                                      int threads) {
 +  std::unique_ptr<tark_captions::TranslationEngine> engine =
-+      tark_captions::TranslationEngine::Create(models_dir, ort_dylib);
++      tark_captions::TranslationEngine::Create(models_dir, ort_dylib, threads);
 +  if (!engine) {
 +    return nullptr;
 +  }
@@ -691,33 +713,69 @@
 +  return sentences;
 +}
 +
-+// A page text goes to the model a sentence at a time, as captions do: the
++// Page texts go to the model a sentence at a time, as captions' do: the
 +// models read at most 255 source tokens and write at most 128, and each
-+// decoder step costs more the longer the output. Any sentence that fails
-+// keeps the whole text original.
-+std::optional<std::string> TranslateText(TarkTranslationModel* model,
-+                                         std::string_view text,
-+                                         std::string_view source,
-+                                         std::string_view target) {
-+  std::string joined;
-+  bool after_line_break = false;
-+  for (const Sentence& sentence : Sentences(text)) {
-+    const std::string_view trimmed = base::TrimWhitespaceASCII(sentence.text, base::TRIM_ALL);
-+    if (trimmed.empty()) {
-+      after_line_break |= sentence.line_break;
++// decoder step costs more the longer the output. Every sentence of every
++// text goes in one call (`parallel` at a time); each text is then joined
++// back from its sentences. Any sentence that fails keeps its whole text
++// original.
++void TranslateTexts(TarkTranslationModel* model,
++                    std::vector<std::optional<std::string>>& texts,
++                    std::string_view source,
++                    std::string_view target,
++                    int parallel) {
++  struct Piece {
++    size_t text;            // index into `texts`
++    bool after_line_break;  // a "\n" goes before it
++  };
++  std::vector<std::string> sentences;
++  std::vector<Piece> pieces;
++  for (size_t i = 0; i < texts.size(); ++i) {
++    if (!texts[i]) {
 +      continue;
 +    }
-+    std::optional<std::string> done = Checked(model->TranslatePage(trimmed, source, target));
-+    if (!done) {
-+      return std::nullopt;
++    bool after_line_break = false;
++    for (const Sentence& sentence : Sentences(*texts[i])) {
++      const std::string_view trimmed = base::TrimWhitespaceASCII(sentence.text, base::TRIM_ALL);
++      if (trimmed.empty()) {
++        after_line_break |= sentence.line_break;
++        continue;
++      }
++      sentences.emplace_back(trimmed);
++      pieces.push_back({i, after_line_break});
++      after_line_break = sentence.line_break;
 +    }
-+    if (!joined.empty()) {
-+      joined += after_line_break ? '\n' : ' ';  // the page's line breaks stay
-+    }
-+    joined += *done;
-+    after_line_break = sentence.line_break;
 +  }
-+  return Checked(std::move(joined));
++  std::vector<std::optional<std::string>> done;
++  if (!sentences.empty()) {
++    done = model->TranslatePages(sentences, source, target, parallel);
++    if (done.size() != sentences.size()) {
++      done.assign(sentences.size(), std::nullopt);  // a broken model fails them all
++    }
++  }
++  std::vector<std::string> joined(texts.size());
++  std::vector<bool> failed(texts.size(), false);
++  for (size_t k = 0; k < pieces.size(); ++k) {
++    const Piece& piece = pieces[k];
++    if (failed[piece.text]) {
++      continue;
++    }
++    std::optional<std::string> sentence = Checked(std::move(done[k]));
++    if (!sentence) {
++      failed[piece.text] = true;
++      continue;
++    }
++    std::string& text = joined[piece.text];
++    if (!text.empty()) {
++      text += piece.after_line_break ? '\n' : ' ';  // the page's line breaks stay
++    }
++    text += *sentence;
++  }
++  for (size_t i = 0; i < texts.size(); ++i) {
++    if (texts[i]) {
++      texts[i] = failed[i] ? std::nullopt : Checked(std::move(joined[i]));
++    }
++  }
 +}
 +
 +// The items as they go to the first leg: null when an item is too long, or
@@ -836,11 +894,7 @@
 +      return batch;
 +    }
 +    std::vector<std::optional<std::string>> texts = Admitted(items);
-+    for (std::optional<std::string>& text : texts) {
-+      if (text) {
-+        text = TranslateText(model, *text, source, target);
-+      }
-+    }
++    TranslateTexts(model, texts, source, target, /*parallel=*/1);  // beside captions
 +    batch.results = std::move(texts);
 +    DVLOG(1) << "tark-page: shared batch items=" << items.size()
 +             << " ms=" << (base::TimeTicks::Now() - start).InMilliseconds();
@@ -855,11 +909,7 @@
 +      batch.status = Status::kModelMissing;
 +      return batch;
 +    }
-+    for (std::optional<std::string>& text : texts) {
-+      if (text) {
-+        text = TranslateText(model, *text, leg.source, leg.target);
-+      }
-+    }
++    TranslateTexts(model, texts, leg.source, leg.target, kTarkPageParallel);
 +  }
 +  batch.results = std::move(texts);
 +  // Codes and sizes only: page content stays out of logs.
@@ -888,14 +938,18 @@
 +    const TarkDirections held = CaptionsHold();
 +    wanted.insert(held.begin(), held.end());
 +  }
-+  if (!std::ranges::includes(wanted, loaded_)) {
++  // Captions (and the page on captions' model) run beside speech
++  // recognition; a page alone runs sentences in parallel instead.
++  const int threads = keep_captions ? tark_captions::kTranslationThreads : kTarkPageOwnThreads;
++  if (!std::ranges::includes(wanted, loaded_) || (model_ && model_threads_ != threads)) {
 +    Unload();  // never a model nobody needs next to the one that loads
 +  }
 +  if (!model_) {
-+    model_ = make_.Run();
++    model_ = make_.Run(threads);
 +    if (!model_) {
 +      return nullptr;
 +    }
++    model_threads_ = threads;
 +  }
 +  loaded_.insert(directions.begin(), directions.end());
 +  return model_.get();
@@ -903,6 +957,7 @@
 +
 +void TarkPageTranslator::Unload() {
 +  model_.reset();
++  model_threads_ = 0;
 +  loaded_.clear();
 +  if (next_make_) {
 +    make_ = std::move(next_make_);
@@ -925,7 +980,7 @@
 +}  // namespace speech
 --- /dev/null
 +++ b/chrome/services/speech/tark_page_translator_unittest.cc
-@@ -0,0 +1,442 @@
+@@ -0,0 +1,503 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -944,6 +999,7 @@
 +#include "base/files/scoped_temp_dir.h"
 +#include "base/functional/bind.h"
 +#include "base/memory/raw_ptr.h"
++#include "base/strings/string_number_conversions.h"
 +#include "base/test/task_environment.h"
 +#include "base/test/test_future.h"
 +#include "chrome/services/speech/tark_caption_translator.h"
@@ -966,6 +1022,8 @@
 +  int made = 0;
 +  std::vector<std::string> events;  // "make", "use:<source>-><target>", "unload"
 +  std::vector<std::string> received;
++  std::vector<std::string> batches;  // "<source>-><target>:<sentences>x<parallel>", a call each
++  std::vector<int> threads;          // each model's, as made
 +  std::string fail;   // this text comes back nullopt
 +  std::string blank;  // this text comes back ""
 +  bool factory_fails = false;
@@ -975,7 +1033,8 @@
 +
 +class FakeModel : public TarkTranslationModel {
 + public:
-+  explicit FakeModel(Models* models) : models_(models) {
++  FakeModel(Models* models, int threads) : models_(models) {
++    models_->threads.push_back(threads);
 +    ++models_->made;
 +    ++models_->alive;
 +    models_->most_alive = std::max(models_->most_alive, models_->alive);
@@ -987,9 +1046,25 @@
 +    models_->events.push_back("unload");
 +  }
 +
-+  std::optional<std::string> TranslatePage(std::string_view text,
-+                                           std::string_view source,
-+                                           std::string_view target) override {
++  std::vector<std::optional<std::string>> TranslatePages(const std::vector<std::string>& texts,
++                                                         std::string_view source,
++                                                         std::string_view target,
++                                                         int parallel) override {
++    models_->batches.push_back(std::string(source) + "->" + std::string(target) + ":" +
++                               base::NumberToString(texts.size()) + "x" +
++                               base::NumberToString(parallel));
++    std::vector<std::optional<std::string>> out;
++    for (const std::string& text : texts) {
++      out.push_back(TranslateOne(text, source, target));
++    }
++    return out;
++  }
++  tark_captions::TranslationEngine* engine() override { return nullptr; }
++
++ private:
++  std::optional<std::string> TranslateOne(std::string_view text,
++                                          std::string_view source,
++                                          std::string_view target) {
 +    const std::string use = "use:" + std::string(source) + "->" + std::string(target);
 +    if (!std::ranges::contains(uses_, use)) {
 +      uses_.push_back(use);
@@ -1004,9 +1079,7 @@
 +    }
 +    return std::string(target) + ":" + std::string(text);
 +  }
-+  tark_captions::TranslationEngine* engine() override { return nullptr; }
 +
-+ private:
 +  raw_ptr<Models> models_;
 +  std::vector<std::string> uses_;
 +};
@@ -1015,11 +1088,11 @@
 + protected:
 +  TarkPageTranslatorTest()
 +      : page_(base::BindRepeating(
-+                  [](Models* models) -> std::unique_ptr<TarkTranslationModel> {
++                  [](Models* models, int threads) -> std::unique_ptr<TarkTranslationModel> {
 +                    if (models->factory_fails) {
 +                      return nullptr;
 +                    }
-+                    return std::make_unique<FakeModel>(models);
++                    return std::make_unique<FakeModel>(models, threads);
 +                  },
 +                  base::Unretained(&models_)),
 +              base::BindRepeating(
@@ -1241,9 +1314,9 @@
 +  Translate("en", "hi", {"one"});
 +  page_.SetModelSource(
 +      base::BindRepeating(
-+          [](Models* models) -> std::unique_ptr<TarkTranslationModel> {
++          [](Models* models, int threads) -> std::unique_ptr<TarkTranslationModel> {
 +            ++models->other_made;
-+            return std::make_unique<FakeModel>(models);
++            return std::make_unique<FakeModel>(models, threads);
 +          },
 +          base::Unretained(&models_)),
 +      base::BindRepeating([](TranslationDirection) { return true; }));
@@ -1264,6 +1337,49 @@
 +  EXPECT_EQ(models_.events, (std::vector<std::string>{"make", "unload", "make"}));
 +  EXPECT_EQ(models_.most_alive, 1);
 +  EXPECT_EQ(page_.LoadedForTesting(), TarkDirections{TranslationDirection::kEnglishToIndic});
++}
++
++// Every sentence of every item goes to the model in one call per leg,
++// kTarkPageParallel at a time, and comes back to its own item, in order.
++TEST_F(TarkPageTranslatorTest, OneBatchedCallPerLeg) {
++  const TarkPageTranslator::PageBatch batch =
++      Translate("hi", "ta", {"एक। दो।", "तीन", "  ", "चार\nपाँच"});
++  EXPECT_EQ(batch.results, (Results{"ta:en:एक। ta:en:दो।", "ta:en:तीन", std::nullopt,
++                                    "ta:en:चार\nta:en:पाँच"}));
++  EXPECT_EQ(models_.batches, (std::vector<std::string>{"hi->en:5x4", "en->ta:5x4"}));
++}
++
++// On captions' model the pair is one call (TranslatePages takes both hops),
++// one sentence at a time beside live captions.
++TEST_F(TarkPageTranslatorTest, SharedModelOneBatchedCall) {
++  ASSERT_TRUE(page_.ForCaptions(
++      /*holder=*/1, {TranslationDirection::kIndicToEnglish, TranslationDirection::kEnglishToIndic}));
++  const TarkPageTranslator::PageBatch batch = Translate("hi", "ta", {"एक। दो।", "तीन"});
++  EXPECT_EQ(batch.results, (Results{"ta:एक। ta:दो।", "ta:तीन"}));
++  EXPECT_EQ(models_.batches, (std::vector<std::string>{"hi->ta:3x1"}));
++}
++
++// A failed sentence nulls its own item only; the batch's other items keep
++// their translations.
++TEST_F(TarkPageTranslatorTest, FailedSentenceNullsOnlyItsItem) {
++  models_.fail = "दो।";
++  const TarkPageTranslator::PageBatch batch = Translate("hi", "en", {"एक। दो। तीन।", "चार।"});
++  EXPECT_EQ(batch.results, (Results{std::nullopt, "en:चार।"}));
++  EXPECT_EQ(models_.batches, (std::vector<std::string>{"hi->en:4x4"}));
++}
++
++// A model only the page uses gets kTarkPageOwnThreads; captions' (and one the
++// page shares with them) keeps captions' count, so captions taking over the
++// page's model reload it.
++TEST_F(TarkPageTranslatorTest, PageOwnModelGetsMoreThreads) {
++  Translate("hi", "en", {"एक"});
++  ASSERT_TRUE(page_.ForCaptions(/*holder=*/1, {TranslationDirection::kIndicToEnglish}));
++  Translate("hi", "en", {"दो"});
++  EXPECT_EQ(models_.threads, (std::vector<int>{kTarkPageOwnThreads,
++                                               tark_captions::kTranslationThreads}));
++  EXPECT_EQ(models_.events, (std::vector<std::string>{"make", "use:hi->en", "unload", "make",
++                                                     "use:hi->en"}));
++  EXPECT_EQ(models_.most_alive, 1);
 +}
 +
 +TEST_F(TarkPageTranslatorTest, Legs) {
