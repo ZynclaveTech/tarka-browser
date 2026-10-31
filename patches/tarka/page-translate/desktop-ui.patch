@@ -1,0 +1,1771 @@
+Tark page translation on the desktop (Mac, Windows, Linux): the Translate
+surfaces (ported from Android's page-translate-ui.patch; not on Android, see
+android/desktop-only-patches.txt). "The Mac" below stands for the computer
+on Windows and Linux too; Settings' line says "this PC" there.
+
+Translate is offered (the omnibox icon and bubble, "Translate to …" in the
+page's menu, Translate in the app menu) only where Tark's own translator
+can translate the page: Settings › Languages › Page translation on, a
+language pair the Mac has a model for (TarkPageTranslation::CanOffer; no
+Spanish on the Mac), and in a Private window only with the models already
+here. --translate-script-url is ignored; Partial Translate (Google's) is
+off. TranslateClient gains TarkCanOffer and TarkReadyToTranslate; the
+first Translate of a pair downloads its models from gettarka.com (never
+for an automatic translation) and the bubble shows "Getting translation
+ready · N MB" (the manifest's size) until they are here. Translated, the
+bubble's line is "Hindi → English · Show original". No Google branding:
+the plain translate icon, no wordmark, no always-translate rules. The
+Languages page gets the Page translation switch where Google's Translate
+card was (removals/translate.patch). Supported languages: the 22 of India
+and English. Browser tests: tark_page_translate_browsertest.cc; they give
+captions' model store a temporary folder (--tark-captions-models-dir-for-
+testing, honoured only in tests), never the person's own; they build on
+Mac, Windows and Linux.
+
+--- a/chrome/app/tark_captions_strings.grdp
++++ b/chrome/app/tark_captions_strings.grdp
+@@ -160,4 +160,26 @@
+   <message name="IDS_TARK_CAPTIONS_OPEN_SETTINGS" desc="Call captions pill: button that opens macOS System Settings where translation languages are added.">
+     Open Settings
+   </message>
++  <message name="IDS_TARK_PAGE_TRANSLATE_BUBBLE_TRANSLATED" desc="Tark page translation: the line under the translate bubble once the page is translated on the computer. $1 is the page's language, $2 the language it is now in, $3 the Show original link (IDS_TARK_PAGE_TRANSLATE_BUBBLE_SHOW_ORIGINAL).">
++    <ph name="SOURCE">$1<ex>Hindi</ex></ph> → <ph name="TARGET">$2<ex>English</ex></ph> · <ph name="SHOW_ORIGINAL">$3<ex>Show original</ex></ph>
++  </message>
++  <message name="IDS_TARK_PAGE_TRANSLATE_BUBBLE_SHOW_ORIGINAL" desc="Tark page translation: link under the translate bubble that puts the page back as it was, with no reload.">
++    Show original
++  </message>
++  <message name="IDS_TARK_PAGE_TRANSLATE_BUBBLE_GETTING_READY" desc="Tark page translation: under the translate bubble while the translation model downloads, the first time a language pair is translated. $1 is its size in megabytes.">
++    Getting translation ready · <ph name="SIZE">$1<ex>238</ex></ph> MB
++  </message>
++  <message name="IDS_SETTINGS_TARK_PAGE_TRANSLATION" desc="Settings › Languages: the switch for translating web pages with Tark's own translation model, on the computer.">
++    Page translation
++  </message>
++  <if expr="is_macosx">
++    <message name="IDS_SETTINGS_TARK_PAGE_TRANSLATION_DESC" desc="Settings › Languages: the line under the Page translation switch.">
++      Translates pages on your Mac with Tark's own model. Pages never leave your Mac.
++    </message>
++  </if>
++  <if expr="not is_macosx">
++    <message name="IDS_SETTINGS_TARK_PAGE_TRANSLATION_DESC" desc="Settings › Languages: the line under the Page translation switch.">
++      Translates pages on this PC with Tark's own model. Pages never leave this PC.
++    </message>
++  </if>
+ </grit-part>
+--- a/chrome/browser/extensions/api/settings_private/prefs_util.cc
++++ b/chrome/browser/extensions/api/settings_private/prefs_util.cc
+@@ -1211,6 +1211,9 @@
+       settings_api::PrefType::kBoolean;
+   // Tark: protected content (Widevine), opt-in.
+   (*s_allowlist)["tark.widevine_enabled"] = settings_api::PrefType::kBoolean;
++  // Tark: Settings > Languages > Page translation (Tark's own translator).
++  (*s_allowlist)["tark.page_translation.enabled"] =
++      settings_api::PrefType::kBoolean;
+ #if BUILDFLAG(IS_WIN)
+   (*s_allowlist)[::prefs::kForegroundLaunchOnLogin] =
+       settings_api::PrefType::kBoolean;
+--- a/chrome/browser/renderer_context_menu/render_view_context_menu.cc
++++ b/chrome/browser/renderer_context_menu/render_view_context_menu.cc
+@@ -2711,8 +2711,9 @@
+     menu_model_.AddSeparator(ui::NORMAL_SEPARATOR);
+   }
+ 
++  // Tark for Mac: Tark's own translator, wherever CanTranslate says it can
++  // translate the page; --translate-script-url is ignored.
+   if (CanTranslate(/*menu_logging=*/true)) {
+-   if (base::CommandLine::ForCurrentProcess()->HasSwitch(translate::switches::kTranslateScriptURL))
+     AppendTranslateItem();
+   }
+ }
+--- a/chrome/browser/resources/settings/languages_page/languages_page_index.html.ts
++++ b/chrome/browser/resources/settings/languages_page/languages_page_index.html.ts
+@@ -18,6 +18,15 @@
+       route-path="${this.routes_.SPELL_CHECK.path}">
+   </settings-spell-check-page>
+ 
++  <!-- Tark: where Google's Translate card was. -->
++  <settings-section slot="view" id="translate">
++    <settings-toggle-button id="tarkPageTranslation"
++        pref-key="tark.page_translation.enabled"
++        label="$i18n{tarkPageTranslation}"
++        sub-label="$i18n{tarkPageTranslationDesc}">
++    </settings-toggle-button>
++  </settings-section>
++
+ <if expr="not is_macosx">
+   <settings-edit-dictionary-page slot="view" id="editDictionary"
+       data-parent-view-id="spellCheck"
+--- a/chrome/browser/resources/settings/languages_page/languages_page_index.ts
++++ b/chrome/browser/resources/settings/languages_page/languages_page_index.ts
+@@ -3,6 +3,8 @@
+ // found in the LICENSE file.
+ 
+ import 'chrome://resources/cr_elements/cr_view_manager/cr_view_manager.js';
++import '../controls/settings_toggle_button.js';
++import '../settings_page/settings_section.js';
+ import './languages_page.js';
+ import './spell_check_page.js';
+ // <if expr="not is_macosx">
+@@ -55,7 +57,7 @@
+ 
+   private showDefaultViews_() {
+     this.$.viewManager.switchViews(
+-        ['languages', 'spellCheck'], 'no-animation',
++        ['languages', 'spellCheck', 'translate'], 'no-animation',
+         'no-animation');
+   }
+ 
+--- a/chrome/browser/tark_captions/caption_models.cc
++++ b/chrome/browser/tark_captions/caption_models.cc
+@@ -6,7 +6,9 @@
+ 
+ #include <memory>
+ 
++#include "base/check_is_test.h"
+ #include "base/command_line.h"
++#include "base/files/file_path.h"
+ #include "base/no_destructor.h"
+ #include "chrome/browser/browser_process.h"
+ #include "chrome/browser/speech/chrome_speech_recognition_service.h"
+@@ -19,6 +21,18 @@
+ 
+ constexpr char kModelsUrlSwitch[] = "tark-captions-models-url";
+ constexpr char kModelsUrl[] = "https://gettarka.com/models/captions/v1/";
++// Tests only (kModelsDirSwitch): the models folder, instead of the
++// person's own under Application Support.
++constexpr char kModelsDirSwitch[] = "tark-captions-models-dir-for-testing";
++
++base::FilePath ModelsDir() {
++  const base::CommandLine& command_line = *base::CommandLine::ForCurrentProcess();
++  if (command_line.HasSwitch(kModelsDirSwitch)) {
++    CHECK_IS_TEST();
++    return command_line.GetSwitchValuePath(kModelsDirSwitch);
++  }
++  return speech::ChromeSpeechRecognitionService::TarkCaptionsModelsDir();
++}
+ 
+ constexpr net::NetworkTrafficAnnotationTag kAnnotation =
+     net::DefineNetworkTrafficAnnotation("tark_captions_models", R"(
+@@ -49,7 +63,7 @@
+ 
+ CaptionModelStore& TarkCaptionModels() {
+   static base::NoDestructor<CaptionModelStore> store(
+-      speech::ChromeSpeechRecognitionService::TarkCaptionsModelsDir(),
++      ModelsDir(),
+       g_browser_process->shared_url_loader_factory(),
+       GURL(base::CommandLine::ForCurrentProcess()->HasSwitch(kModelsUrlSwitch)
+                ? base::CommandLine::ForCurrentProcess()->GetSwitchValueASCII(kModelsUrlSwitch)
+--- /dev/null
++++ b/chrome/browser/tark_captions/tark_page_translate_browsertest.cc
+@@ -0,0 +1,626 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// Tark's desktop page translation (Mac, Windows, Linux) in the browser: the
++// offer (omnibox icon, bubble, menus) only where Tark's own translator can
++// translate, Settings › Languages › Page translation, the download card,
++// Private windows, the host's refusal of batches nobody started, and no
++// request anywhere but gettarka.com/models. The speech process is replaced
++// by a fake translator at the bridge (TarkPageTranslateHost::
++// SetTranslatorForTesting); whether the models are on the computer by
++// TarkPageTranslation::SetModelsForTesting.
++
++#include <memory>
++#include <optional>
++#include <string>
++#include <vector>
++
++#include "base/files/scoped_temp_dir.h"
++#include "base/functional/bind.h"
++#include "base/logging.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/synchronization/lock.h"
++#include "base/test/bind.h"
++#include "base/test/run_until.h"
++#include "base/test/test_future.h"
++#include "base/threading/thread_restrictions.h"
++#include "base/thread_annotations.h"
++#include "chrome/app/chrome_command_ids.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/tark_captions/caption_models.h"
++#include "chrome/browser/tark_captions/page_translation_prefs.h"
++#include "chrome/browser/tark_captions/tark_page_translate_host.h"
++#include "chrome/browser/tark_captions/tark_page_translation.h"
++#include "chrome/browser/translate/chrome_translate_client.h"
++#include "chrome/browser/ui/browser.h"
++#include "chrome/browser/ui/browser_commands.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/tabs/tab_enums.h"
++#include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "chrome/browser/ui/toolbar/app_menu_model.h"
++#include "chrome/browser/ui/views/translate/translate_bubble_controller.h"
++#include "chrome/browser/ui/views/translate/translate_bubble_view.h"
++#include "chrome/test/base/in_process_browser_test.h"
++#include "chrome/test/base/ui_test_utils.h"
++#include "components/language/core/browser/pref_names.h"
++#include "components/prefs/pref_service.h"
++#include "components/tark_captions/caption_model_store.h"
++#include "components/tark_captions/model_manifest.h"
++#include "components/translate/core/browser/language_state.h"
++#include "components/translate/core/browser/translate_manager.h"
++#include "components/translate/content/common/tark_page_translate.mojom.h"
++#include "components/translate/core/common/translate_switches.h"
++#include "content/public/browser/navigation_controller.h"
++#include "content/public/browser/navigation_entry.h"
++#include "content/public/browser/render_frame_host.h"
++#include "content/public/browser/web_contents.h"
++#include "content/public/test/browser_test.h"
++#include "content/public/test/browser_test_utils.h"
++#include "content/public/test/test_utils.h"
++#include "content/public/test/url_loader_interceptor.h"
++#include "mojo/public/cpp/bindings/pending_receiver.h"
++#include "mojo/public/cpp/bindings/pending_remote.h"
++#include "mojo/public/cpp/bindings/remote.h"
++#include "net/test/embedded_test_server/embedded_test_server.h"
++#include "net/test/embedded_test_server/http_request.h"
++#include "net/test/embedded_test_server/http_response.h"
++#include "services/network/public/mojom/url_loader.mojom.h"
++#include "testing/gtest/include/gtest/gtest.h"
++#include "ui/base/window_open_disposition.h"
++
++namespace tark_captions {
++namespace {
++
++constexpr char kHindiPage[] =
++    "<!doctype html><html lang=\"hi\"><head><meta charset=\"utf-8\">"
++    "<title>पन्ना</title></head><body>"
++    "<p id=\"a\">भारत एक विशाल देश है। यहाँ अनेक भाषाएँ बोली जाती हैं।</p>"
++    "<p id=\"b\">हिंदी भारत की सबसे अधिक बोली जाने वाली भाषा है।</p>"
++    "</body></html>";
++
++// Spanish: Tark has no Spanish model on the computer, so nothing is offered.
++constexpr char kSpanishPage[] =
++    "<!doctype html><html lang=\"es\"><head><meta charset=\"utf-8\">"
++    "<title>Página</title></head><body>"
++    "<p id=\"a\">España es un país grande donde se hablan muchas lenguas "
++    "todos los días en ciudades y pueblos de todo el territorio.</p>"
++    "</body></html>";
++
++// The fake translator: "EN:" before each text.
++std::string Fake(const std::string& text) {
++  return "EN:" + text;
++}
++
++std::unique_ptr<net::test_server::HttpResponse> ServePages(
++    const net::test_server::HttpRequest& request) {
++  const char* content = nullptr;
++  if (request.relative_url == "/hi.html") {
++    content = kHindiPage;
++  } else if (request.relative_url == "/es.html") {
++    content = kSpanishPage;
++  } else {
++    return nullptr;
++  }
++  auto response = std::make_unique<net::test_server::BasicHttpResponse>();
++  response->set_content_type("text/html; charset=utf-8");
++  response->set_content(content);
++  return response;
++}
++
++class TarkPageTranslateBrowserTest : public InProcessBrowserTest {
++ protected:
++  ~TarkPageTranslateBrowserTest() override {
++    base::ScopedAllowBlockingForTesting allow_blocking;
++    EXPECT_TRUE(models_dir_.Delete());
++  }
++
++  // Captions' model store (TarkCaptionModels, made on first use, after this)
++  // uses an empty folder of the test's, never the person's own.
++  void SetUpCommandLine(base::CommandLine* command_line) override {
++    InProcessBrowserTest::SetUpCommandLine(command_line);
++    base::ScopedAllowBlockingForTesting allow_blocking;
++    ASSERT_TRUE(models_dir_.CreateUniqueTempDir());
++    command_line->AppendSwitchPath("tark-captions-models-dir-for-testing",
++                                   models_dir_.GetPath());
++  }
++
++  void SetUpOnMainThread() override {
++    // Every http(s) request from as early as a test can: the test server's
++    // are fine; gettarka.com/models (the models' download) is held, never
++    // answered; anything else fails the test (TearDownOnMainThread).
++    interceptor_ = std::make_unique<content::URLLoaderInterceptor>(
++        base::BindLambdaForTesting(
++            [this](content::URLLoaderInterceptor::RequestParams* params) {
++              const GURL& url = params->url_request.url;
++              if (!url.SchemeIsHTTPOrHTTPS() || url.host() == "127.0.0.1" ||
++                  url.host() == "localhost") {
++                return false;
++              }
++              base::AutoLock lock(lock_);
++              if (url.host() == "gettarka.com" &&
++                  url.path().starts_with("/models/")) {
++                // Kept open, never answered: the download stays pending.
++                // (Pending ends, so they may be let go on any thread.)
++                held_loaders_.push_back(std::move(params->receiver));
++                held_.push_back(params->client.Unbind());
++                return true;
++              }
++              unexpected_.push_back(url.spec());
++              return true;  // never reaches the network
++            }));
++    InProcessBrowserTest::SetUpOnMainThread();
++    embedded_test_server()->RegisterRequestHandler(
++        base::BindRepeating(&ServePages));
++    ASSERT_TRUE(embedded_test_server()->Start());
++    TarkPageTranslateHost::SetTranslatorForTesting(base::BindRepeating(
++        &TarkPageTranslateBrowserTest::FakeTranslate, base::Unretained(this)));
++    TarkPageTranslation::SetModelsForTesting(true);
++  }
++
++  void TearDownOnMainThread() override {
++    TarkPageTranslateHost::SetTranslatorForTesting({});
++    TarkPageTranslation::SetModelsForTesting(std::nullopt);
++    {
++      base::AutoLock lock(lock_);
++      EXPECT_TRUE(unexpected_.empty())
++          << "requested: " << (unexpected_.empty() ? "" : unexpected_[0]);
++      held_.clear();
++      held_loaders_.clear();
++    }
++    interceptor_.reset();
++    InProcessBrowserTest::TearDownOnMainThread();
++  }
++
++  void FakeTranslate(
++      std::vector<std::string> texts,
++      std::string source,
++      std::string target,
++      base::OnceCallback<void(std::vector<std::optional<std::string>>)> done) {
++    ++batches_;
++    std::vector<std::optional<std::string>> results;
++    for (const std::string& text : texts) {
++      results.push_back(Fake(text));
++    }
++    std::move(done).Run(std::move(results));
++  }
++
++  content::WebContents* web_contents() {
++    return browser()->tab_strip_model()->GetActiveWebContents();
++  }
++
++  translate::TranslateManager* manager(content::WebContents* contents) {
++    return ChromeTranslateClient::FromWebContents(contents)
++        ->GetTranslateManager();
++  }
++  translate::TranslateManager* manager() { return manager(web_contents()); }
++
++  PrefService* prefs() { return browser()->profile()->GetPrefs(); }
++
++  // The tab's page translation (ChromeTranslateClient makes it as soon as
++  // translate asks whether to offer; made here in case it hasn't yet).
++  TarkPageTranslation* Page(content::WebContents* contents) {
++    TarkPageTranslation::CreateForWebContents(contents);
++    return TarkPageTranslation::FromWebContents(contents);
++  }
++  TarkPageTranslation* Page() { return Page(web_contents()); }
++
++  // Loads a page in `contents` and waits until translate has its language.
++  void Load(content::WebContents* contents,
++            const std::string& path,
++            const std::string& language) {
++    ASSERT_TRUE(content::NavigateToURL(
++        contents, embedded_test_server()->GetURL(path)));
++    ASSERT_TRUE(base::test::RunUntil([&] {
++      return manager(contents)->GetLanguageState()->source_language() ==
++             language;
++    }));
++  }
++  void LoadHindiPage() { Load(web_contents(), "/hi.html", "hi"); }
++
++  std::string Text(content::WebContents* contents, const std::string& id) {
++    return content::EvalJs(contents, "document.getElementById('" + id +
++                                         "').textContent")
++        .ExtractString();
++  }
++  std::string Text(const std::string& id) { return Text(web_contents(), id); }
++
++  // Waits (in the page) until the element's text is `expected`.
++  bool WaitForText(content::WebContents* contents,
++                   const std::string& id,
++                   const std::string& expected) {
++    return content::EvalJs(
++               contents,
++               content::JsReplace(
++                   "new Promise(resolve => {"
++                   "  const check = () => {"
++                   "    if (document.getElementById($1).textContent === $2) {"
++                   "      resolve(true);"
++                   "    } else {"
++                   "      setTimeout(check, 50);"
++                   "    }"
++                   "  };"
++                   "  check();"
++                   "})",
++                   id, expected))
++        .ExtractBool();
++  }
++  bool WaitForText(const std::string& id, const std::string& expected) {
++    return WaitForText(web_contents(), id, expected);
++  }
++
++  size_t HeldDownloads() {
++    base::AutoLock lock(lock_);
++    return held_.size();
++  }
++
++  // The models' download answers with an error (the connection drops).
++  void FailHeldDownloads() {
++    base::AutoLock lock(lock_);
++    held_.clear();
++    held_loaders_.clear();
++  }
++
++  // The bubble, when it shows: only in the last active window, which
++  // browser_tests don't promise (interactive_ui_tests do).
++  TranslateBubbleView* Bubble() {
++    TranslateBubbleController* controller =
++        TranslateBubbleController::From(browser());
++    return controller ? controller->GetTranslateBubble() : nullptr;
++  }
++
++  bool AppMenuHasTranslate() {
++    AppMenuModel model(nullptr, browser());
++    model.Init();
++    return model.GetIndexOfCommandId(IDC_SHOW_TRANSLATE).has_value();
++  }
++
++  base::ScopedTempDir models_dir_;
++  base::Lock lock_;
++  std::unique_ptr<content::URLLoaderInterceptor> interceptor_;
++  std::vector<mojo::PendingRemote<network::mojom::URLLoaderClient>> held_
++      GUARDED_BY(lock_);
++  std::vector<mojo::PendingReceiver<network::mojom::URLLoader>> held_loaders_
++      GUARDED_BY(lock_);
++  std::vector<std::string> unexpected_ GUARDED_BY(lock_);
++  int batches_ = 0;
++};
++
++// The person's Translate changes the page in place, Show original puts it
++// back, with no reload either way; the bubble says "Hindi → English · Show
++// original".
++IN_PROC_BROWSER_TEST_F(TarkPageTranslateBrowserTest,
++                       TranslatesAndRevertsWithoutReload) {
++  LoadHindiPage();
++  const std::string a = Text("a");
++  const std::string b = Text("b");
++  // A mark in the page's own world that a reload would wipe.
++  ASSERT_TRUE(content::ExecJs(web_contents(), "window.tarkMark = 7;"));
++  content::NavigationController& controller = web_contents()->GetController();
++  const int entries = controller.GetEntryCount();
++  const int entry_id = controller.GetLastCommittedEntry()->GetUniqueID();
++
++  // Offered: the icon (translate_enabled) and the menus.
++  EXPECT_TRUE(manager()->GetLanguageState()->translate_enabled());
++  EXPECT_TRUE(manager()->CanManuallyTranslate(/*menu_logging=*/false));
++
++  TarkPageTranslation* page = Page();
++  ASSERT_TRUE(page);
++  ASSERT_TRUE(page->Start("en"));
++  EXPECT_TRUE(WaitForText("a", Fake(a)));
++  EXPECT_TRUE(WaitForText("b", Fake(b)));
++  ASSERT_TRUE(base::test::RunUntil(
++      [&] { return manager()->GetLanguageState()->IsPageTranslated(); }));
++  EXPECT_EQ("en", manager()->GetLanguageState()->current_language());
++  EXPECT_EQ(0u, HeldDownloads());
++
++  if (TranslateBubbleView* bubble = Bubble()) {
++    EXPECT_EQ(u"Hindi → English · Show original",
++              bubble->tark_footnote_text_for_testing());
++  } else {
++    LOG(WARNING) << "No bubble (window not active); its line is unchecked.";
++  }
++
++  page->Revert();
++  EXPECT_TRUE(WaitForText("a", a));
++  EXPECT_TRUE(WaitForText("b", b));
++  EXPECT_FALSE(manager()->GetLanguageState()->IsPageTranslated());
++  EXPECT_EQ(7, content::EvalJs(web_contents(), "window.tarkMark"));
++  EXPECT_EQ(entries, controller.GetEntryCount());
++  EXPECT_EQ(entry_id, controller.GetLastCommittedEntry()->GetUniqueID());
++}
++
++// The renderer is not trusted to start a translation: batches sent to the
++// host before the browser started one (or in another direction) come back
++// as the originals, and never reach the translator.
++IN_PROC_BROWSER_TEST_F(TarkPageTranslateBrowserTest,
++                       HostKeepsOriginalsUntilTheBrowserTranslates) {
++  LoadHindiPage();
++  mojo::Remote<tark::mojom::PageTranslateHost> host;
++  TarkPageTranslateHost::Bind(web_contents()->GetPrimaryMainFrame(),
++                              host.BindNewPipeAndPassReceiver());
++  using Results = std::vector<std::optional<std::string>>;
++  auto send = [&](const std::string& source, const std::string& target) {
++    base::test::TestFuture<const Results&> answer;
++    host->Translate({"नमस्ते"}, source, target, answer.GetCallback());
++    return answer.Get();
++  };
++  EXPECT_EQ(Results{std::nullopt}, send("hi", "en"));
++  EXPECT_EQ(0, batches_);
++  EXPECT_EQ(0u, HeldDownloads());
++
++  ASSERT_TRUE(Page()->Start("en"));
++  ASSERT_TRUE(base::test::RunUntil(
++      [&] { return manager()->GetLanguageState()->IsPageTranslated(); }));
++  const int before = batches_;
++  EXPECT_EQ(Results{std::nullopt}, send("hi", "ta"));  // not this direction
++  EXPECT_EQ(before, batches_);
++  EXPECT_EQ(Results{Fake("नमस्ते")}, send("hi", "en"));
++  EXPECT_EQ(before + 1, batches_);
++
++  // Upstream's revert (not TarkPageTranslation::Revert): originals again.
++  manager()->RevertTranslation();
++  EXPECT_EQ(Results{std::nullopt}, send("hi", "en"));
++  EXPECT_EQ(before + 1, batches_);
++}
++
++// Back from the back/forward cache, a translated page is still translated,
++// and text it adds then is translated too.
++IN_PROC_BROWSER_TEST_F(TarkPageTranslateBrowserTest,
++                       RestoredPageTranslatesLaterText) {
++  LoadHindiPage();
++  const std::string a = Text("a");
++  content::RenderFrameHostWrapper translated_frame(
++      web_contents()->GetPrimaryMainFrame());
++  ASSERT_TRUE(Page()->Start("en"));
++  ASSERT_TRUE(WaitForText("a", Fake(a)));
++  Load(web_contents(), "/es.html", "es");
++  ASSERT_TRUE(content::HistoryGoBack(web_contents()));
++  if (translated_frame.get() != web_contents()->GetPrimaryMainFrame()) {
++    GTEST_SKIP() << "the page was not kept in the back/forward cache";
++  }
++  ASSERT_EQ(Fake(a), Text("a"));
++  const std::string more = "और भी पाठ यहाँ जोड़ा गया है।";
++  ASSERT_TRUE(content::ExecJs(
++      web_contents(),
++      content::JsReplace("const p = document.createElement('p');"
++                         "p.id = 'more';"
++                         "p.textContent = $1;"
++                         "document.body.appendChild(p);",
++                         more)));
++  EXPECT_TRUE(WaitForText("more", Fake(more)));
++}
++
++// The bubble's lines, exactly (the same functions draw them; no window
++// needed): the translated line with its link, and the download card with
++// the manifest's size.
++IN_PROC_BROWSER_TEST_F(TarkPageTranslateBrowserTest, BubbleLinesExact) {
++  std::vector<size_t> offsets;
++  const std::u16string line =
++      TranslateBubbleView::TarkTranslatedLine(u"Hindi", u"English", &offsets);
++  EXPECT_EQ(u"Hindi → English · Show original", line);
++  ASSERT_EQ(3u, offsets.size());
++  EXPECT_EQ(u"Show original", line.substr(offsets[2]));
++  EXPECT_EQ(u"Getting translation ready · 238 MB",
++            TranslateBubbleView::TarkGettingReadyLine(
++                UnitSize(ModelUnit::kToEnglish)));
++  EXPECT_EQ(u"Getting translation ready · 282 MB",
++            TranslateBubbleView::TarkGettingReadyLine(
++                UnitSize(ModelUnit::kFromEnglish)));
++}
++
++// Text the page adds after the translation finished is translated too.
++IN_PROC_BROWSER_TEST_F(TarkPageTranslateBrowserTest, TranslatesLaterText) {
++  LoadHindiPage();
++  const std::string a = Text("a");
++  ASSERT_TRUE(Page()->Start("en"));
++  ASSERT_TRUE(WaitForText("a", Fake(a)));
++  ASSERT_TRUE(base::test::RunUntil(
++      [&] { return manager()->GetLanguageState()->IsPageTranslated(); }));
++  const std::string more = "और भी पाठ यहाँ जोड़ा गया है।";
++  ASSERT_TRUE(content::ExecJs(
++      web_contents(),
++      content::JsReplace("const p = document.createElement('p');"
++                         "p.id = 'more';"
++                         "p.textContent = $1;"
++                         "document.body.appendChild(p);",
++                         more)));
++  EXPECT_TRUE(WaitForText("more", Fake(more)));
++}
++
++// A language Tark can't translate on the computer (Spanish: no model here) is not
++// offered anywhere, and asking anyway does nothing.
++IN_PROC_BROWSER_TEST_F(TarkPageTranslateBrowserTest,
++                       NoOfferForUnsupportedSource) {
++  Load(web_contents(), "/es.html", "es");
++  const std::string a = Text("a");
++  TarkPageTranslation* page = Page();
++  ASSERT_TRUE(page);
++  EXPECT_FALSE(page->CanOffer("es", "en"));
++  EXPECT_FALSE(manager()->GetLanguageState()->translate_enabled());
++  EXPECT_FALSE(manager()->CanManuallyTranslate(/*menu_logging=*/false));
++  EXPECT_FALSE(chrome::IsCommandEnabled(browser(), IDC_SHOW_TRANSLATE));
++
++  EXPECT_FALSE(page->Start("en"));
++  manager()->TranslatePage("es", "en", /*triggered_from_menu=*/true);
++  content::RunAllTasksUntilIdle();
++  EXPECT_EQ(a, Text("a"));
++  EXPECT_EQ(0, batches_);
++  EXPECT_FALSE(manager()->GetLanguageState()->IsPageTranslated());
++  EXPECT_EQ(0u, HeldDownloads());
++}
++
++// Settings › Languages › Page translation off: no icon, no bubble, no
++// Translate in the app menu or the page's menu; on again, all of them.
++IN_PROC_BROWSER_TEST_F(TarkPageTranslateBrowserTest, SwitchOffHidesSurfaces) {
++  ASSERT_TRUE(prefs()->GetBoolean(kPageTranslationEnabledPref));
++  prefs()->SetBoolean(kPageTranslationEnabledPref, false);
++  LoadHindiPage();
++  const std::string a = Text("a");
++  EXPECT_FALSE(manager()->GetLanguageState()->translate_enabled());
++  EXPECT_FALSE(manager()->CanManuallyTranslate(/*menu_logging=*/false));
++  EXPECT_FALSE(chrome::IsCommandEnabled(browser(), IDC_SHOW_TRANSLATE));
++  EXPECT_FALSE(AppMenuHasTranslate());
++  EXPECT_FALSE(Bubble());
++  EXPECT_FALSE(Page()->Start("en"));
++  content::RunAllTasksUntilIdle();
++  EXPECT_EQ(a, Text("a"));
++  EXPECT_EQ(0, batches_);
++
++  prefs()->SetBoolean(kPageTranslationEnabledPref, true);
++  LoadHindiPage();
++  ASSERT_TRUE(base::test::RunUntil(
++      [&] { return manager()->GetLanguageState()->translate_enabled(); }));
++  EXPECT_TRUE(manager()->CanManuallyTranslate(/*menu_logging=*/false));
++  ASSERT_TRUE(base::test::RunUntil(
++      [&] { return chrome::IsCommandEnabled(browser(), IDC_SHOW_TRANSLATE); }));
++  EXPECT_TRUE(AppMenuHasTranslate());
++}
++
++// A Private window translates with models already on the computer and keeps
++// nothing; without them it offers nothing and never downloads.
++IN_PROC_BROWSER_TEST_F(TarkPageTranslateBrowserTest,
++                       PrivateWindowKeepsNothing) {
++  const std::string accept_languages =
++      prefs()->GetString(language::prefs::kAcceptLanguages);
++  BrowserWindowInterface* incognito = CreateIncognitoBrowser();
++  content::WebContents* contents =
++      incognito->GetTabStripModel()->GetActiveWebContents();
++
++  // Without the models: no offer, no download.
++  TarkPageTranslation::SetModelsForTesting(false);
++  Load(contents, "/hi.html", "hi");
++  const std::string a = Text(contents, "a");
++  EXPECT_FALSE(manager(contents)->GetLanguageState()->translate_enabled());
++  EXPECT_FALSE(manager(contents)->CanManuallyTranslate(/*menu_logging=*/false));
++  TarkPageTranslation* page = Page(contents);
++  ASSERT_TRUE(page);
++  EXPECT_FALSE(page->Start("en"));
++  manager(contents)->TranslatePage("hi", "en", /*triggered_from_menu=*/true);
++  content::RunAllTasksUntilIdle();
++  EXPECT_FALSE(page->waiting());
++  EXPECT_EQ(0u, HeldDownloads());
++  EXPECT_EQ(a, Text(contents, "a"));
++
++  // With them: translated as in a regular window.
++  TarkPageTranslation::SetModelsForTesting(true);
++  Load(contents, "/hi.html", "hi");
++  EXPECT_TRUE(manager(contents)->CanManuallyTranslate(/*menu_logging=*/false));
++  ASSERT_TRUE(Page(contents)->Start("en"));
++  EXPECT_TRUE(WaitForText(contents, "a", Fake(a)));
++
++  CloseBrowserSynchronously(incognito);
++  // Nothing of it reached the regular profile.
++  EXPECT_EQ(accept_languages,
++            prefs()->GetString(language::prefs::kAcceptLanguages));
++  EXPECT_EQ(0u, HeldDownloads());
++}
++
++// No request to Google or to any translate server, even with ungoogled's
++// --translate-script-url given: only the test pages (and, on a first
++// Translate, gettarka.com/models).
++class TarkPageTranslateScriptUrlBrowserTest
++    : public TarkPageTranslateBrowserTest {
++ protected:
++  void SetUpCommandLine(base::CommandLine* command_line) override {
++    TarkPageTranslateBrowserTest::SetUpCommandLine(command_line);
++    command_line->AppendSwitchASCII(
++        translate::switches::kTranslateScriptURL,
++        "https://translate.googleapis.com/translate_a/element.js");
++  }
++};
++
++IN_PROC_BROWSER_TEST_F(TarkPageTranslateScriptUrlBrowserTest,
++                       NoRequestToGoogle) {
++  LoadHindiPage();
++  const std::string a = Text("a");
++  ASSERT_TRUE(Page()->Start("en"));
++  ASSERT_TRUE(WaitForText("a", Fake(a)));
++  ASSERT_TRUE(base::test::RunUntil(
++      [&] { return manager()->GetLanguageState()->IsPageTranslated(); }));
++  manager()->RevertTranslation();
++  ASSERT_TRUE(WaitForText("a", a));
++  {
++    base::AutoLock lock(lock_);
++    EXPECT_TRUE(unexpected_.empty())
++        << "requested: " << (unexpected_.empty() ? "" : unexpected_[0]);
++  }
++}
++
++// The first Translate of a pair downloads its models (only gettarka.com) and
++// shows the download card with their size from the manifest; the page is
++// left as it is until they are here.
++IN_PROC_BROWSER_TEST_F(TarkPageTranslateBrowserTest,
++                       DownloadCardWhileModelsCome) {
++  TarkPageTranslation::SetModelsForTesting(false);
++  LoadHindiPage();
++  const std::string a = Text("a");
++  TarkPageTranslation* page = Page();
++  ASSERT_TRUE(page);
++  // As the bubble's, the page menu's and the app menu's Translate do.
++  manager()->TranslatePage("hi", "en", /*triggered_from_menu=*/true);
++  ASSERT_TRUE(page->waiting());
++  EXPECT_EQ("hi", page->waiting()->source);
++  EXPECT_EQ("en", page->waiting()->target);
++  EXPECT_EQ(UnitSize(ModelUnit::kToEnglish), page->waiting_bytes());
++  ASSERT_TRUE(base::test::RunUntil([&] { return HeldDownloads() > 0; }));
++  EXPECT_EQ(a, Text("a"));
++  EXPECT_FALSE(manager()->GetLanguageState()->IsPageTranslated());
++
++  if (TranslateBubbleView* bubble = Bubble()) {
++    EXPECT_EQ(TranslateBubbleView::TarkGettingReadyLine(
++                  UnitSize(ModelUnit::kToEnglish)),
++              bubble->tark_footnote_text_for_testing());
++  } else {
++    LOG(WARNING) << "No bubble (window not active); the card is unchecked.";
++  }
++
++  // Show original: the download no longer translates the page.
++  page->Revert();
++  EXPECT_FALSE(page->waiting());
++}
++
++// Closing the tab while its models download: nothing calls into the closed
++// tab when the download ends (TarkPageTranslation's teardown).
++IN_PROC_BROWSER_TEST_F(TarkPageTranslateBrowserTest,
++                       CloseTabWhileDownloadingIsSafe) {
++  TarkPageTranslation::SetModelsForTesting(false);
++  ASSERT_TRUE(ui_test_utils::NavigateToURLWithDisposition(
++      browser(), embedded_test_server()->GetURL("/hi.html"),
++      WindowOpenDisposition::NEW_FOREGROUND_TAB,
++      ui_test_utils::BROWSER_TEST_WAIT_FOR_LOAD_STOP));
++  content::WebContents* contents = web_contents();
++  ASSERT_TRUE(base::test::RunUntil([&] {
++    return manager(contents)->GetLanguageState()->source_language() == "hi";
++  }));
++  TarkPageTranslation* page = Page(contents);
++  ASSERT_TRUE(page);
++  ASSERT_TRUE(page->Start("en"));
++  ASSERT_TRUE(page->waiting());
++  ASSERT_TRUE(base::test::RunUntil([&] { return HeldDownloads() > 0; }));
++
++  content::WebContentsDestroyedWatcher destroyed(contents);
++  TabStripModel* tabs = browser()->tab_strip_model();
++  tabs->CloseWebContentsAt(tabs->GetIndexOfWebContents(contents),
++                           TabCloseTypes::CLOSE_NONE);
++  destroyed.Wait();
++
++  // The download ends (failed) with the tab gone; the store tells its
++  // observers, none of which is the closed tab's any more.
++  FailHeldDownloads();
++  ASSERT_TRUE(base::test::RunUntil([&] {
++    return TarkCaptionModels().status(ModelUnit::kToEnglish).state !=
++           CaptionModelStore::State::kDownloading;
++  }));
++  content::RunAllTasksUntilIdle();
++
++  // The other tab still translates.
++  TarkPageTranslation::SetModelsForTesting(true);
++  LoadHindiPage();
++  const std::string a = Text("a");
++  ASSERT_TRUE(Page()->Start("en"));
++  EXPECT_TRUE(WaitForText("a", Fake(a)));
++}
++
++}  // namespace
++}  // namespace tark_captions
+--- a/chrome/browser/tark_captions/tark_page_translation.cc
++++ b/chrome/browser/tark_captions/tark_page_translation.cc
+@@ -18,6 +18,8 @@
+ #include "components/tark_captions/model_manifest.h"
+ #include "components/translate/core/browser/language_state.h"
+ #include "components/translate/core/browser/translate_manager.h"
++#include "components/translate/core/browser/translate_step.h"
++#include "components/translate/core/common/translate_errors.h"
+ #include "components/user_prefs/user_prefs.h"
+ #include "content/public/browser/browser_context.h"
+ #include "content/public/browser/page.h"
+@@ -40,6 +42,11 @@
+   return PageTranslation::BatchStatus::kModelMissing;
+ }
+ 
++std::optional<bool>& ModelsForTesting() {
++  static std::optional<bool> on_the_computer;
++  return on_the_computer;
++}
++
+ // The direction a page was translated in (PageTranslation::allowed()), kept
+ // with the page: a back/forward cache restore brings the page back still
+ // translated, and its later text is translated in that direction again.
+@@ -58,6 +65,11 @@
+ 
+ }  // namespace
+ 
++// static
++void TarkPageTranslation::SetModelsForTesting(std::optional<bool> on_the_computer) {
++  ModelsForTesting() = on_the_computer;
++}
++
+ TarkPageTranslation::TarkPageTranslation(content::WebContents* web_contents)
+     : content::WebContentsObserver(web_contents),
+       content::WebContentsUserData<TarkPageTranslation>(*web_contents),
+@@ -89,24 +101,47 @@
+   if (!manager) {
+     return false;
+   }
+-  Direction direction{manager->GetLanguageState()->source_language(), target};
+-  if (!CanOffer(direction.source, direction.target)) {
+-    return false;
++  const Direction direction{manager->GetLanguageState()->source_language(), target};
++  switch (PrepareTranslation(direction.source, direction.target, /*may_download=*/true)) {
++    case Readiness::kReady:
++      TranslateNow(direction);
++      return true;
++    case Readiness::kDownloading:
++      return true;
++    case Readiness::kUnavailable:
++      return false;
++  }
++  return false;
++}
++
++TarkPageTranslation::Readiness TarkPageTranslation::PrepareTranslation(const std::string& source,
++                                                                       const std::string& target,
++                                                                       bool may_download) {
++  if (!CanOffer(source, target)) {
++    return Readiness::kUnavailable;
++  }
++  if (logic_.ModelsReady(source, target)) {
++    StopWaiting();
++    return Readiness::kReady;
++  }
++  if (waiting_ && waiting_->source == source && waiting_->target == target) {
++    return Readiness::kDownloading;  // asked again while it downloads
++  }
++  if (!may_download) {
++    return Readiness::kUnavailable;
+   }
+   StopWaiting();
+-  if (logic_.ModelsReady(direction.source, direction.target)) {
+-    TranslateNow(direction);
+-    return true;
+-  }
+-  // Only the user's Translate downloads (never off the record: CanOffer).
+-  const int64_t bytes = logic_.MissingBytes(direction.source, direction.target);
+-  if (!logic_.RequestModels(direction.source, direction.target)) {
+-    return false;
++  // Only the person's Translate downloads (never off the record: CanOffer).
++  const int64_t bytes = logic_.MissingBytes(source, target);
++  if (!logic_.RequestModels(source, target)) {
++    return Readiness::kUnavailable;
+   }
++  const Direction direction{source, target};
+   waiting_ = direction;
++  waiting_bytes_ = bytes;
+   models_observation_.Observe(&TarkCaptionModels());
+   observers_.Notify(&Observer::OnDownloadNeeded, this, direction, bytes);
+-  return true;
++  return Readiness::kDownloading;
+ }
+ 
+ void TarkPageTranslation::Revert() {
+@@ -130,6 +165,13 @@
+   logic_.Translate(std::move(texts), std::move(source), std::move(target), std::move(callback));
+ }
+ 
++void TarkPageTranslation::OnPageLanguage(const std::string& source, const std::string& target) {
++  // CanOffer's switch and pair checks; Private windows too, from what is on
++  // the computer (WarmOnDetection never downloads).
++  logic_.WarmOnDetection(source, target, Enabled(),
++                         GetWebContents().GetVisibility() != content::Visibility::HIDDEN);
++}
++
+ bool TarkPageTranslation::Allowed(const std::string& source, const std::string& target) const {
+   return logic_.Allowed(source, target);
+ }
+@@ -182,6 +224,12 @@
+   if (TarkCaptionModels().status(unit).state == CaptionModelStore::State::kFailed) {
+     StopWaiting();
+     observers_.Notify(&Observer::OnDownloadFailed, this, direction);
++    // The bubble says the page couldn't be translated (and offers Try again).
++    if (ChromeTranslateClient* client = ChromeTranslateClient::FromWebContents(&GetWebContents())) {
++      client->ShowTranslateUI(translate::TRANSLATE_STEP_TRANSLATE_ERROR, direction.source,
++                              direction.target, translate::TranslateErrors::NETWORK,
++                              /*triggered_from_menu=*/true);
++    }
+     return;
+   }
+   if (!logic_.ModelsReady(direction.source, direction.target)) {
+@@ -202,6 +250,7 @@
+ 
+ void TarkPageTranslation::StopWaiting() {
+   waiting_.reset();
++  waiting_bytes_ = 0;
+   models_observation_.Reset();
+ }
+ 
+@@ -272,6 +321,9 @@
+ }
+ 
+ bool TarkPageTranslation::UnitReady(ModelUnit unit) const {
++  if (ModelsForTesting().has_value()) {
++    return *ModelsForTesting();
++  }
+   return TarkCaptionModels().ready(unit);
+ }
+ 
+--- a/chrome/browser/tark_captions/tark_page_translation.h
++++ b/chrome/browser/tark_captions/tark_page_translation.h
+@@ -80,6 +80,37 @@
+   // translates when it ends.
+   void Revert();
+ 
++  // Translate's TranslatePage asks before translating (ChromeTranslateClient::
++  // TarkReadyToTranslate).
++  enum class Readiness {
++    // The pair's models are on the computer: translate now.
++    kReady,
++    // They are being downloaded for this pair (OnDownloadNeeded); the page is
++    // translated when they are here (TranslatePage again).
++    kDownloading,
++    // Nothing happens: CanOffer is false, or they are missing and
++    // `may_download` is false (an automatic translation never downloads).
++    kUnavailable,
++  };
++  Readiness PrepareTranslation(const std::string& source,
++                               const std::string& target,
++                               bool may_download);
++
++  // The pair Start/PrepareTranslation waits for while its models download,
++  // and how many bytes that download is (the bubble's download card).
++  const std::optional<Direction>& waiting() const { return waiting_; }
++  int64_t waiting_bytes() const { return waiting_bytes_; }
++
++  // Tests: every pair's models count as on the computer (true) or as missing
++  // (false; a download then goes through captions' store as in the product);
++  // nullopt asks the store.
++  static void SetModelsForTesting(std::optional<bool> on_the_computer);
++
++  // Translate found the page's language and is deciding whether to offer
++  // Translate into `target`: warms the pair's model when it may
++  // (PageTranslation::WarmOnDetection).
++  void OnPageLanguage(const std::string& source, const std::string& target);
++
+   // The browser started translating this page from `source` into `target`
+   // (OnTranslationStarting) and the page has not gone or been shown in its
+   // original since. TarkPageTranslateHost answers anything else with the
+@@ -143,8 +174,9 @@
+   const raw_ptr<PrefService> prefs_;
+   const bool off_the_record_;
+   mojo::Remote<media::mojom::TarkCaptionTranslator> translator_;
+-  // Start's direction while its models download.
++  // Start's direction while its models download, and their size.
+   std::optional<Direction> waiting_;
++  int64_t waiting_bytes_ = 0;
+   base::ObserverList<Observer> observers_;
+   // After the remote: its destructor lets it go.
+   PageTranslation logic_;
+--- a/chrome/browser/translate/BUILD.gn
++++ b/chrome/browser/translate/BUILD.gn
+@@ -76,6 +76,7 @@
+ 
+   if (!is_android) {
+     deps += [
++      "//chrome/browser/tark_captions",
+       "//chrome/browser/ui:browser_window_header",
+       "//chrome/browser/ui/browser_window",
+       "//chrome/browser/ui/read_anything",
+--- a/chrome/browser/translate/chrome_translate_client.cc
++++ b/chrome/browser/translate/chrome_translate_client.cc
+@@ -29,6 +29,7 @@
+ #include "chrome/browser/translate/translate_ranker_factory.h"
+ #include "chrome/browser/translate/translate_service.h"
+ #if !BUILDFLAG(IS_ANDROID)
++#include "chrome/browser/tark_captions/tark_page_translation.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_features.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/browser_window/public/global_browser_collection.h"
+@@ -402,6 +403,69 @@
+   return TranslateService::IsTranslatableURL(url);
+ }
+ 
++#if !BUILDFLAG(IS_ANDROID)
++bool ChromeTranslateClient::TarkCanOffer(const std::string& source_language,
++                                         const std::string& target_language) {
++  if (!web_contents()) {
++    return false;
++  }
++  tark_captions::TarkPageTranslation::CreateForWebContents(web_contents());
++  return tark_captions::TarkPageTranslation::FromWebContents(web_contents())
++      ->CanOffer(source_language, target_language);
++}
++
++bool ChromeTranslateClient::TarkReadyToTranslate(
++    const std::string& source_language,
++    const std::string& target_language,
++    bool may_download) {
++  if (!web_contents()) {
++    return false;
++  }
++  tark_captions::TarkPageTranslation::CreateForWebContents(web_contents());
++  tark_captions::TarkPageTranslation* page =
++      tark_captions::TarkPageTranslation::FromWebContents(web_contents());
++  using Readiness = tark_captions::TarkPageTranslation::Readiness;
++  switch (page->PrepareTranslation(source_language, target_language,
++                                   may_download)) {
++    case Readiness::kReady:
++      // TranslatePage goes on to translate right after this answer: only
++      // now may the page's batches be translated (TarkPageTranslateHost).
++      page->OnTranslationStarting(source_language, target_language);
++      return true;
++    case Readiness::kDownloading:
++      // The bubble shows the download card while the models come; the page
++      // is translated once they are here.
++      ShowTranslateUI(translate::TRANSLATE_STEP_TRANSLATING, source_language,
++                      target_language, translate::TranslateErrors::NONE,
++                      /*triggered_from_menu=*/true);
++      return false;
++    case Readiness::kUnavailable:
++      return false;
++  }
++  return false;
++}
++
++void ChromeTranslateClient::TarkTranslationReverted() {
++  if (!web_contents()) {
++    return;
++  }
++  if (tark_captions::TarkPageTranslation* page =
++          tark_captions::TarkPageTranslation::FromWebContents(web_contents())) {
++    page->OnTranslationReverted();
++  }
++}
++
++void ChromeTranslateClient::TarkPageLanguageKnown(const std::string& source_language,
++                                                  const std::string& target_language) {
++  if (!web_contents()) {
++    return;
++  }
++  tark_captions::TarkPageTranslation::CreateForWebContents(web_contents());
++  tark_captions::TarkPageTranslation::FromWebContents(web_contents())
++      ->OnPageLanguage(source_language, target_language);
++}
++#endif  // !BUILDFLAG(IS_ANDROID)
++
+ void ChromeTranslateClient::UndoTranslate() {
+   std::string source_language = GetLanguageState().source_language();
+   std::string target_language = GetLanguageState().current_language();
+--- a/chrome/browser/translate/chrome_translate_client.h
++++ b/chrome/browser/translate/chrome_translate_client.h
+@@ -125,6 +125,18 @@
+                        translate::TranslateErrors error_type,
+                        bool triggered_from_menu) override;
+   bool IsTranslatableURL(const GURL& url) override;
++#if !BUILDFLAG(IS_ANDROID)
++  // Tark (desktop): Translate is offered only where Tark's own translator can
++  // translate the page, and its models come first (TarkPageTranslation).
++  bool TarkCanOffer(const std::string& source_language,
++                    const std::string& target_language) override;
++  bool TarkReadyToTranslate(const std::string& source_language,
++                            const std::string& target_language,
++                            bool may_download) override;
++  void TarkTranslationReverted() override;
++  void TarkPageLanguageKnown(const std::string& source_language,
++                             const std::string& target_language) override;
++#endif
+   void TriggerPdfTranslation() override;
+   void RevertPdfTranslation() override;
+   bool IsReadingModeOpen() const override;
+--- a/chrome/browser/ui/browser_actions.cc
++++ b/chrome/browser/ui/browser_actions.cc
+@@ -1467,8 +1467,9 @@
+                 chrome::ShowTranslateBubble(bwi);
+               },
+               bwi),
++          // Tark: the plain translate icon, not Google Translate's.
+           kActionShowTranslate, IDS_SHOW_TRANSLATE, IDS_TOOLTIP_TRANSLATE,
+-          vector_icons::kGTranslateIcon)
++          omnibox::kTranslateIcon)
+           .Build());
+ 
+   root_action_item_->AddChild(
+--- a/chrome/browser/ui/browser_ui_prefs.cc
++++ b/chrome/browser/ui/browser_ui_prefs.cc
+@@ -145,8 +145,10 @@
+   registry->RegisterBooleanPref(prefs::kWebAppCreateOnDesktop, true);
+   registry->RegisterBooleanPref(prefs::kWebAppCreateInAppsMenu, true);
+   registry->RegisterBooleanPref(prefs::kWebAppCreateInQuickLaunchBar, true);
++  // Tark for Mac: on, so Tark's own translator is offered; its Page
++  // translation switch (below) is the one people see and change.
+   registry->RegisterBooleanPref(
+-      translate::prefs::kOfferTranslateEnabled, false,
++      translate::prefs::kOfferTranslateEnabled, true,
+       user_prefs::PrefRegistrySyncable::SYNCABLE_PREF);
+   // Tark page translation (Mac): Settings › Languages › Page translation, on.
+   registry->RegisterBooleanPref(tark_captions::kPageTranslationEnabledPref, true);
+--- a/chrome/browser/ui/toolbar/BUILD.gn
++++ b/chrome/browser/ui/toolbar/BUILD.gn
+@@ -149,6 +149,7 @@
+       "//chrome/browser/signin",
+       "//chrome/browser/sync",
+       "//chrome/browser/sync:factories",
++      "//chrome/browser/tark_captions:page_translation_prefs",
+       "//chrome/browser/themes",
+       "//chrome/browser/ttc/core",
+       "//chrome/browser/ui:browser_commands",
+--- a/chrome/browser/ui/toolbar/app_menu_model.cc
++++ b/chrome/browser/ui/toolbar/app_menu_model.cc
+@@ -10,7 +10,6 @@
+ #include <optional>
+ 
+ #include "base/command_line.h"
+-#include "components/translate/core/common/translate_switches.h"
+ #include "base/debug/debugging_buildflags.h"
+ #include "base/debug/profiler.h"
+ #include "base/functional/bind.h"
+@@ -54,6 +53,7 @@
+ #include "chrome/browser/signin/signin_util.h"
+ #include "chrome/browser/sync/sync_service_factory.h"
+ #include "chrome/browser/sync/sync_ui_util.h"
++#include "chrome/browser/tark_captions/page_translation_prefs.h"
+ #include "chrome/browser/themes/theme_service_factory.h"
+ #include "chrome/browser/ttc/core/ttc_keyed_service.h"
+ #include "chrome/browser/ui/bookmarks/bookmark_utils.h"
+@@ -2173,13 +2173,15 @@
+             lens::features::kLensOverlay));
+   }
+ 
+-  // Tark: Translate is offered only when the user points it at a server of
+-  // their choosing (ungoogled-chromium's --translate-script-url).
+-  if (base::CommandLine::ForCurrentProcess()->HasSwitch(
+-          translate::switches::kTranslateScriptURL)) {
++  // Tark for Mac: Translate (Tark's own translator, on the Mac) while
++  // Settings › Languages › Page translation is on; --translate-script-url
++  // is ignored. Enabled only where it can translate the page
++  // (TranslateManager::CanManuallyTranslate).
++  if (browser()->GetProfile()->GetPrefs()->GetBoolean(
++          tark_captions::kPageTranslationEnabledPref)) {
+     AddItemWithStringIdAndVectorIcon(this, IDC_SHOW_TRANSLATE,
+                                      IDS_SHOW_TRANSLATE,
+-                                     vector_icons::kGTranslateIcon);
++                                     omnibox::kTranslateIcon);
+   }
+ 
+   CreateFindAndEditSubMenu();
+--- a/chrome/browser/ui/views/translate/BUILD.gn
++++ b/chrome/browser/ui/views/translate/BUILD.gn
+@@ -55,6 +55,7 @@
+     "//chrome/browser:primitives",
+     "//chrome/browser/profiles:profile",
+     "//chrome/browser/search_engines",
++    "//chrome/browser/tark_captions",
+     "//chrome/browser/ui:browser_actions",
+     "//chrome/browser/ui:browser_element_identifiers",
+     "//chrome/browser/ui:chrome_pages",
+@@ -69,6 +70,7 @@
+     "//chrome/browser/ui/views/frame:browser_view_header",
+     "//chrome/browser/ui/views/frame:toolbar_button_provider",
+     "//components/language_detection/core",
++    "//components/omnibox/browser:vector_icons",
+     "//components/prefs",
+     "//components/strings:components_strings",
+     "//components/touch_to_search/core/browser",
+--- a/chrome/browser/ui/views/translate/translate_bubble_view.cc
++++ b/chrome/browser/ui/views/translate/translate_bubble_view.cc
+@@ -16,12 +16,15 @@
+ #include "base/i18n/string_compare.h"
+ #include "base/memory/singleton.h"
+ #include "base/metrics/field_trial_params.h"
++#include "base/strings/string_number_conversions.h"
+ #include "base/strings/utf_string_conversions.h"
++#include "base/task/sequenced_task_runner.h"
+ #include "build/branding_buildflags.h"
+ #include "build/build_config.h"
+ #include "chrome/app/vector_icons/vector_icons.h"
+ #include "chrome/browser/platform_util.h"
+ #include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/tark_captions/tark_page_translation.h"
+ #include "chrome/browser/translate/chrome_translate_client.h"
+ #include "chrome/browser/translate/translate_service.h"
+ #include "chrome/browser/ui/actions/chrome_action_id.h"
+@@ -38,8 +41,10 @@
+ #include "chrome/grit/generated_resources.h"
+ #include "chrome/grit/theme_resources.h"
+ #include "components/language_detection/core/constants.h"
++#include "components/omnibox/browser/vector_icons.h"
+ #include "components/prefs/pref_service.h"
+ #include "components/strings/grit/components_strings.h"
++#include "components/tark_captions/model_manifest.h"
+ #include "components/translate/core/browser/translate_download_manager.h"
+ #include "components/translate/core/browser/translate_manager.h"
+ #include "components/translate/core/browser/translate_metrics_logger.h"
+@@ -115,24 +120,6 @@
+ #endif
+ }
+ 
+-std::unique_ptr<views::View> CreateWordmarkView() {
+-#if BUILDFLAG(GOOGLE_CHROME_BRANDING)
+-  auto view = std::make_unique<views::View>();
+-  view->SetLayoutManager(std::make_unique<views::BoxLayout>());
+-
+-  // Translate icon
+-  std::unique_ptr<views::ImageView> translate_icon =
+-      std::make_unique<views::ImageView>();
+-  translate_icon->SetImage(
+-      ui::ImageModel::FromResourceId(IDR_TRANSLATE_TAB_WORDMARK));
+-  view->AddChildView(std::move(translate_icon));
+-
+-  return view;
+-#else
+-  return nullptr;
+-#endif
+-}
+-
+ void OpenLanguageSettings(TranslateBubbleModel* model_,
+                           content::WebContents* web_contents_) {
+   model_->ReportUIInteraction(translate::UIInteraction::kOpenLanguageSettings);
+@@ -176,7 +163,9 @@
+         std::make_unique<WebContentMouseHandler>(this, web_contents);
+   }
+   SetButtons(static_cast<int>(ui::mojom::DialogButton::kNone));
+-  SetFootnoteView(CreateWordmarkView());
++  // Tark: no Google Translate wordmark; Tark's line (the download card, or
++  // "Hindi → English · Show original") instead.
++  SetFootnoteView(CreateTarkFootnote(model_->GetViewState()));
+   SetProperty(views::kElementIdentifierKey, kIdentifier);
+ }
+ 
+@@ -380,7 +369,9 @@
+ }
+ 
+ bool TranslateBubbleView::ShouldShowAlwaysTranslate() {
+-  return model_->ShouldShowAlwaysTranslateShortcut();
++  // Tark: no always-translate rules; a page is translated when its person
++  // asks (and only then are models downloaded).
++  return false;
+ }
+ 
+ // Create the menu items for the dropdown options menu under TAB UI.
+@@ -412,7 +403,8 @@
+   }
+   // Don't show "Always translate <language>" in incognito mode, because it
+   // doesn't do anything anyways. Don't show if the source language is unknown.
+-  if (!is_in_incognito_window_ && has_valid_source_language) {
++  // Tark: no always-translate rules (see ShouldShowAlwaysTranslate).
++  if ((false) && !is_in_incognito_window_ && has_valid_source_language) {
+     options_menu_model_->AddCheckItem(
+         static_cast<int>(OptionsMenuItem::kAlwaysTranslateLanguage),
+         l10n_util::GetStringFUTF16(IDS_TRANSLATE_BUBBLE_ALWAYS_TRANSLATE_LANG,
+@@ -568,6 +560,12 @@
+ 
+ void TranslateBubbleView::ShowOriginal() {
+   model_->ReportUIInteraction(translate::UIInteraction::kRevert);
++  // Tark: also a download Translate waits for no longer translates the page.
++  if (auto* page = web_contents() ? tark_captions::TarkPageTranslation::FromWebContents(
++                                        web_contents())
++                                  : nullptr) {
++    page->Revert();
++  }
+   model_->RevertTranslation();
+   SwitchView(TranslateBubbleModel::VIEW_STATE_BEFORE_TRANSLATE);
+ }
+@@ -1070,13 +1068,78 @@
+ }
+ 
+ std::unique_ptr<views::ImageView> TranslateBubbleView::CreateTranslateIcon() {
+-  const int language_icon_id = IDR_TRANSLATE_BUBBLE_ICON;
++  // Tark: the plain translate icon, not Google Translate's logo.
+   std::unique_ptr<views::ImageView> language_icon =
+       std::make_unique<views::ImageView>();
+-  language_icon->SetImage(ui::ImageModel::FromResourceId(language_icon_id));
++  language_icon->SetImage(ui::ImageModel::FromVectorIcon(
++      omnibox::kTranslateIcon, ui::kColorIcon, 20));
+   return language_icon;
+ }
+ 
++// static
++std::u16string TranslateBubbleView::TarkTranslatedLine(
++    const std::u16string& source_name,
++    const std::u16string& target_name,
++    std::vector<size_t>* offsets) {
++  return l10n_util::GetStringFUTF16(
++      IDS_TARK_PAGE_TRANSLATE_BUBBLE_TRANSLATED,
++      {source_name, target_name,
++       l10n_util::GetStringUTF16(IDS_TARK_PAGE_TRANSLATE_BUBBLE_SHOW_ORIGINAL)},
++      offsets);
++}
++
++// static
++std::u16string TranslateBubbleView::TarkGettingReadyLine(int64_t bytes) {
++  return l10n_util::GetStringFUTF16(
++      IDS_TARK_PAGE_TRANSLATE_BUBBLE_GETTING_READY,
++      base::NumberToString16(tark_captions::Megabytes(bytes)));
++}
++
++std::unique_ptr<views::View> TranslateBubbleView::CreateTarkFootnote(
++    TranslateBubbleModel::ViewState view_state) {
++  tark_footnote_text_.clear();
++  tark_captions::TarkPageTranslation* page =
++      web_contents()
++          ? tark_captions::TarkPageTranslation::FromWebContents(web_contents())
++          : nullptr;
++  // The download card: the person's Translate waits for the models.
++  if (page && page->waiting()) {
++    tark_footnote_text_ = TarkGettingReadyLine(page->waiting_bytes());
++    auto card = std::make_unique<views::Label>(
++        tark_footnote_text_, views::style::CONTEXT_BUBBLE_FOOTER);
++    card->SetHorizontalAlignment(gfx::ALIGN_LEFT);
++    card->SetMultiLine(true);
++    return card;
++  }
++  if (view_state != TranslateBubbleModel::VIEW_STATE_AFTER_TRANSLATE) {
++    return nullptr;
++  }
++  // "Hindi → English · Show original"; Show original restores the page
++  // with no reload.
++  std::vector<size_t> offsets;
++  tark_footnote_text_ = TarkTranslatedLine(
++      model_->GetSourceLanguageNameAt(model_->GetSourceLanguageIndex()),
++      model_->GetTargetLanguageNameAt(model_->GetTargetLanguageIndex()),
++      &offsets);
++  const size_t link_length = tark_footnote_text_.size() - offsets[2];
++  auto line = std::make_unique<views::StyledLabel>();
++  line->SetText(tark_footnote_text_);
++  line->SetTextContext(views::style::CONTEXT_BUBBLE_FOOTER);
++  line->SetDefaultTextStyle(views::style::STYLE_SECONDARY);
++  // Posted: Show original replaces this line, which mustn't go while its
++  // own link runs.
++  line->AddStyleRange(
++      gfx::Range(offsets[2], offsets[2] + link_length),
++      views::StyledLabel::RangeStyleInfo::CreateForLink(base::BindRepeating(
++          [](base::WeakPtr<TranslateBubbleView> bubble) {
++            base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++                FROM_HERE, base::BindOnce(&TranslateBubbleView::ShowOriginal,
++                                          bubble));
++          },
++          tark_weak_factory_.GetWeakPtr())));
++  return line;
++}
++
+ std::unique_ptr<views::Button> TranslateBubbleView::CreateOptionsMenuButton() {
+   // Three dots options menu button
+   auto tab_translate_options_button =
+@@ -1163,7 +1226,7 @@
+       view_state == TranslateBubbleModel::VIEW_STATE_TARGET_LANGUAGE) {
+     GetBubbleFrameView()->SetFootnoteView(nullptr);
+   } else {
+-    GetBubbleFrameView()->SetFootnoteView(CreateWordmarkView());
++    GetBubbleFrameView()->SetFootnoteView(CreateTarkFootnote(view_state));
+   }
+ 
+   SwitchTabForViewState(view_state);
+--- a/chrome/browser/ui/views/translate/translate_bubble_view.h
++++ b/chrome/browser/ui/views/translate/translate_bubble_view.h
+@@ -5,12 +5,15 @@
+ #ifndef CHROME_BROWSER_UI_VIEWS_TRANSLATE_TRANSLATE_BUBBLE_VIEW_H_
+ #define CHROME_BROWSER_UI_VIEWS_TRANSLATE_TRANSLATE_BUBBLE_VIEW_H_
+ 
++#include <cstdint>
+ #include <memory>
+ #include <string>
++#include <vector>
+ 
+ #include "base/functional/callback_forward.h"
+ #include "base/gtest_prod_util.h"
+ #include "base/memory/raw_ptr.h"
++#include "base/memory/weak_ptr.h"
+ #include "base/strings/utf_string_conversions.h"
+ #include "chrome/browser/translate/chrome_translate_client.h"
+ #include "chrome/browser/ui/translate/source_language_combobox_model.h"
+@@ -94,6 +97,21 @@
+ 
+   TranslateBubbleModel* model() { return model_.get(); }
+ 
++  // Tark: the footnote's lines (CreateTarkFootnote uses these). Translated:
++  // "Hindi → English · Show original", with `offsets` (may be null) at
++  // the three parts, the last being the link. While the models download:
++  // "Getting translation ready · 238 MB" for `bytes`.
++  static std::u16string TarkTranslatedLine(const std::u16string& source_name,
++                                           const std::u16string& target_name,
++                                           std::vector<size_t>* offsets);
++  static std::u16string TarkGettingReadyLine(int64_t bytes);
++
++  // Tark: the line under the bubble as shown (the download card, or
++  // "Hindi → English · Show original"); empty with none.
++  const std::u16string& tark_footnote_text_for_testing() const {
++    return tark_footnote_text_;
++  }
++
+   // LocationBarBubbleDelegateView:
+   void Init() override;
+   View* GetInitiallyFocusedView() override;
+@@ -233,6 +251,11 @@
+   // should only be used on non-Chrome-branded builds.
+   std::unique_ptr<views::ImageView> CreateTranslateIcon();
+ 
++  // Tark: the line under the bubble: the download card while the models
++  // come, "Hindi → English · Show original" once translated, else none.
++  std::unique_ptr<views::View> CreateTarkFootnote(
++      TranslateBubbleModel::ViewState view_state);
++
+   // Creates a three dot options menu button.
+   std::unique_ptr<views::Button> CreateOptionsMenuButton();
+ 
+@@ -331,6 +354,10 @@
+   std::unique_ptr<WebContentMouseHandler> mouse_handler_;
+ 
+   base::OnceClosure on_closing_;
++
++  // Tark: the footnote's text (CreateTarkFootnote), empty with none.
++  std::u16string tark_footnote_text_;
++  base::WeakPtrFactory<TranslateBubbleView> tark_weak_factory_{this};
+ };
+ 
+ #endif  // CHROME_BROWSER_UI_VIEWS_TRANSLATE_TRANSLATE_BUBBLE_VIEW_H_
+--- a/chrome/browser/ui/webui/settings/tark_settings_strings.cc
++++ b/chrome/browser/ui/webui/settings/tark_settings_strings.cc
+@@ -85,6 +85,9 @@
+       {"tarkCaptionsHindi", IDS_TARK_CAPTIONS_HINDI},
+       {"tarkCaptionsTamil", IDS_TARK_CAPTIONS_TAMIL},
+       {"tarkCaptionsBengali", IDS_TARK_CAPTIONS_BENGALI},
++      // Tark page translation: Settings > Languages > Page translation.
++      {"tarkPageTranslation", IDS_SETTINGS_TARK_PAGE_TRANSLATION},
++      {"tarkPageTranslationDesc", IDS_SETTINGS_TARK_PAGE_TRANSLATION_DESC},
+   };
+   html_source->AddLocalizedStrings(kStrings);
+   // The first-time download size, up front: detection and Tark's captions,
+--- a/chrome/test/BUILD.gn
++++ b/chrome/test/BUILD.gn
+@@ -3129,6 +3129,15 @@
+       deps += [ "//chrome/browser/ui/webui/default_browser:browser_tests" ]
+     }
+ 
++    # Tark: page translation on the desktop (desktop-ui.patch).
++    if (is_mac || is_win || is_linux) {
++      sources += [ "../browser/tark_captions/tark_page_translate_browsertest.cc" ]
++      deps += [
++        "//chrome/browser/tark_captions",
++        "//chrome/browser/tark_captions:page_translation_prefs",
++      ]
++    }
++
+     if (is_win) {
+       sources += [
+         "../browser/ui/views/sync/inline_login_ui_browsertest.cc",
+--- a/components/translate/core/browser/BUILD.gn
++++ b/components/translate/core/browser/BUILD.gn
+@@ -4,6 +4,7 @@
+ 
+ import("//build/config/ui.gni")
+ import("//third_party/protobuf/proto_library.gni")
++import("//testing/test.gni")
+ 
+ static_library("browser") {
+   sources = [
+@@ -159,6 +160,19 @@
+   }
+ }
+ 
++# Tark for Mac: the translate component's unit tests on their own
++# (components_unittests isn't built on the Mac build machine).
++test("tark_translate_unittests") {
++  deps = [
++    ":unit_tests",
++    "//components/test:run_all_unittests",  # resources, as components_unittests
++  ]
++  data_deps = [
++    "//components:components_tests_pak",
++    "//ui/resources:ui_test_pak",
++  ]
++}
++
+ source_set("test_support") {
+   testonly = true
+   sources = [
+--- a/components/translate/core/browser/mock_translate_client.h
++++ b/components/translate/core/browser/mock_translate_client.h
+@@ -55,6 +55,10 @@
+                     TranslateErrors,
+                     bool));
+   MOCK_METHOD1(IsTranslatableURL, bool(const GURL&));
++  MOCK_METHOD(void,
++              TarkPageLanguageKnown,
++              (const std::string&, const std::string&),
++              (override));
+   MOCK_METHOD(void, TriggerPdfTranslation, (), (override));
+   MOCK_METHOD(void, RevertPdfTranslation, (), (override));
+   MOCK_METHOD(bool, IsReadingModeOpen, (), (const, override));
+--- a/components/translate/core/browser/translate_client.h
++++ b/components/translate/core/browser/translate_client.h
+@@ -71,6 +71,34 @@
+   // Returns true if the URL can be translated.
+   virtual bool IsTranslatableURL(const GURL& url) = 0;
+ 
++  // Tark (desktop): whether Translate may be offered from `source_language` to
++  // `target_language` (the omnibox icon, the bubble, the menus): only what
++  // Tark's own translator can do. Embedders without it offer everything.
++  virtual bool TarkCanOffer(const std::string& source_language,
++                            const std::string& target_language) {
++    return true;
++  }
++
++  // Tark (desktop): whether a translation can start now. False when the
++  // direction's models aren't here: if `may_download` (the person asked), the
++  // embedder fetches them and translates once they are; otherwise nothing
++  // happens.
++  virtual bool TarkReadyToTranslate(const std::string& source_language,
++                                    const std::string& target_language,
++                                    bool may_download) {
++    return true;
++  }
++
++  // Tark (desktop): the page was just put back in its original
++  // (RevertTranslation), however that was asked for.
++  virtual void TarkTranslationReverted() {}
++
++  // Tark (desktop): Translate into `target_language` was just offered for the
++  // page (its language known, the offer shown): the embedder may start
++  // loading the model ahead of the person's Translate.
++  virtual void TarkPageLanguageKnown(const std::string& source_language,
++                                     const std::string& target_language) {}
++
+   // Triggers PDF translation.
+   virtual void TriggerPdfTranslation() {}
+ 
+--- a/components/translate/core/browser/translate_language_list.cc
++++ b/components/translate/core/browser/translate_language_list.cc
+@@ -192,6 +192,14 @@
+                   languages.end());
+ }
+ 
++// Tark for Mac: the languages Tark's translator has on the Mac (the 22
++// languages of India and English; tark_translate_directions.h). Translate
++// offers and lists only these, and no list is ever fetched.
++constexpr std::string_view kTarkLanguages[] = {
++    "as", "bn",  "brx", "doi", "en", "gu", "hi",  "kn", "ks", "kok", "mai", "ml",
++    "mni", "mr", "ne",  "or",  "pa", "sa", "sat", "sd", "ta", "te",  "ur",
++};
++
+ }  // namespace
+ 
+ const char TranslateLanguageList::kTargetLanguagesKey[] = "tl";
+@@ -209,7 +217,14 @@
+       // overridden by a server providing supported languages list.
+       supported_languages_(std::from_range,
+                            translate::GetDefaultSupportedLanguages()),
+-      language_list_fetcher_(std::move(fetcher)) {}
++      language_list_fetcher_(std::move(fetcher)) {
++  supported_languages_.clear();
++  for (std::string_view code : kTarkLanguages) {
++    if (std::optional<LanguageTag> tag = GetLanguageTagFromString(code)) {
++      supported_languages_.insert(*tag);
++    }
++  }
++}
+ 
+ TranslateLanguageList::~TranslateLanguageList() = default;
+ 
+--- a/components/translate/core/browser/translate_manager.cc
++++ b/components/translate/core/browser/translate_manager.cc
+@@ -30,6 +30,7 @@
+ #include "components/prefs/pref_service.h"
+ #include "components/translate/core/browser/language_state.h"
+ #include "components/translate/core/browser/page_translated_details.h"
++#include "components/translate/core/browser/tark_translate_directions.h"
+ #include "components/translate/core/browser/translate_browser_metrics.h"
+ #include "components/translate/core/browser/translate_client.h"
+ #include "components/translate/core/browser/translate_download_manager.h"
+@@ -157,9 +158,12 @@
+       TranslateDownloadManager::GetLanguageCode(page_lang);
+   TranslateBrowserMetrics::TargetLanguageOrigin target_language_origin =
+       TranslateBrowserMetrics::TargetLanguageOrigin::kUninitialized;
+-  std::string target_lang =
++  // Tark: a direction Tark's translator has (Hindi → Spanish is offered as
++  // Hindi → English).
++  std::string target_lang = TarkTargetFor(
++      page_language_code,
+       GetTargetLanguage(translate_prefs.get(), language_model_,
+-                        page_language_code, target_language_origin);
++                        page_language_code, target_language_origin));
+ 
+   // TODO(crbug.com/40610937): The ranker event shouldn't be a global on this
+   // object. It should instead be passed around to code that uses it.
+@@ -292,6 +296,18 @@
+     can_translate = false;
+   }
+ 
++  // Tark (desktop): Translate only where Tark's own translator can translate
++  // this page (Settings › Languages › Page translation on, a direction the
++  // Mac has a model for, and in a Private window only one already here).
++  {
++    const std::string tark_source =
++        TranslateDownloadManager::GetLanguageCode(source_language);
++    if (!translate_client_->TarkCanOffer(
++            tark_source, TarkTargetFor(tark_source, target_lang))) {
++      return false;
++    }
++  }
++
+   if (menu_logging) {
+     UMA_HISTOGRAM_BOOLEAN("Translate.MenuTranslation.IsAvailable",
+                           can_translate);
+@@ -301,18 +317,8 @@
+ }
+ 
+ bool TranslateManager::CanPartiallyTranslateTargetLanguage() {
+-  std::unique_ptr<TranslatePrefs> translate_prefs(
+-      translate_client_->GetTranslatePrefs());
+-  const std::string& source_language = language_state_.source_language();
+-  const std::string target_lang = GetTargetLanguage(
+-      translate_prefs.get(), language_model_,
+-      TranslateDownloadManager::GetLanguageCode(source_language));
+-
+-  if (target_lang.empty()) {
+-    return false;
+-  }
+-  return TranslateLanguageList::IsSupportedPartialTranslateLanguage(
+-      target_lang);
++  // Tark: no Partial Translate; it sends the selection to Google's servers.
++  return false;
+ }
+ 
+ bool TranslateManager::IsMimeTypeSupported(std::string_view mime_type) {
+@@ -391,6 +397,28 @@
+     return;
+   }
+ 
++  // Tark: a target Tark's translator doesn't have from this source becomes
++  // English (never a tap that does nothing).
++  const std::string tark_target =
++      TarkTargetFor(original_source_lang, target_lang);
++  target_lang = tark_target;
++
++  // Tark (desktop): the direction's models first. Without them on the computer, the
++  // person's Translate fetches them (the bubble's download card) and the page
++  // is translated once they are here; an automatic translation never fetches
++  // anything. The page and translate's state stay as they are.
++  const bool tark_asked_by_user =
++      translation_type != TranslationType::kAutomaticTranslationByPref &&
++      translation_type != TranslationType::kAutomaticTranslationByLink &&
++      translation_type !=
++          TranslationType::kAutomaticTranslationToPredefinedTarget &&
++      translation_type != TranslationType::kAutomaticTranslationByHref &&
++      translation_type != TranslationType::kForcedTranslationByCommandline;
++  if (!translate_client_->TarkReadyToTranslate(std::string(original_source_lang),
++                                               tark_target, tark_asked_by_user)) {
++    return;
++  }
++
+   translate_driver_->PrepareToTranslatePage(page_seq_no_, original_source_lang,
+                                             target_lang, triggered_from_menu);
+ 
+@@ -476,6 +504,8 @@
+   // Revert the translation.
+   translate_driver_->RevertTranslation(page_seq_no_);
+   language_state_.SetCurrentLanguage(language_state_.source_language());
++  // Tark: the page's batches are no longer translated.
++  translate_client_->TarkTranslationReverted();
+ 
+   GetActiveTranslateMetricsLogger()->LogReversion();
+ 
+@@ -978,6 +1008,16 @@
+         TriggerDecision::kDisabledURLNotSupported);
+   }
+ 
++  // Tark (desktop): nothing is offered that Tark's own translator can't do
++  // here (the switch off, a language pair without a Mac model, a Private
++  // window without the models).
++  if (!translate_client_->TarkCanOffer(std::string(page_language_code),
++                                       std::string(target_lang))) {
++    decision->PreventAllTriggering();
++    GetActiveTranslateMetricsLogger()->LogTriggerDecision(
++        TriggerDecision::kDisabledUnsupportedLanguage);
++  }
++
+   if (!translate_prefs->IsOfferTranslateEnabled()) {
+     decision->PreventAllTriggering();
+     decision->ranker_events.push_back(
+@@ -1251,6 +1291,13 @@
+         translate::TRANSLATE_STEP_BEFORE_TRANSLATE,
+         std::string(page_language_code), std::string(target_lang),
+         TranslateErrors::NONE, false);
++    // Tark (desktop): the offer is up (every filter, the person's prefs and the
++    // ranker said yes), so warm the model now, from the Mac only, never a
++    // download: the person's Translate then starts on a loaded model.
++    if (did_show_ui) {
++      translate_client_->TarkPageLanguageKnown(std::string(page_language_code),
++                                               std::string(target_lang));
++    }
+   }
+ 
+   // Auto-translate didn't happen, and the UI wasn't shown so consider the
+--- a/components/translate/core/browser/translate_manager_unittest.cc
++++ b/components/translate/core/browser/translate_manager_unittest.cc
+@@ -735,6 +735,58 @@
+   translate_manager_->InitiateTranslation("de");
+ }
+ 
++// Tark for Mac warms its model only when the offer is actually shown: the
++// language blocked, the site on the never-prompt list, the offer setting off
++// or the prompt not shown mean no TarkPageLanguageKnown.
++class TarkWarmTest : public TranslateManagerTest {
++ protected:
++  void Initiate(int expected_warms, bool shows_ui = true) {
++    TranslateManager::SetIgnoreMissingKeyForTesting(true);
++    ON_CALL(mock_translate_client_, IsTranslatableURL(_)).WillByDefault(Return(true));
++    ON_CALL(mock_translate_client_, GetAcceptLanguagesService())
++        .WillByDefault(Return(&accept_languages_));
++    ON_CALL(mock_translate_client_, ShowTranslateUI(_, _, _, _, false))
++        .WillByDefault(Return(shows_ui));
++    EXPECT_CALL(mock_translate_client_, TarkPageLanguageKnown("hi", "en"))
++        .Times(expected_warms);
++    translate_manager_ = std::make_unique<TranslateManager>(
++        &mock_translate_client_, &mock_translate_ranker_, &mock_language_model_);
++    driver_.SetVisibleURL(GURL("https://example.in/"));
++    network_notifier_.SimulateOnline();
++    translate_manager_->GetLanguageState()->LanguageDetermined("hi", true);
++    translate_manager_->InitiateTranslation("hi");
++  }
++
++  language::AcceptLanguagesService accept_languages_{&prefs_, accept_languages_prefs};
++};
++
++TEST_F(TarkWarmTest, WarmsWhenTheOfferIsShown) {
++  prefs_.SetBoolean(prefs::kOfferTranslateEnabled, true);
++  Initiate(1);
++}
++
++TEST_F(TarkWarmTest, NoWarmForABlockedLanguage) {
++  prefs_.SetBoolean(prefs::kOfferTranslateEnabled, true);
++  translate_prefs_.BlockLanguage("hi");
++  Initiate(0);
++}
++
++TEST_F(TarkWarmTest, NoWarmOnANeverPromptSite) {
++  prefs_.SetBoolean(prefs::kOfferTranslateEnabled, true);
++  translate_prefs_.AddSiteToNeverPromptList("example.in");
++  Initiate(0);
++}
++
++TEST_F(TarkWarmTest, NoWarmWithTheOfferSettingOff) {
++  prefs_.SetBoolean(prefs::kOfferTranslateEnabled, false);
++  Initiate(0);
++}
++
++TEST_F(TarkWarmTest, NoWarmWhenThePromptIsNotShown) {
++  prefs_.SetBoolean(prefs::kOfferTranslateEnabled, true);
++  Initiate(0, /*shows_ui=*/false);
++}
++
+ TEST_F(TranslateManagerTest, TestRecordTranslateEvent) {
+   PrepareTranslateManager();
+   const std::string locale = "zh-TW";

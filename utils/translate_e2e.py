@@ -12,8 +12,8 @@ local Hindi page and checks, through DevTools:
   js_text          A paragraph the page adds 3 s later is translated too.
   link_kept        The link inside a translated sentence is still a link,
                    with translated words of its own to click.
-With --screenshot, the whole screen (the translate bar under the toolbar
-is browser UI, not page) is saved after the checks (ImageMagick's import).
+With --screenshot, the whole screen (Translate's omnibox icon and bubble
+are browser UI, not page) is saved after the checks (ImageMagick's import).
 With --diag, a failed run leaves Tark's log (translate VLOGs on), the text
 of chrome://translate-internals (Chromium's translate events and errors)
 and the models folder's listing in DIR.
@@ -154,7 +154,16 @@ def main(argv=None):
         if not ws:
             return report(False, 'page_translated', 'the page never opened')
         # The first sentences load the model (up to a minute on a cold disk).
-        ok1, t1 = wait_text(ws, 'p1', 120)
+        ok1, t1 = wait_text(ws, 'p1', 60)
+        if not ok1:
+            # Tark checks the models folder once, in the background, when it
+            # first needs it (each file hashed: they come without Tark's ready
+            # marker), and an automatic translation never waits for a check
+            # or a download. A page that loaded before the check ended stays
+            # as it is; loaded again, it is translated.
+            e2e.evaluate(ws, 'location.reload()')
+            time.sleep(2)
+            ok1, t1 = wait_text(ws, 'p1', 90)
         ok2, t2 = wait_text(ws, 'p2', 30)
         failed += report(ok1 and ok2, 'page_translated', f'{t1!r} / {t2!r}')
         ok, late = wait_text(ws, 'late', 20)

@@ -4,14 +4,16 @@
 # found in the LICENSE file.
 """Tark's page-translate script, from android/translate/script/.
 
-    python3 android/translate/script.py build [REPO]   write android/patches/page-translate-script.patch
-    python3 android/translate/script.py check [REPO]   exit 1 if it is out of date
+    python3 android/translate/script.py build [REPO] [--out PATCH]   write patches/tarka/page-translate/script.patch
+    python3 android/translate/script.py check [REPO]                 exit 1 if it is out of date
 
 The translate isolated world runs one script string, so batcher.js and
 tark_translate.js go into one file, served as the IDR_TARK_TRANSLATE_JS
-resource (its own grdp, a part of components_resources.grd). Edit the
-sources and run build; utils/tests/test_android_translate_script.py fails
-when the patch and the sources disagree.
+resource (its own grdp, a part of components_resources.grd). The patch is
+shared: the Mac's series has it, and android/series.py takes it from there.
+--out writes it elsewhere (the parity test). Edit the sources and run
+build; utils/tests/test_android_translate_script.py fails when the patch and
+the sources disagree.
 """
 
 import pathlib
@@ -21,7 +23,7 @@ import sys
 SOURCES = ('batcher.js', 'tark_translate.js')
 JS = 'components/translate/core/browser/resources/tark_translate.js'
 GRDP = 'components/resources/tark_translate_resources.grdp'
-OUT = pathlib.Path('android') / 'patches' / 'page-translate-script.patch'
+OUT = pathlib.Path('patches') / 'tarka' / 'page-translate' / 'script.patch'
 GRD = '''--- a/components/resources/components_resources.grd
 +++ b/components/resources/components_resources.grd
 @@ -24,6 +24,7 @@
@@ -61,17 +63,26 @@ def build(repo):
 
 
 def main():
-    if len(sys.argv) not in (2, 3) or sys.argv[1] not in ('build', 'check'):
+    args = sys.argv[1:]
+    out = None
+    if '--out' in args:
+        i = args.index('--out')
+        if i + 1 >= len(args):
+            sys.exit(__doc__)
+        out = pathlib.Path(args[i + 1])
+        del args[i:i + 2]
+    if len(args) not in (1, 2) or args[0] not in ('build', 'check') or (out and args[0] != 'build'):
         sys.exit(__doc__)
-    repo = pathlib.Path(sys.argv[2] if len(sys.argv) == 3 else pathlib.Path(__file__).resolve().parents[2])
+    repo = pathlib.Path(args[1] if len(args) == 2 else pathlib.Path(__file__).resolve().parents[2])
     text = build(repo)
-    out = repo / OUT
-    if sys.argv[1] == 'check':
+    out = out or repo / OUT
+    if args[0] == 'check':
         if not out.exists() or out.read_text(encoding='utf-8') != text:
             sys.exit(f'{OUT} is out of date: run android/translate/script.py build')
         return
+    out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(text, encoding='utf-8')
-    print(f'wrote {OUT}: {len(re.findall(r"^[+]{3} b/", text, re.M))} files')
+    print(f'wrote {out}: {len(re.findall(r"^[+]{3} b/", text, re.M))} files')
 
 
 if __name__ == '__main__':

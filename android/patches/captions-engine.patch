@@ -4898,6 +4898,263 @@
 +}  // namespace
 +}  // namespace tark_captions
 --- /dev/null
++++ b/components/tark_captions/flat_vocab.h
+@@ -0,0 +1,254 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef COMPONENTS_TARK_CAPTIONS_FLAT_VOCAB_H_
++#define COMPONENTS_TARK_CAPTIONS_FLAT_VOCAB_H_
++
++#include <cstdint>
++#include <optional>
++#include <string>
++#include <string_view>
++#include <utility>
++#include <vector>
++
++#include "base/strings/string_util.h"
++
++namespace tark_captions {
++
++// A flat JSON object of string keys and int32 values, {"token": id, ...}, as
++// IndicTrans2's and opus-mt's dict.SRC.json and dict.TGT.json are: its
++// entries in file order, in one pass. base::JSONReader builds a
++// base::DictValue, a sorted flat_map that moves the entries after each new
++// key: those files list their keys by id, not in key order, so
++// dict.SRC.json's 122,706 keys took about 3.6 billion element moves (18.7 s
++// on a Snapdragon 695, Tark for Android round 11).
++// Nullopt for anything else (another value type, a number that is not an
++// int32, a bad escape, invalid UTF-8, trailing text): the caller then uses
++// base::JSONReader, so a file never loads differently, only faster. Then
++// `why` (when given) says what and `at` where, for the log.
++// Keys may hold Unicode noncharacters (dict.SRC.json of it2_indic_en has
++// eight, U+FDDB..U+FDEB): base::JSONReader takes them, so this does too.
++inline std::optional<std::vector<std::pair<std::string, int>>> ParseFlatVocab(
++    std::string_view json,
++    const char** why = nullptr,
++    size_t* at = nullptr) {
++  size_t i = 0;
++  auto decline = [&](const char* reason) {
++    if (why) {
++      *why = reason;
++    }
++    if (at) {
++      *at = i;
++    }
++    return std::nullopt;
++  };
++  const size_t n = json.size();
++  auto skip_space = [&] {
++    while (i < n && (json[i] == ' ' || json[i] == '\n' || json[i] == '\r' || json[i] == '\t')) {
++      ++i;
++    }
++  };
++  auto hex4 = [&](uint32_t* out) {
++    if (n - i < 4) {
++      return false;
++    }
++    uint32_t v = 0;
++    for (int k = 0; k < 4; ++k) {
++      const char c = json[i++];
++      v <<= 4;
++      if (c >= '0' && c <= '9') {
++        v |= static_cast<uint32_t>(c - '0');
++      } else if (c >= 'a' && c <= 'f') {
++        v |= static_cast<uint32_t>(c - 'a' + 10);
++      } else if (c >= 'A' && c <= 'F') {
++        v |= static_cast<uint32_t>(c - 'A' + 10);
++      } else {
++        return false;
++      }
++    }
++    *out = v;
++    return true;
++  };
++  auto append_utf8 = [](uint32_t cp, std::string* s) {
++    if (cp < 0x80) {
++      s->push_back(static_cast<char>(cp));
++    } else if (cp < 0x800) {
++      s->push_back(static_cast<char>(0xC0 | (cp >> 6)));
++      s->push_back(static_cast<char>(0x80 | (cp & 0x3F)));
++    } else if (cp < 0x10000) {
++      s->push_back(static_cast<char>(0xE0 | (cp >> 12)));
++      s->push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
++      s->push_back(static_cast<char>(0x80 | (cp & 0x3F)));
++    } else {
++      s->push_back(static_cast<char>(0xF0 | (cp >> 18)));
++      s->push_back(static_cast<char>(0x80 | ((cp >> 12) & 0x3F)));
++      s->push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
++      s->push_back(static_cast<char>(0x80 | (cp & 0x3F)));
++    }
++  };
++  auto read_string = [&](std::string* s) {
++    if (i >= n || json[i] != '"') {
++      return false;
++    }
++    ++i;
++    s->clear();
++    while (i < n) {
++      const unsigned char c = static_cast<unsigned char>(json[i]);
++      if (c == '"') {
++        ++i;
++        return true;
++      }
++      if (c < 0x20) {
++        return false;
++      }
++      if (c != '\\') {
++        // A run of plain bytes at once.
++        size_t end = i + 1;
++        while (end < n && json[end] != '"' && json[end] != '\\' &&
++               static_cast<unsigned char>(json[end]) >= 0x20) {
++          ++end;
++        }
++        s->append(json.substr(i, end - i));
++        i = end;
++        continue;
++      }
++      if (++i >= n) {
++        return false;
++      }
++      const char e = json[i++];
++      switch (e) {
++        case '"':
++          s->push_back('"');
++          break;
++        case '\\':
++          s->push_back('\\');
++          break;
++        case '/':
++          s->push_back('/');
++          break;
++        case 'b':
++          s->push_back('\b');
++          break;
++        case 'f':
++          s->push_back('\f');
++          break;
++        case 'n':
++          s->push_back('\n');
++          break;
++        case 'r':
++          s->push_back('\r');
++          break;
++        case 't':
++          s->push_back('\t');
++          break;
++        case 'u': {
++          uint32_t cp = 0;
++          if (!hex4(&cp)) {
++            return false;
++          }
++          if (cp >= 0xD800 && cp <= 0xDBFF) {  // a high surrogate: its low half follows
++            uint32_t low = 0;
++            if (n - i < 2 || json[i] != '\\' || json[i + 1] != 'u') {
++              return false;
++            }
++            i += 2;
++            if (!hex4(&low) || low < 0xDC00 || low > 0xDFFF) {
++              return false;
++            }
++            cp = 0x10000 + ((cp - 0xD800) << 10) + (low - 0xDC00);
++          } else if (cp >= 0xDC00 && cp <= 0xDFFF) {
++            return false;  // a lone low surrogate
++          }
++          append_utf8(cp, s);
++          break;
++        }
++        default:
++          return false;
++      }
++    }
++    return false;  // no closing quote
++  };
++  auto read_int = [&](int* out) {
++    bool negative = false;
++    if (i < n && json[i] == '-') {
++      negative = true;
++      ++i;
++    }
++    if (i >= n || json[i] < '0' || json[i] > '9') {
++      return false;
++    }
++    if (json[i] == '0' && i + 1 < n && json[i + 1] >= '0' && json[i + 1] <= '9') {
++      return false;  // a leading zero is not JSON
++    }
++    int64_t v = 0;
++    while (i < n && json[i] >= '0' && json[i] <= '9') {
++      v = v * 10 + (json[i] - '0');
++      if (v > int64_t{2147483648}) {
++        return false;
++      }
++      ++i;
++    }
++    if (i < n && (json[i] == '.' || json[i] == 'e' || json[i] == 'E')) {
++      return false;  // a double: base::JSONReader's int check decides
++    }
++    v = negative ? -v : v;
++    if (v > int64_t{2147483647} || v < -int64_t{2147483648}) {
++      return false;
++    }
++    *out = static_cast<int>(v);
++    return true;
++  };
++
++  std::vector<std::pair<std::string, int>> entries;
++  skip_space();
++  if (i >= n || json[i] != '{') {
++    return decline("not an object");
++  }
++  ++i;
++  skip_space();
++  if (i < n && json[i] == '}') {
++    ++i;
++  } else {
++    std::string key;
++    for (;;) {
++      skip_space();
++      if (!read_string(&key)) {
++        return decline("key");
++      }
++      skip_space();
++      if (i >= n || json[i] != ':') {
++        return decline("no colon");
++      }
++      ++i;
++      skip_space();
++      int value = 0;
++      if (!read_int(&value)) {
++        return decline("value not an int32");
++      }
++      if (!base::IsStringUTF8AllowingNoncharacters(key)) {
++        return decline("key not UTF-8");
++      }
++      entries.emplace_back(std::move(key), value);
++      skip_space();
++      if (i < n && json[i] == ',') {
++        ++i;
++        continue;
++      }
++      if (i < n && json[i] == '}') {
++        ++i;
++        break;
++      }
++      return decline("no comma or brace");
++    }
++  }
++  skip_space();
++  if (i != n) {
++    return decline("text after the object");
++  }
++  return entries;
++}
++
++}  // namespace tark_captions
++
++#endif  // COMPONENTS_TARK_CAPTIONS_FLAT_VOCAB_H_
+--- /dev/null
 +++ b/components/tark_captions/indic_text.cc
 @@ -0,0 +1,544 @@
 +// Copyright 2026 The Tark Authors
@@ -8073,7 +8330,7 @@
 +}  // namespace tark_captions
 --- /dev/null
 +++ b/components/tark_captions/ort_runtime.h
-@@ -0,0 +1,100 @@
+@@ -0,0 +1,103 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -8159,6 +8416,9 @@
 +
 +  // Runs the model on `inputs` (float32 or int64, by name) and fills
 +  // `outputs` with `output_names`, in that order. False on any error.
++  // Several threads may Run one model at once (ONNX Runtime's Run is
++  // thread-safe; page translation runs sentences in parallel on one
++  // session).
 +  bool Run(const std::vector<Tensor>& inputs,
 +           const std::vector<std::string>& output_names,
 +           std::vector<Tensor>* outputs);
@@ -9422,7 +9682,7 @@
 +#endif  // COMPONENTS_TARK_CAPTIONS_TEST_UTIL_H_
 --- /dev/null
 +++ b/components/tark_captions/translation_engine.cc
-@@ -0,0 +1,594 @@
+@@ -0,0 +1,771 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -9430,6 +9690,7 @@
 +#include "components/tark_captions/translation_engine.h"
 +
 +#include <algorithm>
++#include <atomic>
 +#include <utility>
 +
 +#include "base/containers/flat_map.h"
@@ -9437,9 +9698,15 @@
 +#include "base/json/json_reader.h"
 +#include "base/logging.h"
 +#include "base/memory/ptr_util.h"
++#include "base/memory/raw_ref.h"
 +#include "base/strings/string_util.h"
 +#include "base/strings/utf_string_conversions.h"
++#include "base/functional/bind.h"
++#include "base/threading/scoped_blocking_call.h"
++#include "base/threading/simple_thread.h"
++#include "base/time/time.h"
 +#include "components/tark_captions/english_text.h"
++#include "components/tark_captions/flat_vocab.h"
 +#include "components/tark_captions/indic_text.h"
 +#include "components/tark_captions/model_source.h"
 +#include "components/tark_captions/ort_runtime.h"
@@ -9448,7 +9715,6 @@
 +namespace tark_captions {
 +namespace {
 +
-+constexpr int kThreads = 2;
 +// IndicTrans2's model_max_length: 255 tokens and </s>.
 +constexpr size_t kMaxSourceTokens = 255;
 +constexpr char kEnglishTag[] = "eng_Latn";
@@ -9478,6 +9744,12 @@
 +  }
 +}
 +
++// A dict.*.json's {"token": id} entries: ParseFlatVocab, or base::JSONReader
++// when that declines (same result, slower). Nullopt when missing or not all
++// values are ints.
++std::optional<std::vector<std::pair<std::string, int>>> ReadVocab(const ModelSource& source,
++                                                                   std::string_view name);
++
 +std::optional<base::DictValue> ReadJsonDict(const ModelSource& source, std::string_view name) {
 +  std::optional<base::span<const uint8_t>> bytes = source.Read(name);
 +  if (!bytes) {
@@ -9489,6 +9761,36 @@
 +    return std::nullopt;
 +  }
 +  return std::move(*value).TakeDict();
++}
++
++std::optional<std::vector<std::pair<std::string, int>>> ReadVocab(const ModelSource& source,
++                                                                   std::string_view name) {
++  std::optional<base::span<const uint8_t>> bytes = source.Read(name);
++  if (!bytes) {
++    return std::nullopt;
++  }
++  const char* why = "";
++  size_t at = 0;
++  if (auto entries = ParseFlatVocab(base::as_string_view(*bytes), &why, &at)) {
++    DVLOG(1) << "tark-page: vocab " << name << " fast entries=" << entries->size();
++    return entries;
++  }
++  // The slow path is ~20 s on a phone: worth a warning.
++  LOG(WARNING) << "Tark translation: " << name << " fast path declined (" << why << " at byte "
++               << at << "), using base::JSONReader";
++  std::optional<base::DictValue> dict = ReadJsonDict(source, name);
++  if (!dict) {
++    return std::nullopt;
++  }
++  std::vector<std::pair<std::string, int>> entries;
++  entries.reserve(dict->size());
++  for (const auto [key, value] : *dict) {
++    if (!value.is_int()) {
++      return std::nullopt;
++    }
++    entries.emplace_back(key, value.GetInt());
++  }
++  return entries;
 +}
 +
 +bool IsIndianCode(std::string_view code) {
@@ -9546,11 +9848,23 @@
 + public:
 +  // config.json, dict.SRC.json, dict.TGT.json, model.SRC (SentencePiece),
 +  // encoder.int8.onnx and decoder_step.int8.onnx, from `source`.
-+  static std::unique_ptr<Direction> Load(OrtRuntime* runtime, const ModelSource& source) {
++  // `threads`: ONNX Runtime's intra-op threads for each of the two models.
++  static std::unique_ptr<Direction> Load(OrtRuntime* runtime,
++                                         const ModelSource& source,
++                                         int threads) {
 +    auto d = base::WrapUnique(new Direction());
++    // Diagnostics (DVLOG): where a model's load time goes.
++    const base::TimeTicks load_start = base::TimeTicks::Now();
++    auto ms = [](base::TimeTicks since) {
++      return (base::TimeTicks::Now() - since).InMilliseconds();
++    };
 +    std::optional<base::DictValue> config = ReadJsonDict(source, "config.json");
-+    std::optional<base::DictValue> src = ReadJsonDict(source, "dict.SRC.json");
-+    std::optional<base::DictValue> tgt = ReadJsonDict(source, "dict.TGT.json");
++    std::optional<std::vector<std::pair<std::string, int>>> src =
++        ReadVocab(source, "dict.SRC.json");
++    std::optional<std::vector<std::pair<std::string, int>>> tgt =
++        ReadVocab(source, "dict.TGT.json");
++    const int64_t dicts_ms = ms(load_start);
++    const base::TimeTicks spm_start = base::TimeTicks::Now();
 +    std::optional<base::span<const uint8_t>> spm = source.Read("model.SRC");
 +    if (!config || !src || !tgt || !spm ||
 +        !d->spm_.LoadFromSerializedProto(base::as_string_view(*spm)).ok()) {
@@ -9572,22 +9886,28 @@
 +    d->head_dim_ = *dim / *heads;
 +    d->start_ = *start;
 +    d->eos_ = *eos;
++    // A key given twice keeps its last id, as base::JSONReader did: flat_map
++    // keeps the first of equal keys, so the entries go in newest first.
 +    std::vector<std::pair<std::string, int64_t>> src_entries;
-+    for (const auto [piece, id] : *src) {
-+      if (!id.is_int()) {
-+        return nullptr;
-+      }
-+      src_entries.emplace_back(piece, id.GetInt());
++    src_entries.reserve(src->size());
++    for (auto it = src->rbegin(); it != src->rend(); ++it) {
++      src_entries.emplace_back(std::move(it->first), it->second);
 +    }
 +    d->src_vocab_ = base::flat_map<std::string, int64_t>(std::move(src_entries));
-+    for (const auto [token, id] : *tgt) {
-+      if (!id.is_int() || id.GetInt() < 0) {
++    // The same for the target: one id per token, the last one given, then
++    // read in key order, so ids given twice resolve as base::JSONReader's
++    // sorted DictValue did.
++    std::vector<std::pair<std::string, int>> tgt_newest_first(
++        std::make_move_iterator(tgt->rbegin()), std::make_move_iterator(tgt->rend()));
++    const base::flat_map<std::string, int> tgt_map(std::move(tgt_newest_first));
++    for (const auto& [token, id] : tgt_map) {
++      if (id < 0) {
 +        return nullptr;
 +      }
-+      if (static_cast<size_t>(id.GetInt()) >= d->tgt_vocab_.size()) {
-+        d->tgt_vocab_.resize(id.GetInt() + 1);
++      if (static_cast<size_t>(id) >= d->tgt_vocab_.size()) {
++        d->tgt_vocab_.resize(id + 1);
 +      }
-+      d->tgt_vocab_[id.GetInt()] = token;
++      d->tgt_vocab_[id] = token;
 +    }
 +    auto unk = d->src_vocab_.find("<unk>");
 +    auto end = d->src_vocab_.find("</s>");
@@ -9596,8 +9916,16 @@
 +    }
 +    d->unk_ = unk->second;
 +    d->end_ = end->second;
-+    d->encoder_ = runtime->LoadModel(source, "encoder.int8.onnx", kThreads);
-+    d->decoder_ = runtime->LoadModel(source, "decoder_step.int8.onnx", kThreads);
++    const int64_t vocab_ms = ms(spm_start);  // SentencePiece and the vocabularies' maps
++    const base::TimeTicks encoder_start = base::TimeTicks::Now();
++    d->encoder_ = runtime->LoadModel(source, "encoder.int8.onnx", threads);
++    const int64_t encoder_ms = ms(encoder_start);
++    const base::TimeTicks decoder_start = base::TimeTicks::Now();
++    d->decoder_ = runtime->LoadModel(source, "decoder_step.int8.onnx", threads);
++    const int64_t decoder_ms = ms(decoder_start);
++    DVLOG(1) << "tark-page: model load json_dicts_ms=" << dicts_ms << " vocab_ms=" << vocab_ms
++             << " encoder_session_ms=" << encoder_ms << " decoder_session_ms=" << decoder_ms
++             << " total_ms=" << ms(load_start);
 +    if (!d->encoder_ || !d->decoder_) {
 +      LOG(ERROR) << "Tark translation: models not loaded";
 +      return nullptr;
@@ -9631,6 +9959,7 @@
 +  }
 +
 +  std::optional<std::vector<int64_t>> Greedy(const std::vector<int64_t>& ids) {
++    const base::TimeTicks start = base::TimeTicks::Now();
 +    std::vector<Tensor> encoded;
 +    if (!encoder_->Run({Tensor{.name = "ids",
 +                               .shape = {1, static_cast<int64_t>(ids.size())},
@@ -9638,6 +9967,7 @@
 +                       {"cross_mask", "cross_k", "cross_v"}, &encoded)) {
 +      return std::nullopt;
 +    }
++    const base::TimeDelta encoder_time = base::TimeTicks::Now() - start;
 +    const std::vector<int64_t> empty_cache = {layers_, 1, heads_, 0, head_dim_};
 +    std::vector<Tensor> inputs = {
 +        Tensor{.name = "token", .shape = {1, 1}, .i64 = {start_}},
@@ -9668,6 +9998,18 @@
 +      inputs[3] = std::move(step_out[2]);
 +      inputs[3].name = "past_v";
 +    }
++    if (!ran_.exchange(true)) {  // the first inference after a load (diagnostics)
++      DVLOG(1) << "tark-page: first inference source_tokens=" << ids.size()
++               << " output_tokens=" << out.size()
++               << " encoder_ms=" << encoder_time.InMilliseconds()
++               << " total_ms=" << (base::TimeTicks::Now() - start).InMilliseconds();
++    }
++    if (out.size() == static_cast<size_t>(kMaxOutputTokens)) {
++      // No end token within the output limit: the translation was cut off.
++      // Nullopt keeps the original (a page's text, or a caption shown alone)
++      // rather than half a sentence.
++      return std::nullopt;
++    }
 +    return out;
 +  }
 +
@@ -9692,6 +10034,7 @@
 + private:
 +  Direction() = default;
 +
++
 +  std::unique_ptr<OrtModel> encoder_;
 +  std::unique_ptr<OrtModel> decoder_;
 +  sentencepiece::SentencePieceProcessor spm_;
@@ -9705,11 +10048,14 @@
 +  int64_t unk_ = 0;
 +  int64_t end_ = 0;
 +  bool language_tags_ = true;
++  // Greedy runs on several threads at once (TranslatePages).
++  std::atomic<bool> ran_ = false;
 +};
 +
 +// static
 +std::unique_ptr<TranslationEngine> TranslationEngine::Create(const base::FilePath& models_dir,
-+                                                             const base::FilePath& ort_dylib) {
++                                                             const base::FilePath& ort_dylib,
++                                                             int threads) {
 +  std::map<TranslationDirection, std::unique_ptr<ModelSource>> sources;
 +  sources[TranslationDirection::kIndicToEnglish] =
 +      std::make_unique<DirectorySource>(models_dir.Append("it2_indic_en"));
@@ -9717,23 +10063,25 @@
 +      std::make_unique<DirectorySource>(models_dir.Append("it2_en_indic"));
 +  sources[TranslationDirection::kSpanishToEnglish] =
 +      std::make_unique<DirectorySource>(models_dir.Append("opus_es_en"));
-+  return Create(OrtRuntime::Load(ort_dylib), std::move(sources));
++  return Create(OrtRuntime::Load(ort_dylib), std::move(sources), threads);
 +}
 +
 +// static
 +std::unique_ptr<TranslationEngine> TranslationEngine::Create(
 +    std::unique_ptr<OrtRuntime> runtime,
-+    std::map<TranslationDirection, std::unique_ptr<ModelSource>> sources) {
++    std::map<TranslationDirection, std::unique_ptr<ModelSource>> sources,
++    int threads) {
 +  if (!runtime) {
 +    return nullptr;
 +  }
-+  return base::WrapUnique(new TranslationEngine(std::move(runtime), std::move(sources)));
++  return base::WrapUnique(new TranslationEngine(std::move(runtime), std::move(sources), threads));
 +}
 +
 +TranslationEngine::TranslationEngine(
 +    std::unique_ptr<OrtRuntime> runtime,
-+    std::map<TranslationDirection, std::unique_ptr<ModelSource>> sources)
-+    : runtime_(std::move(runtime)), sources_(std::move(sources)) {}
++    std::map<TranslationDirection, std::unique_ptr<ModelSource>> sources,
++    int threads)
++    : runtime_(std::move(runtime)), sources_(std::move(sources)), threads_(threads) {}
 +
 +TranslationEngine::~TranslationEngine() {
 +  // The models before the runtime that loaded them.
@@ -9745,12 +10093,22 @@
 +  if (loaded != loaded_.end()) {
 +    return loaded->second.get();
 +  }
++  // TranslatePages' workers run on several threads: loaded_ is read-only
++  // then (everything they need loaded before they started).
++  if (lookup_only_) {
++    // Release builds too: the whole batch keeps its originals, so say why
++    // (PageDirectionsFor left out a direction TranslatePage uses).
++    LOG(WARNING) << "tark-page: a parallel run needed a model it had not loaded (direction "
++                 << static_cast<int>(direction) << "); the batch keeps its originals";
++    DCHECK(!lookup_only_) << "a model loads during a parallel run";
++    return nullptr;
++  }
 +  auto source = sources_.find(direction);
 +  if (source == sources_.end()) {
 +    return nullptr;
 +  }
 +  // Not remembered when missing: the models may arrive later.
-+  std::unique_ptr<Direction> d = Direction::Load(runtime_.get(), *source->second);
++  std::unique_ptr<Direction> d = Direction::Load(runtime_.get(), *source->second, threads_);
 +  Direction* raw = d.get();
 +  if (d) {
 +    loaded_[direction] = std::move(d);
@@ -9827,6 +10185,10 @@
 +  return IntoIndian(EnglishModelInput(english), *indian_target,
 +                    trace ? &trace->pivot_src_ids : nullptr,
 +                    trace ? &trace->pivot_out_ids : nullptr);
++}
++
++bool TranslationEngine::Preload(TranslationDirection direction) {
++  return Get(direction) != nullptr;
 +}
 +
 +int TranslationEngine::LoadedDirectionsForTesting() const {
@@ -10000,6 +10362,81 @@
 +  return IntoTag(english, *target);
 +}
 +
++void RunInParallel(size_t count, int parallel, base::RepeatingCallback<void(size_t)> work) {
++  class Worker : public base::DelegateSimpleThread::Delegate {
++   public:
++    Worker(size_t count, const base::RepeatingCallback<void(size_t)>& work)
++        : count_(count), work_(work) {}
++    void Run() override {
++      for (size_t i = next_++; i < count_; i = next_++) {
++        work_->Run(i);
++      }
++    }
++
++   private:
++    const size_t count_;
++    raw_ref<const base::RepeatingCallback<void(size_t)>> work_;
++    std::atomic<size_t> next_ = 0;
++  };
++  Worker worker(count, work);
++  const size_t helpers_wanted =
++      std::min(static_cast<size_t>(std::max(parallel, 1)), std::max<size_t>(count, 1)) - 1;
++  std::vector<std::unique_ptr<base::DelegateSimpleThread>> helpers;
++  for (size_t t = 0; t < helpers_wanted; ++t) {
++    helpers.push_back(std::make_unique<base::DelegateSimpleThread>(&worker, "TarkPageTranslate"));
++    helpers.back()->Start();
++  }
++  worker.Run();  // this thread is one of them
++  base::ScopedBlockingCall blocking(FROM_HERE, base::BlockingType::MAY_BLOCK);
++  for (const std::unique_ptr<base::DelegateSimpleThread>& helper : helpers) {
++    helper->Join();
++  }
++}
++
++std::vector<std::optional<std::string>> TranslationEngine::TranslatePages(
++    const std::vector<std::string>& texts,
++    std::string_view source_code,
++    std::string_view target_code,
++    int parallel) {
++  std::vector<std::optional<std::string>> results(texts.size());
++  if (parallel <= 1 || texts.size() <= 1) {
++    for (size_t i = 0; i < texts.size(); ++i) {
++      results[i] = TranslatePage(texts[i], source_code, target_code);
++    }
++    return results;
++  }
++  // Every model the pair needs loads here, first: the workers only read
++  // loaded_. A model that doesn't load fails every text, as TranslatePage
++  // would (blank ones stay "").
++  for (TranslationDirection direction : PageDirectionsFor(source_code, target_code)) {
++    if (!Get(direction)) {
++      for (size_t i = 0; i < texts.size(); ++i) {
++        if (base::TrimWhitespaceASCII(texts[i], base::TRIM_ALL).empty()) {
++          results[i] = std::string();
++        }
++      }
++      return results;
++    }
++  }
++  // Workers only look models up from here on (Get).
++  lookup_only_ = true;
++  RunInParallel(texts.size(), parallel, base::BindRepeating(
++                                            [](TranslationEngine* engine,
++                                               const std::vector<std::string>* texts,
++                                               const std::string& source,
++                                               const std::string& target,
++                                               std::vector<std::optional<std::string>>* results,
++                                               size_t i) {
++                                              (*results)[i] =
++                                                  engine->TranslatePage((*texts)[i], source, target);
++                                            },
++                                            base::Unretained(this), base::Unretained(&texts),
++                                            std::string(source_code), std::string(target_code),
++                                            base::Unretained(&results)));
++  lookup_only_ = false;
++  return results;
++}
++
 +std::optional<std::string> TranslationEngine::IntoTag(std::string_view model_input,
 +                                                      const IndicLanguage& target) {
 +  Direction* from_english = Get(TranslationDirection::kEnglishToIndic);
@@ -10019,7 +10456,7 @@
 +}  // namespace tark_captions
 --- /dev/null
 +++ b/components/tark_captions/translation_engine.h
-@@ -0,0 +1,151 @@
+@@ -0,0 +1,187 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -10027,6 +10464,8 @@
 +#ifndef COMPONENTS_TARK_CAPTIONS_TRANSLATION_ENGINE_H_
 +#define COMPONENTS_TARK_CAPTIONS_TRANSLATION_ENGINE_H_
 +
++#include <atomic>
++#include <cstddef>
 +#include <cstdint>
 +#include <map>
 +#include <memory>
@@ -10037,6 +10476,7 @@
 +
 +#include "base/containers/span.h"
 +#include "base/files/file_path.h"
++#include "base/functional/callback.h"
 +#include "components/tark_captions/asr_model.h"
 +
 +namespace tark_captions {
@@ -10082,6 +10522,10 @@
 +// A translation stops after this many tokens (a caption is a few seconds).
 +inline constexpr int kMaxOutputTokens = 128;
 +
++// ONNX Runtime's intra-op threads per model unless Create() is told otherwise
++// (captions run beside speech recognition).
++inline constexpr int kTranslationThreads = 2;
++
 +// The model's token ids, for tests: the first hop (to English) and, for an
 +// Indian target, the second.
 +struct TranslationTrace {
@@ -10091,22 +10535,31 @@
 +  std::vector<int64_t> pivot_out_ids;
 +};
 +
++// Calls `work` with 0 .. count-1, each index once, on up to `parallel`
++// threads (this one and parallel - 1 more, which take the next index until
++// none is left); returns when every call has. The caller must allow base
++// sync primitives when `parallel` > 1 (it joins the threads).
++void RunInParallel(size_t count, int parallel, base::RepeatingCallback<void(size_t)> work);
++
 +// AI4Bharat's IndicTrans2 distilled 200M (MIT), int8 ONNX encoder and
-+// cached decoder step (utils/indictrans_export.py), greedy, one caption at
-+// a time. Each direction loads from the models folder (it2_indic_en/,
++// cached decoder step (utils/indictrans_export.py), greedy, one sentence at
++// a time (TranslatePages runs several on threads sharing the models). Each direction loads from the models folder (it2_indic_en/,
 +// it2_en_indic/) the first time it is needed. Use on one sequence; it
 +// blocks while it loads or decodes.
 +class TranslationEngine {
 + public:
 +  // Null if ONNX Runtime is missing; a missing model shows up in Translate().
++  // `threads` is each model's ONNX Runtime intra-op thread count.
 +  static std::unique_ptr<TranslationEngine> Create(const base::FilePath& models_dir,
-+                                                   const base::FilePath& ort_dylib);
++                                                   const base::FilePath& ort_dylib,
++                                                   int threads = kTranslationThreads);
 +  // Tark for Android: each direction's files by handle (the sandboxed
 +  // captions process opens nothing). A direction without a source fails
 +  // in Translate(). Null if `runtime` is.
 +  static std::unique_ptr<TranslationEngine> Create(
 +      std::unique_ptr<OrtRuntime> runtime,
-+      std::map<TranslationDirection, std::unique_ptr<ModelSource>> sources);
++      std::map<TranslationDirection, std::unique_ptr<ModelSource>> sources,
++      int threads = kTranslationThreads);
 +
 +  TranslationEngine(const TranslationEngine&) = delete;
 +  TranslationEngine& operator=(const TranslationEngine&) = delete;
@@ -10144,13 +10597,30 @@
 +                                           std::string_view source_code,
 +                                           std::string_view target_code);
 +
++  // TranslatePage for each of `texts`, aligned with them and exactly what
++  // it gives: `parallel` texts at a time, each on its own thread sharing the
++  // loaded models (no second copy). Every model the pair needs loads first,
++  // on the calling thread. With `parallel` > 1 the caller must allow base
++  // sync primitives (it joins threads).
++  std::vector<std::optional<std::string>> TranslatePages(const std::vector<std::string>& texts,
++                                                         std::string_view source_code,
++                                                         std::string_view target_code,
++                                                         int parallel = 1);
++
++  // Loads `direction`'s model now rather than at its first translation
++  // (page translation warms it). False when its files are missing or bad.
++  bool Preload(TranslationDirection direction);
++
 +  int LoadedDirectionsForTesting() const;
++  // As while TranslatePages' workers run: Get() only looks up.
++  void SetLookupOnlyForTesting(bool lookup_only) { lookup_only_ = lookup_only; }
 +
 + private:
 +  class Direction;
 +
 +  TranslationEngine(std::unique_ptr<OrtRuntime> runtime,
-+                    std::map<TranslationDirection, std::unique_ptr<ModelSource>> sources);
++                    std::map<TranslationDirection, std::unique_ptr<ModelSource>> sources,
++                    int threads);
 +  // Loads the direction on first use; null if its files are missing or bad.
 +  Direction* Get(TranslationDirection direction);
 +  // English model input (tokens) into `target`; the ids go to `src_ids` and
@@ -10166,6 +10636,9 @@
 +  std::unique_ptr<OrtRuntime> runtime_;
 +  std::map<TranslationDirection, std::unique_ptr<ModelSource>> sources_;
 +  std::map<TranslationDirection, std::unique_ptr<Direction>> loaded_;
++  const int threads_;
++  // While TranslatePages' workers run: Get() only looks up.
++  std::atomic<bool> lookup_only_ = false;
 +};
 +
 +}  // namespace tark_captions
@@ -10173,20 +10646,31 @@
 +#endif  // COMPONENTS_TARK_CAPTIONS_TRANSLATION_ENGINE_H_
 --- /dev/null
 +++ b/components/tark_captions/translation_engine_unittest.cc
-@@ -0,0 +1,299 @@
+@@ -0,0 +1,492 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
 +
 +#include "components/tark_captions/translation_engine.h"
 +
++#include <atomic>
 +#include <map>
++#include <set>
 +#include <memory>
 +#include <string>
 +#include <vector>
 +
++#include "base/check.h"
 +#include "base/files/file_util.h"
 +#include "base/files/scoped_temp_dir.h"
++#include "base/json/json_reader.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/synchronization/lock.h"
++#include "base/test/bind.h"
++#include "base/threading/platform_thread.h"
++#include "base/time/time.h"
++#include "base/values.h"
++#include "components/tark_captions/flat_vocab.h"
 +#include "components/tark_captions/model_source.h"
 +#include "components/tark_captions/ort_runtime.h"
 +#include "components/tark_captions/test_util.h"
@@ -10418,6 +10902,63 @@
 +  EXPECT_EQ(engine_->LoadedDirectionsForTesting(), 0);  // nothing loaded for it
 +}
 +
++// A model missing during a parallel run (PageDirectionsFor left out a
++// direction TranslatePage uses) is logged in release builds too, and the
++// text keeps its original.
++TEST_F(TranslationEngineTest, ParallelRunMissingModelIsLogged) {
++  engine_->SetLookupOnlyForTesting(true);
++#if DCHECK_IS_ON()
++  EXPECT_DEATH(engine_->TranslatePage("नमस्ते", "hi", "en"),
++               "needed a model it had not loaded");
++#else
++  testing::internal::CaptureStderr();
++  EXPECT_EQ(engine_->TranslatePage("नमस्ते", "hi", "en"), std::nullopt);
++  EXPECT_NE(testing::internal::GetCapturedStderr().find("needed a model it had not loaded"),
++            std::string::npos);
++#endif
++  engine_->SetLookupOnlyForTesting(false);
++}
++
++// TranslatePages' thread loop, without models: a slow fake sentence
++// translation that fails on chosen indices. Every index runs once, on more
++// than one thread; each result lands at its own index, in order, and a
++// failure nulls only its own.
++TEST(TranslationEngineNoRuntimeTest, RunInParallelKeepsOrderAndFailures) {
++  constexpr size_t kCount = 13;
++  const std::set<size_t> failing = {2, 7, 12};
++  std::vector<std::optional<std::string>> results(kCount);
++  std::vector<std::atomic<int>> calls(kCount);
++  base::Lock lock;
++  std::set<base::PlatformThreadId> threads;
++  RunInParallel(kCount, 4, base::BindLambdaForTesting([&](size_t i) {
++                  {
++                    base::AutoLock hold(lock);
++                    threads.insert(base::PlatformThread::CurrentId());
++                  }
++                  // Later indices finish sooner, so completion order differs.
++                  base::PlatformThread::Sleep(base::Milliseconds(2 * (kCount - i)));
++                  ++calls[i];
++                  results[i] = failing.contains(i) ? std::nullopt
++                                                   : std::optional<std::string>(
++                                                         "s" + base::NumberToString(i));
++                }));
++  for (size_t i = 0; i < kCount; ++i) {
++    EXPECT_EQ(calls[i], 1) << i;
++    EXPECT_EQ(results[i], failing.contains(i) ? std::nullopt
++                                              : std::optional<std::string>(
++                                                    "s" + base::NumberToString(i)))
++        << i;
++  }
++  EXPECT_GT(threads.size(), 1u);
++  EXPECT_LE(threads.size(), 4u);
++
++  // One at a time, and nothing to do.
++  std::vector<size_t> order;
++  RunInParallel(3, 1, base::BindLambdaForTesting([&](size_t i) { order.push_back(i); }));
++  EXPECT_EQ(order, (std::vector<size_t>{0, 1, 2}));
++  RunInParallel(0, 4, base::BindLambdaForTesting([&](size_t) { ADD_FAILURE(); }));
++}
++
 +TEST(TranslationEngineNoRuntimeTest, CreateFailsWithoutRuntime) {
 +  EXPECT_FALSE(TranslationEngine::Create(base::FilePath("/nonexistent"),
 +                                         base::FilePath("/nonexistent/libonnxruntime.dylib")));
@@ -10469,6 +11010,131 @@
 +        << *c.FindString("id");
 +  }
 +  EXPECT_EQ(engine_->TranslatePage("  ", "ml", "en"), std::string());
++}
++
++// A page's sentences on four threads sharing one engine (one intra-op
++// thread each) come back exactly as one at a time gives them, in order; a
++// sentence cut off at kMaxOutputTokens is nullopt without failing the rest.
++TEST_F(TranslationEngineTest, ParallelPagesMatchOneAtATime) {
++  std::string cut_off;
++  for (int i = 0; i < 60; ++i) {
++    cut_off += "नमस्ते दुनिया ";
++  }
++  std::vector<std::string> texts = {"", cut_off};
++  for (const base::Value& v : cases_) {
++    if (*v.GetDict().FindString("lang") == "hi") {
++      texts.push_back(*v.GetDict().FindString("caption"));
++    }
++  }
++  ASSERT_GE(texts.size(), 4u);
++  std::unique_ptr<TranslationEngine> one_thread = TranslationEngine::Create(models_, ort_, 1);
++  ASSERT_TRUE(one_thread);
++  for (const char* target : {"en", "ta", "gu"}) {
++    std::vector<std::optional<std::string>> one;
++    for (const std::string& text : texts) {
++      one.push_back(engine_->TranslatePage(text, "hi", target));
++    }
++    ASSERT_EQ(one[0], std::string()) << target;
++    ASSERT_EQ(one[1], std::nullopt) << target;  // the cut-off one
++    const std::vector<std::optional<std::string>> parallel =
++        one_thread->TranslatePages(texts, "hi", target, /*parallel=*/4);
++    ASSERT_EQ(parallel.size(), one.size());
++    for (size_t i = 0; i < one.size(); ++i) {
++      EXPECT_EQ(parallel[i], one[i]) << target << " row " << i;
++    }
++  }
++}
++
++// Models that can't load fail every non-blank text before any thread starts.
++TEST_F(TranslationEngineTest, ParallelPagesMissingModelFails) {
++  base::ScopedTempDir empty;
++  ASSERT_TRUE(empty.CreateUniqueTempDir());
++  std::unique_ptr<TranslationEngine> engine = TranslationEngine::Create(empty.GetPath(), ort_);
++  ASSERT_TRUE(engine);
++  EXPECT_EQ(engine->TranslatePages({"एक", " ", "दो"}, "hi", "en", 4),
++            (std::vector<std::optional<std::string>>{std::nullopt, "", std::nullopt}));
++}
++
++// The thread count is a load parameter; translations don't depend on it.
++TEST_F(TranslationEngineTest, ThreadsDoNotChangeTranslations) {
++  std::unique_ptr<TranslationEngine> four = TranslationEngine::Create(models_, ort_, 4);
++  ASSERT_TRUE(four);
++  for (const base::Value& v : cases_) {
++    const base::DictValue& c = v.GetDict();
++    EXPECT_EQ(four->TranslatePages({*c.FindString("caption")}, *c.FindString("lang"), "en"),
++              (std::vector<std::optional<std::string>>{
++                  engine_->TranslatePage(*c.FindString("caption"), *c.FindString("lang"), "en")}))
++        << *c.FindString("id");
++  }
++}
++
++// ParseFlatVocab gives what base::JSONReader gives for a flat {"token": id}
++// file, escapes and all (dict.*.json write Devanagari raw, but a file may
++// escape it).
++TEST(FlatVocabTest, MatchesJsonReader) {
++  const std::string json =
++      "{\n  \"<s>\": 0,\n  \"a\\\"b\": 1, \"\\\\\": 2, \"\\u0905\\u093e\": 3,\n"
++      "  \"\\ud83d\\ude00\": 4, \"tab\\there\": 5, \"\\/x\": -6,\n"
++      "  \"\xE2\x96\x81\xE0\xA5\xA4\": 7, \"z\": 2147483647, \"y\": -2147483648 }\n";
++  std::optional<std::vector<std::pair<std::string, int>>> fast = ParseFlatVocab(json);
++  ASSERT_TRUE(fast);
++  std::optional<base::Value> slow = base::JSONReader::Read(json, base::JSON_PARSE_RFC);
++  ASSERT_TRUE(slow && slow->is_dict());
++  ASSERT_EQ(fast->size(), slow->GetDict().size());
++  for (const auto& [key, id] : *fast) {
++    EXPECT_EQ(slow->GetDict().FindInt(key), id) << key;
++  }
++  EXPECT_EQ((*fast)[2].first, "\\");
++  EXPECT_EQ((*fast)[3].first, "\xE0\xA4\x85\xE0\xA4\xBE");      // अा
++  EXPECT_EQ((*fast)[4].first, "\xF0\x9F\x98\x80");              // a surrogate pair
++  EXPECT_EQ((*fast)[0].first, "<s>");                           // file order
++}
++
++// it2_indic_en's dict.SRC.json has keys with Unicode noncharacters
++// (U+FDDB..U+FDEB). base::JSONReader takes them, and so must the fast path: with
++// base::IsStringUTF8 it declined that file on the phone (round 12) and fell
++// back to the 18 s path.
++TEST(FlatVocabTest, NoncharacterKeysTaken) {
++  const std::string json = "{\"\xEF\xB7\x9C\": 5, \"\\ufdeb\": 6}";
++  const char* why = "";
++  std::optional<std::vector<std::pair<std::string, int>>> fast = ParseFlatVocab(json, &why);
++  ASSERT_TRUE(fast) << why;
++  std::optional<base::Value> slow = base::JSONReader::Read(json, base::JSON_PARSE_RFC);
++  ASSERT_TRUE(slow && slow->is_dict());
++  ASSERT_EQ(fast->size(), slow->GetDict().size());
++  for (const auto& [key, id] : *fast) {
++    EXPECT_EQ(slow->GetDict().FindInt(key), id);
++  }
++}
++
++// Anything that is not a flat object of int32s goes back to base::JSONReader.
++TEST(FlatVocabTest, DeclinesWhatItDoesNotHandle) {
++  for (const char* json :
++       {"{\"a\": 1.0}", "{\"a\": 1e2}", "{\"a\": 01}", "{\"a\": \"1\"}", "{\"a\": [1]}",
++        "{\"a\": 2147483648}", "{\"\\ud800\": 1}", "{\"\\udc00\": 1}", "{\"\\x41\": 1}",
++        "{\"a\": 1,}", "{\"a\": 1} x", "[1]", "", "{\"\xFF\": 1}", "{\"a\nb\": 1}"}) {
++    EXPECT_FALSE(ParseFlatVocab(json)) << json;
++  }
++  EXPECT_EQ(ParseFlatVocab(" {} "), (std::vector<std::pair<std::string, int>>{}));
++}
++
++// The size of IndicTrans2's dict.SRC.json, keys in id order (not key order),
++// as on the phone, where base::JSONReader took 18.7 s: well under a second.
++TEST(FlatVocabTest, LargeVocabularyIsFast) {
++  std::string json = "{";
++  for (int id = 0; id < 122706; ++id) {
++    json += (id ? ",\n  \"" : "\n  \"");
++    json += "\xE2\x96\x81\xE0\xA4\x95";  // ▁क
++    json += std::to_string((id * 7919) % 122706);
++    json += "\": " + std::to_string(id);
++  }
++  json += "\n}\n";
++  const base::TimeTicks start = base::TimeTicks::Now();
++  std::optional<std::vector<std::pair<std::string, int>>> entries = ParseFlatVocab(json);
++  const base::TimeDelta took = base::TimeTicks::Now() - start;
++  ASSERT_TRUE(entries);
++  EXPECT_EQ(entries->size(), 122706u);
++  EXPECT_LT(took, base::Seconds(1));
 +}
 +
 +}  // namespace

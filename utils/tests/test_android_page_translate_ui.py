@@ -11,6 +11,8 @@ import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 PATCHES = ROOT / 'android' / 'patches'
+# The platform-neutral half, shared with the Mac (patches/series).
+SHARED_WIRING = ROOT / 'patches' / 'tarka' / 'page-translate' / 'wiring.patch'
 PREF = 'tark.page_translation.enabled'
 INDIAN = ['as', 'bn', 'brx', 'doi', 'gu', 'hi', 'kn', 'ks', 'kok', 'mai', 'ml',
           'mni', 'mr', 'ne', 'or', 'pa', 'sa', 'sat', 'sd', 'ta', 'te', 'ur']
@@ -108,7 +110,8 @@ class TestUiPatch(unittest.TestCase):
         self.assertIn('IsOffTheRecord()', client)
 
     def test_directions_offer_menu_and_fallback(self):
-        header = added(section(self.patch, 'components/translate/core/browser/tark_translate_directions.h'))
+        shared = SHARED_WIRING.read_text(encoding='utf-8')
+        header = added(section(shared, 'components/translate/core/browser/tark_translate_directions.h'))
         kindian = header[header.index('kIndian[] = {'):]
         self.assertEqual(re.findall(r'"([a-z]{2,3})"', kindian[:kindian.index('};')]), INDIAN)
         manager = added(section(self.patch, 'components/translate/core/browser/translate_manager.cc'))
