@@ -738,7 +738,7 @@ testing, honoured only in tests), never the person's own.
  TarkPageTranslation::TarkPageTranslation(content::WebContents* web_contents)
      : content::WebContentsObserver(web_contents),
        content::WebContentsUserData<TarkPageTranslation>(*web_contents),
-@@ -71,24 +83,47 @@
+@@ -71,24 +83,50 @@
    if (!manager) {
      return false;
    }
@@ -766,6 +766,9 @@ testing, honoured only in tests), never the person's own.
 +  }
 +  if (logic_.ModelsReady(source, target)) {
 +    StopWaiting();
++    // Translate is about to translate the page this way (TranslatePage, after
++    // its target is settled): the page's batches in it are translated.
++    logic_.Allow(source, target);
 +    return Readiness::kReady;
 +  }
 +  if (waiting_ && waiting_->source == source && waiting_->target == target) {
@@ -798,7 +801,7 @@ testing, honoured only in tests), never the person's own.
  }
  
  void TarkPageTranslation::Revert() {
-@@ -112,6 +147,13 @@
+@@ -112,6 +150,13 @@
    logic_.Translate(std::move(texts), std::move(source), std::move(target), std::move(callback));
  }
  
@@ -809,10 +812,10 @@ testing, honoured only in tests), never the person's own.
 +                         GetWebContents().GetVisibility() != content::Visibility::HIDDEN);
 +}
 +
- void TarkPageTranslation::AddObserver(Observer* observer) {
-   observers_.AddObserver(observer);
+ bool TarkPageTranslation::Allowed(const std::string& source, const std::string& target) const {
+   return logic_.Allowed(source, target);
  }
-@@ -145,6 +187,12 @@
+@@ -149,6 +194,12 @@
    if (TarkCaptionModels().status(unit).state == CaptionModelStore::State::kFailed) {
      StopWaiting();
      observers_.Notify(&Observer::OnDownloadFailed, this, direction);
@@ -825,7 +828,7 @@ testing, honoured only in tests), never the person's own.
      return;
    }
    if (!logic_.ModelsReady(direction.source, direction.target)) {
-@@ -165,6 +213,7 @@
+@@ -172,6 +223,7 @@
  
  void TarkPageTranslation::StopWaiting() {
    waiting_.reset();
@@ -833,7 +836,7 @@ testing, honoured only in tests), never the person's own.
    models_observation_.Reset();
  }
  
-@@ -235,6 +284,9 @@
+@@ -242,6 +294,9 @@
  }
  
  bool TarkPageTranslation::UnitReady(ModelUnit unit) const {
@@ -880,10 +883,10 @@ testing, honoured only in tests), never the person's own.
 +  // (PageTranslation::WarmOnDetection).
 +  void OnPageLanguage(const std::string& source, const std::string& target);
 +
-   // TarkPageTranslateHost: one batch from the page's script. Null results
-   // keep the original; an empty Results is deferred (the script sends them
-   // again).
-@@ -130,8 +161,9 @@
+   // The browser started translating this page from `source` into `target`
+   // (TranslateNow; the person's Translate or translate's own automatic one,
+   // with the models here) and the page has not gone or been shown in its
+@@ -137,8 +168,9 @@
    const raw_ptr<PrefService> prefs_;
    const bool off_the_record_;
    mojo::Remote<media::mojom::TarkCaptionTranslator> translator_;
