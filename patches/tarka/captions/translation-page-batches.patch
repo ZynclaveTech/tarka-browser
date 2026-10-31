@@ -8,14 +8,15 @@
  #include <utility>
  
  #include "base/containers/flat_map.h"
-@@ -12,9 +13,14 @@
+@@ -12,9 +13,15 @@
  #include "base/json/json_reader.h"
  #include "base/logging.h"
  #include "base/memory/ptr_util.h"
-+#include "base/memory/raw_ptr.h"
 +#include "base/memory/raw_ref.h"
  #include "base/strings/string_util.h"
  #include "base/strings/utf_string_conversions.h"
++#include "base/functional/bind.h"
++#include "base/threading/scoped_blocking_call.h"
 +#include "base/threading/simple_thread.h"
 +#include "base/time/time.h"
  #include "components/tark_captions/english_text.h"
@@ -23,7 +24,7 @@
  #include "components/tark_captions/indic_text.h"
  #include "components/tark_captions/model_source.h"
  #include "components/tark_captions/ort_runtime.h"
-@@ -23,7 +29,6 @@
+@@ -23,7 +30,6 @@
  namespace tark_captions {
  namespace {
  
@@ -31,7 +32,7 @@
  // IndicTrans2's model_max_length: 255 tokens and </s>.
  constexpr size_t kMaxSourceTokens = 255;
  constexpr char kEnglishTag[] = "eng_Latn";
-@@ -53,6 +58,12 @@
+@@ -53,6 +59,12 @@
    }
  }
  
@@ -44,7 +45,7 @@
  std::optional<base::DictValue> ReadJsonDict(const ModelSource& source, std::string_view name) {
    std::optional<base::span<const uint8_t>> bytes = source.Read(name);
    if (!bytes) {
-@@ -66,6 +77,36 @@
+@@ -66,6 +78,36 @@
    return std::move(*value).TakeDict();
  }
  
@@ -81,7 +82,7 @@
  bool IsIndianCode(std::string_view code) {
    return code == "hi" || code == "ta" || code == "bn";
  }
-@@ -121,11 +162,23 @@
+@@ -121,11 +163,23 @@
   public:
    // config.json, dict.SRC.json, dict.TGT.json, model.SRC (SentencePiece),
    // encoder.int8.onnx and decoder_step.int8.onnx, from `source`.
@@ -108,7 +109,7 @@
      std::optional<base::span<const uint8_t>> spm = source.Read("model.SRC");
      if (!config || !src || !tgt || !spm ||
          !d->spm_.LoadFromSerializedProto(base::as_string_view(*spm)).ok()) {
-@@ -147,22 +200,28 @@
+@@ -147,22 +201,28 @@
      d->head_dim_ = *dim / *heads;
      d->start_ = *start;
      d->eos_ = *eos;
@@ -147,7 +148,7 @@
      }
      auto unk = d->src_vocab_.find("<unk>");
      auto end = d->src_vocab_.find("</s>");
-@@ -171,8 +230,16 @@
+@@ -171,8 +231,16 @@
      }
      d->unk_ = unk->second;
      d->end_ = end->second;
@@ -166,7 +167,7 @@
      if (!d->encoder_ || !d->decoder_) {
        LOG(ERROR) << "Tark translation: models not loaded";
        return nullptr;
-@@ -206,6 +273,7 @@
+@@ -206,6 +274,7 @@
    }
  
    std::optional<std::vector<int64_t>> Greedy(const std::vector<int64_t>& ids) {
@@ -174,7 +175,7 @@
      std::vector<Tensor> encoded;
      if (!encoder_->Run({Tensor{.name = "ids",
                                 .shape = {1, static_cast<int64_t>(ids.size())},
-@@ -213,6 +281,7 @@
+@@ -213,6 +282,7 @@
                         {"cross_mask", "cross_k", "cross_v"}, &encoded)) {
        return std::nullopt;
      }
@@ -182,7 +183,7 @@
      const std::vector<int64_t> empty_cache = {layers_, 1, heads_, 0, head_dim_};
      std::vector<Tensor> inputs = {
          Tensor{.name = "token", .shape = {1, 1}, .i64 = {start_}},
-@@ -243,6 +312,18 @@
+@@ -243,6 +313,18 @@
        inputs[3] = std::move(step_out[2]);
        inputs[3].name = "past_v";
      }
@@ -201,7 +202,7 @@
      return out;
    }
  
-@@ -267,6 +348,7 @@
+@@ -267,6 +349,7 @@
   private:
    Direction() = default;
  
@@ -209,7 +210,7 @@
    std::unique_ptr<OrtModel> encoder_;
    std::unique_ptr<OrtModel> decoder_;
    sentencepiece::SentencePieceProcessor spm_;
-@@ -280,11 +362,14 @@
+@@ -280,11 +363,14 @@
    int64_t unk_ = 0;
    int64_t end_ = 0;
    bool language_tags_ = true;
@@ -225,7 +226,7 @@
    std::map<TranslationDirection, std::unique_ptr<ModelSource>> sources;
    sources[TranslationDirection::kIndicToEnglish] =
        std::make_unique<DirectorySource>(models_dir.Append("it2_indic_en"));
-@@ -292,23 +377,25 @@
+@@ -292,23 +378,25 @@
        std::make_unique<DirectorySource>(models_dir.Append("it2_en_indic"));
    sources[TranslationDirection::kSpanishToEnglish] =
        std::make_unique<DirectorySource>(models_dir.Append("opus_es_en"));
@@ -256,7 +257,18 @@
  
  TranslationEngine::~TranslationEngine() {
    // The models before the runtime that loaded them.
-@@ -325,7 +412,7 @@
+@@ -320,12 +408,18 @@
+   if (loaded != loaded_.end()) {
+     return loaded->second.get();
+   }
++  // TranslatePages' workers run on several threads: loaded_ is read-only
++  // then (everything they need loaded before they started).
++  DCHECK(!lookup_only_) << "a model loads during a parallel run";
++  if (lookup_only_) {
++    return nullptr;
++  }
+   auto source = sources_.find(direction);
+   if (source == sources_.end()) {
      return nullptr;
    }
    // Not remembered when missing: the models may arrive later.
@@ -265,10 +277,41 @@
    Direction* raw = d.get();
    if (d) {
      loaded_[direction] = std::move(d);
-@@ -575,6 +662,76 @@
+@@ -575,6 +669,81 @@
    return IntoTag(english, *target);
  }
  
++void RunInParallel(size_t count, int parallel, base::RepeatingCallback<void(size_t)> work) {
++  class Worker : public base::DelegateSimpleThread::Delegate {
++   public:
++    Worker(size_t count, const base::RepeatingCallback<void(size_t)>& work)
++        : count_(count), work_(work) {}
++    void Run() override {
++      for (size_t i = next_++; i < count_; i = next_++) {
++        work_->Run(i);
++      }
++    }
++
++   private:
++    const size_t count_;
++    raw_ref<const base::RepeatingCallback<void(size_t)>> work_;
++    std::atomic<size_t> next_ = 0;
++  };
++  Worker worker(count, work);
++  const size_t helpers_wanted =
++      std::min(static_cast<size_t>(std::max(parallel, 1)), std::max<size_t>(count, 1)) - 1;
++  std::vector<std::unique_ptr<base::DelegateSimpleThread>> helpers;
++  for (size_t t = 0; t < helpers_wanted; ++t) {
++    helpers.push_back(std::make_unique<base::DelegateSimpleThread>(&worker, "TarkPageTranslate"));
++    helpers.back()->Start();
++  }
++  worker.Run();  // this thread is one of them
++  base::ScopedBlockingCall blocking(FROM_HERE, base::BlockingType::MAY_BLOCK);
++  for (const std::unique_ptr<base::DelegateSimpleThread>& helper : helpers) {
++    helper->Join();
++  }
++}
++
 +std::vector<std::optional<std::string>> TranslationEngine::TranslatePages(
 +    const std::vector<std::string>& texts,
 +    std::string_view source_code,
@@ -294,48 +337,22 @@
 +      return results;
 +    }
 +  }
-+  // Workers take the next text until none is left, each running
-+  // TranslatePage on the shared sessions (ONNX Runtime's Run is thread-safe).
-+  class Worker : public base::DelegateSimpleThread::Delegate {
-+   public:
-+    Worker(TranslationEngine* engine,
-+           const std::vector<std::string>& texts,
-+           std::string_view source,
-+           std::string_view target,
-+           std::vector<std::optional<std::string>>& results,
-+           std::atomic<size_t>& next)
-+        : engine_(engine),
-+          texts_(texts),
-+          source_(source),
-+          target_(target),
-+          results_(results),
-+          next_(next) {}
-+    void Run() override {
-+      for (size_t i = (*next_)++; i < texts_->size(); i = (*next_)++) {
-+        (*results_)[i] = engine_->TranslatePage((*texts_)[i], source_, target_);
-+      }
-+    }
-+
-+   private:
-+    raw_ptr<TranslationEngine> engine_;
-+    raw_ref<const std::vector<std::string>> texts_;
-+    std::string_view source_;
-+    std::string_view target_;
-+    raw_ref<std::vector<std::optional<std::string>>> results_;
-+    raw_ref<std::atomic<size_t>> next_;
-+  };
-+  std::atomic<size_t> next = 0;
-+  Worker worker(this, texts, source_code, target_code, results, next);
-+  const size_t threads = std::min(static_cast<size_t>(parallel), texts.size()) - 1;
-+  std::vector<std::unique_ptr<base::DelegateSimpleThread>> helpers;
-+  for (size_t t = 0; t < threads; ++t) {
-+    helpers.push_back(std::make_unique<base::DelegateSimpleThread>(&worker, "TarkPageTranslate"));
-+    helpers.back()->Start();
-+  }
-+  worker.Run();  // this thread is one of them
-+  for (const std::unique_ptr<base::DelegateSimpleThread>& helper : helpers) {
-+    helper->Join();
-+  }
++  // Workers only look models up from here on (Get).
++  lookup_only_ = true;
++  RunInParallel(texts.size(), parallel, base::BindRepeating(
++                                            [](TranslationEngine* engine,
++                                               const std::vector<std::string>* texts,
++                                               const std::string& source,
++                                               const std::string& target,
++                                               std::vector<std::optional<std::string>>* results,
++                                               size_t i) {
++                                              (*results)[i] =
++                                                  engine->TranslatePage((*texts)[i], source, target);
++                                            },
++                                            base::Unretained(this), base::Unretained(&texts),
++                                            std::string(source_code), std::string(target_code),
++                                            base::Unretained(&results)));
++  lookup_only_ = false;
 +  return results;
 +}
 +
@@ -344,7 +361,24 @@
    Direction* from_english = Get(TranslationDirection::kEnglishToIndic);
 --- a/components/tark_captions/translation_engine.h
 +++ b/components/tark_captions/translation_engine.h
-@@ -60,6 +60,10 @@
+@@ -5,6 +5,8 @@
+ #ifndef COMPONENTS_TARK_CAPTIONS_TRANSLATION_ENGINE_H_
+ #define COMPONENTS_TARK_CAPTIONS_TRANSLATION_ENGINE_H_
+ 
++#include <atomic>
++#include <cstddef>
+ #include <cstdint>
+ #include <map>
+ #include <memory>
+@@ -15,6 +17,7 @@
+ 
+ #include "base/containers/span.h"
+ #include "base/files/file_path.h"
++#include "base/functional/callback.h"
+ #include "components/tark_captions/asr_model.h"
+ 
+ namespace tark_captions {
+@@ -60,6 +63,10 @@
  // A translation stops after this many tokens (a caption is a few seconds).
  inline constexpr int kMaxOutputTokens = 128;
  
@@ -355,9 +389,16 @@
  // The model's token ids, for tests: the first hop (to English) and, for an
  // Indian target, the second.
  struct TranslationTrace {
-@@ -70,21 +74,24 @@
+@@ -69,22 +76,31 @@
+   std::vector<int64_t> pivot_out_ids;
  };
  
++// Calls `work` with 0 .. count-1, each index once, on up to `parallel`
++// threads (this one and parallel - 1 more, which take the next index until
++// none is left); returns when every call has. The caller must allow base
++// sync primitives when `parallel` > 1 (it joins the threads).
++void RunInParallel(size_t count, int parallel, base::RepeatingCallback<void(size_t)> work);
++
  // AI4Bharat's IndicTrans2 distilled 200M (MIT), int8 ONNX encoder and
 -// cached decoder step (utils/indictrans_export.py), greedy, one caption at
 -// a time. Each direction loads from the models folder (it2_indic_en/,
@@ -384,7 +425,7 @@
  
    TranslationEngine(const TranslationEngine&) = delete;
    TranslationEngine& operator=(const TranslationEngine&) = delete;
-@@ -122,13 +129,24 @@
+@@ -122,13 +138,24 @@
                                             std::string_view source_code,
                                             std::string_view target_code);
  
@@ -410,14 +451,28 @@
    // Loads the direction on first use; null if its files are missing or bad.
    Direction* Get(TranslationDirection direction);
    // English model input (tokens) into `target`; the ids go to `src_ids` and
-@@ -144,6 +162,7 @@
+@@ -144,6 +171,9 @@
    std::unique_ptr<OrtRuntime> runtime_;
    std::map<TranslationDirection, std::unique_ptr<ModelSource>> sources_;
    std::map<TranslationDirection, std::unique_ptr<Direction>> loaded_;
 +  const int threads_;
++  // While TranslatePages' workers run: Get() only looks up.
++  std::atomic<bool> lookup_only_ = false;
  };
  
  }  // namespace tark_captions
+--- a/components/tark_captions/ort_runtime.h
++++ b/components/tark_captions/ort_runtime.h
+@@ -83,6 +83,9 @@
+ 
+   // Runs the model on `inputs` (float32 or int64, by name) and fills
+   // `outputs` with `output_names`, in that order. False on any error.
++  // Several threads may Run one model at once (ONNX Runtime's Run is
++  // thread-safe; page translation runs sentences in parallel on one
++  // session).
+   bool Run(const std::vector<Tensor>& inputs,
+            const std::vector<std::string>& output_names,
+            std::vector<Tensor>* outputs);
 --- /dev/null
 +++ b/components/tark_captions/flat_vocab.h
 @@ -0,0 +1,254 @@
@@ -677,18 +732,78 @@
 +#endif  // COMPONENTS_TARK_CAPTIONS_FLAT_VOCAB_H_
 --- a/components/tark_captions/translation_engine_unittest.cc
 +++ b/components/tark_captions/translation_engine_unittest.cc
-@@ -11,6 +11,10 @@
+@@ -4,13 +4,23 @@
+ 
+ #include "components/tark_captions/translation_engine.h"
+ 
++#include <atomic>
+ #include <map>
++#include <set>
+ #include <memory>
+ #include <string>
+ #include <vector>
  
  #include "base/files/file_util.h"
  #include "base/files/scoped_temp_dir.h"
 +#include "base/json/json_reader.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/synchronization/lock.h"
++#include "base/test/bind.h"
++#include "base/threading/platform_thread.h"
 +#include "base/time/time.h"
 +#include "base/values.h"
 +#include "components/tark_captions/flat_vocab.h"
  #include "components/tark_captions/model_source.h"
  #include "components/tark_captions/ort_runtime.h"
  #include "components/tark_captions/test_util.h"
-@@ -295,5 +299,130 @@
+@@ -242,6 +252,46 @@
+   EXPECT_EQ(engine_->LoadedDirectionsForTesting(), 0);  // nothing loaded for it
+ }
+ 
++// TranslatePages' thread loop, without models: a slow fake sentence
++// translation that fails on chosen indices. Every index runs once, on more
++// than one thread; each result lands at its own index, in order, and a
++// failure nulls only its own.
++TEST(TranslationEngineNoRuntimeTest, RunInParallelKeepsOrderAndFailures) {
++  constexpr size_t kCount = 13;
++  const std::set<size_t> failing = {2, 7, 12};
++  std::vector<std::optional<std::string>> results(kCount);
++  std::vector<std::atomic<int>> calls(kCount);
++  base::Lock lock;
++  std::set<base::PlatformThreadId> threads;
++  RunInParallel(kCount, 4, base::BindLambdaForTesting([&](size_t i) {
++                  {
++                    base::AutoLock hold(lock);
++                    threads.insert(base::PlatformThread::CurrentId());
++                  }
++                  // Later indices finish sooner, so completion order differs.
++                  base::PlatformThread::Sleep(base::Milliseconds(2 * (kCount - i)));
++                  ++calls[i];
++                  results[i] = failing.contains(i) ? std::nullopt
++                                                   : std::optional<std::string>(
++                                                         "s" + base::NumberToString(i));
++                }));
++  for (size_t i = 0; i < kCount; ++i) {
++    EXPECT_EQ(calls[i], 1) << i;
++    EXPECT_EQ(results[i], failing.contains(i) ? std::nullopt
++                                              : std::optional<std::string>(
++                                                    "s" + base::NumberToString(i)))
++        << i;
++  }
++  EXPECT_GT(threads.size(), 1u);
++  EXPECT_LE(threads.size(), 4u);
++
++  // One at a time, and nothing to do.
++  std::vector<size_t> order;
++  RunInParallel(3, 1, base::BindLambdaForTesting([&](size_t i) { order.push_back(i); }));
++  EXPECT_EQ(order, (std::vector<size_t>{0, 1, 2}));
++  RunInParallel(0, 4, base::BindLambdaForTesting([&](size_t) { ADD_FAILURE(); }));
++}
++
+ TEST(TranslationEngineNoRuntimeTest, CreateFailsWithoutRuntime) {
+   EXPECT_FALSE(TranslationEngine::Create(base::FilePath("/nonexistent"),
+                                          base::FilePath("/nonexistent/libonnxruntime.dylib")));
+@@ -295,5 +345,130 @@
    EXPECT_EQ(engine_->TranslatePage("  ", "ml", "en"), std::string());
  }
  
