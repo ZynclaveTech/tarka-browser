@@ -379,7 +379,7 @@
 +}  // namespace tark_captions
 --- /dev/null
 +++ b/chrome/browser/tark_captions/page_translation.h
-@@ -0,0 +1,190 @@
+@@ -0,0 +1,201 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -409,6 +409,17 @@
 +// Mac has no model for the pair (Spanish: captions' opus-mt is Android's
 +// download, not the Mac's), or the two are the same.
 +std::vector<ModelUnit> PageUnitsFor(std::string_view source, std::string_view target);
++
++// The profile whose speech service a tab's page translator binds on: the
++// original one, so a Private tab shares the normal profile's speech process,
++// its one model slot and captions' busy-model rule (one model, ~500 MB, not
++// one per profile). The process writes nothing; downloads stay gated on the
++// tab's own profile being off the record. `P` is Profile (a template so the
++// rule is tested without a browser).
++template <typename P>
++P* SpeechProfileFor(P* profile) {
++  return profile ? profile->GetOriginalProfile() : nullptr;
++}
 +
 +// Keep in sync with android/patches/page-translate-browser.patch
 +// (chrome/browser/tark_captions_android/page_translation.*), which this is
@@ -790,7 +801,7 @@
 +#endif  // CHROME_BROWSER_TARK_CAPTIONS_TARK_PAGE_TRANSLATE_HOST_H_
 --- /dev/null
 +++ b/chrome/browser/tark_captions/tark_page_translation.cc
-@@ -0,0 +1,261 @@
+@@ -0,0 +1,263 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -966,13 +977,15 @@
 +}
 +
 +void TarkPageTranslation::BindTranslator() {
-+  // The profile's speech process: captions' when they run (the same model
-+  // slot), else started now without speech. An off-the-record profile has
-+  // its own service; the models are the same files.
++  // The original profile's speech process, also for a Private tab (one
++  // process, one model slot): captions' when they run, else started now
++  // without speech. The original profile outlives its off-the-record ones;
++  // if its process goes anyway, OnGone answers and the next batch rebinds.
 +  if (!web_contents()) {
 +    return;  // the tab is closing
 +  }
-+  Profile* profile = Profile::FromBrowserContext(web_contents()->GetBrowserContext());
++  Profile* profile =
++      SpeechProfileFor(Profile::FromBrowserContext(web_contents()->GetBrowserContext()));
 +  speech::SpeechRecognitionService* service =
 +      profile ? SpeechRecognitionServiceFactory::GetForProfile(profile) : nullptr;
 +  if (!service) {
@@ -1207,7 +1220,7 @@
 +#endif  // CHROME_BROWSER_TARK_CAPTIONS_TARK_PAGE_TRANSLATION_H_
 --- /dev/null
 +++ b/chrome/browser/tark_captions/tark_page_translation_unittest.cc
-@@ -0,0 +1,501 @@
+@@ -0,0 +1,519 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -1707,6 +1720,24 @@
 +  EXPECT_EQ(TarkPageBatchEnd({hindi, hindi, "a"}), 2u);
 +}
 +
++// A Private tab's translator binds on the original profile's speech service,
++// so normal and Private tabs share one process, one model and captions'
++// busy-model rule (review I1).
++struct FakeProfile {
++  FakeProfile* original = this;
++  FakeProfile* GetOriginalProfile() { return original; }
++};
++
++TEST(TarkSpeechProfileTest, PrivateSharesTheOriginalProfilesProcess) {
++  FakeProfile normal;
++  FakeProfile off_the_record;
++  off_the_record.original = &normal;
++  EXPECT_EQ(SpeechProfileFor(&off_the_record), &normal);
++  EXPECT_EQ(SpeechProfileFor(&normal), &normal);
++  EXPECT_EQ(SpeechProfileFor(&off_the_record), SpeechProfileFor(&normal));
++  EXPECT_EQ(SpeechProfileFor(static_cast<FakeProfile*>(nullptr)), nullptr);
++}
++
 +}  // namespace
 +}  // namespace tark_captions
 --- a/chrome/browser/ui/BUILD.gn
@@ -1797,3 +1828,4 @@
      bool download_when_checked = false;
      // Bumped by every Download, Cancel and failure; replies from an older
      // download are dropped.
+Warning: more recent patches modify files in patch /Users/soorajpandey/Projects/tarka-mac-page-translation/patches/tarka/page-translate/browser.patch
