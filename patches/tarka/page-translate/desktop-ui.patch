@@ -1368,6 +1368,49 @@ testing, honoured only in tests), never the person's own.
          "//chrome/browser/ui:fullscreen_util_mac",
          "//chrome/browser/ui/cocoa:browser_tests",
          "//chrome/browser/ui/views/frame:browser_frame_view_mac",
+--- a/components/translate/core/browser/BUILD.gn
++++ b/components/translate/core/browser/BUILD.gn
+@@ -4,6 +4,7 @@
+ 
+ import("//build/config/ui.gni")
+ import("//third_party/protobuf/proto_library.gni")
++import("//testing/test.gni")
+ 
+ static_library("browser") {
+   sources = [
+@@ -159,6 +160,19 @@
+   }
+ }
+ 
++# Tark for Mac: the translate component's unit tests on their own
++# (components_unittests isn't built on the Mac build machine).
++test("tark_translate_unittests") {
++  deps = [
++    ":unit_tests",
++    "//components/test:run_all_unittests",  # resources, as components_unittests
++  ]
++  data_deps = [
++    "//components:components_tests_pak",
++    "//ui/resources:ui_test_pak",
++  ]
++}
++
+ source_set("test_support") {
+   testonly = true
+   sources = [
+--- a/components/translate/core/browser/mock_translate_client.h
++++ b/components/translate/core/browser/mock_translate_client.h
+@@ -55,6 +55,10 @@
+                     TranslateErrors,
+                     bool));
+   MOCK_METHOD1(IsTranslatableURL, bool(const GURL&));
++  MOCK_METHOD(void,
++              TarkPageLanguageKnown,
++              (const std::string&, const std::string&),
++              (override));
+   MOCK_METHOD(void, TriggerPdfTranslation, (), (override));
+   MOCK_METHOD(void, RevertPdfTranslation, (), (override));
+   MOCK_METHOD(bool, IsReadingModeOpen, (), (const, override));
 --- a/components/translate/core/browser/translate_client.h
 +++ b/components/translate/core/browser/translate_client.h
 @@ -71,6 +71,30 @@
@@ -1392,9 +1435,9 @@ testing, honoured only in tests), never the person's own.
 +    return true;
 +  }
 +
-+  // Tark for Mac: the page's language is known and Translate into
-+  // `target_language` may be offered (TarkCanOffer said yes): the embedder
-+  // may start loading the model ahead of the person's Translate.
++  // Tark for Mac: Translate into `target_language` was just offered for the
++  // page (its language known, the offer shown): the embedder may start
++  // loading the model ahead of the person's Translate.
 +  virtual void TarkPageLanguageKnown(const std::string& source_language,
 +                                     const std::string& target_language) {}
 +
@@ -1528,7 +1571,7 @@ testing, honoured only in tests), never the person's own.
    translate_driver_->PrepareToTranslatePage(page_seq_no_, original_source_lang,
                                              target_lang, triggered_from_menu);
  
-@@ -978,6 +1006,21 @@
+@@ -978,6 +1006,16 @@
          TriggerDecision::kDisabledURLNotSupported);
    }
  
@@ -1540,13 +1583,83 @@ testing, honoured only in tests), never the person's own.
 +    decision->PreventAllTriggering();
 +    GetActiveTranslateMetricsLogger()->LogTriggerDecision(
 +        TriggerDecision::kDisabledUnsupportedLanguage);
-+  } else if (translate_client_->IsTranslatableURL(page_url)) {
-+    // Warm the model now (from the Mac only, never a download): the
-+    // person's Translate then starts on a loaded model.
-+    translate_client_->TarkPageLanguageKnown(std::string(page_language_code),
-+                                             std::string(target_lang));
 +  }
 +
    if (!translate_prefs->IsOfferTranslateEnabled()) {
      decision->PreventAllTriggering();
      decision->ranker_events.push_back(
+@@ -1251,6 +1289,13 @@
+         translate::TRANSLATE_STEP_BEFORE_TRANSLATE,
+         std::string(page_language_code), std::string(target_lang),
+         TranslateErrors::NONE, false);
++    // Tark for Mac: the offer is up (every filter, the person's prefs and the
++    // ranker said yes), so warm the model now, from the Mac only, never a
++    // download: the person's Translate then starts on a loaded model.
++    if (did_show_ui) {
++      translate_client_->TarkPageLanguageKnown(std::string(page_language_code),
++                                               std::string(target_lang));
++    }
+   }
+ 
+   // Auto-translate didn't happen, and the UI wasn't shown so consider the
+--- a/components/translate/core/browser/translate_manager_unittest.cc
++++ b/components/translate/core/browser/translate_manager_unittest.cc
+@@ -735,6 +735,58 @@
+   translate_manager_->InitiateTranslation("de");
+ }
+ 
++// Tark for Mac warms its model only when the offer is actually shown: the
++// language blocked, the site on the never-prompt list, the offer setting off
++// or the prompt not shown mean no TarkPageLanguageKnown.
++class TarkWarmTest : public TranslateManagerTest {
++ protected:
++  void Initiate(int expected_warms, bool shows_ui = true) {
++    TranslateManager::SetIgnoreMissingKeyForTesting(true);
++    ON_CALL(mock_translate_client_, IsTranslatableURL(_)).WillByDefault(Return(true));
++    ON_CALL(mock_translate_client_, GetAcceptLanguagesService())
++        .WillByDefault(Return(&accept_languages_));
++    ON_CALL(mock_translate_client_, ShowTranslateUI(_, _, _, _, false))
++        .WillByDefault(Return(shows_ui));
++    EXPECT_CALL(mock_translate_client_, TarkPageLanguageKnown("hi", "en"))
++        .Times(expected_warms);
++    translate_manager_ = std::make_unique<TranslateManager>(
++        &mock_translate_client_, &mock_translate_ranker_, &mock_language_model_);
++    driver_.SetVisibleURL(GURL("https://example.in/"));
++    network_notifier_.SimulateOnline();
++    translate_manager_->GetLanguageState()->LanguageDetermined("hi", true);
++    translate_manager_->InitiateTranslation("hi");
++  }
++
++  language::AcceptLanguagesService accept_languages_{&prefs_, accept_languages_prefs};
++};
++
++TEST_F(TarkWarmTest, WarmsWhenTheOfferIsShown) {
++  prefs_.SetBoolean(prefs::kOfferTranslateEnabled, true);
++  Initiate(1);
++}
++
++TEST_F(TarkWarmTest, NoWarmForABlockedLanguage) {
++  prefs_.SetBoolean(prefs::kOfferTranslateEnabled, true);
++  translate_prefs_.BlockLanguage("hi");
++  Initiate(0);
++}
++
++TEST_F(TarkWarmTest, NoWarmOnANeverPromptSite) {
++  prefs_.SetBoolean(prefs::kOfferTranslateEnabled, true);
++  translate_prefs_.AddSiteToNeverPromptList("example.in");
++  Initiate(0);
++}
++
++TEST_F(TarkWarmTest, NoWarmWithTheOfferSettingOff) {
++  prefs_.SetBoolean(prefs::kOfferTranslateEnabled, false);
++  Initiate(0);
++}
++
++TEST_F(TarkWarmTest, NoWarmWhenThePromptIsNotShown) {
++  prefs_.SetBoolean(prefs::kOfferTranslateEnabled, true);
++  Initiate(0, /*shows_ui=*/false);
++}
++
+ TEST_F(TranslateManagerTest, TestRecordTranslateEvent) {
+   PrepareTranslateManager();
+   const std::string locale = "zh-TW";
