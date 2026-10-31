@@ -36,6 +36,7 @@ class TestRunTests(unittest.TestCase):
         program(out / 'tark_speech_unittests', '[1/1] A.B (0 ms)\nSUCCESS: all tests passed.')
         program(out / 'tark_xlit_unittests', '[==========] 2 tests ran.\n[  PASSED  ] 2 tests.')
         program(out / 'tark_updater_unittests', '[1/1] A.B (0 ms)\nSUCCESS: all tests passed.')
+        program(out / 'tark_page_translate_unittests', '[6/6] A.B (0 ms)\nSUCCESS: all tests passed.')
         bin_dir = root / 'bin'
         bin_dir.mkdir()
         program(bin_dir / 'ninja', '')
@@ -50,6 +51,14 @@ class TestRunTests(unittest.TestCase):
         self.assertIn('ok speech', out)
         self.assertIn('ok xlit', out)
         self.assertIn('ok updater', out)
+        self.assertIn('ok pagetranslate', out)
+
+    def test_page_translation_with_real_models_cannot_be_skipped(self):
+        # Desktop page translation (Hindi → English, Hindi → Tamil) runs on
+        # the real IndicTrans2 models; without them (curl fails here) the
+        # check fails rather than passing on skipped tests.
+        out = self.run_with('[211/211] A.B (0 ms)\nSUCCESS: all tests passed.')
+        self.assertIn('FAIL pagetranslate-models', out)
 
     def test_a_failing_program_fails(self):
         self.assertIn('FAIL captions', self.run_with('1 test failed', 1))

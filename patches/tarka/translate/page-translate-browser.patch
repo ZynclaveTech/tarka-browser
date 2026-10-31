@@ -1,0 +1,629 @@
+--- a/chrome/browser/speech/speech_recognition_service.h
++++ b/chrome/browser/speech/speech_recognition_service.h
+@@ -27,6 +27,11 @@
+   virtual void BindTarkCaptionTranslator(
+       mojo::PendingReceiver<media::mojom::TarkCaptionTranslator> receiver) {}
+ 
++  // Tark: a web page translator in the speech process (the captions'
++  // engine and models). Only the Chrome service has one.
++  virtual void BindTarkPageTranslator(
++      mojo::PendingReceiver<media::mojom::TarkPageTranslator> receiver) {}
++
+   // Tark (D4 Phase 3): where the speech process opens taps for the call
+   // audio of the languages macOS captions. The captioning tab provides a
+   // source; the service hands the speech process a fresh one with every
+--- a/chrome/browser/speech/chrome_speech_recognition_service.h
++++ b/chrome/browser/speech/chrome_speech_recognition_service.h
+@@ -62,6 +62,9 @@
+   void BindTarkCaptionTranslator(
+       mojo::PendingReceiver<media::mojom::TarkCaptionTranslator> receiver)
+       override;
++  void BindTarkPageTranslator(
++      mojo::PendingReceiver<media::mojom::TarkPageTranslator> receiver)
++      override;
+   void SetTarkTapSourceProvider(TarkTapSourceProvider provider) override;
+ 
+   // media::mojom::SpeechRecognitionContext:
+--- a/chrome/browser/speech/chrome_speech_recognition_service.cc
++++ b/chrome/browser/speech/chrome_speech_recognition_service.cc
+@@ -240,6 +240,15 @@
+   }
+ }
+ 
++void ChromeSpeechRecognitionService::BindTarkPageTranslator(
++    mojo::PendingReceiver<media::mojom::TarkPageTranslator> receiver) {
++  LaunchIfNotRunning();
++
++  if (speech_recognition_service_.is_bound()) {
++    speech_recognition_service_->BindTarkPageTranslator(std::move(receiver));
++  }
++}
++
+ void ChromeSpeechRecognitionService::SetTarkTapSourceProvider(TarkTapSourceProvider provider) {
+   tark_tap_source_provider_ = std::move(provider);
+ }
+--- a/chrome/browser/tark_captions/page_translator.h
++++ b/chrome/browser/tark_captions/page_translator.h
+@@ -0,0 +1,76 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_TARK_CAPTIONS_PAGE_TRANSLATOR_H_
++#define CHROME_BROWSER_TARK_CAPTIONS_PAGE_TRANSLATOR_H_
++
++#include <map>
++#include <string>
++#include <vector>
++
++#include "base/functional/callback.h"
++#include "base/functional/callback_forward.h"
++#include "base/memory/weak_ptr.h"
++#include "components/tark_captions/model_manifest.h"
++#include "media/mojo/mojom/tark_page_translator.mojom.h"
++#include "mojo/public/cpp/bindings/remote.h"
++
++namespace tark_captions {
++
++// Tark: one tab's page translation in the browser. Sentences already
++// translated are kept in memory (never on disk) per `scope` (the page's
++// origin), so one site can't learn by timing what another site in the tab
++// had translated; they go when the tab does. The rest go to the speech
++// process's TarkPageTranslator.
++class PageTranslator {
++ public:
++  using Binder = base::RepeatingCallback<void(
++      mojo::PendingReceiver<media::mojom::TarkPageTranslator>)>;
++  using Callback = base::OnceCallback<void(bool ok, std::vector<std::string> translations)>;
++
++  // Sentences kept per tab; the oldest half goes when it is reached.
++  static constexpr size_t kMaxCached = 20000;
++
++  explicit PageTranslator(Binder binder);
++  PageTranslator(const PageTranslator&) = delete;
++  PageTranslator& operator=(const PageTranslator&) = delete;
++  ~PageTranslator();
++
++  void Translate(const std::string& scope,
++                 const std::vector<std::string>& sentences,
++                 const std::string& source,
++                 const std::string& target,
++                 Callback callback);
++
++  // The model units the last failed request needed (empty after a success).
++  const std::vector<ModelUnit>& missing() const { return missing_; }
++  // Runs when missing() changes.
++  void SetOnMissingChanged(base::RepeatingClosure closure);
++
++  size_t cached() const { return cache_.size(); }
++
++ private:
++  void OnTranslated(std::vector<std::string> sentences,
++                    std::vector<size_t> positions,
++                    std::vector<std::string> result,
++                    std::string prefix,
++                    Callback callback,
++                    bool ok,
++                    const std::vector<std::string>& translations,
++                    const std::vector<std::string>& missing);
++  void SetMissing(std::vector<ModelUnit> missing);
++  media::mojom::TarkPageTranslator* translator();
++
++  Binder binder_;
++  mojo::Remote<media::mojom::TarkPageTranslator> translator_;
++  std::map<std::string, std::string> cache_;  // prefix + sentence -> translation
++  std::vector<std::string> order_;            // insertion order, for trimming
++  std::vector<ModelUnit> missing_;
++  base::RepeatingClosure on_missing_changed_;
++  base::WeakPtrFactory<PageTranslator> weak_factory_{this};
++};
++
++}  // namespace tark_captions
++
++#endif  // CHROME_BROWSER_TARK_CAPTIONS_PAGE_TRANSLATOR_H_
+--- a/chrome/browser/tark_captions/page_translator.cc
++++ b/chrome/browser/tark_captions/page_translator.cc
+@@ -0,0 +1,124 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/tark_captions/page_translator.h"
++
++#include <optional>
++#include <utility>
++
++#include "base/functional/bind.h"
++#include "mojo/public/cpp/bindings/callback_helpers.h"
++
++namespace tark_captions {
++
++namespace {
++
++std::optional<ModelUnit> UnitOf(const std::string& folder) {
++  if (folder == "it2_indic_en") {
++    return ModelUnit::kToEnglish;
++  }
++  if (folder == "it2_en_indic") {
++    return ModelUnit::kFromEnglish;
++  }
++  return std::nullopt;
++}
++
++}  // namespace
++
++PageTranslator::PageTranslator(Binder binder) : binder_(std::move(binder)) {}
++
++PageTranslator::~PageTranslator() = default;
++
++void PageTranslator::SetOnMissingChanged(base::RepeatingClosure closure) {
++  on_missing_changed_ = std::move(closure);
++}
++
++media::mojom::TarkPageTranslator* PageTranslator::translator() {
++  if (!translator_.is_bound()) {
++    binder_.Run(translator_.BindNewPipeAndPassReceiver());
++    // The speech process went away (idle, crash): bind afresh next time.
++    translator_.reset_on_disconnect();
++  }
++  return translator_.get();
++}
++
++void PageTranslator::Translate(const std::string& scope,
++                               const std::vector<std::string>& sentences,
++                               const std::string& source,
++                               const std::string& target,
++                               Callback callback) {
++  const std::string prefix = scope + '\n' + source + '\n' + target + '\n';
++  std::vector<std::string> result(sentences.size());
++  std::vector<std::string> todo;
++  std::vector<size_t> positions;
++  for (size_t i = 0; i < sentences.size(); ++i) {
++    auto it = cache_.find(prefix + sentences[i]);
++    if (it != cache_.end()) {
++      result[i] = it->second;
++    } else {
++      todo.push_back(sentences[i]);
++      positions.push_back(i);
++    }
++  }
++  if (todo.empty()) {
++    std::move(callback).Run(true, std::move(result));
++    return;
++  }
++  // The speech process can go away mid-request (idle, crash): its reply is
++  // then a failure, so the page goes back to its original.
++  translator()->Translate(
++      todo, source, target,
++      mojo::WrapCallbackWithDefaultInvokeIfNotRun(
++          base::BindOnce(&PageTranslator::OnTranslated, weak_factory_.GetWeakPtr(), todo,
++                         std::move(positions), std::move(result), prefix, std::move(callback)),
++          false, std::vector<std::string>(), std::vector<std::string>()));
++}
++
++void PageTranslator::OnTranslated(std::vector<std::string> sentences,
++                                  std::vector<size_t> positions,
++                                  std::vector<std::string> result,
++                                  std::string prefix,
++                                  Callback callback,
++                                  bool ok,
++                                  const std::vector<std::string>& translations,
++                                  const std::vector<std::string>& missing) {
++  if (!ok || translations.size() != sentences.size()) {
++    std::vector<ModelUnit> units;
++    for (const std::string& folder : missing) {
++      if (std::optional<ModelUnit> unit = UnitOf(folder)) {
++        units.push_back(*unit);
++      }
++    }
++    SetMissing(std::move(units));
++    std::move(callback).Run(false, {});
++    return;
++  }
++  SetMissing({});
++  for (size_t i = 0; i < sentences.size(); ++i) {
++    result[positions[i]] = translations[i];
++    if (cache_.emplace(prefix + sentences[i], translations[i]).second) {
++      order_.push_back(prefix + sentences[i]);
++    }
++  }
++  if (cache_.size() >= kMaxCached) {
++    const size_t drop = order_.size() / 2;
++    for (size_t i = 0; i < drop; ++i) {
++      cache_.erase(order_[i]);
++    }
++    order_.erase(order_.begin(), order_.begin() + drop);
++  }
++  std::move(callback).Run(true, std::move(result));
++}
++
++void PageTranslator::SetMissing(std::vector<ModelUnit> missing) {
++  if (missing == missing_) {
++    return;
++  }
++  missing_ = std::move(missing);
++  if (on_missing_changed_) {
++    on_missing_changed_.Run();
++  }
++}
++
++}  // namespace tark_captions
+--- a/chrome/browser/tark_captions/page_translator_unittest.cc
++++ b/chrome/browser/tark_captions/page_translator_unittest.cc
+@@ -0,0 +1,152 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/tark_captions/page_translator.h"
++
++#include <optional>
++
++#include "base/strings/string_number_conversions.h"
++#include "base/task/sequenced_task_runner.h"
++#include "base/test/task_environment.h"
++#include "base/test/test_future.h"
++#include "mojo/public/cpp/bindings/receiver_set.h"
++#include "testing/gmock/include/gmock/gmock.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace tark_captions {
++namespace {
++
++using ::testing::ElementsAre;
++using ::testing::IsEmpty;
++
++// Brackets each sentence, or reports `missing`.
++class FakeTranslator : public media::mojom::TarkPageTranslator {
++ public:
++  void Translate(const std::vector<std::string>& sentences,
++                 const std::string& source,
++                 const std::string& target,
++                 TranslateCallback callback) override {
++    ++calls;
++    asked.insert(asked.end(), sentences.begin(), sentences.end());
++    if (drop) {
++      // The process goes away: the pipe closes, then the reply is dropped.
++      held = std::move(callback);
++      base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++          FROM_HERE, base::BindOnce(
++                         [](FakeTranslator* fake) {
++                           fake->receivers.Clear();
++                           fake->held.reset();
++                         },
++                         base::Unretained(this)));
++      return;
++    }
++    if (!missing.empty()) {
++      std::move(callback).Run(false, {}, missing);
++      return;
++    }
++    std::vector<std::string> out;
++    for (const std::string& s : sentences) {
++      out.push_back("[" + s + "]");
++    }
++    std::move(callback).Run(true, out, {});
++  }
++  int calls = 0;
++  bool drop = false;
++  std::optional<TranslateCallback> held;
++  std::vector<std::string> asked;
++  std::vector<std::string> missing;
++  mojo::ReceiverSet<media::mojom::TarkPageTranslator> receivers;
++};
++
++class PageTranslatorTest : public testing::Test {
++ protected:
++  PageTranslatorTest()
++      : translator_(base::BindRepeating(
++            [](FakeTranslator* fake,
++               mojo::PendingReceiver<media::mojom::TarkPageTranslator> receiver) {
++              fake->receivers.Add(fake, std::move(receiver));
++            },
++            &fake_)) {}
++
++  std::pair<bool, std::vector<std::string>> Translate(
++      std::vector<std::string> sentences,
++      const std::string& scope = "https://a.example") {
++    base::test::TestFuture<bool, std::vector<std::string>> done;
++    translator_.Translate(scope, sentences, "hi", "en", done.GetCallback());
++    return {done.Get<0>(), done.Get<1>()};
++  }
++
++  base::test::TaskEnvironment env_;
++  FakeTranslator fake_;
++  PageTranslator translator_;
++};
++
++TEST_F(PageTranslatorTest, TranslatesInOrder) {
++  auto [ok, out] = Translate({"a", "b"});
++  EXPECT_TRUE(ok);
++  EXPECT_THAT(out, ElementsAre("[a]", "[b]"));
++}
++
++TEST_F(PageTranslatorTest, CachedSentencesNeedNoCall) {
++  Translate({"a", "b"});
++  ASSERT_EQ(fake_.calls, 1);
++  auto [ok, out] = Translate({"b", "a"});
++  EXPECT_TRUE(ok);
++  EXPECT_THAT(out, ElementsAre("[b]", "[a]"));
++  EXPECT_EQ(fake_.calls, 1);
++}
++
++TEST_F(PageTranslatorTest, OriginsDoNotShareTheCache) {
++  Translate({"a"}, "https://a.example");
++  ASSERT_EQ(fake_.calls, 1);
++  Translate({"a"}, "https://b.example");
++  EXPECT_EQ(fake_.calls, 2);
++}
++
++TEST_F(PageTranslatorTest, OnlyNewSentencesAreAsked) {
++  Translate({"a"});
++  auto [ok, out] = Translate({"a", "c"});
++  EXPECT_THAT(out, ElementsAre("[a]", "[c]"));
++  EXPECT_THAT(fake_.asked, ElementsAre("a", "c"));
++}
++
++TEST_F(PageTranslatorTest, MissingModelsAreReported) {
++  fake_.missing = {"it2_indic_en", "it2_en_indic"};
++  int changed = 0;
++  translator_.SetOnMissingChanged(base::BindRepeating([](int* n) { ++*n; }, &changed));
++  auto [ok, out] = Translate({"a"});
++  EXPECT_FALSE(ok);
++  EXPECT_THAT(out, IsEmpty());
++  EXPECT_THAT(translator_.missing(), ElementsAre(ModelUnit::kToEnglish, ModelUnit::kFromEnglish));
++  EXPECT_EQ(changed, 1);
++  EXPECT_EQ(translator_.cached(), 0u);
++
++  // Downloaded: the next request works and clears missing().
++  fake_.missing.clear();
++  auto [ok2, out2] = Translate({"a"});
++  EXPECT_TRUE(ok2);
++  EXPECT_THAT(translator_.missing(), IsEmpty());
++  EXPECT_EQ(changed, 2);
++}
++
++TEST_F(PageTranslatorTest, SpeechProcessGoneMidRequestFails) {
++  // The fake drops the request (a crashed or idled speech process): the
++  // reply is a failure, not silence.
++  fake_.drop = true;
++  auto [ok, out] = Translate({"a"});
++  EXPECT_FALSE(ok);
++  EXPECT_THAT(out, IsEmpty());
++}
++
++TEST_F(PageTranslatorTest, CacheIsBounded) {
++  std::vector<std::string> many;
++  for (size_t i = 0; i < PageTranslator::kMaxCached; ++i) {
++    many.push_back("s" + base::NumberToString(i));
++  }
++  Translate(many);
++  EXPECT_LT(translator_.cached(), PageTranslator::kMaxCached);
++}
++
++}  // namespace
++}  // namespace tark_captions
+--- a/chrome/browser/tark_captions/page_translate_tab_helper.h
++++ b/chrome/browser/tark_captions/page_translate_tab_helper.h
+@@ -0,0 +1,60 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_TARK_CAPTIONS_PAGE_TRANSLATE_TAB_HELPER_H_
++#define CHROME_BROWSER_TARK_CAPTIONS_PAGE_TRANSLATE_TAB_HELPER_H_
++
++#include "base/callback_list.h"
++#include "chrome/browser/tark_captions/page_translator.h"
++#include "components/translate/content/common/translate.mojom.h"
++#include "content/public/browser/web_contents_user_data.h"
++#include "mojo/public/cpp/bindings/receiver_set.h"
++#include "url/origin.h"
++
++namespace content {
++class RenderFrameHost;
++}
++
++namespace tark_captions {
++
++// Tark: a tab's page translation. The translate agent of the tab's main
++// frame asks it for translations (TarkPageTranslateHost); the translate bar
++// reads which models are missing.
++class PageTranslateTabHelper
++    : public content::WebContentsUserData<PageTranslateTabHelper>,
++      public translate::mojom::TarkPageTranslateHost {
++ public:
++  static void BindHost(
++      content::RenderFrameHost* render_frame_host,
++      mojo::PendingReceiver<translate::mojom::TarkPageTranslateHost> receiver);
++
++  PageTranslateTabHelper(const PageTranslateTabHelper&) = delete;
++  PageTranslateTabHelper& operator=(const PageTranslateTabHelper&) = delete;
++  ~PageTranslateTabHelper() override;
++
++  // The models the last request needed and didn't find.
++  const std::vector<ModelUnit>& missing() const { return translator_.missing(); }
++  base::CallbackListSubscription AddMissingChangedCallback(base::RepeatingClosure closure);
++
++  // translate::mojom::TarkPageTranslateHost:
++  void Translate(const std::vector<std::string>& sentences,
++                 const std::string& source,
++                 const std::string& target,
++                 TranslateCallback callback) override;
++
++ private:
++  friend class content::WebContentsUserData<PageTranslateTabHelper>;
++  explicit PageTranslateTabHelper(content::WebContents* web_contents);
++
++  PageTranslator translator_;
++  // Each receiver's context is its frame's origin when bound.
++  mojo::ReceiverSet<translate::mojom::TarkPageTranslateHost, url::Origin> receivers_;
++  base::RepeatingClosureList missing_changed_;
++
++  WEB_CONTENTS_USER_DATA_KEY_DECL();
++};
++
++}  // namespace tark_captions
++
++#endif  // CHROME_BROWSER_TARK_CAPTIONS_PAGE_TRANSLATE_TAB_HELPER_H_
+--- a/chrome/browser/tark_captions/page_translate_tab_helper.cc
++++ b/chrome/browser/tark_captions/page_translate_tab_helper.cc
+@@ -0,0 +1,81 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/tark_captions/page_translate_tab_helper.h"
++
++#include <utility>
++
++#include "base/functional/bind.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/speech/speech_recognition_service.h"
++#include "chrome/browser/speech/speech_recognition_service_factory.h"
++#include "content/public/browser/render_frame_host.h"
++#include "content/public/browser/web_contents.h"
++
++namespace tark_captions {
++
++namespace {
++
++void BindTranslator(content::WebContents* web_contents,
++                    mojo::PendingReceiver<media::mojom::TarkPageTranslator> receiver) {
++  Profile* profile = Profile::FromBrowserContext(web_contents->GetBrowserContext());
++  speech::SpeechRecognitionService* service =
++      SpeechRecognitionServiceFactory::GetForProfile(profile);
++  if (service) {
++    service->BindTarkPageTranslator(std::move(receiver));
++  }
++}
++
++}  // namespace
++
++// static
++void PageTranslateTabHelper::BindHost(
++    content::RenderFrameHost* render_frame_host,
++    mojo::PendingReceiver<translate::mojom::TarkPageTranslateHost> receiver) {
++  // The translate agent runs in main frames only.
++  if (render_frame_host->GetParentOrOuterDocument()) {
++    return;
++  }
++  content::WebContents* web_contents =
++      content::WebContents::FromRenderFrameHost(render_frame_host);
++  if (!web_contents) {
++    return;
++  }
++  PageTranslateTabHelper::CreateForWebContents(web_contents);
++  PageTranslateTabHelper* helper = PageTranslateTabHelper::FromWebContents(web_contents);
++  helper->receivers_.Add(helper, std::move(receiver),
++                         render_frame_host->GetLastCommittedOrigin());
++}
++
++PageTranslateTabHelper::PageTranslateTabHelper(content::WebContents* web_contents)
++    : content::WebContentsUserData<PageTranslateTabHelper>(*web_contents),
++      translator_(base::BindRepeating(&BindTranslator, base::Unretained(web_contents))) {
++  translator_.SetOnMissingChanged(base::BindRepeating(
++      [](base::RepeatingClosureList* list) { list->Notify(); },
++      base::Unretained(&missing_changed_)));
++}
++
++PageTranslateTabHelper::~PageTranslateTabHelper() = default;
++
++base::CallbackListSubscription PageTranslateTabHelper::AddMissingChangedCallback(
++    base::RepeatingClosure closure) {
++  return missing_changed_.Add(std::move(closure));
++}
++
++void PageTranslateTabHelper::Translate(const std::vector<std::string>& sentences,
++                                       const std::string& source,
++                                       const std::string& target,
++                                       TranslateCallback callback) {
++  translator_.Translate(
++      receivers_.current_context().Serialize(), sentences, source, target,
++      base::BindOnce(
++          [](TranslateCallback callback, bool ok, std::vector<std::string> translations) {
++            std::move(callback).Run(ok, std::move(translations));
++          },
++          std::move(callback)));
++}
++
++WEB_CONTENTS_USER_DATA_KEY_IMPL(PageTranslateTabHelper);
++
++}  // namespace tark_captions
+--- a/chrome/browser/tark_captions/BUILD.gn
++++ b/chrome/browser/tark_captions/BUILD.gn
+@@ -13,6 +13,8 @@
+     "call_captions_tab_helper.h",
+     "caption_models.cc",
+     "caption_models.h",
++    "page_translate_tab_helper.cc",
++    "page_translate_tab_helper.h",
+   ]
+   public_deps = [
+     "//base",
+@@ -23,6 +25,8 @@
+     "//media/mojo/mojom:speech_recognition",
+   ]
+   deps = [
++    ":page_translator",
++    "//components/translate/content/common",
+     "//chrome/browser:browser_process",
+     "//chrome/browser/profiles:profile",
+     "//chrome/browser/speech",
+@@ -39,6 +43,32 @@
+   }
+ }
+ 
++# Tark: page translation's per-tab cache and its link to the speech
++# process, without the tab (tested on its own).
++source_set("page_translator") {
++  sources = [
++    "page_translator.cc",
++    "page_translator.h",
++  ]
++  public_deps = [
++    "//base",
++    "//components/tark_captions",
++    "//media/mojo/mojom",
++    "//mojo/public/cpp/bindings",
++  ]
++}
++
++test("tark_page_translate_unittests") {
++  sources = [ "page_translator_unittest.cc" ]
++  deps = [
++    ":page_translator",
++    "//base/test:test_support",
++    "//mojo/core/test:run_all_unittests",
++    "//testing/gmock",
++    "//testing/gtest",
++  ]
++}
++
+ if (is_mac) {
+   # D4 Phase 3: the Apple languages, over libtark_apple_speech.dylib; tested
+   # with a fake of the library, so it needs nothing of the browser.
+--- a/chrome/browser/chrome_browser_interface_binders.cc
++++ b/chrome/browser/chrome_browser_interface_binders.cc
+@@ -130,6 +130,7 @@
+ #include "chrome/browser/accessibility/live_caption/live_caption_speech_recognition_host.h"
+ #include "chrome/browser/accessibility/live_caption/live_caption_unavailability_notifier.h"
+ #include "chrome/browser/tark_captions/call_captions_tab_helper.h"
++#include "chrome/browser/tark_captions/page_translate_tab_helper.h"
+ #include "chrome/browser/speech/speech_recognition_client_browser_interface.h"
+ #include "chrome/browser/speech/speech_recognition_client_browser_interface_factory.h"
+ #include "chrome/browser/speech/speech_recognition_service.h"
+@@ -450,6 +451,13 @@
+   map->Add<tark_adblock::mojom::CosmeticResources>(
+       &tark_adblock::BindCosmeticResources);
+ 
++#if BUILDFLAG(ENABLE_SPEECH_SERVICE) && \
++    (BUILDFLAG(IS_MAC) || BUILDFLAG(IS_WIN) || BUILDFLAG(IS_LINUX))
++  // Tark: page translation on the computer (the translate agent).
++  map->Add<translate::mojom::TarkPageTranslateHost>(
++      &tark_captions::PageTranslateTabHelper::BindHost);
++#endif
++
+   map->Add<blink::mojom::ScriptToolHost>(
+       &actor::ActorScriptToolReceiver::Create);
+ 

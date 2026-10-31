@@ -1,0 +1,678 @@
+--- a/chrome/browser/ui/views/translate/tark_translate_bar.h
++++ b/chrome/browser/ui/views/translate/tark_translate_bar.h
+@@ -0,0 +1,31 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_TRANSLATE_TARK_TRANSLATE_BAR_H_
++#define CHROME_BROWSER_UI_VIEWS_TRANSLATE_TARK_TRANSLATE_BAR_H_
++
++#include <string>
++
++#include "components/translate/core/browser/translate_step.h"
++#include "components/translate/core/common/translate_errors.h"
++
++namespace content {
++class WebContents;
++}
++
++namespace tark_translate {
++
++// Tark: shows (or updates) the translate bar under the toolbar for
++// `web_contents`, in place of Chromium's translate bubble. Tark translates
++// pages on the computer; the bar has the languages, Original | Translated,
++// the preferences and ✕ (mockup A of the page translation design).
++void ShowTranslateBar(content::WebContents* web_contents,
++                      translate::TranslateStep step,
++                      const std::string& source_language,
++                      const std::string& target_language,
++                      translate::TranslateErrors error_type);
++
++}  // namespace tark_translate
++
++#endif  // CHROME_BROWSER_UI_VIEWS_TRANSLATE_TARK_TRANSLATE_BAR_H_
+--- a/chrome/browser/ui/views/translate/tark_translate_bar.cc
++++ b/chrome/browser/ui/views/translate/tark_translate_bar.cc
+@@ -0,0 +1,411 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/ui/views/translate/tark_translate_bar.h"
++
++#include <memory>
++#include <utility>
++#include <vector>
++
++#include "base/memory/raw_ptr.h"
++#include "base/memory/weak_ptr.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/strings/utf_string_conversions.h"
++#include "chrome/browser/browser_process.h"
++#include "chrome/browser/tark_captions/caption_models.h"
++#include "chrome/browser/tark_captions/page_translate_tab_helper.h"
++#include "chrome/browser/translate/chrome_translate_client.h"
++#include "chrome/browser/ui/views/infobars/infobar_view.h"
++#include "chrome/grit/generated_resources.h"
++#include "components/infobars/content/content_infobar_manager.h"
++#include "components/infobars/core/infobar_delegate.h"
++#include "components/tark_captions/caption_model_store.h"
++#include "components/tark_captions/model_manifest.h"
++#include "components/tark_captions/page_translate_rules.h"
++#include "components/tark_captions/translation_engine.h"
++#include "components/translate/core/browser/translate_manager.h"
++#include "components/translate/core/browser/translate_ui_delegate.h"
++#include "content/public/browser/web_contents.h"
++#include "ui/base/l10n/l10n_util.h"
++#include "ui/base/mojom/menu_source_type.mojom.h"
++#include "ui/base/ui_base_types.h"
++#include "ui/menus/simple_menu_model.h"
++#include "ui/views/controls/button/md_text_button.h"
++#include "ui/views/controls/label.h"
++#include "ui/views/controls/menu/menu_runner.h"
++#include "ui/views/layout/flex_layout_types.h"
++#include "ui/views/view_class_properties.h"
++
++namespace tark_translate {
++
++namespace {
++
++constexpr const char* kTargets[] = {"en", "hi", "ta", "bn"};
++
++std::u16string NameInEnglishUi(const std::string& code) {
++  return l10n_util::GetDisplayNameForLocale(code, g_browser_process->GetApplicationLocale(),
++                                            /*is_for_ui=*/true);
++}
++
++std::u16string NameInItself(const std::string& code) {
++  return l10n_util::GetDisplayNameForLocale(code, code, /*is_for_ui=*/true);
++}
++
++tark_captions::PageStep StepOf(translate::TranslateStep step, translate::TranslateErrors error) {
++  if (error != translate::TranslateErrors::NONE ||
++      step == translate::TRANSLATE_STEP_TRANSLATE_ERROR) {
++    return tark_captions::PageStep::kError;
++  }
++  switch (step) {
++    case translate::TRANSLATE_STEP_TRANSLATING:
++      return tark_captions::PageStep::kTranslating;
++    case translate::TRANSLATE_STEP_AFTER_TRANSLATE:
++      return tark_captions::PageStep::kAfter;
++    default:
++      return tark_captions::PageStep::kBefore;
++  }
++}
++
++// The bar's state and actions; outlives no tab (the infobar owns it).
++class BarDelegate : public infobars::InfoBarDelegate {
++ public:
++  BarDelegate(content::WebContents* web_contents,
++              const std::string& source,
++              const std::string& target)
++      : web_contents_(web_contents), source_(source), target_(target) {
++    ResetUiDelegate();
++  }
++
++  // infobars::InfoBarDelegate:
++  InfoBarIdentifier GetIdentifier() const override {
++    // Chromium's (Android) translate infobar id: one translate bar per tab.
++    return TRANSLATE_INFOBAR_DELEGATE_NON_AURA;
++  }
++  void InfoBarDismissed() override {
++    if (ui_delegate_) {
++      ui_delegate_->OnUIClosedByUser();
++    }
++  }
++
++  const std::string& source() const { return source_; }
++  const std::string& target() const { return target_; }
++  tark_captions::PageStep step() const { return step_; }
++
++  void SetState(const std::string& source,
++                const std::string& target,
++                tark_captions::PageStep step) {
++    const bool languages_changed = source != source_ || target != target_;
++    source_ = source;
++    target_ = target;
++    step_ = step;
++    if (languages_changed) {
++      ResetUiDelegate();
++    }
++  }
++
++  std::vector<tark_captions::ModelUnit> Missing() const {
++    auto* helper = tark_captions::PageTranslateTabHelper::FromWebContents(web_contents_);
++    if (helper && !helper->missing().empty()) {
++      // What the last request found missing, less what has downloaded
++      // since (no new request has said so yet).
++      std::vector<tark_captions::ModelUnit> still = tark_captions::StillMissing(
++          helper->missing(),
++          [](tark_captions::ModelUnit unit) { return tark_captions::TarkCaptionModels().ready(unit); });
++      if (!still.empty()) {
++        return still;
++      }
++    }
++    std::vector<tark_captions::ModelUnit> missing;
++    const std::optional<tark_captions::Target> t = tark_captions::TargetFromCode(target_);
++    std::vector<tark_captions::ModelUnit> units;
++    if (source_ != "en") {
++      units.push_back(tark_captions::ModelUnit::kToEnglish);
++    }
++    if (t && *t != tark_captions::Target::kEnglish && *t != tark_captions::Target::kNone) {
++      units.push_back(tark_captions::ModelUnit::kFromEnglish);
++    }
++    for (tark_captions::ModelUnit unit : units) {
++      if (!tark_captions::TarkCaptionModels().ready(unit)) {
++        missing.push_back(unit);
++      }
++    }
++    return missing;
++  }
++
++  void Translate() {
++    if (ui_delegate_) {
++      ui_delegate_->Translate();
++    }
++  }
++  void ShowOriginal() {
++    if (ui_delegate_) {
++      ui_delegate_->RevertTranslation();
++    }
++  }
++  void SetTarget(const std::string& target) {
++    target_ = target;
++    ResetUiDelegate();
++    Translate();
++  }
++  translate::TranslateUIDelegate* prefs() { return ui_delegate_.get(); }
++
++ private:
++  void ResetUiDelegate() {
++    ChromeTranslateClient* client = ChromeTranslateClient::FromWebContents(web_contents_);
++    ui_delegate_ = client ? std::make_unique<translate::TranslateUIDelegate>(
++                                client->GetTranslateManager()->GetWeakPtr(), source_, target_)
++                          : nullptr;
++  }
++
++  raw_ptr<content::WebContents> web_contents_;
++  std::string source_;
++  std::string target_;
++  tark_captions::PageStep step_ = tark_captions::PageStep::kBefore;
++  std::unique_ptr<translate::TranslateUIDelegate> ui_delegate_;
++};
++
++enum Command {
++  kAlways = 1,
++  kNever,
++  kNeverSite,
++  kTargetBase = 100,
++};
++
++class BarView : public InfoBarView,
++                public ui::SimpleMenuModel::Delegate,
++                public tark_captions::CaptionModelStore::Observer {
++ public:
++  explicit BarView(std::unique_ptr<BarDelegate> delegate) : InfoBarView(std::move(delegate)) {
++    from_ = AddContentChildView(CreateLabel(std::u16string()));
++    target_button_ = AddContentChildView(std::make_unique<views::MdTextButton>(
++        base::BindRepeating(&BarView::ShowTargets, base::Unretained(this))));
++    original_ = AddContentChildView(std::make_unique<views::MdTextButton>(
++        base::BindRepeating(&BarView::OnOriginal, base::Unretained(this)),
++        l10n_util::GetStringUTF16(IDS_TARK_TRANSLATE_BAR_ORIGINAL)));
++    translated_ = AddContentChildView(std::make_unique<views::MdTextButton>(
++        base::BindRepeating(&BarView::OnTranslated, base::Unretained(this)),
++        l10n_util::GetStringUTF16(IDS_TARK_TRANSLATE_BAR_TRANSLATED)));
++    status_ = AddContentChildView(CreateLabel(std::u16string()));
++    download_ = AddContentChildView(std::make_unique<views::MdTextButton>(
++        base::BindRepeating(&BarView::OnDownload, base::Unretained(this))));
++    download_->SetStyle(ui::ButtonStyle::kProminent);
++    auto options = std::make_unique<views::MdTextButton>(
++        base::BindRepeating(&BarView::ShowOptions, base::Unretained(this)),
++        l10n_util::GetStringUTF16(IDS_TARK_TRANSLATE_BAR_OPTIONS));
++    options_ = options.get();
++    AddViewBeforeCloseButton(std::move(options));
++    models_observation_ = true;
++    tark_captions::TarkCaptionModels().AddObserver(this);
++    Refresh();
++  }
++  ~BarView() override {
++    if (models_observation_) {
++      tark_captions::TarkCaptionModels().RemoveObserver(this);
++    }
++  }
++
++  void Refresh() {
++    BarDelegate* d = bar();
++    from_->SetText(l10n_util::GetStringFUTF16(IDS_TARK_TRANSLATE_BAR_FROM,
++                                              NameInItself(d->source())));
++    target_button_->SetText(NameInEnglishUi(d->target()) + u" ▾");
++    const std::vector<tark_captions::ModelUnit> missing = d->Missing();
++    waiting_for_models_ = !missing.empty();
++    bool downloading = false;
++    int64_t done = 0;
++    int64_t total = 0;
++    for (tark_captions::ModelUnit unit : missing) {
++      const tark_captions::CaptionModelStore::Status s =
++          tark_captions::TarkCaptionModels().status(unit);
++      downloading |= s.state == tark_captions::CaptionModelStore::State::kDownloading;
++      done += s.done;
++      total += tark_captions::UnitSize(unit);
++    }
++    const tark_captions::BarMode mode =
++        tark_captions::BarModeFor(d->step(), !missing.empty(), downloading);
++    const bool translated = mode == tark_captions::BarMode::kTranslated ||
++                            mode == tark_captions::BarMode::kTranslating;
++    original_->SetStyle(translated ? ui::ButtonStyle::kDefault : ui::ButtonStyle::kTonal);
++    translated_->SetStyle(translated ? ui::ButtonStyle::kTonal : ui::ButtonStyle::kDefault);
++    const bool ready = mode != tark_captions::BarMode::kNeedsDownload &&
++                       mode != tark_captions::BarMode::kDownloading;
++    original_->SetVisible(ready);
++    translated_->SetVisible(ready);
++    download_->SetVisible(mode == tark_captions::BarMode::kNeedsDownload);
++    download_->SetText(l10n_util::GetStringFUTF16(
++        IDS_TARK_TRANSLATE_BAR_DOWNLOAD,
++        base::NumberToString16(tark_captions::Megabytes(total))));
++    if (mode == tark_captions::BarMode::kDownloading) {
++      status_->SetText(l10n_util::GetStringFUTF16(
++          IDS_TARK_TRANSLATE_BAR_DOWNLOADING,
++          base::NumberToString16(total > 0 ? done * 100 / total : 0)));
++    } else if (mode == tark_captions::BarMode::kError) {
++      status_->SetText(l10n_util::GetStringUTF16(IDS_TARK_TRANSLATE_BAR_ERROR));
++    } else {
++      status_->SetText(std::u16string());
++    }
++    status_->SetVisible(!status_->GetText().empty());
++    InvalidateLayout();
++  }
++
++  // tark_captions::CaptionModelStore::Observer:
++  void OnModelStatusChanged(tark_captions::ModelUnit) override {
++    // The store has already changed: what the bar showed before this
++    // refresh is the only record that it was waiting.
++    const bool was_waiting = waiting_for_models_;
++    Refresh();
++    // Downloaded while the bar waited: translate now.
++    if (was_waiting && !waiting_for_models_) {
++      bar()->Translate();
++    }
++  }
++
++  // ui::SimpleMenuModel::Delegate:
++  bool IsCommandIdChecked(int command_id) const override {
++    translate::TranslateUIDelegate* prefs = const_cast<BarView*>(this)->bar()->prefs();
++    if (!prefs) {
++      return false;
++    }
++    switch (command_id) {
++      case kAlways:
++        return prefs->ShouldAlwaysTranslate();
++      case kNever:
++        return prefs->IsLanguageBlocked();
++      case kNeverSite:
++        return prefs->IsSiteOnNeverPromptList();
++      default:
++        return false;
++    }
++  }
++  void ExecuteCommand(int command_id, int event_flags) override {
++    if (command_id >= kTargetBase) {
++      bar()->SetTarget(kTargets[command_id - kTargetBase]);
++      Refresh();
++      return;
++    }
++    translate::TranslateUIDelegate* prefs = bar()->prefs();
++    if (!prefs) {
++      return;
++    }
++    switch (command_id) {
++      case kAlways: {
++        const bool on = !prefs->ShouldAlwaysTranslate();
++        prefs->SetAlwaysTranslate(on);
++        if (on) {
++          bar()->Translate();
++        }
++        break;
++      }
++      case kNever:
++        prefs->SetLanguageBlocked(!prefs->IsLanguageBlocked());
++        if (prefs->IsLanguageBlocked()) {
++          bar()->ShowOriginal();
++          RemoveSelf();
++        }
++        break;
++      case kNeverSite:
++        prefs->SetNeverPromptSite(!prefs->IsSiteOnNeverPromptList());
++        if (prefs->IsSiteOnNeverPromptList()) {
++          bar()->ShowOriginal();
++          RemoveSelf();
++        }
++        break;
++    }
++  }
++
++ private:
++  BarDelegate* bar() { return static_cast<BarDelegate*>(delegate()); }
++
++  // Whether the last Refresh() found models missing.
++  bool waiting_for_models_ = false;
++
++  void OnOriginal() {
++    bar()->ShowOriginal();
++    bar()->SetState(bar()->source(), bar()->target(), tark_captions::PageStep::kBefore);
++    Refresh();
++  }
++  void OnTranslated() {
++    bar()->Translate();
++    bar()->SetState(bar()->source(), bar()->target(), tark_captions::PageStep::kTranslating);
++    Refresh();
++  }
++  void OnDownload() {
++    for (tark_captions::ModelUnit unit : bar()->Missing()) {
++      tark_captions::TarkCaptionModels().Download(unit);
++    }
++    Refresh();
++  }
++
++  void ShowTargets() {
++    menu_model_ = std::make_unique<ui::SimpleMenuModel>(this);
++    for (size_t i = 0; i < std::size(kTargets); ++i) {
++      if (tark_captions::Supported(bar()->source(), kTargets[i])) {
++        menu_model_->AddItem(kTargetBase + static_cast<int>(i),
++                             NameInEnglishUi(kTargets[i]));
++      }
++    }
++    RunMenu(target_button_);
++  }
++  void ShowOptions() {
++    const std::u16string language = NameInEnglishUi(bar()->source());
++    menu_model_ = std::make_unique<ui::SimpleMenuModel>(this);
++    menu_model_->AddCheckItem(kAlways, l10n_util::GetStringFUTF16(
++                                           IDS_TARK_TRANSLATE_BAR_ALWAYS, language));
++    menu_model_->AddCheckItem(kNever, l10n_util::GetStringFUTF16(
++                                          IDS_TARK_TRANSLATE_BAR_NEVER, language));
++    menu_model_->AddCheckItem(kNeverSite,
++                              l10n_util::GetStringUTF16(IDS_TARK_TRANSLATE_BAR_NEVER_SITE));
++    RunMenu(options_);
++  }
++  void RunMenu(views::View* anchor) {
++    menu_runner_ = std::make_unique<views::MenuRunner>(menu_model_.get(),
++                                                       views::MenuRunner::HAS_MNEMONICS);
++    menu_runner_->RunMenuAt(anchor->GetWidget(), nullptr, anchor->GetAnchorBoundsInScreen(),
++                            views::MenuAnchorPosition::kTopLeft, ui::mojom::MenuSourceType::kNone);
++  }
++
++  raw_ptr<views::Label> from_ = nullptr;
++  raw_ptr<views::MdTextButton> target_button_ = nullptr;
++  raw_ptr<views::MdTextButton> original_ = nullptr;
++  raw_ptr<views::MdTextButton> translated_ = nullptr;
++  raw_ptr<views::Label> status_ = nullptr;
++  raw_ptr<views::MdTextButton> download_ = nullptr;
++  raw_ptr<views::MdTextButton> options_ = nullptr;
++  bool models_observation_ = false;
++  std::unique_ptr<ui::SimpleMenuModel> menu_model_;
++  std::unique_ptr<views::MenuRunner> menu_runner_;
++};
++
++}  // namespace
++
++void ShowTranslateBar(content::WebContents* web_contents,
++                      translate::TranslateStep step,
++                      const std::string& source_language,
++                      const std::string& target_language,
++                      translate::TranslateErrors error_type) {
++  infobars::ContentInfoBarManager* manager =
++      infobars::ContentInfoBarManager::FromWebContents(web_contents);
++  if (!manager) {
++    return;
++  }
++  const tark_captions::PageStep page_step = StepOf(step, error_type);
++  for (infobars::InfoBar* infobar : manager->infobars()) {
++    if (infobar->delegate()->GetIdentifier() ==
++        infobars::InfoBarDelegate::TRANSLATE_INFOBAR_DELEGATE_NON_AURA) {
++      static_cast<BarDelegate*>(infobar->delegate())
++          ->SetState(source_language, target_language, page_step);
++      static_cast<BarView*>(infobar)->Refresh();
++      return;
++    }
++  }
++  if (!tark_captions::Supported(source_language, target_language)) {
++    return;
++  }
++  tark_captions::PageTranslateTabHelper::CreateForWebContents(web_contents);
++  auto delegate = std::make_unique<BarDelegate>(web_contents, source_language, target_language);
++  delegate->SetState(source_language, target_language, page_step);
++  manager->AddInfoBar(std::make_unique<BarView>(std::move(delegate)));
++}
++
++}  // namespace tark_translate
+--- a/chrome/browser/ui/views/translate/BUILD.gn
++++ b/chrome/browser/ui/views/translate/BUILD.gn
+@@ -9,6 +9,7 @@
+ source_set("translate") {
+   public = [
+     "partial_translate_bubble_view.h",
++    "tark_translate_bar.h",
+     "translate_bubble_controller.h",
+     "translate_bubble_view.h",
+     "translate_language_search_view.h",
+@@ -41,6 +42,7 @@
+ source_set("impl") {
+   sources = [
+     "partial_translate_bubble_view.cc",
++    "tark_translate_bar.cc",
+     "translate_bubble_controller.cc",
+     "translate_bubble_view.cc",
+     "translate_language_search_view.cc",
+@@ -68,6 +70,11 @@
+     "//chrome/browser/ui/views/controls",
+     "//chrome/browser/ui/views/frame:browser_view_header",
+     "//chrome/browser/ui/views/frame:toolbar_button_provider",
++    "//chrome/browser/ui/views/infobars",
++    "//chrome/browser/tark_captions",
++    "//components/infobars/content",
++    "//components/infobars/core",
++    "//components/tark_captions",
+     "//components/language_detection/core",
+     "//components/prefs",
+     "//components/strings:components_strings",
+--- a/chrome/browser/ui/views/frame/browser_view.cc
++++ b/chrome/browser/ui/views/frame/browser_view.cc
+@@ -4,6 +4,10 @@
+ 
+ #include "chrome/browser/ui/views/frame/browser_view.h"
+ 
++#include "base/command_line.h"
++#include "chrome/browser/ui/views/translate/tark_translate_bar.h"
++#include "components/translate/core/common/translate_switches.h"
++
+ #include <stdint.h>
+ 
+ #include <algorithm>
+@@ -3167,6 +3171,15 @@
+       ->GetLanguageState()
+       ->SetTranslateEnabled(true);
+ 
++  // Tark: pages are translated on the computer, from the translate bar
++  // under the toolbar; Chromium's bubble only with the user's own server.
++  if (!base::CommandLine::ForCurrentProcess()->HasSwitch(
++          translate::switches::kTranslateScriptURL)) {
++    tark_translate::ShowTranslateBar(web_contents, step, source_language,
++                                     target_language, error_type);
++    return ShowTranslateBubbleResult::kSuccess;
++  }
++
+   if (IsMinimized()) {
+     return ShowTranslateBubbleResult::kBrowserWindowMinimized;
+   }
+--- a/chrome/app/tark_captions_strings.grdp
++++ b/chrome/app/tark_captions_strings.grdp
+@@ -160,4 +160,35 @@
+   <message name="IDS_TARK_CAPTIONS_OPEN_SETTINGS" desc="Call captions pill: button that opens macOS System Settings where translation languages are added.">
+     Open Settings
+   </message>
++  <!-- Tark: page translation's bar (under the toolbar). -->
++  <message name="IDS_TARK_TRANSLATE_BAR_FROM" desc="Start of the translate bar: the page's language (in that language), then an arrow; the language the page is translated into follows as a button.">
++    <ph name="LANGUAGE">$1<ex>हिन्दी</ex></ph> →
++  </message>
++  <message name="IDS_TARK_TRANSLATE_BAR_ORIGINAL" desc="Translate bar: show the page as it is.">
++    Original
++  </message>
++  <message name="IDS_TARK_TRANSLATE_BAR_TRANSLATED" desc="Translate bar: show the page translated.">
++    Translated
++  </message>
++  <message name="IDS_TARK_TRANSLATE_BAR_OPTIONS" desc="Translate bar: button opening the translate preferences.">
++    Options
++  </message>
++  <message name="IDS_TARK_TRANSLATE_BAR_ALWAYS" desc="Translate bar options: open pages in this language already translated.">
++    Always translate <ph name="LANGUAGE">$1<ex>Hindi</ex></ph>
++  </message>
++  <message name="IDS_TARK_TRANSLATE_BAR_NEVER" desc="Translate bar options: don't offer to translate pages in this language.">
++    Never translate <ph name="LANGUAGE">$1<ex>Hindi</ex></ph>
++  </message>
++  <message name="IDS_TARK_TRANSLATE_BAR_NEVER_SITE" desc="Translate bar options: don't offer to translate this site.">
++    Never translate this site
++  </message>
++  <message name="IDS_TARK_TRANSLATE_BAR_DOWNLOAD" desc="Translate bar: the translation models aren't on the computer yet; download them. $1 is the size in MB.">
++    Download (<ph name="SIZE">$1<ex>486</ex></ph> MB)
++  </message>
++  <message name="IDS_TARK_TRANSLATE_BAR_DOWNLOADING" desc="Translate bar while the translation models download. $1 is the percentage done.">
++    Getting translation ready… <ph name="PERCENT">$1<ex>40</ex></ph>%
++  </message>
++  <message name="IDS_TARK_TRANSLATE_BAR_ERROR" desc="Translate bar: the page couldn't be translated.">
++    Couldn't translate this page
++  </message>
+ </grit-part>
+--- a/components/translate/core/browser/translate_manager.cc
++++ b/components/translate/core/browser/translate_manager.cc
+@@ -943,8 +943,10 @@
+   }
+ 
+   const base::CommandLine& command_line = *base::CommandLine::ForCurrentProcess();
+-  if (!command_line.HasSwitch(translate::switches::kTranslateScriptURL) ||
+-      (!ignore_missing_key_for_testing_ && !::google_apis::HasAPIKeyConfigured())) {
++  // Tark: without --translate-script-url, pages are translated on the
++  // computer (tark_page_translate.js), which needs no key or server.
++  if (command_line.HasSwitch(translate::switches::kTranslateScriptURL) &&
++      !ignore_missing_key_for_testing_ && !::google_apis::HasAPIKeyConfigured()) {
+     // Without an API key, translate won't work, so don't offer to translate in
+     // the first place. Leave kOfferTranslateEnabled on, though, because that
+     // settings syncs and we don't want to turn off translate everywhere else.
+--- a/chrome/browser/ui/browser_ui_prefs.cc
++++ b/chrome/browser/ui/browser_ui_prefs.cc
+@@ -145,7 +145,8 @@
+   registry->RegisterBooleanPref(prefs::kWebAppCreateInAppsMenu, true);
+   registry->RegisterBooleanPref(prefs::kWebAppCreateInQuickLaunchBar, true);
+   registry->RegisterBooleanPref(
+-      translate::prefs::kOfferTranslateEnabled, false,
++      // Tark: translation happens on the computer, so offering it is on.
++      translate::prefs::kOfferTranslateEnabled, true,
+       user_prefs::PrefRegistrySyncable::SYNCABLE_PREF);
+   registry->RegisterDictionaryPref(prefs::kBrowserWindowPlacement);
+   registry->RegisterDictionaryPref(prefs::kBrowserWindowPlacementPopup);
+--- a/chrome/browser/ui/toolbar/app_menu_model.cc
++++ b/chrome/browser/ui/toolbar/app_menu_model.cc
+@@ -2205,12 +2205,10 @@
+ 
+   // Tark: Translate is offered only when the user points it at a server of
+   // their choosing (ungoogled-chromium's --translate-script-url).
+-  if (base::CommandLine::ForCurrentProcess()->HasSwitch(
+-          translate::switches::kTranslateScriptURL)) {
+-    AddItemWithStringIdAndVectorIcon(this, IDC_SHOW_TRANSLATE,
+-                                     IDS_SHOW_TRANSLATE,
+-                                     vector_icons::kGTranslateIcon);
+-  }
++  // Tark: and always now that pages are translated on the computer.
++  AddItemWithStringIdAndVectorIcon(this, IDC_SHOW_TRANSLATE,
++                                   IDS_SHOW_TRANSLATE,
++                                   vector_icons::kGTranslateIcon);
+ 
+   CreateFindAndEditSubMenu();
+ 
+--- a/chrome/browser/resources/settings/languages_page/languages_page_index.html.ts
++++ b/chrome/browser/resources/settings/languages_page/languages_page_index.html.ts
+@@ -18,6 +18,9 @@
+       route-path="${this.routes_.SPELL_CHECK.path}">
+   </settings-spell-check-page>
+ 
++  <settings-translate-page slot="view" id="translate">
++  </settings-translate-page>
++
+ <if expr="not is_macosx">
+   <settings-edit-dictionary-page slot="view" id="editDictionary"
+       data-parent-view-id="spellCheck"
+--- a/chrome/browser/resources/settings/languages_page/languages_page_index.ts
++++ b/chrome/browser/resources/settings/languages_page/languages_page_index.ts
+@@ -5,6 +5,7 @@
+ import 'chrome://resources/cr_elements/cr_view_manager/cr_view_manager.js';
+ import './languages_page.js';
+ import './spell_check_page.js';
++import './translate_page.js';
+ // <if expr="not is_macosx">
+ import './edit_dictionary_page.js';
+ 
+@@ -55,7 +56,7 @@
+ 
+   private showDefaultViews_() {
+     this.$.viewManager.switchViews(
+-        ['languages', 'spellCheck'], 'no-animation',
++        ['languages', 'spellCheck', 'translate'], 'no-animation',
+         'no-animation');
+   }
+ 
+--- a/chrome/app/settings_strings.grdp
++++ b/chrome/app/settings_strings.grdp
+@@ -1513,13 +1513,13 @@
+         Let websites know the languages you speak. They'll show content in those languages, when possible.
+       </message>
+       <message name="IDS_SETTINGS_LANGUAGES_OFFER_TO_ENABLE_TRANSLATE" desc="The label of the check-box that enables the prompt to translate a page.">
+-        Use Google Translate
++        Offer to translate pages
+       </message>
+       <message name="IDS_SETTINGS_LANGUAGES_OFFER_TO_ENABLE_TRANSLATE_SUBLABEL" desc="The sublabel of the check-box that enables the prompt to translate a page.">
+-        When on, Google Translate will offer to translate sites into your preferred language. It can also automatically translate sites.
++        When on, Tark offers to translate pages into your preferred language. Pages are translated on your computer; nothing is sent anywhere.
+       </message>
+       <message name="IDS_SETTINGS_LANGUAGES_OFFER_TO_ENABLE_TRANSLATE_SUBLABEL_WITH_PDF" desc="The sublabel of the check-box that enables the prompt to translate a page or PDF.">
+-  When on, Google Translate will offer to translate sites and PDFs into your preferred language. It can also automatically translate sites.
++  When on, Tark offers to translate pages into your preferred language. Pages are translated on your computer; nothing is sent anywhere.
+ </message>
+       <message name="IDS_SETTINGS_LANGUAGES_TRANSLATE_TARGET" desc="The label under a language's name in a list of enabled languages indicating that pages will be translated to this language.">
+         This language is used when translating pages
+@@ -1540,7 +1540,7 @@
+         Remove <ph name="LANGUAGE_NAME">$1<ex>Swahili</ex></ph> from never offer translation languages
+       </message>
+       <message name="IDS_SETTINGS_TRANSLATE_PAGE_TITLE" desc="Name of the settings page which displays translate preferences.">
+-        Google Translate
++        Translate
+       </message>
+       <message name="IDS_SETTINGS_TARGET_TRANSLATE_LABEL" desc="Label for the element to select the target language">
+         Translate into this language
+--- a/chrome/browser/translate/chrome_translate_client.cc
++++ b/chrome/browser/translate/chrome_translate_client.cc
+@@ -4,6 +4,8 @@
+ 
+ #include "chrome/browser/translate/chrome_translate_client.h"
+ 
++#include "components/translate/core/common/translate_switches.h"
++
+ #include <memory>
+ #include <vector>
+ 
+@@ -503,6 +505,16 @@
+     return ShowTranslateBubbleResult::kBrowserWindowNotActive;
+   }
+ 
++  // Tark: pages are translated on the computer and the translate bar shows
++  // every step, an automatic translation included (the bar says
++  // "Translated"); Chromium's toast only with the user's own server.
++  if (!base::CommandLine::ForCurrentProcess()->HasSwitch(
++          translate::switches::kTranslateScriptURL)) {
++    return TranslateBubbleFactory::Show(
++        BrowserWindow::FromBrowser(browser), web_contents(), step,
++        source_language, target_language, error_type, is_user_gesture);
++  }
++
+   // During auto-translating, the bubble should not be shown.
+   if (!is_user_gesture && (step == translate::TRANSLATE_STEP_TRANSLATING ||
+                            step == translate::TRANSLATE_STEP_AFTER_TRANSLATE)) {
