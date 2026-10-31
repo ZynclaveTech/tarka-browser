@@ -1,6 +1,7 @@
-Tark page translation on the Mac: the desktop surfaces (ported from
-Android's page-translate-ui.patch; Mac only, see windows/ and linux/
-mac-only-patches.txt and android/desktop-only-patches.txt).
+Tark page translation on the desktop (Mac, Windows, Linux): the Translate
+surfaces (ported from Android's page-translate-ui.patch; not on Android, see
+android/desktop-only-patches.txt). "The Mac" below stands for the computer
+on Windows and Linux too; Settings' line says "this PC" there.
 
 Translate is offered (the omnibox icon and bubble, "Translate to …" in the
 page's menu, Translate in the app menu) only where Tark's own translator
@@ -18,15 +19,16 @@ Languages page gets the Page translation switch where Google's Translate
 card was (removals/translate.patch). Supported languages: the 22 of India
 and English. Browser tests: tark_page_translate_browsertest.cc; they give
 captions' model store a temporary folder (--tark-captions-models-dir-for-
-testing, honoured only in tests), never the person's own.
+testing, honoured only in tests), never the person's own; they build on
+Mac, Windows and Linux.
 
 --- a/chrome/app/tark_captions_strings.grdp
 +++ b/chrome/app/tark_captions_strings.grdp
-@@ -160,4 +160,19 @@
+@@ -160,4 +160,26 @@
    <message name="IDS_TARK_CAPTIONS_OPEN_SETTINGS" desc="Call captions pill: button that opens macOS System Settings where translation languages are added.">
      Open Settings
    </message>
-+  <message name="IDS_TARK_PAGE_TRANSLATE_BUBBLE_TRANSLATED" desc="Tark page translation: the line under the translate bubble once the page is translated on the Mac. $1 is the page's language, $2 the language it is now in, $3 the Show original link (IDS_TARK_PAGE_TRANSLATE_BUBBLE_SHOW_ORIGINAL).">
++  <message name="IDS_TARK_PAGE_TRANSLATE_BUBBLE_TRANSLATED" desc="Tark page translation: the line under the translate bubble once the page is translated on the computer. $1 is the page's language, $2 the language it is now in, $3 the Show original link (IDS_TARK_PAGE_TRANSLATE_BUBBLE_SHOW_ORIGINAL).">
 +    <ph name="SOURCE">$1<ex>Hindi</ex></ph> → <ph name="TARGET">$2<ex>English</ex></ph> · <ph name="SHOW_ORIGINAL">$3<ex>Show original</ex></ph>
 +  </message>
 +  <message name="IDS_TARK_PAGE_TRANSLATE_BUBBLE_SHOW_ORIGINAL" desc="Tark page translation: link under the translate bubble that puts the page back as it was, with no reload.">
@@ -35,12 +37,19 @@ testing, honoured only in tests), never the person's own.
 +  <message name="IDS_TARK_PAGE_TRANSLATE_BUBBLE_GETTING_READY" desc="Tark page translation: under the translate bubble while the translation model downloads, the first time a language pair is translated. $1 is its size in megabytes.">
 +    Getting translation ready · <ph name="SIZE">$1<ex>238</ex></ph> MB
 +  </message>
-+  <message name="IDS_SETTINGS_TARK_PAGE_TRANSLATION" desc="Settings › Languages: the switch for translating web pages with Tark's own translation model, on the Mac.">
++  <message name="IDS_SETTINGS_TARK_PAGE_TRANSLATION" desc="Settings › Languages: the switch for translating web pages with Tark's own translation model, on the computer.">
 +    Page translation
 +  </message>
-+  <message name="IDS_SETTINGS_TARK_PAGE_TRANSLATION_DESC" desc="Settings › Languages: the line under the Page translation switch.">
-+    Translates pages on your Mac with Tark's own model. Pages never leave your Mac.
-+  </message>
++  <if expr="is_macosx">
++    <message name="IDS_SETTINGS_TARK_PAGE_TRANSLATION_DESC" desc="Settings › Languages: the line under the Page translation switch.">
++      Translates pages on your Mac with Tark's own model. Pages never leave your Mac.
++    </message>
++  </if>
++  <if expr="not is_macosx">
++    <message name="IDS_SETTINGS_TARK_PAGE_TRANSLATION_DESC" desc="Settings › Languages: the line under the Page translation switch.">
++      Translates pages on this PC with Tark's own model. Pages never leave this PC.
++    </message>
++  </if>
  </grit-part>
 --- a/chrome/browser/extensions/api/settings_private/prefs_util.cc
 +++ b/chrome/browser/extensions/api/settings_private/prefs_util.cc
@@ -1353,24 +1362,22 @@ testing, honoured only in tests), never the person's own.
    // The first-time download size, up front: detection and Tark's captions,
 --- a/chrome/test/BUILD.gn
 +++ b/chrome/test/BUILD.gn
-@@ -3163,6 +3163,8 @@
+@@ -3129,6 +3129,15 @@
+       deps += [ "//chrome/browser/ui/webui/default_browser:browser_tests" ]
+     }
  
-     if (is_mac) {
-       sources += [
-+        # Tark: page translation on the Mac (desktop-ui.patch).
-+        "../browser/tark_captions/tark_page_translate_browsertest.cc",
-         "../browser/ui/views/frame/browser_frame_view_mac_browsertest.mm",
-         "../browser/ui/views/fullscreen_mac_browsertest.cc",
-         "../browser/ui/views/web_apps/app_shim_metrics_browsertest.cc",
-@@ -3183,6 +3185,8 @@
-         "//chrome/browser/mac:browser_tests",
-         "//chrome/browser/renderer_host:history_swiper",
-         "//chrome/browser/shortcuts",
++    # Tark: page translation on the desktop (desktop-ui.patch).
++    if (is_mac || is_win || is_linux) {
++      sources += [ "../browser/tark_captions/tark_page_translate_browsertest.cc" ]
++      deps += [
 +        "//chrome/browser/tark_captions",
 +        "//chrome/browser/tark_captions:page_translation_prefs",
-         "//chrome/browser/ui:fullscreen_util_mac",
-         "//chrome/browser/ui/cocoa:browser_tests",
-         "//chrome/browser/ui/views/frame:browser_frame_view_mac",
++      ]
++    }
++
+     if (is_win) {
+       sources += [
+         "../browser/ui/views/sync/inline_login_ui_browsertest.cc",
 --- a/components/translate/core/browser/BUILD.gn
 +++ b/components/translate/core/browser/BUILD.gn
 @@ -4,6 +4,7 @@

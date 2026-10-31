@@ -57,9 +57,17 @@ class TestAndroidSeries(unittest.TestCase):
         self.assertFalse([e for e in self.series if e.startswith('tarka/zynclave/')])
 
     def test_desktop_page_translation_stays_off_android(self):
-        self.assertIn('tarka/translate/', self.skip)
-        self.assertTrue([e for e in self.tark if e.startswith('tarka/translate/')])
-        self.assertFalse([e for e in self.series if e.startswith('tarka/translate/')])
+        # The desktop's speech process, browser side and Translate surfaces
+        # (Mac, Windows, Linux); the script and the renderer's wiring are
+        # shared with Android.
+        desktop = ['tarka/page-translate/service.patch', 'tarka/page-translate/browser.patch',
+                   'tarka/page-translate/desktop-ui.patch']
+        for entry in desktop:
+            self.assertIn(entry, self.skip)
+            self.assertIn(entry, self.tark)
+            self.assertNotIn(entry, self.series)
+        for entry in ['tarka/page-translate/script.patch', 'tarka/page-translate/wiring.patch']:
+            self.assertIn(entry, self.series)
 
     def test_linux_patches_stay_off_android(self):
         # The portable Linux build's patches (update notice, captions,
