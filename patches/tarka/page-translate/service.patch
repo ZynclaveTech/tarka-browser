@@ -18,7 +18,7 @@
  // Tark (D4 Phase 2): shows a call's caption in the script the user reads
  // and translates it, in the speech recognition utility process. Bound by
  // the browser through SpeechRecognitionService.BindTarkCaptionTranslator.
-@@ -15,4 +26,22 @@
+@@ -15,4 +26,23 @@
    // missing; `shown` is still filled when only the translation failed.
    Render(string text, string source, string script, string target)
        => (bool ok, string shown, string translation);
@@ -38,7 +38,8 @@
 +  TranslatePageBatch(string source, string target, array<string> items)
 +      => (PageBatchStatus status, array<string?> results);
 +
-+  // The page lets its model go now (tab hidden). Captions' models stay.
++  // This translator's page lets its model go now (tab hidden): it unloads
++  // unless another translator's page still uses it. Captions' models stay.
 +  ReleasePageModel();
  };
 --- a/chrome/services/speech/tark_caption_translator.h
@@ -169,17 +170,18 @@
      }
      // Codes and sizes only: call content stays out of logs.
      VLOG(1) << "Tark translation: " << source_code << " -> " << (script.empty() ? "-" : script)
-@@ -93,10 +118,75 @@
+@@ -93,10 +118,76 @@
      return result;
    }
  
-+  TarkPageTranslator::PageBatch TranslatePageBatch(const std::string& source,
++  TarkPageTranslator::PageBatch TranslatePageBatch(uint64_t holder,
++                                                   const std::string& source,
 +                                                   const std::string& target,
 +                                                   const std::vector<std::string>& items) {
-+    return slot_.TranslatePageBatch(source, target, items);
++    return slot_.TranslatePageBatch(holder, source, target, items);
 +  }
 +
-+  void ReleasePageModel() { slot_.ReleasePageModel(); }
++  void ReleasePageModel(uint64_t holder) { slot_.ReleasePageModel(holder); }
 +
 +  void DropHolder(uint64_t holder) { slot_.DropHolder(holder); }
 +
@@ -248,7 +250,7 @@
  };
  
  // static
-@@ -110,20 +200,21 @@
+@@ -110,20 +201,21 @@
  
  TarkCaptionTranslator::TarkCaptionTranslator(const base::FilePath& ort_dylib,
                                               const base::FilePath& models_dir)
@@ -277,7 +279,7 @@
        .Then(base::BindOnce(
            [](RenderCallback callback, Result result) {
              std::move(callback).Run(result.ok, result.shown, result.translation);
-@@ -131,4 +222,21 @@
+@@ -131,4 +223,21 @@
            std::move(callback)));
  }
  
@@ -286,7 +288,7 @@
 +                                               const std::vector<std::string>& items,
 +                                               TranslatePageBatchCallback callback) {
 +  shared_->worker().AsyncCall(&Worker::TranslatePageBatch)
-+      .WithArgs(source, target, items)
++      .WithArgs(holder_, source, target, items)
 +      .Then(base::BindOnce(
 +          [](TranslatePageBatchCallback callback, TarkPageTranslator::PageBatch batch) {
 +            std::move(callback).Run(ToMojom(batch.status), std::move(batch.results));
@@ -295,7 +297,7 @@
 +}
 +
 +void TarkCaptionTranslator::ReleasePageModel() {
-+  shared_->worker().AsyncCall(&Worker::ReleasePageModel);
++  shared_->worker().AsyncCall(&Worker::ReleasePageModel).WithArgs(holder_);
 +}
 +
  }  // namespace speech
@@ -409,7 +411,7 @@
 +#endif  // CHROME_SERVICES_SPEECH_TARK_PAGE_BATCH_H_
 --- /dev/null
 +++ b/chrome/services/speech/tark_page_translator.h
-@@ -0,0 +1,174 @@
+@@ -0,0 +1,184 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -492,7 +494,9 @@
 +// - captions hold none: the batch loads one model at a time, leg by leg,
 +//   unloading the previous one first.
 +// A page's model unloads after kTarkPageIdleUnload without a batch, on
-+// ReleasePageModel(), or as soon as captions need the slot. Captions' own
++// ReleasePageModel() from the last page using it (each tab's translator is
++// a page user from its first batch until it lets go, goes, or the idle
++// unload), or as soon as captions need the slot. Captions' own
 +// models stay while captions hold them. Each sentence of an item is
 +// translated whole, every sentence of the batch in one call per leg;
 +// an item with a failed or empty sentence, or longer than
@@ -544,15 +548,18 @@
 +  // The model to translate with; null when none is needed or it can't be
 +  // made.
 +  TarkTranslationModel* ForCaptions(uint64_t holder, const TarkDirections& directions);
-+  // `holder` is gone.
++  // `holder` is gone (its captions, and it as a page user; the idle unload
++  // takes a model only it used).
 +  void DropHolder(uint64_t holder);
 +
-+  PageBatch TranslatePageBatch(const std::string& source,
++  // `holder`'s page batch; it is a page user from now on.
++  PageBatch TranslatePageBatch(uint64_t holder,
++                               const std::string& source,
 +                               const std::string& target,
 +                               const std::vector<std::string>& items);
-+  // The page lets its model go (tab hidden): unloaded unless captions hold
-+  // it.
-+  void ReleasePageModel();
++  // `holder`'s page lets its model go (tab hidden): unloaded unless another
++  // page still uses it or captions hold it.
++  void ReleasePageModel(uint64_t holder);
 +
 +  // The directions the slot's model has been used for, while it is loaded.
 +  const TarkDirections& LoadedForTesting() const { return loaded_; }
@@ -566,6 +573,9 @@
 +  void Unload();
 +  // Unloads the model unless captions hold everything it has loaded.
 +  void UnloadPageModel();
++  // The idle unload: no page batch for kTarkPageIdleUnload, so no page user
++  // is left either.
++  void OnIdle();
 +  void ArmIdleTimer();
 +
 +  ModelFactory make_;
@@ -577,6 +587,8 @@
 +  int model_threads_ = 0;  // what model_ was made with
 +  TarkDirections loaded_;
 +  std::map<uint64_t, TarkDirections> captions_;
++  // The translators (holders) whose pages use the model.
++  std::set<uint64_t> page_users_;
 +  base::OneShotTimer idle_;
 +  SEQUENCE_CHECKER(sequence_checker_);
 +};
@@ -586,7 +598,7 @@
 +#endif  // CHROME_SERVICES_SPEECH_TARK_PAGE_TRANSLATOR_H_
 --- /dev/null
 +++ b/chrome/services/speech/tark_page_translator.cc
-@@ -0,0 +1,417 @@
+@@ -0,0 +1,430 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -860,15 +872,18 @@
 +void TarkPageTranslator::DropHolder(uint64_t holder) {
 +  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
 +  captions_.erase(holder);
++  page_users_.erase(holder);
 +  ArmIdleTimer();
 +}
 +
 +TarkPageTranslator::PageBatch TarkPageTranslator::TranslatePageBatch(
++    uint64_t holder,
 +    const std::string& source,
 +    const std::string& target,
 +    const std::vector<std::string>& items) {
 +  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
 +  ArmIdleTimer();
++  page_users_.insert(holder);
 +  const base::TimeTicks start = base::TimeTicks::Now();
 +  PageBatch batch;
 +  batch.results.resize(items.size());
@@ -940,9 +955,14 @@
 +  return batch;
 +}
 +
-+void TarkPageTranslator::ReleasePageModel() {
++void TarkPageTranslator::ReleasePageModel(uint64_t holder) {
 +  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
-+  UnloadPageModel();
++  page_users_.erase(holder);
++  // Another tab still translating on it keeps it (no reload for its next
++  // batch); the idle unload takes it once that tab stops too.
++  if (page_users_.empty()) {
++    UnloadPageModel();
++  }
 +}
 +
 +TarkDirections TarkPageTranslator::CaptionsHold() const {
@@ -999,14 +1019,19 @@
 +  }
 +}
 +
++void TarkPageTranslator::OnIdle() {
++  page_users_.clear();
++  UnloadPageModel();
++}
++
 +void TarkPageTranslator::ArmIdleTimer() {
-+  idle_.Start(FROM_HERE, kTarkPageIdleUnload, this, &TarkPageTranslator::UnloadPageModel);
++  idle_.Start(FROM_HERE, kTarkPageIdleUnload, this, &TarkPageTranslator::OnIdle);
 +}
 +
 +}  // namespace speech
 --- /dev/null
 +++ b/chrome/services/speech/tark_page_translator_unittest.cc
-@@ -0,0 +1,552 @@
+@@ -0,0 +1,588 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -1131,11 +1156,15 @@
 +                  },
 +                  base::Unretained(&models_))) {}
 +
++  // `page`: the tab's translator (its pipe), a page user until it lets go.
 +  TarkPageTranslator::PageBatch Translate(const std::string& source,
 +                                          const std::string& target,
-+                                          const std::vector<std::string>& items) {
-+    return page_.TranslatePageBatch(source, target, items);
++                                          const std::vector<std::string>& items,
++                                          uint64_t page = kPage) {
++    return page_.TranslatePageBatch(page, source, target, items);
 +  }
++
++  static constexpr uint64_t kPage = 100;
 +
 +  base::test::TaskEnvironment task_environment_{
 +      base::test::TaskEnvironment::TimeSource::MOCK_TIME};
@@ -1306,14 +1335,46 @@
 +// captions share with it.
 +TEST_F(TarkPageTranslatorTest, ReleaseUnloadsPageModelOnly) {
 +  Translate("en", "hi", {"one"});
-+  page_.ReleasePageModel();
++  page_.ReleasePageModel(kPage);
 +  EXPECT_FALSE(page_.HasModelForTesting());
 +
 +  ASSERT_TRUE(page_.ForCaptions(/*holder=*/1, {TranslationDirection::kIndicToEnglish}));
 +  Translate("hi", "en", {"नमस्ते"});
-+  page_.ReleasePageModel();
++  page_.ReleasePageModel(kPage);
 +  EXPECT_TRUE(page_.HasModelForTesting());
 +  EXPECT_EQ(models_.alive, 1);
++}
++
++// One tab hidden (its ReleasePageModel) while another visible tab still
++// translates on the same model: the model stays (no reload for the other
++// tab's next batch) and goes when the last page user lets go.
++TEST_F(TarkPageTranslatorTest, ReleaseKeepsModelAnotherPageUses) {
++  Translate("hi", "en", {"एक"}, /*page=*/100);
++  Translate("hi", "en", {"दो"}, /*page=*/200);
++  page_.ReleasePageModel(100);
++  EXPECT_TRUE(page_.HasModelForTesting());
++  Translate("hi", "en", {"तीन"}, 200);
++  EXPECT_EQ(models_.made, 1);  // not reloaded
++  page_.ReleasePageModel(200);
++  EXPECT_FALSE(page_.HasModelForTesting());
++}
++
++// A page user whose pipe went (DropSent, tab closed) no longer keeps the
++// model from the last one's release; the idle unload clears every user.
++TEST_F(TarkPageTranslatorTest, GonePageUserAndIdleDontKeepTheModel) {
++  Translate("hi", "en", {"एक"}, /*page=*/100);
++  Translate("hi", "en", {"दो"}, /*page=*/200);
++  page_.DropHolder(200);
++  EXPECT_TRUE(page_.HasModelForTesting());  // the idle unload takes it later
++  page_.ReleasePageModel(100);
++  EXPECT_FALSE(page_.HasModelForTesting());
++
++  Translate("hi", "en", {"एक"}, /*page=*/100);
++  task_environment_.FastForwardBy(kTarkPageIdleUnload);
++  EXPECT_FALSE(page_.HasModelForTesting());
++  Translate("hi", "en", {"दो"}, /*page=*/200);
++  page_.ReleasePageModel(200);  // 100 went idle: not a user any more
++  EXPECT_FALSE(page_.HasModelForTesting());
 +}
 +
 +// 16 items at most, and 2,000 characters in total: the tail comes back null
@@ -1353,7 +1414,7 @@
 +  Translate("en", "hi", {"two"});  // the loaded model, same direction
 +  EXPECT_EQ(models_.made, 1);
 +  EXPECT_EQ(models_.other_made, 0);
-+  page_.ReleasePageModel();
++  page_.ReleasePageModel(kPage);
 +  Translate("en", "hi", {"three"});
 +  EXPECT_EQ(models_.other_made, 1);
 +  EXPECT_EQ(models_.most_alive, 1);

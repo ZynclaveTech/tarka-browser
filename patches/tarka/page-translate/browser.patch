@@ -93,7 +93,7 @@
    # with a fake of the library, so it needs nothing of the browser.
 --- /dev/null
 +++ b/chrome/browser/tark_captions/page_translation.cc
-@@ -0,0 +1,283 @@
+@@ -0,0 +1,297 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -156,6 +156,7 @@
 +    DVLOG(1) << "tark-page: browser connecting to the speech process";
 +    backend_->Connect();
 +  }
++  pipe_ = true;
 +  for (ModelUnit unit : PageUnitsFor(source, target)) {
 +    if (!std::ranges::contains(held_, unit)) {
 +      backend_->HoldUnit(unit, true);
@@ -187,6 +188,7 @@
 +  warmed_ = pair;
 +  DVLOG(1) << "tark-page: warming " << pair;
 +  connected_ = true;
++  pipe_ = true;
 +  backend_->Connect();
 +  for (ModelUnit unit : PageUnitsFor(source, target)) {
 +    if (!std::ranges::contains(held_, unit)) {
@@ -234,6 +236,7 @@
 +void PageTranslation::Cancel() {
 +  if (!pending_.empty() && connected_) {
 +    backend_->DropSent();
++    pipe_ = false;
 +  }
 +  AnswerAllNull();
 +  MaybeStartIdleTimer();
@@ -247,6 +250,7 @@
 +
 +void PageTranslation::OnBackendGone() {
 +  connected_ = false;  // nothing to let go
++  pipe_ = false;
 +  Unload();
 +  AnswerAllNull();
 +}
@@ -258,6 +262,7 @@
 +  }
 +  const Pending& batch = it->second;
 +  const std::vector<std::string> items(batch.texts.begin() + batch.next, batch.texts.end());
++  pipe_ = true;  // the backend binds a new one after DropSent
 +  backend_->SendBatch(batch.source, batch.target, items,
 +                      base::BindOnce(&PageTranslation::OnBatch, weak_factory_.GetWeakPtr(), id));
 +}
@@ -329,6 +334,7 @@
 +  // deferred and the script sends it again; the next batch gets a new one.
 +  if (connected_) {
 +    backend_->DropSent();
++    pipe_ = false;
 +  }
 +  AnswerAllDeferred();
 +  MaybeStartIdleTimer();
@@ -363,9 +369,17 @@
 +  idle_.Stop();
 +  if (connected_) {
 +    connected_ = false;
-+    backend_->ReleaseModel();
++    // Only on a live pipe: after DropSent a new one would start a speech
++    // process just to say "unload"; the service's own idle timer unloads
++    // what the dropped pipe used.
++    if (pipe_) {
++      backend_->ReleaseModel();
++    }
 +    backend_->Disconnect();
 +  }
++  pipe_ = false;
++  // The model is gone, so the next page in the same language warms again.
++  warmed_.clear();
 +  ReleaseUnits();
 +}
 +
@@ -379,7 +393,7 @@
 +}  // namespace tark_captions
 --- /dev/null
 +++ b/chrome/browser/tark_captions/page_translation.h
-@@ -0,0 +1,201 @@
+@@ -0,0 +1,206 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -467,8 +481,9 @@
 +    virtual void Connect() = 0;
 +    // Lets the translator go.
 +    virtual void Disconnect() = 0;
-+    // TarkCaptionTranslator.ReleasePageModel: the page's model unloads now
-+    // (captions' models stay).
++    // TarkCaptionTranslator.ReleasePageModel on the bound translator: the
++    // page's model unloads now unless another page still uses it (captions'
++    // models stay). Never binds one: only called while a pipe is bound.
 +    virtual void ReleaseModel() = 0;
 +    // Drops what was sent and not answered (the page went, the deadline): a
 +    // new translator for the next batch; replies on the old one never come.
@@ -509,7 +524,8 @@
 +  // person's Translate, with an empty batch. Only when `enabled` (the Page
 +  // translation switch), the tab is `visible`, the pair has models and they
 +  // are all on the Mac already (it never downloads, Private or not), nothing
-+  // is connected yet, and not for the same pair twice in a row in this tab.
++  // is connected yet, and not for the same pair twice in a row in this tab
++  // while the model is warm (the idle unload or hiding resets that).
 +  // Nothing else changes; the result is ignored and the idle unload bounds
 +  // what it holds. True when it warmed. The pair counts as warmed when the
 +  // batch is sent, before any answer: one answered kModelMissing or
@@ -568,11 +584,14 @@
 +  const raw_ptr<Backend> backend_;
 +  const bool off_the_record_;
 +  bool connected_ = false;
++  // The backend has a translator pipe bound (false after DropSent until the
++  // next batch binds one): what ReleaseModel needs.
++  bool pipe_ = false;
 +  uint64_t next_id_ = 1;
 +  std::map<uint64_t, Pending> pending_;
 +  std::vector<ModelUnit> held_;
 +  // The pair WarmOnDetection last warmed ("source>target"), set when its
-+  // empty batch is sent, whatever the answer.
++  // empty batch is sent, whatever the answer; cleared by Unload.
 +  std::string warmed_;
 +  base::OneShotTimer idle_;
 +  base::WeakPtrFactory<PageTranslation> weak_factory_{this};
@@ -801,7 +820,7 @@
 +#endif  // CHROME_BROWSER_TARK_CAPTIONS_TARK_PAGE_TRANSLATE_HOST_H_
 --- /dev/null
 +++ b/chrome/browser/tark_captions/tark_page_translation.cc
-@@ -0,0 +1,263 @@
+@@ -0,0 +1,260 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -1001,12 +1020,9 @@
 +}
 +
 +void TarkPageTranslation::ReleaseModel() {
-+  // Sent before Disconnect closes the pipe, so it arrives. After DropSent
-+  // there may be no pipe: a new one carries it (the slot is the process's,
-+  // not the pipe's). Not from the destructor, where web_contents() is null.
-+  if (!translator_.is_bound() && web_contents()) {
-+    BindTranslator();
-+  }
++  // Sent before Disconnect closes the pipe, so it arrives. Never binds a
++  // pipe for it (that could start a speech process just to unload): without
++  // one, the service's idle timer unloads the model.
 +  if (translator_.is_bound()) {
 +    translator_->ReleasePageModel();
 +  }
@@ -1220,7 +1236,7 @@
 +#endif  // CHROME_BROWSER_TARK_CAPTIONS_TARK_PAGE_TRANSLATION_H_
 --- /dev/null
 +++ b/chrome/browser/tark_captions/tark_page_translation_unittest.cc
-@@ -0,0 +1,519 @@
+@@ -0,0 +1,555 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -1606,7 +1622,9 @@
 +  EXPECT_EQ(answers_, 1);
 +  EXPECT_EQ(out_, Results(1));  // answered null, not deferred
 +  EXPECT_TRUE(backend_.holds.empty());
-+  EXPECT_EQ(backend_.releases, 1);
++  // Cancel dropped the pipe first: no new one just to say "unload" (the
++  // service's idle timer takes the model).
++  EXPECT_EQ(backend_.releases, 0);
 +  EXPECT_EQ(backend_.disconnects, 1);
 +  EXPECT_EQ(backend_.connects, 1);  // nothing connected again
 +  sends_after_destroy = static_cast<int>(backend_.sent.size());
@@ -1656,20 +1674,54 @@
 +  EXPECT_TRUE(backend_.sent.empty());
 +}
 +
-+// Once per page language: detection again (a reload, the same language on
-+// the next page) doesn't warm again, even after the idle unload; another
++// Once per page language while the model is warm: detection again (a
++// reload, the same language on the next page) doesn't warm again; another
 +// language may.
 +TEST_F(TarkPageTranslationTest, WarmsOncePerLanguage) {
 +  PageTranslation page(&backend_, false);
 +  EXPECT_TRUE(page.WarmOnDetection("hi", "en", true, true));
 +  backend_.Answer(BatchStatus::kOk, {});
 +  EXPECT_FALSE(page.WarmOnDetection("hi", "en", true, true));
-+  task_environment_.FastForwardBy(PageTranslation::kIdleUnload);
 +  page.Cancel();  // a navigation
 +  EXPECT_FALSE(page.WarmOnDetection("hi", "en", true, true));
 +  EXPECT_EQ(backend_.connects, 1);
++  task_environment_.FastForwardBy(PageTranslation::kIdleUnload);
 +  EXPECT_TRUE(page.WarmOnDetection("bn", "en", true, true));
 +  EXPECT_EQ(backend_.connects, 2);
++}
++
++// After the idle unload the model is gone, so the next page in the same
++// language in this tab warms again.
++TEST_F(TarkPageTranslationTest, WarmsAgainAfterIdleUnload) {
++  PageTranslation page(&backend_, false);
++  EXPECT_TRUE(page.WarmOnDetection("hi", "en", true, true));
++  backend_.Answer(BatchStatus::kOk, {});
++  task_environment_.FastForwardBy(PageTranslation::kIdleUnload);
++  EXPECT_FALSE(backend_.connected);
++  page.Cancel();  // the next Hindi page
++  EXPECT_TRUE(page.WarmOnDetection("hi", "en", true, true));
++  EXPECT_EQ(backend_.connects, 2);
++  EXPECT_TRUE(backend_.downloads.empty());
++}
++
++// After a navigation dropped the pipe (DropSent), the idle unload doesn't
++// ask for a new one just to say "unload": the service's own idle timer
++// unloads the model, and no process is started.
++TEST_F(TarkPageTranslationTest, IdleUnloadAfterDropBindsNothing) {
++  PageTranslation page(&backend_, false);
++  Translate(page, {"एक"});
++  page.Cancel();
++  EXPECT_EQ(backend_.drops, 1);
++  task_environment_.FastForwardBy(PageTranslation::kIdleUnload);
++  EXPECT_EQ(backend_.releases, 0);
++  EXPECT_EQ(backend_.connects, 1);
++  EXPECT_EQ(backend_.disconnects, 1);
++  EXPECT_TRUE(backend_.holds.empty());
++  // A batch after that sends on a new pipe; its idle unload releases again.
++  Translate(page, {"दो"});
++  backend_.Answer(BatchStatus::kOk, {"two"});
++  task_environment_.FastForwardBy(PageTranslation::kIdleUnload);
++  EXPECT_EQ(backend_.releases, 1);
 +}
 +
 +// A Private tab warms from what is on the Mac and never downloads.
