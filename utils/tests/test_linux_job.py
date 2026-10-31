@@ -92,6 +92,30 @@ class TestLinuxJob(unittest.TestCase):
         self.assertTrue(0 < tarball < zynclave, (tarball, zynclave))
         self.assertIn('--production', text[zynclave:zynclave + 200])
 
+    def test_a_failed_compile_keeps_going_to_list_every_error(self):
+        # One run on the machine should show every compile error, not the
+        # first two: after a failed build, ninja -k 0 over the same targets
+        # and Tark's test programs, the job still failing.
+        text = JOB.read_text()
+        build = text.find('tark-linux-builder bash /repo/scripts/build.sh')
+        keep = text.find('ninja -k 0 -C /repo/build/src/out/Default chrome chromedriver')
+        self.assertTrue(0 < build < keep, (build, keep))
+        self.assertIn('tark_page_translate_unittests', text[keep:keep + 300])
+        # The test programs need Chromium's test fonts first (run_tests.sh's).
+        fonts = text.find('linux/fetch_test_fonts.py /repo/build/src', build)
+        self.assertTrue(build < fonts < keep, (build, fonts, keep))
+
+    def test_checks_page_translation_on_the_tarball_with_real_models(self):
+        # Desktop page translation: the tarball's Tark translates a Hindi
+        # page (and text its JS adds) on the computer, with the models
+        # fetched and checked as Tark fetches them.
+        text = JOB.read_text()
+        tarball = text.find('package_tarball.sh" "$repo"')
+        fetch = text.find('linux/fetch_translate_models.sh" "$work/build/src"')
+        e2e = text.find('python3 "$repo/utils/translate_e2e.py"')
+        self.assertTrue(0 < tarball < fetch < e2e, (tarball, fetch, e2e))
+        self.assertIn('checks/translate.txt', text[e2e:e2e + 600])
+
     def test_installs_websocket_client_before_the_zynclave_checks(self):
         # zynclave_e2e.py talks to DevTools through websocket-client.
         text = JOB.read_text()

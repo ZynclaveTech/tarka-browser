@@ -96,6 +96,16 @@ else
     -v "$work:/repo" -v "$repo:$repo:ro" -v "$L/lists:$L/lists:ro" "${lists[@]}" \
     tark-linux-builder bash /repo/scripts/build.sh >> "$log" 2>&1
   code=$?
+  # A failed compile goes on past its first errors, so one run lists them
+  # all (the job still fails).
+  if (( code != 0 )) && [[ -f $work/build/src/out/Default/build.ninja ]]; then
+    echo "keep going: every compile error" >> "$log"
+    timeout 2h sudo docker run --rm -u "$(id -u):$(id -g)" \
+      -v "$work:/repo" -v "$repo:$repo:ro" tark-linux-builder bash -c \
+      "python3 $repo/linux/fetch_test_fonts.py /repo/build/src;
+       ninja -k 0 -C /repo/build/src/out/Default chrome chromedriver \
+         tark_captions_unittests tark_speech_unittests tark_page_translate_unittests" >> "$log" 2>&1
+  fi
 fi
 echo "build exit $code" >> "$log"
 
@@ -133,6 +143,27 @@ if (( code == 0 )); then
   cat "$L/checks/zynclave.txt" >> "$log"
   upload "$L/checks/zynclave.txt" checks/zynclave.txt
   rm -rf "$unpacked"
+fi
+# Desktop page translation on the tarball's Tark: a Hindi page, and text its
+# JS adds later, turned into English on the computer by the real models
+# (utils/translate_e2e.py).
+if (( code == 0 )); then
+  unpacked=$(mktemp -d)
+  models=$(mktemp -d)
+  tar -xJf "$L"/out/Tark-*-x64-linux.tar.xz -C "$unpacked"
+  if bash "$repo/linux/fetch_translate_models.sh" "$work/build/src" "$models" >> "$log" 2>&1; then
+    timeout 15m xvfb-run -a -s "-screen 0 1280x800x24" \
+      python3 "$repo/utils/translate_e2e.py" "$(ls -d "$unpacked"/Tark-*/)" "$models" \
+      --screenshot "$L/checks/translate-bar.png" --diag "$L/checks/translate-diag" \
+      > "$L/checks/translate.txt" 2>&1 || code=1
+  else
+    echo "FAIL translate: could not fetch the translation models" > "$L/checks/translate.txt"; code=1
+  fi
+  cat "$L/checks/translate.txt" >> "$log"
+  upload "$L/checks/translate.txt" checks/translate.txt
+  [[ -f $L/checks/translate-bar.png ]] && upload "$L/checks/translate-bar.png" checks/translate-bar.png
+  for f in "$L"/checks/translate-diag/*; do [[ -f $f ]] && upload "$f" "checks/translate-diag/$(basename "$f")"; done
+  rm -rf "$unpacked" "$models"
 fi
 # L3: the .deb, from the tarball as people get it, then installed and started
 # in a clean Ubuntu.

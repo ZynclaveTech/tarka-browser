@@ -15,7 +15,7 @@ set -uo pipefail
 src=$1; report=$2
 out=$src/out/Default
 mkdir -p "$report"
-programs="tark_captions_unittests tark_speech_unittests tark_xlit_unittests tark_updater_unittests"
+programs="tark_captions_unittests tark_speech_unittests tark_xlit_unittests tark_updater_unittests tark_page_translate_unittests"
 # The test programs need Chromium's test fonts, which the lite tarball leaves out.
 python3 "$(dirname "$0")/fetch_test_fonts.py" "$src" || exit 1
 ninja -C "$out" $programs || exit 1
@@ -41,6 +41,7 @@ run captions tark_captions_unittests
 run speech tark_speech_unittests
 run xlit tark_xlit_unittests
 run updater tark_updater_unittests
+run pagetranslate tark_page_translate_unittests
 # ONNX Runtime itself, loaded from where the browser loads it, running a real
 # model (Silero VAD, as Windows' verify.ps1 does). None may be skipped.
 models=$report/models
@@ -55,6 +56,23 @@ if curl -sSfL -o "$models/silero_vad.onnx" https://gettarka.com/models/captions/
   fi
 else
   echo "FAIL onnxruntime: could not fetch silero_vad.onnx with the expected sha256"; fails=$((fails + 1))
+fi
+rm -rf "$models"
+
+# Desktop page translation on the real IndicTrans2 models (Hindi → English,
+# Hindi → Tamil through English, idle unload), fetched as Tark fetches them:
+# every file of the to_english and from_english units, sha256-checked
+# against the manifest compiled into Tark. None may be skipped.
+models=$report/translate-models
+if bash "$(dirname "$0")/fetch_translate_models.sh" "$src" "$models"; then
+  TARK_CAPTIONS_ORT=$out/libonnxruntime.so.1 TARK_CAPTIONS_MODELS=$models \
+    run pagetranslate-models tark_speech_unittests --gtest_filter='TarkPageTranslator*' --single-process-tests
+  if grep -q '\[  SKIPPED \]' "$report/pagetranslate-models.log"; then
+    echo "FAIL pagetranslate-models: a test was skipped"; fails=$((fails + 1))
+  fi
+else
+  echo "FAIL pagetranslate-models: could not fetch the translation models with the expected sha256"
+  fails=$((fails + 1))
 fi
 rm -rf "$models"
 exit $(( fails > 0 ))
