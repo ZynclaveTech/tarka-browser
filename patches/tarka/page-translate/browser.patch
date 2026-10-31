@@ -13,7 +13,7 @@
        &BindSpeechRecognitionClientBrowserInterfaceHandler);
    map->Add<media::mojom::SpeechRecognitionRecognizerClient>(
        &BindSpeechRecognitionRecognizerClientHandler);
-+  // Tark page translation (Mac): the main frame's TranslateAgent sends Tark's
++  // Tark page translation (desktop): the main frame's TranslateAgent sends Tark's
 +  // translate script's batches to the speech process's translator.
 +  map->Add<tark::mojom::PageTranslateHost>(
 +      &tark_captions::TarkPageTranslateHost::Bind);
@@ -93,7 +93,7 @@
    # with a fake of the library, so it needs nothing of the browser.
 --- /dev/null
 +++ b/chrome/browser/tark_captions/page_translation.cc
-@@ -0,0 +1,306 @@
+@@ -0,0 +1,311 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -123,7 +123,7 @@
 +        units.push_back(ModelUnit::kFromEnglish);
 +        break;
 +      case TranslationDirection::kSpanishToEnglish:
-+        return {};  // no Mac download for it
++        return {};  // no desktop download for it
 +    }
 +  }
 +  return units;
@@ -249,6 +249,11 @@
 +  }
 +  AnswerAllNull();
 +  MaybeStartIdleTimer();
++}
++
++void PageTranslation::OnPrimaryPageChanged(std::string restored) {
++  Cancel();
++  allowed_ = std::move(restored);
 +}
 +
 +void PageTranslation::OnTabHidden() {
@@ -402,7 +407,7 @@
 +}  // namespace tark_captions
 --- /dev/null
 +++ b/chrome/browser/tark_captions/page_translation.h
-@@ -0,0 +1,215 @@
+@@ -0,0 +1,224 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -426,11 +431,11 @@
 +
 +namespace tark_captions {
 +
-+// The Mac's download units a page in `source` needs to reach `target`, in
++// The desktop's download units a page in `source` needs to reach `target`, in
 +// order (the engine's PageDirectionsFor): to_english for an Indian source,
 +// from_english for an Indian target, both for Indian ↔ Indian. Empty when the
-+// Mac has no model for the pair (Spanish: captions' opus-mt is Android's
-+// download, not the Mac's), or the two are the same.
++// computer has no model for the pair (Spanish: captions' opus-mt is Android's
++// download, not the desktop's), or the two are the same.
 +std::vector<ModelUnit> PageUnitsFor(std::string_view source, std::string_view target);
 +
 +// The profile whose speech service a tab's page translator binds on: the
@@ -446,9 +451,9 @@
 +
 +// Keep in sync with android/patches/page-translate-browser.patch
 +// (chrome/browser/tark_captions_android/page_translation.*), which this is
-+// copied from; the differences are the Mac's units, statuses and tail.
++// copied from; the differences are the desktop's units, statuses and tail.
 +//
-+// One tab's page translation on the Mac, without content or mojo
++// One tab's page translation on the desktop, without content or mojo
 +// (TarkPageTranslation is the tab's side; this is what it decides, tested on
 +// the build machine). Ported from Android's PageTranslation. Batches go to
 +// the profile's speech process (TarkCaptionTranslator.TranslatePageBatch)
@@ -530,6 +535,9 @@
 +  // the models here): batches in that direction are translated until Cancel.
 +  void Allow(std::string_view source, std::string_view target);
 +  bool Allowed(std::string_view source, std::string_view target) const;
++  // What Allow allowed ("source>target"), empty when nothing is: kept with
++  // the page (TarkPageTranslation) for a back/forward cache restore.
++  const std::string& allowed() const { return allowed_; }
 +  // The bytes still to download for the pair (0 when ready).
 +  int64_t MissingBytes(std::string_view source, std::string_view target) const;
 +  // The user's Translate: downloads the pair's missing models. False (nothing
@@ -539,7 +547,7 @@
 +  // starts loading the pair's model in the speech process ahead of the
 +  // person's Translate, with an empty batch. Only when `enabled` (the Page
 +  // translation switch), the tab is `visible`, the pair has models and they
-+  // are all on the Mac already (it never downloads, Private or not), nothing
++  // are all on the computer already (it never downloads, Private or not), nothing
 +  // is connected yet, and not for the same pair twice in a row in this tab
 +  // while the model is warm (the idle unload or hiding resets that).
 +  // Nothing else changes; the result is ignored and the idle unload bounds
@@ -556,6 +564,12 @@
 +  // The page went (a navigation, Show original): outstanding batches answer
 +  // all-null now, and what Allow allowed no longer is.
 +  void Cancel();
++  // A new primary page: Cancel, then the page's own allowed direction
++  // (`restored`, allowed() as it was when the page was last in front) holds
++  // again. Empty for a new document; a document restored from the
++  // back/forward cache is still translated in the renderer, and its text
++  // added later keeps being translated.
++  void OnPrimaryPageChanged(std::string restored);
 +  // The tab was hidden: no translating there, the model goes; outstanding
 +  // batches answer deferred. The next batch (the tab shown again) connects
 +  // again.
@@ -796,7 +810,7 @@
 +
 +namespace tark_captions {
 +
-+// The browser end of page translation's bridge on the Mac (Android's, as
++// The browser end of page translation's bridge on the desktop (Android's, as
 +// is): a main document's TranslateAgent sends the batches of Tark's
 +// translate script here, and they go to the tab's TarkPageTranslation. One
 +// per document (DocumentService): a new document gets a new one and the old
@@ -844,7 +858,7 @@
 +#endif  // CHROME_BROWSER_TARK_CAPTIONS_TARK_PAGE_TRANSLATE_HOST_H_
 --- /dev/null
 +++ b/chrome/browser/tark_captions/tark_page_translation.cc
-@@ -0,0 +1,267 @@
+@@ -0,0 +1,297 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -867,6 +881,8 @@
 +#include "components/translate/core/browser/translate_manager.h"
 +#include "components/user_prefs/user_prefs.h"
 +#include "content/public/browser/browser_context.h"
++#include "content/public/browser/page.h"
++#include "content/public/browser/page_user_data.h"
 +#include "content/public/browser/visibility.h"
 +#include "content/public/browser/web_contents.h"
 +
@@ -884,6 +900,22 @@
 +  }
 +  return PageTranslation::BatchStatus::kModelMissing;
 +}
++
++// The direction a page was translated in (PageTranslation::allowed()), kept
++// with the page: a back/forward cache restore brings the page back still
++// translated, and its later text is translated in that direction again.
++class TranslatedPage : public content::PageUserData<TranslatedPage> {
++ public:
++  ~TranslatedPage() override = default;
++  std::string direction;
++
++ private:
++  explicit TranslatedPage(content::Page& page) : PageUserData(page) {}
++  friend PageUserData;
++  PAGE_USER_DATA_KEY_DECL();
++};
++
++PAGE_USER_DATA_KEY_IMPL(TranslatedPage);
 +
 +}  // namespace
 +
@@ -908,7 +940,7 @@
 +  if (!Enabled() || PageUnitsFor(source, target).empty()) {
 +    return false;
 +  }
-+  // A Private window never downloads: only what is on the Mac already.
++  // A Private window never downloads: only what is on the computer already.
 +  return !off_the_record_ || logic_.ModelsReady(source, target);
 +}
 +
@@ -940,7 +972,7 @@
 +
 +void TarkPageTranslation::Revert() {
 +  StopWaiting();
-+  logic_.Cancel();
++  OnTranslationReverted();
 +  translate::TranslateManager* manager =
 +      ChromeTranslateClient::GetManagerFromWebContents(&GetWebContents());
 +  if (manager) {
@@ -963,6 +995,18 @@
 +  return logic_.Allowed(source, target);
 +}
 +
++void TarkPageTranslation::OnTranslationStarting(const std::string& source,
++                                                const std::string& target) {
++  logic_.Allow(source, target);
++  TranslatedPage::GetOrCreateForPage(GetWebContents().GetPrimaryPage())->direction =
++      logic_.allowed();
++}
++
++void TarkPageTranslation::OnTranslationReverted() {
++  logic_.Cancel();
++  TranslatedPage::DeleteForPage(GetWebContents().GetPrimaryPage());
++}
++
 +void TarkPageTranslation::AddObserver(Observer* observer) {
 +  observers_.AddObserver(observer);
 +}
@@ -973,9 +1017,12 @@
 +
 +void TarkPageTranslation::PrimaryPageChanged(content::Page& page) {
 +  // A new main document: the old page's batches answer null and are dropped,
-+  // and a download Start waited for no longer translates this page.
++  // and a download Start waited for no longer translates this page. A page
++  // back from the back/forward cache is still translated in the renderer:
++  // its direction holds again, so text it adds later is translated too.
 +  StopWaiting();
-+  logic_.Cancel();
++  TranslatedPage* translated = TranslatedPage::GetForPage(page);
++  logic_.OnPrimaryPageChanged(translated ? translated->direction : std::string());
 +}
 +
 +void TarkPageTranslation::OnVisibilityChanged(content::Visibility visibility) {
@@ -1010,9 +1057,6 @@
 +  translate::TranslateManager* manager =
 +      ChromeTranslateClient::GetManagerFromWebContents(&GetWebContents());
 +  if (manager) {
-+    // The page's batches in this direction are translated from now on;
-+    // PrepareTranslation allows the direction TranslatePage settles on.
-+    logic_.Allow(direction.source, direction.target);
 +    manager->TranslatePage(direction.source, direction.target, /*triggered_from_menu=*/true);
 +  }
 +}
@@ -1114,7 +1158,7 @@
 +}  // namespace tark_captions
 --- /dev/null
 +++ b/chrome/browser/tark_captions/tark_page_translation.h
-@@ -0,0 +1,157 @@
+@@ -0,0 +1,163 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -1144,7 +1188,7 @@
 +
 +namespace tark_captions {
 +
-+// Tark for Mac's page translation in one tab, tied to its main document
++// Tark's desktop page translation in one tab, tied to its main document
 +// (ported from Android's). The page's text comes in batches from Tark's
 +// translate script (TarkPageTranslateHost) and goes to the profile's speech
 +// process, the one captions use (TarkCaptionTranslator.TranslatePageBatch):
@@ -1184,7 +1228,7 @@
 +  // Tark's page translation is on (tark.page_translation.enabled) for the
 +  // tab's profile.
 +  bool Enabled() const;
-+  // Whether Translate may be offered for the pair: on, a direction the Mac
++  // Whether Translate may be offered for the pair: on, a direction the computer
 +  // has models for, and in a Private window only when they are downloaded
 +  // already (it never downloads).
 +  bool CanOffer(const std::string& source, const std::string& target) const;
@@ -1198,11 +1242,17 @@
 +  void Revert();
 +
 +  // The browser started translating this page from `source` into `target`
-+  // (TranslateNow; the person's Translate or translate's own automatic one,
-+  // with the models here) and the page has not gone or been shown in its
++  // (OnTranslationStarting) and the page has not gone or been shown in its
 +  // original since. TarkPageTranslateHost answers anything else with the
 +  // originals: the renderer's batches never start a translation.
 +  bool Allowed(const std::string& source, const std::string& target) const;
++  // Translate is translating the page now (TranslateManager::TranslatePage,
++  // past every check, its target settled): the page's batches in that
++  // direction are translated, also after a back/forward cache restore.
++  void OnTranslationStarting(const std::string& source, const std::string& target);
++  // The page is shown in its original again, by whatever path
++  // (TranslateManager::RevertTranslation, Revert): nothing is allowed.
++  void OnTranslationReverted();
 +
 +  // TarkPageTranslateHost: one batch from the page's script. Null results
 +  // keep the original; an empty Results is deferred (the script sends them
@@ -1274,7 +1324,7 @@
 +#endif  // CHROME_BROWSER_TARK_CAPTIONS_TARK_PAGE_TRANSLATION_H_
 --- /dev/null
 +++ b/chrome/browser/tark_captions/tark_page_translation_unittest.cc
-@@ -0,0 +1,600 @@
+@@ -0,0 +1,629 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -1835,6 +1885,35 @@
 +  EXPECT_EQ(out, Results(1));
 +  EXPECT_TRUE(backend_.sent.empty());
 +  EXPECT_TRUE(backend_.downloads.empty());
++}
++
++// A new page: nothing allowed. A page back from the back/forward cache, the
++// direction it had (it is still translated in the renderer), and only that.
++TEST_F(TarkPageTranslationTest, RestoredPageKeepsItsDirection) {
++  PageTranslation page(&backend_, /*off_the_record=*/false);
++  page.Allow("hi", "en");
++  const std::string kept = page.allowed();
++  EXPECT_EQ(kept, "hi>en");
++  page.OnPrimaryPageChanged("");  // another document
++  EXPECT_FALSE(page.Allowed("hi", "en"));
++  Results out;
++  auto keep = base::BindRepeating([](Results* out, Results r) { *out = std::move(r); }, &out);
++  page.OnPrimaryPageChanged(kept);  // back, from the cache
++  EXPECT_TRUE(page.Allowed("hi", "en"));
++  EXPECT_FALSE(page.Allowed("hi", "ta"));
++  page.Translate({"और"}, "hi", "en", keep);
++  EXPECT_EQ(backend_.connects, 1);
++  backend_.AnswerTranslated();
++  EXPECT_EQ(out, (Results{"और!"}));
++}
++
++// The page changing answers what was outstanding for the old one with nulls.
++TEST_F(TarkPageTranslationTest, PageChangeAnswersOutstandingNull) {
++  PageTranslation page(&backend_, false);
++  Translate(page, {"एक"});
++  page.OnPrimaryPageChanged("hi>en");
++  EXPECT_EQ(out_, Results(1));
++  EXPECT_EQ(answers_, 1);
 +}
 +
 +TEST(TarkPageBatchEndTest, MatchesTheServiceBound) {
