@@ -257,14 +257,18 @@
  
  TranslationEngine::~TranslationEngine() {
    // The models before the runtime that loaded them.
-@@ -320,12 +408,18 @@
+@@ -320,12 +408,22 @@
    if (loaded != loaded_.end()) {
      return loaded->second.get();
    }
 +  // TranslatePages' workers run on several threads: loaded_ is read-only
 +  // then (everything they need loaded before they started).
-+  DCHECK(!lookup_only_) << "a model loads during a parallel run";
 +  if (lookup_only_) {
++    // Release builds too: the whole batch keeps its originals, so say why
++    // (PageDirectionsFor left out a direction TranslatePage uses).
++    LOG(WARNING) << "tark-page: a parallel run needed a model it had not loaded (direction "
++                 << static_cast<int>(direction) << "); the batch keeps its originals";
++    DCHECK(!lookup_only_) << "a model loads during a parallel run";
 +    return nullptr;
 +  }
    auto source = sources_.find(direction);
@@ -277,7 +281,7 @@
    Direction* raw = d.get();
    if (d) {
      loaded_[direction] = std::move(d);
-@@ -404,6 +498,10 @@
+@@ -404,6 +502,10 @@
                      trace ? &trace->pivot_out_ids : nullptr);
  }
  
@@ -288,7 +292,7 @@
  int TranslationEngine::LoadedDirectionsForTesting() const {
    return static_cast<int>(loaded_.size());
  }
-@@ -575,6 +673,81 @@
+@@ -575,6 +677,81 @@
    return IntoTag(english, *target);
  }
  
@@ -436,7 +440,7 @@
  
    TranslationEngine(const TranslationEngine&) = delete;
    TranslationEngine& operator=(const TranslationEngine&) = delete;
-@@ -122,13 +138,28 @@
+@@ -122,13 +138,30 @@
                                             std::string_view source_code,
                                             std::string_view target_code);
  
@@ -455,6 +459,8 @@
 +  bool Preload(TranslationDirection direction);
 +
    int LoadedDirectionsForTesting() const;
++  // As while TranslatePages' workers run: Get() only looks up.
++  void SetLookupOnlyForTesting(bool lookup_only) { lookup_only_ = lookup_only; }
  
   private:
    class Direction;
@@ -466,7 +472,7 @@
    // Loads the direction on first use; null if its files are missing or bad.
    Direction* Get(TranslationDirection direction);
    // English model input (tokens) into `target`; the ids go to `src_ids` and
-@@ -144,6 +175,9 @@
+@@ -144,6 +177,9 @@
    std::unique_ptr<OrtRuntime> runtime_;
    std::map<TranslationDirection, std::unique_ptr<ModelSource>> sources_;
    std::map<TranslationDirection, std::unique_ptr<Direction>> loaded_;
@@ -747,7 +753,7 @@
 +#endif  // COMPONENTS_TARK_CAPTIONS_FLAT_VOCAB_H_
 --- a/components/tark_captions/translation_engine_unittest.cc
 +++ b/components/tark_captions/translation_engine_unittest.cc
-@@ -4,13 +4,23 @@
+@@ -4,13 +4,24 @@
  
  #include "components/tark_captions/translation_engine.h"
  
@@ -758,6 +764,7 @@
  #include <string>
  #include <vector>
  
++#include "base/check.h"
  #include "base/files/file_util.h"
  #include "base/files/scoped_temp_dir.h"
 +#include "base/json/json_reader.h"
@@ -771,10 +778,27 @@
  #include "components/tark_captions/model_source.h"
  #include "components/tark_captions/ort_runtime.h"
  #include "components/tark_captions/test_util.h"
-@@ -242,6 +252,46 @@
+@@ -242,6 +253,63 @@
    EXPECT_EQ(engine_->LoadedDirectionsForTesting(), 0);  // nothing loaded for it
  }
  
++// A model missing during a parallel run (PageDirectionsFor left out a
++// direction TranslatePage uses) is logged in release builds too, and the
++// text keeps its original.
++TEST_F(TranslationEngineTest, ParallelRunMissingModelIsLogged) {
++  engine_->SetLookupOnlyForTesting(true);
++#if DCHECK_IS_ON()
++  EXPECT_DEATH(engine_->TranslatePage("नमस्ते", "hi", "en"),
++               "needed a model it had not loaded");
++#else
++  testing::internal::CaptureStderr();
++  EXPECT_EQ(engine_->TranslatePage("नमस्ते", "hi", "en"), std::nullopt);
++  EXPECT_NE(testing::internal::GetCapturedStderr().find("needed a model it had not loaded"),
++            std::string::npos);
++#endif
++  engine_->SetLookupOnlyForTesting(false);
++}
++
 +// TranslatePages' thread loop, without models: a slow fake sentence
 +// translation that fails on chosen indices. Every index runs once, on more
 +// than one thread; each result lands at its own index, in order, and a
@@ -818,7 +842,7 @@
  TEST(TranslationEngineNoRuntimeTest, CreateFailsWithoutRuntime) {
    EXPECT_FALSE(TranslationEngine::Create(base::FilePath("/nonexistent"),
                                           base::FilePath("/nonexistent/libonnxruntime.dylib")));
-@@ -295,5 +345,130 @@
+@@ -295,5 +363,130 @@
    EXPECT_EQ(engine_->TranslatePage("  ", "ml", "en"), std::string());
  }
  

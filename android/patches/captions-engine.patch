@@ -9682,7 +9682,7 @@
 +#endif  // COMPONENTS_TARK_CAPTIONS_TEST_UTIL_H_
 --- /dev/null
 +++ b/components/tark_captions/translation_engine.cc
-@@ -0,0 +1,767 @@
+@@ -0,0 +1,771 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -10095,8 +10095,12 @@
 +  }
 +  // TranslatePages' workers run on several threads: loaded_ is read-only
 +  // then (everything they need loaded before they started).
-+  DCHECK(!lookup_only_) << "a model loads during a parallel run";
 +  if (lookup_only_) {
++    // Release builds too: the whole batch keeps its originals, so say why
++    // (PageDirectionsFor left out a direction TranslatePage uses).
++    LOG(WARNING) << "tark-page: a parallel run needed a model it had not loaded (direction "
++                 << static_cast<int>(direction) << "); the batch keeps its originals";
++    DCHECK(!lookup_only_) << "a model loads during a parallel run";
 +    return nullptr;
 +  }
 +  auto source = sources_.find(direction);
@@ -10452,7 +10456,7 @@
 +}  // namespace tark_captions
 --- /dev/null
 +++ b/components/tark_captions/translation_engine.h
-@@ -0,0 +1,185 @@
+@@ -0,0 +1,187 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -10608,6 +10612,8 @@
 +  bool Preload(TranslationDirection direction);
 +
 +  int LoadedDirectionsForTesting() const;
++  // As while TranslatePages' workers run: Get() only looks up.
++  void SetLookupOnlyForTesting(bool lookup_only) { lookup_only_ = lookup_only; }
 +
 + private:
 +  class Direction;
@@ -10640,7 +10646,7 @@
 +#endif  // COMPONENTS_TARK_CAPTIONS_TRANSLATION_ENGINE_H_
 --- /dev/null
 +++ b/components/tark_captions/translation_engine_unittest.cc
-@@ -0,0 +1,474 @@
+@@ -0,0 +1,492 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -10654,6 +10660,7 @@
 +#include <string>
 +#include <vector>
 +
++#include "base/check.h"
 +#include "base/files/file_util.h"
 +#include "base/files/scoped_temp_dir.h"
 +#include "base/json/json_reader.h"
@@ -10893,6 +10900,23 @@
 +  EXPECT_EQ(engine_->TranslateFrom("", "hi", Target::kEnglish), std::string());
 +  EXPECT_EQ(engine_->TranslateFrom("   ", "es", Target::kHindi), std::string());
 +  EXPECT_EQ(engine_->LoadedDirectionsForTesting(), 0);  // nothing loaded for it
++}
++
++// A model missing during a parallel run (PageDirectionsFor left out a
++// direction TranslatePage uses) is logged in release builds too, and the
++// text keeps its original.
++TEST_F(TranslationEngineTest, ParallelRunMissingModelIsLogged) {
++  engine_->SetLookupOnlyForTesting(true);
++#if DCHECK_IS_ON()
++  EXPECT_DEATH(engine_->TranslatePage("नमस्ते", "hi", "en"),
++               "needed a model it had not loaded");
++#else
++  testing::internal::CaptureStderr();
++  EXPECT_EQ(engine_->TranslatePage("नमस्ते", "hi", "en"), std::nullopt);
++  EXPECT_NE(testing::internal::GetCapturedStderr().find("needed a model it had not loaded"),
++            std::string::npos);
++#endif
++  engine_->SetLookupOnlyForTesting(false);
 +}
 +
 +// TranslatePages' thread loop, without models: a slow fake sentence
