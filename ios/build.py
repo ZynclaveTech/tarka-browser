@@ -361,8 +361,11 @@ STRINGSDICT_VALUE = re.compile(r'(<string>)([^<]*)(</string>)')
 
 def debrand():
     mark_svg = DERIVED.parent / 'tark-mark.svg'
+    # Firefox's art leaves a margin round the logo; the menu mark fills its
+    # square, so it gets the same margin (about a sixth each side) here.
     mark_svg.write_text(TOOLBAR_GLYPHS['tarkMenuMark.imageset/tarkMenuMark.pdf'].replace(
-        'width="24" height="24"', 'width="88" height="88"'))
+        'width="24" height="24"', 'width="88" height="88"').replace(
+        'viewBox="0 0 44 44"', 'viewBox="-8 -8 60 60"'))
     mark_pdf = DERIVED.parent / 'tark-mark.pdf'
     run('rsvg-convert', '-f', 'pdf', mark_svg, '-o', mark_pdf)
     contents = json.dumps({'images': [{'filename': 'tarkMark.pdf', 'idiom': 'universal'}],
