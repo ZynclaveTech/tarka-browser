@@ -93,7 +93,7 @@
    # with a fake of the library, so it needs nothing of the browser.
 --- /dev/null
 +++ b/chrome/browser/tark_captions/page_translation.cc
-@@ -0,0 +1,256 @@
+@@ -0,0 +1,283 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -173,6 +173,33 @@
 +      FROM_HERE, base::BindOnce(&PageTranslation::OnDeadline, weak_factory_.GetWeakPtr(), id),
 +      kBatchDeadline);
 +  SendNext(id);
++}
++
++bool PageTranslation::WarmOnDetection(std::string_view source,
++                                      std::string_view target,
++                                      bool enabled,
++                                      bool visible) {
++  const std::string pair = std::string(source) + ">" + std::string(target);
++  if (!enabled || !visible || pair == warmed_ || connected_ || !pending_.empty() ||
++      !ModelsReady(source, target)) {
++    return false;  // ModelsReady: no pair without models, and never a download
++  }
++  warmed_ = pair;
++  DVLOG(1) << "tark-page: warming " << pair;
++  connected_ = true;
++  backend_->Connect();
++  for (ModelUnit unit : PageUnitsFor(source, target)) {
++    if (!std::ranges::contains(held_, unit)) {
++      backend_->HoldUnit(unit, true);
++      held_.push_back(unit);
++    }
++  }
++  // An empty batch: the service loads the model and answers; the answer
++  // (even kBusyOtherModel) is ignored.
++  backend_->SendBatch(std::string(source), std::string(target), {},
++                      base::BindOnce([](BatchStatus, Results) {}));
++  MaybeStartIdleTimer();
++  return true;
 +}
 +
 +bool PageTranslation::ModelsReady(std::string_view source, std::string_view target) const {
@@ -352,7 +379,7 @@
 +}  // namespace tark_captions
 --- /dev/null
 +++ b/chrome/browser/tark_captions/page_translation.h
-@@ -0,0 +1,170 @@
+@@ -0,0 +1,185 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -466,6 +493,19 @@
 +  // The user's Translate: downloads the pair's missing models. False (nothing
 +  // asked) off the record or for a pair without models.
 +  bool RequestModels(std::string_view source, std::string_view target);
++  // Translate found the page's language (`source`, offered into `target`):
++  // starts loading the pair's model in the speech process ahead of the
++  // person's Translate, with an empty batch. Only when `enabled` (the Page
++  // translation switch), the tab is `visible`, the pair has models and they
++  // are all on the Mac already (it never downloads, Private or not), nothing
++  // is connected yet, and not for the same pair twice in a row in this tab.
++  // Nothing else changes; the result is ignored and the idle unload bounds
++  // what it holds. True when it warmed.
++  bool WarmOnDetection(std::string_view source,
++                       std::string_view target,
++                       bool enabled,
++                       bool visible);
++
 +  // The page went (a navigation, Show original): outstanding batches answer
 +  // all-null now.
 +  void Cancel();
@@ -516,6 +556,8 @@
 +  uint64_t next_id_ = 1;
 +  std::map<uint64_t, Pending> pending_;
 +  std::vector<ModelUnit> held_;
++  // The pair WarmOnDetection last warmed ("source>target").
++  std::string warmed_;
 +  base::OneShotTimer idle_;
 +  base::WeakPtrFactory<PageTranslation> weak_factory_{this};
 +};
@@ -1160,7 +1202,7 @@
 +#endif  // CHROME_BROWSER_TARK_CAPTIONS_TARK_PAGE_TRANSLATION_H_
 --- /dev/null
 +++ b/chrome/browser/tark_captions/tark_page_translation_unittest.cc
-@@ -0,0 +1,425 @@
+@@ -0,0 +1,501 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -1553,6 +1595,82 @@
 +  EXPECT_EQ(sends_after_destroy, 0);
 +  task_environment_.FastForwardBy(PageTranslation::kBatchDeadline);  // no timer left
 +  EXPECT_EQ(answers_, 1);
++}
++
++// Warm on detection: a supported page whose models are on the Mac connects,
++// holds them and sends an empty batch (the service loads the model); the
++// answer changes nothing and the idle unload lets it go.
++TEST_F(TarkPageTranslationTest, WarmsOnDetectionWithModelsPresent) {
++  PageTranslation page(&backend_, false);
++  EXPECT_TRUE(page.WarmOnDetection("hi", "en", /*enabled=*/true, /*visible=*/true));
++  EXPECT_EQ(backend_.connects, 1);
++  ASSERT_EQ(backend_.sent.size(), 1u);
++  EXPECT_TRUE(backend_.sent[0].items.empty());
++  EXPECT_EQ(backend_.holds, (std::map<ModelUnit, int>{{ModelUnit::kToEnglish, 1}}));
++  backend_.Answer(BatchStatus::kBusyOtherModel, {});  // ignored
++  EXPECT_EQ(page.outstanding(), 0u);
++  EXPECT_EQ(answers_, 0);
++  EXPECT_TRUE(backend_.downloads.empty());
++  task_environment_.FastForwardBy(PageTranslation::kIdleUnload);
++  EXPECT_FALSE(backend_.connected);
++  EXPECT_EQ(backend_.releases, 1);
++  EXPECT_TRUE(backend_.holds.empty());
++}
++
++TEST_F(TarkPageTranslationTest, NoWarmWithoutModelsAndNoDownload) {
++  backend_.ready = {ModelUnit::kToEnglish};  // English → Indian is missing
++  PageTranslation page(&backend_, false);
++  EXPECT_FALSE(page.WarmOnDetection("en", "hi", true, true));
++  EXPECT_FALSE(page.WarmOnDetection("hi", "ta", true, true));
++  EXPECT_EQ(backend_.connects, 0);
++  EXPECT_TRUE(backend_.sent.empty());
++  EXPECT_TRUE(backend_.downloads.empty());
++  EXPECT_TRUE(backend_.holds.empty());
++}
++
++TEST_F(TarkPageTranslationTest, NoWarmUnsupportedSwitchOffOrHidden) {
++  PageTranslation page(&backend_, false);
++  EXPECT_FALSE(page.WarmOnDetection("fr", "en", true, true));  // no model for it
++  EXPECT_FALSE(page.WarmOnDetection("hi", "hi", true, true));
++  EXPECT_FALSE(page.WarmOnDetection("hi", "en", /*enabled=*/false, true));
++  EXPECT_FALSE(page.WarmOnDetection("hi", "en", true, /*visible=*/false));
++  EXPECT_EQ(backend_.connects, 0);
++  EXPECT_TRUE(backend_.sent.empty());
++}
++
++// Once per page language: detection again (a reload, the same language on
++// the next page) doesn't warm again, even after the idle unload; another
++// language may.
++TEST_F(TarkPageTranslationTest, WarmsOncePerLanguage) {
++  PageTranslation page(&backend_, false);
++  EXPECT_TRUE(page.WarmOnDetection("hi", "en", true, true));
++  backend_.Answer(BatchStatus::kOk, {});
++  EXPECT_FALSE(page.WarmOnDetection("hi", "en", true, true));
++  task_environment_.FastForwardBy(PageTranslation::kIdleUnload);
++  page.Cancel();  // a navigation
++  EXPECT_FALSE(page.WarmOnDetection("hi", "en", true, true));
++  EXPECT_EQ(backend_.connects, 1);
++  EXPECT_TRUE(page.WarmOnDetection("bn", "en", true, true));
++  EXPECT_EQ(backend_.connects, 2);
++}
++
++// A Private tab warms from what is on the Mac and never downloads.
++TEST_F(TarkPageTranslationTest, PrivateWarmsWithoutDownloading) {
++  PageTranslation page(&backend_, /*off_the_record=*/true);
++  EXPECT_TRUE(page.WarmOnDetection("hi", "en", true, true));
++  EXPECT_EQ(backend_.sent.size(), 1u);
++  backend_.ready.clear();
++  PageTranslation other(&backend_, true);
++  EXPECT_FALSE(other.WarmOnDetection("hi", "en", true, true));
++  EXPECT_TRUE(backend_.downloads.empty());
++}
++
++// A translation already under way is not disturbed.
++TEST_F(TarkPageTranslationTest, NoWarmWhileTranslating) {
++  PageTranslation page(&backend_, false);
++  Translate(page, {"एक"});
++  EXPECT_FALSE(page.WarmOnDetection("hi", "en", true, true));
++  EXPECT_EQ(backend_.sent.size(), 1u);
 +}
 +
 +TEST(PageUnitsForTest, EveryIndianLanguageThroughEnglish) {

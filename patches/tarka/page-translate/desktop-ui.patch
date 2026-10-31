@@ -798,7 +798,21 @@ testing, honoured only in tests), never the person's own.
  }
  
  void TarkPageTranslation::Revert() {
-@@ -145,6 +180,12 @@
+@@ -112,6 +147,13 @@
+   logic_.Translate(std::move(texts), std::move(source), std::move(target), std::move(callback));
+ }
+ 
++void TarkPageTranslation::OnPageLanguage(const std::string& source, const std::string& target) {
++  // CanOffer's switch and pair checks; Private windows too, from what is on
++  // the Mac (WarmOnDetection never downloads).
++  logic_.WarmOnDetection(source, target, Enabled(),
++                         GetWebContents().GetVisibility() != content::Visibility::HIDDEN);
++}
++
+ void TarkPageTranslation::AddObserver(Observer* observer) {
+   observers_.AddObserver(observer);
+ }
+@@ -145,6 +187,12 @@
    if (TarkCaptionModels().status(unit).state == CaptionModelStore::State::kFailed) {
      StopWaiting();
      observers_.Notify(&Observer::OnDownloadFailed, this, direction);
@@ -811,7 +825,7 @@ testing, honoured only in tests), never the person's own.
      return;
    }
    if (!logic_.ModelsReady(direction.source, direction.target)) {
-@@ -165,6 +206,7 @@
+@@ -165,6 +213,7 @@
  
  void TarkPageTranslation::StopWaiting() {
    waiting_.reset();
@@ -819,7 +833,7 @@ testing, honoured only in tests), never the person's own.
    models_observation_.Reset();
  }
  
-@@ -236,6 +278,9 @@
+@@ -236,6 +285,9 @@
  }
  
  bool TarkPageTranslation::UnitReady(ModelUnit unit) const {
@@ -831,7 +845,7 @@ testing, honoured only in tests), never the person's own.
  
 --- a/chrome/browser/tark_captions/tark_page_translation.h
 +++ b/chrome/browser/tark_captions/tark_page_translation.h
-@@ -80,6 +80,32 @@
+@@ -80,6 +80,37 @@
    // translates when it ends.
    void Revert();
  
@@ -861,10 +875,15 @@ testing, honoured only in tests), never the person's own.
 +  // nullopt asks the store.
 +  static void SetModelsForTesting(std::optional<bool> on_the_mac);
 +
++  // Translate found the page's language and is deciding whether to offer
++  // Translate into `target`: warms the pair's model when it may
++  // (PageTranslation::WarmOnDetection).
++  void OnPageLanguage(const std::string& source, const std::string& target);
++
    // TarkPageTranslateHost: one batch from the page's script. Null results
    // keep the original; an empty Results is deferred (the script sends them
    // again).
-@@ -130,8 +156,9 @@
+@@ -130,8 +161,9 @@
    const raw_ptr<PrefService> prefs_;
    const bool off_the_record_;
    mojo::Remote<media::mojom::TarkCaptionTranslator> translator_;
@@ -895,7 +914,7 @@ testing, honoured only in tests), never the person's own.
  #include "chrome/browser/ui/browser_window/public/browser_window_features.h"
  #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
  #include "chrome/browser/ui/browser_window/public/global_browser_collection.h"
-@@ -402,6 +403,45 @@
+@@ -402,6 +403,55 @@
    return TranslateService::IsTranslatableURL(url);
  }
  
@@ -936,6 +955,16 @@ testing, honoured only in tests), never the person's own.
 +  }
 +  return false;
 +}
++
++void ChromeTranslateClient::TarkPageLanguageKnown(const std::string& source_language,
++                                                  const std::string& target_language) {
++  if (!web_contents()) {
++    return;
++  }
++  tark_captions::TarkPageTranslation::CreateForWebContents(web_contents());
++  tark_captions::TarkPageTranslation::FromWebContents(web_contents())
++      ->OnPageLanguage(source_language, target_language);
++}
 +#endif  // !BUILDFLAG(IS_ANDROID)
 +
  void ChromeTranslateClient::UndoTranslate() {
@@ -943,7 +972,7 @@ testing, honoured only in tests), never the person's own.
    std::string target_language = GetLanguageState().current_language();
 --- a/chrome/browser/translate/chrome_translate_client.h
 +++ b/chrome/browser/translate/chrome_translate_client.h
-@@ -125,6 +125,15 @@
+@@ -125,6 +125,17 @@
                         translate::TranslateErrors error_type,
                         bool triggered_from_menu) override;
    bool IsTranslatableURL(const GURL& url) override;
@@ -955,6 +984,8 @@ testing, honoured only in tests), never the person's own.
 +  bool TarkReadyToTranslate(const std::string& source_language,
 +                            const std::string& target_language,
 +                            bool may_download) override;
++  void TarkPageLanguageKnown(const std::string& source_language,
++                             const std::string& target_language) override;
 +#endif
    void TriggerPdfTranslation() override;
    void RevertPdfTranslation() override;
@@ -1339,7 +1370,7 @@ testing, honoured only in tests), never the person's own.
          "//chrome/browser/ui/views/frame:browser_frame_view_mac",
 --- a/components/translate/core/browser/translate_client.h
 +++ b/components/translate/core/browser/translate_client.h
-@@ -71,6 +71,24 @@
+@@ -71,6 +71,30 @@
    // Returns true if the URL can be translated.
    virtual bool IsTranslatableURL(const GURL& url) = 0;
  
@@ -1360,6 +1391,12 @@ testing, honoured only in tests), never the person's own.
 +                                    bool may_download) {
 +    return true;
 +  }
++
++  // Tark for Mac: the page's language is known and Translate into
++  // `target_language` may be offered (TarkCanOffer said yes): the embedder
++  // may start loading the model ahead of the person's Translate.
++  virtual void TarkPageLanguageKnown(const std::string& source_language,
++                                     const std::string& target_language) {}
 +
    // Triggers PDF translation.
    virtual void TriggerPdfTranslation() {}
@@ -1491,7 +1528,7 @@ testing, honoured only in tests), never the person's own.
    translate_driver_->PrepareToTranslatePage(page_seq_no_, original_source_lang,
                                              target_lang, triggered_from_menu);
  
-@@ -978,6 +1006,16 @@
+@@ -978,6 +1006,21 @@
          TriggerDecision::kDisabledURLNotSupported);
    }
  
@@ -1503,6 +1540,11 @@ testing, honoured only in tests), never the person's own.
 +    decision->PreventAllTriggering();
 +    GetActiveTranslateMetricsLogger()->LogTriggerDecision(
 +        TriggerDecision::kDisabledUnsupportedLanguage);
++  } else if (translate_client_->IsTranslatableURL(page_url)) {
++    // Warm the model now (from the Mac only, never a download): the
++    // person's Translate then starts on a loaded model.
++    translate_client_->TarkPageLanguageKnown(std::string(page_language_code),
++                                             std::string(target_lang));
 +  }
 +
    if (!translate_prefs->IsOfferTranslateEnabled()) {

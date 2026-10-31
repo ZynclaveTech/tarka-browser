@@ -409,7 +409,7 @@
 +#endif  // CHROME_SERVICES_SPEECH_TARK_PAGE_BATCH_H_
 --- /dev/null
 +++ b/chrome/services/speech/tark_page_translator.h
-@@ -0,0 +1,170 @@
+@@ -0,0 +1,174 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -452,6 +452,8 @@
 +      std::string_view source,
 +      std::string_view target,
 +      int parallel) = 0;
++  // Loads `direction`'s model now (an empty page batch warms it).
++  virtual void Preload(tark_captions::TranslationDirection direction) = 0;
 +  // The engine, for captions' Render; null in tests.
 +  virtual tark_captions::TranslationEngine* engine() = 0;
 +};
@@ -500,6 +502,8 @@
 +// thread count; a model loaded for the other kind of use is unloaded first.
 +// The sequence must allow base sync primitives (parallel sentences join
 +// threads).
++// An empty batch warms: it loads the model the next batch needs first (the
++// first leg's, or every one captions' engine shares) and translates nothing.
 +// Use on one sequence; it blocks while a model loads or decodes.
 +class TarkPageTranslator {
 + public:
@@ -582,7 +586,7 @@
 +#endif  // CHROME_SERVICES_SPEECH_TARK_PAGE_TRANSLATOR_H_
 --- /dev/null
 +++ b/chrome/services/speech/tark_page_translator.cc
-@@ -0,0 +1,399 @@
+@@ -0,0 +1,417 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -629,6 +633,7 @@
 +                                                         int parallel) override {
 +    return engine_->TranslatePages(texts, source, target, parallel);
 +  }
++  void Preload(TranslationDirection direction) override { engine_->Preload(direction); }
 +  tark_captions::TranslationEngine* engine() override { return engine_.get(); }
 +
 + private:
@@ -893,6 +898,12 @@
 +      batch.status = Status::kModelMissing;
 +      return batch;
 +    }
++    if (items.empty()) {  // warming
++      for (TranslationDirection direction : needed) {
++        model->Preload(direction);
++      }
++      return batch;
++    }
 +    std::vector<std::optional<std::string>> texts = Admitted(items);
 +    TranslateTexts(model, texts, source, target, /*parallel=*/1);  // beside captions
 +    batch.results = std::move(texts);
@@ -902,6 +913,17 @@
 +  }
 +
 +  // The page's own model, one leg (one model) at a time.
++  if (items.empty()) {  // warming: the first leg's model, which a batch needs first
++    TarkTranslationModel* model = Hold({legs[0].direction}, /*keep_captions=*/false);
++    if (!model) {
++      batch.status = Status::kModelMissing;
++      return batch;
++    }
++    model->Preload(legs[0].direction);
++    DVLOG(1) << "tark-page: warmed " << source << " -> " << target
++             << " ms=" << (base::TimeTicks::Now() - start).InMilliseconds();
++    return batch;
++  }
 +  std::vector<std::optional<std::string>> texts = Admitted(items);
 +  for (const TarkPageLeg& leg : legs) {
 +    TarkTranslationModel* model = Hold({leg.direction}, /*keep_captions=*/false);
@@ -984,7 +1006,7 @@
 +}  // namespace speech
 --- /dev/null
 +++ b/chrome/services/speech/tark_page_translator_unittest.cc
-@@ -0,0 +1,503 @@
+@@ -0,0 +1,544 @@
 +// Copyright 2026 The Tark Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -1062,6 +1084,10 @@
 +      out.push_back(TranslateOne(text, source, target));
 +    }
 +    return out;
++  }
++  void Preload(TranslationDirection direction) override {
++    models_->events.push_back("preload:" +
++                              base::NumberToString(static_cast<int>(direction)));
 +  }
 +  tark_captions::TranslationEngine* engine() override { return nullptr; }
 +
@@ -1384,6 +1410,43 @@
 +  EXPECT_EQ(models_.events, (std::vector<std::string>{"make", "use:hi->en", "unload", "make",
 +                                                     "use:hi->en"}));
 +  EXPECT_EQ(models_.most_alive, 1);
++}
++
++// An empty batch warms: the page's own model for the first leg is made and
++// its direction loaded; nothing is translated.
++TEST_F(TarkPageTranslatorTest, EmptyBatchWarmsFirstLeg) {
++  const TarkPageTranslator::PageBatch batch = Translate("hi", "ta", {});
++  EXPECT_EQ(batch.status, Status::kOk);
++  EXPECT_TRUE(batch.results.empty());
++  EXPECT_EQ(models_.events,
++            (std::vector<std::string>{
++                "make", "preload:" + base::NumberToString(static_cast<int>(
++                                         TranslationDirection::kIndicToEnglish))}));
++  EXPECT_EQ(models_.threads, (std::vector<int>{kTarkPageOwnThreads}));
++  EXPECT_TRUE(models_.batches.empty());
++  // The first real batch uses the warmed model.
++  Translate("hi", "en", {"एक"});
++  EXPECT_EQ(models_.made, 1);
++}
++
++// Warming on captions' engine loads what the page needs there; captions
++// holding another model refuse it and nothing loads.
++TEST_F(TarkPageTranslatorTest, EmptyBatchOnCaptionsModel) {
++  ASSERT_TRUE(page_.ForCaptions(/*holder=*/1, {TranslationDirection::kIndicToEnglish}));
++  EXPECT_EQ(Translate("hi", "en", {}).status, Status::kOk);
++  EXPECT_EQ(models_.made, 1);
++  EXPECT_EQ(models_.events.back(),
++            "preload:" + base::NumberToString(
++                             static_cast<int>(TranslationDirection::kIndicToEnglish)));
++  EXPECT_EQ(Translate("en", "hi", {}).status, Status::kBusyOtherModel);
++  EXPECT_EQ(models_.made, 1);
++}
++
++// Warming when a model is missing loads nothing.
++TEST_F(TarkPageTranslatorTest, EmptyBatchWithModelMissing) {
++  models_.missing = {TranslationDirection::kIndicToEnglish};
++  EXPECT_EQ(Translate("hi", "en", {}).status, Status::kModelMissing);
++  EXPECT_EQ(models_.made, 0);
 +}
 +
 +TEST_F(TarkPageTranslatorTest, Legs) {
