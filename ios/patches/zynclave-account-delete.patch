@@ -1,3 +1,50 @@
+diff --git a/BrowserKit/Sources/TarkAccount/TarkAccount.swift b/BrowserKit/Sources/TarkAccount/TarkAccount.swift
+index 58d52f2..afd3d40 100644
+--- a/BrowserKit/Sources/TarkAccount/TarkAccount.swift
++++ b/BrowserKit/Sources/TarkAccount/TarkAccount.swift
+@@ -186,6 +186,10 @@ public final class TarkAccount: NSObject {
+ 
+     /// Refetches `userinfo`. Kept signed in on a network failure; a refused
+     /// token ends in `freshAccessToken`'s clean sign-out.
++    ///
++    /// Zynclave revokes the access token at once when the account is deleted
++    /// (or Tark's access is removed), long before it would expire: a 401 from
++    /// `userinfo` forces a refresh now, and the refused refresh signs Tark out.
+     public func refreshProfile() async {
+         let configuration = try? await serviceConfiguration()
+         guard let endpoint = configuration?.discoveryDocument?.userinfoEndpoint,
+@@ -193,8 +197,13 @@ public final class TarkAccount: NSObject {
+         var request = URLRequest(url: endpoint)
+         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+         request.setValue("application/json", forHTTPHeaderField: "Accept")
+-        guard let (data, response) = try? await urlSession.data(for: request),
+-              (response as? HTTPURLResponse)?.statusCode == 200,
++        guard let (data, response) = try? await urlSession.data(for: request) else { return }
++        if (response as? HTTPURLResponse)?.statusCode == 401 {
++            authState?.setNeedsTokenRefresh()
++            _ = try? await freshAccessToken()
++            return
++        }
++        guard (response as? HTTPURLResponse)?.statusCode == 200,
+               let info = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let sub = info["sub"] as? String else { return }
+         let picture = (info["picture"] as? String).flatMap(URL.init(string:)).flatMap {
+@@ -210,6 +219,15 @@ public final class TarkAccount: NSObject {
+         NotificationCenter.default.post(name: .tarkAccountDidChange, object: self)
+     }
+ 
++    /// A normal tab finished loading `url`. Zynclave's "account deleted" page
++    /// means the account may be gone: check now rather than at the next
++    /// refresh, so Tark doesn't keep showing it.
++    public func noteNavigation(to url: URL) {
++        guard isSignedIn, url.scheme == "https",
++              url.host?.lowercased() == config.accountsHost, url.path == "/deleted" else { return }
++        Task { await refreshProfile() }
++    }
++
+     // MARK: Sign out
+ 
+     /// Signs Tark out: revokes the refresh token and forgets the account.
 diff --git a/BrowserKit/Sources/TarkAccount/TarkAccountConfig.swift b/BrowserKit/Sources/TarkAccount/TarkAccountConfig.swift
 index e20e408..ae5aebe 100644
 --- a/BrowserKit/Sources/TarkAccount/TarkAccountConfig.swift
@@ -69,3 +116,18 @@ index 8eee675..8670a9c 100644
          }
      }
  
+diff --git a/firefox-ios/Client/Frontend/Browser/BrowserViewController/Extensions/BrowserViewController+WebViewDelegates.swift b/firefox-ios/Client/Frontend/Browser/BrowserViewController/Extensions/BrowserViewController+WebViewDelegates.swift
+index b5f44a4..bb598b5 100644
+--- a/firefox-ios/Client/Frontend/Browser/BrowserViewController/Extensions/BrowserViewController+WebViewDelegates.swift
++++ b/firefox-ios/Client/Frontend/Browser/BrowserViewController/Extensions/BrowserViewController+WebViewDelegates.swift
+@@ -1400,6 +1400,10 @@ extension BrowserViewController: WKNavigationDelegate {
+ 
+         // Tark: "Sign in to Tark as X?" after signing in on Zynclave's site.
+         if let tab = tabManager[webView] { offerTarkSignIn(after: webView, in: tab) }
++        // Tark: after deleting the Zynclave account on its site, sign Tark out now.
++        if let url = webView.url, tabManager[webView]?.isPrivate == false {
++            TarkAccount.shared.noteNavigation(to: url)
++        }
+ 
+         if let tab = tabManager[webView] {
+             if tab == tabManager.selectedTab {
