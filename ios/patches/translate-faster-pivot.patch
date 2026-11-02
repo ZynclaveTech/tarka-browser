@@ -1,0 +1,71 @@
+diff --git a/firefox-ios/Client/Assets/CC_Script/translations-document.sys.mjs b/firefox-ios/Client/Assets/CC_Script/translations-document.sys.mjs
+index 564f8ab..3c2ca02 100644
+--- a/firefox-ios/Client/Assets/CC_Script/translations-document.sys.mjs
++++ b/firefox-ios/Client/Assets/CC_Script/translations-document.sys.mjs
+@@ -4871,7 +4871,9 @@ class TranslationScheduler {
+    * @type {number}
+    */
+   static get ACTIVE_REQUEST_THRESHOLD() {
+-    return 1;
++    // Tark: Tark's engine answers in batches (and Indian <-> Indian swaps
++    // models once per batch), so it needs many requests in flight, not one.
++    return 48;
+   }
+ 
+   /**
+@@ -5558,6 +5560,9 @@ class TranslationScheduler {
+     );
+ 
+     this.#hasPendingScheduleRequestsCallback = false;
++    // Tark: keep filling up to ACTIVE_REQUEST_THRESHOLD rather than waiting
++    // for a response, so Tark's engine sees a screenful to batch.
++    this.maybeScheduleMoreTranslationRequests();
+   };
+ 
+   /**
+diff --git a/firefox-ios/Client/Frontend/Translations/Engine/TranslationsEngine.swift b/firefox-ios/Client/Frontend/Translations/Engine/TranslationsEngine.swift
+index 20ab550..b791085 100644
+--- a/firefox-ios/Client/Frontend/Translations/Engine/TranslationsEngine.swift
++++ b/firefox-ios/Client/Frontend/Translations/Engine/TranslationsEngine.swift
+@@ -69,6 +69,12 @@ final class TarkEngineEndpoint: BridgeEndpoint {
+     /// Paragraphs per batch: about a screenful, so the first screen comes
+     /// back in one pass.
+     private static let batchSize = 12
++    /// Indian ↔ Indian loads one model, frees it and loads the other for
++    /// every batch (~1.4 s each in the simulator), while the page sends a
++    /// sentence or two at a time — so it waits briefly to gather the page's
++    /// requests and takes many more at once.
++    private static let pivotBatchSize = 200
++    private static let pivotGatherNanoseconds: UInt64 = 400_000_000
+ 
+     let handlerName: String
+     weak var bridge: Bridge?
+@@ -140,13 +146,23 @@ final class TarkEngineEndpoint: BridgeEndpoint {
+     private func translateNextBatch() {
+         guard !isTranslating, !queue.isEmpty else { return }
+         isTranslating = true
+-        let batch = Array(queue.prefix(Self.batchSize))
+-        queue.removeFirst(batch.count)
+-        let paragraphs = batch.map { Self.sentences(in: $0.isHTML ? Self.plainText(fromHTML: $0.sourceText) : $0.sourceText) }
+-        let started = generation
+-        let (from, to) = (self.from, self.to)
++        let throughEnglish = from != "en" && to != "en"
+ 
+         Task {
++            if throughEnglish {
++                try? await Task.sleep(nanoseconds: Self.pivotGatherNanoseconds)
++            }
++            guard !queue.isEmpty else {
++                isTranslating = false
++                return
++            }
++            let batch = Array(queue.prefix(throughEnglish ? Self.pivotBatchSize : Self.batchSize))
++            queue.removeFirst(batch.count)
++            let paragraphs = batch.map {
++                Self.sentences(in: $0.isHTML ? Self.plainText(fromHTML: $0.sourceText) : $0.sourceText)
++            }
++            let started = generation
++            let (from, to) = (self.from, self.to)
+             let flat = paragraphs.flatMap { $0 }
+             let translated = await TarkPageTranslator.shared.translate(flat, from: from, to: to)
+             var index = 0

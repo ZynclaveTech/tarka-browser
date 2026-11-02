@@ -1,0 +1,592 @@
+diff --git a/firefox-ios/Client/Coordinators/TabTray/TabTrayCoordinator.swift b/firefox-ios/Client/Coordinators/TabTray/TabTrayCoordinator.swift
+index 1d41d24..b6d4526 100644
+--- a/firefox-ios/Client/Coordinators/TabTray/TabTrayCoordinator.swift
++++ b/firefox-ios/Client/Coordinators/TabTray/TabTrayCoordinator.swift
+@@ -71,12 +71,8 @@ final class TabTrayCoordinator: BaseCoordinator,
+                                                              dragAndDropDelegate: dragAndDropDelegate)
+         // Tark: no synced-tabs panel (no Firefox account or Sync).
+         let panels: [UIViewController]
+-        // Panels order is different for the experiment
+-        if tabTrayUtils.shouldDisplayExperimentUI() {
+-            panels = [privateTabsPanel, regularTabsPanel]
+-        } else {
+-            panels = [regularTabsPanel, privateTabsPanel]
+-        }
++        // Tark: Tabs first, then Private, in every layout.
++        panels = [regularTabsPanel, privateTabsPanel]
+ 
+         return panels.map {
+             ThemedNavigationController(rootViewController: $0, windowUUID: windowUUID)
+diff --git a/firefox-ios/Client/Frontend/Browser/Tabs/LayoutManager/TabsSectionManager.swift b/firefox-ios/Client/Frontend/Browser/Tabs/LayoutManager/TabsSectionManager.swift
+index cd39dec..251f190 100644
+--- a/firefox-ios/Client/Frontend/Browser/Tabs/LayoutManager/TabsSectionManager.swift
++++ b/firefox-ios/Client/Frontend/Browser/Tabs/LayoutManager/TabsSectionManager.swift
+@@ -10,7 +10,7 @@ final class TabsSectionManager {
+         // On iPad we can set to have bigger tabs, on iPhone we need smaller ones
+         @MainActor
+         static let cellEstimatedWidth: CGFloat = UIDevice.current.userInterfaceIdiom == .pad ? 250 : 170
+-        static let cellAbsoluteHeight: CGFloat = 200
++        static let cellAbsoluteHeight: CGFloat = 230
+         static let cardSpacing: CGFloat = 16
+         static let experimentCardSpacing: CGFloat = 52
+         static let experimentA11yCardSpacing: CGFloat = 72
+@@ -92,17 +92,8 @@ final class TabsSectionManager {
+             heightDimension: .absolute(cellHeight)
+         )
+ 
+-        let titleSize = NSCollectionLayoutSize(
+-            widthDimension: .fractionalWidth(1.0),
+-            heightDimension: .absolute(UX.experimentTitleHeight)
+-        )
+-
+-        let titleSupplementary = NSCollectionLayoutSupplementaryItem(
+-            layoutSize: titleSize,
+-            elementKind: TabTitleSupplementaryView.cellIdentifier,
+-            containerAnchor: NSCollectionLayoutAnchor(edges: [.bottom])
+-        )
+-        let item = NSCollectionLayoutItem(layoutSize: itemSize, supplementaryItems: [titleSupplementary])
++        // Tark: the title is inside the card (a strip above the picture), not below it.
++        let item = NSCollectionLayoutItem(layoutSize: itemSize)
+ 
+         let groupSize = NSCollectionLayoutSize(
+             widthDimension: .fractionalWidth(1),
+@@ -115,15 +106,14 @@ final class TabsSectionManager {
+ 
+         let section = NSCollectionLayoutSection(group: group)
+ 
+-        let isAccessibilitySize = layoutEnvironment.traitCollection.preferredContentSizeCategory.isAccessibilityCategory
+         let horizontalInset = TabsSectionManager.leadingInset(traitCollection: layoutEnvironment.traitCollection)
+         section.contentInsets = NSDirectionalEdgeInsets(
+             top: UX.verticalInset,
+             leading: horizontalInset,
+-            bottom: isAccessibilitySize ? UX.experimentA11yCardSpacing : UX.experimentCardSpacing,
++            bottom: UX.verticalInset,
+             trailing: horizontalInset
+         )
+-        section.interGroupSpacing = isAccessibilitySize ? UX.experimentA11yCardSpacing : UX.experimentCardSpacing
++        section.interGroupSpacing = UX.cardSpacing
+ 
+         return section
+     }
+diff --git a/firefox-ios/Client/Frontend/Browser/Tabs/State/TabTrayPanelType.swift b/firefox-ios/Client/Frontend/Browser/Tabs/State/TabTrayPanelType.swift
+index fd7bc75..fb1cafc 100644
+--- a/firefox-ios/Client/Frontend/Browser/Tabs/State/TabTrayPanelType.swift
++++ b/firefox-ios/Client/Frontend/Browser/Tabs/State/TabTrayPanelType.swift
+@@ -67,8 +67,9 @@ enum TabTrayPanelType: Int, CaseIterable {
+     static func getExperimentConvert(index: Int) -> TabTrayPanelType {
+         var panelType: TabTrayPanelType = .tabs
+         switch index {
+-        case 0: panelType = .privateTabs
+-        case 1: panelType = .tabs
++        // Tark: Tabs first, then Private (index and panel match).
++        case 0: panelType = .tabs
++        case 1: panelType = .privateTabs
+         case 2: panelType = .syncedTabs
+         default: break
+         }
+diff --git a/firefox-ios/Client/Frontend/Browser/Tabs/Views/CustomSelectorView/TabTraySelectorButtonModel.swift b/firefox-ios/Client/Frontend/Browser/Tabs/Views/CustomSelectorView/TabTraySelectorButtonModel.swift
+index fe1fb70..33e1881 100644
+--- a/firefox-ios/Client/Frontend/Browser/Tabs/Views/CustomSelectorView/TabTraySelectorButtonModel.swift
++++ b/firefox-ios/Client/Frontend/Browser/Tabs/Views/CustomSelectorView/TabTraySelectorButtonModel.swift
+@@ -17,6 +17,7 @@ struct TabTraySelectorButtonModel {
+ final class TabTraySelectorButton: UIButton, ThemeApplicable {
+     private var foregroundColorNormal: UIColor = .clear
+     private var foregroundColorHighlighted: UIColor = .clear
++    private var foregroundColorSelected: UIColor = .clear
+     private var backgroundColorNormal: UIColor = .clear
+ 
+     override init(frame: CGRect) {
+@@ -72,7 +73,10 @@ final class TabTraySelectorButton: UIButton, ThemeApplicable {
+             return
+         }
+ 
++        // Tark: white on the indigo highlight when chosen.
+         switch state {
++        case _ where isSelected:
++            updatedConfiguration.baseForegroundColor = foregroundColorSelected
+         case [.highlighted]:
+             updatedConfiguration.baseForegroundColor = foregroundColorHighlighted
+         default:
+@@ -88,6 +92,7 @@ final class TabTraySelectorButton: UIButton, ThemeApplicable {
+     func applyTheme(theme: Theme) {
+         foregroundColorNormal = theme.colors.textPrimary
+         foregroundColorHighlighted = theme.colors.actionSecondaryHover
++        foregroundColorSelected = theme.colors.textInverted
+         backgroundColorNormal = .clear
+         setNeedsUpdateConfiguration()
+     }
+diff --git a/firefox-ios/Client/Frontend/Browser/Tabs/Views/CustomSelectorView/TabTraySelectorView.swift b/firefox-ios/Client/Frontend/Browser/Tabs/Views/CustomSelectorView/TabTraySelectorView.swift
+index 8760e85..1f8da82 100644
+--- a/firefox-ios/Client/Frontend/Browser/Tabs/Views/CustomSelectorView/TabTraySelectorView.swift
++++ b/firefox-ios/Client/Frontend/Browser/Tabs/Views/CustomSelectorView/TabTraySelectorView.swift
+@@ -122,7 +122,7 @@ class TabTraySelectorView: UIView, ThemeApplicable {
+         addSubview(containerView)
+         containerView.addSubview(selectionBackgroundView)
+         containerView.addSubview(stackView)
+-        containerView.layer.mask = edgeFadeGradientLayer
++        // Tark: no edge fade; the short track shows both choices whole.
+     }
+ 
+     func setupConstraints() {
+@@ -136,10 +136,10 @@ class TabTraySelectorView: UIView, ThemeApplicable {
+             containerView.topAnchor.constraint(equalTo: topAnchor,
+                                                constant: UX.topSpacing),
+             containerView.bottomAnchor.constraint(equalTo: bottomAnchor, constant: bottomSpacing),
+-            containerView.leadingAnchor.constraint(equalTo: leadingAnchor,
+-                                                   constant: UX.containerHorizontalSpacing),
+-            containerView.trailingAnchor.constraint(equalTo: trailingAnchor,
+-                                                    constant: -UX.containerHorizontalSpacing),
++            // Tark: the track hugs its two choices, centred, instead of spanning the screen.
++            containerView.centerXAnchor.constraint(equalTo: centerXAnchor),
++            containerView.widthAnchor.constraint(equalTo: stackView.widthAnchor,
++                                                 constant: UX.stackViewLeadingTrailingPadding * 2),
+ 
+             stackView.centerYAnchor.constraint(equalTo: containerView.centerYAnchor),
+             selectionBackgroundView.heightAnchor.constraint(equalTo: stackView.heightAnchor),
+@@ -189,6 +189,7 @@ class TabTraySelectorView: UIView, ThemeApplicable {
+         button.applyTheme(theme: theme)
+ 
+         button.tag = index
++        button.isSelected = index == selectedIndex
+         button.addTarget(self, action: #selector(sectionSelected(_:)), for: .touchUpInside)
+         button.translatesAutoresizingMaskIntoConstraints = false
+         return button
+@@ -387,15 +388,8 @@ class TabTraySelectorView: UIView, ThemeApplicable {
+             visualEffectView.effect = glass
+         }
+ 
+-        if #available(iOS 26, *) {
+-            selectionBackgroundView.backgroundColor = theme.isNova
+-                ? theme.colors.layerGlassSelectedFill
+-                : theme.colors.layerEmphasis
+-        } else {
+-            selectionBackgroundView.backgroundColor = theme.isNova
+-                ? theme.colors.layer2
+-                : theme.colors.layerEmphasis
+-        }
++        // Tark: an indigo highlight with white text slides under the chosen side.
++        selectionBackgroundView.backgroundColor = theme.colors.actionPrimary
+ 
+         for button in buttons {
+             button.applyTheme(theme: theme)
+diff --git a/firefox-ios/Client/Frontend/Browser/Tabs/Views/ExperimentEmptyPrivateTabsView.swift b/firefox-ios/Client/Frontend/Browser/Tabs/Views/ExperimentEmptyPrivateTabsView.swift
+index dd04d39..cf9811c 100644
+--- a/firefox-ios/Client/Frontend/Browser/Tabs/Views/ExperimentEmptyPrivateTabsView.swift
++++ b/firefox-ios/Client/Frontend/Browser/Tabs/Views/ExperimentEmptyPrivateTabsView.swift
+@@ -29,6 +29,8 @@ class ExperimentEmptyPrivateTabsView: UIView,
+     // MARK: - Properties
+ 
+     var needsSafeArea: Bool { true }
++    private let tarkCentreGuide = UILayoutGuide()
++    private var tarkMinHeight: NSLayoutConstraint?
+     weak var delegate: EmptyPrivateTabsViewDelegate?
+ 
+     // UI
+@@ -56,7 +58,8 @@ class ExperimentEmptyPrivateTabsView: UIView,
+ 
+     private lazy var learnMoreButton: SecondaryRoundedButton = .build { button in
+         let viewModel = SecondaryRoundedButtonViewModel(
+-            title: .PrivateBrowsingLearnMore,
++            // Tark: says what the link explains; it opens Tark's help, not Mozilla's.
++            title: "How private tabs work",
+             a11yIdentifier: AccessibilityIdentifiers.TabTray.learnMoreButton
+         )
+         button.configure(viewModel: viewModel)
+@@ -64,7 +67,9 @@ class ExperimentEmptyPrivateTabsView: UIView,
+     }
+ 
+     private let iconImageView: UIImageView = .build { imageView in
+-        imageView.image = UIImage.templateImageNamed(StandardImageIdentifiers.Large.privateMode)
++        // Tark: the mark, in its own colours, instead of Firefox's mask.
++        imageView.image = UIImage(named: ImageIdentifiers.tarkMenuMark)
++        imageView.contentMode = .scaleAspectFit
+     }
+ 
+     // MARK: - Inits
+@@ -86,8 +91,13 @@ class ExperimentEmptyPrivateTabsView: UIView,
+     private func setupLayout() {
+         configureLearnMoreButton()
+         containerView.addSubviews(iconImageView, titleLabel, descriptionLabel, learnMoreButton)
++        containerView.addLayoutGuide(tarkCentreGuide)
+         scrollView.addSubview(containerView)
+         addSubview(scrollView)
++        tarkMinHeight = containerView.heightAnchor.constraint(
++            greaterThanOrEqualTo: scrollView.frameLayoutGuide.heightAnchor
++        )
++        tarkMinHeight?.isActive = true
+ 
+         NSLayoutConstraint.activate([
+             scrollView.leadingAnchor.constraint(equalTo: leadingAnchor),
+@@ -101,8 +111,12 @@ class ExperimentEmptyPrivateTabsView: UIView,
+             containerView.bottomAnchor.constraint(equalTo: scrollView.contentLayoutGuide.bottomAnchor),
+             containerView.trailingAnchor.constraint(equalTo: scrollView.contentLayoutGuide.trailingAnchor),
+ 
+-            iconImageView.topAnchor.constraint(equalTo: containerView.topAnchor,
++            // Tark: the icon, text and button sit in the middle of the screen.
++            iconImageView.topAnchor.constraint(greaterThanOrEqualTo: containerView.topAnchor,
+                                                constant: UX.topPadding),
++            tarkCentreGuide.topAnchor.constraint(equalTo: iconImageView.topAnchor),
++            tarkCentreGuide.bottomAnchor.constraint(equalTo: learnMoreButton.bottomAnchor),
++            tarkCentreGuide.centerYAnchor.constraint(equalTo: containerView.centerYAnchor).priority(.defaultHigh),
+             iconImageView.centerXAnchor.constraint(equalTo: containerView.centerXAnchor),
+             iconImageView.widthAnchor.constraint(equalToConstant: UX.imageSize.width),
+             iconImageView.heightAnchor.constraint(equalToConstant: UX.imageSize.height),
+@@ -127,7 +141,7 @@ class ExperimentEmptyPrivateTabsView: UIView,
+                                                      constant: UX.horizontalPadding),
+             learnMoreButton.trailingAnchor.constraint(equalTo: containerView.trailingAnchor,
+                                                       constant: -UX.horizontalPadding),
+-            learnMoreButton.bottomAnchor.constraint(equalTo: containerView.bottomAnchor,
++            learnMoreButton.bottomAnchor.constraint(lessThanOrEqualTo: containerView.bottomAnchor,
+                                                     constant: -UX.bottomPadding)
+         ])
+     }
+@@ -137,7 +151,6 @@ class ExperimentEmptyPrivateTabsView: UIView,
+         titleLabel.textColor = theme.colors.textPrimary
+         descriptionLabel.textColor = theme.colors.textPrimary
+         learnMoreButton.applyTheme(theme: theme)
+-        iconImageView.tintColor = theme.colors.iconDisabled
+     }
+ 
+     @objc
+@@ -151,6 +164,7 @@ class ExperimentEmptyPrivateTabsView: UIView,
+ 
+     func updateInsets(top: CGFloat, bottom: CGFloat) {
+         scrollView.contentInset.top = top
++        tarkMinHeight?.constant = -(top + bottom)
+         scrollView.contentInset.bottom = bottom
+     }
+ }
+diff --git a/firefox-ios/Client/Frontend/Browser/Tabs/Views/ExperimentTabCell.swift b/firefox-ios/Client/Frontend/Browser/Tabs/Views/ExperimentTabCell.swift
+index 6fcdc8d..a31e798 100644
+--- a/firefox-ios/Client/Frontend/Browser/Tabs/Views/ExperimentTabCell.swift
++++ b/firefox-ios/Client/Frontend/Browser/Tabs/Views/ExperimentTabCell.swift
+@@ -28,6 +28,8 @@ final class ExperimentTabCell: UICollectionViewCell, ThemeApplicable, ReusableCe
+         static let shadowOffset = CGSize(width: 0, height: 2)
+         static let shadowOpacity: Float = 1
+         static let borderLayerName = "externalBorder"
++        static let titleStripHeight: CGFloat = 30
++        static let stripFaviconSize: CGFloat = 14
+     }
+     // MARK: - Properties
+ 
+@@ -51,6 +53,7 @@ final class ExperimentTabCell: UICollectionViewCell, ThemeApplicable, ReusableCe
+     private lazy var screenshotViewPhone: UIImageView = .build { view in
+         view.contentMode = .scaleAspectFill
+         view.layer.cornerRadius = UX.cornerRadius
++        view.layer.maskedCorners = [.layerMinXMaxYCorner, .layerMaxXMaxYCorner]
+         view.clipsToBounds = true
+         view.isAccessibilityElement = false
+         view.accessibilityElementsHidden = true
+@@ -71,6 +74,7 @@ final class ExperimentTabCell: UICollectionViewCell, ThemeApplicable, ReusableCe
+     func syncScreenshotForAnimation(_ image: UIImage?) {
+         guard let image, screenshotView.image != nil else { return }
+         screenshotView.image = image
++        setNeedsLayout()
+     }
+ 
+     /// Invisible button without corner radius to ensure the button has the required hitbox size
+@@ -91,6 +95,22 @@ final class ExperimentTabCell: UICollectionViewCell, ThemeApplicable, ReusableCe
+ 
+     private var borderLayer = CAShapeLayer()
+ 
++    // Tark: the page's title and × sit in a strip above the picture, not over it.
++    private lazy var titleStrip: UIView = .build { view in
++        view.isUserInteractionEnabled = true
++    }
++
++    private lazy var stripFaviconView: FaviconImageView = .build()
++
++    private lazy var titleLabel: UILabel = .build { label in
++        label.font = FXFontStyles.Regular.caption1.scaledFont()
++        label.adjustsFontForContentSizeCategory = true
++        label.lineBreakMode = .byTruncatingTail
++        label.isAccessibilityElement = false
++    }
++
++    private lazy var stripDivider: UIView = .build()
++
+     override func layoutSubviews() {
+         super.layoutSubviews()
+         smallFaviconView.layer.cornerRadius = UX.fallbackFaviconSize.height / 2
+@@ -101,8 +121,7 @@ final class ExperimentTabCell: UICollectionViewCell, ThemeApplicable, ReusableCe
+             cornerRadius: self.backgroundHolder.layer.cornerRadius
+         ).cgPath
+ 
+-        closeButtonBlurView.addBlurEffectWithClearBackgroundAndClipping(using: .systemUltraThinMaterialDark)
+-        closeButtonBlurView.layer.cornerRadius = closeButtonBlurView.frame.height / 2
++        alignScreenshotToTop()
+ 
+         // Handles initial draw and non-rotation layout changes (e.g. multitasking resize).
+         guard isSelectedTab, backgroundHolder.bounds != borderLayer.frame else { return }
+@@ -138,9 +157,13 @@ final class ExperimentTabCell: UICollectionViewCell, ThemeApplicable, ReusableCe
+ 
+         backgroundHolder.addSubviews(screenshotView,
+                                      smallFaviconView,
+-                                     closeButton,
+-                                     closeButtonBlurView,
+-                                     closeButtonImageOverlay)
++                                     titleStrip)
++        titleStrip.addSubviews(stripFaviconView,
++                               titleLabel,
++                               stripDivider,
++                               closeButtonBlurView,
++                               closeButtonImageOverlay,
++                               closeButton)
+ 
+         accessibilityCustomActions = [
+             UIAccessibilityCustomAction(name: .TabsTray.TabTrayCloseAccessibilityCustomAction,
+@@ -181,6 +204,13 @@ final class ExperimentTabCell: UICollectionViewCell, ThemeApplicable, ReusableCe
+                                  theme: theme)
+ 
+         configureScreenshot(tabModel: tabModel)
++        titleLabel.text = newTabTitle ?? tabModel.tabTitle
++        setNeedsLayout()
++        if let tabURL = tabModel.url?.absoluteString, !isInternal(url: tabModel.url!) {
++            stripFaviconView.setFavicon(FaviconImageViewModel(siteURLString: tabURL))
++        } else {
++            stripFaviconView.manuallySetImage(UIImage(named: ImageIdentifiers.tarkMenuMark) ?? UIImage())
++        }
+ 
+         if let theme {
+             applyTheme(theme: theme)
+@@ -199,17 +229,14 @@ final class ExperimentTabCell: UICollectionViewCell, ThemeApplicable, ReusableCe
+ 
+     func applyTheme(theme: Theme) {
+         backgroundHolder.backgroundColor = theme.colors.layer1
+-        closeButtonImageOverlay.tintColor = theme.isNova ? theme.colors.iconOnColor : theme.colors.textOnDark
++        closeButtonImageOverlay.tintColor = theme.colors.iconSecondary
++        titleLabel.textColor = theme.colors.textPrimary
++        stripDivider.backgroundColor = theme.colors.borderPrimary
+         screenshotView.backgroundColor = theme.colors.layer1
+         smallFaviconView.tintColor = theme.colors.textPrimary
+         setupShadow(theme: theme)
+ 
+-        if UIAccessibility.isReduceTransparencyEnabled {
+-            closeButtonBlurView.backgroundColor = theme.colors.iconSecondary
+-        } else {
+-            closeButtonBlurView.backgroundColor = .clear
+-            closeButtonBlurView.addBlurEffectWithClearBackgroundAndClipping(using: .systemUltraThinMaterialDark)
+-        }
++        closeButtonBlurView.backgroundColor = .clear
+ 
+         guard let tabModel else { return }
+         updateUIForSelectedState(tabModel.isSelected,
+@@ -317,6 +344,8 @@ final class ExperimentTabCell: UICollectionViewCell, ThemeApplicable, ReusableCe
+         tabModel = nil
+         accessibilityLabel = nil
+         screenshotView.image = nil
++        screenshotView.layer.contentsRect = CGRect(x: 0, y: 0, width: 1, height: 1)
++        titleLabel.text = nil
+         smallFaviconView.isHidden = true
+         removeExternalBorder(from: backgroundHolder)
+         layer.shadowOffset = .zero
+@@ -342,13 +371,31 @@ final class ExperimentTabCell: UICollectionViewCell, ThemeApplicable, ReusableCe
+ 
+             closeButtonBlurView.heightAnchor.constraint(equalToConstant: UX.closeButtonSize),
+             closeButtonBlurView.widthAnchor.constraint(equalToConstant: UX.closeButtonSize),
+-            closeButtonBlurView.topAnchor.constraint(equalTo: backgroundHolder.topAnchor,
+-                                                     constant: UX.closeButtonTop),
+-            closeButtonBlurView.trailingAnchor.constraint(equalTo: backgroundHolder.trailingAnchor,
+-                                                          constant: -UX.closeButtonTrailing),
++            closeButtonBlurView.centerYAnchor.constraint(equalTo: titleStrip.centerYAnchor),
++            closeButtonBlurView.trailingAnchor.constraint(equalTo: titleStrip.trailingAnchor,
++                                                          constant: -UX.closeButtonTrailing + 4),
++
++            titleStrip.topAnchor.constraint(equalTo: backgroundHolder.topAnchor),
++            titleStrip.leadingAnchor.constraint(equalTo: backgroundHolder.leadingAnchor),
++            titleStrip.trailingAnchor.constraint(equalTo: backgroundHolder.trailingAnchor),
++            titleStrip.heightAnchor.constraint(equalToConstant: UX.titleStripHeight),
++
++            stripFaviconView.leadingAnchor.constraint(equalTo: titleStrip.leadingAnchor, constant: 10),
++            stripFaviconView.centerYAnchor.constraint(equalTo: titleStrip.centerYAnchor),
++            stripFaviconView.widthAnchor.constraint(equalToConstant: UX.stripFaviconSize),
++            stripFaviconView.heightAnchor.constraint(equalToConstant: UX.stripFaviconSize),
++
++            titleLabel.leadingAnchor.constraint(equalTo: stripFaviconView.trailingAnchor, constant: 6),
++            titleLabel.trailingAnchor.constraint(equalTo: closeButtonBlurView.leadingAnchor, constant: -4),
++            titleLabel.centerYAnchor.constraint(equalTo: titleStrip.centerYAnchor),
++
++            stripDivider.leadingAnchor.constraint(equalTo: titleStrip.leadingAnchor),
++            stripDivider.trailingAnchor.constraint(equalTo: titleStrip.trailingAnchor),
++            stripDivider.bottomAnchor.constraint(equalTo: titleStrip.bottomAnchor),
++            stripDivider.heightAnchor.constraint(equalToConstant: 0.5),
+ 
+             // Screenshot either shown or favicon takes its place as fallback
+-            screenshotView.topAnchor.constraint(equalTo: backgroundHolder.topAnchor),
++            screenshotView.topAnchor.constraint(equalTo: titleStrip.bottomAnchor),
+             screenshotView.leadingAnchor.constraint(equalTo: backgroundHolder.leadingAnchor),
+             screenshotView.trailingAnchor.constraint(equalTo: backgroundHolder.trailingAnchor),
+             screenshotView.bottomAnchor.constraint(equalTo: backgroundHolder.bottomAnchor),
+@@ -367,6 +414,24 @@ final class ExperimentTabCell: UICollectionViewCell, ThemeApplicable, ReusableCe
+         ])
+     }
+ 
++    /// Tark: shows the page from its top (aspect fill would cut off the top as well as the bottom).
++    private func alignScreenshotToTop() {
++        guard let image = screenshotView.image,
++              image.size.width > 0, image.size.height > 0,
++              screenshotView.bounds.width > 0, screenshotView.bounds.height > 0
++        else { return }
++        let viewSize = screenshotView.bounds.size
++        let imageAspect = image.size.height / image.size.width
++        let viewAspect = viewSize.height / viewSize.width
++        screenshotView.contentMode = .scaleToFill
++        if imageAspect > viewAspect {
++            screenshotView.layer.contentsRect = CGRect(x: 0, y: 0, width: 1, height: viewAspect / imageAspect)
++        } else {
++            let width = imageAspect / viewAspect
++            screenshotView.layer.contentsRect = CGRect(x: (1 - width) / 2, y: 0, width: width, height: 1)
++        }
++    }
++
+     // MARK: - Accessibility
+ 
+     override func accessibilityScroll(_ direction: UIAccessibilityScrollDirection) -> Bool {
+diff --git a/firefox-ios/Client/Frontend/Browser/Tabs/Views/TabDisplayPanelViewController.swift b/firefox-ios/Client/Frontend/Browser/Tabs/Views/TabDisplayPanelViewController.swift
+index 90a9dfa..843c191 100644
+--- a/firefox-ios/Client/Frontend/Browser/Tabs/Views/TabDisplayPanelViewController.swift
++++ b/firefox-ios/Client/Frontend/Browser/Tabs/Views/TabDisplayPanelViewController.swift
+@@ -290,14 +290,14 @@ final class TabDisplayPanelViewController: UIViewController,
+ 
+     private func updateInsets() {
+         if isCompactLayout {
+-            let bottomInset = if emptyPrivateTabsView.needsSafeArea {
+-                DefaultTabTrayUtils().segmentedControlHeight + view.safeAreaInsets.bottom
+-            } else {
+-                DefaultTabTrayUtils().segmentedControlHeight
+-            }
+-
+-            emptyPrivateTabsView.updateInsets(top: 0, bottom: bottomInset)
+-            tabDisplayView.updateInsets(top: 0, bottom: DefaultTabTrayUtils().segmentedControlHeight)
++            // Tark: the switch is at the top. Panels get different safe areas, so start the
++            // content just below the switch as measured from the window, whatever this one has.
++            let switchBottom = (view.window?.safeAreaInsets.top ?? 0) + DefaultTabTrayUtils().segmentedControlHeight
++            let topInset = max(0, switchBottom - view.safeAreaInsets.top)
++            let bottomInset = emptyPrivateTabsView.needsSafeArea ? view.safeAreaInsets.bottom : 0
++
++            emptyPrivateTabsView.updateInsets(top: topInset, bottom: bottomInset)
++            tabDisplayView.updateInsets(top: topInset, bottom: 0)
+         } else {
+             emptyPrivateTabsView.updateInsets(top: view.safeAreaInsets.top, bottom: 0)
+             tabDisplayView.updateInsets(top: 0, bottom: 0)
+diff --git a/firefox-ios/Client/Frontend/Browser/Tabs/Views/TabDisplayView.swift b/firefox-ios/Client/Frontend/Browser/Tabs/Views/TabDisplayView.swift
+index 3c518a5..735d6d3 100644
+--- a/firefox-ios/Client/Frontend/Browser/Tabs/Views/TabDisplayView.swift
++++ b/firefox-ios/Client/Frontend/Browser/Tabs/Views/TabDisplayView.swift
+@@ -335,8 +335,13 @@ final class TabDisplayView: UIView,
+     // MARK: - InsetUpdatable
+ 
+     func updateInsets(top: CGFloat, bottom: CGFloat) {
++        // Tark: when the top inset changes while at the top, stay at the top (no jump later).
++        let wasAtTop = collectionView.contentOffset.y <= -collectionView.adjustedContentInset.top + 1
+         collectionView.contentInset.top = top
+         collectionView.contentInset.bottom = bottom
++        if wasAtTop {
++            collectionView.contentOffset.y = -collectionView.adjustedContentInset.top
++        }
+     }
+ 
+     // MARK: - UICollectionViewDataSourcePrefetching
+diff --git a/firefox-ios/Client/Frontend/Browser/Tabs/Views/TabTrayViewController.swift b/firefox-ios/Client/Frontend/Browser/Tabs/Views/TabTrayViewController.swift
+index 73dae9c..5777498 100644
+--- a/firefox-ios/Client/Frontend/Browser/Tabs/Views/TabTrayViewController.swift
++++ b/firefox-ios/Client/Frontend/Browser/Tabs/Views/TabTrayViewController.swift
+@@ -126,8 +126,8 @@ final class TabTrayViewController: UIViewController,
+     private lazy var experimentSegmentControl: TabTraySelectorView = {
+         let selectedIndex = experimentConvertSelectedIndex()
+         // Tark: no synced-tabs panel.
+-        let titles = [TabTrayPanelType.privateTabs.label,
+-                      TabTrayPanelType.tabs.label]
++        let titles = [TabTrayPanelType.tabs.label,
++                      TabTrayPanelType.privateTabs.label]
+         let selector = TabTraySelectorView(selectedIndex: selectedIndex,
+                                            theme: retrieveTheme(),
+                                            buttonTitles: titles)
+@@ -140,8 +140,8 @@ final class TabTrayViewController: UIViewController,
+ 
+     private lazy var experimentiPadSegmentControl: TabTrayiPadSelectorView = {
+         let selectedIndex = experimentConvertSelectedIndex()
+-        let titles = [TabTrayPanelType.privateTabs.label,
+-                      TabTrayPanelType.tabs.label]
++        let titles = [TabTrayPanelType.tabs.label,
++                      TabTrayPanelType.privateTabs.label]
+         let selector = TabTrayiPadSelectorView(selectedIndex: selectedIndex,
+                                                theme: retrieveTheme(),
+                                                buttonTitles: titles)
+@@ -295,9 +295,46 @@ final class TabTrayViewController: UIViewController,
+     }()
+ 
+     private lazy var experimentBottomToolbarItems: [UIBarButtonItem] = {
+-        return [deleteButton, flexibleSpace, newTabButton, flexibleSpace, doneButton]
++        // Tark: the actions in words: Close all, New tab (the main one), Done.
++        return [tarkCloseAllButton, flexibleSpace, tarkNewTabButton, flexibleSpace, tarkDoneButton]
+     }()
+ 
++    private lazy var tarkCloseAllButton: UIBarButtonItem = {
++        let button = UIBarButtonItem(title: "Close all",
++                                     style: .plain,
++                                     target: self,
++                                     action: #selector(deleteTabsButtonTapped))
++        button.accessibilityIdentifier = AccessibilityIdentifiers.TabTray.closeAllTabsButton
++        return button
++    }()
++
++    private lazy var tarkNewTabButton: UIBarButtonItem = {
++        let button = UIBarButtonItem(title: "New tab",
++                                     style: .plain,
++                                     target: self,
++                                     action: #selector(newTabButtonTapped))
++        if #available(iOS 26.0, *) {
++            button.style = .prominent
++        }
++        button.accessibilityIdentifier = AccessibilityIdentifiers.TabTray.newTabButton
++        return button
++    }()
++
++    private lazy var tarkDoneButton: UIBarButtonItem = {
++        let button = UIBarButtonItem(title: "Done",
++                                     style: .plain,
++                                     target: self,
++                                     action: #selector(doneButtonTapped))
++        button.accessibilityIdentifier = AccessibilityIdentifiers.TabTray.doneButton
++        return button
++    }()
++
++    private func applyTarkToolbarTints(theme: Theme) {
++        tarkCloseAllButton.tintColor = theme.colors.textCritical
++        tarkNewTabButton.tintColor = theme.colors.actionPrimary
++        tarkDoneButton.tintColor = theme.colors.actionPrimary
++    }
++
+     private lazy var bottomToolbarItemsForSync: [UIBarButtonItem] = {
+         guard hasSyncableAccount else { return [] }
+ 
+@@ -514,6 +551,7 @@ final class TabTrayViewController: UIViewController,
+             doneButton.tintColor = theme.colors.iconPrimary
+         }
+         syncTabButton.tintColor = theme.colors.iconPrimary
++        applyTarkToolbarTints(theme: theme)
+         panelContainer.backgroundColor = theme.isNova ? theme.colors.layer1 : theme.colors.layer3
+         if #available(iOS 26.0, *) {
+             applyToolbarGlassButtonTints(theme: theme)
+@@ -667,7 +705,8 @@ final class TabTrayViewController: UIViewController,
+                 segmentedControl.trailingAnchor.constraint(equalTo: containerView.safeAreaLayoutGuide.trailingAnchor,
+                                                            constant: -UX.segmentedControlHorizontalSpacing),
+ 
+-                experimentSegmentControl.bottomAnchor.constraint(equalTo: containerView.safeAreaLayoutGuide.bottomAnchor),
++                // Tark: the switch sits at the top; the bottom is the toolbar's.
++                experimentSegmentControl.topAnchor.constraint(equalTo: containerView.safeAreaLayoutGuide.topAnchor),
+                 experimentSegmentControl.leadingAnchor.constraint(equalTo: containerView.safeAreaLayoutGuide.leadingAnchor),
+                 experimentSegmentControl.trailingAnchor.constraint(
+                     equalTo: containerView.safeAreaLayoutGuide.trailingAnchor),
+@@ -923,7 +962,9 @@ final class TabTrayViewController: UIViewController,
+ 
+         if let scrollView = pageVC.view.subviews.first(where: { $0 is UIScrollView }) as? UIScrollView {
+             scrollView.delegate = self
+-            scrollView.isScrollEnabled = false
++            // Tark: swipe between Tabs and Private; the highlight follows the finger.
++            scrollView.isScrollEnabled = true
++            pageScrollView = scrollView
+         }
+ 
+         self.pageViewController = pageVC

@@ -1,0 +1,208 @@
+diff --git a/BrowserKit/Sources/TarkTranslate/TarkTranslateModels.swift b/BrowserKit/Sources/TarkTranslate/TarkTranslateModels.swift
+index 0583d05..4cbc900 100644
+--- a/BrowserKit/Sources/TarkTranslate/TarkTranslateModels.swift
++++ b/BrowserKit/Sources/TarkTranslate/TarkTranslateModels.swift
+@@ -141,23 +141,12 @@ public final class TarkTranslateModels: NSObject, @unchecked Sendable, URLSessio
+         // What an earlier, cut-off try left: URLSession's resume data, so the
+         // file continues from where it stopped (gettarka.com serves ranges).
+         let resumeFile = path(name + ".resume")
+-        let temporary: URL
+-        let response: URLResponse
+-        do {
+-            if let resumeData = try? Data(contentsOf: resumeFile) {
+-                try? FileManager.default.removeItem(at: resumeFile)
+-                (temporary, response) = try await session.download(resumeFrom: resumeData,
+-                                                                   delegate: ProgressDelegate(progress))
+-            } else {
+-                (temporary, response) = try await session.download(from: url, delegate: ProgressDelegate(progress))
+-            }
+-        } catch {
+-            if let resumeData = (error as? URLError)?.downloadTaskResumeData {
+-                try? resumeData.write(to: resumeFile)
+-            }
++        let resumeData = try? Data(contentsOf: resumeFile)
++        try? FileManager.default.removeItem(at: resumeFile)
++        guard let (temporary, response) = await download(url: url, resumeData: resumeData,
++                                                         resumeFile: resumeFile, progress: progress) else {
+             return false
+         }
+-        defer { try? FileManager.default.removeItem(at: temporary) }
+         // 206 when resumed.
+         guard let status = (response as? HTTPURLResponse)?.statusCode, status == 200 || status == 206,
+               TarkXlitDownloader.sha256(of: temporary) == pinned.sha256 else { return false }
+@@ -168,6 +157,47 @@ public final class TarkTranslateModels: NSObject, @unchecked Sendable, URLSessio
+         return true
+     }
+ 
++    /// One file. A plain task (not the async API, whose per-task delegate
++    /// was not told about progress on the iPhone); its byte count is read
++    /// four times a second. The file is moved out before the handler
++    /// returns, as URLSession deletes it then. Cut off by the network or a
++    /// cancel, the partial download is kept in `resumeFile`.
++    private func download(url: URL,
++                          resumeData: Data?,
++                          resumeFile: URL,
++                          progress: @escaping @Sendable (Int64) -> Void) async -> (URL, URLResponse)? {
++        let holder = TaskHolder()
++        return await withTaskCancellationHandler {
++            await withCheckedContinuation { (continuation: CheckedContinuation<(URL, URLResponse)?, Never>) in
++                let handler: @Sendable (URL?, URLResponse?, Error?) -> Void = { location, response, error in
++                    holder.stopPolling()
++                    if let error {
++                        if let data = (error as? URLError)?.downloadTaskResumeData {
++                            try? data.write(to: resumeFile)
++                        }
++                        continuation.resume(returning: nil)
++                        return
++                    }
++                    guard let location, let response else {
++                        continuation.resume(returning: nil)
++                        return
++                    }
++                    let kept = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
++                    guard (try? FileManager.default.moveItem(at: location, to: kept)) != nil else {
++                        continuation.resume(returning: nil)
++                        return
++                    }
++                    continuation.resume(returning: (kept, response))
++                }
++                let task = resumeData.map { session.downloadTask(withResumeData: $0, completionHandler: handler) }
++                    ?? session.downloadTask(with: url, completionHandler: handler)
++                holder.start(task, progress: progress)
++            }
++        } onCancel: {
++            holder.cancelKeepingResumeData(into: resumeFile)
++        }
++    }
++
+     /// Never follows a redirect: the files come from gettarka.com only.
+     public func urlSession(_ session: URLSession,
+                            task: URLSessionTask,
+@@ -177,21 +207,36 @@ public final class TarkTranslateModels: NSObject, @unchecked Sendable, URLSessio
+     }
+ }
+ 
+-/// Reports one file's bytes written so far.
+-private final class ProgressDelegate: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
+-    private let progress: @Sendable (Int64) -> Void
+-
+-    init(_ progress: @escaping @Sendable (Int64) -> Void) {
+-        self.progress = progress
++/// The running task of one file: polls its byte count, and cancels it
++/// keeping what was downloaded.
++private final class TaskHolder: @unchecked Sendable {
++    private let lock = NSLock()
++    private var task: URLSessionDownloadTask?
++    private var timer: DispatchSourceTimer?
++
++    func start(_ task: URLSessionDownloadTask, progress: @escaping @Sendable (Int64) -> Void) {
++        let timer = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
++        timer.schedule(deadline: .now(), repeating: .milliseconds(250))
++        timer.setEventHandler { progress(task.countOfBytesReceived) }
++        lock.withLock {
++            self.task = task
++            self.timer = timer
++        }
++        timer.resume()
++        task.resume()
+     }
+ 
+-    func urlSession(_ session: URLSession,
+-                    downloadTask: URLSessionDownloadTask,
+-                    didWriteData bytesWritten: Int64,
+-                    totalBytesWritten: Int64,
+-                    totalBytesExpectedToWrite: Int64) {
+-        progress(totalBytesWritten)
++    func stopPolling() {
++        lock.withLock {
++            timer?.cancel()
++            timer = nil
++        }
+     }
+ 
+-    func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {}
++    func cancelKeepingResumeData(into file: URL) {
++        let task = lock.withLock { self.task }
++        task?.cancel { data in
++            if let data { try? data.write(to: file) }
++        }
++    }
+ }
+diff --git a/firefox-ios/Client/Frontend/Translations/Engine/TranslationsEngine.swift b/firefox-ios/Client/Frontend/Translations/Engine/TranslationsEngine.swift
+index b791085..da5d618 100644
+--- a/firefox-ios/Client/Frontend/Translations/Engine/TranslationsEngine.swift
++++ b/firefox-ios/Client/Frontend/Translations/Engine/TranslationsEngine.swift
+@@ -64,8 +64,16 @@ final class TarkEngineEndpoint: BridgeEndpoint {
+         let id: Int
+         let sourceText: String
+         let isHTML: Bool
++        /// Requests the page sends together (one scroll, one screenful) share
++        /// a group; a later group is what is on screen now.
++        let group: Int
+     }
+ 
++    /// A pause this long between requests starts a new group.
++    private static let groupGap: TimeInterval = 0.15
++    private var group = 0
++    private var lastRequestAt = Date.distantPast
++
+     /// Paragraphs per batch: about a screenful, so the first screen comes
+     /// back in one pass.
+     private static let batchSize = 12
+@@ -128,7 +136,11 @@ final class TarkEngineEndpoint: BridgeEndpoint {
+         case "TranslationsPort:TranslationRequest":
+             guard let id = message["translationId"] as? Int,
+                   let sourceText = message["sourceText"] as? String else { return }
+-            queue.append(Request(id: id, sourceText: sourceText, isHTML: message["isHTML"] as? Bool ?? false))
++            let now = Date()
++            if now.timeIntervalSince(lastRequestAt) > Self.groupGap { group += 1 }
++            lastRequestAt = now
++            queue.append(Request(id: id, sourceText: sourceText,
++                                 isHTML: message["isHTML"] as? Bool ?? false, group: group))
+             translateNextBatch()
+         case "TranslationsPort:CancelSingleTranslation":
+             guard let id = message["translationId"] as? Int else { return }
+@@ -156,8 +168,7 @@ final class TarkEngineEndpoint: BridgeEndpoint {
+                 isTranslating = false
+                 return
+             }
+-            let batch = Array(queue.prefix(throughEnglish ? Self.pivotBatchSize : Self.batchSize))
+-            queue.removeFirst(batch.count)
++            let batch = takeBatch(limit: throughEnglish ? Self.pivotBatchSize : Self.batchSize)
+             let paragraphs = batch.map {
+                 Self.sentences(in: $0.isHTML ? Self.plainText(fromHTML: $0.sourceText) : $0.sourceText)
+             }
+@@ -182,6 +193,18 @@ final class TarkEngineEndpoint: BridgeEndpoint {
+         }
+     }
+ 
++    /// Up to `limit` requests out of the queue: the newest group first (what
++    /// the person scrolled to), each group in the page's own order.
++    private func takeBatch(limit: Int) -> [Request] {
++        let ordered = queue.enumerated().sorted {
++            $0.element.group != $1.element.group ? $0.element.group > $1.element.group : $0.offset < $1.offset
++        }
++        let batch = ordered.prefix(limit).map(\.element)
++        let taken = Set(batch.map(\.id))
++        queue.removeAll { taken.contains($0.id) }
++        return batch
++    }
++
+     private func reply(_ message: [String: Any]) {
+         bridge?.receive(handlerName: handlerName, body: message)
+     }
+diff --git a/firefox-ios/Client/Frontend/Translations/TranslationsMiddleware.swift b/firefox-ios/Client/Frontend/Translations/TranslationsMiddleware.swift
+index c0557dc..b1f2b38 100644
+--- a/firefox-ios/Client/Frontend/Translations/TranslationsMiddleware.swift
++++ b/firefox-ios/Client/Frontend/Translations/TranslationsMiddleware.swift
+@@ -228,7 +228,9 @@ final class TranslationsMiddleware: FeatureFlaggable, Notifiable {
+                 let languages = manager.preferredLanguages(supportedTargetLanguages: supported)
+                 let pageLanguage = try? await translationsService.detectPageLanguage(for: action.windowUUID)
+                 let filteredLanguages = languages.filter { $0 != pageLanguage }
+-                if !translationConfiguration.isMultiLanguageFlow, let singleLanguage = filteredLanguages.first {
++                // Tark: one language to offer is no choice; translate into it.
++                if !translationConfiguration.isMultiLanguageFlow || filteredLanguages.count == 1,
++                   let singleLanguage = filteredLanguages.first {
+                     store.dispatch(TranslationLanguageSelectedAction(
+                         windowUUID: action.windowUUID,
+                         targetLanguage: singleLanguage,

@@ -1,0 +1,453 @@
+diff --git a/firefox-ios/Client/Application/AppDelegate.swift b/firefox-ios/Client/Application/AppDelegate.swift
+index 589e23d..d12a2aa 100644
+--- a/firefox-ios/Client/Application/AppDelegate.swift
++++ b/firefox-ios/Client/Application/AppDelegate.swift
+@@ -154,14 +154,8 @@ class AppDelegate: UIResponder,
+ 
+         addObservers()
+ 
+-        /// Prewarm translation resources off the main thread
+-        /// This will fetch the translator WASM and model attachments for the device language.
+-        /// Running this on a utility QoS to avoid impacting app launch time.
+-        if featureFlagsProvider.isEnabled(.translation) {
+-            Task(priority: .utility) {
+-                await ASTranslationModelsFetcher().prewarmResourcesForStartup()
+-            }
+-        }
++        // Tark: no translation prewarm at launch; it fetched Mozilla's models.
++        // Tark's models download when the person first translates a page.
+ 
+         if #available(iOS 17.0, *) {
+             ResetTipsSetting.resetDatastoreIfNeeded(prefs: profile.prefs)
+diff --git a/firefox-ios/Client/Application/RemoteSettings/Application Services/ASTranslationModelsFetcher.swift b/firefox-ios/Client/Application/RemoteSettings/Application Services/ASTranslationModelsFetcher.swift
+index 124c185..5fc3474 100644
+--- a/firefox-ios/Client/Application/RemoteSettings/Application Services/ASTranslationModelsFetcher.swift	
++++ b/firefox-ios/Client/Application/RemoteSettings/Application Services/ASTranslationModelsFetcher.swift	
+@@ -4,6 +4,7 @@
+ 
+ import MozillaAppServices
+ import Common
++import TarkTranslate
+ 
+ /// For more context, See schema in
+ /// https://firefox.settings.services.mozilla.com/v1/buckets/main/collections/translations-wasm/records
+@@ -32,8 +33,41 @@ protocol TranslationModelsFetcherProtocol: Sendable {
+     func resetStorage() async
+ }
+ 
++/// Tark: page translation runs on Tark's own IndicTrans2 engine on the
++/// phone, so the languages are the engine's and nothing is fetched from
++/// Mozilla's Remote Settings. English and the Indian languages translate
++/// both ways; Indian ↔ Indian goes through English (TarkPageTranslator).
++final class TarkTranslationModelsFetcher: TranslationModelsFetcherProtocol {
++    static let languages = ["en", "hi", "ta", "bn"]
++
++    func fetchTranslatorWASM() async -> Data? { return nil }
++
++    /// Non-nil when Tark translates `sourceLang` into `targetLang`; Firefox
++    /// only checks for a pair, it does not read the data.
++    func fetchModels(from sourceLang: String, to targetLang: String) async -> Data? {
++        let supported = sourceLang != targetLang
++            && Self.languages.contains(sourceLang)
++            && Self.languages.contains(targetLang)
++        return supported ? Data("[]".utf8) : nil
++    }
++
++    func fetchModelBuffer(recordId: String) async -> Data? { return nil }
++
++    /// The models download on first use (a card asks), never ahead of time.
++    func prewarmResources(for sourceLang: String, to targetLang: String) async {}
++
++    func fetchSupportedTargetLanguages() async -> [String] { return Self.languages }
++
++    /// Firefox's "remove downloaded languages": deletes Tark's models.
++    func resetStorage() async {
++        TarkPageTranslator.shared.unload()
++        TarkTranslateModels.Direction.allCases.forEach(TarkTranslateModels.shared.delete)
++    }
++}
++
+ final class ASTranslationModelsFetcher: TranslationModelsFetcherProtocol {
+-    static let shared = ASTranslationModelsFetcher()
++    /// Tark: every caller of `shared` gets Tark's languages, not Mozilla's.
++    static let shared: TranslationModelsFetcherProtocol = TarkTranslationModelsFetcher()
+     // Pin versions to avoid using unsupported models
+     private enum Constants {
+         static let translatorVersion = "3.0"
+diff --git a/firefox-ios/Client/FeatureFlags/FeatureFlagsProvider.swift b/firefox-ios/Client/FeatureFlags/FeatureFlagsProvider.swift
+index f29918a..11860ef 100644
+--- a/firefox-ios/Client/FeatureFlags/FeatureFlagsProvider.swift
++++ b/firefox-ios/Client/FeatureFlags/FeatureFlagsProvider.swift
+@@ -28,6 +28,7 @@ final class FeatureFlagsProvider: FeatureFlagProviding, @unchecked Sendable {
+     /// Used for checking the status of a feature flag from the feature flag backend
+     func isEnabled(_ flag: FeatureFlagID) -> Bool {
+         if Self.tarkOff.contains(flag) { return false }
++        if Self.tarkOn.contains(flag) { return true }
+         return backendLayer.checkNimbusConfigFor(flag, with: prefs)
+     }
+ 
+@@ -39,10 +40,15 @@ final class FeatureFlagsProvider: FeatureFlagProviding, @unchecked Sendable {
+         .homepageStoryCategories, .hostedSummarizer, .hostedSummarizerShakeGesture,
+         .hostedSummarizerToolbarEntrypoint, .microsurvey, .relayIntegration,
+         .reportBrokenSite, .sentFromFirefox, .sentFromFirefoxTreatmentA,
+-        .summarizerAppAttestAuth, .translation, .translationLanguagePicker,
++        .summarizerAppAttestAuth,
+         .trendingSearches, .tosFeature, .touFeature, .vpnFeature
+     ]
+ 
++    /// Tark: features Tark runs itself, on whatever Nimbus says. Page
++    /// translation uses Tark's own IndicTrans2 engine on the phone (not
++    /// Mozilla's models); the person's switch is AI Controls → Page translation.
++    static let tarkOn: Set<FeatureFlagID> = [.translation, .translationLanguagePicker]
++
+     func setDebugOverride(_ flag: FeatureFlagID, to value: Bool) {
+         guard let debugKey = flag.debugKey else { return }
+         prefs.setBool(value, forKey: debugKey)
+diff --git a/firefox-ios/Client/Frontend/Browser/Toolbars/Redux/LeadingPageActionsBuilder.swift b/firefox-ios/Client/Frontend/Browser/Toolbars/Redux/LeadingPageActionsBuilder.swift
+index 6669201..fc3cd68 100644
+--- a/firefox-ios/Client/Frontend/Browser/Toolbars/Redux/LeadingPageActionsBuilder.swift
++++ b/firefox-ios/Client/Frontend/Browser/Toolbars/Redux/LeadingPageActionsBuilder.swift
+@@ -20,12 +20,15 @@ enum LeadingPageActionsBuilder {
+ 
+         // Whether the navigation toolbar is showing doesn't affect these actions — share/translate
+         // only depend on whether we're editing or on the homepage.
+-        // Tark: the pill shows the shield and the address only; Share is in the menu.
+-        guard TarkPill.showsPageButtons, !isEditing, !isHomepage else { return actions }
++        guard !isEditing, !isHomepage else { return actions }
+ 
+-        let shareAction = shareAction(enabled: isLoading == false,
+-                                      hasAlternativeLocationColor: hasAlternativeLocationColor)
+-        actions.append(shareAction)
++        // Tark: the pill shows the shield and the address; Share is in the
++        // menu. Translate stays: it appears only on a page Tark can translate.
++        if TarkPill.showsPageButtons {
++            let shareAction = shareAction(enabled: isLoading == false,
++                                          hasAlternativeLocationColor: hasAlternativeLocationColor)
++            actions.append(shareAction)
++        }
+ 
+         if let translationAction = configureTranslationIcon(
+             translationConfiguration: translationConfiguration,
+diff --git a/firefox-ios/Client/Frontend/Settings/AIControls/AIControlsModel.swift b/firefox-ios/Client/Frontend/Settings/AIControls/AIControlsModel.swift
+index 90e13c2..027f7d9 100644
+--- a/firefox-ios/Client/Frontend/Settings/AIControls/AIControlsModel.swift
++++ b/firefox-ios/Client/Frontend/Settings/AIControls/AIControlsModel.swift
+@@ -17,17 +17,13 @@ class AIControlsModel: ObservableObject,
+     @Published var translationsVisible = false
+     @Published var pageSummariesVisible = false
+     @Published var quickAnswersVisible = false
+-    // Tark: page translation with Tark's own IndicTrans2 model, and the
+-    // models it has downloaded (direction, bytes), for "On this phone".
+-    @Published var pageTranslationEnabled = true
++    // Tark: the models page translation has downloaded (direction, bytes),
++    // for "On this phone".
+     @Published var modelsOnPhone: [(direction: TarkTranslateModels.Direction, bytes: Int64)] = []
+ 
+-    /// Whether page translation is on (the Translate button shows itself);
+-    /// on unless turned off here or by "Turn off AI features".
+-    static let pageTranslationKey = "tark.pageTranslation"
+-    static var isPageTranslationOn: Bool {
+-        return UserDefaults.standard.object(forKey: pageTranslationKey) as? Bool ?? true
+-    }
++    /// Tark: Page translation is Firefox's own translation setting, run by
++    /// Tark's engine; one switch, shown in Tark's row.
++    var pageTranslationEnabled: Bool { translationEnabled }
+ 
+     let headerLinkInfo = LinkInfo(
+         label: .Settings.AIControls.HeaderCard.Link,
+@@ -101,11 +97,11 @@ class AIControlsModel: ObservableObject,
+         quickAnswersEnabled = userPreferences.getPreferenceFor(.quickAnswers)
+ 
+         pageSummariesVisible = self.summarizerConfiguration.isSummarizeFeatureEnabled
+-        translationsVisible = featureFlagsProvider.isEnabled(.translation)
++        // Tark: Firefox's Translation row is replaced by Page translation.
++        translationsVisible = false
+         quickAnswersVisible = featureFlagsProvider.isEnabled(.quickAnswers)
+ 
+         killSwitchIsOn = featureFlagsProvider.isEnabled(.aiKillSwitch) && userPreferences.getPreferenceFor(.aiKillSwitch)
+-        pageTranslationEnabled = Self.isPageTranslationOn
+         refreshModelsOnPhone()
+     }
+ 
+@@ -127,8 +123,7 @@ class AIControlsModel: ObservableObject,
+ 
+     @MainActor
+     func togglePageTranslation(to newValue: Bool) {
+-        pageTranslationEnabled = newValue
+-        UserDefaults.standard.set(newValue, forKey: Self.pageTranslationKey)
++        toggleTranslationsFeature(to: newValue)
+         if !newValue { TarkPageTranslator.shared.unload() }
+     }
+ 
+@@ -149,7 +144,6 @@ class AIControlsModel: ObservableObject,
+         updateTranslationsFeature(to: !newValue)
+         updateQuickAnswersFeature(to: !newValue)
+         // Tark: the models are Tark's own download, so turning AI off removes them.
+-        togglePageTranslation(to: !newValue)
+         if newValue {
+             TarkTranslateModels.Direction.allCases.forEach(deleteModel)
+         }
+diff --git a/firefox-ios/Client/Frontend/Translations/Engine/TranslationsEngine.swift b/firefox-ios/Client/Frontend/Translations/Engine/TranslationsEngine.swift
+index 3102522..e0df37d 100644
+--- a/firefox-ios/Client/Frontend/Translations/Engine/TranslationsEngine.swift
++++ b/firefox-ios/Client/Frontend/Translations/Engine/TranslationsEngine.swift
+@@ -2,12 +2,12 @@
+ // License, v. 2.0. If a copy of the MPL was not distributed with this
+ // file, You can obtain one at http://mozilla.org/MPL/2.0/
+ 
++import NaturalLanguage
++import TarkTranslate
+ import WebKit
+ 
+ @MainActor
+ final class TranslationsEngine {
+-    /// A single WKWebView managed by the engine.
+-    private let webView: WKWebView
+     /// Keep bridges alive as long as their webviews exist.
+     private let bridges = NSMapTable<WKWebView, Bridge>(
+         keyOptions: [.weakMemory],
+@@ -24,34 +24,12 @@ final class TranslationsEngine {
+         static let receiveFunction   = "window.receive"
+     }
+ 
+-    init(schemeHandler: WKURLSchemeHandler = TranslationsSchemeHandler()) {
+-        let config = WKWebViewConfiguration()
+-        config.setURLSchemeHandler(
+-            schemeHandler,
+-            forURLScheme: TranslationsSchemeHandler.scheme
+-        )
+-
+-        self.webView = WKWebView(frame: .zero, configuration: config)
+-        self.webView.isHidden = true
+-
+-        #if targetEnvironment(simulator)
+-        /// Allow Safari Web Inspector only when running in simulator.
+-        /// Requires to toggle `show features for web developers` in
+-        /// Safari > Settings > Advanced menu.
+-        if #available(iOS 16.4, *) {
+-            self.webView.isInspectable = true
+-        }
+-        /// NOTE:  The webview needs to be in the view tree to show up in the safari inspector.
+-        if let windowScene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
+-           let window = windowScene.windows.first {
+-            window.addSubview(self.webView)
+-        }
+-        #endif
++    /// Tark: no engine web view (it ran Bergamot with Mozilla's models); the
++    /// engine side of every bridge is `TarkEngineEndpoint`, in Swift. The
++    /// scheme handler is no longer used and stays only for Firefox's tests.
++    init(schemeHandler: WKURLSchemeHandler? = nil) {}
+ 
+-        loadEntrypointHTML()
+-    }
+-
+-    /// Creates or reuses a bridge between the engine's webview and a page webview.
++    /// Creates or reuses a bridge between the engine and a page webview.
+     func bridge(to pageWebView: WKWebView) -> Bridge {
+         if let existing = bridges.object(forKey: pageWebView) {
+             return existing
+@@ -64,23 +42,191 @@ final class TranslationsEngine {
+             receiveFunction: BridgeConfig.receiveFunction
+         )
+ 
+-        let engineEndpoint = WebViewBridgeEndpoint(
+-            webView: self.webView,
+-            handlerName: BridgeConfig.engineHandlerName,
+-            contentWorld: .page,
+-            receiveFunction: BridgeConfig.receiveFunction
+-        )
+-
++        let engineEndpoint = TarkEngineEndpoint(handlerName: BridgeConfig.engineHandlerName)
+         let bridge = Bridge(portA: pageEndpoint, portB: engineEndpoint)
++        engineEndpoint.bridge = bridge
+         bridges.setObject(bridge, forKey: pageWebView)
+         return bridge
+     }
++}
++
++/// Tark: the engine side of the page's translation port, answering
++/// `translations-document.sys.mjs` the way Firefox's engine
++/// (`translations-engine.sys.mjs`) does, with Tark's IndicTrans2 model on the
++/// phone. Paragraphs are split into sentences; requests are batched so
++/// Indian ↔ Indian swaps models once per batch, not per paragraph. Markup
++/// inside a paragraph is dropped and the paragraph translated whole (the
++/// user's choice: good sentences over keeping inline links). A sentence that
++/// fails keeps its original text.
++@MainActor
++final class TarkEngineEndpoint: BridgeEndpoint {
++    private struct Request {
++        let id: Int
++        let sourceText: String
++        let isHTML: Bool
++    }
++
++    /// Paragraphs per batch: about a screenful, so the first screen comes
++    /// back in one pass.
++    private static let batchSize = 12
++
++    let handlerName: String
++    weak var bridge: Bridge?
++
++    private var from = ""
++    private var to = ""
++    /// Bumped by StartTranslation and DiscardTranslations; a batch that
++    /// finishes under an older generation is dropped.
++    private var generation = 0
++    private var queue: [Request] = []
++    private var isTranslating = false
++
++    init(handlerName: String) {
++        self.handlerName = handlerName
++    }
++
++    func registerScriptHandler(_ handler: WKScriptMessageHandler) {}
++
++    /// A message from the page, as JSON.
++    func send(json: String) {
++        guard let data = json.data(using: .utf8),
++              let message = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
++              let type = message["type"] as? String else { return }
++
++        switch type {
++        case "StartTranslation":
++            let pair = message["languagePair"] as? [String: Any]
++            from = pair?["sourceLanguage"] as? String ?? ""
++            to = pair?["targetLanguage"] as? String ?? ""
++            reset()
++        case "DiscardTranslations", "TranslationsPort:DiscardTranslations":
++            reset()
++        case "ForceShutdown":
++            reset()
++            TarkPageTranslator.shared.unload()
++        case "TranslationsPort:GetEngineStatusRequest":
++            let ready = directions().allSatisfy { TarkTranslateModels.shared.isReady($0) }
++            reply(["type": "TranslationsPort:GetEngineStatusResponse",
++                   "status": ready ? "ready" : "error",
++                   "error": ready ? NSNull() : "models not on this phone"])
++        case "TranslationsPort:Passthrough":
++            reply(["type": "TranslationsPort:TranslationResponse",
++                   "translationId": message["translationId"] ?? NSNull(),
++                   "targetText": NSNull()])
++        case "TranslationsPort:CachedTranslation":
++            reply(["type": "TranslationsPort:TranslationResponse",
++                   "translationId": message["translationId"] ?? NSNull(),
++                   "targetText": message["cachedTranslation"] ?? NSNull()])
++        case "TranslationsPort:TranslationRequest":
++            guard let id = message["translationId"] as? Int,
++                  let sourceText = message["sourceText"] as? String else { return }
++            queue.append(Request(id: id, sourceText: sourceText, isHTML: message["isHTML"] as? Bool ?? false))
++            translateNextBatch()
++        case "TranslationsPort:CancelSingleTranslation":
++            guard let id = message["translationId"] as? Int else { return }
++            queue.removeAll { $0.id == id }
++        default:
++            break
++        }
++    }
++
++    private func reset() {
++        generation += 1
++        queue.removeAll()
++    }
++
++    /// The models this pair goes through.
++    private func directions() -> [TarkTranslateModels.Direction] {
++        var directions: [TarkTranslateModels.Direction] = []
++        if from != "en" { directions.append(.indicToEnglish) }
++        if to != "en" { directions.append(.englishToIndic) }
++        return directions
++    }
++
++    private func translateNextBatch() {
++        guard !isTranslating, !queue.isEmpty else { return }
++        isTranslating = true
++        let batch = Array(queue.prefix(Self.batchSize))
++        queue.removeFirst(batch.count)
++        let paragraphs = batch.map { Self.sentences(in: $0.isHTML ? Self.plainText(fromHTML: $0.sourceText) : $0.sourceText) }
++        let started = generation
++        let (from, to) = (self.from, self.to)
++
++        Task {
++            let flat = paragraphs.flatMap { $0 }
++            let translated = await TarkPageTranslator.shared.translate(flat, from: from, to: to)
++            var index = 0
++            if started == generation {
++                for (request, sentences) in zip(batch, paragraphs) {
++                    let text = sentences.map { sentence -> String in
++                        defer { index += 1 }
++                        return translated[index] ?? sentence
++                    }.joined(separator: " ")
++                    reply(["type": "TranslationsPort:TranslationResponse",
++                           "translationId": request.id,
++                           "targetText": request.isHTML ? Self.escapeHTML(text) : text])
++                }
++            }
++            isTranslating = false
++            translateNextBatch()
++        }
++    }
++
++    private func reply(_ message: [String: Any]) {
++        bridge?.receive(handlerName: handlerName, body: message)
++    }
++
++    /// `text` split into sentences; whitespace-only pieces dropped.
++    static func sentences(in text: String) -> [String] {
++        let tokenizer = NLTokenizer(unit: .sentence)
++        tokenizer.string = text
++        var sentences: [String] = []
++        tokenizer.enumerateTokens(in: text.startIndex..<text.endIndex) { range, _ in
++            let sentence = text[range].trimmingCharacters(in: .whitespacesAndNewlines)
++            if !sentence.isEmpty { sentences.append(sentence) }
++            return true
++        }
++        return sentences
++    }
++
++    /// The text of an inline-markup fragment: tags dropped (`<br>` as a
++    /// space), entities decoded, whitespace collapsed.
++    static func plainText(fromHTML html: String) -> String {
++        var text = html.replacingOccurrences(of: "<br\\s*/?>", with: " ", options: [.regularExpression, .caseInsensitive])
++        text = text.replacingOccurrences(of: "<[^>]*>", with: "", options: .regularExpression)
++        text = decodeEntities(text)
++        return text.replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
++            .trimmingCharacters(in: .whitespaces)
++    }
++
++    private static let namedEntities = ["amp": "&", "lt": "<", "gt": ">", "quot": "\"", "apos": "'", "nbsp": "\u{00A0}"]
++
++    static func decodeEntities(_ text: String) -> String {
++        guard text.contains("&") else { return text }
++        let regex = try? NSRegularExpression(pattern: "&(#[0-9]+|#[xX][0-9a-fA-F]+|[a-zA-Z]+);")
++        let ns = text as NSString
++        var out = ""
++        var last = 0
++        for match in regex?.matches(in: text, range: NSRange(location: 0, length: ns.length)) ?? [] {
++            out += ns.substring(with: NSRange(location: last, length: match.range.location - last))
++            let body = ns.substring(with: match.range(at: 1))
++            var decoded: String?
++            if body.hasPrefix("#x") || body.hasPrefix("#X") {
++                decoded = UInt32(body.dropFirst(2), radix: 16).flatMap(Unicode.Scalar.init).map { String($0) }
++            } else if body.hasPrefix("#") {
++                decoded = UInt32(body.dropFirst()).flatMap(Unicode.Scalar.init).map { String($0) }
++            } else {
++                decoded = namedEntities[body]
++            }
++            out += decoded ?? ns.substring(with: match.range)
++            last = match.range.location + match.range.length
++        }
++        return out + ns.substring(from: last)
++    }
+ 
+-    /// Load the initial entrypoint for the engine.
+-    /// NOTE: This is loaded via the custom scheme defined in `TranslationsSchemeHandler` to avoid
+-    /// any security errors or CORS errors when loading other assets or workers.
+-    private func loadEntrypointHTML() {
+-        let appURL = URL(string: "translations://app/TranslationsEngine.html")!
+-        webView.load(URLRequest(url: appURL))
++    static func escapeHTML(_ text: String) -> String {
++        return text.replacingOccurrences(of: "&", with: "&amp;")
++            .replacingOccurrences(of: "<", with: "&lt;")
++            .replacingOccurrences(of: ">", with: "&gt;")
+     }
+ }

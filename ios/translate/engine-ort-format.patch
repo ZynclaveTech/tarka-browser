@@ -1,0 +1,112 @@
+diff --git a/components/tark_captions/ort_runtime.cc b/components/tark_captions/ort_runtime.cc
+index a5fa932..8496640 100644
+--- a/components/tark_captions/ort_runtime.cc
++++ b/components/tark_captions/ort_runtime.cc
+@@ -2,6 +2,11 @@
+ // Use of this source code is governed by a BSD-style license that can be
+ // found in the LICENSE file.
+ 
++#include <fcntl.h>
++#include <sys/mman.h>
++#include <sys/stat.h>
++#include <unistd.h>
++
+ #include "components/tark_captions/ort_runtime.h"
+ 
+ #include <utility>
+@@ -82,6 +87,16 @@ std::unique_ptr<OrtModel> OrtRuntime::LoadModelFromMemory(base::span<const uint8
+ std::unique_ptr<OrtModel> OrtRuntime::LoadModel(const ModelSource& source,
+                                                 std::string_view name,
+                                                 int threads) {
++  // Tark for iOS: "<name>.ort" (ORT format, mapped) is used when the source
++  // has it, with or without "<name>.onnx".
++  if (name.ends_with(".onnx")) {
++    const std::string ort = std::string(name.substr(0, name.size() - 5)) + ".ort";
++    if (std::optional<base::FilePath> path = source.PathOf(ort)) {
++      if (std::unique_ptr<OrtModel> model = LoadMappedOrtModel(*path, threads)) {
++        return model;
++      }
++    }
++  }
+   if (std::optional<base::FilePath> path = source.PathOf(name)) {
+     return LoadModel(*path, threads);
+   }
+@@ -89,6 +104,42 @@ std::unique_ptr<OrtModel> OrtRuntime::LoadModel(const ModelSource& source,
+   return bytes ? LoadModelFromMemory(*bytes, threads) : nullptr;
+ }
+ 
++std::unique_ptr<OrtModel> OrtRuntime::LoadMappedOrtModel(const base::FilePath& ort, int threads) {
++  const int fd = open(ort.value().c_str(), O_RDONLY);
++  if (fd < 0) {
++    return nullptr;
++  }
++  struct stat st;
++  void* bytes = MAP_FAILED;
++  if (fstat(fd, &st) == 0 && st.st_size > 0) {
++    bytes = mmap(nullptr, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
++  }
++  if (close(fd) != 0 || bytes == MAP_FAILED) {
++    if (bytes != MAP_FAILED) {
++      munmap(bytes, st.st_size);
++    }
++    return nullptr;
++  }
++  const size_t size = static_cast<size_t>(st.st_size);
++  std::unique_ptr<OrtModel> model =
++      Load(threads, [&](OrtSessionOptions* options, OrtSession** session) {
++        OrtStatus* status =
++            api_->AddSessionConfigEntry(options, "session.use_ort_model_bytes_directly", "1");
++        if (!status) {
++          status = api_->AddSessionConfigEntry(options,
++                                               "session.use_ort_model_bytes_for_initializers", "1");
++        }
++        return status ? status : api_->CreateSessionFromArray(env_, bytes, size, options, session);
++      });
++  if (!model) {
++    munmap(bytes, size);
++    return nullptr;
++  }
++  model->mapping_ = bytes;
++  model->mapping_size_ = size;
++  return model;
++}
++
+ std::unique_ptr<OrtModel> OrtRuntime::Load(
+     int threads,
+     base::FunctionRef<OrtStatus*(OrtSessionOptions*, OrtSession**)> create) {
+@@ -112,6 +163,9 @@ OrtModel::OrtModel(const OrtApi* api, OrtSession* session) : api_(api), session_
+ 
+ OrtModel::~OrtModel() {
+   api_->ReleaseSession(session_.ExtractAsDangling());
++  if (mapping_) {
++    munmap(mapping_, mapping_size_);
++  }
+ }
+ 
+ bool OrtModel::Run(const std::vector<Tensor>& inputs,
+diff --git a/components/tark_captions/ort_runtime.h b/components/tark_captions/ort_runtime.h
+index ce06479..2623f86 100644
+--- a/components/tark_captions/ort_runtime.h
++++ b/components/tark_captions/ort_runtime.h
+@@ -59,6 +59,10 @@ class OrtRuntime {
+   // The model file `name` of `source`: by path when it has one, else from
+   // its bytes.
+   std::unique_ptr<OrtModel> LoadModel(const ModelSource& source, std::string_view name, int threads);
++  // Tark for iOS: an ORT-format model mapped from its file, its weights used
++  // in place (they stay file-backed and are not counted against the app, and
++  // loading makes no second copy). Null when the file is missing.
++  std::unique_ptr<OrtModel> LoadMappedOrtModel(const base::FilePath& ort, int threads);
+ 
+  private:
+   OrtRuntime(base::NativeLibrary library, const OrtApi* api, OrtEnv* env);
+@@ -93,6 +97,10 @@ class OrtModel {
+ 
+   raw_ptr<const OrtApi> api_;
+   raw_ptr<OrtSession> session_;
++  // The mapped file a mapped ORT model reads from; unmapped after the
++  // session is released.
++  void* mapping_ = nullptr;
++  size_t mapping_size_ = 0;
+ };
+ 
+ }  // namespace tark_captions

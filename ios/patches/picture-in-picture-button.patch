@@ -1,0 +1,220 @@
+diff --git a/BrowserKit/Sources/ToolbarKit/ToolbarButton.swift b/BrowserKit/Sources/ToolbarKit/ToolbarButton.swift
+index f49d94f..2904ab3 100644
+--- a/BrowserKit/Sources/ToolbarKit/ToolbarButton.swift
++++ b/BrowserKit/Sources/ToolbarKit/ToolbarButton.swift
+@@ -328,7 +328,9 @@ class ToolbarButton: UIButton,
+             return existingImage
+         }
+ 
+-        guard let iconName = element.iconName, let baseImage = UIImage(named: iconName) else {
++        // Tark: an SF Symbol name works too.
++        guard let iconName = element.iconName,
++              let baseImage = UIImage(named: iconName) ?? UIImage(systemName: iconName) else {
+             return nil
+         }
+         let image = element.templateModeForImage
+diff --git a/firefox-ios/Client/Frontend/Browser/Toolbars/AddressToolbarContainerLens.swift b/firefox-ios/Client/Frontend/Browser/Toolbars/AddressToolbarContainerLens.swift
+index f0879cc..4f66061 100644
+--- a/firefox-ios/Client/Frontend/Browser/Toolbars/AddressToolbarContainerLens.swift
++++ b/firefox-ios/Client/Frontend/Browser/Toolbars/AddressToolbarContainerLens.swift
+@@ -61,7 +61,8 @@ struct AddressToolbarContainerLens: StateLens {
+             isHomepage: addressToolbar.url == nil,
+             isLoading: addressToolbar.isLoading,
+             hasAlternativeLocationColor: hasAlternativeLocationColor,
+-            isNovaDesignEnabled: addressToolbar.isNovaDesignEnabled
++            isNovaDesignEnabled: addressToolbar.isNovaDesignEnabled,
++            tarkVideoPlaying: addressToolbar.tarkVideoPlaying
+         )
+ 
+         let trailingPageActions = TrailingPageActionsBuilder.getActions(
+diff --git a/firefox-ios/Client/Frontend/Browser/Toolbars/Redux/AddressBarState.swift b/firefox-ios/Client/Frontend/Browser/Toolbars/Redux/AddressBarState.swift
+index 8865740..6b60e90 100644
+--- a/firefox-ios/Client/Frontend/Browser/Toolbars/Redux/AddressBarState.swift
++++ b/firefox-ios/Client/Frontend/Browser/Toolbars/Redux/AddressBarState.swift
+@@ -31,6 +31,8 @@ struct AddressBarState: StateType, Sendable, Equatable {
+     /// Stores the alternative search engine that the user has temporarily selected (otherwise use the default)
+     let alternativeSearchEngine: SearchEngineModel?
+     let isNovaDesignEnabled: Bool
++    /// Tark: a video on the page is playing and Picture in Picture is on.
++    let tarkVideoPlaying: Bool
+ 
+     private static let cancelEditAction = ToolbarActionConfiguration(
+         actionType: .cancelEdit,
+@@ -106,7 +108,8 @@ struct AddressBarState: StateType, Sendable, Equatable {
+          didStartTyping: Bool,
+          isEmptySearch: Bool,
+          alternativeSearchEngine: SearchEngineModel?,
+-         isNovaDesignEnabled: Bool) {
++         isNovaDesignEnabled: Bool,
++         tarkVideoPlaying: Bool = false) {
+         self.windowUUID = windowUUID
+         self.editingAccessoryAction = editingAccessoryAction
+         self.borderPosition = borderPosition
+@@ -127,6 +130,7 @@ struct AddressBarState: StateType, Sendable, Equatable {
+         self.canSummarize = canSummarize
+         self.translationConfiguration = translationConfiguration
+         self.isNovaDesignEnabled = isNovaDesignEnabled
++        self.tarkVideoPlaying = tarkVideoPlaying
+     }
+ 
+     static let reducer: Reducer<Self> = (legacyReducer, modernReducer)
+@@ -169,8 +173,12 @@ struct AddressBarState: StateType, Sendable, Equatable {
+         case ToolbarActionType.websiteLoadingStateDidChange:
+             return handleWebsiteLoadingStateDidChangeAction(state: state, action: action)
+ 
++        case TarkVideoActionType.videoStateChanged:
++            guard let videoAction = action as? TarkVideoStateAction else { return defaultState(from: state) }
++            return state.copy(tarkVideoPlaying: videoAction.playing)
++
+         case ToolbarActionType.urlDidChange:
+-            return handleUrlDidChangeAction(state: state, action: action)
++            return handleUrlDidChangeAction(state: state, action: action).copy(tarkVideoPlaying: false)
+ 
+         case ToolbarActionType.lockIconChanged:
+             return handleLockIconChangedAction(state: state, action: action)
+@@ -540,7 +548,8 @@ struct AddressBarState: StateType, Sendable, Equatable {
+             didStartTyping: state.didStartTyping,
+             isEmptySearch: state.isEmptySearch,
+             alternativeSearchEngine: state.alternativeSearchEngine,
+-            isNovaDesignEnabled: state.isNovaDesignEnabled
++            isNovaDesignEnabled: state.isNovaDesignEnabled,
++            tarkVideoPlaying: state.tarkVideoPlaying
+         )
+     }
+ 
+@@ -550,3 +559,20 @@ struct AddressBarState: StateType, Sendable, Equatable {
+         return googleLensAction
+     }
+ }
++
++/// Tark: the selected tab's page started or stopped playing a video.
++struct TarkVideoStateAction: Action {
++    let windowUUID: WindowUUID
++    let actionType: ActionType
++    let playing: Bool
++
++    init(playing: Bool, windowUUID: WindowUUID) {
++        self.playing = playing
++        self.windowUUID = windowUUID
++        self.actionType = TarkVideoActionType.videoStateChanged
++    }
++}
++
++enum TarkVideoActionType: ActionType {
++    case videoStateChanged
++}
+diff --git a/firefox-ios/Client/Frontend/Browser/Toolbars/Redux/LeadingPageActionsBuilder.swift b/firefox-ios/Client/Frontend/Browser/Toolbars/Redux/LeadingPageActionsBuilder.swift
+index fc3cd68..500201d 100644
+--- a/firefox-ios/Client/Frontend/Browser/Toolbars/Redux/LeadingPageActionsBuilder.swift
++++ b/firefox-ios/Client/Frontend/Browser/Toolbars/Redux/LeadingPageActionsBuilder.swift
+@@ -15,7 +15,8 @@ enum LeadingPageActionsBuilder {
+                            isHomepage: Bool,
+                            isLoading: Bool?,
+                            hasAlternativeLocationColor: Bool,
+-                           isNovaDesignEnabled: Bool) -> [ToolbarActionConfiguration] {
++                           isNovaDesignEnabled: Bool,
++                           tarkVideoPlaying: Bool = false) -> [ToolbarActionConfiguration] {
+         var actions = [ToolbarActionConfiguration]()
+ 
+         // Whether the navigation toolbar is showing doesn't affect these actions — share/translate
+@@ -39,6 +40,17 @@ enum LeadingPageActionsBuilder {
+             actions.append(translationAction)
+         }
+ 
++        // Tark: Picture in Picture while a video plays (Settings → Browsing).
++        if tarkVideoPlaying {
++            actions.append(ToolbarActionConfiguration(
++                actionType: .tarkPictureInPicture,
++                iconName: "pip.enter",
++                isEnabled: true,
++                hasCustomColor: !hasAlternativeLocationColor,
++                a11yLabel: "Picture in Picture",
++                a11yId: "tark.toolbar.pictureInPicture"))
++        }
++
+         return actions
+     }
+ 
+diff --git a/firefox-ios/Client/Frontend/Browser/Toolbars/Redux/ToolbarActionConfiguration.swift b/firefox-ios/Client/Frontend/Browser/Toolbars/Redux/ToolbarActionConfiguration.swift
+index 8463737..4c3c3da 100644
+--- a/firefox-ios/Client/Frontend/Browser/Toolbars/Redux/ToolbarActionConfiguration.swift
++++ b/firefox-ios/Client/Frontend/Browser/Toolbars/Redux/ToolbarActionConfiguration.swift
+@@ -33,6 +33,8 @@ struct ToolbarActionConfiguration: Equatable {
+         case readerModeWithSummarizer
+         case summarizer
+         case translate
++        /// Tark: Picture in Picture for the page's playing video.
++        case tarkPictureInPicture
+         case cancelEdit
+     }
+ 
+@@ -71,7 +73,7 @@ struct ToolbarActionConfiguration: Equatable {
+             return !isShowingTopTabs
+         case .home, .search, .menu, .share, .stopLoading, .trackingProtection,
+              .locationView, .googleLens, .googleLensPhotoLibrary, .googleLensTakePhoto,
+-             .cancelEdit:
++             .cancelEdit, .tarkPictureInPicture:
+             return false
+         }
+     }
+diff --git a/firefox-ios/Client/Frontend/Browser/Toolbars/Redux/ToolbarMiddleware.swift b/firefox-ios/Client/Frontend/Browser/Toolbars/Redux/ToolbarMiddleware.swift
+index 87cc6d9..75801a2 100644
+--- a/firefox-ios/Client/Frontend/Browser/Toolbars/Redux/ToolbarMiddleware.swift
++++ b/firefox-ios/Client/Frontend/Browser/Toolbars/Redux/ToolbarMiddleware.swift
+@@ -225,6 +225,11 @@ final class ToolbarMiddleware {
+ 
+         switch gestureType {
+         case .tap:
++            // Tark: the address bar's Picture in Picture button.
++            if action.buttonType == .tarkPictureInPicture {
++                startPictureInPicture(windowUUID: action.windowUUID)
++                return
++            }
+             handleToolbarButtonTapActions(action: action, state: state)
+         case .longPress:
+             handleToolbarButtonLongPressActions(action: action, state: state)
+@@ -367,6 +372,12 @@ final class ToolbarMiddleware {
+         }
+     }
+ 
++    /// Tark: the address bar's Picture in Picture button.
++    private func startPictureInPicture(windowUUID: WindowUUID) {
++        guard let webView = windowManager.tabManager(for: windowUUID)?.selectedTab?.webView else { return }
++        BackgroundAudioHelper.startPictureInPicture(in: webView)
++    }
++
+     private func handleToolbarButtonLongPressActions(action: ToolbarMiddlewareAction, state: AppState) {
+         guard let toolbarState = state.componentState(ToolbarState.self, for: .toolbar, window: action.windowUUID)
+         else { return }
+diff --git a/firefox-ios/Client/Frontend/Browser/Toolbars/Redux/ToolbarState.swift b/firefox-ios/Client/Frontend/Browser/Toolbars/Redux/ToolbarState.swift
+index 19a85de..b0577a0 100644
+--- a/firefox-ios/Client/Frontend/Browser/Toolbars/Redux/ToolbarState.swift
++++ b/firefox-ios/Client/Frontend/Browser/Toolbars/Redux/ToolbarState.swift
+@@ -238,6 +238,11 @@ struct ToolbarState: ScreenState, Sendable {
+             SearchEngineSelectionMiddlewareActionType.didClearAlternativeSearchEngine:
+             return handleSearchEngineSelectionAction(state: state, action: action)
+ 
++        // Tark: the address bar's Picture in Picture button.
++        case TarkVideoActionType.videoStateChanged:
++            return defaultState(from: state)
++                .copy(addressToolbar: AddressBarState.reducer.legacyReducer(state.addressToolbar, action))
++
+         default:
+             return defaultState(from: state)
+         }
+diff --git a/firefox-ios/Client/Frontend/TabContentsScripts/BackgroundAudioHelper.swift b/firefox-ios/Client/Frontend/TabContentsScripts/BackgroundAudioHelper.swift
+index 50c6338..474c0a6 100644
+--- a/firefox-ios/Client/Frontend/TabContentsScripts/BackgroundAudioHelper.swift
++++ b/firefox-ios/Client/Frontend/TabContentsScripts/BackgroundAudioHelper.swift
+@@ -234,5 +234,11 @@ final class TarkVideoStateHelper: TabContentScript {
+                                didReceiveScriptMessage message: WKScriptMessage) {
+         guard let body = message.body as? [String: Any], let playing = body["playing"] as? Bool else { return }
+         tab?.tarkHasPlayingVideo = playing
++        // The address bar's PiP button, for the tab on screen.
++        let windowManager: WindowManager = AppContainer.shared.resolve()
++        guard let tab, windowManager.tabManager(for: tab.windowUUID)?.selectedTab === tab else { return }
++        store.dispatch(TarkVideoStateAction(
++            playing: playing && BackgroundAudioHelper.isPictureInPictureEnabled(tab.profile.prefs),
++            windowUUID: tab.windowUUID))
+     }
+ }

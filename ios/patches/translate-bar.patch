@@ -1,0 +1,244 @@
+diff --git a/firefox-ios/Client/Frontend/Browser/BrowserViewController/Views/BrowserViewController.swift b/firefox-ios/Client/Frontend/Browser/BrowserViewController/Views/BrowserViewController.swift
+index 655d46f..fb3977b 100644
+--- a/firefox-ios/Client/Frontend/Browser/BrowserViewController/Views/BrowserViewController.swift
++++ b/firefox-ios/Client/Frontend/Browser/BrowserViewController/Views/BrowserViewController.swift
+@@ -112,6 +112,8 @@ class BrowserViewController: UIViewController,
+     var tabSwipeGestureHandler: TabSwipeGestureHandler?
+     var microsurvey: MicrosurveyPromptView?
+     var autoTranslatePrompt: AutoTranslatePromptView?
++    /// Tark: "Hindi → English · Show original" under a translated page.
++    private lazy var tarkTranslationBar = TarkTranslationBar(windowUUID: windowUUID)
+     // TODO: FXIOS-14347 Remove this property as part of cleaning up the toolbar performance
+     var keyboardBackdrop: UIView?
+     var pendingToast: Toast? // A toast that might be waiting for BVC to appear before displaying
+@@ -605,6 +607,7 @@ class BrowserViewController: UIViewController,
+         updateHeaderConstraints()
+         addressToolbarContainer.updateConstraints()
+         updateMicrosurveyConstraints()
++        updateTarkTranslationBarPosition()
+         updateAutoTranslatePromptConstraints()
+         updateToolbarDisplay()
+         addOrUpdateMaskViewIfNeeded()
+@@ -2053,6 +2056,18 @@ class BrowserViewController: UIViewController,
+         autoTranslatePrompt = nil
+     }
+ 
++    /// Tark: the bar sits where Firefox's auto-translate prompt does, under
++    /// it; it hides itself unless the page is translated.
++    private func updateTarkTranslationBarPosition() {
++        tarkTranslationBar.removeFromSuperview()
++        if isBottomSearchBar {
++            overKeyboardContainer.addArrangedViewToTop(tarkTranslationBar, animated: false, completion: nil)
++        } else {
++            bottomContainer.addArrangedViewToTop(tarkTranslationBar, animated: false, completion: nil)
++        }
++        tarkTranslationBar.applyTheme(theme: themeManager.getCurrentTheme(for: windowUUID))
++    }
++
+     private func updateAutoTranslatePromptConstraints() {
+         guard let prompt = autoTranslatePrompt else { return }
+         prompt.removeFromSuperview()
+@@ -3898,6 +3913,7 @@ class BrowserViewController: UIViewController,
+         let currentTheme = currentTheme()
+         statusBarOverlay.hasTopTabs = toolbarHelper.shouldShowTopTabs(for: traitCollection)
+         statusBarOverlay.applyTheme(theme: currentTheme)
++        tarkTranslationBar.applyTheme(theme: currentTheme)
+ 
+         // to make sure on homepage with bottom search bar the status bar is hidden
+         // we have to adjust the background color to match the homepage background color
+diff --git a/firefox-ios/Client/Frontend/Translations/AutoTranslatePromptView.swift b/firefox-ios/Client/Frontend/Translations/AutoTranslatePromptView.swift
+index 7dbc6b6..8162de4 100644
+--- a/firefox-ios/Client/Frontend/Translations/AutoTranslatePromptView.swift
++++ b/firefox-ios/Client/Frontend/Translations/AutoTranslatePromptView.swift
+@@ -167,3 +167,161 @@ final class AutoTranslatePromptView: UIView, AlphaDimmable, ThemeApplicable, Not
+         closeButton.tintColor = theme.colors.textSecondary
+     }
+ }
++
++/// Tark: the bar under a translated page — "Hindi → [English ▾] · Show
++/// original". The chip picks another language (Firefox's language switch
++/// re-translates from the original); Show original is the Translate button's
++/// own restore. It watches the toolbar's translation state, so it shows only
++/// while the page is translated.
++final class TarkTranslationBar: UIView, AlphaDimmable, ThemeApplicable, StoreSubscriber {
++    typealias SubscriberStateType = ToolbarState
++
++    private struct UX {
++        static let borderThickness: CGFloat = 1.0
++        static let verticalPadding: CGFloat = 8
++        static let horizontalPadding: CGFloat = 16
++        static let spacing: CGFloat = 8
++    }
++
++    private let windowUUID: WindowUUID
++    private var source: String?
++    private var target: String?
++    private var theme: Theme?
++
++    private var topBorderView: UIView = .build()
++
++    private let sourceLabel: UILabel = .build { label in
++        label.adjustsFontForContentSizeCategory = true
++        label.font = FXFontStyles.Regular.body.scaledFont()
++        label.setContentCompressionResistancePriority(.defaultHigh, for: .horizontal)
++    }
++
++    private lazy var targetChip: UIButton = .build { button in
++        var configuration = UIButton.Configuration.tinted()
++        configuration.cornerStyle = .capsule
++        configuration.image = UIImage(systemName: "chevron.down",
++                                      withConfiguration: UIImage.SymbolConfiguration(scale: .small))
++        configuration.imagePlacement = .trailing
++        configuration.imagePadding = 4
++        configuration.contentInsets = NSDirectionalEdgeInsets(top: 4, leading: 12, bottom: 4, trailing: 10)
++        button.configuration = configuration
++        button.showsMenuAsPrimaryAction = true
++        button.accessibilityHint = "Chooses the language to translate into"
++    }
++
++    private lazy var showOriginalButton: UIButton = .build { button in
++        button.titleLabel?.adjustsFontForContentSizeCategory = true
++        button.titleLabel?.font = FXFontStyles.Regular.body.scaledFont()
++        button.setTitle("Show original", for: .normal)
++        button.addTarget(self, action: #selector(self.didTapShowOriginal), for: .touchUpInside)
++        button.setContentCompressionResistancePriority(.required, for: .horizontal)
++    }
++
++    private lazy var row: UIStackView = .build { stack in
++        stack.axis = .horizontal
++        stack.alignment = .center
++        stack.spacing = UX.spacing
++    }
++
++    init(windowUUID: WindowUUID) {
++        self.windowUUID = windowUUID
++        super.init(frame: .zero)
++        isHidden = true
++        let spacer = UIView()
++        spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
++        [sourceLabel, targetChip, spacer, showOriginalButton].forEach(row.addArrangedSubview)
++        addSubview(topBorderView)
++        addSubview(row)
++        NSLayoutConstraint.activate([
++            topBorderView.leadingAnchor.constraint(equalTo: leadingAnchor),
++            topBorderView.trailingAnchor.constraint(equalTo: trailingAnchor),
++            topBorderView.topAnchor.constraint(equalTo: topAnchor),
++            topBorderView.heightAnchor.constraint(equalToConstant: UX.borderThickness),
++            row.topAnchor.constraint(equalTo: topBorderView.bottomAnchor, constant: UX.verticalPadding),
++            row.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -UX.verticalPadding),
++            row.leadingAnchor.constraint(equalTo: safeAreaLayoutGuide.leadingAnchor,
++                                         constant: UX.horizontalPadding),
++            row.trailingAnchor.constraint(equalTo: safeAreaLayoutGuide.trailingAnchor,
++                                          constant: -UX.horizontalPadding),
++        ])
++        subscribeToRedux()
++    }
++
++    func subscribeToRedux() {
++        let windowUUID = windowUUID
++        store.subscribe(self, transform: {
++            $0.select { appState in ToolbarState(appState: appState, uuid: windowUUID) }
++        })
++    }
++
++    required init?(coder: NSCoder) {
++        fatalError("init(coder:) has not been implemented")
++    }
++
++    deinit {
++        // As NavigationToolbarContainer: the store holds subscribers weakly,
++        // so off the main thread there is nothing to clean up safely.
++        guard Thread.isMainThread else { return }
++        MainActor.assumeIsolated { store.unsubscribe(self) }
++    }
++
++    func newState(state: ToolbarState) {
++        let configuration = state.addressToolbar.translationConfiguration
++        guard configuration?.state == .active,
++              let source = configuration?.sourceLanguage,
++              let target = configuration?.translatedToLanguage else {
++            isHidden = true
++            return
++        }
++        isHidden = false
++        guard source != self.source || target != self.target else { return }
++        self.source = source
++        self.target = target
++        sourceLabel.text = "\(Self.name(source)) →"
++        targetChip.configuration?.title = Self.name(target)
++        targetChip.accessibilityLabel = "Translated into \(Self.name(target))"
++        targetChip.menu = UIMenu(children: TarkTranslationModelsFetcher.languages
++            .filter { $0 != source }
++            .map { code in
++                UIAction(title: Self.name(code), state: code == target ? .on : .off) { [weak self] _ in
++                    guard let self, code != self.target else { return }
++                    store.dispatch(TranslationLanguageSelectedAction(
++                        windowUUID: self.windowUUID,
++                        targetLanguage: code,
++                        actionType: TranslationsActionType.didSelectTargetLanguage
++                    ))
++                }
++            })
++    }
++
++    @objc
++    private func didTapShowOriginal() {
++        store.dispatch(ToolbarMiddlewareAction(
++            buttonType: .translate,
++            gestureType: .tap,
++            windowUUID: windowUUID,
++            actionType: ToolbarMiddlewareActionType.didTapButton
++        ))
++    }
++
++    private static func name(_ code: String) -> String {
++        return Locale.current.localizedString(forLanguageCode: code) ?? code
++    }
++
++    // MARK: - AlphaDimmable
++
++    func updateAlphaForSubviews(_ alpha: CGFloat) {
++        self.alpha = alpha
++    }
++
++    // MARK: - ThemeApplicable
++
++    func applyTheme(theme: Theme) {
++        backgroundColor = theme.colors.layer1
++        topBorderView.backgroundColor = theme.colors.borderPrimary
++        sourceLabel.textColor = theme.colors.textPrimary
++        targetChip.tintColor = theme.colors.actionPrimary
++        targetChip.configuration?.baseForegroundColor = theme.colors.textAccent
++        showOriginalButton.setTitleColor(theme.colors.textAccent, for: .normal)
++    }
++}
+diff --git a/firefox-ios/Client/Frontend/Translations/Engine/TranslationsEngine.swift b/firefox-ios/Client/Frontend/Translations/Engine/TranslationsEngine.swift
+index e0df37d..20ab550 100644
+--- a/firefox-ios/Client/Frontend/Translations/Engine/TranslationsEngine.swift
++++ b/firefox-ios/Client/Frontend/Translations/Engine/TranslationsEngine.swift
+@@ -105,7 +105,9 @@ final class TarkEngineEndpoint: BridgeEndpoint {
+             reset()
+             TarkPageTranslator.shared.unload()
+         case "TranslationsPort:GetEngineStatusRequest":
+-            let ready = directions().allSatisfy { TarkTranslateModels.shared.isReady($0) }
++            let ready = TarkTranslateModels.directions(from: from, to: to).allSatisfy {
++                TarkTranslateModels.shared.isReady($0)
++            }
+             reply(["type": "TranslationsPort:GetEngineStatusResponse",
+                    "status": ready ? "ready" : "error",
+                    "error": ready ? NSNull() : "models not on this phone"])
+@@ -135,14 +137,6 @@ final class TarkEngineEndpoint: BridgeEndpoint {
+         queue.removeAll()
+     }
+ 
+-    /// The models this pair goes through.
+-    private func directions() -> [TarkTranslateModels.Direction] {
+-        var directions: [TarkTranslateModels.Direction] = []
+-        if from != "en" { directions.append(.indicToEnglish) }
+-        if to != "en" { directions.append(.englishToIndic) }
+-        return directions
+-    }
+-
+     private func translateNextBatch() {
+         guard !isTranslating, !queue.isEmpty else { return }
+         isTranslating = true

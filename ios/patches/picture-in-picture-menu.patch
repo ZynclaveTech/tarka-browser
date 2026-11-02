@@ -1,0 +1,239 @@
+diff --git a/BrowserKit/Sources/MenuKit/MenuCell.swift b/BrowserKit/Sources/MenuKit/MenuCell.swift
+index e075ccf..3d7985f 100644
+--- a/BrowserKit/Sources/MenuKit/MenuCell.swift
++++ b/BrowserKit/Sources/MenuKit/MenuCell.swift
+@@ -88,7 +88,8 @@ final class MenuCell: UITableViewCell, ReusableCell, ThemeApplicable {
+         self.titleLabel.text = model.title
+         self.descriptionLabel.text = model.description
+         self.contentStackView.spacing = model.description != nil ? UX.contentSpacing : UX.noDescriptionContentSpacing
+-        self.iconImageView.image = UIImage(named: model.iconName)?
++        // Tark: an SF Symbol name works too (no asset for every Tark item).
++        self.iconImageView.image = (UIImage(named: model.iconName) ?? UIImage(systemName: model.iconName))?
+             .withRenderingMode(.alwaysTemplate)
+             .imageFlippedForRightToLeftLayoutDirection()
+         self.isAccessibilityElement = true
+diff --git a/firefox-ios/Client/Frontend/Browser/BrowserViewController/Views/BrowserViewController.swift b/firefox-ios/Client/Frontend/Browser/BrowserViewController/Views/BrowserViewController.swift
+index fb3977b..de7c18d 100644
+--- a/firefox-ios/Client/Frontend/Browser/BrowserViewController/Views/BrowserViewController.swift
++++ b/firefox-ios/Client/Frontend/Browser/BrowserViewController/Views/BrowserViewController.swift
+@@ -4301,6 +4301,8 @@ extension BrowserViewController: LegacyTabDelegate {
+         readerMode.delegate = self
+         tab.addContentScript(readerMode, name: ReaderMode.name())
+ 
++        tab.addContentScript(TarkVideoStateHelper(tab: tab), name: TarkVideoStateHelper.name())
++
+         let logins = LoginsHelper(
+             tab: tab,
+             profile: profile,
+diff --git a/firefox-ios/Client/Frontend/Browser/MainMenu/MainMenuConfigurationUtility.swift b/firefox-ios/Client/Frontend/Browser/MainMenu/MainMenuConfigurationUtility.swift
+index 336a564..9873426 100644
+--- a/firefox-ios/Client/Frontend/Browser/MainMenu/MainMenuConfigurationUtility.swift
++++ b/firefox-ios/Client/Frontend/Browser/MainMenu/MainMenuConfigurationUtility.swift
+@@ -212,6 +212,18 @@ struct MainMenuConfigurationUtility: Equatable, FeatureFlaggable {
+             options.append(configureUserAgentItem(with: uuid, tabInfo: tabInfo))
+             options.append(configureReaderViewItem(with: uuid, tabInfo: tabInfo))
+         }
++        if tabInfo.offersPictureInPicture {
++            // Tark: starts while Tark is on screen, so iOS opens the window.
++            options.insert(tarkItem("Picture in Picture", icon: "pip.enter",
++                                    a11yId: "tark.menu.pictureInPicture", uuid: uuid, tabInfo: tabInfo,
++                                    perform: {
++                                        let windowManager: WindowManager = AppContainer.shared.resolve()
++                                        guard let webView = windowManager.tabManager(for: uuid)?.selectedTab?.webView
++                                        else { return }
++                                        BackgroundAudioHelper.startPictureInPicture(in: webView)
++                                    }),
++                           at: 0)
++        }
+         return MenuSection(isHomepage: tabInfo.isHomepage, options: options)
+     }
+ 
+diff --git a/firefox-ios/Client/Frontend/Browser/MainMenu/Redux/MainMenuState.swift b/firefox-ios/Client/Frontend/Browser/MainMenu/Redux/MainMenuState.swift
+index 2c4c7e0..5e6fe94 100644
+--- a/firefox-ios/Client/Frontend/Browser/MainMenu/Redux/MainMenuState.swift
++++ b/firefox-ios/Client/Frontend/Browser/MainMenu/Redux/MainMenuState.swift
+@@ -79,6 +79,8 @@ struct MainMenuTabInfo: Equatable {
+     let translationConfiguration: TranslationConfiguration?
+     /// Tark: the menu's page row shows on the new tab too when forward is possible.
+     var canGoForward = false
++    /// Tark: a video is playing and Picture in Picture is on in Settings.
++    var offersPictureInPicture = false
+ }
+ 
+ @Copyable
+diff --git a/firefox-ios/Client/Frontend/Browser/Tabs/Middleware/TabManagerMiddleware.swift b/firefox-ios/Client/Frontend/Browser/Tabs/Middleware/TabManagerMiddleware.swift
+index 6ff0676..e756ef9 100644
+--- a/firefox-ios/Client/Frontend/Browser/Tabs/Middleware/TabManagerMiddleware.swift
++++ b/firefox-ios/Client/Frontend/Browser/Tabs/Middleware/TabManagerMiddleware.swift
+@@ -837,7 +837,9 @@ final class TabManagerMiddleware: FeatureFlaggable, CanRemoveQuickActionBookmark
+                     isPinned: info.isPinned,
+                     accountData: accountData,
+                     translationConfiguration: translationConfig,
+-                    canGoForward: selectedTab.canGoForward
++                    canGoForward: selectedTab.canGoForward,
++                    offersPictureInPicture: selectedTab.tarkHasPlayingVideo
++                        && BackgroundAudioHelper.isPictureInPictureEnabled(profile.prefs)
+                 )
+             )
+         )
+diff --git a/firefox-ios/Client/Frontend/Settings/Main/General/BackgroundAudioSetting.swift b/firefox-ios/Client/Frontend/Settings/Main/General/BackgroundAudioSetting.swift
+index 6dcf38b..a8a58fc 100644
+--- a/firefox-ios/Client/Frontend/Settings/Main/General/BackgroundAudioSetting.swift
++++ b/firefox-ios/Client/Frontend/Settings/Main/General/BackgroundAudioSetting.swift
+@@ -36,7 +36,7 @@ class PictureInPictureSetting: BoolSetting {
+             defaultValue: true,
+             attributedTitleText: NSAttributedString(string: "Picture in Picture"),
+             attributedStatusText: NSAttributedString(
+-                string: "A playing video keeps going in a small window when you leave Tark."),
++                string: "While a video plays, Tark's menu offers Picture in Picture."),
+             settingDidChange: { isEnabled in
+                 Task { @MainActor in
+                     BackgroundAudioHelper.shared.togglePictureInPicture(isEnabled: isEnabled, prefs: prefs)
+diff --git a/firefox-ios/Client/Frontend/TabContentsScripts/BackgroundAudioHelper.swift b/firefox-ios/Client/Frontend/TabContentsScripts/BackgroundAudioHelper.swift
+index 66fef22..75be33c 100644
+--- a/firefox-ios/Client/Frontend/TabContentsScripts/BackgroundAudioHelper.swift
++++ b/firefox-ios/Client/Frontend/TabContentsScripts/BackgroundAudioHelper.swift
+@@ -33,21 +33,26 @@ class BackgroundAudioHelper: Notifiable {
+         });
+         """
+ 
+-    /// Tark: a video playing when Tark leaves the screen goes into Picture in
+-    /// Picture (sites like YouTube play inline and offer no PiP of their own).
+-    /// If WebKit declines, the sound carries on as background audio.
++    /// Tark: the page's playing video (else its largest) into Picture in
++    /// Picture. iOS opens the window only while Tark is on screen, so this
++    /// runs from a tap (the menu, the address bar), not on leaving the app.
+     private static let pictureInPictureJS = """
+         (() => {
+-          const video = [...document.querySelectorAll('video')].find(v =>
+-            !v.paused && !v.ended && v.readyState > 2 && v.videoWidth > 0);
++          const videos = [...document.querySelectorAll('video')].filter(v => v.readyState > 0);
++          const video = videos.find(v => !v.paused && !v.ended)
++            || videos.sort((a, b) => b.clientWidth * b.clientHeight - a.clientWidth * a.clientHeight)[0];
+           if (video && video.webkitSupportsPresentationMode
+-              && video.webkitSupportsPresentationMode('picture-in-picture')
+-              && video.webkitPresentationMode === 'inline') {
++              && video.webkitSupportsPresentationMode('picture-in-picture')) {
+             video.webkitSetPresentationMode('picture-in-picture');
+           }
+         })();
+         """
+ 
++    /// Tark: puts `webView`'s video into Picture in Picture.
++    static func startPictureInPicture(in webView: WKWebView) {
++        webView.evaluateJavaScript(pictureInPictureJS)
++    }
++
+     private static let resumeTaggedMediaJS = """
+         document.querySelectorAll('[data-was-playing="true"]').forEach(el => {
+             el.play();
+@@ -78,7 +83,8 @@ class BackgroundAudioHelper: Notifiable {
+         return prefs.boolForKey(PrefsKeys.BackgroundAudio) ?? defaultOn
+     }
+ 
+-    /// Tark: Settings → Browsing → Picture in Picture, on until turned off.
++    /// Tark: Settings → Browsing → Picture in Picture (the menu item and the
++    /// address bar button while a video plays), on until turned off.
+     static let pictureInPictureKey = "tark.pictureInPicture"
+ 
+     static func isPictureInPictureEnabled(_ prefs: Prefs) -> Bool {
+@@ -100,10 +106,9 @@ class BackgroundAudioHelper: Notifiable {
+         configure(prefs: prefs)
+     }
+ 
+-    /// Listens while background audio or Picture in Picture is on.
+     private func updateObserving() {
+         guard let prefs else { return }
+-        if Self.isEnabled(prefs) || Self.isPictureInPictureEnabled(prefs) {
++        if Self.isEnabled(prefs) {
+             startObserving()
+         } else {
+             stopObserving()
+@@ -152,9 +157,6 @@ class BackgroundAudioHelper: Notifiable {
+             if Self.isEnabled(prefs) {
+                 webView.evaluateJavaScript(Self.tagPlayingMediaJS)
+             }
+-            if Self.isPictureInPictureEnabled(prefs) {
+-                webView.evaluateJavaScript(Self.pictureInPictureJS)
+-            }
+         }
+     }
+ 
+@@ -179,3 +181,49 @@ class BackgroundAudioHelper: Notifiable {
+         return windowManager.allWindowTabManagers().compactMap { $0.selectedTab?.webView }
+     }
+ }
++
++/// Tark: tells the tab whether a video on its page is playing (for the
++/// Picture in Picture menu item and address bar button). Main frame only.
++@MainActor
++final class TarkVideoStateHelper: TabContentScript {
++    static let handlerName = "tarkVideoState"
++
++    private static let script = """
++        (() => {
++          if (window.__tarkVideoState) { return; }
++          window.__tarkVideoState = true;
++          let last = null;
++          const post = playing => {
++            if (playing === last) { return; }
++            last = playing;
++            window.webkit.messageHandlers.tarkVideoState.postMessage({ playing });
++          };
++          const report = () => post([...document.querySelectorAll('video')]
++            .some(v => !v.paused && !v.ended && v.readyState > 2));
++          ['play', 'playing', 'pause', 'ended', 'emptied'].forEach(type =>
++            document.addEventListener(type, () => setTimeout(report, 0), true));
++          window.addEventListener('pagehide', () => post(false));
++        })();
++        """
++
++    /// Added with the other page scripts (UserScriptManager), which are
++    /// cleared and re-added together.
++    static let userScript = WKUserScript(
++        source: script, injectionTime: .atDocumentEnd, forMainFrameOnly: true, in: .defaultClient)
++
++    private weak var tab: Tab?
++
++    init(tab: Tab) {
++        self.tab = tab
++    }
++
++    static func name() -> String { return "TarkVideoState" }
++
++    func scriptMessageHandlerNames() -> [String]? { return [Self.handlerName] }
++
++    func userContentController(_ userContentController: WKUserContentController,
++                               didReceiveScriptMessage message: WKScriptMessage) {
++        guard let body = message.body as? [String: Any], let playing = body["playing"] as? Bool else { return }
++        tab?.tarkHasPlayingVideo = playing
++    }
++}
+diff --git a/firefox-ios/Client/Frontend/TabContentsScripts/UserScriptManager.swift b/firefox-ios/Client/Frontend/TabContentsScripts/UserScriptManager.swift
+index c2fd08d..fa557ec 100644
+--- a/firefox-ios/Client/Frontend/TabContentsScripts/UserScriptManager.swift
++++ b/firefox-ios/Client/Frontend/TabContentsScripts/UserScriptManager.swift
+@@ -117,6 +117,8 @@ class UserScriptManager {
+         webView?.configuration.userContentController.removeAllUserScripts()
+         // Tark: element hiding and scriptlets (TarkCosmeticFilter).
+         webView?.configuration.userContentController.addUserScript(TarkCosmeticFilter.userScript)
++        // Tark: whether a video is playing (Picture in Picture controls).
++        webView?.configuration.userContentController.addUserScript(TarkVideoStateHelper.userScript)
+ 
+         // Inject all pre-compiled user scripts.
+         [(WKUserScriptInjectionTime.atDocumentStart, mainFrameOnly: false),
+diff --git a/firefox-ios/Client/TabManagement/Tab.swift b/firefox-ios/Client/TabManagement/Tab.swift
+index d469968..f9e9b5e 100644
+--- a/firefox-ios/Client/TabManagement/Tab.swift
++++ b/firefox-ios/Client/TabManagement/Tab.swift
+@@ -435,6 +435,10 @@ class Tab: NSObject,
+     }
+ 
+     /// The reader mode state for the tab. The value could be nil when ReaderMode is not supported for the page.
++    /// Tark: a video on the page is playing (TarkVideoStateHelper); the
++    /// menu and the address bar offer Picture in Picture while it is.
++    var tarkHasPlayingVideo = false
++
+     var readerModeState: ReaderModeState? {
+         if mimeType == MIMEType.HTML,
+            let readerMode = self.getContentScript(name: "ReaderMode") as? ReaderMode {
