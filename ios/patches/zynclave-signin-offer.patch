@@ -1,0 +1,141 @@
+diff --git a/BrowserKit/Sources/TarkAccount/TarkAccountOffer.swift b/BrowserKit/Sources/TarkAccount/TarkAccountOffer.swift
+new file mode 100644
+index 0000000..02fa934
+--- /dev/null
++++ b/BrowserKit/Sources/TarkAccount/TarkAccountOffer.swift
+@@ -0,0 +1,76 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++import CryptoKit
++import Foundation
++import WebKit
++
++/// "Sign in to Tark as X?": after the person signs in to Zynclave on its
++/// website in a normal tab, Tark offers to use the same account, once. It
++/// never signs in by itself, never looks in Private tabs, and never reads
++/// cookies: it asks Zynclave's own session endpoint from the page, in Tark's
++/// content world (the page's scripts can't see or change the call).
++@MainActor
++public enum TarkAccountOffer {
++    /// Who the Zynclave web session in the tab belongs to.
++    public struct WebIdentity: Sendable {
++        /// Kratos' identity id; only its hash is ever stored.
++        public let id: String
++        /// For the prompt's text only.
++        public let displayName: String?
++    }
++
++    private static let declinedKey = "TarkAccountDeclinedOffers"
++    /// Asked about already while Tark runs (declined or not): ask once.
++    private static var askedThisRun: Set<String> = []
++
++    /// The web identity to offer, or nil: not Zynclave's accounts site, a
++    /// Private tab, already signed in, a sign-in running, no web session, or
++    /// this account was offered before.
++    public static func identityToOffer(in webView: WKWebView,
++                                       isPrivate: Bool,
++                                       signInRunning: Bool) async -> WebIdentity? {
++        let account = TarkAccount.shared
++        guard !isPrivate, !signInRunning, !account.isSignedIn,
++              let url = webView.url, url.scheme == "https",
++              url.host?.lowercased() == account.config.accountsHost else { return nil }
++        let script = """
++            const response = await fetch('/sessions/whoami', {
++                credentials: 'include', headers: { Accept: 'application/json' } });
++            if (response.status !== 200) { return null; }
++            const session = await response.json();
++            const identity = session && session.identity;
++            if (!identity || !identity.id) { return null; }
++            const traits = identity.traits || {};
++            let name = traits.name;
++            if (name && typeof name === 'object') {
++                name = [name.first, name.last].filter(Boolean).join(' ');
++            }
++            return { id: identity.id, name: name || traits.email || '' };
++            """
++        guard let result = try? await webView.callAsyncJavaScript(script, contentWorld: .defaultClient)
++                as? [String: Any],
++              let id = result["id"] as? String, !id.isEmpty else { return nil }
++        let hash = hashed(id)
++        guard !askedThisRun.contains(hash), !declined.contains(hash), !account.isSignedIn else { return nil }
++        askedThisRun.insert(hash)
++        let name = (result["name"] as? String).flatMap { $0.isEmpty ? nil : $0 }
++        return WebIdentity(id: id, displayName: name)
++    }
++
++    /// "No thanks": never offer this account again.
++    public static func decline(_ identity: WebIdentity) {
++        var list = declined
++        list.insert(hashed(identity.id))
++        UserDefaults.standard.set(Array(list), forKey: declinedKey)
++    }
++
++    private static var declined: Set<String> {
++        Set(UserDefaults.standard.stringArray(forKey: declinedKey) ?? [])
++    }
++
++    private static func hashed(_ id: String) -> String {
++        SHA256.hash(data: Data(id.utf8)).map { String(format: "%02x", $0) }.joined()
++    }
++}
+diff --git a/firefox-ios/Client/Frontend/Browser/BrowserViewController/Extensions/BrowserViewController+WebViewDelegates.swift b/firefox-ios/Client/Frontend/Browser/BrowserViewController/Extensions/BrowserViewController+WebViewDelegates.swift
+index 8422513..98ee7fe 100644
+--- a/firefox-ios/Client/Frontend/Browser/BrowserViewController/Extensions/BrowserViewController+WebViewDelegates.swift
++++ b/firefox-ios/Client/Frontend/Browser/BrowserViewController/Extensions/BrowserViewController+WebViewDelegates.swift
+@@ -1398,6 +1398,9 @@ extension BrowserViewController: WKNavigationDelegate {
+         scrollController.configureRefreshControl()
+         navigationHandler?.removeDocumentLoading()
+ 
++        // Tark: "Sign in to Tark as X?" after signing in on Zynclave's site.
++        if let tab = tabManager[webView] { offerTarkSignIn(after: webView, in: tab) }
++
+         if let tab = tabManager[webView] {
+             if tab == tabManager.selectedTab {
+                 screenshotHelper.takeScreenshot(
+@@ -1727,6 +1730,44 @@ extension BrowserViewController {
+         }
+     }
+ 
++    /// Offers once to sign Tark in with the Zynclave account just signed in
++    /// on its website in this normal tab (see `TarkAccountOffer`). Sign in
++    /// asks Zynclave without a page (`prompt=none`); if it wants one after
++    /// all, it runs again with the page, which offers "Continue as …".
++    func offerTarkSignIn(after webView: WKWebView, in tab: Tab) {
++        let isPrivate = tab.isPrivate
++        let signInRunning = TarkSignInTab.tab != nil
++        Task { @MainActor [weak self] in
++            guard let identity = await TarkAccountOffer.identityToOffer(
++                in: webView, isPrivate: isPrivate, signInRunning: signInRunning),
++                  let self, self.presentedViewController == nil,
++                  self.tabManager.selectedTab === tab else { return }
++            let name = identity.displayName ?? "your Zynclave account"
++            let alert = UIAlertController(
++                title: "Sign in to Tark as \(name)?",
++                message: "You're signed in to Zynclave on this site. Tark can use the same account. "
++                    + "Your browsing stays on this phone.",
++                preferredStyle: .alert)
++            alert.addAction(UIAlertAction(title: "No thanks", style: .cancel) { _ in
++                TarkAccountOffer.decline(identity)
++            })
++            alert.addAction(UIAlertAction(title: "Sign in", style: .default) { [weak self] _ in
++                Task { @MainActor in
++                    do {
++                        try await self?.startTarkSignIn(prompt: "none")
++                    } catch TarkAccount.SignInError.cancelled {
++                        // Closed the tab.
++                    } catch {
++                        // login_required, consent_required and the like:
++                        // once more, with the page.
++                        try? await self?.startTarkSignIn()
++                    }
++                }
++            })
++            self.present(alert, animated: true)
++        }
++    }
++
+     /// The person closed the sign-in tab before finishing.
+     func tarkSignInTabRemoved(_ tab: Tab) {
+         guard tab === TarkSignInTab.tab else { return }
