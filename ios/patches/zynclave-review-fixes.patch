@@ -1,0 +1,182 @@
+diff --git a/BrowserKit/Sources/TarkAccount/TarkAccount.swift b/BrowserKit/Sources/TarkAccount/TarkAccount.swift
+index c69994f..58d52f2 100644
+--- a/BrowserKit/Sources/TarkAccount/TarkAccount.swift
++++ b/BrowserKit/Sources/TarkAccount/TarkAccount.swift
+@@ -43,6 +43,8 @@ public final class TarkAccount: NSObject {
+     private var authState: OIDAuthState?
+     private var discovery: OIDServiceConfiguration?
+     private var session: OIDExternalUserAgentSession?
++    /// The `state` of the sign-in waiting for its redirect.
++    private var pendingState: String?
+     /// Browsing cookies never ride along on account calls.
+     private let urlSession = URLSession(configuration: .ephemeral)
+ 
+@@ -54,18 +56,18 @@ public final class TarkAccount: NSObject {
+         self.config = config
+         super.init()
+         // The Keychain outlives an uninstall, UserDefaults does not: a
+-        // reinstall finds the old sign-in with no marker, revokes its
+-        // refresh token (in the background, never holding up launch) and
+-        // starts signed out.
++        // reinstall finds the old sign-in with no marker, deletes it at once
++        // (Tark is signed out from the first moment) and revokes its refresh
++        // token in the background, never holding up launch.
+         if !UserDefaults.standard.bool(forKey: Self.installedKey) {
+-            if let data = TarkAccountKeychain.load(),
+-               let leftover = try? NSKeyedUnarchiver.unarchivedObject(ofClass: OIDAuthState.self, from: data) {
+-                authState = leftover
+-                Task { await self.signOut(alsoWebsites: false) }
+-            } else {
+-                TarkAccountKeychain.delete()
+-            }
++            let leftover = TarkAccountKeychain.load().flatMap {
++                try? NSKeyedUnarchiver.unarchivedObject(ofClass: OIDAuthState.self, from: $0)
++            }?.refreshToken
++            TarkAccountKeychain.delete()
+             UserDefaults.standard.set(true, forKey: Self.installedKey)
++            if let leftover {
++                Task { await self.revoke(leftover, using: try? await self.serviceConfiguration()) }
++            }
+             return
+         }
+         if let data = TarkAccountKeychain.load(),
+@@ -109,7 +111,11 @@ public final class TarkAccount: NSObject {
+                                               responseType: OIDResponseTypeCode,
+                                               additionalParameters: parameters.isEmpty ? nil : parameters)
+         session?.cancel(completion: nil)
+-        let state: OIDAuthState = try await withCheckedThrowingContinuation { continuation in
++        let state = request.state
++        pendingState = state
++        // A newer sign-in that replaced this one keeps its own state.
++        defer { if pendingState == state { pendingState = nil } }
++        let authorized: OIDAuthState = try await withCheckedThrowingContinuation { continuation in
+             session = OIDAuthState.authState(byPresenting: request, externalUserAgent: agent) { state, error in
+                 if let state {
+                     continuation.resume(returning: state)
+@@ -119,19 +125,24 @@ public final class TarkAccount: NSObject {
+             }
+         }
+         session = nil
+-        authState = state
+-        state.stateChangeDelegate = self
++        authState = authorized
++        authorized.stateChangeDelegate = self
+         persist()
+         NotificationCenter.default.post(name: .tarkAccountDidChange, object: self)
+         await refreshProfile()
+     }
+ 
+-    /// The redirect, from the sign-in tab or from outside Tark. False when no
+-    /// sign-in is waiting or the `state` is not this sign-in's (AppAuth
+-    /// checks), so a stray link does nothing.
++    /// The redirect, from the sign-in tab or from outside Tark. Only a
++    /// redirect carrying the waiting sign-in's `state` reaches AppAuth: it
++    /// would end the sign-in on any other, and an `error=` response skips its
++    /// state check, so a stray or forged link could cancel a real sign-in.
++    /// False (and nothing happens) otherwise.
+     @discardableResult
+     public func resume(with url: URL) -> Bool {
+-        guard TarkAccountConfig.isRedirect(url), let session else { return false }
++        guard TarkAccountConfig.isRedirect(url), let session, let pendingState,
++              URLComponents(url: url, resolvingAgainstBaseURL: false)?
++                .queryItems?.first(where: { $0.name == "state" })?.value == pendingState
++        else { return false }
+         do {
+             try session.resumeExternalUserAgentFlow(url)
+             return true
+@@ -144,6 +155,7 @@ public final class TarkAccount: NSObject {
+     public func cancelSignIn() {
+         session?.cancel(completion: nil)
+         session = nil
++        pendingState = nil
+     }
+ 
+     // MARK: Tokens
+@@ -214,25 +226,29 @@ public final class TarkAccount: NSObject {
+             }
+             endSession = components.url
+         }
+-        if let refreshToken = authState?.refreshToken,
+-           let revocation = (configuration?.discoveryDocument?.discoveryDictionary["revocation_endpoint"] as? String)
+-            .flatMap(URL.init(string:)) {
+-            var request = URLRequest(url: revocation)
+-            request.httpMethod = "POST"
+-            request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+-            var body = URLComponents()
+-            body.queryItems = [URLQueryItem(name: "token", value: refreshToken),
+-                               URLQueryItem(name: "token_type_hint", value: "refresh_token"),
+-                               URLQueryItem(name: "client_id", value: config.clientID)]
+-            request.httpBody = body.percentEncodedQuery?.data(using: .utf8)
+-            // Signed out on this phone either way; a failed revoke leaves a
+-            // token that expires on its own.
+-            _ = try? await urlSession.data(for: request)
++        if let refreshToken = authState?.refreshToken {
++            await revoke(refreshToken, using: configuration)
+         }
+         clear()
+         return endSession
+     }
+ 
++    /// Revokes a refresh token. Signed out on this phone either way; a failed
++    /// revoke leaves a token that expires on its own.
++    private func revoke(_ refreshToken: String, using configuration: OIDServiceConfiguration?) async {
++        guard let revocation = (configuration?.discoveryDocument?.discoveryDictionary["revocation_endpoint"] as? String)
++            .flatMap(URL.init(string:)) else { return }
++        var request = URLRequest(url: revocation)
++        request.httpMethod = "POST"
++        request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
++        var body = URLComponents()
++        body.queryItems = [URLQueryItem(name: "token", value: refreshToken),
++                           URLQueryItem(name: "token_type_hint", value: "refresh_token"),
++                           URLQueryItem(name: "client_id", value: config.clientID)]
++        request.httpBody = body.percentEncodedQuery?.data(using: .utf8)
++        _ = try? await urlSession.data(for: request)
++    }
++
+     // MARK: Private
+ 
+     private func serviceConfiguration() async throws -> OIDServiceConfiguration {
+diff --git a/BrowserKit/Sources/TarkAccount/TarkAccountOffer.swift b/BrowserKit/Sources/TarkAccount/TarkAccountOffer.swift
+index 02fa934..a3a5ea9 100644
+--- a/BrowserKit/Sources/TarkAccount/TarkAccountOffer.swift
++++ b/BrowserKit/Sources/TarkAccount/TarkAccountOffer.swift
+@@ -22,7 +22,7 @@ public enum TarkAccountOffer {
+     }
+ 
+     private static let declinedKey = "TarkAccountDeclinedOffers"
+-    /// Asked about already while Tark runs (declined or not): ask once.
++    /// Shown already while Tark runs (declined or not): ask once.
+     private static var askedThisRun: Set<String> = []
+ 
+     /// The web identity to offer, or nil: not Zynclave's accounts site, a
+@@ -54,11 +54,17 @@ public enum TarkAccountOffer {
+               let id = result["id"] as? String, !id.isEmpty else { return nil }
+         let hash = hashed(id)
+         guard !askedThisRun.contains(hash), !declined.contains(hash), !account.isSignedIn else { return nil }
+-        askedThisRun.insert(hash)
+         let name = (result["name"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+         return WebIdentity(id: id, displayName: name)
+     }
+ 
++    /// The offer is on screen: not again while Tark runs. Called only once it
++    /// is shown, so an offer skipped (another tab came to the front, a sheet
++    /// was open) is made on the next visit.
++    public static func markShown(_ identity: WebIdentity) {
++        askedThisRun.insert(hashed(identity.id))
++    }
++
+     /// "No thanks": never offer this account again.
+     public static func decline(_ identity: WebIdentity) {
+         var list = declined
+diff --git a/firefox-ios/Client/Frontend/Browser/BrowserViewController/Extensions/BrowserViewController+WebViewDelegates.swift b/firefox-ios/Client/Frontend/Browser/BrowserViewController/Extensions/BrowserViewController+WebViewDelegates.swift
+index 98ee7fe..b5f44a4 100644
+--- a/firefox-ios/Client/Frontend/Browser/BrowserViewController/Extensions/BrowserViewController+WebViewDelegates.swift
++++ b/firefox-ios/Client/Frontend/Browser/BrowserViewController/Extensions/BrowserViewController+WebViewDelegates.swift
+@@ -1764,6 +1764,7 @@ extension BrowserViewController {
+                     }
+                 }
+             })
++            TarkAccountOffer.markShown(identity)
+             self.present(alert, animated: true)
+         }
+     }
