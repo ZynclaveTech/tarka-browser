@@ -1,0 +1,156 @@
+diff --git a/BrowserKit/Sources/TarkAccount/TarkTabUserAgent.swift b/BrowserKit/Sources/TarkAccount/TarkTabUserAgent.swift
+new file mode 100644
+index 0000000..29cc791
+--- /dev/null
++++ b/BrowserKit/Sources/TarkAccount/TarkTabUserAgent.swift
+@@ -0,0 +1,38 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++@preconcurrency import AppAuthCore
++import Foundation
++
++/// AppAuth's "external user agent" as a Tark tab: the login page opens in a
++/// normal (never Private) tab of the person's own browser, so the Zynclave
++/// session lands in Tark's cookies, where Shodhya and Zynclave's other sites
++/// in Tark can use it. Not ASWebAuthenticationSession or Safari: those keep
++/// the session in Safari. The tab shows the real address bar and padlock.
++/// Tark catches the redirect in the tab's navigation and hands it to
++/// `TarkAccount.resume(with:)`; AppAuth then dismisses, which closes the tab.
++@MainActor
++public final class TarkTabUserAgent: NSObject, OIDExternalUserAgent {
++    private let open: @MainActor (URL) -> Void
++    private let close: @MainActor () -> Void
++
++    /// `open` shows the authorization URL in a new normal tab; `close`
++    /// closes that tab if it is still open.
++    public init(open: @escaping @MainActor (URL) -> Void, close: @escaping @MainActor () -> Void) {
++        self.open = open
++        self.close = close
++    }
++
++    nonisolated public func present(_ request: OIDExternalUserAgentRequest,
++                                    session: OIDExternalUserAgentSession) -> Bool {
++        guard let url = request.externalUserAgentRequestURL() else { return false }
++        MainActor.assumeIsolated { open(url) }
++        return true
++    }
++
++    nonisolated public func dismiss(animated: Bool, completion: @escaping () -> Void) {
++        MainActor.assumeIsolated { close() }
++        completion()
++    }
++}
+diff --git a/firefox-ios/Client/Application/SceneDelegate.swift b/firefox-ios/Client/Application/SceneDelegate.swift
+index 2fc8afe..8954984 100644
+--- a/firefox-ios/Client/Application/SceneDelegate.swift
++++ b/firefox-ios/Client/Application/SceneDelegate.swift
+@@ -7,6 +7,7 @@ import CoreSpotlight
+ import Shared
+ import UserNotifications
+ import Common
++import TarkAccount
+ 
+ class SceneDelegate: UIResponder,
+                      UIWindowSceneDelegate,
+@@ -134,6 +135,13 @@ class SceneDelegate: UIResponder,
+         openURLContexts URLContexts: Set<UIOpenURLContext>
+     ) {
+         guard let url = URLContexts.first?.url else { return }
++        // Tark: Zynclave's redirect opened from outside Tark. AppAuth takes
++        // it only for the sign-in waiting with that `state`; otherwise it is
++        // dropped, never treated as a link to open.
++        if TarkAccountConfig.isRedirect(url) {
++            TarkAccount.shared.resume(with: url)
++            return
++        }
+         handleOpenURL(url)
+     }
+ 
+diff --git a/firefox-ios/Client/Frontend/Browser/BrowserViewController/Extensions/BrowserViewController+WebViewDelegates.swift b/firefox-ios/Client/Frontend/Browser/BrowserViewController/Extensions/BrowserViewController+WebViewDelegates.swift
+index 0e744b7..72768e3 100644
+--- a/firefox-ios/Client/Frontend/Browser/BrowserViewController/Extensions/BrowserViewController+WebViewDelegates.swift
++++ b/firefox-ios/Client/Frontend/Browser/BrowserViewController/Extensions/BrowserViewController+WebViewDelegates.swift
+@@ -9,6 +9,7 @@ import Shared
+ import UIKit
+ import Photos
+ import SafariServices
++import TarkAccount
+ import WebEngine
+ 
+ // MARK: - WKUIDelegate
+@@ -577,6 +578,12 @@ extension BrowserViewController: WKNavigationDelegate {
+             return
+         }
+ 
++        // Tark: Zynclave's redirect back from the sign-in tab.
++        if handleTarkSignInRedirect(url, in: tab) {
++            decisionHandler(.cancel)
++            return
++        }
++
+         // Bugzilla #1979499
+         if (url.scheme ?? "").lowercased() == "fido" {
+             decisionHandler(.cancel)
+@@ -1637,3 +1644,48 @@ extension WKNavigationAction {
+         return false
+     }
+ }
++
++// MARK: - Tark: Sign in with Zynclave
++
++/// The tab Sign in with Zynclave is running in, while it runs.
++@MainActor
++private enum TarkSignInTab {
++    static weak var tab: Tab?
++}
++
++extension BrowserViewController {
++    /// Signs in to Zynclave in a new normal tab (see `TarkTabUserAgent`).
++    /// `prompt: "none"` with no web session ends in `.loginRequired`, and
++    /// the caller retries without it.
++    func startTarkSignIn(prompt: String? = nil, idTokenHint: String? = nil) async throws {
++        let agent = TarkTabUserAgent(
++            open: { [weak self] url in
++                guard let self else { return }
++                TarkSignInTab.tab = self.openURLInNewTab(url, isPrivate: false)
++            },
++            close: { [weak self] in
++                guard let tab = TarkSignInTab.tab else { return }
++                TarkSignInTab.tab = nil
++                self?.tabManager.removeTab(tab.tabUUID)
++            })
++        try await TarkAccount.shared.signIn(using: agent, prompt: prompt, idTokenHint: idTokenHint)
++    }
++
++    /// True (the navigation is cancelled) for Zynclave's redirect back to
++    /// Tark. Only the normal sign-in tab may finish a sign-in; from any other
++    /// tab, Private ones included, the redirect is just dropped.
++    func handleTarkSignInRedirect(_ url: URL, in tab: Tab) -> Bool {
++        guard TarkAccountConfig.isRedirect(url) else { return false }
++        if !tab.isPrivate, tab === TarkSignInTab.tab {
++            TarkAccount.shared.resume(with: url)
++        }
++        return true
++    }
++
++    /// The person closed the sign-in tab before finishing.
++    func tarkSignInTabRemoved(_ tab: Tab) {
++        guard tab === TarkSignInTab.tab else { return }
++        TarkSignInTab.tab = nil
++        TarkAccount.shared.cancelSignIn()
++    }
++}
+diff --git a/firefox-ios/Client/Frontend/Browser/BrowserViewController/Views/BrowserViewController.swift b/firefox-ios/Client/Frontend/Browser/BrowserViewController/Views/BrowserViewController.swift
+index 6e3b3a0..5cc922d 100644
+--- a/firefox-ios/Client/Frontend/Browser/BrowserViewController/Views/BrowserViewController.swift
++++ b/firefox-ios/Client/Frontend/Browser/BrowserViewController/Views/BrowserViewController.swift
+@@ -4836,6 +4836,7 @@ extension BrowserViewController: TabManagerDelegate {
+     }
+ 
+     func tabManager(_ tabManager: TabManager, didRemoveTab tab: Tab, isRestoring: Bool) {
++        tarkSignInTabRemoved(tab)
+         if let url = tab.lastKnownUrl, !(InternalURL(url)?.isAboutURL ?? false), !tab.isPrivate {
+             profile.recentlyClosedTabs.addTab(url as URL,
+                                               title: tab.lastTitle,
