@@ -1,0 +1,481 @@
+diff --git a/BrowserKit/Package.swift b/BrowserKit/Package.swift
+index eb9f599..a4ef0a8 100644
+--- a/BrowserKit/Package.swift
++++ b/BrowserKit/Package.swift
+@@ -100,6 +100,10 @@ let package = Package(
+         .package(
+             url: "https://github.com/johnxnguyen/Down.git",
+             exact: "0.11.0"),
++        // Tark: OAuth 2.0 / OpenID Connect for Sign in with Zynclave.
++        .package(
++            url: "https://github.com/openid/AppAuth-iOS.git",
++            exact: "3.0.0"),
+     ],
+     targets: [
+         // Tark: adblock-rust for iOS, built by ios/build.py engine.
+@@ -174,6 +178,12 @@ let package = Package(
+         .target(
+             name: "TarkSources",
+             dependencies: ["TarkXlit"]),
++        // Tark: Sign in with Zynclave (public client, PKCE), the account in
++        // the Keychain and its profile. AppAuthCore only: the login page
++        // opens in a Tark tab, not Safari.
++        .target(
++            name: "TarkAccount",
++            dependencies: [.product(name: "AppAuthCore", package: "AppAuth-iOS")]),
+         .target(
+             name: "Shared",
+             dependencies: ["Common"],
+@@ -228,6 +238,7 @@ let package = Package(
+             dependencies: ["Dip",
+                            "SwiftyBeaver",
+                            "TarkAdblock",
++                           "TarkAccount",
+                            "TarkSources",
+                            "TarkTranslate",
+                            "TarkXlit",
+diff --git a/BrowserKit/Sources/TarkAccount/TarkAccount.swift b/BrowserKit/Sources/TarkAccount/TarkAccount.swift
+new file mode 100644
+index 0000000..819f6c2
+--- /dev/null
++++ b/BrowserKit/Sources/TarkAccount/TarkAccount.swift
+@@ -0,0 +1,274 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++@preconcurrency import AppAuthCore
++import Foundation
++
++public extension Notification.Name {
++    /// Signed in, signed out, or the profile changed.
++    static let tarkAccountDidChange = Notification.Name("TarkAccountDidChange")
++}
++
++/// What `userinfo` says about the signed-in person; any of it may be missing
++/// except `sub`, the only key the account is known by.
++public struct TarkAccountProfile: Codable, Equatable, Sendable {
++    public let sub: String
++    public let name: String?
++    public let email: String?
++    /// Only from an allowed photo host (`TarkAccountConfig.allowsPicture`).
++    public let picture: URL?
++
++    /// Name, else email, else nothing: what Tark shows for the account.
++    public var displayName: String? { name ?? email }
++}
++
++/// Sign in with Zynclave: authorization code + PKCE as a public client
++/// (AppAuth), tokens in the Keychain, refreshed on use. Sign-in is optional;
++/// nothing here runs at launch beyond reading the Keychain, so Tark starts
++/// and browses the same signed out or offline.
++@MainActor
++public final class TarkAccount: NSObject {
++    public enum SignInError: Error {
++        /// The person closed the sign-in tab.
++        case cancelled
++        /// `prompt=none` found no Zynclave session to use.
++        case loginRequired
++        case failed(Error)
++    }
++
++    public static let shared = TarkAccount(config: .current)
++
++    public let config: TarkAccountConfig
++    private var authState: OIDAuthState?
++    private var discovery: OIDServiceConfiguration?
++    private var session: OIDExternalUserAgentSession?
++    /// Browsing cookies never ride along on account calls.
++    private let urlSession = URLSession(configuration: .ephemeral)
++
++    private static let profileKey = "TarkAccountProfile"
++    public private(set) var profile: TarkAccountProfile?
++
++    init(config: TarkAccountConfig) {
++        self.config = config
++        super.init()
++        if let data = TarkAccountKeychain.load(),
++           let state = try? NSKeyedUnarchiver.unarchivedObject(ofClass: OIDAuthState.self, from: data) {
++            authState = state
++            state.stateChangeDelegate = self
++            if let saved = UserDefaults.standard.data(forKey: Self.profileKey) {
++                profile = try? JSONDecoder().decode(TarkAccountProfile.self, from: saved)
++            }
++        } else {
++            // A Keychain left from a deleted install, or nothing: start clean.
++            UserDefaults.standard.removeObject(forKey: Self.profileKey)
++        }
++    }
++
++    public var isSignedIn: Bool { authState?.refreshToken != nil }
++
++    /// The last ID token, for `id_token_hint` (re-sign-in the same account
++    /// silently, or sign out of Zynclave's websites).
++    public var lastIDToken: String? { authState?.lastTokenResponse?.idToken }
++
++    // MARK: Sign in
++
++    /// Runs the authorization in `agent` (a Tark tab). `prompt: "none"` asks
++    /// for the Zynclave web session already in Tark without showing a page;
++    /// with `idTokenHint` it returns that same account even when another is
++    /// active. Never sends `prompt=select_account` (Zynclave rejects it):
++    /// with two or more web accounts Zynclave shows its chooser by itself.
++    public func signIn(using agent: OIDExternalUserAgent,
++                       prompt: String? = nil,
++                       idTokenHint: String? = nil,
++                       loginHint: String? = nil) async throws {
++        let configuration = try await serviceConfiguration()
++        var parameters: [String: String] = [:]
++        if let prompt { parameters["prompt"] = prompt }
++        if let idTokenHint { parameters["id_token_hint"] = idTokenHint }
++        if let loginHint { parameters["login_hint"] = loginHint }
++        let request = OIDAuthorizationRequest(configuration: configuration,
++                                              clientId: config.clientID,
++                                              scopes: TarkAccountConfig.scopes,
++                                              redirectURL: TarkAccountConfig.redirectURL,
++                                              responseType: OIDResponseTypeCode,
++                                              additionalParameters: parameters.isEmpty ? nil : parameters)
++        session?.cancel(completion: nil)
++        let state: OIDAuthState = try await withCheckedThrowingContinuation { continuation in
++            session = OIDAuthState.authState(byPresenting: request, externalUserAgent: agent) { state, error in
++                if let state {
++                    continuation.resume(returning: state)
++                } else {
++                    continuation.resume(throwing: Self.signInError(error))
++                }
++            }
++        }
++        session = nil
++        authState = state
++        state.stateChangeDelegate = self
++        persist()
++        NotificationCenter.default.post(name: .tarkAccountDidChange, object: self)
++        await refreshProfile()
++    }
++
++    /// The redirect, from the sign-in tab or from outside Tark. False when no
++    /// sign-in is waiting or the `state` is not this sign-in's (AppAuth
++    /// checks), so a stray link does nothing.
++    @discardableResult
++    public func resume(with url: URL) -> Bool {
++        guard TarkAccountConfig.isRedirect(url), let session else { return false }
++        do {
++            try session.resumeExternalUserAgentFlow(url)
++            return true
++        } catch {
++            return false
++        }
++    }
++
++    /// The sign-in tab closed before the redirect.
++    public func cancelSignIn() {
++        session?.cancel(completion: nil)
++        session = nil
++    }
++
++    // MARK: Tokens
++
++    /// An access token, refreshed first when needed. A refused refresh
++    /// (`invalid_grant`: revoked, expired, or rotated elsewhere) signs Tark
++    /// out cleanly instead of retrying.
++    public func freshAccessToken() async throws -> String {
++        guard let authState else { throw SignInError.loginRequired }
++        do {
++            return try await withCheckedThrowingContinuation { continuation in
++                authState.performAction { accessToken, _, error in
++                    if let accessToken {
++                        continuation.resume(returning: accessToken)
++                    } else {
++                        continuation.resume(throwing: error ?? SignInError.loginRequired)
++                    }
++                }
++            }
++        } catch let error as NSError where error.domain == OIDOAuthTokenErrorDomain
++                    && error.code == OIDErrorCodeOAuthToken.invalidGrant.rawValue {
++            clear()
++            throw SignInError.loginRequired
++        }
++    }
++
++    // MARK: Profile
++
++    /// Refetches `userinfo`. Kept signed in on a network failure; a refused
++    /// token ends in `freshAccessToken`'s clean sign-out.
++    public func refreshProfile() async {
++        let configuration = try? await serviceConfiguration()
++        guard let endpoint = configuration?.discoveryDocument?.userinfoEndpoint,
++              let token = try? await freshAccessToken() else { return }
++        var request = URLRequest(url: endpoint)
++        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
++        request.setValue("application/json", forHTTPHeaderField: "Accept")
++        guard let (data, response) = try? await urlSession.data(for: request),
++              (response as? HTTPURLResponse)?.statusCode == 200,
++              let info = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
++              let sub = info["sub"] as? String else { return }
++        let picture = (info["picture"] as? String).flatMap(URL.init(string:)).flatMap {
++            config.allowsPicture($0) ? $0 : nil
++        }
++        let fresh = TarkAccountProfile(sub: sub,
++                                       name: (info["name"] as? String).flatMap { $0.isEmpty ? nil : $0 },
++                                       email: info["email"] as? String,
++                                       picture: picture)
++        guard fresh != profile else { return }
++        profile = fresh
++        UserDefaults.standard.set(try? JSONEncoder().encode(fresh), forKey: Self.profileKey)
++        NotificationCenter.default.post(name: .tarkAccountDidChange, object: self)
++    }
++
++    // MARK: Sign out
++
++    /// Signs Tark out: revokes the refresh token and forgets the account.
++    /// Returns the URL that also signs out of Zynclave's websites in Tark
++    /// (open it in a normal tab) when `alsoWebsites` is set.
++    @discardableResult
++    public func signOut(alsoWebsites: Bool) async -> URL? {
++        let configuration = try? await serviceConfiguration()
++        var endSession: URL?
++        if alsoWebsites, let endpoint = configuration?.discoveryDocument?.endSessionEndpoint,
++           var components = URLComponents(url: endpoint, resolvingAgainstBaseURL: false) {
++            if let idToken = lastIDToken {
++                components.queryItems = (components.queryItems ?? []) + [URLQueryItem(name: "id_token_hint", value: idToken)]
++            }
++            endSession = components.url
++        }
++        if let refreshToken = authState?.refreshToken,
++           let revocation = (configuration?.discoveryDocument?.discoveryDictionary["revocation_endpoint"] as? String)
++            .flatMap(URL.init(string:)) {
++            var request = URLRequest(url: revocation)
++            request.httpMethod = "POST"
++            request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
++            var body = URLComponents()
++            body.queryItems = [URLQueryItem(name: "token", value: refreshToken),
++                               URLQueryItem(name: "token_type_hint", value: "refresh_token"),
++                               URLQueryItem(name: "client_id", value: config.clientID)]
++            request.httpBody = body.percentEncodedQuery?.data(using: .utf8)
++            // Signed out on this phone either way; a failed revoke leaves a
++            // token that expires on its own.
++            _ = try? await urlSession.data(for: request)
++        }
++        clear()
++        return endSession
++    }
++
++    // MARK: Private
++
++    private func serviceConfiguration() async throws -> OIDServiceConfiguration {
++        if let discovery { return discovery }
++        let fetched: OIDServiceConfiguration = try await withCheckedThrowingContinuation { continuation in
++            OIDAuthorizationService.discoverConfiguration(forIssuer: config.issuer) { configuration, error in
++                if let configuration {
++                    continuation.resume(returning: configuration)
++                } else {
++                    continuation.resume(throwing: SignInError.failed(error ?? URLError(.badServerResponse)))
++                }
++            }
++        }
++        discovery = fetched
++        return fetched
++    }
++
++    private func persist() {
++        guard let authState,
++              let data = try? NSKeyedArchiver.archivedData(withRootObject: authState, requiringSecureCoding: true)
++        else { return }
++        TarkAccountKeychain.save(data)
++    }
++
++    private func clear() {
++        let wasSignedIn = authState != nil
++        authState?.stateChangeDelegate = nil
++        authState = nil
++        profile = nil
++        TarkAccountKeychain.delete()
++        UserDefaults.standard.removeObject(forKey: Self.profileKey)
++        if wasSignedIn {
++            NotificationCenter.default.post(name: .tarkAccountDidChange, object: self)
++        }
++    }
++
++    nonisolated private static func signInError(_ error: Error?) -> SignInError {
++        guard let error = error as NSError? else { return .failed(URLError(.unknown)) }
++        if error.domain == OIDGeneralErrorDomain,
++           error.code == OIDErrorCode.userCanceledAuthorizationFlow.rawValue {
++            return .cancelled
++        }
++        let response = error.userInfo[OIDOAuthErrorResponseErrorKey] as? [String: Any]
++        if response?["error"] as? String == "login_required" { return .loginRequired }
++        return .failed(error)
++    }
++}
++
++extension TarkAccount: OIDAuthStateChangeDelegate {
++    /// Refresh tokens rotate on every use: keep the newest in the Keychain.
++    nonisolated public func didChange(_ state: OIDAuthState) {
++        Task { @MainActor in self.persist() }
++    }
++}
+diff --git a/BrowserKit/Sources/TarkAccount/TarkAccountConfig.swift b/BrowserKit/Sources/TarkAccount/TarkAccountConfig.swift
+new file mode 100644
+index 0000000..e20e408
+--- /dev/null
++++ b/BrowserKit/Sources/TarkAccount/TarkAccountConfig.swift
+@@ -0,0 +1,61 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++import Foundation
++
++/// Tark's Zynclave clients: public native clients (no secret, PKCE S256),
++/// the same redirect as every other Tark platform, so a person has the same
++/// pairwise `sub` in Tark on iOS, Android and the desktop. Debug (`.dev`)
++/// builds use staging; TestFlight and the App Store use production.
++public struct TarkAccountConfig: Sendable {
++    public let issuer: URL
++    public let clientID: String
++    public let accountsHost: String
++    public let avatarHosts: Set<String>
++
++    /// Never change: the pairwise `sub` is derived from it.
++    public static let redirectURL = URL(string: "com.gettarka.tarka:/oauth2redirect")!
++    public static let scopes = ["openid", "profile", "email", "offline_access"]
++
++    public static let production = TarkAccountConfig(
++        issuer: URL(string: "https://auth.zynclave.com/")!,
++        clientID: "faedd095-b0c2-4caa-84b1-384a6520f903",
++        accountsHost: "accounts.zynclave.com",
++        avatarHosts: ["avatars.zynclave.com"])
++
++    public static let staging = TarkAccountConfig(
++        issuer: URL(string: "https://auth.staging.zynclave.com/")!,
++        clientID: "c8a4acfb-88e0-4d0d-91ad-7f32bd2ff795",
++        accountsHost: "accounts.staging.zynclave.com",
++        avatarHosts: ["avatars.staging.zynclave.com"])
++
++    public static var current: TarkAccountConfig {
++        Bundle.main.bundleIdentifier?.hasSuffix(".dev") == true ? staging : production
++    }
++
++    /// Google's photo hosts, besides Zynclave's own.
++    private static let googlePhotoHosts: Set<String> = [
++        "lh3.googleusercontent.com", "lh4.googleusercontent.com",
++        "lh5.googleusercontent.com", "lh6.googleusercontent.com",
++    ]
++
++    /// The account settings page (photo, username, other accounts).
++    public var settingsURL: URL { URL(string: "https://\(accountsHost)/settings")! }
++
++    /// Forces the account chooser when only one web account is signed in.
++    public var chooseAccountURL: URL { URL(string: "https://\(accountsHost)/accounts/choose")! }
++
++    /// A `picture` Tark loads only from Zynclave's or Google's photo hosts,
++    /// over HTTPS.
++    public func allowsPicture(_ url: URL) -> Bool {
++        guard url.scheme == "https", let host = url.host?.lowercased() else { return false }
++        return avatarHosts.contains(host) || Self.googlePhotoHosts.contains(host)
++    }
++
++    /// True for `com.gettarka.tarka:/oauth2redirect…` (schemes are
++    /// case-insensitive).
++    public static func isRedirect(_ url: URL) -> Bool {
++        url.scheme?.lowercased() == redirectURL.scheme && url.path == redirectURL.path
++    }
++}
+diff --git a/BrowserKit/Sources/TarkAccount/TarkAccountKeychain.swift b/BrowserKit/Sources/TarkAccount/TarkAccountKeychain.swift
+new file mode 100644
+index 0000000..c68cb59
+--- /dev/null
++++ b/BrowserKit/Sources/TarkAccount/TarkAccountKeychain.swift
+@@ -0,0 +1,46 @@
++// Copyright 2026 The Tark Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++import Foundation
++import Security
++
++/// The archived sign-in, in the app's own Keychain group. This device only
++/// and after first unlock: never synced to iCloud Keychain or restored to
++/// another phone, where its already-rotated refresh token would only fail.
++enum TarkAccountKeychain {
++    private static let service = "com.gettarka.Tarka.zynclave"
++    private static let account = "auth-state"
++
++    private static var query: [String: Any] {
++        [kSecClass as String: kSecClassGenericPassword,
++         kSecAttrService as String: service,
++         kSecAttrAccount as String: account]
++    }
++
++    static func load() -> Data? {
++        var request = query
++        request[kSecReturnData as String] = true
++        request[kSecMatchLimit as String] = kSecMatchLimitOne
++        var result: CFTypeRef?
++        guard SecItemCopyMatching(request as CFDictionary, &result) == errSecSuccess else { return nil }
++        return result as? Data
++    }
++
++    @discardableResult
++    static func save(_ data: Data) -> Bool {
++        let attributes: [String: Any] = [
++            kSecValueData as String: data,
++            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
++        ]
++        let status = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
++        if status == errSecItemNotFound {
++            return SecItemAdd(query.merging(attributes) { $1 } as CFDictionary, nil) == errSecSuccess
++        }
++        return status == errSecSuccess
++    }
++
++    static func delete() {
++        SecItemDelete(query as CFDictionary)
++    }
++}
+diff --git a/firefox-ios/Client.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved b/firefox-ios/Client.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved
+index fa9baec..afb3a33 100644
+--- a/firefox-ios/Client.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved
++++ b/firefox-ios/Client.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved
+@@ -1,5 +1,5 @@
+ {
+-  "originHash" : "e7404401c1215852b570f6834c531f39cbf1d9d6cb652546b4c0dac229d6945b",
++  "originHash" : "0278cefb080820f3aad00d80b1265c854d24fa408072754986502b2a83b16cea",
+   "pins" : [
+     {
+       "identity" : "a-star",
+@@ -10,6 +10,15 @@
+         "version" : "3.0.0-beta-1"
+       }
+     },
++    {
++      "identity" : "appauth-ios",
++      "kind" : "remoteSourceControl",
++      "location" : "https://github.com/openid/AppAuth-iOS.git",
++      "state" : {
++        "revision" : "a972daac82d449d58ab119e91c68153e29ddac33",
++        "version" : "3.0.0"
++      }
++    },
+     {
+       "identity" : "dip",
+       "kind" : "remoteSourceControl",
+diff --git a/firefox-ios/Client/Info.plist b/firefox-ios/Client/Info.plist
+index c8ea420..e8c960a 100644
+--- a/firefox-ios/Client/Info.plist
++++ b/firefox-ios/Client/Info.plist
+@@ -83,6 +83,14 @@
+ 				<string>https</string>
+ 			</array>
+ 		</dict>
++		<dict>
++			<key>CFBundleURLName</key>
++			<string>com.gettarka.tarka.oauth</string>
++			<key>CFBundleURLSchemes</key>
++			<array>
++				<string>com.gettarka.tarka</string>
++			</array>
++		</dict>
+ 	</array>
+ 	<key>CFBundleVersion</key>
+ 	<string>$(TARK_BUILD)</string>
